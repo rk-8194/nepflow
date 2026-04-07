@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=45", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nepflow"
+version = "0.1.0"
+description = "HPC workflow system for atomistic datasets"
+requires-python = ">=3.11"
+
+[tool.pylint.init-hook]
+init-hook = "import sys; sys.path.insert(0, 'src')"
+
+[tool.pylint.messages_control]
+disable = [
+    "missing-docstring",
+    "trailing-whitespace",
+    "wrong-import-position",
+    "import-outside-toplevel",
+    "trailing-newlines",
+]
+
+[tool.pyright]
+include = ["src"]
+pythonVersion = "3.11"

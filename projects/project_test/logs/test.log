@@ -1,0 +1,76 @@
+2026-04-07 14:10:20 - nepflow - INFO - NEPFlow started for project: test
+2026-04-07 14:10:20 - nepflow.generate - INFO - Running structure generation
+2026-04-07 14:10:20 - nepflow.generate - INFO - Target elements: ['W', 'Cr']
+2026-04-07 14:10:20 - nepflow.generate - INFO - Target structures: ['bcc', 'fcc', 'hcp', 'diamond', 'simple_cubic']
+2026-04-07 14:10:20 - nepflow.generate - INFO - 
+2026-04-07 14:10:20 - nepflow.generate - INFO - ================================================================================
+2026-04-07 14:10:20 - nepflow.generate - INFO - FETCHING LATTICE PARAMETERS FROM MATERIALS PROJECT
+2026-04-07 14:10:20 - nepflow.generate - INFO - ================================================================================
+2026-04-07 14:10:42 - nepflow.generate - INFO - ✓ Found 6 structure(s)
+2026-04-07 14:10:42 - nepflow.generate - INFO - 
+  Cr: 3 structure(s)
+2026-04-07 14:10:42 - nepflow.generate - INFO -     Cr              a=2.4436Å  V=23.18ų  SG#194  (mp-89)
+2026-04-07 14:10:42 - nepflow.generate - INFO -     Cr              a=2.5336Å  V=11.50ų  SG#225  (mp-8633)
+2026-04-07 14:10:42 - nepflow.generate - INFO -     Cr              a=2.9689Å  V=26.17ų  SG#229  (mp-90)
+2026-04-07 14:10:42 - nepflow.generate - INFO - 
+  W: 3 structure(s)
+2026-04-07 14:10:42 - nepflow.generate - INFO -     W               a=2.7829Å  V=33.23ų  SG#194  (mp-2646990)
+2026-04-07 14:10:42 - nepflow.generate - INFO -     W               a=2.8228Å  V=15.90ų  SG#225  (mp-8641)
+2026-04-07 14:10:42 - nepflow.generate - INFO -     W               a=2.7456Å  V=15.93ų  SG#229  (mp-91)
+2026-04-07 14:10:42 - nepflow.generate - INFO - 
+================================================================================
+
+2026-04-07 14:10:42 - nepflow.generate - INFO - Structure generation complete
+2026-04-07 14:10:42 - nepflow - INFO - Workflow completed successfully
+2026-04-07 14:12:55 - nepflow - INFO - NEPFlow started for project: test
+2026-04-07 14:12:55 - nepflow.generate - INFO - Running structure generation
+2026-04-07 14:12:55 - nepflow.generate - INFO - Target elements: ['W', 'Cr']
+2026-04-07 14:12:55 - nepflow.generate - INFO - Target structures: ['bcc', 'fcc', 'hcp', 'diamond', 'simple_cubic']
+2026-04-07 14:12:55 - nepflow.generate - INFO - 
+2026-04-07 14:12:55 - nepflow.generate - INFO - Fetching lattice parameters from Materials Project
+2026-04-07 14:13:17 - nepflow.generate - INFO - ✓ Found 6 structure(s)
+2026-04-07 14:13:17 - nepflow.generate - INFO -   Cr -bcc           a=2.968899Å  V= 26.1690ų  mp-90
+2026-04-07 14:13:17 - nepflow.generate - INFO -   Cr -fcc           a=2.533640Å  V= 11.5006ų  mp-8633
+2026-04-07 14:13:17 - nepflow.generate - INFO -   Cr -hcp           a=2.443591Å  V= 23.1753ų  mp-89
+2026-04-07 14:13:17 - nepflow.generate - INFO -   W  -bcc           a=2.745574Å  V= 15.9323ų  mp-91
+2026-04-07 14:13:17 - nepflow.generate - INFO -   W  -fcc           a=2.822756Å  V= 15.9039ų  mp-8641
+2026-04-07 14:13:17 - nepflow.generate - INFO -   W  -hcp           a=2.782929Å  V= 33.2278ų  mp-2646990
+2026-04-07 14:13:17 - nepflow.generate - INFO - 
+2026-04-07 14:13:17 - nepflow.generate - INFO - Structure generation complete
+2026-04-07 14:13:17 - nepflow - INFO - Workflow completed successfully
+2026-04-07 14:17:39 - nepflow - INFO - NEPFlow started for project: test
+2026-04-07 14:17:39 - nepflow.generate - INFO - Running structure generation
+2026-04-07 14:17:39 - nepflow.generate - INFO - Target elements: ['W', 'Cr']
+2026-04-07 14:17:39 - nepflow.generate - INFO - Target structures: ['bcc', 'fcc', 'hcp', 'diamond', 'simple_cubic']
+2026-04-07 14:17:39 - nepflow.generate - INFO - 
+2026-04-07 14:17:39 - nepflow.generate - INFO - Fetching lattice parameters from Materials Project
+2026-04-07 14:17:59 - nepflow.generate - INFO - ✓ Found 6 structure(s)
+2026-04-07 14:17:59 - nepflow.generate - INFO -   Cr -bcc           a=2.968899Å  V= 26.1690ų  mp-90
+2026-04-07 14:17:59 - nepflow.generate - INFO -   Cr -fcc           a=3.583108Å  V= 46.0023ų  mp-8633
+2026-04-07 14:17:59 - nepflow.generate - INFO -   Cr -hcp           a=2.443591Å  V= 23.1753ų  mp-89
+2026-04-07 14:17:59 - nepflow.generate - INFO -   W  -bcc           a=3.170316Å  V= 31.8645ų  mp-91
+2026-04-07 14:17:59 - nepflow.generate - INFO -   W  -fcc           a=3.991978Å  V= 63.6157ų  mp-8641
+2026-04-07 14:17:59 - nepflow.generate - INFO -   W  -hcp           a=2.782929Å  V= 33.2278ų  mp-2646990
+2026-04-07 14:17:59 - nepflow.generate - INFO - 
+2026-04-07 14:17:59 - nepflow.generate - INFO - Structure generation complete
+2026-04-07 14:17:59 - nepflow - INFO - Workflow completed successfully
+2026-04-07 14:18:52 - nepflow - INFO - NEPFlow started for project: test
+2026-04-07 14:18:52 - nepflow.generate - INFO - Running structure generation
+2026-04-07 14:18:52 - nepflow.generate - INFO - Target elements: ['W', 'Cr', 'C']
+2026-04-07 14:18:52 - nepflow.generate - INFO - Target structures: ['bcc', 'fcc', 'hcp', 'diamond', 'simple_cubic']
+2026-04-07 14:18:52 - nepflow.generate - INFO - 
+2026-04-07 14:18:52 - nepflow.generate - INFO - Fetching lattice parameters from Materials Project
+2026-04-07 14:19:32 - nepflow.generate - INFO - ✓ Found 17 structure(s)
+2026-04-07 14:19:32 - nepflow.generate - INFO -   C  -bcc           a=4.843440Å  V=113.6218ų  mp-570002
+2026-04-07 14:19:32 - nepflow.generate - INFO -   C  -diamond       a=3.560745Å  V= 45.1464ų  mp-66
+2026-04-07 14:19:32 - nepflow.generate - INFO -   C  -hcp           a=2.467291Å  V= 41.1374ų  mp-48
+2026-04-07 14:19:32 - nepflow.generate - INFO -   C  -simple_cubic  a=5.183610Å  V=139.2826ų  mp-1188817
+2026-04-07 14:19:32 - nepflow.generate - INFO -   Cr -bcc           a=2.968899Å  V= 26.1690ų  mp-90
+2026-04-07 14:19:32 - nepflow.generate - INFO -   Cr -fcc           a=3.583108Å  V= 46.0023ų  mp-8633
+2026-04-07 14:19:32 - nepflow.generate - INFO -   Cr -hcp           a=2.443591Å  V= 23.1753ų  mp-89
+2026-04-07 14:19:32 - nepflow.generate - INFO -   W  -bcc           a=3.170316Å  V= 31.8645ų  mp-91
+2026-04-07 14:19:32 - nepflow.generate - INFO -   W  -fcc           a=3.991978Å  V= 63.6157ų  mp-8641
+2026-04-07 14:19:32 - nepflow.generate - INFO -   W  -hcp           a=2.782929Å  V= 33.2278ų  mp-2646990
+2026-04-07 14:19:32 - nepflow.generate - INFO - 
+2026-04-07 14:19:32 - nepflow.generate - INFO - Structure generation complete
+2026-04-07 14:19:32 - nepflow - INFO - Workflow completed successfully

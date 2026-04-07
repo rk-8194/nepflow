@@ -1,0 +1,10 @@
+[MASTER]
+init-hook='import sys; sys.path.insert(0, "src")'
+
+[MESSAGES CONTROL]
+disable=
+    missing-docstring,
+    trailing-whitespace,
+    wrong-import-position,
+    import-outside-toplevel,
+    trailing-newlines,
