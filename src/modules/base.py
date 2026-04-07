@@ -7,6 +7,10 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+class SelfResubmitExit(Exception):
+    """Raised when a stage resubmits itself via SLURM and needs to exit without advancing."""
+
+
 class Stage(ABC):
     """Base class for all workflow stages."""
     

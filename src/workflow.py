@@ -8,6 +8,7 @@ import logging
 # Note: src/ is added to sys.path dynamically by nepflow.py
 # pylint: disable=import-error
 from modules import (
+    SelfResubmitExit,
     InitStage,
     GenerateStage,
     SelectStage,
@@ -36,7 +37,9 @@ class WorkflowController:
         project_name: str,
         output_dir: Path,
         init_mode: bool = False,
-        debug: bool = False
+        debug: bool = False,
+        stage_override: str | None = None,
+        local_mode: bool = False,
     ):
         """
         Initialize workflow controller.
@@ -51,6 +54,8 @@ class WorkflowController:
         self.output_dir = Path(output_dir)
         self.init_mode = init_mode
         self.debug = debug
+        self.stage_override = stage_override
+        self.local_mode = local_mode
         
         # Project directory (contains config, state, logs, outputs)
         self.project_dir = self.output_dir / f"project_{project_name}"
@@ -132,7 +137,7 @@ class WorkflowController:
         )
         stage.run()
     
-    def _generate(self) -> None:
+    def _generate(self, seeds_only: bool = False) -> None:
         """Generate base structures and variants."""
         stage = GenerateStage(
             project_name=self.project_name,
@@ -141,7 +146,7 @@ class WorkflowController:
             project_dir=self.project_dir,
             debug=self.debug
         )
-        stage.run()
+        stage.run(seeds_only=seeds_only)
     
     def _select(self) -> None:
         """Select representative subset from candidates."""
@@ -197,6 +202,42 @@ class WorkflowController:
         # Project is considered initialized if config directory exists
         return self.config_dir.exists()
     
+    def _run_local(self) -> None:
+        """
+        Fetch base structures locally, then stop.
+        
+        Used when the HPC has no web access. Runs init (if needed)
+        and the seed-generation part of generate (composition grid +
+        configurational generators including Materials Project fetch),
+        but skips perturbations. The stage stays at 'generate' so
+        the HPC can resume with perturbations → select → …
+        """
+        stage = self._determine_current_stage()
+        
+        # If we haven't initialized yet, do that first
+        if stage == "init":
+            logger.info("Local mode — initializing project")
+            self._initialize()
+            self._set_current_stage("generate")
+            stage = "generate"
+        
+        if stage == "generate":
+            logger.info("Local mode — generating base structures (seeds only)")
+            self._generate(seeds_only=True)
+            # Stage stays at 'generate' — HPC resumes with perturbations
+            logger.info("Local mode complete — seeds generated, stage remains at 'generate'")
+            print("✓ Base structures generated (seeds only, no perturbations)")
+            print("  Transfer the project directory to HPC and resume with:")
+            print("  python nepflow.py --project %s" % self.project_name)
+        else:
+            logger.info(
+                "Local mode — nothing to do, current stage is '%s'. "
+                "Base structures were already generated.", stage
+            )
+            print("✓ Local stages already complete (current stage: '%s')" % stage)
+            print("  Resume on HPC with:")
+            print("  python nepflow.py --project %s" % self.project_name)
+    
     def run(self) -> None:
         """
         Run workflow controller.
@@ -211,7 +252,8 @@ class WorkflowController:
             self._initialize()
             self._set_current_stage("generate")
             logger.info("Project initialization complete. Initialization stage finished.")
-            return
+            if not self.local_mode:
+                return
         
         # Check if project is initialized
         if not self._check_project_initialized():
@@ -226,6 +268,15 @@ class WorkflowController:
                 f"Run: python3 nepflow.py --project {self.project_name} --init"
             )
         
+        if self.stage_override:
+            self._set_current_stage(self.stage_override)
+            logger.info("Stage overridden to: %s", self.stage_override)
+
+        # Local mode: run all stages before select, then stop
+        if self.local_mode:
+            self._run_local()
+            return
+
         stage = self._determine_current_stage()
         logger.info("Executing stage: %s", stage)
         
@@ -243,7 +294,11 @@ class WorkflowController:
             self._set_current_stage("run_vasp")
         elif stage == "run_vasp":
             logger.debug("Running VASP calculations")
-            self._run_vasp()
+            try:
+                self._run_vasp()
+            except SelfResubmitExit:
+                logger.info("Launcher resubmitted itself — exiting without advancing stage")
+                return
             self._set_current_stage("train_nep")
         elif stage == "train_nep":
             logger.debug("Training NEP models")

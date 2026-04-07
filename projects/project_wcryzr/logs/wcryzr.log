@@ -1,0 +1,124 @@
+2026-04-07 18:42:06 - nepflow - INFO - NEPFlow started for project: wcryzr
+2026-04-07 18:42:06 - nepflow - INFO - Workflow completed successfully
+2026-04-07 18:50:45 - nepflow - INFO - NEPFlow started for project: wcryzr
+2026-04-07 18:50:45 - nepflow.generate - INFO - Running structure generation
+2026-04-07 18:50:45 - nepflow.generate - INFO - Elements: ['W', 'Cr', 'Y', 'Zr']
+2026-04-07 18:50:45 - nepflow.generate - INFO - Crystal structures: ['bcc', 'fcc', 'hcp', 'diamond', 'simple_cubic']
+2026-04-07 18:50:45 - nepflow.generate - INFO - 
+2026-04-07 18:50:45 - nepflow.generate - INFO - Step 1: Building composition grid
+2026-04-07 18:50:45 - nepflow.composition - INFO - Generated 130 compositions (4 elements, step=0.125)
+2026-04-07 18:50:45 - nepflow.generate - INFO -   130 compositions
+2026-04-07 18:50:45 - nepflow.generate - INFO - 
+2026-04-07 18:50:45 - nepflow.generate - INFO - Step 2: Generating base structures (configurational generators)
+2026-04-07 18:50:45 - nepflow.generate - INFO -   Active generators: ['MaterialsProject', 'RandomSolidSolution', 'SQS', 'Segregated']
+2026-04-07 18:54:43 - nepflow - INFO - NEPFlow started for project: wcryzr
+2026-04-07 18:54:43 - nepflow.generate - INFO - Running structure generation
+2026-04-07 18:54:43 - nepflow.generate - INFO - Elements: ['W', 'Cr', 'Y', 'Zr']
+2026-04-07 18:54:43 - nepflow.generate - INFO - Crystal structures: ['bcc', 'fcc', 'hcp', 'diamond', 'simple_cubic']
+2026-04-07 18:54:43 - nepflow.generate - INFO - 
+2026-04-07 18:54:43 - nepflow.generate - INFO - Step 1: Building composition grid
+2026-04-07 18:54:43 - nepflow.composition - INFO - Generated 130 compositions (4 elements, step=0.125)
+2026-04-07 18:54:43 - nepflow.generate - INFO -   130 compositions
+2026-04-07 18:54:43 - nepflow.generate - INFO - 
+2026-04-07 18:54:43 - nepflow.generate - INFO - Step 2: Generating base structures (configurational generators)
+2026-04-07 18:54:43 - nepflow.generate - INFO -   Active generators: ['MaterialsProject', 'RandomSolidSolution', 'SQS', 'Segregated']
+2026-04-07 18:55:44 - nepflow - INFO - NEPFlow started for project: wcryzr
+2026-04-07 18:55:44 - nepflow.generate - INFO - Running structure generation
+2026-04-07 18:55:44 - nepflow.generate - INFO - Elements: ['W', 'Cr', 'Y', 'Zr']
+2026-04-07 18:55:44 - nepflow.generate - INFO - Crystal structures: ['bcc', 'fcc', 'hcp']
+2026-04-07 18:55:44 - nepflow.generate - INFO - 
+2026-04-07 18:55:44 - nepflow.generate - INFO - Step 1: Building composition grid
+2026-04-07 18:55:44 - nepflow.composition - INFO - Generated 130 compositions (4 elements, step=0.125)
+2026-04-07 18:55:44 - nepflow.generate - INFO -   130 compositions
+2026-04-07 18:55:44 - nepflow.generate - INFO - 
+2026-04-07 18:55:44 - nepflow.generate - INFO - Step 2: Generating base structures (configurational generators)
+2026-04-07 18:55:44 - nepflow.generate - INFO -   Active generators: ['MaterialsProject', 'RandomSolidSolution', 'SQS', 'Segregated']
+2026-04-07 18:56:23 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'Y']
+2026-04-07 18:56:24 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'Y']
+2026-04-07 18:56:24 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'Y']
+2026-04-07 18:56:25 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'Y']
+2026-04-07 18:56:25 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'Y']
+2026-04-07 18:56:25 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'Y']
+2026-04-07 18:56:26 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'Y']
+2026-04-07 18:56:26 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'Zr']
+2026-04-07 18:56:27 - nepflow.materials_project - INFO - ✓ Found 4 compound(s) for ['Cr', 'Zr']
+2026-04-07 18:56:27 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['W', 'Y']
+2026-04-07 18:56:28 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['W', 'Y']
+2026-04-07 18:56:28 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['W', 'Y']
+2026-04-07 18:56:29 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['W', 'Y']
+2026-04-07 18:56:29 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['W', 'Y']
+2026-04-07 18:56:29 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['W', 'Y']
+2026-04-07 18:56:30 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['W', 'Y']
+2026-04-07 18:56:30 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['W', 'Zr']
+2026-04-07 18:56:31 - nepflow.materials_project - INFO - ✓ Found 4 compound(s) for ['W', 'Zr']
+2026-04-07 18:56:31 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Y', 'Zr']
+2026-04-07 18:56:32 - nepflow.materials_project - INFO - ✓ Found 1 compound(s) for ['Y', 'Zr']
+2026-04-07 18:56:32 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'W', 'Y']
+2026-04-07 18:56:33 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'W', 'Y']
+2026-04-07 18:56:33 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'W', 'Y']
+2026-04-07 18:56:34 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'W', 'Y']
+2026-04-07 18:56:34 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'W', 'Y']
+2026-04-07 18:56:35 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'W', 'Y']
+2026-04-07 18:56:35 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'W', 'Y']
+2026-04-07 18:56:35 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'W', 'Y']
+2026-04-07 18:56:36 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'W', 'Y']
+2026-04-07 18:56:36 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'W', 'Y']
+2026-04-07 18:56:37 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'W', 'Y']
+2026-04-07 18:56:37 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'W', 'Y']
+2026-04-07 18:56:38 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'W', 'Y']
+2026-04-07 18:56:38 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'W', 'Y']
+2026-04-07 18:56:39 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'W', 'Y']
+2026-04-07 18:56:39 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'W', 'Y']
+2026-04-07 18:56:40 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'W', 'Y']
+2026-04-07 18:56:40 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'W', 'Y']
+2026-04-07 18:56:41 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'W', 'Y']
+2026-04-07 18:56:41 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'W', 'Y']
+2026-04-07 18:56:42 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'W', 'Y']
+2026-04-07 18:56:42 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'W', 'Zr']
+2026-04-07 18:56:43 - nepflow.materials_project - INFO - ✓ Found 1 compound(s) for ['Cr', 'W', 'Zr']
+2026-04-07 18:56:45 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'Y', 'Zr']
+2026-04-07 18:56:45 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'Y', 'Zr']
+2026-04-07 18:56:45 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'Y', 'Zr']
+2026-04-07 18:56:46 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'Y', 'Zr']
+2026-04-07 18:56:46 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'Y', 'Zr']
+2026-04-07 18:56:47 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'Y', 'Zr']
+2026-04-07 18:56:47 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'Y', 'Zr']
+2026-04-07 18:56:48 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'Y', 'Zr']
+2026-04-07 18:56:48 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'Y', 'Zr']
+2026-04-07 18:56:49 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'Y', 'Zr']
+2026-04-07 18:56:49 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'Y', 'Zr']
+2026-04-07 18:56:50 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'Y', 'Zr']
+2026-04-07 18:56:50 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'Y', 'Zr']
+2026-04-07 18:56:51 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'Y', 'Zr']
+2026-04-07 18:56:51 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'Y', 'Zr']
+2026-04-07 18:56:52 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'Y', 'Zr']
+2026-04-07 18:56:52 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'Y', 'Zr']
+2026-04-07 18:56:53 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'Y', 'Zr']
+2026-04-07 18:56:53 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'Y', 'Zr']
+2026-04-07 18:56:54 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'Y', 'Zr']
+2026-04-07 18:56:54 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'Y', 'Zr']
+2026-04-07 18:56:55 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['W', 'Y', 'Zr']
+2026-04-07 18:56:55 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['W', 'Y', 'Zr']
+2026-04-07 18:56:56 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['W', 'Y', 'Zr']
+2026-04-07 18:56:56 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['W', 'Y', 'Zr']
+2026-04-07 18:56:57 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['W', 'Y', 'Zr']
+2026-04-07 18:56:57 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['W', 'Y', 'Zr']
+2026-04-07 18:56:57 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['W', 'Y', 'Zr']
+2026-04-07 18:56:58 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['W', 'Y', 'Zr']
+2026-04-07 18:56:59 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['W', 'Y', 'Zr']
+2026-04-07 18:56:59 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['W', 'Y', 'Zr']
+2026-04-07 18:57:00 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['W', 'Y', 'Zr']
+2026-04-07 18:57:00 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['W', 'Y', 'Zr']
+2026-04-07 18:57:01 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['W', 'Y', 'Zr']
+2026-04-07 18:57:01 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['W', 'Y', 'Zr']
+2026-04-07 18:57:02 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['W', 'Y', 'Zr']
+2026-04-07 18:57:02 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['W', 'Y', 'Zr']
+2026-04-07 18:57:03 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['W', 'Y', 'Zr']
+2026-04-07 18:57:03 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['W', 'Y', 'Zr']
+2026-04-07 18:57:03 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['W', 'Y', 'Zr']
+2026-04-07 18:57:04 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['W', 'Y', 'Zr']
+2026-04-07 18:57:04 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['W', 'Y', 'Zr']
+2026-04-07 18:57:05 - nepflow.generate - INFO -   Total base structures: 985
+2026-04-07 18:57:06 - nepflow.generate - INFO -   Saved seeds to /mnt/c/Users/vp8194/.files/project_nepflow/projects/project_wcryzr/structures/seeds/base_structures.xyz
+2026-04-07 18:57:06 - nepflow.generate - INFO - Seeds-only mode — skipping perturbations
+2026-04-07 18:57:06 - nepflow - INFO - Workflow completed successfully

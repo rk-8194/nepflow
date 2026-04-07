@@ -4,9 +4,11 @@ Structure selection stage — farthest-point sampling in NEP descriptor space.
 Pipeline:
   1. Load generated structures from structures/generated/
   2. Compute NEP descriptors using foundation model (NEP89) via NepTrainKit
-  3. Run farthest-point sampling (FPS) to select target number of structures
-  4. Plot descriptor-space visualization (PCA 2D)
-  5. Save selected structures to structures/selected/
+  3. FPS to select training set (target_train_count)
+  4. FPS on remainder to select test set (target_test_count), ensuring
+     minimum separation from the training set in descriptor space
+  5. Plot descriptor-space visualization (PCA 2D): training=red, test=blue
+  6. Save training and test sets
 """
 
 import logging
@@ -15,6 +17,7 @@ from configparser import ConfigParser
 from pathlib import Path
 
 import numpy as np
+from ase.io import read as ase_read, write as ase_write
 from NepTrainKit.core.calculator import NepCalculator
 from NepTrainKit.core.structure import Structure
 from NepTrainKit.core.io import farthest_point_sampling
@@ -49,6 +52,9 @@ class SelectStage(Stage):
 
         t0 = time.perf_counter()
         structures = Structure.read_multiple(str(generated_path))
+        # Also load with ASE for lossless extxyz round-tripping (NepTrainKit's
+        # writer corrupts quoted JSON values in info fields).
+        ase_structures = ase_read(str(generated_path), index=":", format="extxyz")
         t_load = time.perf_counter() - t0
         logger.info(f"  Loaded {len(structures)} candidate structures ({t_load:.1f}s)")
 
@@ -103,65 +109,121 @@ class SelectStage(Stage):
         logger.info(f"  Descriptor type: {descriptor_type}")
 
         # ----------------------------------------------------------
-        # Step 3: Farthest-point sampling with target count
+        # Step 3: FPS — training set
         # ----------------------------------------------------------
         logger.info("")
-        logger.info("Step 3: Running farthest-point sampling")
+        logger.info("Step 3: Selecting training set via FPS")
 
-        target_count = config.getint("selection", "target_count", fallback=1000)
+        target_train = config.getint("selection", "target_train_count", fallback=1000)
+        target_test = config.getint("selection", "target_test_count", fallback=200)
         tolerance = config.getint("selection", "target_tolerance", fallback=50)
         max_iterations = config.getint("selection", "max_search_iterations", fallback=30)
 
-        if target_count >= len(structures):
-            logger.info(f"  target_count ({target_count}) >= total structures ({len(structures)}), selecting all")
-            frame_indices = list(range(len(structures)))
-            final_min_distance = 0.0
+        if target_train >= len(structures):
+            logger.info(f"  target_train_count ({target_train}) >= total ({len(structures)}), selecting all for training")
+            train_indices = list(range(len(structures)))
+            train_min_dist = 0.0
         else:
-            frame_indices, final_min_distance = self._fps_target_count(
+            train_indices, train_min_dist = self._fps_target_count(
                 descriptors, structures, mean_descriptor,
-                target_count, tolerance, max_iterations,
+                target_train, tolerance, max_iterations, label="train",
             )
 
-        logger.info(f"  Selected {len(frame_indices)} / {len(structures)} structures")
-        logger.info(f"  Final min_distance: {final_min_distance:.6f}")
+        logger.info(f"  Training set: {len(train_indices)} structures (min_distance={train_min_dist:.6f})")
 
         # ----------------------------------------------------------
-        # Step 4: Plot descriptor space
+        # Step 4: FPS — test set from remaining structures
+        #   Pre-filter to candidates farthest from the training set
+        #   so the test set targets under-represented regions.
         # ----------------------------------------------------------
         logger.info("")
-        logger.info("Step 4: Plotting descriptor space")
+        logger.info("Step 4: Selecting test set via FPS (from remaining structures)")
+
+        train_set = set(train_indices)
+        remaining_mask = np.array([i not in train_set for i in range(len(structures))])
+        remaining_indices = np.where(remaining_mask)[0]
+        logger.info(f"  {len(remaining_indices)} candidates remaining after training selection")
+
+        if len(remaining_indices) == 0:
+            logger.warning("  No structures remain for test set")
+            test_indices = []
+            test_min_dist = 0.0
+            min_train_test_dist = float("inf")
+            mean_train_test_dist = float("inf")
+        elif target_test >= len(remaining_indices):
+            logger.info(f"  target_test_count ({target_test}) >= remaining ({len(remaining_indices)}), using all remaining for test")
+            test_indices = remaining_indices.tolist()
+            test_min_dist = 0.0
+            min_train_test_dist, mean_train_test_dist = self._cross_distance_stats(descriptors, train_indices, test_indices)
+        else:
+            # Rank remaining candidates by distance to nearest training point
+            # and keep only the farthest half — the pool for test FPS.
+            from scipy.spatial.distance import cdist
+            d_to_train = cdist(
+                descriptors[remaining_indices], descriptors[train_indices]
+            ).min(axis=1)
+
+            test_pool_factor = config.getfloat("selection", "test_pool_factor", fallback=0.5)
+            pool_size = max(target_test, int(len(remaining_indices) * test_pool_factor))
+            top_k = np.argsort(d_to_train)[::-1][:pool_size]
+            pool_indices = remaining_indices[top_k]
+            logger.info(
+                f"  Pre-filtered to {len(pool_indices)} candidates farthest from training "
+                f"(top {test_pool_factor*100:.0f}%, min d_train in pool: {d_to_train[top_k[-1]]:.6f}, "
+                f"max: {d_to_train[top_k[0]]:.6f})"
+            )
+
+            pool_descriptors = descriptors[pool_indices]
+            test_local, test_min_dist = self._fps_target_count(
+                pool_descriptors, [structures[i] for i in pool_indices],
+                mean_descriptor, target_test, tolerance, max_iterations, label="test",
+            )
+            test_indices = [int(pool_indices[i]) for i in test_local]
+            min_train_test_dist, mean_train_test_dist = self._cross_distance_stats(descriptors, train_indices, test_indices)
+
+        logger.info(f"  Test set: {len(test_indices)} structures (min_distance={test_min_dist:.6f})")
+        logger.info(f"  Train↔test nearest-neighbour distance — min: {min_train_test_dist:.6f}, mean: {mean_train_test_dist:.6f}")
+
+        # ----------------------------------------------------------
+        # Step 5: Plot descriptor space
+        # ----------------------------------------------------------
+        logger.info("")
+        logger.info("Step 5: Plotting descriptor space")
 
         reports_dir = self.project_dir / "reports"
         reports_dir.mkdir(parents=True, exist_ok=True)
         self._plot_descriptor_space(
-            descriptors, frame_indices, mean_descriptor,
+            descriptors, train_indices, test_indices,
             reports_dir / "descriptor_space.png",
         )
 
         # ----------------------------------------------------------
-        # Step 5: Save selected structures
+        # Step 6: Save training and test sets
         # ----------------------------------------------------------
         logger.info("")
-        logger.info("Step 5: Saving selected structures")
-
-        selected_structures = [structures[i] for i in frame_indices]
+        logger.info("Step 6: Saving selected structures")
 
         selected_dir = self.project_dir / "structures" / "selected"
         selected_dir.mkdir(parents=True, exist_ok=True)
-        output_path = selected_dir / "selected_structures.xyz"
-        with open(output_path, "w") as f:
-            for s in selected_structures:
-                s.write(f)
-        logger.info(f"  Saved to {output_path}")
+
+        train_path = selected_dir / "train.xyz"
+        ase_write(str(train_path), [ase_structures[i] for i in train_indices], format="extxyz")
+        logger.info(f"  Training set saved to {train_path}")
+
+        test_path = selected_dir / "test.xyz"
+        ase_write(str(test_path), [ase_structures[i] for i in test_indices], format="extxyz")
+        logger.info(f"  Test set saved to {test_path}")
 
         # ----------------------------------------------------------
         # Summary
         # ----------------------------------------------------------
         logger.info("")
-        logger.info(f"Selection complete: {len(selected_structures)} structures selected from {len(structures)} candidates")
-        logger.info(f"  Reduction: {100 * (1 - len(selected_structures) / len(structures)):.1f}%")
-        logger.info(f"  min_distance used: {final_min_distance:.6f}")
-        logger.info(f"  Plot saved to: {reports_dir / 'descriptor_space.png'}")
+        logger.info(f"Selection complete from {len(structures)} candidates:")
+        logger.info(f"  Training: {len(train_indices)} structures (FPS min_distance={train_min_dist:.6f})")
+        logger.info(f"  Test:     {len(test_indices)} structures (FPS min_distance={test_min_dist:.6f})")
+        logger.info(f"  Train↔test NN distance — min: {min_train_test_dist:.6f}, mean: {mean_train_test_dist:.6f}")
+        logger.info(f"  Total selected: {len(train_indices) + len(test_indices)} ({100 * (len(train_indices) + len(test_indices)) / len(structures):.1f}%)")
+        logger.info(f"  Plot: {reports_dir / 'descriptor_space.png'}")
 
     # ==================================================================
     # helpers
@@ -187,16 +249,17 @@ class SelectStage(Stage):
         target: int,
         tolerance: int,
         max_iterations: int,
+        label: str = "",
     ) -> tuple[list[int], float]:
         """Binary search on min_distance to hit target structure count."""
-        n_total = len(structures)
+        prefix = f"[{label}] " if label else ""
         lo, hi = 0.0, None
 
         # Find an upper bound: keep doubling until we get fewer than target
         dist = 0.01
         while True:
             count = self._fps_count(descriptors, structures, mean_descriptor, dist)
-            logger.info(f"  Probing min_distance={dist:.6f} → {count} structures")
+            logger.info(f"  {prefix}Probing min_distance={dist:.6f} → {count} structures")
             if count <= target:
                 hi = dist
                 break
@@ -213,7 +276,7 @@ class SelectStage(Stage):
         for i in range(max_iterations):
             mid = (lo + hi) / 2
             count = self._fps_count(descriptors, structures, mean_descriptor, mid)
-            logger.info(f"  Iteration {i+1}: min_distance={mid:.6f} → {count} structures (target={target}±{tolerance})")
+            logger.info(f"  {prefix}Iteration {i+1}: min_distance={mid:.6f} → {count} structures (target={target}±{tolerance})")
 
             if abs(count - target) <= tolerance:
                 best_dist = mid
@@ -228,7 +291,7 @@ class SelectStage(Stage):
                 best_indices = self._fps_run(descriptors, structures, mean_descriptor, mid)
         else:
             # Exhausted iterations — use best hi (closest from above)
-            logger.info(f"  Search did not converge within tolerance; using min_distance={best_dist:.6f}")
+            logger.info(f"  {prefix}Search did not converge within tolerance; using min_distance={best_dist:.6f}")
 
         return best_indices, best_dist
 
@@ -262,13 +325,32 @@ class SelectStage(Stage):
         return len(self._fps_run(descriptors, structures, mean_descriptor, min_dist))
 
     @staticmethod
+    def _cross_distance_stats(
+        descriptors: np.ndarray,
+        indices_a: list[int],
+        indices_b: list[int],
+    ) -> tuple[float, float]:
+        """Return (min, mean) nearest-neighbour distance from B to A.
+
+        For each point in B, find the distance to the closest point in A,
+        then return the minimum and mean of those nearest-neighbour distances.
+        """
+        from scipy.spatial.distance import cdist
+        if not indices_a or not indices_b:
+            return float("inf"), float("inf")
+        # shape (len_b, len_a)
+        d = cdist(descriptors[indices_b], descriptors[indices_a])
+        nn_dists = d.min(axis=1)  # nearest training neighbour per test point
+        return float(nn_dists.min()), float(nn_dists.mean())
+
+    @staticmethod
     def _plot_descriptor_space(
         descriptors: np.ndarray,
-        selected_indices: list[int],
-        mean_descriptor: bool,
+        train_indices: list[int],
+        test_indices: list[int],
         output_path: Path,
     ) -> None:
-        """PCA 2D scatter plot of all vs selected structures in descriptor space."""
+        """PCA 2D scatter plot: training (red), test (blue), unselected (gray)."""
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
@@ -277,25 +359,32 @@ class SelectStage(Stage):
         pca = PCA(n_components=2)
         coords_2d = pca.fit_transform(descriptors)
 
-        mask = np.zeros(len(descriptors), dtype=bool)
-        mask[selected_indices] = True
+        train_mask = np.zeros(len(descriptors), dtype=bool)
+        train_mask[train_indices] = True
+        test_mask = np.zeros(len(descriptors), dtype=bool)
+        test_mask[test_indices] = True
+        unselected = ~(train_mask | test_mask)
 
         fig, ax = plt.subplots(figsize=(10, 8))
         ax.scatter(
-            coords_2d[~mask, 0], coords_2d[~mask, 1],
-            s=6, alpha=0.3, c="gray", label="Unselected",
+            coords_2d[unselected, 0], coords_2d[unselected, 1],
+            s=4, alpha=0.2, c="gray", label=f"Unselected ({unselected.sum()})",
         )
         ax.scatter(
-            coords_2d[mask, 0], coords_2d[mask, 1],
-            s=12, alpha=0.7, c="tab:red", label=f"Selected ({mask.sum()})",
+            coords_2d[train_mask, 0], coords_2d[train_mask, 1],
+            s=10, alpha=0.7, c="tab:red", label=f"Train ({train_mask.sum()})",
+        )
+        ax.scatter(
+            coords_2d[test_mask, 0], coords_2d[test_mask, 1],
+            s=10, alpha=0.7, c="tab:blue", label=f"Test ({test_mask.sum()})",
         )
         var = pca.explained_variance_ratio_
         ax.set_xlabel(f"PC1 ({var[0]*100:.1f}%)")
         ax.set_ylabel(f"PC2 ({var[1]*100:.1f}%)")
-        ax.set_title("NEP Descriptor Space — FPS Selection")
+        ax.set_title("NEP Descriptor Space — Train/Test Selection")
         ax.legend()
         fig.tight_layout()
-        fig.savefig(output_path, dpi=150)
+        fig.savefig(str(output_path), dpi=150)
         plt.close(fig)
         logger.info(f"  Saved plot to {output_path}")
 

@@ -1,0 +1,39 @@
+SYSTEM = Elastic constant calculation (stage 1 - pre-processing)
+
+PREC = Accurate # Precision
+NCORE = 8
+KPAR = 4
+
+LORBIT = 11 # Determines whether PROCAR or PROOUT files are written
+LREAL = .FALSE. # Whether projection operators are evaluated in real or k-space (default = FALSE)
+LASPH = .TRUE. # Include non-spherical contributions related to the gradient of the density in PAW spheres
+LAECHG = .FALSE.
+
+KSPACING = 0.22 # Automatic k-point spacing (no KPOINTS file needed)
+KGAMMA = .TRUE. # Include Gamma point in the mesh
+
+ISPIN = 2
+ISMEAR = 0 # Determines how partical occupancies f_{nk} are set for each orbital. 0 = gaussian,-1 = fermi, etc.
+SIGMA = 0.05
+LSORBIT = .FALSE. # Spin-orbit coupling
+
+ALGO = Normal # Electronic minimisation algorithm
+ENCUT = 520 # Cutoff energy, need to perform convergence on this.
+ENAUG = 1360
+NELM = 200 # Maximum number of selfconsistency (SC) steps which may be performed
+EDIFF = 1E-05 # Global break conditions for electrons in the SC-loop
+
+LMAXMIX = 6 # Controls up to which l-quantum number the one-center PAW charge densities are passed through the charge density mixer
+LMIXTAU = .TRUE.
+GGA = PE # Type of generalized-gradient-approximation XC functional, e.g. PS = revised Perdew-Berke-Ernzerhof
+
+LDAU = .FALSE.
+LDAUTYPE = 2
+
+IBRION = -1 # Determines how ions are updated + moved.
+NSW = 0 # Maximum number of ionic steps
+EDIFFG = -1E-02 # Ionic convergence
+ISIF = 2 # Number of degrees of freedom
+
+LWAVE = F
+LCHARGE = F 

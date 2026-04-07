@@ -54,8 +54,9 @@ def create_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python main.py --project myproject
-  python main.py --project myproject --debug
+  python nepflow.py --project myproject
+  python nepflow.py --project myproject --local
+  python nepflow.py --project myproject --debug
         """
     )
     
@@ -70,6 +71,20 @@ Examples:
         "--init",
         action="store_true",
         help="Initialize a new project (required on first run)"
+    )
+    parser.add_argument(
+        "--stage",
+        type=str,
+        choices=["init", "generate", "select", "run_vasp", "train_nep", "validate"],
+        default=None,
+        help="Set the workflow stage (overrides .project file)"
+    )
+    parser.add_argument(
+        "--local",
+        action="store_true",
+        help="Fetch base structures locally (seeds only, no perturbations), "
+             "then stop. Use on a machine with web access before transferring "
+             "to HPC."
     )
     parser.add_argument(
         "--debug",
@@ -111,7 +126,9 @@ def main():
         project_name=args.project,
         output_dir=args.output_dir,
         init_mode=args.init,
-        debug=args.debug
+        debug=args.debug,
+        stage_override=args.stage,
+        local_mode=args.local,
     )
     
     # Run workflow: controller determines current stage from .project file

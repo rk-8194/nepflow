@@ -1,5 +1,6 @@
 """Workflow stage modules."""
 
+from .base import SelfResubmitExit
 from .init.init import InitStage
 from .generate.generate import GenerateStage
 from .select.select import SelectStage
@@ -8,6 +9,7 @@ from .train_nep.train_nep import TrainNepStage
 from .validate.validate import ValidateStage
 
 __all__ = [
+    "SelfResubmitExit",
     "InitStage",
     "GenerateStage",
     "SelectStage",

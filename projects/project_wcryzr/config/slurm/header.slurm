@@ -8,7 +8,6 @@
 #SBATCH --account=FUPB2_MALPSAMS
 #SBATCH --partition=boost_fua_prod
 
-
 module purge
 module load profile/chem-phys
 module load nvhpc/
@@ -16,5 +15,3 @@ module load cuda/
 module load openmpi/
 
 source $HOME/ase/bin/activate
-
-python3 nepflow.py --project test
