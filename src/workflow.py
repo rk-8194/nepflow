@@ -236,15 +236,19 @@ class WorkflowController:
         elif stage == "generate":
             logger.debug("Running structure generation")
             self._generate()
+            self._set_current_stage("select")
         elif stage == "select":
             logger.debug("Running selection algorithm")
             self._select()
+            self._set_current_stage("run_vasp")
         elif stage == "run_vasp":
             logger.debug("Running VASP calculations")
             self._run_vasp()
+            self._set_current_stage("train_nep")
         elif stage == "train_nep":
             logger.debug("Training NEP models")
             self._train_nep()
+            self._set_current_stage("validate")
         elif stage == "validate":
             logger.debug("Running GPUMD validation")
             self._validate()

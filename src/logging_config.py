@@ -73,6 +73,13 @@ def setup_logging(
     # Ensure propagation is enabled for child loggers
     root_logger.propagate = True
     
+    # Silence NepTrainKit's internal loguru debug output
+    try:
+        from loguru import logger as loguru_logger
+        loguru_logger.disable("NepTrainKit")
+    except ImportError:
+        pass
+    
     return root_logger
 
 

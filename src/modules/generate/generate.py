@@ -1,165 +1,229 @@
-"""Structure generation stage."""
+"""
+Structure generation stage — unified orchestration.
+
+Pipeline:
+  1. Parse config → build composition grid
+  2. For each composition → run configurational generators → base structures
+  3. For each base structure → PerturbationEngine.process() → perturbed variants
+  4. Save all structures + summary
+"""
 
 import logging
 from configparser import ConfigParser
 from pathlib import Path
-from typing import Dict, List
+from typing import List
+
+from ase import Atoms
+from ase.io import write
 
 from ..base import Stage
+from .composition import CompositionGrid
+from .configurational import (
+    MaterialsProjectGenerator,
+    RandomSolidSolutionGenerator,
+    SegregatedGenerator,
+    SQSGenerator,
+)
 from .materials_project import get_materials_project_fetcher
+from .structure_generation import PerturbationEngine
 
 logger = logging.getLogger("nepflow.generate")
 
 
 class GenerateStage(Stage):
-    """Generate base structures and variants."""
-    
+    """Generate structures spanning the full phase space."""
+
     def run(self) -> None:
-        """Execute structure generation."""
         logger.info("Running structure generation")
-        
-        try:
-            # Find and parse configuration
-            config_path = self._find_config_file()
-            config = ConfigParser()
-            config.read(config_path)
-            logger.debug(f"Loaded config from {config_path}")
-            
-            # Verify required sections exist
-            if not config.has_section("generation"):
-                logger.error("Missing [generation] section in config")
-                raise ValueError("Config missing [generation] section")
-            
-            elements = self._parse_config_list(config, "generation", "elements")
-            structures = self._parse_config_list(config, "generation", "crystal_structures")
-            
-            logger.info(f"Target elements: {elements}")
-            logger.info(f"Target structures: {structures}")
-            
-            # Fetch lattice parameters from Materials Project
-            self._fetch_and_report_lattice_parameters(config, elements, structures)
-            
-            logger.info("Structure generation complete")
-            
-        except Exception as e:
-            logger.error(f"Error during structure generation: {e}")
-            raise
-    
+
+        config_path = self._find_config_file()
+        config = ConfigParser()
+        config.read(config_path)
+        logger.debug(f"Loaded config from {config_path}")
+
+        for section in ("composition", "generation"):
+            if not config.has_section(section):
+                raise ValueError(f"Config missing [{section}] section")
+
+        # --- global settings ---
+        random_seed = config.getint("project", "random_seed", fallback=42)
+        elements = self._parse_list(config, "composition", "elements")
+        crystal_structures = self._parse_list(config, "generation", "crystal_structures")
+        target_n_atoms = config.getint("generation", "target_n_atoms", fallback=250)
+
+        logger.info(f"Elements: {elements}")
+        logger.info(f"Crystal structures: {crystal_structures}")
+
+        # ----------------------------------------------------------
+        # Step 1: composition grid
+        # ----------------------------------------------------------
+        logger.info("")
+        logger.info("Step 1: Building composition grid")
+        grid = CompositionGrid(
+            elements=elements,
+            step=config.getfloat("composition", "composition_step", fallback=0.1),
+            include_pure=config.getboolean("composition", "include_pure_elements", fallback=True),
+            include_binaries=config.getboolean("composition", "include_binaries", fallback=True),
+            include_ternaries=config.getboolean("composition", "include_ternaries", fallback=True),
+        )
+        compositions = grid.generate()
+        logger.info(f"  {len(compositions)} compositions")
+
+        # ----------------------------------------------------------
+        # Step 2: configurational generators
+        # ----------------------------------------------------------
+        logger.info("")
+        logger.info("Step 2: Generating base structures (configurational generators)")
+        generators = self._build_generators(config, elements, random_seed)
+        if not generators:
+            logger.warning("No configurational generators enabled")
+            return
+
+        all_bases: List[Atoms] = []
+        for comp in compositions:
+            label = CompositionGrid.format_composition(comp)
+            for gen_name, gen in generators:
+                bases = gen.generate(comp, crystal_structures, target_n_atoms)
+                for b in bases:
+                    b.info.setdefault("composition", comp)
+                    b.info.setdefault("elements", elements)
+                all_bases.extend(bases)
+                if bases:
+                    logger.debug(f"  {label} / {gen_name}: {len(bases)} structures")
+
+        logger.info(f"  Total base structures: {len(all_bases)}")
+
+        if not all_bases:
+            logger.warning("No base structures generated — aborting")
+            return
+
+        # Save seeds
+        seeds_dir = self.project_dir / "structures" / "seeds"
+        seeds_dir.mkdir(parents=True, exist_ok=True)
+        write(str(seeds_dir / "base_structures.xyz"), all_bases)
+        logger.info(f"  Saved seeds to {seeds_dir / 'base_structures.xyz'}")
+
+        # ----------------------------------------------------------
+        # Step 3: perturbations
+        # ----------------------------------------------------------
+        logger.info("")
+        logger.info("Step 3: Applying perturbations")
+        engine = self._build_engine(config, target_n_atoms, random_seed)
+
+        generated_dir = self.project_dir / "structures" / "generated"
+        engine.process(
+            all_bases,
+            output_dir=generated_dir,
+            n_rattled=config.getint("generation", "n_rattled", fallback=10),
+            n_strained=config.getint("generation", "n_strained", fallback=10),
+            n_deformed=config.getint("generation", "n_deformed", fallback=10),
+            n_vacancies=config.getint("generation", "n_vacancies", fallback=10),
+            n_interstitials=config.getint("generation", "n_interstitials", fallback=10),
+            n_workers=config.getint("generation", "n_workers", fallback=0),
+        )
+
+        # ----------------------------------------------------------
+        # Step 4: report
+        # ----------------------------------------------------------
+        summary = engine.get_summary()
+        logger.info("")
+        logger.info(f"Total structures: {summary['total']}")
+        logger.info("By perturbation type:")
+        for ptype, count in sorted(summary["by_type"].items()):
+            logger.info(f"  {ptype:20s}: {count:5d}")
+        logger.info("By configurational type:")
+        for ctype, count in sorted(summary["by_config"].items()):
+            logger.info(f"  {ctype:25s}: {count:5d}")
+
+        logger.info("")
+        logger.info("Structure generation complete")
+
+    # ==================================================================
+    # helpers
+    # ==================================================================
+
     def _find_config_file(self) -> Path:
-        """
-        Find the project config file.
-        
-        Tries to locate project.config (INI format) in the project directory.
-        Falls back to the configured config_file path if it exists.
-        
-        Returns:
-            Path to the config file
-            
-        Raises:
-            FileNotFoundError: If no config file is found
-        """
-        # Try project.config in the project directory config folder
         project_config = self.project_dir / "config" / "project.config"
         if project_config.exists():
-            logger.debug(f"Found project config at {project_config}")
             return project_config
-        
-        # Fall back to configured config_file
         if self.config_file.exists():
-            logger.debug(f"Found config at {self.config_file}")
             return self.config_file
-        
         raise FileNotFoundError(
             f"Config file not found. Tried:\n"
             f"  - {project_config}\n"
             f"  - {self.config_file}"
         )
-    
+
     @staticmethod
-    def _parse_config_list(config: ConfigParser, section: str, option: str) -> List[str]:
-        """Parse comma-separated list from config."""
+    def _parse_list(config: ConfigParser, section: str, option: str) -> List[str]:
         value = config.get(section, option)
         return [item.strip() for item in value.split(",") if item.strip()]
-    
-    def _fetch_and_report_lattice_parameters(
-        self, config: ConfigParser, elements: List[str], structures: List[str]
-    ) -> None:
-        """Fetch and report lattice parameters for selected systems."""
-        logger.info("")
-        logger.info("Fetching lattice parameters from Materials Project")
-        
-        try:
-            fetcher = get_materials_project_fetcher(dict(config))
-            
-            # Clear cache for fresh data on each run
-            fetcher.clear_cache()
-            
-            results = fetcher.fetch_structures(elements, structures, use_cache=True)
-            
-            if not results:
-                logger.warning("No structures found matching the criteria")
-                return
-            
-            # Filter results to only include requested structures
-            filtered_results = [r for r in results if r.get("structure") in structures]
-            
-            if not filtered_results:
-                logger.warning(f"No structures found for requested types: {structures}")
-                return
-            
-            logger.info(f"✓ Found {len(filtered_results)} structure(s)")
-            
-            # Group by element and structure for reporting
-            for element in sorted(set(r["elements"][0] for r in filtered_results)):
-                element_results = [r for r in filtered_results if r["elements"][0] == element]
-                
-                for struct_type in sorted(set(r["structure"] for r in element_results)):
-                    type_results = [r for r in element_results if r["structure"] == struct_type]
-                    if type_results:
-                        result = type_results[0]  # Take the most stable (first in MP results)
-                        self._log_structure_summary(element, struct_type, result)
-            
-            logger.info("")
-            
-        except ImportError as e:
-            logger.error(f"Materials Project API not available: {e}")
-            logger.info("Install with: pip install mp-api")
-            raise
-        except ValueError as e:
-            logger.error(f"Configuration error: {e}")
-            logger.info("Please set api_key in [materialsproject] section of project config or set MP_API_KEY environment variable")
-            raise
-    
+
+    def _build_generators(
+        self, config: ConfigParser, elements: List[str], random_seed: int  # noqa: ARG002
+    ) -> List[tuple]:
+        """Instantiate enabled configurational generators."""
+        generators: List[tuple] = []
+
+        if config.getboolean("generation", "use_materials_project", fallback=True):
+            try:
+                fetcher = get_materials_project_fetcher(dict(config))
+                generators.append((
+                    "MaterialsProject",
+                    MaterialsProjectGenerator(fetcher, max_per_composition=5),
+                ))
+            except Exception as e:
+                logger.warning(f"Cannot initialise MP fetcher: {e}")
+
+        n_rss = config.getint("generation", "n_random_solid_solution", fallback=3)
+        if config.getboolean("generation", "use_random_solid_solution", fallback=True):
+            generators.append((
+                "RandomSolidSolution",
+                RandomSolidSolutionGenerator(n_structures=n_rss, random_seed=random_seed),
+            ))
+
+        n_sqs = config.getint("generation", "n_sqs", fallback=3)
+        if config.getboolean("generation", "use_sqs", fallback=True):
+            generators.append((
+                "SQS",
+                SQSGenerator(n_structures=n_sqs, random_seed=random_seed),
+            ))
+
+        n_seg = config.getint("generation", "n_segregated", fallback=3)
+        if config.getboolean("generation", "use_segregated", fallback=True):
+            generators.append((
+                "Segregated",
+                SegregatedGenerator(n_structures=n_seg, random_seed=random_seed),
+            ))
+
+        logger.info(f"  Active generators: {[name for name, _ in generators]}")
+        return generators
+
     @staticmethod
-    def _group_by_structure_type(results: List[Dict]) -> Dict[str, List[Dict]]:
-        """Group results by crystal structure type."""
-        grouped = {}
-        for result in results:
-            crystal_system = result["symmetry"]["crystal_system"]
-            if crystal_system not in grouped:
-                grouped[crystal_system] = []
-            grouped[crystal_system].append(result)
-        return grouped
-    
-    @staticmethod
-    def _log_structure_summary(element: str, struct_type: str, structure: Dict) -> None:
-        """Log a one-line summary of structure."""
-        lattice = structure["lattice"]
-        logger.info(
-            f"  {element:3s}-{struct_type:12s}  a={lattice['a']:.6f}Å  V={lattice['volume']:8.4f}ų  {structure['material_id']}"
+    def _build_engine(
+        config: ConfigParser, target_n_atoms: int, random_seed: int
+    ) -> PerturbationEngine:
+        return PerturbationEngine(
+            rattle_std=config.getfloat("generation", "rattle_std", fallback=0.03),
+            rattle_d_min=config.getfloat("generation", "rattle_d_min", fallback=1.5),
+            strain_limit=(
+                config.getfloat("generation", "strain_min", fallback=-0.02),
+                config.getfloat("generation", "strain_max", fallback=0.02),
+            ),
+            vacancy_range=(
+                config.getfloat("generation", "vacancy_min", fallback=0.0),
+                config.getfloat("generation", "vacancy_max", fallback=0.1),
+            ),
+            interstitial_range=(
+                config.getfloat("generation", "interstitial_min", fallback=0.05),
+                config.getfloat("generation", "interstitial_max", fallback=0.1),
+            ),
+            interstitial_d_min=config.getfloat("generation", "interstitial_d_min", fallback=1.65),
+            volume_scale_range=(
+                config.getfloat("generation", "volume_scale_min", fallback=0.8),
+                config.getfloat("generation", "volume_scale_max", fallback=1.2),
+            ),
+            n_volume_points=config.getint("generation", "n_volume_points", fallback=11),
+            target_n_atoms=target_n_atoms,
+            random_seed=random_seed,
         )
-    
-    @staticmethod
-    def _log_structure_info(structure: Dict) -> None:
-        """Log detailed information about a structure (for log file)."""
-        logger.debug(f"Material ID: {structure['material_id']}")
-        logger.debug(f"Formula: {structure['formula']}")
-        
-        lattice = structure["lattice"]
-        logger.debug(f"Lattice Parameters (Å):")
-        logger.debug(f"  a={lattice['a']:.6f}  b={lattice['b']:.6f}  c={lattice['c']:.6f}")
-        logger.debug(f"  α={lattice['alpha']:.2f}°  β={lattice['beta']:.2f}°  γ={lattice['gamma']:.2f}°")
-        logger.debug(f"  Volume={lattice['volume']:.4f} ų")
-        
-        symmetry = structure["symmetry"]
-        logger.debug(f"Symmetry: {symmetry['crystal_system']} (Space group #{symmetry['space_group']})")

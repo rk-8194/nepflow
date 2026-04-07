@@ -1,8 +1,9 @@
 """
 Materials Project API integration for structure generation.
 
-Handles fetching lattice parameters from Materials Project with local caching
-to avoid repeated API calls.
+Handles fetching lattice parameters and full structures from Materials Project
+with local caching to avoid repeated API calls.  Supports both pure-element
+queries (original behaviour) and multi-element compound queries.
 """
 
 import json
@@ -12,6 +13,9 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 import hashlib
 
+import numpy as np
+from ase import Atoms
+from pymatgen.io.ase import AseAtomsAdaptor
 from pymatgen.symmetry.analyzer import SpacegroupAnalyzer
 
 logger = logging.getLogger("nepflow.materials_project")
@@ -278,6 +282,196 @@ class MaterialsProjectFetcher:
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         logger.info(f"Cleared cache at {self.cache_dir}")
 
+    # ------------------------------------------------------------------
+    # Multi-element / compound queries
+    # ------------------------------------------------------------------
+
+    def fetch_compounds(
+        self,
+        elements: List[str],
+        max_per_query: int = 50,
+        use_cache: bool = True,
+    ) -> List[Atoms]:
+        """Fetch known compounds from MP for a set of elements.
+
+        Queries for materials whose composition is drawn exclusively from
+        *elements*.  Returns ASE Atoms objects with metadata stored in
+        ``atoms.info``.
+
+        Args:
+            elements: Element symbols (e.g. ``["W", "Cr", "C"]``).
+            max_per_query: Cap the number of results returned per query.
+            use_cache: Use local JSON cache when available.
+
+        Returns:
+            List of ASE Atoms with ``info`` keys:
+            ``material_id``, ``formula``, ``elements``, ``structure_name``,
+            ``space_group``, ``source``.
+        """
+        key = f"compounds__{'_'.join(sorted(elements))}"
+        query_hash = hashlib.md5(key.encode()).hexdigest()
+        cache_path = self._get_cache_path(query_hash)
+
+        if use_cache and cache_path.exists():
+            logger.debug(f"Loading cached compound results for {elements}")
+            return self._load_atoms_cache(cache_path)
+
+        logger.info(f"Querying Materials Project for compounds of {elements}")
+        try:
+            docs = self.mpr.materials.summary.search(
+                elements=elements,
+                num_elements=(1, len(elements)),
+                fields=[
+                    "material_id",
+                    "formula_pretty",
+                    "composition",
+                    "structure",
+                    "symmetry",
+                    "energy_above_hull",
+                ],
+            )
+        except Exception as e:
+            logger.error(f"MP query failed for {elements}: {e}")
+            return []
+
+        if not docs:
+            logger.debug(f"No compounds found for {elements}")
+            return []
+
+        # Keep only phases whose elements are a subset of the requested set
+        element_set = set(elements)
+        docs = [
+            d for d in docs
+            if set(d.composition.as_dict().keys()).issubset(element_set)
+        ]
+
+        # Sort by energy above hull (most stable first) and cap
+        docs.sort(key=lambda d: getattr(d, "energy_above_hull", 0) or 0)
+        docs = docs[:max_per_query]
+
+        atoms_list = self._docs_to_ase(docs)
+        self._save_atoms_cache(cache_path, atoms_list)
+        logger.info(f"✓ Found {len(atoms_list)} compound(s) for {elements}")
+        return atoms_list
+
+    def fetch_pure_element_structures(
+        self,
+        elements: List[str],
+        crystal_structures: List[str],
+        use_cache: bool = True,
+    ) -> List[Atoms]:
+        """Fetch pure-element structures filtered by crystal type, returned as ASE Atoms.
+
+        Wraps the existing ``fetch_structures`` and converts results to ASE
+        using ``ase.build.bulk`` with correct lattice parameters.
+        """
+        from ase.build import bulk
+
+        results = self.fetch_structures(elements, crystal_structures, use_cache=use_cache)
+        atoms_list: List[Atoms] = []
+
+        for r in results:
+            element = r["elements"][0]
+            struct_type = r["structure"]
+            a = r["lattice"]["a"]
+
+            try:
+                if struct_type == "hcp":
+                    atoms = bulk(element, "hcp", a=a, c=a * 1.633)
+                else:
+                    atoms = bulk(element, struct_type, a=a)
+            except Exception as e:
+                logger.warning(f"Could not build {element}-{struct_type}: {e}")
+                continue
+
+            atoms.info.update({
+                "material_id": r["material_id"],
+                "formula": r["formula"],
+                "elements": r["elements"],
+                "structure_name": struct_type,
+                "space_group": r["symmetry"]["space_group"],
+                "source": f"{element}-{struct_type}",
+                "configurational_type": "mp_phase",
+            })
+            atoms_list.append(atoms)
+
+        return atoms_list
+
+    # ------------------------------------------------------------------
+    # pymatgen → ASE conversion helpers
+    # ------------------------------------------------------------------
+
+    def _docs_to_ase(self, docs) -> List[Atoms]:
+        """Convert MP summary docs to ASE Atoms."""
+        adaptor = AseAtomsAdaptor()
+        atoms_list: List[Atoms] = []
+
+        for doc in docs:
+            try:
+                structure = doc.structure
+                sga = SpacegroupAnalyzer(structure)
+                conv = sga.get_conventional_standard_structure()
+            except Exception:
+                conv = doc.structure
+
+            try:
+                atoms = adaptor.get_atoms(conv)
+            except Exception as e:
+                logger.warning(f"pymatgen→ASE conversion failed for {doc.material_id}: {e}")
+                continue
+
+            sg = doc.symmetry.number if doc.symmetry else 0
+            struct_name = self.SPACE_GROUP_TO_STRUCTURE.get(sg, "unknown")
+            atoms.info.update({
+                "material_id": str(doc.material_id),
+                "formula": doc.formula_pretty,
+                "elements": sorted(doc.composition.as_dict().keys()),
+                "structure_name": struct_name,
+                "space_group": sg,
+                "source": f"mp-{doc.formula_pretty}",
+                "configurational_type": "mp_phase",
+                "energy_above_hull": getattr(doc, "energy_above_hull", None),
+            })
+            atoms_list.append(atoms)
+
+        return atoms_list
+
+    # ------------------------------------------------------------------
+    # Atoms list ↔ JSON cache
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _save_atoms_cache(path: Path, atoms_list: List[Atoms]) -> None:
+        """Serialise a list of Atoms to a JSON cache file."""
+        records = []
+        for atoms in atoms_list:
+            records.append({
+                "numbers": atoms.numbers.tolist(),
+                "positions": atoms.positions.tolist(),
+                "cell": atoms.cell.tolist(),
+                "pbc": atoms.pbc.tolist(),
+                "info": {k: _json_safe(v) for k, v in atoms.info.items()},
+            })
+        with open(path, "w") as f:
+            json.dump(records, f)
+
+    @staticmethod
+    def _load_atoms_cache(path: Path) -> List[Atoms]:
+        """Load a list of Atoms from a JSON cache file."""
+        with open(path) as f:
+            records = json.load(f)
+        atoms_list: List[Atoms] = []
+        for rec in records:
+            atoms = Atoms(
+                numbers=rec["numbers"],
+                positions=rec["positions"],
+                cell=rec["cell"],
+                pbc=rec["pbc"],
+            )
+            atoms.info.update(rec.get("info", {}))
+            atoms_list.append(atoms)
+        return atoms_list
+
 
 def get_materials_project_fetcher(config_dict: Dict) -> MaterialsProjectFetcher:
     """
@@ -293,3 +487,14 @@ def get_materials_project_fetcher(config_dict: Dict) -> MaterialsProjectFetcher:
     api_key = mp_config.get("api_key")
 
     return MaterialsProjectFetcher(api_key=api_key)
+
+
+def _json_safe(value):
+    """Make a value JSON-serialisable."""
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, (np.integer,)):
+        return int(value)
+    if isinstance(value, (np.floating,)):
+        return float(value)
+    return value

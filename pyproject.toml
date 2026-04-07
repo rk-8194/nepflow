@@ -7,6 +7,17 @@ name = "nepflow"
 version = "0.1.0"
 description = "HPC workflow system for atomistic datasets"
 requires-python = ">=3.11"
+dependencies = [
+    "numpy",
+    "ase",
+    "hiphive",
+    "mp-api",
+    "pymatgen",
+    "icet",
+    "NepTrainKit",
+    "scikit-learn",
+    "matplotlib",
+]
 
 [tool.pylint.init-hook]
 init-hook = "import sys; sys.path.insert(0, 'src')"

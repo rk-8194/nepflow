@@ -1,0 +1,92 @@
+2026-04-07 18:21:54.050 | DEBUG    | NepTrainKit.core.calculator:<module>:39 - no found NepTrainKit.nep_gpu
+2026-04-07 18:21:54.050 | DEBUG    | NepTrainKit.core.calculator:<module>:43 - no found nep_gpu
+2026-04-07 18:21:54 - nepflow - INFO - NEPFlow started for project: test
+2026-04-07 18:21:54 - nepflow.select - INFO - Running structure selection
+2026-04-07 18:21:54 - nepflow.select - INFO - 
+2026-04-07 18:21:54 - nepflow.select - INFO - Step 1: Loading generated structures
+2026-04-07 18:22:35 - nepflow.select - INFO -   Loaded 28892 candidate structures (40.9s)
+2026-04-07 18:22:35 - nepflow.select - INFO - 
+2026-04-07 18:22:35 - nepflow.select - INFO - Step 2: Computing NEP descriptors
+2026-04-07 18:22:35 - nepflow.select - INFO -   Loaded NEP model: nep89.txt
+2026-04-07 18:22:38 - nepflow.select - INFO -   Batch 500/28892 (2%) — 2.9s elapsed, ~163s remaining
+2026-04-07 18:22:41 - nepflow.select - INFO -   Batch 1000/28892 (3%) — 6.1s elapsed, ~170s remaining
+2026-04-07 18:22:44 - nepflow.select - INFO -   Batch 1500/28892 (5%) — 8.8s elapsed, ~161s remaining
+2026-04-07 18:22:46 - nepflow.select - INFO -   Batch 2000/28892 (7%) — 11.5s elapsed, ~155s remaining
+2026-04-07 18:22:49 - nepflow.select - INFO -   Batch 2500/28892 (9%) — 13.8s elapsed, ~145s remaining
+2026-04-07 18:22:51 - nepflow.select - INFO -   Batch 3000/28892 (10%) — 16.5s elapsed, ~142s remaining
+2026-04-07 18:22:54 - nepflow.select - INFO -   Batch 3500/28892 (12%) — 19.2s elapsed, ~139s remaining
+2026-04-07 18:22:56 - nepflow.select - INFO -   Batch 4000/28892 (14%) — 21.5s elapsed, ~134s remaining
+2026-04-07 18:22:59 - nepflow.select - INFO -   Batch 4500/28892 (16%) — 24.3s elapsed, ~132s remaining
+2026-04-07 18:23:02 - nepflow.select - INFO -   Batch 5000/28892 (17%) — 26.8s elapsed, ~128s remaining
+2026-04-07 18:23:04 - nepflow.select - INFO -   Batch 5500/28892 (19%) — 29.0s elapsed, ~124s remaining
+2026-04-07 18:23:07 - nepflow.select - INFO -   Batch 6000/28892 (21%) — 31.9s elapsed, ~122s remaining
+2026-04-07 18:23:09 - nepflow.select - INFO -   Batch 6500/28892 (22%) — 34.4s elapsed, ~118s remaining
+2026-04-07 18:23:12 - nepflow.select - INFO -   Batch 7000/28892 (24%) — 37.1s elapsed, ~116s remaining
+2026-04-07 18:23:14 - nepflow.select - INFO -   Batch 7500/28892 (26%) — 39.4s elapsed, ~112s remaining
+2026-04-07 18:23:17 - nepflow.select - INFO -   Batch 8000/28892 (28%) — 41.8s elapsed, ~109s remaining
+2026-04-07 18:23:19 - nepflow.select - INFO -   Batch 8500/28892 (29%) — 44.4s elapsed, ~107s remaining
+2026-04-07 18:23:22 - nepflow.select - INFO -   Batch 9000/28892 (31%) — 46.6s elapsed, ~103s remaining
+2026-04-07 18:23:24 - nepflow.select - INFO -   Batch 9500/28892 (33%) — 49.2s elapsed, ~100s remaining
+2026-04-07 18:23:27 - nepflow.select - INFO -   Batch 10000/28892 (35%) — 51.9s elapsed, ~98s remaining
+2026-04-07 18:23:29 - nepflow.select - INFO -   Batch 10500/28892 (36%) — 54.3s elapsed, ~95s remaining
+2026-04-07 18:23:32 - nepflow.select - INFO -   Batch 11000/28892 (38%) — 56.9s elapsed, ~93s remaining
+2026-04-07 18:23:34 - nepflow.select - INFO -   Batch 11500/28892 (40%) — 59.3s elapsed, ~90s remaining
+2026-04-07 18:23:37 - nepflow.select - INFO -   Batch 12000/28892 (42%) — 61.7s elapsed, ~87s remaining
+2026-04-07 18:23:39 - nepflow.select - INFO -   Batch 12500/28892 (43%) — 64.1s elapsed, ~84s remaining
+2026-04-07 18:23:41 - nepflow.select - INFO -   Batch 13000/28892 (45%) — 66.5s elapsed, ~81s remaining
+2026-04-07 18:23:44 - nepflow.select - INFO -   Batch 13500/28892 (47%) — 68.9s elapsed, ~79s remaining
+2026-04-07 18:23:46 - nepflow.select - INFO -   Batch 14000/28892 (48%) — 71.3s elapsed, ~76s remaining
+2026-04-07 18:23:48 - nepflow.select - INFO -   Batch 14500/28892 (50%) — 73.5s elapsed, ~73s remaining
+2026-04-07 18:23:51 - nepflow.select - INFO -   Batch 15000/28892 (52%) — 75.7s elapsed, ~70s remaining
+2026-04-07 18:23:53 - nepflow.select - INFO -   Batch 15500/28892 (54%) — 78.0s elapsed, ~67s remaining
+2026-04-07 18:23:55 - nepflow.select - INFO -   Batch 16000/28892 (55%) — 80.2s elapsed, ~65s remaining
+2026-04-07 18:23:57 - nepflow.select - INFO -   Batch 16500/28892 (57%) — 82.4s elapsed, ~62s remaining
+2026-04-07 18:24:00 - nepflow.select - INFO -   Batch 17000/28892 (59%) — 84.6s elapsed, ~59s remaining
+2026-04-07 18:24:02 - nepflow.select - INFO -   Batch 17500/28892 (61%) — 86.9s elapsed, ~57s remaining
+2026-04-07 18:24:04 - nepflow.select - INFO -   Batch 18000/28892 (62%) — 89.1s elapsed, ~54s remaining
+2026-04-07 18:24:06 - nepflow.select - INFO -   Batch 18500/28892 (64%) — 91.3s elapsed, ~51s remaining
+2026-04-07 18:24:08 - nepflow.select - INFO -   Batch 19000/28892 (66%) — 93.5s elapsed, ~49s remaining
+2026-04-07 18:24:11 - nepflow.select - INFO -   Batch 19500/28892 (67%) — 95.8s elapsed, ~46s remaining
+2026-04-07 18:24:13 - nepflow.select - INFO -   Batch 20000/28892 (69%) — 98.0s elapsed, ~44s remaining
+2026-04-07 18:24:15 - nepflow.select - INFO -   Batch 20500/28892 (71%) — 100.2s elapsed, ~41s remaining
+2026-04-07 18:24:17 - nepflow.select - INFO -   Batch 21000/28892 (73%) — 102.5s elapsed, ~39s remaining
+2026-04-07 18:24:20 - nepflow.select - INFO -   Batch 21500/28892 (74%) — 104.6s elapsed, ~36s remaining
+2026-04-07 18:24:22 - nepflow.select - INFO -   Batch 22000/28892 (76%) — 106.8s elapsed, ~33s remaining
+2026-04-07 18:24:24 - nepflow.select - INFO -   Batch 22500/28892 (78%) — 109.1s elapsed, ~31s remaining
+2026-04-07 18:24:26 - nepflow.select - INFO -   Batch 23000/28892 (80%) — 111.4s elapsed, ~29s remaining
+2026-04-07 18:24:28 - nepflow.select - INFO -   Batch 23500/28892 (81%) — 113.6s elapsed, ~26s remaining
+2026-04-07 18:24:31 - nepflow.select - INFO -   Batch 24000/28892 (83%) — 115.8s elapsed, ~24s remaining
+2026-04-07 18:24:33 - nepflow.select - INFO -   Batch 24500/28892 (85%) — 118.0s elapsed, ~21s remaining
+2026-04-07 18:24:35 - nepflow.select - INFO -   Batch 25000/28892 (87%) — 120.3s elapsed, ~19s remaining
+2026-04-07 18:24:37 - nepflow.select - INFO -   Batch 25500/28892 (88%) — 122.5s elapsed, ~16s remaining
+2026-04-07 18:24:40 - nepflow.select - INFO -   Batch 26000/28892 (90%) — 124.7s elapsed, ~14s remaining
+2026-04-07 18:24:42 - nepflow.select - INFO -   Batch 26500/28892 (92%) — 127.0s elapsed, ~11s remaining
+2026-04-07 18:24:44 - nepflow.select - INFO -   Batch 27000/28892 (93%) — 129.2s elapsed, ~9s remaining
+2026-04-07 18:24:46 - nepflow.select - INFO -   Batch 27500/28892 (95%) — 131.4s elapsed, ~7s remaining
+2026-04-07 18:24:49 - nepflow.select - INFO -   Batch 28000/28892 (97%) — 133.7s elapsed, ~4s remaining
+2026-04-07 18:24:51 - nepflow.select - INFO -   Batch 28500/28892 (99%) — 135.9s elapsed, ~2s remaining
+2026-04-07 18:24:53 - nepflow.select - INFO -   Batch 28892/28892 (100%) — 137.7s elapsed, ~0s remaining
+2026-04-07 18:24:53 - nepflow.select - INFO -   Descriptor shape: (28892, 35)
+2026-04-07 18:24:53 - nepflow.select - INFO -   Descriptor type: structure
+2026-04-07 18:24:53 - nepflow.select - INFO - 
+2026-04-07 18:24:53 - nepflow.select - INFO - Step 3: Running farthest-point sampling
+2026-04-07 18:24:55 - nepflow.select - INFO -   Probing min_distance=0.010000 → 1931 structures
+2026-04-07 18:24:56 - nepflow.select - INFO -   Probing min_distance=0.020000 → 781 structures
+2026-04-07 18:25:00 - nepflow.select - INFO -   Iteration 1: min_distance=0.010000 → 1931 structures (target=1000±50)
+2026-04-07 18:25:02 - nepflow.select - INFO -   Iteration 2: min_distance=0.015000 → 1154 structures (target=1000±50)
+2026-04-07 18:25:03 - nepflow.select - INFO -   Iteration 3: min_distance=0.017500 → 945 structures (target=1000±50)
+2026-04-07 18:25:06 - nepflow.select - INFO -   Iteration 4: min_distance=0.016250 → 1035 structures (target=1000±50)
+2026-04-07 18:25:08 - nepflow.select - INFO -   Selected 1035 / 28892 structures
+2026-04-07 18:25:08 - nepflow.select - INFO -   Final min_distance: 0.016250
+2026-04-07 18:25:08 - nepflow.select - INFO - 
+2026-04-07 18:25:08 - nepflow.select - INFO - Step 4: Plotting descriptor space
+2026-04-07 18:25:09 - nepflow.select - INFO -   Saved plot to /pitagora/home/userexternal/rkerr000/nepflow/projects/project_test/reports/descriptor_space.png
+2026-04-07 18:25:09 - nepflow.select - INFO - 
+2026-04-07 18:25:09 - nepflow.select - INFO - Step 5: Saving selected structures
+2026-04-07 18:25:09 - nepflow.select - INFO -   Saved to /pitagora/home/userexternal/rkerr000/nepflow/projects/project_test/structures/selected/selected_structures.xyz
+2026-04-07 18:25:09 - nepflow.select - INFO - 
+2026-04-07 18:25:09 - nepflow.select - INFO - Selection complete: 1035 structures selected from 28892 candidates
+2026-04-07 18:25:09 - nepflow.select - INFO -   Reduction: 96.4%
+2026-04-07 18:25:09 - nepflow.select - INFO -   min_distance used: 0.016250
+2026-04-07 18:25:09 - nepflow.select - INFO -   Plot saved to: /pitagora/home/userexternal/rkerr000/nepflow/projects/project_test/reports/descriptor_space.png
+2026-04-07 18:25:10 - nepflow - INFO - Workflow completed successfully

@@ -10,6 +10,32 @@ import argparse
 import logging
 from pathlib import Path
 
+# Check required libraries before doing anything else
+REQUIRED_PACKAGES = {
+    "numpy": "numpy",
+    "ase": "ase",
+    "hiphive": "hiphive",
+    "mp_api": "mp-api",
+    "pymatgen": "pymatgen",
+    "icet": "icet",
+    "NepTrainKit": "NepTrainKit",
+}
+
+_missing = []
+for _mod, _pkg in REQUIRED_PACKAGES.items():
+    try:
+        __import__(_mod)
+    except ImportError:
+        _missing.append(_pkg)
+
+if _missing:
+    print(
+        f"Missing required packages: {', '.join(_missing)}\n"
+        f"Install with:  pip install {' '.join(_missing)}",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
 # Add src to path
 sys.path.insert(0, str(Path(__file__).parent / "src"))
 
