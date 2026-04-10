@@ -1,124 +1,429 @@
-2026-04-07 18:42:06 - nepflow - INFO - NEPFlow started for project: wcryzr
-2026-04-07 18:42:06 - nepflow - INFO - Workflow completed successfully
-2026-04-07 18:50:45 - nepflow - INFO - NEPFlow started for project: wcryzr
-2026-04-07 18:50:45 - nepflow.generate - INFO - Running structure generation
-2026-04-07 18:50:45 - nepflow.generate - INFO - Elements: ['W', 'Cr', 'Y', 'Zr']
-2026-04-07 18:50:45 - nepflow.generate - INFO - Crystal structures: ['bcc', 'fcc', 'hcp', 'diamond', 'simple_cubic']
-2026-04-07 18:50:45 - nepflow.generate - INFO - 
-2026-04-07 18:50:45 - nepflow.generate - INFO - Step 1: Building composition grid
-2026-04-07 18:50:45 - nepflow.composition - INFO - Generated 130 compositions (4 elements, step=0.125)
-2026-04-07 18:50:45 - nepflow.generate - INFO -   130 compositions
-2026-04-07 18:50:45 - nepflow.generate - INFO - 
-2026-04-07 18:50:45 - nepflow.generate - INFO - Step 2: Generating base structures (configurational generators)
-2026-04-07 18:50:45 - nepflow.generate - INFO -   Active generators: ['MaterialsProject', 'RandomSolidSolution', 'SQS', 'Segregated']
-2026-04-07 18:54:43 - nepflow - INFO - NEPFlow started for project: wcryzr
-2026-04-07 18:54:43 - nepflow.generate - INFO - Running structure generation
-2026-04-07 18:54:43 - nepflow.generate - INFO - Elements: ['W', 'Cr', 'Y', 'Zr']
-2026-04-07 18:54:43 - nepflow.generate - INFO - Crystal structures: ['bcc', 'fcc', 'hcp', 'diamond', 'simple_cubic']
-2026-04-07 18:54:43 - nepflow.generate - INFO - 
-2026-04-07 18:54:43 - nepflow.generate - INFO - Step 1: Building composition grid
-2026-04-07 18:54:43 - nepflow.composition - INFO - Generated 130 compositions (4 elements, step=0.125)
-2026-04-07 18:54:43 - nepflow.generate - INFO -   130 compositions
-2026-04-07 18:54:43 - nepflow.generate - INFO - 
-2026-04-07 18:54:43 - nepflow.generate - INFO - Step 2: Generating base structures (configurational generators)
-2026-04-07 18:54:43 - nepflow.generate - INFO -   Active generators: ['MaterialsProject', 'RandomSolidSolution', 'SQS', 'Segregated']
-2026-04-07 18:55:44 - nepflow - INFO - NEPFlow started for project: wcryzr
-2026-04-07 18:55:44 - nepflow.generate - INFO - Running structure generation
-2026-04-07 18:55:44 - nepflow.generate - INFO - Elements: ['W', 'Cr', 'Y', 'Zr']
-2026-04-07 18:55:44 - nepflow.generate - INFO - Crystal structures: ['bcc', 'fcc', 'hcp']
-2026-04-07 18:55:44 - nepflow.generate - INFO - 
-2026-04-07 18:55:44 - nepflow.generate - INFO - Step 1: Building composition grid
-2026-04-07 18:55:44 - nepflow.composition - INFO - Generated 130 compositions (4 elements, step=0.125)
-2026-04-07 18:55:44 - nepflow.generate - INFO -   130 compositions
-2026-04-07 18:55:44 - nepflow.generate - INFO - 
-2026-04-07 18:55:44 - nepflow.generate - INFO - Step 2: Generating base structures (configurational generators)
-2026-04-07 18:55:44 - nepflow.generate - INFO -   Active generators: ['MaterialsProject', 'RandomSolidSolution', 'SQS', 'Segregated']
-2026-04-07 18:56:23 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'Y']
-2026-04-07 18:56:24 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'Y']
-2026-04-07 18:56:24 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'Y']
-2026-04-07 18:56:25 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'Y']
-2026-04-07 18:56:25 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'Y']
-2026-04-07 18:56:25 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'Y']
-2026-04-07 18:56:26 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'Y']
-2026-04-07 18:56:26 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'Zr']
-2026-04-07 18:56:27 - nepflow.materials_project - INFO - ✓ Found 4 compound(s) for ['Cr', 'Zr']
-2026-04-07 18:56:27 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['W', 'Y']
-2026-04-07 18:56:28 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['W', 'Y']
-2026-04-07 18:56:28 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['W', 'Y']
-2026-04-07 18:56:29 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['W', 'Y']
-2026-04-07 18:56:29 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['W', 'Y']
-2026-04-07 18:56:29 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['W', 'Y']
-2026-04-07 18:56:30 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['W', 'Y']
-2026-04-07 18:56:30 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['W', 'Zr']
-2026-04-07 18:56:31 - nepflow.materials_project - INFO - ✓ Found 4 compound(s) for ['W', 'Zr']
-2026-04-07 18:56:31 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Y', 'Zr']
-2026-04-07 18:56:32 - nepflow.materials_project - INFO - ✓ Found 1 compound(s) for ['Y', 'Zr']
-2026-04-07 18:56:32 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'W', 'Y']
-2026-04-07 18:56:33 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'W', 'Y']
-2026-04-07 18:56:33 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'W', 'Y']
-2026-04-07 18:56:34 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'W', 'Y']
-2026-04-07 18:56:34 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'W', 'Y']
-2026-04-07 18:56:35 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'W', 'Y']
-2026-04-07 18:56:35 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'W', 'Y']
-2026-04-07 18:56:35 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'W', 'Y']
-2026-04-07 18:56:36 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'W', 'Y']
-2026-04-07 18:56:36 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'W', 'Y']
-2026-04-07 18:56:37 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'W', 'Y']
-2026-04-07 18:56:37 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'W', 'Y']
-2026-04-07 18:56:38 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'W', 'Y']
-2026-04-07 18:56:38 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'W', 'Y']
-2026-04-07 18:56:39 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'W', 'Y']
-2026-04-07 18:56:39 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'W', 'Y']
-2026-04-07 18:56:40 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'W', 'Y']
-2026-04-07 18:56:40 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'W', 'Y']
-2026-04-07 18:56:41 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'W', 'Y']
-2026-04-07 18:56:41 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'W', 'Y']
-2026-04-07 18:56:42 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'W', 'Y']
-2026-04-07 18:56:42 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'W', 'Zr']
-2026-04-07 18:56:43 - nepflow.materials_project - INFO - ✓ Found 1 compound(s) for ['Cr', 'W', 'Zr']
-2026-04-07 18:56:45 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'Y', 'Zr']
-2026-04-07 18:56:45 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'Y', 'Zr']
-2026-04-07 18:56:45 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'Y', 'Zr']
-2026-04-07 18:56:46 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'Y', 'Zr']
-2026-04-07 18:56:46 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'Y', 'Zr']
-2026-04-07 18:56:47 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'Y', 'Zr']
-2026-04-07 18:56:47 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'Y', 'Zr']
-2026-04-07 18:56:48 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'Y', 'Zr']
-2026-04-07 18:56:48 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'Y', 'Zr']
-2026-04-07 18:56:49 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'Y', 'Zr']
-2026-04-07 18:56:49 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'Y', 'Zr']
-2026-04-07 18:56:50 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'Y', 'Zr']
-2026-04-07 18:56:50 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'Y', 'Zr']
-2026-04-07 18:56:51 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'Y', 'Zr']
-2026-04-07 18:56:51 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'Y', 'Zr']
-2026-04-07 18:56:52 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'Y', 'Zr']
-2026-04-07 18:56:52 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'Y', 'Zr']
-2026-04-07 18:56:53 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'Y', 'Zr']
-2026-04-07 18:56:53 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'Y', 'Zr']
-2026-04-07 18:56:54 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'Y', 'Zr']
-2026-04-07 18:56:54 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'Y', 'Zr']
-2026-04-07 18:56:55 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['W', 'Y', 'Zr']
-2026-04-07 18:56:55 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['W', 'Y', 'Zr']
-2026-04-07 18:56:56 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['W', 'Y', 'Zr']
-2026-04-07 18:56:56 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['W', 'Y', 'Zr']
-2026-04-07 18:56:57 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['W', 'Y', 'Zr']
-2026-04-07 18:56:57 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['W', 'Y', 'Zr']
-2026-04-07 18:56:57 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['W', 'Y', 'Zr']
-2026-04-07 18:56:58 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['W', 'Y', 'Zr']
-2026-04-07 18:56:59 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['W', 'Y', 'Zr']
-2026-04-07 18:56:59 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['W', 'Y', 'Zr']
-2026-04-07 18:57:00 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['W', 'Y', 'Zr']
-2026-04-07 18:57:00 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['W', 'Y', 'Zr']
-2026-04-07 18:57:01 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['W', 'Y', 'Zr']
-2026-04-07 18:57:01 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['W', 'Y', 'Zr']
-2026-04-07 18:57:02 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['W', 'Y', 'Zr']
-2026-04-07 18:57:02 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['W', 'Y', 'Zr']
-2026-04-07 18:57:03 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['W', 'Y', 'Zr']
-2026-04-07 18:57:03 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['W', 'Y', 'Zr']
-2026-04-07 18:57:03 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['W', 'Y', 'Zr']
-2026-04-07 18:57:04 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['W', 'Y', 'Zr']
-2026-04-07 18:57:04 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['W', 'Y', 'Zr']
-2026-04-07 18:57:05 - nepflow.generate - INFO -   Total base structures: 985
-2026-04-07 18:57:06 - nepflow.generate - INFO -   Saved seeds to /mnt/c/Users/vp8194/.files/project_nepflow/projects/project_wcryzr/structures/seeds/base_structures.xyz
-2026-04-07 18:57:06 - nepflow.generate - INFO - Seeds-only mode — skipping perturbations
-2026-04-07 18:57:06 - nepflow - INFO - Workflow completed successfully
+2026-04-08 12:47:52 - nepflow - INFO - NEPFlow started for project: wcryzr
+2026-04-08 12:47:52 - nepflow - INFO - Not running under SLURM — no walltime limit, workflow will run indefinitely
+2026-04-08 12:47:52 - nepflow - INFO - Workflow completed successfully
+2026-04-08 12:49:03 - nepflow - INFO - NEPFlow started for project: wcryzr
+2026-04-08 12:49:03 - nepflow - INFO - Not running under SLURM — no walltime limit, workflow will run indefinitely
+2026-04-08 12:49:03 - nepflow.generate - INFO - Running structure generation
+2026-04-08 12:49:03 - nepflow.generate - INFO - Elements: ['W', 'Cr', 'Y', 'Zr']
+2026-04-08 12:49:03 - nepflow.generate - INFO - Crystal structures: ['bcc', 'fcc', 'hcp']
+2026-04-08 12:49:03 - nepflow.generate - INFO - 
+2026-04-08 12:49:03 - nepflow.generate - INFO - Step 1: Building composition grid
+2026-04-08 12:49:03 - nepflow.composition - INFO - Generated 130 compositions (4 elements, step=0.125)
+2026-04-08 12:49:03 - nepflow.generate - INFO -   130 compositions
+2026-04-08 12:49:03 - nepflow.generate - INFO - 
+2026-04-08 12:49:03 - nepflow.generate - INFO - Step 2: Generating base structures (configurational generators)
+2026-04-08 12:49:03 - nepflow.generate - INFO -   Active generators: ['MaterialsProject', 'RandomSolidSolution', 'SQS', 'Segregated']
+2026-04-08 12:49:05 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'Y']
+2026-04-08 12:49:16 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'Y']
+2026-04-08 12:49:17 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'Y']
+2026-04-08 12:49:17 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'Y']
+2026-04-08 12:49:18 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'Y']
+2026-04-08 12:49:19 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'Y']
+2026-04-08 12:49:20 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'Y']
+2026-04-08 12:49:22 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['W', 'Y']
+2026-04-08 12:49:23 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['W', 'Y']
+2026-04-08 12:49:23 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['W', 'Y']
+2026-04-08 12:49:24 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['W', 'Y']
+2026-04-08 12:49:25 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['W', 'Y']
+2026-04-08 12:49:26 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['W', 'Y']
+2026-04-08 12:49:26 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['W', 'Y']
+2026-04-08 12:49:30 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'W', 'Y']
+2026-04-08 12:49:31 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'W', 'Y']
+2026-04-08 12:49:32 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'W', 'Y']
+2026-04-08 12:49:32 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'W', 'Y']
+2026-04-08 12:49:33 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'W', 'Y']
+2026-04-08 12:49:34 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'W', 'Y']
+2026-04-08 12:49:35 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'W', 'Y']
+2026-04-08 12:49:36 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'W', 'Y']
+2026-04-08 12:49:36 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'W', 'Y']
+2026-04-08 12:49:37 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'W', 'Y']
+2026-04-08 12:49:38 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'W', 'Y']
+2026-04-08 12:49:39 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'W', 'Y']
+2026-04-08 12:49:40 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'W', 'Y']
+2026-04-08 12:49:41 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'W', 'Y']
+2026-04-08 12:49:41 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'W', 'Y']
+2026-04-08 12:49:42 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'W', 'Y']
+2026-04-08 12:49:43 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'W', 'Y']
+2026-04-08 12:49:44 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'W', 'Y']
+2026-04-08 12:49:45 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'W', 'Y']
+2026-04-08 12:49:46 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'W', 'Y']
+2026-04-08 12:49:46 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'W', 'Y']
+2026-04-08 12:49:52 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'Y', 'Zr']
+2026-04-08 12:49:52 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'Y', 'Zr']
+2026-04-08 12:49:53 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'Y', 'Zr']
+2026-04-08 12:49:54 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'Y', 'Zr']
+2026-04-08 12:49:55 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'Y', 'Zr']
+2026-04-08 12:49:56 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'Y', 'Zr']
+2026-04-08 12:49:57 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'Y', 'Zr']
+2026-04-08 12:49:57 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'Y', 'Zr']
+2026-04-08 12:49:58 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'Y', 'Zr']
+2026-04-08 12:49:59 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'Y', 'Zr']
+2026-04-08 12:50:00 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'Y', 'Zr']
+2026-04-08 12:50:00 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'Y', 'Zr']
+2026-04-08 12:50:01 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'Y', 'Zr']
+2026-04-08 12:50:02 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'Y', 'Zr']
+2026-04-08 12:50:03 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'Y', 'Zr']
+2026-04-08 12:50:04 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'Y', 'Zr']
+2026-04-08 12:50:04 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'Y', 'Zr']
+2026-04-08 12:50:05 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'Y', 'Zr']
+2026-04-08 12:50:06 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'Y', 'Zr']
+2026-04-08 12:50:07 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'Y', 'Zr']
+2026-04-08 12:50:07 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['Cr', 'Y', 'Zr']
+2026-04-08 12:50:08 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['W', 'Y', 'Zr']
+2026-04-08 12:50:09 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['W', 'Y', 'Zr']
+2026-04-08 12:50:10 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['W', 'Y', 'Zr']
+2026-04-08 12:50:11 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['W', 'Y', 'Zr']
+2026-04-08 12:50:12 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['W', 'Y', 'Zr']
+2026-04-08 12:50:12 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['W', 'Y', 'Zr']
+2026-04-08 12:50:13 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['W', 'Y', 'Zr']
+2026-04-08 12:50:14 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['W', 'Y', 'Zr']
+2026-04-08 12:50:15 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['W', 'Y', 'Zr']
+2026-04-08 12:50:16 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['W', 'Y', 'Zr']
+2026-04-08 12:50:16 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['W', 'Y', 'Zr']
+2026-04-08 12:50:17 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['W', 'Y', 'Zr']
+2026-04-08 12:50:18 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['W', 'Y', 'Zr']
+2026-04-08 12:50:19 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['W', 'Y', 'Zr']
+2026-04-08 12:50:20 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['W', 'Y', 'Zr']
+2026-04-08 12:50:20 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['W', 'Y', 'Zr']
+2026-04-08 12:50:21 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['W', 'Y', 'Zr']
+2026-04-08 12:50:22 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['W', 'Y', 'Zr']
+2026-04-08 12:50:23 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['W', 'Y', 'Zr']
+2026-04-08 12:50:24 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['W', 'Y', 'Zr']
+2026-04-08 12:50:24 - nepflow.materials_project - INFO - Querying Materials Project for compounds of ['W', 'Y', 'Zr']
+2026-04-08 12:50:25 - nepflow.generate - INFO -   Total base structures: 985
+2026-04-08 12:50:27 - nepflow.generate - INFO -   Saved seeds to /mnt/c/Users/vp8194/.files/project_nepflow/projects/project_wcryzr/structures/seeds/base_structures.xyz
+2026-04-08 12:50:27 - nepflow.generate - INFO - Seeds-only mode — skipping perturbations
+2026-04-08 12:50:27 - nepflow - INFO - Workflow completed successfully
+2026-04-08 14:42:24 - nepflow - INFO - NEPFlow started for project: wcryzr
+2026-04-08 14:42:24 - nepflow - DEBUG - Debug mode enabled
+2026-04-08 14:42:24 - nepflow - DEBUG - Checking for SLURM walltime...
+2026-04-08 14:42:24 - nepflow - DEBUG - SLURM_JOB_ID env var: (not set)
+2026-04-08 14:42:24 - nepflow - INFO - Not running under SLURM — no walltime limit, workflow will run indefinitely
+2026-04-08 14:42:24 - nepflow.run_vasp - INFO -   Benchmark supercells: [2, 16, 54, 128] atoms (BCC W)
+2026-04-08 14:42:24 - nepflow.run_vasp - INFO -   Parameter combos: 36 (GPUs: [1, 2, 4], NCORE: [2, 4, 8, 16, 32, 64], KPAR varies by GPU count)
+2026-04-08 14:42:24 - nepflow.run_vasp - INFO -   Preparing memory benchmark jobs
+2026-04-08 14:42:28 - nepflow.run_vasp - INFO -   Prepared 144 benchmark jobs (4 sizes × 36 combos)
+2026-04-08 14:42:28 - nepflow.run_vasp - INFO -   Memory benchmark script: /mnt/c/Users/vp8194/.files/project_nepflow/projects/project_wcryzr/vasp/memory/run_memory.sh
+2026-04-08 14:42:29 - nepflow.run_vasp - INFO - 
+2026-04-08 14:42:29 - nepflow.run_vasp - INFO -   Memory benchmark launcher: 144 jobs
+2026-04-08 14:42:29 - nepflow.run_vasp - INFO -   Max concurrent: 20
+2026-04-08 14:42:29 - nepflow.run_vasp - INFO -   [DEBUG] Simulated SLURM mode
+2026-04-08 14:42:29 - nepflow.run_vasp - INFO -     atoms_002/gpu1_nc02_kp1: submitted (debug) job DEBUG_00001
+2026-04-08 14:42:29 - nepflow.run_vasp - INFO -     atoms_002/gpu1_nc04_kp1: submitted (debug) job DEBUG_00002
+2026-04-08 14:42:29 - nepflow.run_vasp - INFO -     atoms_002/gpu1_nc08_kp1: submitted (debug) job DEBUG_00003
+2026-04-08 14:42:29 - nepflow.run_vasp - INFO -     atoms_002/gpu1_nc16_kp1: submitted (debug) job DEBUG_00004
+2026-04-08 14:42:29 - nepflow.run_vasp - INFO -     atoms_002/gpu1_nc32_kp1: submitted (debug) job DEBUG_00005
+2026-04-08 14:42:29 - nepflow.run_vasp - INFO -     atoms_002/gpu1_nc64_kp1: submitted (debug) job DEBUG_00006
+2026-04-08 14:42:29 - nepflow.run_vasp - INFO -     atoms_002/gpu2_nc02_kp1: submitted (debug) job DEBUG_00007
+2026-04-08 14:42:29 - nepflow.run_vasp - INFO -     atoms_002/gpu2_nc02_kp2: submitted (debug) job DEBUG_00008
+2026-04-08 14:42:29 - nepflow.run_vasp - INFO -     atoms_002/gpu2_nc04_kp1: submitted (debug) job DEBUG_00009
+2026-04-08 14:42:29 - nepflow.run_vasp - INFO -     atoms_002/gpu2_nc04_kp2: submitted (debug) job DEBUG_00010
+2026-04-08 14:42:29 - nepflow.run_vasp - INFO -     atoms_002/gpu2_nc08_kp1: submitted (debug) job DEBUG_00011
+2026-04-08 14:42:29 - nepflow.run_vasp - INFO -     atoms_002/gpu2_nc08_kp2: submitted (debug) job DEBUG_00012
+2026-04-08 14:42:29 - nepflow.run_vasp - INFO -     atoms_002/gpu2_nc16_kp1: submitted (debug) job DEBUG_00013
+2026-04-08 14:42:29 - nepflow.run_vasp - INFO -     atoms_002/gpu2_nc16_kp2: submitted (debug) job DEBUG_00014
+2026-04-08 14:42:29 - nepflow.run_vasp - INFO -     atoms_002/gpu2_nc32_kp1: submitted (debug) job DEBUG_00015
+2026-04-08 14:42:29 - nepflow.run_vasp - INFO -     atoms_002/gpu2_nc32_kp2: submitted (debug) job DEBUG_00016
+2026-04-08 14:42:29 - nepflow.run_vasp - INFO -     atoms_002/gpu2_nc64_kp1: submitted (debug) job DEBUG_00017
+2026-04-08 14:42:29 - nepflow.run_vasp - INFO -     atoms_002/gpu2_nc64_kp2: submitted (debug) job DEBUG_00018
+2026-04-08 14:42:29 - nepflow.run_vasp - INFO -     atoms_002/gpu4_nc02_kp1: submitted (debug) job DEBUG_00019
+2026-04-08 14:42:29 - nepflow.run_vasp - INFO -     atoms_002/gpu4_nc02_kp2: submitted (debug) job DEBUG_00020
+2026-04-08 14:42:30 - nepflow.run_vasp - INFO -   Status: 144 pending, 0 running, 0 completed, 0 OOM
+2026-04-08 14:42:30 - nepflow.run_vasp - INFO -     atoms_002/gpu1_nc02_kp1: completed
+2026-04-08 14:42:30 - nepflow.run_vasp - INFO -     atoms_002/gpu1_nc04_kp1: completed
+2026-04-08 14:42:30 - nepflow.run_vasp - INFO -     atoms_002/gpu1_nc08_kp1: completed
+2026-04-08 14:42:30 - nepflow.run_vasp - INFO -     atoms_002/gpu1_nc16_kp1: completed
+2026-04-08 14:42:30 - nepflow.run_vasp - INFO -     atoms_002/gpu1_nc32_kp1: OOM
+2026-04-08 14:42:30 - nepflow.run_vasp - INFO -     atoms_002/gpu1_nc64_kp1: completed
+2026-04-08 14:42:30 - nepflow.run_vasp - INFO -     atoms_002/gpu2_nc02_kp1: completed
+2026-04-08 14:42:30 - nepflow.run_vasp - INFO -     atoms_002/gpu2_nc02_kp2: completed
+2026-04-08 14:42:30 - nepflow.run_vasp - INFO -     atoms_002/gpu2_nc04_kp1: completed
+2026-04-08 14:42:30 - nepflow.run_vasp - INFO -     atoms_002/gpu2_nc04_kp2: OOM
+2026-04-08 14:42:30 - nepflow.run_vasp - INFO -     atoms_002/gpu2_nc08_kp1: completed
+2026-04-08 14:42:30 - nepflow.run_vasp - INFO -     atoms_002/gpu2_nc08_kp2: completed
+2026-04-08 14:42:30 - nepflow.run_vasp - INFO -     atoms_002/gpu2_nc16_kp1: completed
+2026-04-08 14:42:30 - nepflow.run_vasp - INFO -     atoms_002/gpu2_nc16_kp2: completed
+2026-04-08 14:42:30 - nepflow.run_vasp - INFO -     atoms_002/gpu2_nc32_kp1: OOM
+2026-04-08 14:42:30 - nepflow.run_vasp - INFO -     atoms_002/gpu2_nc32_kp2: completed
+2026-04-08 14:42:30 - nepflow.run_vasp - INFO -     atoms_002/gpu2_nc64_kp1: completed
+2026-04-08 14:42:30 - nepflow.run_vasp - INFO -     atoms_002/gpu2_nc64_kp2: completed
+2026-04-08 14:42:30 - nepflow.run_vasp - INFO -     atoms_002/gpu4_nc02_kp1: completed
+2026-04-08 14:42:30 - nepflow.run_vasp - INFO -     atoms_002/gpu4_nc02_kp2: OOM
+2026-04-08 14:42:31 - nepflow.run_vasp - INFO -     atoms_002/gpu4_nc02_kp4: submitted (debug) job DEBUG_00021
+2026-04-08 14:42:31 - nepflow.run_vasp - INFO -     atoms_002/gpu4_nc04_kp1: submitted (debug) job DEBUG_00022
+2026-04-08 14:42:31 - nepflow.run_vasp - INFO -     atoms_002/gpu4_nc04_kp2: submitted (debug) job DEBUG_00023
+2026-04-08 14:42:31 - nepflow.run_vasp - INFO -     atoms_002/gpu4_nc04_kp4: submitted (debug) job DEBUG_00024
+2026-04-08 14:42:31 - nepflow.run_vasp - INFO -     atoms_002/gpu4_nc08_kp1: submitted (debug) job DEBUG_00025
+2026-04-08 14:42:31 - nepflow.run_vasp - INFO -     atoms_002/gpu4_nc08_kp2: submitted (debug) job DEBUG_00026
+2026-04-08 14:42:31 - nepflow.run_vasp - INFO -     atoms_002/gpu4_nc08_kp4: submitted (debug) job DEBUG_00027
+2026-04-08 14:42:31 - nepflow.run_vasp - INFO -     atoms_002/gpu4_nc16_kp1: submitted (debug) job DEBUG_00028
+2026-04-08 14:42:31 - nepflow.run_vasp - INFO -     atoms_002/gpu4_nc16_kp2: submitted (debug) job DEBUG_00029
+2026-04-08 14:42:31 - nepflow.run_vasp - INFO -     atoms_002/gpu4_nc16_kp4: submitted (debug) job DEBUG_00030
+2026-04-08 14:42:31 - nepflow.run_vasp - INFO -     atoms_002/gpu4_nc32_kp1: submitted (debug) job DEBUG_00031
+2026-04-08 14:42:31 - nepflow.run_vasp - INFO -     atoms_002/gpu4_nc32_kp2: submitted (debug) job DEBUG_00032
+2026-04-08 14:42:31 - nepflow.run_vasp - INFO -     atoms_002/gpu4_nc32_kp4: submitted (debug) job DEBUG_00033
+2026-04-08 14:42:31 - nepflow.run_vasp - INFO -     atoms_002/gpu4_nc64_kp1: submitted (debug) job DEBUG_00034
+2026-04-08 14:42:31 - nepflow.run_vasp - INFO -     atoms_002/gpu4_nc64_kp2: submitted (debug) job DEBUG_00035
+2026-04-08 14:42:31 - nepflow.run_vasp - INFO -     atoms_002/gpu4_nc64_kp4: submitted (debug) job DEBUG_00036
+2026-04-08 14:42:31 - nepflow.run_vasp - INFO -     atoms_016/gpu1_nc02_kp1: submitted (debug) job DEBUG_00037
+2026-04-08 14:42:31 - nepflow.run_vasp - INFO -     atoms_016/gpu1_nc04_kp1: submitted (debug) job DEBUG_00038
+2026-04-08 14:42:31 - nepflow.run_vasp - INFO -     atoms_016/gpu1_nc08_kp1: submitted (debug) job DEBUG_00039
+2026-04-08 14:42:31 - nepflow.run_vasp - INFO -     atoms_016/gpu1_nc16_kp1: submitted (debug) job DEBUG_00040
+2026-04-08 14:42:32 - nepflow.run_vasp - INFO -   Status: 124 pending, 0 running, 16 completed, 4 OOM
+2026-04-08 14:42:32 - nepflow.run_vasp - INFO -     atoms_002/gpu4_nc02_kp4: completed
+2026-04-08 14:42:32 - nepflow.run_vasp - INFO -     atoms_002/gpu4_nc04_kp1: completed
+2026-04-08 14:42:32 - nepflow.run_vasp - INFO -     atoms_002/gpu4_nc04_kp2: completed
+2026-04-08 14:42:32 - nepflow.run_vasp - INFO -     atoms_002/gpu4_nc04_kp4: completed
+2026-04-08 14:42:32 - nepflow.run_vasp - INFO -     atoms_002/gpu4_nc08_kp1: OOM
+2026-04-08 14:42:32 - nepflow.run_vasp - INFO -     atoms_002/gpu4_nc08_kp2: completed
+2026-04-08 14:42:32 - nepflow.run_vasp - INFO -     atoms_002/gpu4_nc08_kp4: completed
+2026-04-08 14:42:32 - nepflow.run_vasp - INFO -     atoms_002/gpu4_nc16_kp1: completed
+2026-04-08 14:42:32 - nepflow.run_vasp - INFO -     atoms_002/gpu4_nc16_kp2: completed
+2026-04-08 14:42:32 - nepflow.run_vasp - INFO -     atoms_002/gpu4_nc16_kp4: OOM
+2026-04-08 14:42:32 - nepflow.run_vasp - INFO -     atoms_002/gpu4_nc32_kp1: completed
+2026-04-08 14:42:32 - nepflow.run_vasp - INFO -     atoms_002/gpu4_nc32_kp2: completed
+2026-04-08 14:42:32 - nepflow.run_vasp - INFO -     atoms_002/gpu4_nc32_kp4: completed
+2026-04-08 14:42:32 - nepflow.run_vasp - INFO -     atoms_002/gpu4_nc64_kp1: completed
+2026-04-08 14:42:32 - nepflow.run_vasp - INFO -     atoms_002/gpu4_nc64_kp2: OOM
+2026-04-08 14:42:32 - nepflow.run_vasp - INFO -     atoms_002/gpu4_nc64_kp4: completed
+2026-04-08 14:42:32 - nepflow.run_vasp - INFO -     atoms_016/gpu1_nc02_kp1: completed
+2026-04-08 14:42:32 - nepflow.run_vasp - INFO -     atoms_016/gpu1_nc04_kp1: completed
+2026-04-08 14:42:32 - nepflow.run_vasp - INFO -     atoms_016/gpu1_nc08_kp1: completed
+2026-04-08 14:42:32 - nepflow.run_vasp - INFO -     atoms_016/gpu1_nc16_kp1: OOM
+2026-04-08 14:42:32 - nepflow.run_vasp - INFO -     atoms_016/gpu1_nc32_kp1: submitted (debug) job DEBUG_00041
+2026-04-08 14:42:32 - nepflow.run_vasp - INFO -     atoms_016/gpu1_nc64_kp1: submitted (debug) job DEBUG_00042
+2026-04-08 14:42:32 - nepflow.run_vasp - INFO -     atoms_016/gpu2_nc02_kp1: submitted (debug) job DEBUG_00043
+2026-04-08 14:42:32 - nepflow.run_vasp - INFO -     atoms_016/gpu2_nc02_kp2: submitted (debug) job DEBUG_00044
+2026-04-08 14:42:32 - nepflow.run_vasp - INFO -     atoms_016/gpu2_nc04_kp1: submitted (debug) job DEBUG_00045
+2026-04-08 14:42:32 - nepflow.run_vasp - INFO -     atoms_016/gpu2_nc04_kp2: submitted (debug) job DEBUG_00046
+2026-04-08 14:42:32 - nepflow.run_vasp - INFO -     atoms_016/gpu2_nc08_kp1: submitted (debug) job DEBUG_00047
+2026-04-08 14:42:32 - nepflow.run_vasp - INFO -     atoms_016/gpu2_nc08_kp2: submitted (debug) job DEBUG_00048
+2026-04-08 14:42:32 - nepflow.run_vasp - INFO -     atoms_016/gpu2_nc16_kp1: submitted (debug) job DEBUG_00049
+2026-04-08 14:42:33 - nepflow.run_vasp - INFO -     atoms_016/gpu2_nc16_kp2: submitted (debug) job DEBUG_00050
+2026-04-08 14:42:33 - nepflow.run_vasp - INFO -     atoms_016/gpu2_nc32_kp1: submitted (debug) job DEBUG_00051
+2026-04-08 14:42:33 - nepflow.run_vasp - INFO -     atoms_016/gpu2_nc32_kp2: submitted (debug) job DEBUG_00052
+2026-04-08 14:42:33 - nepflow.run_vasp - INFO -     atoms_016/gpu2_nc64_kp1: submitted (debug) job DEBUG_00053
+2026-04-08 14:42:33 - nepflow.run_vasp - INFO -     atoms_016/gpu2_nc64_kp2: submitted (debug) job DEBUG_00054
+2026-04-08 14:42:33 - nepflow.run_vasp - INFO -     atoms_016/gpu4_nc02_kp1: submitted (debug) job DEBUG_00055
+2026-04-08 14:42:33 - nepflow.run_vasp - INFO -     atoms_016/gpu4_nc02_kp2: submitted (debug) job DEBUG_00056
+2026-04-08 14:42:33 - nepflow.run_vasp - INFO -     atoms_016/gpu4_nc02_kp4: submitted (debug) job DEBUG_00057
+2026-04-08 14:42:33 - nepflow.run_vasp - INFO -     atoms_016/gpu4_nc04_kp1: submitted (debug) job DEBUG_00058
+2026-04-08 14:42:33 - nepflow.run_vasp - INFO -     atoms_016/gpu4_nc04_kp2: submitted (debug) job DEBUG_00059
+2026-04-08 14:42:33 - nepflow.run_vasp - INFO -     atoms_016/gpu4_nc04_kp4: submitted (debug) job DEBUG_00060
+2026-04-08 14:42:33 - nepflow.run_vasp - INFO -   Status: 104 pending, 0 running, 32 completed, 8 OOM
+2026-04-08 14:42:34 - nepflow.run_vasp - INFO -     atoms_016/gpu1_nc32_kp1: completed
+2026-04-08 14:42:34 - nepflow.run_vasp - INFO -     atoms_016/gpu1_nc64_kp1: completed
+2026-04-08 14:42:34 - nepflow.run_vasp - INFO -     atoms_016/gpu2_nc02_kp1: completed
+2026-04-08 14:42:34 - nepflow.run_vasp - INFO -     atoms_016/gpu2_nc02_kp2: completed
+2026-04-08 14:42:34 - nepflow.run_vasp - INFO -     atoms_016/gpu2_nc04_kp1: OOM
+2026-04-08 14:42:34 - nepflow.run_vasp - INFO -     atoms_016/gpu2_nc04_kp2: completed
+2026-04-08 14:42:34 - nepflow.run_vasp - INFO -     atoms_016/gpu2_nc08_kp1: completed
+2026-04-08 14:42:34 - nepflow.run_vasp - INFO -     atoms_016/gpu2_nc08_kp2: completed
+2026-04-08 14:42:34 - nepflow.run_vasp - INFO -     atoms_016/gpu2_nc16_kp1: completed
+2026-04-08 14:42:34 - nepflow.run_vasp - INFO -     atoms_016/gpu2_nc16_kp2: OOM
+2026-04-08 14:42:34 - nepflow.run_vasp - INFO -     atoms_016/gpu2_nc32_kp1: completed
+2026-04-08 14:42:34 - nepflow.run_vasp - INFO -     atoms_016/gpu2_nc32_kp2: completed
+2026-04-08 14:42:34 - nepflow.run_vasp - INFO -     atoms_016/gpu2_nc64_kp1: completed
+2026-04-08 14:42:34 - nepflow.run_vasp - INFO -     atoms_016/gpu2_nc64_kp2: completed
+2026-04-08 14:42:34 - nepflow.run_vasp - INFO -     atoms_016/gpu4_nc02_kp1: OOM
+2026-04-08 14:42:34 - nepflow.run_vasp - INFO -     atoms_016/gpu4_nc02_kp2: completed
+2026-04-08 14:42:34 - nepflow.run_vasp - INFO -     atoms_016/gpu4_nc02_kp4: completed
+2026-04-08 14:42:34 - nepflow.run_vasp - INFO -     atoms_016/gpu4_nc04_kp1: completed
+2026-04-08 14:42:34 - nepflow.run_vasp - INFO -     atoms_016/gpu4_nc04_kp2: completed
+2026-04-08 14:42:34 - nepflow.run_vasp - INFO -     atoms_016/gpu4_nc04_kp4: OOM
+2026-04-08 14:42:34 - nepflow.run_vasp - INFO -     atoms_016/gpu4_nc08_kp1: submitted (debug) job DEBUG_00061
+2026-04-08 14:42:34 - nepflow.run_vasp - INFO -     atoms_016/gpu4_nc08_kp2: submitted (debug) job DEBUG_00062
+2026-04-08 14:42:34 - nepflow.run_vasp - INFO -     atoms_016/gpu4_nc08_kp4: submitted (debug) job DEBUG_00063
+2026-04-08 14:42:34 - nepflow.run_vasp - INFO -     atoms_016/gpu4_nc16_kp1: submitted (debug) job DEBUG_00064
+2026-04-08 14:42:34 - nepflow.run_vasp - INFO -     atoms_016/gpu4_nc16_kp2: submitted (debug) job DEBUG_00065
+2026-04-08 14:42:34 - nepflow.run_vasp - INFO -     atoms_016/gpu4_nc16_kp4: submitted (debug) job DEBUG_00066
+2026-04-08 14:42:34 - nepflow.run_vasp - INFO -     atoms_016/gpu4_nc32_kp1: submitted (debug) job DEBUG_00067
+2026-04-08 14:42:34 - nepflow.run_vasp - INFO -     atoms_016/gpu4_nc32_kp2: submitted (debug) job DEBUG_00068
+2026-04-08 14:42:34 - nepflow.run_vasp - INFO -     atoms_016/gpu4_nc32_kp4: submitted (debug) job DEBUG_00069
+2026-04-08 14:42:34 - nepflow.run_vasp - INFO -     atoms_016/gpu4_nc64_kp1: submitted (debug) job DEBUG_00070
+2026-04-08 14:42:34 - nepflow.run_vasp - INFO -     atoms_016/gpu4_nc64_kp2: submitted (debug) job DEBUG_00071
+2026-04-08 14:42:34 - nepflow.run_vasp - INFO -     atoms_016/gpu4_nc64_kp4: submitted (debug) job DEBUG_00072
+2026-04-08 14:42:34 - nepflow.run_vasp - INFO -     atoms_054/gpu1_nc02_kp1: submitted (debug) job DEBUG_00073
+2026-04-08 14:42:34 - nepflow.run_vasp - INFO -     atoms_054/gpu1_nc04_kp1: submitted (debug) job DEBUG_00074
+2026-04-08 14:42:34 - nepflow.run_vasp - INFO -     atoms_054/gpu1_nc08_kp1: submitted (debug) job DEBUG_00075
+2026-04-08 14:42:34 - nepflow.run_vasp - INFO -     atoms_054/gpu1_nc16_kp1: submitted (debug) job DEBUG_00076
+2026-04-08 14:42:35 - nepflow.run_vasp - INFO -     atoms_054/gpu1_nc32_kp1: submitted (debug) job DEBUG_00077
+2026-04-08 14:42:35 - nepflow.run_vasp - INFO -     atoms_054/gpu1_nc64_kp1: submitted (debug) job DEBUG_00078
+2026-04-08 14:42:35 - nepflow.run_vasp - INFO -     atoms_054/gpu2_nc02_kp1: submitted (debug) job DEBUG_00079
+2026-04-08 14:42:35 - nepflow.run_vasp - INFO -     atoms_054/gpu2_nc02_kp2: submitted (debug) job DEBUG_00080
+2026-04-08 14:42:35 - nepflow.run_vasp - INFO -   Status: 84 pending, 0 running, 48 completed, 12 OOM
+2026-04-08 14:42:35 - nepflow.run_vasp - INFO -     atoms_016/gpu4_nc08_kp1: completed
+2026-04-08 14:42:35 - nepflow.run_vasp - INFO -     atoms_016/gpu4_nc08_kp2: completed
+2026-04-08 14:42:35 - nepflow.run_vasp - INFO -     atoms_016/gpu4_nc08_kp4: completed
+2026-04-08 14:42:35 - nepflow.run_vasp - INFO -     atoms_016/gpu4_nc16_kp1: completed
+2026-04-08 14:42:36 - nepflow.run_vasp - INFO -     atoms_016/gpu4_nc16_kp2: OOM
+2026-04-08 14:42:36 - nepflow.run_vasp - INFO -     atoms_016/gpu4_nc16_kp4: completed
+2026-04-08 14:42:36 - nepflow.run_vasp - INFO -     atoms_016/gpu4_nc32_kp1: completed
+2026-04-08 14:42:36 - nepflow.run_vasp - INFO -     atoms_016/gpu4_nc32_kp2: completed
+2026-04-08 14:42:36 - nepflow.run_vasp - INFO -     atoms_016/gpu4_nc32_kp4: completed
+2026-04-08 14:42:36 - nepflow.run_vasp - INFO -     atoms_016/gpu4_nc64_kp1: OOM
+2026-04-08 14:42:36 - nepflow.run_vasp - INFO -     atoms_016/gpu4_nc64_kp2: completed
+2026-04-08 14:42:36 - nepflow.run_vasp - INFO -     atoms_016/gpu4_nc64_kp4: completed
+2026-04-08 14:42:36 - nepflow.run_vasp - INFO -     atoms_054/gpu1_nc02_kp1: completed
+2026-04-08 14:42:36 - nepflow.run_vasp - INFO -     atoms_054/gpu1_nc04_kp1: completed
+2026-04-08 14:42:36 - nepflow.run_vasp - INFO -     atoms_054/gpu1_nc08_kp1: OOM
+2026-04-08 14:42:36 - nepflow.run_vasp - INFO -     atoms_054/gpu1_nc16_kp1: completed
+2026-04-08 14:42:36 - nepflow.run_vasp - INFO -     atoms_054/gpu1_nc32_kp1: completed
+2026-04-08 14:42:36 - nepflow.run_vasp - INFO -     atoms_054/gpu1_nc64_kp1: completed
+2026-04-08 14:42:36 - nepflow.run_vasp - INFO -     atoms_054/gpu2_nc02_kp1: completed
+2026-04-08 14:42:36 - nepflow.run_vasp - INFO -     atoms_054/gpu2_nc02_kp2: OOM
+2026-04-08 14:42:36 - nepflow.run_vasp - INFO -     atoms_054/gpu2_nc04_kp1: submitted (debug) job DEBUG_00081
+2026-04-08 14:42:36 - nepflow.run_vasp - INFO -     atoms_054/gpu2_nc04_kp2: submitted (debug) job DEBUG_00082
+2026-04-08 14:42:36 - nepflow.run_vasp - INFO -     atoms_054/gpu2_nc08_kp1: submitted (debug) job DEBUG_00083
+2026-04-08 14:42:36 - nepflow.run_vasp - INFO -     atoms_054/gpu2_nc08_kp2: submitted (debug) job DEBUG_00084
+2026-04-08 14:42:36 - nepflow.run_vasp - INFO -     atoms_054/gpu2_nc16_kp1: submitted (debug) job DEBUG_00085
+2026-04-08 14:42:36 - nepflow.run_vasp - INFO -     atoms_054/gpu2_nc16_kp2: submitted (debug) job DEBUG_00086
+2026-04-08 14:42:36 - nepflow.run_vasp - INFO -     atoms_054/gpu2_nc32_kp1: submitted (debug) job DEBUG_00087
+2026-04-08 14:42:36 - nepflow.run_vasp - INFO -     atoms_054/gpu2_nc32_kp2: submitted (debug) job DEBUG_00088
+2026-04-08 14:42:36 - nepflow.run_vasp - INFO -     atoms_054/gpu2_nc64_kp1: submitted (debug) job DEBUG_00089
+2026-04-08 14:42:36 - nepflow.run_vasp - INFO -     atoms_054/gpu2_nc64_kp2: submitted (debug) job DEBUG_00090
+2026-04-08 14:42:36 - nepflow.run_vasp - INFO -     atoms_054/gpu4_nc02_kp1: submitted (debug) job DEBUG_00091
+2026-04-08 14:42:36 - nepflow.run_vasp - INFO -     atoms_054/gpu4_nc02_kp2: submitted (debug) job DEBUG_00092
+2026-04-08 14:42:36 - nepflow.run_vasp - INFO -     atoms_054/gpu4_nc02_kp4: submitted (debug) job DEBUG_00093
+2026-04-08 14:42:36 - nepflow.run_vasp - INFO -     atoms_054/gpu4_nc04_kp1: submitted (debug) job DEBUG_00094
+2026-04-08 14:42:36 - nepflow.run_vasp - INFO -     atoms_054/gpu4_nc04_kp2: submitted (debug) job DEBUG_00095
+2026-04-08 14:42:36 - nepflow.run_vasp - INFO -     atoms_054/gpu4_nc04_kp4: submitted (debug) job DEBUG_00096
+2026-04-08 14:42:36 - nepflow.run_vasp - INFO -     atoms_054/gpu4_nc08_kp1: submitted (debug) job DEBUG_00097
+2026-04-08 14:42:36 - nepflow.run_vasp - INFO -     atoms_054/gpu4_nc08_kp2: submitted (debug) job DEBUG_00098
+2026-04-08 14:42:36 - nepflow.run_vasp - INFO -     atoms_054/gpu4_nc08_kp4: submitted (debug) job DEBUG_00099
+2026-04-08 14:42:36 - nepflow.run_vasp - INFO -     atoms_054/gpu4_nc16_kp1: submitted (debug) job DEBUG_00100
+2026-04-08 14:42:37 - nepflow.run_vasp - INFO -   Status: 64 pending, 0 running, 64 completed, 16 OOM
+2026-04-08 14:42:37 - nepflow.run_vasp - INFO -     atoms_054/gpu2_nc04_kp1: completed
+2026-04-08 14:42:37 - nepflow.run_vasp - INFO -     atoms_054/gpu2_nc04_kp2: completed
+2026-04-08 14:42:37 - nepflow.run_vasp - INFO -     atoms_054/gpu2_nc08_kp1: completed
+2026-04-08 14:42:37 - nepflow.run_vasp - INFO -     atoms_054/gpu2_nc08_kp2: completed
+2026-04-08 14:42:37 - nepflow.run_vasp - INFO -     atoms_054/gpu2_nc16_kp1: OOM
+2026-04-08 14:42:37 - nepflow.run_vasp - INFO -     atoms_054/gpu2_nc16_kp2: completed
+2026-04-08 14:42:37 - nepflow.run_vasp - INFO -     atoms_054/gpu2_nc32_kp1: completed
+2026-04-08 14:42:38 - nepflow.run_vasp - INFO -     atoms_054/gpu2_nc32_kp2: completed
+2026-04-08 14:42:38 - nepflow.run_vasp - INFO -     atoms_054/gpu2_nc64_kp1: completed
+2026-04-08 14:42:38 - nepflow.run_vasp - INFO -     atoms_054/gpu2_nc64_kp2: OOM
+2026-04-08 14:42:38 - nepflow.run_vasp - INFO -     atoms_054/gpu4_nc02_kp1: completed
+2026-04-08 14:42:38 - nepflow.run_vasp - INFO -     atoms_054/gpu4_nc02_kp2: completed
+2026-04-08 14:42:38 - nepflow.run_vasp - INFO -     atoms_054/gpu4_nc02_kp4: completed
+2026-04-08 14:42:38 - nepflow.run_vasp - INFO -     atoms_054/gpu4_nc04_kp1: completed
+2026-04-08 14:42:38 - nepflow.run_vasp - INFO -     atoms_054/gpu4_nc04_kp2: OOM
+2026-04-08 14:42:38 - nepflow.run_vasp - INFO -     atoms_054/gpu4_nc04_kp4: completed
+2026-04-08 14:42:38 - nepflow.run_vasp - INFO -     atoms_054/gpu4_nc08_kp1: completed
+2026-04-08 14:42:38 - nepflow.run_vasp - INFO -     atoms_054/gpu4_nc08_kp2: completed
+2026-04-08 14:42:38 - nepflow.run_vasp - INFO -     atoms_054/gpu4_nc08_kp4: completed
+2026-04-08 14:42:38 - nepflow.run_vasp - INFO -     atoms_054/gpu4_nc16_kp1: OOM
+2026-04-08 14:42:38 - nepflow.run_vasp - INFO -     atoms_054/gpu4_nc16_kp2: submitted (debug) job DEBUG_00101
+2026-04-08 14:42:38 - nepflow.run_vasp - INFO -     atoms_054/gpu4_nc16_kp4: submitted (debug) job DEBUG_00102
+2026-04-08 14:42:38 - nepflow.run_vasp - INFO -     atoms_054/gpu4_nc32_kp1: submitted (debug) job DEBUG_00103
+2026-04-08 14:42:38 - nepflow.run_vasp - INFO -     atoms_054/gpu4_nc32_kp2: submitted (debug) job DEBUG_00104
+2026-04-08 14:42:38 - nepflow.run_vasp - INFO -     atoms_054/gpu4_nc32_kp4: submitted (debug) job DEBUG_00105
+2026-04-08 14:42:38 - nepflow.run_vasp - INFO -     atoms_054/gpu4_nc64_kp1: submitted (debug) job DEBUG_00106
+2026-04-08 14:42:38 - nepflow.run_vasp - INFO -     atoms_054/gpu4_nc64_kp2: submitted (debug) job DEBUG_00107
+2026-04-08 14:42:38 - nepflow.run_vasp - INFO -     atoms_054/gpu4_nc64_kp4: submitted (debug) job DEBUG_00108
+2026-04-08 14:42:38 - nepflow.run_vasp - INFO -     atoms_128/gpu1_nc02_kp1: submitted (debug) job DEBUG_00109
+2026-04-08 14:42:38 - nepflow.run_vasp - INFO -     atoms_128/gpu1_nc04_kp1: submitted (debug) job DEBUG_00110
+2026-04-08 14:42:38 - nepflow.run_vasp - INFO -     atoms_128/gpu1_nc08_kp1: submitted (debug) job DEBUG_00111
+2026-04-08 14:42:38 - nepflow.run_vasp - INFO -     atoms_128/gpu1_nc16_kp1: submitted (debug) job DEBUG_00112
+2026-04-08 14:42:38 - nepflow.run_vasp - INFO -     atoms_128/gpu1_nc32_kp1: submitted (debug) job DEBUG_00113
+2026-04-08 14:42:38 - nepflow.run_vasp - INFO -     atoms_128/gpu1_nc64_kp1: submitted (debug) job DEBUG_00114
+2026-04-08 14:42:38 - nepflow.run_vasp - INFO -     atoms_128/gpu2_nc02_kp1: submitted (debug) job DEBUG_00115
+2026-04-08 14:42:38 - nepflow.run_vasp - INFO -     atoms_128/gpu2_nc02_kp2: submitted (debug) job DEBUG_00116
+2026-04-08 14:42:38 - nepflow.run_vasp - INFO -     atoms_128/gpu2_nc04_kp1: submitted (debug) job DEBUG_00117
+2026-04-08 14:42:38 - nepflow.run_vasp - INFO -     atoms_128/gpu2_nc04_kp2: submitted (debug) job DEBUG_00118
+2026-04-08 14:42:38 - nepflow.run_vasp - INFO -     atoms_128/gpu2_nc08_kp1: submitted (debug) job DEBUG_00119
+2026-04-08 14:42:38 - nepflow.run_vasp - INFO -     atoms_128/gpu2_nc08_kp2: submitted (debug) job DEBUG_00120
+2026-04-08 14:42:39 - nepflow.run_vasp - INFO -   Status: 44 pending, 0 running, 80 completed, 20 OOM
+2026-04-08 14:42:39 - nepflow.run_vasp - INFO -     atoms_054/gpu4_nc16_kp2: completed
+2026-04-08 14:42:39 - nepflow.run_vasp - INFO -     atoms_054/gpu4_nc16_kp4: completed
+2026-04-08 14:42:39 - nepflow.run_vasp - INFO -     atoms_054/gpu4_nc32_kp1: completed
+2026-04-08 14:42:39 - nepflow.run_vasp - INFO -     atoms_054/gpu4_nc32_kp2: completed
+2026-04-08 14:42:39 - nepflow.run_vasp - INFO -     atoms_054/gpu4_nc32_kp4: OOM
+2026-04-08 14:42:39 - nepflow.run_vasp - INFO -     atoms_054/gpu4_nc64_kp1: completed
+2026-04-08 14:42:39 - nepflow.run_vasp - INFO -     atoms_054/gpu4_nc64_kp2: completed
+2026-04-08 14:42:39 - nepflow.run_vasp - INFO -     atoms_054/gpu4_nc64_kp4: completed
+2026-04-08 14:42:39 - nepflow.run_vasp - INFO -     atoms_128/gpu1_nc02_kp1: completed
+2026-04-08 14:42:39 - nepflow.run_vasp - INFO -     atoms_128/gpu1_nc04_kp1: OOM
+2026-04-08 14:42:40 - nepflow.run_vasp - INFO -     atoms_128/gpu1_nc08_kp1: completed
+2026-04-08 14:42:40 - nepflow.run_vasp - INFO -     atoms_128/gpu1_nc16_kp1: completed
+2026-04-08 14:42:40 - nepflow.run_vasp - INFO -     atoms_128/gpu1_nc32_kp1: completed
+2026-04-08 14:42:40 - nepflow.run_vasp - INFO -     atoms_128/gpu1_nc64_kp1: completed
+2026-04-08 14:42:40 - nepflow.run_vasp - INFO -     atoms_128/gpu2_nc02_kp1: OOM
+2026-04-08 14:42:40 - nepflow.run_vasp - INFO -     atoms_128/gpu2_nc02_kp2: completed
+2026-04-08 14:42:40 - nepflow.run_vasp - INFO -     atoms_128/gpu2_nc04_kp1: completed
+2026-04-08 14:42:40 - nepflow.run_vasp - INFO -     atoms_128/gpu2_nc04_kp2: completed
+2026-04-08 14:42:40 - nepflow.run_vasp - INFO -     atoms_128/gpu2_nc08_kp1: completed
+2026-04-08 14:42:40 - nepflow.run_vasp - INFO -     atoms_128/gpu2_nc08_kp2: OOM
+2026-04-08 14:42:40 - nepflow.run_vasp - INFO -     atoms_128/gpu2_nc16_kp1: submitted (debug) job DEBUG_00121
+2026-04-08 14:42:40 - nepflow.run_vasp - INFO -     atoms_128/gpu2_nc16_kp2: submitted (debug) job DEBUG_00122
+2026-04-08 14:42:40 - nepflow.run_vasp - INFO -     atoms_128/gpu2_nc32_kp1: submitted (debug) job DEBUG_00123
+2026-04-08 14:42:40 - nepflow.run_vasp - INFO -     atoms_128/gpu2_nc32_kp2: submitted (debug) job DEBUG_00124
+2026-04-08 14:42:40 - nepflow.run_vasp - INFO -     atoms_128/gpu2_nc64_kp1: submitted (debug) job DEBUG_00125
+2026-04-08 14:42:40 - nepflow.run_vasp - INFO -     atoms_128/gpu2_nc64_kp2: submitted (debug) job DEBUG_00126
+2026-04-08 14:42:40 - nepflow.run_vasp - INFO -     atoms_128/gpu4_nc02_kp1: submitted (debug) job DEBUG_00127
+2026-04-08 14:42:40 - nepflow.run_vasp - INFO -     atoms_128/gpu4_nc02_kp2: submitted (debug) job DEBUG_00128
+2026-04-08 14:42:40 - nepflow.run_vasp - INFO -     atoms_128/gpu4_nc02_kp4: submitted (debug) job DEBUG_00129
+2026-04-08 14:42:40 - nepflow.run_vasp - INFO -     atoms_128/gpu4_nc04_kp1: submitted (debug) job DEBUG_00130
+2026-04-08 14:42:40 - nepflow.run_vasp - INFO -     atoms_128/gpu4_nc04_kp2: submitted (debug) job DEBUG_00131
+2026-04-08 14:42:40 - nepflow.run_vasp - INFO -     atoms_128/gpu4_nc04_kp4: submitted (debug) job DEBUG_00132
+2026-04-08 14:42:40 - nepflow.run_vasp - INFO -     atoms_128/gpu4_nc08_kp1: submitted (debug) job DEBUG_00133
+2026-04-08 14:42:40 - nepflow.run_vasp - INFO -     atoms_128/gpu4_nc08_kp2: submitted (debug) job DEBUG_00134
+2026-04-08 14:42:40 - nepflow.run_vasp - INFO -     atoms_128/gpu4_nc08_kp4: submitted (debug) job DEBUG_00135
+2026-04-08 14:42:40 - nepflow.run_vasp - INFO -     atoms_128/gpu4_nc16_kp1: submitted (debug) job DEBUG_00136
+2026-04-08 14:42:40 - nepflow.run_vasp - INFO -     atoms_128/gpu4_nc16_kp2: submitted (debug) job DEBUG_00137
+2026-04-08 14:42:40 - nepflow.run_vasp - INFO -     atoms_128/gpu4_nc16_kp4: submitted (debug) job DEBUG_00138
+2026-04-08 14:42:40 - nepflow.run_vasp - INFO -     atoms_128/gpu4_nc32_kp1: submitted (debug) job DEBUG_00139
+2026-04-08 14:42:40 - nepflow.run_vasp - INFO -     atoms_128/gpu4_nc32_kp2: submitted (debug) job DEBUG_00140
+2026-04-08 14:42:40 - nepflow.run_vasp - INFO -   Status: 24 pending, 0 running, 96 completed, 24 OOM
+2026-04-08 14:42:41 - nepflow.run_vasp - INFO -     atoms_128/gpu2_nc16_kp1: completed
+2026-04-08 14:42:41 - nepflow.run_vasp - INFO -     atoms_128/gpu2_nc16_kp2: completed
+2026-04-08 14:42:41 - nepflow.run_vasp - INFO -     atoms_128/gpu2_nc32_kp1: completed
+2026-04-08 14:42:41 - nepflow.run_vasp - INFO -     atoms_128/gpu2_nc32_kp2: completed
+2026-04-08 14:42:41 - nepflow.run_vasp - INFO -     atoms_128/gpu2_nc64_kp1: OOM
+2026-04-08 14:42:41 - nepflow.run_vasp - INFO -     atoms_128/gpu2_nc64_kp2: completed
+2026-04-08 14:42:41 - nepflow.run_vasp - INFO -     atoms_128/gpu4_nc02_kp1: completed
+2026-04-08 14:42:41 - nepflow.run_vasp - INFO -     atoms_128/gpu4_nc02_kp2: completed
+2026-04-08 14:42:41 - nepflow.run_vasp - INFO -     atoms_128/gpu4_nc02_kp4: completed
+2026-04-08 14:42:41 - nepflow.run_vasp - INFO -     atoms_128/gpu4_nc04_kp1: OOM
+2026-04-08 14:42:41 - nepflow.run_vasp - INFO -     atoms_128/gpu4_nc04_kp2: completed
+2026-04-08 14:42:41 - nepflow.run_vasp - INFO -     atoms_128/gpu4_nc04_kp4: completed
+2026-04-08 14:42:41 - nepflow.run_vasp - INFO -     atoms_128/gpu4_nc08_kp1: completed
+2026-04-08 14:42:41 - nepflow.run_vasp - INFO -     atoms_128/gpu4_nc08_kp2: completed
+2026-04-08 14:42:41 - nepflow.run_vasp - INFO -     atoms_128/gpu4_nc08_kp4: OOM
+2026-04-08 14:42:41 - nepflow.run_vasp - INFO -     atoms_128/gpu4_nc16_kp1: completed
+2026-04-08 14:42:41 - nepflow.run_vasp - INFO -     atoms_128/gpu4_nc16_kp2: completed
+2026-04-08 14:42:41 - nepflow.run_vasp - INFO -     atoms_128/gpu4_nc16_kp4: completed
+2026-04-08 14:42:41 - nepflow.run_vasp - INFO -     atoms_128/gpu4_nc32_kp1: completed
+2026-04-08 14:42:41 - nepflow.run_vasp - INFO -     atoms_128/gpu4_nc32_kp2: OOM
+2026-04-08 14:42:41 - nepflow.run_vasp - INFO -     atoms_128/gpu4_nc32_kp4: submitted (debug) job DEBUG_00141
+2026-04-08 14:42:42 - nepflow.run_vasp - INFO -     atoms_128/gpu4_nc64_kp1: submitted (debug) job DEBUG_00142
+2026-04-08 14:42:42 - nepflow.run_vasp - INFO -     atoms_128/gpu4_nc64_kp2: submitted (debug) job DEBUG_00143
+2026-04-08 14:42:42 - nepflow.run_vasp - INFO -     atoms_128/gpu4_nc64_kp4: submitted (debug) job DEBUG_00144
+2026-04-08 14:42:42 - nepflow.run_vasp - INFO -   Status: 4 pending, 0 running, 112 completed, 28 OOM
+2026-04-08 14:42:43 - nepflow.run_vasp - INFO -     atoms_128/gpu4_nc32_kp4: completed
+2026-04-08 14:42:43 - nepflow.run_vasp - INFO -     atoms_128/gpu4_nc64_kp1: completed
+2026-04-08 14:42:43 - nepflow.run_vasp - INFO -     atoms_128/gpu4_nc64_kp2: completed
+2026-04-08 14:42:43 - nepflow.run_vasp - INFO -     atoms_128/gpu4_nc64_kp4: completed
+2026-04-08 14:42:43 - nepflow.run_vasp - INFO -   Status: 0 pending, 0 running, 116 completed, 28 OOM
+2026-04-08 14:42:44 - nepflow.run_vasp - INFO - 
+2026-04-08 14:42:44 - nepflow.run_vasp - INFO -   All benchmark jobs terminal: 116 completed, 28 OOM, 0 failed
+2026-04-08 14:42:47 - nepflow.run_vasp - INFO -   Migrated /mnt/c/Users/vp8194/.files/project_nepflow/.vasp_memory to include oom column
+2026-04-08 14:42:47 - nepflow.run_vasp - INFO -   Wrote 144 entries to /mnt/c/Users/vp8194/.files/project_nepflow/.vasp_memory (116 timed, 28 OOM)
+2026-04-08 14:42:47 - nepflow.run_vasp - INFO - 
+2026-04-08 14:42:47 - nepflow.run_vasp - INFO -   ═══════════════════════════════════════════════════════
+2026-04-08 14:42:47 - nepflow.run_vasp - INFO -   Memory Benchmark Summary
+2026-04-08 14:42:47 - nepflow.run_vasp - INFO -   ═══════════════════════════════════════════════════════
+2026-04-08 14:42:47 - nepflow.run_vasp - INFO - 
+2026-04-08 14:42:47 - nepflow.run_vasp - INFO -   2 atoms: 29 timed, 7 OOM
+2026-04-08 14:42:47 - nepflow.run_vasp - INFO -     GPU=4: best NCORE=2 KPAR=1 avg_loop=10.0000s
+2026-04-08 14:42:47 - nepflow.run_vasp - INFO - 
+2026-04-08 14:42:47 - nepflow.run_vasp - INFO -   16 atoms: 29 timed, 7 OOM
+2026-04-08 14:42:47 - nepflow.run_vasp - INFO -     GPU=4: best NCORE=2 KPAR=1 avg_loop=10.0000s
+2026-04-08 14:42:47 - nepflow.run_vasp - INFO - 
+2026-04-08 14:42:47 - nepflow.run_vasp - INFO -   54 atoms: 29 timed, 7 OOM
+2026-04-08 14:42:47 - nepflow.run_vasp - INFO -     GPU=4: best NCORE=2 KPAR=1 avg_loop=10.0000s
+2026-04-08 14:42:47 - nepflow.run_vasp - INFO - 
+2026-04-08 14:42:47 - nepflow.run_vasp - INFO -   128 atoms: 29 timed, 7 OOM
+2026-04-08 14:42:47 - nepflow.run_vasp - INFO -     GPU=4: best NCORE=2 KPAR=1 avg_loop=10.0000s
+2026-04-08 14:42:47 - nepflow.run_vasp - INFO -   ═══════════════════════════════════════════════════════
+2026-04-08 14:42:47 - nepflow - INFO - Workflow completed successfully

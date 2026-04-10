@@ -13,7 +13,9 @@ from configparser import ConfigParser
 from pathlib import Path
 from typing import List
 
+import numpy as np
 from ase import Atoms
+from ase.build import bulk
 from ase.io import write
 
 from ..base import Stage
@@ -48,6 +50,11 @@ class GenerateStage(Stage):
         # --- global settings ---
         random_seed = config.getint("project", "random_seed", fallback=42)
         elements = self._parse_list(config, "composition", "elements")
+
+        # === DEBUG: generate synthetic structures without external calls ===
+        if self.debug:
+            return self._run_debug(elements, random_seed)
+
         crystal_structures = self._parse_list(config, "generation", "crystal_structures")
         target_n_atoms = config.getint("generation", "target_n_atoms", fallback=250)
 
@@ -241,3 +248,49 @@ class GenerateStage(Stage):
             target_n_atoms=target_n_atoms,
             random_seed=random_seed,
         )
+
+    def _run_debug(self, elements: List[str], random_seed: int) -> None:
+        """Generate 10 synthetic structures for debug/simulation mode."""
+        if not elements:
+            elements = ["Si", "Ge"]
+            logger.info("[DEBUG] No elements in config — using defaults: %s", elements)
+        logger.info("[DEBUG] Generating 10 synthetic structures (no external calls)")
+        rng = np.random.RandomState(random_seed)
+        n_debug = 10
+
+        structures: List[Atoms] = []
+        crystal_types = ["bcc", "fcc"]
+        lattice_a = {"bcc": 3.16, "fcc": 3.80}
+        for i in range(n_debug):
+            crystal = crystal_types[i % len(crystal_types)]
+            elem = elements[0]
+            atoms = bulk(elem, crystal, a=lattice_a[crystal], cubic=True) * (2, 2, 2)
+
+            # Assign random element mix across all sites
+            symbols = [elements[rng.randint(len(elements))]
+                       for _ in range(len(atoms))]
+            atoms.set_chemical_symbols(symbols)
+
+            # Apply small random rattle so structures aren't identical
+            atoms.rattle(stdev=0.01, seed=random_seed + i)
+
+            atoms.info["config_type"] = f"debug_{crystal}_{i:04d}"
+            atoms.info["generator"] = "debug"
+            atoms.info["elements"] = elements
+            structures.append(atoms)
+
+        # Save seeds
+        seeds_dir = self.project_dir / "structures" / "seeds"
+        seeds_dir.mkdir(parents=True, exist_ok=True)
+        seeds_file = seeds_dir / "base_structures.xyz"
+        write(str(seeds_file), structures)
+        logger.info(f"[DEBUG] Saved {n_debug} seed structures to {seeds_file}")
+
+        # Save generated (same as seeds in debug — no perturbation step)
+        generated_dir = self.project_dir / "structures" / "generated"
+        generated_dir.mkdir(parents=True, exist_ok=True)
+        generated_file = generated_dir / "generated_structures.xyz"
+        write(str(generated_file), structures)
+        logger.info(f"[DEBUG] Saved {n_debug} generated structures to {generated_file}")
+
+        logger.info("[DEBUG] Structure generation complete")

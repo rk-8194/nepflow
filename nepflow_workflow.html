@@ -1,0 +1,457 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NEPFlow Workflow Architecture</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 40px 20px;
+        }
+
+        .container {
+            max-width: 1000px;
+            margin: 0 auto;
+        }
+
+        header {
+            text-align: center;
+            color: white;
+            margin-bottom: 50px;
+        }
+
+        header h1 {
+            font-size: 2.5em;
+            margin-bottom: 10px;
+            text-shadow: 2px 2px 4px rgba(0, 0, 0, 0.3);
+        }
+
+        header p {
+            font-size: 1.1em;
+            opacity: 0.9;
+        }
+
+        .workflow {
+            display: flex;
+            flex-direction: column;
+            gap: 20px;
+        }
+
+        .stage {
+            display: grid;
+            grid-template-columns: auto 1fr auto;
+            gap: 20px;
+            align-items: flex-start;
+            position: relative;
+        }
+
+        .connector {
+            position: absolute;
+            left: 24px;
+            top: 50px;
+            width: 2px;
+            height: 30px;
+            background: linear-gradient(to bottom, #667eea, #764ba2);
+            z-index: 1;
+        }
+
+        .stage:first-child .connector {
+            display: none;
+        }
+
+        .stage-number {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            width: 50px;
+            height: 50px;
+            background: white;
+            border-radius: 50%;
+            font-weight: bold;
+            font-size: 1.3em;
+            color: #667eea;
+            flex-shrink: 0;
+        }
+
+        .stage-card {
+            background: white;
+            border-radius: 10px;
+            padding: 25px;
+            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.2);
+            cursor: pointer;
+            transition: all 0.3s ease;
+            position: relative;
+            align-self: stretch;
+        }
+
+        .stage-card:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 15px 40px rgba(0, 0, 0, 0.3);
+        }
+
+        .stage-card.completed {
+            border-left: 4px solid #2e7d32;
+            background: linear-gradient(to right, rgba(200, 230, 201, 0.5), white);
+        }
+
+        .stage-card.pending {
+            border-left: 4px solid #c62828;
+            background: linear-gradient(to right, rgba(255, 204, 204, 0.5), white);
+        }
+
+        .stage-card.optional {
+            border-left: 4px solid #f57f17;
+            background: linear-gradient(to right, rgba(255, 245, 196, 0.5), white);
+        }
+
+        .stage-header {
+            display: flex;
+            align-items: center;
+            gap: 15px;
+            margin-bottom: 15px;
+            border-bottom: 2px solid #f0f0f0;
+            padding-bottom: 10px;
+        }
+
+        .stage-header h2 {
+            font-size: 1.3em;
+            color: #333;
+            margin: 0;
+            flex: 1;
+        }
+
+        .status-badge {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            width: 35px;
+            height: 35px;
+            border-radius: 50%;
+            font-weight: bold;
+            font-size: 1.2em;
+            flex-shrink: 0;
+        }
+
+        .status-badge.completed {
+            background: #2e7d32;
+            color: white;
+        }
+
+        .status-badge.pending {
+            background: #c62828;
+            color: white;
+        }
+
+        .status-badge.optional {
+            background: #f57f17;
+            color: white;
+        }
+
+        .stage-icon {
+            font-size: 1.8em;
+        }
+
+        .stage-content {
+            color: #555;
+            font-size: 0.95em;
+            line-height: 1.6;
+        }
+
+        .stage-content h3 {
+            color: #667eea;
+            margin: 15px 0 10px 0;
+            font-size: 1.05em;
+        }
+
+        .stage-content p {
+            margin: 10px 0;
+        }
+
+        .stage-content ul {
+            margin-left: 20px;
+            margin-bottom: 10px;
+        }
+
+        .stage-content li {
+            margin: 5px 0;
+        }
+
+        .output-box {
+            background: #f8f9fa;
+            border: 1px dashed #0277bd;
+            border-radius: 6px;
+            padding: 12px;
+            margin-top: 12px;
+            font-family: 'Courier New', monospace;
+            font-size: 0.9em;
+            color: #0277bd;
+        }
+
+        .stage-connector-right {
+            width: 50px;
+            height: 4px;
+            background: linear-gradient(to right, #667eea, #764ba2);
+            align-self: center;
+            flex-shrink: 0;
+        }
+
+        .stage:last-child .stage-connector-right {
+            display: none;
+        }
+
+        .legend {
+            display: flex;
+            justify-content: center;
+            gap: 40px;
+            margin-top: 50px;
+            padding: 20px;
+            background: rgba(255, 255, 255, 0.1);
+            border-radius: 10px;
+            color: white;
+            flex-wrap: wrap;
+        }
+
+        .legend-item {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .legend-badge {
+            width: 30px;
+            height: 30px;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: bold;
+            color: white;
+        }
+
+        .legend-badge.completed {
+            background: #2e7d32;
+        }
+
+        .legend-badge.pending {
+            background: #c62828;
+        }
+
+        .legend-badge.optional {
+            background: #f57f17;
+        }
+
+        @media (max-width: 768px) {
+            header h1 {
+                font-size: 1.8em;
+            }
+
+            .stage {
+                grid-template-columns: 1fr;
+            }
+
+            .stage-number {
+                display: none;
+            }
+
+            .stage-connector-right {
+                display: none !important;
+            }
+
+            .connector {
+                display: none !important;
+            }
+
+            .stage-header {
+                flex-direction: column;
+                align-items: flex-start;
+            }
+
+            .legend {
+                gap: 20px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>🚀 NEPFlow Workflow Architecture</h1>
+            <p>Automated Materials Discovery & NEP Force Field Training Pipeline</p>
+        </header>
+
+        <div class="workflow">
+            <!-- INIT STAGE -->
+            <div class="stage">
+                <div class="connector"></div>
+                <div class="stage-number">1</div>
+                <div class="stage-card completed">
+                    <div class="stage-header">
+                        <span class="stage-icon">📁</span>
+                        <h2>Initialize Project</h2>
+                        <div class="status-badge completed">✓</div>
+                    </div>
+                    <div class="stage-content">
+                        <p>Organize the project by creating directory structures for configuration, data, and logs. Load experiment parameters from YAML config files, initialize the logging system for debug/info/error output, and validate that all required files and paths exist.</p>
+                    </div>
+                </div>
+                <div class="stage-connector-right"></div>
+            </div>
+
+            <!-- GENERATE STAGE -->
+            <div class="stage">
+                <div class="connector"></div>
+                <div class="stage-number">2</div>
+                <div class="stage-card completed">
+                    <div class="stage-header">
+                        <span class="stage-icon">🔬</span>
+                        <h2>Generate Structures</h2>
+                        <div class="status-badge completed">✓</div>
+                    </div>
+                    <div class="stage-content">
+                        <p><strong>Layer 1: Composition Grid —</strong> Uniformly sample the elemental composition space for unary, binary, and ternary systems using simplex sampling.</p>
+                        <p><strong>Layer 2: Configurational Generators —</strong> Generate diverse structures from Materials Project phases, random solid solutions, special quasirandom structures (SQS), and segregated layered configurations.</p>
+                        <p><strong>Layer 3: Perturbations —</strong> Expand the dataset with volume scaling, atomic rattling, strain/deformation, vacancies, and interstitials to explore local geometries.</p>
+                        <div class="output-box">📦 structures/generated/generated_structures.xyz</div>
+                    </div>
+                </div>
+                <div class="stage-connector-right"></div>
+            </div>
+
+            <!-- SELECT STAGE -->
+            <div class="stage">
+                <div class="connector"></div>
+                <div class="stage-number">3</div>
+                <div class="stage-card completed">
+                    <div class="stage-header">
+                        <span class="stage-icon">🎯</span>
+                        <h2>Select Structures</h2>
+                        <div class="status-badge completed">✓</div>
+                    </div>
+                    <div class="stage-content">
+                        <p><strong>Algorithm:</strong> Farthest-Point Sampling (Greedy Feedforward)</p>
+                        <p>Load the NEP89 foundation model and compute descriptors for all generated structures. Iteratively select the structure furthest from already-selected ones in descriptor space, filter by minimum distance to avoid redundancy, and cap the dataset to stay within computational budget.</p>
+                        <div class="output-box">📦 structures/selected/selected_structures.xyz</div>
+                    </div>
+                </div>
+                <div class="stage-connector-right"></div>
+            </div>
+
+            <!-- RUN VASP STAGE -->
+            <div class="stage">
+                <div class="connector"></div>
+                <div class="stage-number">4</div>
+                <div class="stage-card completed">
+                    <div class="stage-header">
+                        <span class="stage-icon">⚛️</span>
+                        <h2>Run VASP Calculations</h2>
+                        <div class="status-badge completed">✓</div>
+                    </div>
+                    <div class="stage-content">
+                        <p><strong>Phase 1: Prepare —</strong> Validate INCAR templates, identify unique elements, verify POTCAR pseudo-potential files exist, create struct folders, and write POSCAR/POTCAR/INCAR input files.</p>
+                        <p><strong>Phase 2: Submit & Monitor —</strong> Use ML to predict optimal GPU/CPU allocation, submit jobs to SLURM, continuously poll for completion or failure, and parse OUTCAR results to extract energies and forces.</p>
+                        <p><strong>Phase 3: OOM Recovery —</strong> Detect out-of-memory events, escalate NCORE/KPAR parallelization settings to reduce memory per process, and auto-resubmit with a 7-level retry strategy.</p>
+                        <div class="output-box">📦 vasp/jobs/struct_XXXX/ (OUTCAR, vasprun.xml, WAVECAR, CHG)</div>
+                    </div>
+                </div>
+                <div class="stage-connector-right"></div>
+            </div>
+
+            <!-- TRAIN NEP STAGE -->
+            <div class="stage">
+                <div class="connector"></div>
+                <div class="stage-number">5</div>
+                <div class="stage-card pending">
+                    <div class="stage-header">
+                        <span class="stage-icon">🧠</span>
+                        <h2>Train NEP Model</h2>
+                        <div class="status-badge pending">✗</div>
+                    </div>
+                    <div class="stage-content">
+                        <p><strong>Status:</strong> <em>Not Yet Implemented</em></p>
+                        <p>Parse VASP outputs and extract training data from OUTCAR files. Train NEP force field models on the DFT data, store trained weights for reuse, and test model predictions on validation structures.</p>
+                        <div class="output-box">📦 nep/runs/ (trained_model.txt, training_log.txt)</div>
+                    </div>
+                </div>
+                <div class="stage-connector-right"></div>
+            </div>
+
+            <!-- VALIDATE STAGE -->
+            <div class="stage">
+                <div class="connector"></div>
+                <div class="stage-number">6</div>
+                <div class="stage-card pending">
+                    <div class="stage-header">
+                        <span class="stage-icon">✔️</span>
+                        <h2>Validate Model</h2>
+                        <div class="status-badge pending">✗</div>
+                    </div>
+                    <div class="stage-content">
+                        <p><strong>Status:</strong> <em>Not Yet Implemented</em></p>
+                        <p>Run GPUMD molecular dynamics simulations using the trained NEP model. Compare NEP force predictions against DFT reference calculations, compute error metrics (MAE/RMSE), generate validation reports, and evaluate whether the model is production-ready.</p>
+                        <div class="output-box">📦 reports/ (validation_report.pdf, error_analysis.csv)</div>
+                    </div>
+                </div>
+                <div class="stage-connector-right"></div>
+            </div>
+
+            <!-- MEMORY STAGE -->
+            <div class="stage">
+                <div class="connector"></div>
+                <div class="stage-number">*</div>
+                <div class="stage-card optional">
+                    <div class="stage-header">
+                        <span class="stage-icon">📊</span>
+                        <h2>VASP Parameter Benchmarking</h2>
+                        <div class="status-badge optional">OPT</div>
+                    </div>
+                    <div class="stage-content">
+                        <p><strong>Optional:</strong> Systematic performance benchmarking to optimize VASP parameters. Test BCC tungsten supercells at various sizes across 1–32 GPUs, evaluating different NCORE/KPAR combinations. Record execution timings, capture OOM events, populate the .vasp_memory database, and train a machine learning predictor for automatic parameter selection.</p>
+                        <div class="output-box">📊 .vasp_memory (timing data, OOM records, ML predictor)</div>
+                    </div>
+                </div>
+                <div class="stage-connector-right"></div>
+            </div>
+
+            <!-- END STAGE -->
+            <div class="stage">
+                <div class="connector"></div>
+                <div class="stage-number">✓</div>
+                <div class="stage-card completed">
+                    <div class="stage-header">
+                        <span class="stage-icon">✅</span>
+                        <h2>Pipeline Complete</h2>
+                        <div class="status-badge completed">✓</div>
+                    </div>
+                    <div class="stage-content">
+                        <p>NEPFlow workflow execution finished successfully!</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div class="legend">
+            <div class="legend-item">
+                <div class="legend-badge completed">✓</div>
+                <span>Completed</span>
+            </div>
+            <div class="legend-item">
+                <div class="legend-badge pending">✗</div>
+                <span>Not Yet Implemented</span>
+            </div>
+            <div class="legend-item">
+                <div class="legend-badge optional">OPT</div>
+                <span>Optional/Benchmarking</span>
+            </div>
+        </div>
+    </div>
+</body>
+</html>

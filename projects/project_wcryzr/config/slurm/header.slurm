@@ -13,5 +13,6 @@ module load profile/chem-phys
 module load nvhpc/
 module load cuda/
 module load openmpi/
+module load vasp/6.4.3--hpcx-mpi--2.20--nvhpc--24.9
 
 source $HOME/ase/bin/activate

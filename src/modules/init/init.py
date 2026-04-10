@@ -170,6 +170,31 @@ enabled=true
 
 [slurm]
 enabled=false
+
+# Maximum concurrent VASP jobs for this project (squeue-filtered by project name)
+max_concurrent=20
+
+# Launcher walltime fallback (HH:MM:SS) — normally obtained from SLURM submission script
+# If launcher runs under SLURM, actual time comes from SLURM_JOB_END_TIME or SLURM_JOB_TIMELIMIT env vars
+walltime=03:00:00
+
+# Individual VASP job walltime (HH:MM:SS format)
+vasp_walltime=00:30:00
+
+# Seconds between squeue polls during the launcher loop
+poll_interval=30
+
+# Max OOM retry escalation level (0-6, see adaptive_healing levels)
+max_retry_level=6
+
+[hpc]
+# Node architecture — used to generate valid NCORE/KPAR retry levels
+cores_per_node=64
+gpus_per_node=4
+max_nodes=16
+
+# VASP execution command template ({{ntasks}} is replaced at runtime)
+vasp_command=mpirun -np {{ntasks}} vasp_std
 """
             try:
                 with open(project_config_file, "w", encoding="utf-8") as f:

@@ -20,7 +20,8 @@ class Stage(ABC):
         config_file: Path,
         state_file: Path,
         project_dir: Path,
-        debug: bool = False
+        debug: bool = False,
+        slurm_deadline: float | None = None,
     ):
         """
         Initialize stage.
@@ -31,12 +32,14 @@ class Stage(ABC):
             state_file: Path to project state database
             project_dir: Base directory for project outputs
             debug: Enable debug mode
+            slurm_deadline: Unix timestamp of SLURM walltime deadline
         """
         self.project_name = project_name
         self.config_file = Path(config_file)
         self.state_file = Path(state_file)
         self.project_dir = Path(project_dir)
         self.debug = debug
+        self.slurm_deadline = slurm_deadline
     
     @abstractmethod
     def run(self) -> None:

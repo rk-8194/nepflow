@@ -1,0 +1,46 @@
+graph TD
+    Start([🚀 NEPFlow Start]) 
+    
+    Start --> InitStage["<b>1. INIT STAGE</b> ✓<br/>━━━━━━━━━━━━━━━━━<br/>📁 Initialize Project<br/>• Create project directory<br/>• Load configuration (YAML)<br/>• Setup logging<br/>• Validate project structure"]
+    
+    InitStage --> GenStage["<b>2. GENERATE STAGE</b> ✓<br/>━━━━━━━━━━━━━━━━━<br/>🔬 Generate Structures<br/><br/><b>Layer 1: Composition Grid</b><br/>• Simplex sampling<br/>• Unary/Binary/Ternary<br/><br/><b>Layer 2: Configurational Generators</b><br/>• MP phases<br/>• Random solid solutions<br/>• SQS (icet)<br/>• Segregated (layered)<br/><br/><b>Layer 3: Perturbations</b><br/>• Volume profile changes<br/>• Rattling<br/>• Strain/Deformation<br/>• Vacancies/Interstitials"]
+    
+    GenStage --> GenOut["📦 Output<br/>structures/generated/<br/>generated_structures.xyz"]
+    
+    GenOut --> SelectStage["<b>3. SELECT STAGE</b> ✓<br/>━━━━━━━━━━━━━━━━━<br/>🎯 Structure Selection<br/><b>Algorithm:</b><br/>Farthest-Point Sampling<br/>(Greedy Feedforward)<br/><br/><b>Process:</b><br/>1. Load NEP89 foundation model<br/>2. Compute NEP descriptors<br/>3. Iteratively select structures<br/>   maximizing descriptor diversity<br/>4. Filter by min_distance<br/>5. Limit to max_select count"]
+    
+    SelectStage --> SelectOut["📦 Output<br/>structures/selected/<br/>selected_structures.xyz"]
+    
+    SelectOut --> VaspStage["<b>4. RUN VASP STAGE</b> ✓<br/>━━━━━━━━━━━━━━━━━<br/>⚛️ DFT Calculations<br/><br/><b>Phase 1: Prepare</b><br/>• Validate INCAR template<br/>• Scan elements in structures<br/>• Validate POTCAR files<br/>• Create struct_XXXX folders<br/>• Write POSCAR/POTCAR/INCAR<br/><br/><b>Phase 2: Submit & Monitor</b><br/>• Query ML-predicted params<br/>• Submit to SLURM<br/>• Poll job status<br/>• Parse OUTCAR results<br/><br/><b>Phase 3: OOM Recovery</b><br/>• Detect OOM events<br/>• Escalate NCORE/KPAR<br/>• Auto-resubmit jobs<br/>• 7-level retry table"]
+    
+    VaspStage --> VaspOut["📦 Output<br/>vasp/jobs/struct_XXXX/<br/>OUTCAR, vasprun.xml,<br/>WAVECAR, CHG"]
+    
+    VaspOut --> TrainStage["<b>5. TRAIN NEP STAGE</b> ✗<br/>━━━━━━━━━━━━━━━━━<br/>🧠 Model Training<br/><br/><b>Not Yet Implemented</b><br/><br/>Planned functionality:<br/>• Parse DFT outputs<br/>• Extract forces/energies<br/>• Train NEP models<br/>• Store trained weights<br/>• Generate predictions"]
+    
+    TrainStage --> TrainOut["📦 Output (planned)<br/>nep/runs/<br/>trained_model.txt<br/>training_log.txt"]
+    
+    TrainOut --> ValidStage["<b>6. VALIDATE STAGE</b> ✗<br/>━━━━━━━━━━━━━━━━━<br/>✔️ Model Validation<br/><br/><b>Not Yet Implemented</b><br/><br/>Planned functionality:<br/>• Run GPUMD simulations<br/>• Compare to DFT forces<br/>• Compute MAE/RMSE<br/>• Generate reports<br/>• Evaluate model quality"]
+    
+    ValidStage --> ValidOut["📦 Output (planned)<br/>reports/<br/>validation_report.pdf<br/>error_analysis.csv"]
+    
+    ValidOut --> MemoryOptional["<b>OPTIONAL: MEMORY STAGE</b> ✓<br/>━━━━━━━━━━━━━━━━━<br/>📊 VASP Benchmarking<br/><br/>Systematic performance testing:<br/>• BCC W supercells<br/>• Vary GPU counts (1-32)<br/>• Test NCORE/KPAR combos<br/>• Record timings/OOM events<br/>• Populate .vasp_memory CSV<br/>• Generate parameter predictor"]
+    
+    MemoryOptional --> End([✅ Complete])
+    
+    style InitStage fill:#c8e6c9,stroke:#2e7d32,stroke-width:3px,color:#000
+    style GenStage fill:#c8e6c9,stroke:#2e7d32,stroke-width:3px,color:#000
+    style SelectStage fill:#c8e6c9,stroke:#2e7d32,stroke-width:3px,color:#000
+    style VaspStage fill:#c8e6c9,stroke:#2e7d32,stroke-width:3px,color:#000
+    style MemoryOptional fill:#c8e6c9,stroke:#2e7d32,stroke-width:3px,color:#000
+    
+    style TrainStage fill:#ffcccc,stroke:#c62828,stroke-width:3px,color:#000
+    style ValidStage fill:#ffcccc,stroke:#c62828,stroke-width:3px,color:#000
+    
+    style GenOut fill:#e1f5fe,stroke:#0277bd,stroke-width:2px,color:#000
+    style SelectOut fill:#e1f5fe,stroke:#0277bd,stroke-width:2px,color:#000
+    style VaspOut fill:#e1f5fe,stroke:#0277bd,stroke-width:2px,color:#000
+    style TrainOut fill:#fff9c4,stroke:#f57f17,stroke-width:2px,color:#000
+    style ValidOut fill:#fff9c4,stroke:#f57f17,stroke-width:2px,color:#000
+    
+    style Start fill:#fff176,stroke:#f57f17,stroke-width:3px,color:#000
+    style End fill:#fff176,stroke:#f57f17,stroke-width:3px,color:#000

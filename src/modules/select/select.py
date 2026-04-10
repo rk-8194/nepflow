@@ -33,6 +33,10 @@ class SelectStage(Stage):
     def run(self) -> None:
         logger.info("Running structure selection")
 
+        # === DEBUG: random split without NepCalculator/FPS ===
+        if self.debug:
+            return self._run_debug()
+
         config_path = self._find_config_file()
         config = ConfigParser()
         config.read(config_path)
@@ -240,6 +244,48 @@ class SelectStage(Stage):
             f"  - {project_config}\n"
             f"  - {self.config_file}"
         )
+
+    def _run_debug(self) -> None:
+        """Select structures via random split (no NepCalculator/FPS)."""
+        generated_path = self.project_dir / "structures" / "generated" / "generated_structures.xyz"
+        if not generated_path.exists():
+            raise FileNotFoundError(
+                f"No generated structures found at {generated_path}\n"
+                f"Run the 'generate' stage first."
+            )
+
+        ase_structures = ase_read(str(generated_path), index=":", format="extxyz")
+        n = len(ase_structures)
+        logger.info(f"[DEBUG] Loaded {n} structures from {generated_path}")
+
+        # Fake descriptors (random vectors, shape [N, 10])
+        rng = np.random.RandomState(42)
+        descriptors = rng.randn(n, 10).astype(np.float64)
+        descriptor_cache = self.project_dir / "nep" / "datasets" / "descriptors.npy"
+        descriptor_cache.parent.mkdir(parents=True, exist_ok=True)
+        np.save(descriptor_cache, descriptors)
+        logger.info(f"[DEBUG] Saved random descriptors ({descriptors.shape}) to {descriptor_cache}")
+
+        # Random 70/30 train/test split
+        indices = rng.permutation(n)
+        n_train = max(1, int(round(0.7 * n)))
+        train_indices = sorted(indices[:n_train].tolist())
+        test_indices = sorted(indices[n_train:].tolist())
+        logger.info(f"[DEBUG] Random split: {len(train_indices)} train, {len(test_indices)} test")
+
+        # Save
+        selected_dir = self.project_dir / "structures" / "selected"
+        selected_dir.mkdir(parents=True, exist_ok=True)
+
+        train_path = selected_dir / "train.xyz"
+        ase_write(str(train_path), [ase_structures[i] for i in train_indices], format="extxyz")
+        logger.info(f"[DEBUG] Training set saved to {train_path}")
+
+        test_path = selected_dir / "test.xyz"
+        ase_write(str(test_path), [ase_structures[i] for i in test_indices], format="extxyz")
+        logger.info(f"[DEBUG] Test set saved to {test_path}")
+
+        logger.info("[DEBUG] Structure selection complete")
 
     def _fps_target_count(
         self,

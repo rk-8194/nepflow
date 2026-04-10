@@ -7,6 +7,7 @@ from .select.select import SelectStage
 from .run_vasp.run_vasp import RunVaspStage
 from .train_nep.train_nep import TrainNepStage
 from .validate.validate import ValidateStage
+from .memory.memory import MemoryStage
 
 __all__ = [
     "SelfResubmitExit",
@@ -16,4 +17,5 @@ __all__ = [
     "RunVaspStage",
     "TrainNepStage",
     "ValidateStage",
+    "MemoryStage",
 ]

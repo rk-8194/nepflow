@@ -9,17 +9,14 @@ LREAL = .FALSE. # Whether projection operators are evaluated in real or k-space 
 LASPH = .TRUE. # Include non-spherical contributions related to the gradient of the density in PAW spheres
 LAECHG = .FALSE.
 
-KSPACING = 0.22 # Automatic k-point spacing (no KPOINTS file needed)
+KSPACING = 0.30 # Automatic k-point spacing (no KPOINTS file needed)
 KGAMMA = .TRUE. # Include Gamma point in the mesh
 
-ISPIN = 2
-ISMEAR = 0 # Determines how partical occupancies f_{nk} are set for each orbital. 0 = gaussian,-1 = fermi, etc.
-SIGMA = 0.05
+ISMEAR = 1 # Determines how partical occupancies f_{nk} are set for each orbital. 0 = gaussian,-1 = fermi, etc.
 LSORBIT = .FALSE. # Spin-orbit coupling
 
 ALGO = Normal # Electronic minimisation algorithm
 ENCUT = 520 # Cutoff energy, need to perform convergence on this.
-ENAUG = 1360
 NELM = 200 # Maximum number of selfconsistency (SC) steps which may be performed
 EDIFF = 1E-05 # Global break conditions for electrons in the SC-loop
 

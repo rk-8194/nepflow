@@ -8,6 +8,9 @@ Entry point for the workflow controller.
 import sys
 import argparse
 import logging
+import os
+import subprocess
+import time
 from pathlib import Path
 
 # Check required libraries before doing anything else
@@ -43,6 +46,7 @@ sys.path.insert(0, str(Path(__file__).parent / "src"))
 # pylint: disable=import-error
 from workflow import WorkflowController
 from logging_config import setup_logging
+from modules import SelfResubmitExit
 
 logger = logging.getLogger("nepflow")
 
@@ -56,6 +60,7 @@ def create_parser() -> argparse.ArgumentParser:
 Examples:
   python nepflow.py --project myproject
   python nepflow.py --project myproject --local
+  python nepflow.py --project myproject --memory
   python nepflow.py --project myproject --debug
         """
     )
@@ -87,6 +92,13 @@ Examples:
              "to HPC."
     )
     parser.add_argument(
+        "--memory",
+        action="store_true",
+        help="Run VASP memory/performance benchmarks on BCC W supercells "
+             "to populate .vasp_memory with timing and OOM data. "
+             "Does not advance the workflow stage."
+    )
+    parser.add_argument(
         "--debug",
         action="store_true",
         help="Enable debug mode (no external dependencies required)"
@@ -99,6 +111,76 @@ Examples:
     )
     
     return parser
+
+
+def _get_slurm_walltime_info() -> tuple[int | None, str]:
+    """
+    Get SLURM job walltime information.
+    
+    Returns:
+        (remaining_seconds, source_description) or (None, "not_in_slurm") if not under SLURM
+    """
+    slurm_job_id = os.environ.get("SLURM_JOB_ID")
+    logger.debug("SLURM_JOB_ID env var: %s", slurm_job_id or "(not set)")
+    
+    if not slurm_job_id:
+        return None, "not_in_slurm"
+    
+    start_time = time.time()
+    
+    # Try SLURM_JOB_END_TIME first (Unix timestamp, most accurate)
+    slurm_job_end_time = os.environ.get("SLURM_JOB_END_TIME")
+    logger.debug("SLURM_JOB_END_TIME env var: %s", slurm_job_end_time or "(not set)")
+    
+    if slurm_job_end_time:
+        try:
+            remaining = int(slurm_job_end_time) - int(start_time)
+            logger.debug("Using SLURM_JOB_END_TIME: remaining=%d", remaining)
+            return remaining, "SLURM_JOB_END_TIME"
+        except (ValueError, TypeError) as e:
+            logger.debug("Failed to parse SLURM_JOB_END_TIME: %s", e)
+    
+    # Fallback to SLURM_JOB_TIMELIMIT (in minutes)
+    slurm_timelimit = os.environ.get("SLURM_JOB_TIMELIMIT")
+    logger.debug("SLURM_JOB_TIMELIMIT env var: %s", slurm_timelimit or "(not set)")
+    
+    if slurm_timelimit:
+        try:
+            remaining = int(slurm_timelimit) * 60
+            logger.debug("Using SLURM_JOB_TIMELIMIT: %s min → %d seconds", slurm_timelimit, remaining)
+            return remaining, "SLURM_JOB_TIMELIMIT"
+        except (ValueError, TypeError) as e:
+            logger.debug("Failed to parse SLURM_JOB_TIMELIMIT: %s", e)
+    
+    logger.debug("No SLURM walltime vars available")
+    return None, "slurm_vars_unavailable"
+
+
+def _resubmit_slurm_job(debug: bool = False) -> None:
+    """
+    Resubmit nepflow job to SLURM via sbatch submit.slurm.
+
+    If debug=True, simulates the resubmission without actually launching.
+    """
+    nepflow_root = Path(__file__).parent
+    submit_script = nepflow_root / "submit.slurm"
+
+    logger.info("SLURM walltime deadline approaching — resubmitting nepflow")
+
+    if debug:
+        logger.info("[DEBUG] Would resubmit with: sbatch %s", submit_script)
+        return
+
+    try:
+        result = subprocess.run(
+            ["sbatch", str(submit_script)],
+            capture_output=True, text=True, check=True,
+            cwd=str(nepflow_root),
+        )
+        logger.info("Resubmission via sbatch: %s", result.stdout.strip())
+    except (FileNotFoundError, subprocess.CalledProcessError) as e:
+        logger.error("Could not resubmit job: %s", e)
+        raise
 
 
 def main():
@@ -121,6 +203,27 @@ def main():
     if args.debug:
         logger.debug("Debug mode enabled")
     
+    print(f"[nepflow] Checking SLURM walltime (DEBUG)", file=sys.stderr)
+    logger.debug("Checking for SLURM walltime...")
+    
+    # Get SLURM walltime info (None if not running under SLURM)
+    try:
+        walltime_remaining, walltime_source = _get_slurm_walltime_info()
+        print(f"[nepflow] SLURM walltime result: remaining={walltime_remaining}, source={walltime_source}", file=sys.stderr)
+    except Exception as e:
+        print(f"[nepflow] ERROR detecting SLURM walltime: {e}", file=sys.stderr)
+        logger.error("Error detecting SLURM walltime: %s", e)
+        walltime_remaining, walltime_source = None, "error"
+    
+    margin_seconds = 300  # 5 minutes before deadline
+    
+    if walltime_remaining is None:
+        logger.info("Not running under SLURM — no walltime limit, workflow will run indefinitely")
+        slurm_deadline = None
+    else:
+        slurm_deadline = time.time() + walltime_remaining - margin_seconds
+        logger.info("SLURM walltime: %ds (source: %s), deadline in %ds", walltime_remaining, walltime_source, walltime_remaining - margin_seconds)
+    
     # Create workflow controller
     controller = WorkflowController(
         project_name=args.project,
@@ -129,13 +232,28 @@ def main():
         debug=args.debug,
         stage_override=args.stage,
         local_mode=args.local,
+        memory_mode=getattr(args, 'memory', False),
+        slurm_deadline=slurm_deadline,
     )
     
     # Run workflow: controller determines current stage from .project file
+    # If under SLURM and approaching deadline, resubmit before running
     try:
+        if slurm_deadline and time.time() >= slurm_deadline:
+            logger.warning("Already past SLURM deadline — resubmitting immediately")
+            _resubmit_slurm_job(debug=args.debug)
+            return
+        
         controller.run()
         logger.info("Workflow completed successfully")
         print("✓ Workflow completed successfully")
+        
+    except SelfResubmitExit as e:
+        # Workflow reached SLURM deadline — resubmit
+        logger.info("Workflow resubmit triggered: %s", e)
+        _resubmit_slurm_job(debug=args.debug)
+        logger.info("Resubmission initiated, exiting")
+        return
         
     except (ValueError, IOError, RuntimeError) as e:
         # Log the error (message only, not traceback)
