@@ -1,33 +1,34 @@
 """
-Structure generation stage — unified orchestration.
+Structure generation stage - unified orchestration.
 
 Pipeline:
-  1. Parse config → build composition grid
-  2. For each composition → run configurational generators → base structures
-  3. For each base structure → PerturbationEngine.process() → perturbed variants
+  1. Parse config -> build composition grid
+  2. For each composition -> run configurational generators -> base structures
+  3. For each base structure -> PerturbationEngine.process() -> perturbed variants
   4. Save all structures + summary
 """
 
 import logging
+import random
+import subprocess
 from configparser import ConfigParser
 from pathlib import Path
 from typing import List
 
-import numpy as np
 from ase import Atoms
 from ase.build import bulk
 from ase.io import write
 
 from ..base import Stage
-from .composition import CompositionGrid
-from .configurational import (
+from .generators import (
+    CompositionGrid,
     MaterialsProjectGenerator,
+    PerturbationEngine,
     RandomSolidSolutionGenerator,
     SegregatedGenerator,
     SQSGenerator,
+    get_materials_project_fetcher,
 )
-from .materials_project import get_materials_project_fetcher
-from .structure_generation import PerturbationEngine
 
 logger = logging.getLogger("nepflow.generate")
 
@@ -38,98 +39,124 @@ class GenerateStage(Stage):
     def run(self, seeds_only: bool = False) -> None:
         logger.info("Running structure generation")
 
-        config_path = self._find_config_file()
-        config = ConfigParser()
-        config.read(config_path)
-        logger.debug(f"Loaded config from {config_path}")
+        config, settings = self.load_config()
 
-        for section in ("composition", "generation"):
-            if not config.has_section(section):
-                raise ValueError(f"Config missing [{section}] section")
-
-        # --- global settings ---
-        random_seed = config.getint("project", "random_seed", fallback=42)
-        elements = self._parse_list(config, "composition", "elements")
-
-        # === DEBUG: generate synthetic structures without external calls ===
         if self.debug:
-            return self._run_debug(elements, random_seed)
-
-        crystal_structures = self._parse_list(config, "generation", "crystal_structures")
-        target_n_atoms = config.getint("generation", "target_n_atoms", fallback=250)
-
-        logger.info(f"Elements: {elements}")
-        logger.info(f"Crystal structures: {crystal_structures}")
-
-        seeds_dir = self.project_dir / "structures" / "seeds"
-        seeds_file = seeds_dir / "base_structures.xyz"
-
-        # Resume: if seeds already exist, load them and skip to perturbations
-        if not seeds_only and seeds_file.exists():
-            from ase.io import read as ase_read
-            logger.info("Found existing seeds — loading from %s", seeds_file)
-            all_bases = ase_read(str(seeds_file), index=":")
-            logger.info(f"  Loaded {len(all_bases)} base structures from seeds")
-        else:
-            # ----------------------------------------------------------
-            # Step 1: composition grid
-            # ----------------------------------------------------------
-            logger.info("")
-            logger.info("Step 1: Building composition grid")
-            grid = CompositionGrid(
-                elements=elements,
-                step=config.getfloat("composition", "composition_step", fallback=0.1),
-                include_pure=config.getboolean("composition", "include_pure_elements", fallback=True),
-                include_binaries=config.getboolean("composition", "include_binaries", fallback=True),
-                include_ternaries=config.getboolean("composition", "include_ternaries", fallback=True),
+            return self._run_debug(
+                settings["elements"],
+                settings["random_seed"],
+                gas_elements=settings["gas_elements"],
             )
-            compositions = grid.generate()
-            logger.info(f"  {len(compositions)} compositions")
 
-            # ----------------------------------------------------------
-            # Step 2: configurational generators
-            # ----------------------------------------------------------
-            logger.info("")
-            logger.info("Step 2: Generating base structures (configurational generators)")
-            generators = self._build_generators(config, elements, random_seed)
-            if not generators:
-                logger.warning("No configurational generators enabled")
-                return
-
-            all_bases: List[Atoms] = []
-            for comp in compositions:
-                label = CompositionGrid.format_composition(comp)
-                for gen_name, gen in generators:
-                    bases = gen.generate(comp, crystal_structures, target_n_atoms)
-                    for b in bases:
-                        b.info.setdefault("composition", comp)
-                        b.info.setdefault("elements", elements)
-                    all_bases.extend(bases)
-                    if bases:
-                        logger.debug(f"  {label} / {gen_name}: {len(bases)} structures")
-
-            logger.info(f"  Total base structures: {len(all_bases)}")
-
-            if not all_bases:
-                logger.warning("No base structures generated — aborting")
-                return
-
-            # Save seeds
-            seeds_dir.mkdir(parents=True, exist_ok=True)
-            write(str(seeds_file), all_bases)
-            logger.info(f"  Saved seeds to {seeds_file}")
-
-        # In seeds_only mode, stop here (no perturbations)
-        if seeds_only:
-            logger.info("Seeds-only mode — skipping perturbations")
+        all_bases = self.resume_if_needed(config, settings, seeds_only=seeds_only)
+        if all_bases is None:
             return
 
-        # ----------------------------------------------------------
-        # Step 3: perturbations
-        # ----------------------------------------------------------
+        if seeds_only:
+            logger.info("Seeds-only mode - skipping perturbations")
+            self._offer_project_upload(config)
+            return
+
+        summary = self.execute(config, settings, all_bases)
+        self.finalize(summary)
+
+        logger.info("")
+        logger.info("Structure generation complete")
+
+    # ==================================================================
+    # stage lifecycle
+    # ==================================================================
+
+    def load_config(self) -> tuple[ConfigParser, dict]:
+        """Load, validate, and summarise the stage configuration."""
+        config_path = self._find_config_file()
+        config = self._load_config()
+        logger.debug(f"Loaded config from {config_path}")
+
+        self._validate_config(config)
+        settings = self._load_settings(config)
+        self._log_settings(settings)
+        return config, settings
+
+    def resume_if_needed(
+        self,
+        config: ConfigParser,
+        settings: dict,
+        seeds_only: bool = False,
+    ) -> List[Atoms] | None:
+        """Reuse saved seeds when possible, otherwise prepare fresh bases."""
+        seeds_file = self._seeds_file()
+        if not seeds_only and seeds_file.exists():
+            return self._load_saved_bases(seeds_file)
+        return self.prepare(config, settings)
+
+    def prepare(
+        self,
+        config: ConfigParser,
+        settings: dict,
+    ) -> List[Atoms] | None:
+        """Build or fetch the base structures for later perturbation."""
+        compositions = self._build_compositions(config, settings["elements"])
+        generators = self._build_generators(
+            config,
+            settings["elements"],
+            settings["random_seed"],
+            gas_elements=settings["gas_elements"],
+        )
+        if not generators:
+            logger.warning("No configurational generators enabled")
+            return None
+
+        all_bases: List[Atoms] = []
+        logger.info("")
+        logger.info("Step 2: Generating base structures (configurational generators)")
+        for composition in compositions:
+            label = CompositionGrid.format_composition(composition)
+            for gen_name, gen in generators:
+                bases = gen.generate(
+                    composition,
+                    settings["crystal_structures"],
+                    settings["target_n_atoms"],
+                )
+                self._annotate_base_structures(
+                    bases,
+                    composition,
+                    settings["elements"],
+                    settings["gas_elements"],
+                )
+                all_bases.extend(bases)
+                if bases:
+                    logger.debug(f"  {label} / {gen_name}: {len(bases)} structures")
+
+        if settings["gas_elements"]:
+            self._extend_with_gas_phase_bases(all_bases, generators, settings)
+
+        logger.info(f"  Total base structures: {len(all_bases)}")
+        if not all_bases:
+            logger.warning("No base structures generated - aborting")
+            return None
+
+        seeds_file = self._seeds_file()
+        seeds_file.parent.mkdir(parents=True, exist_ok=True)
+        write(str(seeds_file), all_bases)
+        logger.info(f"  Saved seeds to {seeds_file}")
+        return all_bases
+
+    def execute(
+        self,
+        config: ConfigParser,
+        settings: dict,
+        all_bases: List[Atoms],
+    ) -> dict:
+        """Apply perturbations to the prepared base structures."""
         logger.info("")
         logger.info("Step 3: Applying perturbations")
-        engine = self._build_engine(config, target_n_atoms, random_seed)
+        engine = self._build_engine(
+            config,
+            settings["target_n_atoms"],
+            settings["random_seed"],
+            gas_elements=settings["gas_elements"],
+        )
 
         generated_dir = self.project_dir / "structures" / "generated"
         engine.process(
@@ -140,13 +167,27 @@ class GenerateStage(Stage):
             n_deformed=config.getint("generation", "n_deformed", fallback=10),
             n_vacancies=config.getint("generation", "n_vacancies", fallback=10),
             n_interstitials=config.getint("generation", "n_interstitials", fallback=10),
+            n_gas_interstitials=(
+                config.getint("generation", "n_gas_interstitials", fallback=10)
+                if settings["gas_elements"]
+                else 0
+            ),
+            n_vacancy_interstitial=(
+                config.getint("generation", "n_vacancy_interstitial", fallback=10)
+                if settings["gas_elements"]
+                else 0
+            ),
+            n_gas_in_vacancy=(
+                config.getint("generation", "n_gas_in_vacancy", fallback=10)
+                if settings["gas_elements"]
+                else 0
+            ),
             n_workers=config.getint("generation", "n_workers", fallback=0),
         )
+        return engine.get_summary()
 
-        # ----------------------------------------------------------
-        # Step 4: report
-        # ----------------------------------------------------------
-        summary = engine.get_summary()
+    def finalize(self, summary: dict) -> None:
+        """Log the stage summary after successful execution."""
         logger.info("")
         logger.info(f"Total structures: {summary['total']}")
         logger.info("By perturbation type:")
@@ -156,24 +197,139 @@ class GenerateStage(Stage):
         for ctype, count in sorted(summary["by_config"].items()):
             logger.info(f"  {ctype:25s}: {count:5d}")
 
+    def _offer_project_upload(self, config: ConfigParser) -> None:
+        """Offer to copy the project to the configured remote NEPFlow folder."""
+        scp_address = config.get("hpc", "scp_address", fallback="").strip()
+        if not scp_address:
+            logger.debug("No hpc.scp_address configured - skipping upload prompt")
+            return
+
+        remote_target = f"{scp_address.rstrip('/')}/projects/{self.project_dir.name}"
+        print()
+        print("Local seed generation is complete.")
+        response = input(
+            f"Upload project to the remote projects folder at {remote_target}? [y/N]: "
+        ).strip().lower()
+        if response not in {"y", "yes"}:
+            logger.info("Project upload skipped")
+            return
+
+        logger.info("Uploading project to %s", remote_target)
+        try:
+            subprocess.run(
+                ["scp", "-r", str(self.project_dir), remote_target],
+                check=True,
+            )
+        except FileNotFoundError as e:
+            raise FileNotFoundError("scp was not found on PATH") from e
+        logger.info("Project upload complete")
+
+    @staticmethod
+    def _validate_config(config: ConfigParser) -> None:
+        for section in ("composition", "generation"):
+            if not config.has_section(section):
+                raise ValueError(f"Config missing [{section}] section")
+
+    def _load_settings(self, config: ConfigParser) -> dict:
+        return {
+            "random_seed": config.getint("project", "random_seed", fallback=42),
+            "elements": self._parse_list(config, "composition", "elements"),
+            "gas_elements": (
+                self._parse_list(config, "composition", "gasElements")
+                if config.has_option("composition", "gasElements")
+                else []
+            ),
+            "crystal_structures": self._parse_list(
+                config, "generation", "crystal_structures"
+            ),
+            "target_n_atoms": config.getint("generation", "target_n_atoms", fallback=250),
+        }
+
+    @staticmethod
+    def _log_settings(settings: dict) -> None:
+        logger.info(f"Elements: {settings['elements']}")
+        if settings["gas_elements"]:
+            logger.info(f"Gas elements: {settings['gas_elements']}")
+        logger.info(f"Crystal structures: {settings['crystal_structures']}")
+
+    def _seeds_file(self) -> Path:
+        return self.project_dir / "structures" / "seeds" / "base_structures.xyz"
+
+    @staticmethod
+    def _load_saved_bases(seeds_file: Path) -> List[Atoms]:
+        from ase.io import read as ase_read
+
+        logger.info("Found existing seeds - loading from %s", seeds_file)
+        all_bases = ase_read(str(seeds_file), index=":")
+        logger.info(f"  Loaded {len(all_bases)} base structures from seeds")
+        if isinstance(all_bases, list):
+            return all_bases
+        return [all_bases]
+
+    def _build_compositions(
+        self,
+        config: ConfigParser,
+        elements: List[str],
+    ) -> List[dict[str, float]]:
         logger.info("")
-        logger.info("Structure generation complete")
-
-    # ==================================================================
-    # helpers
-    # ==================================================================
-
-    def _find_config_file(self) -> Path:
-        project_config = self.project_dir / "config" / "project.config"
-        if project_config.exists():
-            return project_config
-        if self.config_file.exists():
-            return self.config_file
-        raise FileNotFoundError(
-            f"Config file not found. Tried:\n"
-            f"  - {project_config}\n"
-            f"  - {self.config_file}"
+        logger.info("Step 1: Building composition grid")
+        grid = CompositionGrid(
+            elements=elements,
+            step=config.getfloat("composition", "composition_step", fallback=0.1),
+            include_pure=config.getboolean(
+                "composition", "include_pure_elements", fallback=True
+            ),
+            include_binaries=config.getboolean(
+                "composition", "include_binaries", fallback=True
+            ),
+            include_ternaries=config.getboolean(
+                "composition", "include_ternaries", fallback=True
+            ),
         )
+        compositions = grid.generate()
+        logger.info(f"  {len(compositions)} compositions")
+        return compositions
+
+    @staticmethod
+    def _annotate_base_structures(
+        bases: List[Atoms],
+        composition: dict[str, float],
+        elements: List[str],
+        gas_elements: List[str],
+    ) -> None:
+        for base in bases:
+            base.info.setdefault("composition", composition)
+            base.info.setdefault("elements", elements)
+            if gas_elements:
+                base.info.setdefault("gas_elements", gas_elements)
+
+    def _extend_with_gas_phase_bases(
+        self,
+        all_bases: List[Atoms],
+        generators: List[tuple],
+        settings: dict,
+    ) -> None:
+        logger.info("")
+        logger.info("Step 2b: Fetching gas-phase structures from Materials Project")
+        mp_gen = self._get_mp_generator(generators)
+        if mp_gen is None:
+            logger.warning("  MP generator not available - skipping gas-phase fetch")
+            return
+
+        gas_bases = mp_gen.generate_gas_phases(
+            metal_elements=settings["elements"],
+            gas_elements=settings["gas_elements"],
+            target_n_atoms=settings["target_n_atoms"],
+        )
+        for base in gas_bases:
+            base.info.setdefault("elements", settings["elements"])
+            base.info.setdefault("gas_elements", settings["gas_elements"])
+        all_bases.extend(gas_bases)
+        logger.info(f"  Gas-phase base structures: {len(gas_bases)}")
+
+    # ==================================================================
+    # generation helpers
+    # ==================================================================
 
     @staticmethod
     def _parse_list(config: ConfigParser, section: str, option: str) -> List[str]:
@@ -181,7 +337,8 @@ class GenerateStage(Stage):
         return [item.strip() for item in value.split(",") if item.strip()]
 
     def _build_generators(
-        self, config: ConfigParser, elements: List[str], random_seed: int  # noqa: ARG002
+        self, config: ConfigParser, elements: List[str], random_seed: int,  # noqa: ARG002
+        gas_elements: List[str] | None = None,
     ) -> List[tuple]:
         """Instantiate enabled configurational generators."""
         generators: List[tuple] = []
@@ -191,7 +348,10 @@ class GenerateStage(Stage):
                 fetcher = get_materials_project_fetcher(dict(config))
                 generators.append((
                     "MaterialsProject",
-                    MaterialsProjectGenerator(fetcher, max_per_composition=5),
+                    MaterialsProjectGenerator(
+                        fetcher, max_per_composition=5,
+                        gas_elements=gas_elements,
+                    ),
                 ))
             except Exception as e:
                 logger.warning(f"Cannot initialise MP fetcher: {e}")
@@ -221,8 +381,17 @@ class GenerateStage(Stage):
         return generators
 
     @staticmethod
+    def _get_mp_generator(generators: List[tuple]):
+        """Extract the MaterialsProjectGenerator from the generators list."""
+        for name, gen in generators:
+            if isinstance(gen, MaterialsProjectGenerator):
+                return gen
+        return None
+
+    @staticmethod
     def _build_engine(
-        config: ConfigParser, target_n_atoms: int, random_seed: int
+        config: ConfigParser, target_n_atoms: int, random_seed: int,
+        gas_elements: List[str] | None = None,
     ) -> PerturbationEngine:
         return PerturbationEngine(
             rattle_std=config.getfloat("generation", "rattle_std", fallback=0.03),
@@ -247,15 +416,21 @@ class GenerateStage(Stage):
             n_volume_points=config.getint("generation", "n_volume_points", fallback=11),
             target_n_atoms=target_n_atoms,
             random_seed=random_seed,
+            gas_elements=gas_elements or [],
+            gas_interstitial_d_min=config.getfloat("generation", "gas_interstitial_d_min", fallback=1.2),
+            max_gas_occupancy=config.getint("generation", "max_gas_occupancy", fallback=3),
         )
 
-    def _run_debug(self, elements: List[str], random_seed: int) -> None:
+    def _run_debug(self, elements: List[str], random_seed: int,
+                    gas_elements: List[str] | None = None) -> None:
         """Generate 10 synthetic structures for debug/simulation mode."""
         if not elements:
             elements = ["Si", "Ge"]
-            logger.info("[DEBUG] No elements in config — using defaults: %s", elements)
+            logger.info("[DEBUG] No elements in config - using defaults: %s", elements)
         logger.info("[DEBUG] Generating 10 synthetic structures (no external calls)")
-        rng = np.random.RandomState(random_seed)
+        if gas_elements:
+            logger.info("[DEBUG] Gas elements: %s", gas_elements)
+        rng = random.Random(random_seed)
         n_debug = 10
 
         structures: List[Atoms] = []
@@ -267,7 +442,7 @@ class GenerateStage(Stage):
             atoms = bulk(elem, crystal, a=lattice_a[crystal], cubic=True) * (2, 2, 2)
 
             # Assign random element mix across all sites
-            symbols = [elements[rng.randint(len(elements))]
+            symbols = [elements[rng.randrange(len(elements))]
                        for _ in range(len(atoms))]
             atoms.set_chemical_symbols(symbols)
 
@@ -277,20 +452,46 @@ class GenerateStage(Stage):
             atoms.info["config_type"] = f"debug_{crystal}_{i:04d}"
             atoms.info["generator"] = "debug"
             atoms.info["elements"] = elements
+            if gas_elements:
+                atoms.info["gas_elements"] = gas_elements
             structures.append(atoms)
+
+        # Generate a few gas-interstitial debug structures
+        if gas_elements:
+            from ase import Atom
+            n_gas_debug = 5
+            logger.info("[DEBUG] Generating %d gas-interstitial debug structures", n_gas_debug)
+            for i in range(n_gas_debug):
+                base = structures[i % len(structures)].copy()
+                # Insert 1-3 gas atoms at random positions
+                n_insert = rng.randint(1, 3)
+                for _ in range(n_insert):
+                    gas_elem = gas_elements[rng.randrange(len(gas_elements))]
+                    frac = [rng.random() for _ in range(3)]
+                    pos = [
+                        sum(frac[j] * float(base.cell[j][axis]) for j in range(3))
+                        for axis in range(3)
+                    ]
+                    base.append(Atom(symbol=gas_elem, position=pos))
+                base.info["config_type"] = f"debug_gas_interstitial_{i:04d}"
+                base.info["generator"] = "debug"
+                base.info["perturbation_type"] = "gas_interstitial"
+                base.info["elements"] = elements
+                base.info["gas_elements"] = gas_elements
+                structures.append(base)
 
         # Save seeds
         seeds_dir = self.project_dir / "structures" / "seeds"
         seeds_dir.mkdir(parents=True, exist_ok=True)
         seeds_file = seeds_dir / "base_structures.xyz"
         write(str(seeds_file), structures)
-        logger.info(f"[DEBUG] Saved {n_debug} seed structures to {seeds_file}")
+        logger.info(f"[DEBUG] Saved {len(structures)} seed structures to {seeds_file}")
 
-        # Save generated (same as seeds in debug — no perturbation step)
+        # Save generated (same as seeds in debug - no perturbation step)
         generated_dir = self.project_dir / "structures" / "generated"
         generated_dir.mkdir(parents=True, exist_ok=True)
         generated_file = generated_dir / "generated_structures.xyz"
         write(str(generated_file), structures)
-        logger.info(f"[DEBUG] Saved {n_debug} generated structures to {generated_file}")
+        logger.info(f"[DEBUG] Saved {len(structures)} generated structures to {generated_file}")
 
         logger.info("[DEBUG] Structure generation complete")

@@ -42,6 +42,9 @@ def _process_one_base(args: tuple) -> List[Atoms]:
         n_deformed,
         n_vacancies,
         n_interstitials,
+        n_gas_interstitials,
+        n_vacancy_interstitial,
+        n_gas_in_vacancy,
         seed,
     ) = args
 
@@ -66,6 +69,12 @@ def _process_one_base(args: tuple) -> List[Atoms]:
     results.extend(engine._vacancies(supercell, base, n_vacancies))
     results.extend(engine._interstitials(supercell, base, n_interstitials))
 
+    # 4) Gas-specific perturbations
+    if engine.gas_elements:
+        results.extend(engine._gas_interstitials(supercell, base, n_gas_interstitials))
+        results.extend(engine._vacancy_interstitial(supercell, base, n_vacancy_interstitial))
+        results.extend(engine._gas_in_vacancy(supercell, base, n_gas_in_vacancy))
+
     return results
 
 
@@ -88,6 +97,9 @@ class PerturbationEngine:
         n_volume_points: int = 11,
         target_n_atoms: int = 250,
         random_seed: int = 42,
+        gas_elements: List[str] | None = None,
+        gas_interstitial_d_min: float | None = None,
+        max_gas_occupancy: int = 3,
     ):
         self.rattle_std = rattle_std
         self.rattle_d_min = rattle_d_min
@@ -100,6 +112,9 @@ class PerturbationEngine:
         self.target_n_atoms = target_n_atoms
         self.rng = np.random.RandomState(random_seed)
         self._random_seed = random_seed
+        self.gas_elements = gas_elements or []
+        self.gas_interstitial_d_min = gas_interstitial_d_min if gas_interstitial_d_min is not None else interstitial_d_min
+        self.max_gas_occupancy = max_gas_occupancy
 
         # Lightweight summary counters (no Atoms kept in memory)
         self._total: int = 0
@@ -120,6 +135,9 @@ class PerturbationEngine:
             n_volume_points=self.n_volume_points,
             target_n_atoms=self.target_n_atoms,
             random_seed=self._random_seed,
+            gas_elements=self.gas_elements,
+            gas_interstitial_d_min=self.gas_interstitial_d_min,
+            max_gas_occupancy=self.max_gas_occupancy,
         )
 
     # ------------------------------------------------------------------
@@ -135,6 +153,9 @@ class PerturbationEngine:
         n_deformed: int = 10,
         n_vacancies: int = 10,
         n_interstitials: int = 10,
+        n_gas_interstitials: int = 0,
+        n_vacancy_interstitial: int = 0,
+        n_gas_in_vacancy: int = 0,
         n_workers: int = 0,
     ) -> Path:
         """Run all perturbation types on *base_structures*, streaming to disk.
@@ -165,7 +186,9 @@ class PerturbationEngine:
 
         work_args = [
             (base, params, n_rattled, n_strained, n_deformed,
-             n_vacancies, n_interstitials, base_seeds[i])
+             n_vacancies, n_interstitials,
+             n_gas_interstitials, n_vacancy_interstitial, n_gas_in_vacancy,
+             base_seeds[i])
             for i, base in enumerate(base_structures)
         ]
 
@@ -370,12 +393,13 @@ class PerturbationEngine:
         cell: np.ndarray,
         inv_cell: np.ndarray,
         max_attempts: int = 500,
+        d_min: float | None = None,
     ):
         """Find a valid interstitial position using fast PBC distance check.
 
         Returns the position array or None if placement failed.
         """
-        d_min_sq = self.interstitial_d_min ** 2
+        d_min_sq = (d_min or self.interstitial_d_min) ** 2
 
         for _ in range(max_attempts):
             frac = self.rng.random(3)
@@ -389,3 +413,210 @@ class PerturbationEngine:
             if float(np.min(dist_sq)) >= d_min_sq:
                 return pos
         return None
+
+    def _find_site_near(
+        self,
+        centre: np.ndarray,
+        positions: np.ndarray,
+        cell: np.ndarray,
+        inv_cell: np.ndarray,
+        radius: float = 2.0,
+        d_min: float | None = None,
+        max_attempts: int = 500,
+    ):
+        """Find a valid position within *radius* of *centre*, respecting d_min to existing atoms.
+
+        Returns the position array or None if placement failed.
+        """
+        d_min_sq = (d_min or self.gas_interstitial_d_min) ** 2
+
+        for _ in range(max_attempts):
+            # Random offset within a sphere of given radius
+            direction = self.rng.normal(size=3)
+            direction /= np.linalg.norm(direction) + 1e-12
+            r = radius * self.rng.random() ** (1.0 / 3.0)
+            pos = centre + direction * r
+
+            # Wrap into cell using fractional coordinates
+            frac_pos = pos @ inv_cell
+            frac_pos -= np.floor(frac_pos)
+            pos = frac_pos @ cell
+
+            if len(positions) == 0:
+                return pos
+
+            diff = positions - pos
+            frac_diff = diff @ inv_cell
+            frac_diff -= np.rint(frac_diff)
+            cart_diff = frac_diff @ cell
+            dist_sq = np.sum(cart_diff * cart_diff, axis=1)
+            if float(np.min(dist_sq)) >= d_min_sq:
+                return pos
+        return None
+
+    # ------------------------------------------------------------------
+    # gas-specific perturbation generators
+    # ------------------------------------------------------------------
+
+    def _gas_interstitials(self, supercell: Atoms, base: Atoms, n: int) -> List[Atoms]:
+        """Insert interstitial atoms drawn only from gas elements."""
+        if not self.gas_elements:
+            return []
+
+        cell = np.array(supercell.cell)
+        inv_cell = np.linalg.inv(cell)
+
+        out: List[Atoms] = []
+        for _ in range(n):
+            positions = supercell.get_positions().copy()
+            new_positions: List[np.ndarray] = []
+            new_symbols: List[str] = []
+
+            frac = self.rng.uniform(self.interstitial_range[0], self.interstitial_range[1])
+            n_add = max(1, int(frac * len(supercell)))
+
+            for _ in range(n_add):
+                pos = self._find_interstitial_site(
+                    positions, cell, inv_cell, max_attempts=500,
+                    d_min=self.gas_interstitial_d_min,
+                )
+                if pos is not None:
+                    new_positions.append(pos)
+                    new_symbols.append(
+                        self.gas_elements[self.rng.randint(len(self.gas_elements))]
+                    )
+                    positions = np.vstack([positions, pos])
+
+            a = supercell.copy()
+            for pos, sym in zip(new_positions, new_symbols):
+                a.append(Atom(symbol=sym, position=pos))
+            self._tag(a, base, "gas_interstitial", n_gas_interstitials=len(new_positions))
+            out.append(a)
+        return out
+
+    def _vacancy_interstitial(self, supercell: Atoms, base: Atoms, n: int) -> List[Atoms]:
+        """Create structures with both vacancies and interstitials (metal + gas)."""
+        all_elements = base.info.get("elements", list(set(supercell.get_chemical_symbols())))
+        if isinstance(all_elements, str):
+            all_elements = [all_elements]
+        all_elements = list(all_elements) + [g for g in self.gas_elements if g not in all_elements]
+
+        cell = np.array(supercell.cell)
+        inv_cell = np.linalg.inv(cell)
+
+        out: List[Atoms] = []
+        for _ in range(n):
+            v = supercell.copy()
+
+            # --- vacancy part ---
+            vac_frac = self.rng.uniform(self.vacancy_range[0], self.vacancy_range[1])
+            n_remove = max(1, int(vac_frac * len(v)))
+            n_remove = min(n_remove, len(v) - 1)
+            keep = sorted(self.rng.choice(len(v), size=len(v) - n_remove, replace=False))
+            v = v[keep]
+
+            # --- interstitial part ---
+            positions = v.get_positions().copy()
+            new_positions: List[np.ndarray] = []
+            new_symbols: List[str] = []
+
+            int_frac = self.rng.uniform(self.interstitial_range[0], self.interstitial_range[1])
+            n_add = max(1, int(int_frac * len(supercell)))
+
+            for _ in range(n_add):
+                # Use gas_interstitial_d_min for gas species, regular for metals
+                elem = all_elements[self.rng.randint(len(all_elements))]
+                d_min = self.gas_interstitial_d_min if elem in self.gas_elements else self.interstitial_d_min
+                pos = self._find_interstitial_site(
+                    positions, cell, inv_cell, max_attempts=500, d_min=d_min,
+                )
+                if pos is not None:
+                    new_positions.append(pos)
+                    new_symbols.append(elem)
+                    positions = np.vstack([positions, pos])
+
+            for pos, sym in zip(new_positions, new_symbols):
+                v.append(Atom(symbol=sym, position=pos))
+            self._tag(v, base, "vacancy_interstitial",
+                      n_vacancies=n_remove, n_interstitials=len(new_positions))
+            out.append(v)
+        return out
+
+    def _gas_in_vacancy(self, supercell: Atoms, base: Atoms, n: int) -> List[Atoms]:
+        """Place gas atoms at/near vacancy sites (including multi-occupancy)."""
+        if not self.gas_elements:
+            return []
+
+        cell = np.array(supercell.cell)
+        inv_cell = np.linalg.inv(cell)
+
+        out: List[Atoms] = []
+        for _ in range(n):
+            v = supercell.copy()
+            n_atoms = len(v)
+
+            # Pick a random atom to remove (the vacancy site)
+            vac_idx = self.rng.randint(n_atoms)
+            vacancy_pos = v.get_positions()[vac_idx].copy()
+            vacancy_element = v.get_chemical_symbols()[vac_idx]
+
+            # Remove the atom
+            keep = [i for i in range(n_atoms) if i != vac_idx]
+            v = v[keep]
+
+            # Decide gas occupancy: 1 to max_gas_occupancy
+            n_gas = self.rng.randint(1, self.max_gas_occupancy + 1)
+
+            remaining_positions = v.get_positions().copy()
+            placed = 0
+            gas_species: List[str] = []
+
+            for g_idx in range(n_gas):
+                gas_elem = self.gas_elements[self.rng.randint(len(self.gas_elements))]
+
+                if g_idx == 0:
+                    # First gas atom: place at or very near the vacancy site
+                    # Small random offset so it's not exactly on the lattice point
+                    offset = self.rng.normal(scale=0.1, size=3)
+                    candidate = vacancy_pos + offset
+                    # Wrap into cell
+                    frac_pos = candidate @ inv_cell
+                    frac_pos -= np.floor(frac_pos)
+                    candidate = frac_pos @ cell
+
+                    # Check d_min to existing atoms
+                    if len(remaining_positions) > 0:
+                        diff = remaining_positions - candidate
+                        frac_diff = diff @ inv_cell
+                        frac_diff -= np.rint(frac_diff)
+                        cart_diff = frac_diff @ cell
+                        dist_sq = np.sum(cart_diff * cart_diff, axis=1)
+                        if float(np.min(dist_sq)) < self.gas_interstitial_d_min ** 2:
+                            # Try exact vacancy position as fallback
+                            candidate = vacancy_pos.copy()
+                    pos = candidate
+                else:
+                    # Additional gas atoms: place near the vacancy site
+                    # Use a search radius based on typical nearest-neighbour distance
+                    pos = self._find_site_near(
+                        centre=vacancy_pos,
+                        positions=remaining_positions,
+                        cell=cell,
+                        inv_cell=inv_cell,
+                        radius=2.5,
+                        d_min=self.gas_interstitial_d_min,
+                        max_attempts=500,
+                    )
+
+                if pos is not None:
+                    v.append(Atom(symbol=gas_elem, position=pos))
+                    remaining_positions = np.vstack([remaining_positions, pos])
+                    placed += 1
+                    gas_species.append(gas_elem)
+
+            self._tag(v, base, "gas_in_vacancy",
+                      n_gas_atoms=placed,
+                      vacancy_element=vacancy_element,
+                      gas_species=gas_species)
+            out.append(v)
+        return out

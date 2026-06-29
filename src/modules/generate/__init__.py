@@ -1,14 +1,14 @@
 """Structure generation stage module."""
 
 from .generate import GenerateStage
-from .composition import CompositionGrid
-from .configurational import (
+from .generators import (
+    CompositionGrid,
     MaterialsProjectGenerator,
+    PerturbationEngine,
     RandomSolidSolutionGenerator,
     SQSGenerator,
     SegregatedGenerator,
 )
-from .structure_generation import PerturbationEngine
 
 __all__ = [
     "GenerateStage",

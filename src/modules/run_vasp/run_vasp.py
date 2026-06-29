@@ -25,8 +25,7 @@ class RunVaspStage(Stage):
 
     def run(self) -> None:
         config_path = self._find_config_file()
-        config = ConfigParser()
-        config.read(config_path)
+        config = self._load_config()
 
         selected_dir = self.project_dir / "structures" / "selected"
         jobs_dir = self.project_dir / "vasp" / "jobs"
@@ -124,15 +123,4 @@ class RunVaspStage(Stage):
             n_structs = len(list(ds_jobs_dir.glob("struct_*")))
             logger.info(f"[DEBUG] Created {n_structs} stub job dirs for {ds}")
 
-    def _find_config_file(self) -> Path:
-        project_config = self.project_dir / "config" / "project.config"
-        if project_config.exists():
-            return project_config
-        if self.config_file.exists():
-            return self.config_file
-        raise FileNotFoundError(
-            f"Config file not found. Tried:\n"
-            f"  - {project_config}\n"
-            f"  - {self.config_file}"
-        )
 

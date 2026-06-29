@@ -13,7 +13,7 @@ from configparser import ConfigParser
 # Add src to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from modules.generate.materials_project import get_materials_project_fetcher
+from modules.generate.generators.materials_project import get_materials_project_fetcher
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)

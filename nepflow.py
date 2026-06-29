@@ -51,6 +51,25 @@ from modules import SelfResubmitExit
 logger = logging.getLogger("nepflow")
 
 
+def _resolve_project_config_path(project_name: str, output_dir: Path) -> Path:
+    """
+    Resolve the config file path for a project.
+
+    Prefer existing files in the same order used by workflow stages.
+    If none exist yet, return the primary config path so Vim can create it.
+    """
+    project_dir = Path(output_dir) / f"project_{project_name}"
+    candidates = [
+        project_dir / "config" / "project.config",
+        project_dir / "config" / f"{project_name}.yaml",
+        project_dir / "config" / f"{project_name}.ini",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return candidates[0]
+
+
 def create_parser() -> argparse.ArgumentParser:
     """Create CLI argument parser."""
     parser = argparse.ArgumentParser(
@@ -76,6 +95,11 @@ Examples:
         "--init",
         action="store_true",
         help="Initialize a new project (required on first run)"
+    )
+    parser.add_argument(
+        "--config",
+        action="store_true",
+        help="Open the project config file in Vim and exit"
     )
     parser.add_argument(
         "--stage",
@@ -187,6 +211,16 @@ def main():
     """Main entry point."""
     parser = create_parser()
     args = parser.parse_args()
+
+    if args.config:
+        project_config = _resolve_project_config_path(args.project, args.output_dir)
+        project_dir = args.output_dir / f"project_{args.project}"
+        project_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            subprocess.run(["vim", str(project_config)], check=False, cwd=str(project_dir))
+        except FileNotFoundError as e:
+            raise FileNotFoundError("vim was not found on PATH") from e
+        return
     
     # Setup logging for the project
     # Log directory is inside each project: projects/project_{name}/logs/

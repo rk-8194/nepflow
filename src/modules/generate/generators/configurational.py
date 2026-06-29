@@ -112,9 +112,10 @@ def _composition_label(composition: Dict[str, float]) -> str:
 class MaterialsProjectGenerator(ConfigurationalGenerator):
     """Return known phases from the Materials Project database."""
 
-    def __init__(self, fetcher, max_per_composition: int = 5):
+    def __init__(self, fetcher, max_per_composition: int = 5, gas_elements: List[str] | None = None):
         self.fetcher = fetcher
         self.max_per_composition = max_per_composition
+        self.gas_elements = gas_elements or []
 
     def generate(
         self,
@@ -141,6 +142,41 @@ class MaterialsProjectGenerator(ConfigurationalGenerator):
             atoms.info.setdefault("configurational_type", "mp_phase")
 
         return atoms_list[:self.max_per_composition]
+
+    def generate_gas_phases(
+        self,
+        metal_elements: List[str],
+        gas_elements: List[str],
+        target_n_atoms: int = 250,
+    ) -> List[Atoms]:
+        """Fetch stable compounds containing both metal and gas elements from MP.
+
+        These are oxide / nitride / etc. phases that can't be generated via
+        lattice substitution.  They enter the base-structure pool directly so
+        that standard (and gas-specific) perturbations are applied to them.
+        """
+        if not gas_elements:
+            return []
+
+        all_elements = list(metal_elements) + [g for g in gas_elements if g not in metal_elements]
+        atoms_list = self.fetcher.fetch_compounds(
+            all_elements, max_per_query=self.max_per_composition * 2, use_cache=True,
+        )
+
+        # Keep only phases that actually contain at least one gas element
+        gas_set = set(gas_elements)
+        filtered: List[Atoms] = []
+        for atoms in atoms_list:
+            symbols = set(atoms.get_chemical_symbols())
+            if symbols & gas_set:
+                atoms.info.setdefault("configurational_type", "mp_gas_phase")
+                atoms.info.setdefault("elements", metal_elements)
+                atoms.info.setdefault("gas_elements", gas_elements)
+                filtered.append(atoms)
+
+        logger.info(f"  MP gas phases: {len(filtered)} structures "
+                     f"(from {len(atoms_list)} total compounds for {all_elements})")
+        return filtered[:self.max_per_composition * 2]
 
 
 # ======================================================================

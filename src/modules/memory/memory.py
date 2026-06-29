@@ -42,9 +42,7 @@ class MemoryStage(Stage):
     """Run VASP memory/performance benchmarks to populate .vasp_memory."""
 
     def run(self) -> None:
-        config_path = self._find_config_file()
-        config = ConfigParser()
-        config.read(config_path)
+        config = self._load_config()
 
         vasp_dir = self.project_dir / "vasp"
         memory_dir = vasp_dir / "memory"
@@ -68,15 +66,6 @@ class MemoryStage(Stage):
 
         # Phase 6: Collect results
         self._collect_results(memory_dir, nepflow_root)
-
-    def _find_config_file(self) -> Path:
-        config_path = self.project_dir / "config" / "project.config"
-        if not config_path.exists():
-            raise FileNotFoundError(
-                f"Project config not found: {config_path}\n"
-                f"Run 'nepflow.py --project {self.project_name} --init' first."
-            )
-        return config_path
 
     # ==================================================================
     # Phase 2: Generate BCC W supercells

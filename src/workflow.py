@@ -233,7 +233,8 @@ class WorkflowController:
             config_file=self.config_file,
             state_file=self.state_file,
             project_dir=self.project_dir,
-            debug=self.debug
+            debug=self.debug,
+            slurm_deadline=self.slurm_deadline,
         )
         stage.run()
     
@@ -465,18 +466,20 @@ class WorkflowController:
         elif stage == "train_nep":
             logger.debug("Training NEP models")
             self._check_deadline()
-            self._train_nep()
+            try:
+                self._train_nep()
+            except SelfResubmitExit:
+                logger.info("NEP training deadline reached — resubmitting workflow")
+                raise
             self._set_current_stage("validate")
         elif stage == "validate":
             logger.debug("Running GPUMD validation")
             self._check_deadline()
-            self._validate()
-            logger.debug("Training NEP models")
-            self._train_nep()
-            self._set_current_stage("validate")
-        elif stage == "validate":
-            logger.debug("Running GPUMD validation")
-            self._validate()
+            try:
+                self._validate()
+            except SelfResubmitExit:
+                logger.info("GPUMD validation deadline reached — resubmitting workflow")
+                raise
         else:
             logger.error("Unknown stage: %s", stage)
             raise ValueError("Unknown stage: %s" % stage)
