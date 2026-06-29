@@ -33,6 +33,37 @@ NEPFlow uses these stages in order:
 - External tools configured for your environment, such as VASP, GPUMD, and the NEP executable
 - SLURM if you plan to run on an HPC cluster
 
+## Installation
+
+1. Clone the repository and enter the project directory:
+
+```bash
+git clone git@github.com:rk-8194/nepflow.git
+cd nepflow
+```
+
+2. Create and activate a Python 3.11+ virtual environment:
+
+```powershell
+python -m venv .venv
+.venv\Scripts\Activate.ps1
+```
+
+3. Install NEPFlow and its Python dependencies:
+
+```bash
+python -m pip install --upgrade pip
+python -m pip install -e .
+```
+
+4. Verify the installation:
+
+```bash
+python nepflow.py --help
+```
+
+If you plan to use the Materials Project integration, make sure the `mp-api` dependency is installed and your API key is available in the project config or the `MP_API_KEY` environment variable.
+
 ## Usage
 
 ### 1. Initialize a project
