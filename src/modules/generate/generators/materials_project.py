@@ -17,8 +17,21 @@ import numpy as np
 from ase import Atoms
 from pymatgen.io.ase import AseAtomsAdaptor
 from pymatgen.symmetry.analyzer import SpacegroupAnalyzer
+from requests import Session
 
 logger = logging.getLogger("nepflow.materials_project")
+
+
+class _TimeoutSession(Session):
+    """requests.Session wrapper that applies a default timeout to every request."""
+
+    def __init__(self, timeout: float):
+        super().__init__()
+        self._timeout = timeout
+
+    def request(self, method, url, **kwargs):  # type: ignore[override]
+        kwargs.setdefault("timeout", self._timeout)
+        return super().request(method, url, **kwargs)
 
 
 class MaterialsProjectFetcher:
@@ -62,13 +75,19 @@ class MaterialsProjectFetcher:
         },
     }
 
-    def __init__(self, api_key: Optional[str] = None, cache_dir: Optional[Path] = None):
+    def __init__(
+        self,
+        api_key: Optional[str] = None,
+        cache_dir: Optional[Path] = None,
+        request_timeout: float = 60.0,
+    ):
         """
         Initialize the Materials Project fetcher.
 
         Args:
             api_key: Materials Project API key. If None, tries MP_API_KEY env var.
             cache_dir: Directory to store cached results. Defaults to ~/.cache/nepflow/mp
+            request_timeout: Default timeout in seconds for Materials Project requests.
         """
         self.api_key = api_key or os.environ.get("MP_API_KEY")
         if not self.api_key:
@@ -81,6 +100,7 @@ class MaterialsProjectFetcher:
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
 
+        self.request_timeout = request_timeout
         self._mpr = None
 
     @property
@@ -89,7 +109,14 @@ class MaterialsProjectFetcher:
         if self._mpr is None:
             try:
                 from mp_api.client import MPRester
-                self._mpr = MPRester(self.api_key)
+                session = _TimeoutSession(self.request_timeout)
+                session.headers.update({"X-API-KEY": self.api_key})
+                self._mpr = MPRester(
+                    self.api_key,
+                    session=session,
+                    headers={"X-API-KEY": self.api_key},
+                    timeout=self.request_timeout,
+                )
             except ImportError as e:
                 import sys
                 raise ImportError(

@@ -133,6 +133,14 @@ class InitConfigPromptTests(unittest.TestCase):
             self.assertIn("crystal_structures=bcc,fcc", config_text)
             self.assertIn("target_n_atoms=128", config_text)
             self.assertIn("scp_address=user@host:/opt/nepflow", config_text)
+            self.assertIn("composition_aware_fps=false", config_text)
+            self.assertIn("composition_aware_fps_frontier_fraction=0.10", config_text)
+            self.assertIn("composition_aware_fps_ternary_weight=1.0", config_text)
+            self.assertIn("composition_aware_fps_adaptive_retries=4", config_text)
+            self.assertIn(
+                "composition_aware_fps_descriptor_floor_fraction=0.95",
+                config_text,
+            )
             self.assertEqual(input_mock.call_count, 6)
 
     def test_unknown_element_raises_value_error(self) -> None:

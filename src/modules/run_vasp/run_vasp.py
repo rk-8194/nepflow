@@ -68,7 +68,15 @@ class RunVaspStage(Stage):
         # ----------------------------------------------------------
         # Phase 1a: Prepare job folders (idempotent — skips if done)
         # ----------------------------------------------------------
-        prepare_jobs(config, vasp_config_dir, selected_dir, jobs_dir, datasets)
+        prepare_jobs(
+            config,
+            vasp_config_dir,
+            selected_dir,
+            jobs_dir,
+            datasets,
+            project_dir=self.project_dir,
+            project_name=self.project_name,
+        )
 
         # ----------------------------------------------------------
         # Phase 1b: Write/update shared run_vasp.sh (always, so code

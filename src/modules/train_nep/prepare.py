@@ -1,5 +1,6 @@
 """Prepare sub-stage: parse OUTCAR files and write XYZ datasets."""
 
+import json
 from configparser import ConfigParser
 from pathlib import Path
 from typing import Generator, List
@@ -8,6 +9,18 @@ from ase.atoms import Atoms
 from ase.io import read as ase_read
 
 import numpy as np
+
+from ..run_vasp._common import (
+    get_nepflow_root,
+    get_registry_entry,
+    hash_incar_text,
+    hash_potcar_bytes,
+    hash_structure,
+    outcar_is_complete,
+    read_completed_registry,
+    read_status,
+)
+from ..run_vasp.prepare import inject_incar_defaults
 
 from ._common import HAS_TQDM, logger, parse_virial_from_outcar, tqdm, validate_structure
 
@@ -72,6 +85,7 @@ def _parse_structures(
     """
     dataset_type = "train" if is_train else "test"
     vasp_jobs_path = project_dir / "vasp" / "jobs" / dataset_type
+    input_context = _build_vasp_input_context(project_dir)
 
     if not vasp_jobs_path.exists():
         logger.warning(f"VASP jobs path not found: {vasp_jobs_path}")
@@ -84,26 +98,26 @@ def _parse_structures(
             yield _extract_from_atoms(atoms)
         return
 
-    # Enumerate struct_XXXX folders in order
-    struct_folders = sorted(
-        [d for d in vasp_jobs_path.iterdir() if d.is_dir() and d.name.startswith("struct_")],
-        key=lambda d: int(d.name.split("_")[1]),
-    )
-
-    logger.debug(f"Found {len(struct_folders)} struct folders in {vasp_jobs_path}")
+    if input_context is None:
+        logger.warning("Cannot build VASP input hashes. Skipping this dataset.")
+        return
 
     for struct_idx, atoms in enumerate(ase_structures):
-        if struct_idx >= len(struct_folders):
-            logger.warning(
-                f"[{dataset_type}] More structures ({len(ase_structures)}) than struct folders ({len(struct_folders)}). Stopping."
+        try:
+            outcar_path = _resolve_outcar_for_structure(
+                atoms,
+                dataset_type,
+                struct_idx,
+                project_dir,
+                vasp_jobs_path,
+                input_context,
             )
-            break
+        except Exception as e:
+            logger.warning(f"[{dataset_type}] Skipping struct_{struct_idx:04d}: {e}")
+            continue
 
-        struct_folder = struct_folders[struct_idx]
-        outcar_path = struct_folder / "OUTCAR"
-
-        if not outcar_path.exists():
-            logger.warning(f"[{dataset_type}] Skipping struct_{struct_idx:04d}: OUTCAR not found")
+        if outcar_path is None:
+            logger.warning(f"[{dataset_type}] Skipping struct_{struct_idx:04d}: no completed OUTCAR found")
             continue
 
         try:
@@ -115,6 +129,119 @@ def _parse_structures(
                 logger.warning(f"[{dataset_type}] Skipping struct_{struct_idx:04d}: parse failed")
         except Exception as e:
             logger.warning(f"[{dataset_type}] Skipping struct_{struct_idx:04d}: {e}")
+
+
+def _build_vasp_input_context(project_dir: Path) -> dict | None:
+    """Build reusable hashes for the current project's VASP input files."""
+    vasp_config_dir = project_dir / "config" / "vasp"
+    incar_template = vasp_config_dir / "INCAR"
+    if not incar_template.exists():
+        return None
+
+    config = ConfigParser()
+    for candidate in (
+        project_dir / "config" / "project.config",
+        project_dir / "config" / f"{project_dir.name.removeprefix('project_')}.ini",
+    ):
+        if candidate.exists():
+            config.read(candidate)
+            break
+
+    incar_text = inject_incar_defaults(
+        incar_template.read_text(encoding="utf-8"),
+        config,
+    )
+    potcar_data = {
+        potcar_path.name.split("_", 1)[1]: potcar_path.read_bytes()
+        for potcar_path in vasp_config_dir.glob("POTCAR_*")
+    }
+    return {
+        "incar_hash": hash_incar_text(incar_text),
+        "potcar_data": potcar_data,
+        "registry": read_completed_registry(get_nepflow_root(project_dir)),
+    }
+
+
+def _resolve_outcar_for_structure(
+    atoms: Atoms,
+    dataset_type: str,
+    struct_idx: int,
+    project_dir: Path,
+    vasp_jobs_path: Path,
+    input_context: dict,
+) -> Path | None:
+    """Resolve the completed OUTCAR for one selected structure by input hashes."""
+    structure_hash = hash_structure(atoms)
+    potcar_data = input_context["potcar_data"]
+    struct_elements = sorted(set(atoms.get_chemical_symbols()))
+    missing = [elem for elem in struct_elements if elem not in potcar_data]
+    if missing:
+        raise FileNotFoundError(f"missing POTCAR files for: {', '.join(missing)}")
+
+    potcar_hash = hash_potcar_bytes(b"".join(potcar_data[elem] for elem in struct_elements))
+    incar_hash = input_context["incar_hash"]
+    identity = {
+        "structure_hash": structure_hash,
+        "incar_hash": incar_hash,
+        "potcar_hash": potcar_hash,
+    }
+
+    preferred = vasp_jobs_path / f"struct_{struct_idx:04d}"
+    outcar = _outcar_from_local_job(preferred, identity)
+    if outcar is not None:
+        return outcar
+
+    for struct_dir in sorted(
+        [d for d in vasp_jobs_path.iterdir() if d.is_dir() and d.name.startswith("struct_")],
+        key=lambda d: d.name,
+    ):
+        if struct_dir == preferred:
+            continue
+        outcar = _outcar_from_local_job(struct_dir, identity)
+        if outcar is not None:
+            return outcar
+
+    entry = get_registry_entry(
+        input_context["registry"],
+        incar_hash,
+        potcar_hash,
+        structure_hash,
+    )
+    if entry and entry.get("job_path"):
+        outcar = Path(entry["job_path"]) / "OUTCAR"
+        if outcar_is_complete(outcar):
+            return outcar
+
+    return None
+
+
+def _outcar_from_local_job(struct_dir: Path, identity: dict) -> Path | None:
+    """Return a completed OUTCAR from a local identity-matched job folder."""
+    if not struct_dir.exists():
+        return None
+    local_identity = _read_identity(struct_dir)
+    if not local_identity or any(local_identity.get(k) != v for k, v in identity.items()):
+        return None
+
+    status = read_status(struct_dir)
+    if status.get("status") == "reused" and status.get("reused_from"):
+        reused_outcar = Path(status["reused_from"]) / "OUTCAR"
+        if outcar_is_complete(reused_outcar):
+            return reused_outcar
+
+    outcar = struct_dir / "OUTCAR"
+    return outcar if outcar_is_complete(outcar) else None
+
+
+def _read_identity(struct_dir: Path) -> dict:
+    identity_path = struct_dir / ".vasp_identity"
+    if not identity_path.exists():
+        return {}
+    try:
+        data = json.loads(identity_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {}
+    return data if isinstance(data, dict) else {}
 
 
 def _parse_outcar(outcar_path: Path, ase_atoms: Atoms) -> dict | None:

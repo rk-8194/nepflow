@@ -14,6 +14,7 @@ Plot layers (back to front):
 
 Usage:
     python plot_descriptors.py --project PATH [--potential NAME] [options]
+    python plot_descriptors.py --project PATH --compare-potential NAME --shared-pca [options]
 
 Arguments:
     --project   PATH   Path to the nepflow project directory
@@ -27,7 +28,12 @@ Arguments:
     --batch     INT    Descriptor batch size (default: 500)
     --no-cache         Recompute descriptors even if a cache exists
     --atom             Use per-atom descriptors instead of per-structure mean
+    --compare-potential NAME
+                       Second potential folder inside nep/potentials/ for shared-PCA comparison
+    --shared-pca       Fit one PCA basis on both potentials and plot them side by side
 """
+
+from __future__ import annotations
 
 import argparse
 import hashlib
@@ -50,7 +56,7 @@ logger = logging.getLogger("plot_descriptors")
 
 
 # ---------------------------------------------------------------------------
-# helpers — copied / adapted from select.py
+# helpers - copied / adapted from select.py
 # ---------------------------------------------------------------------------
 
 def _latest_potential(potentials_dir: Path) -> Path:
@@ -72,7 +78,7 @@ def _structure_key(atoms) -> str:
 def _match_indices(ref_ase: list, target_xyz: Path) -> list[int]:
     """Return indices into ref_ase for structures in target_xyz."""
     if not target_xyz.exists():
-        logger.warning(f"  {target_xyz} not found — skipping")
+        logger.warning(f"  {target_xyz} not found - skipping")
         return []
     target = ase_read(str(target_xyz), index=":", format="extxyz")
     if not isinstance(target, list):
@@ -103,9 +109,161 @@ def _compute_descriptors_batched(
         elapsed = time.perf_counter() - t0
         rate = end / elapsed if elapsed > 0 else 0
         eta = (n - end) / rate if rate > 0 else 0
-        logger.info(f"  Batch {end}/{n} ({100*end/n:.0f}%) — {elapsed:.1f}s elapsed, ~{eta:.0f}s remaining")
+        logger.info(
+            f"  Batch {end}/{n} ({100 * end / n:.0f}%) - "
+            f"{elapsed:.1f}s elapsed, ~{eta:.0f}s remaining"
+        )
     return np.concatenate(all_descriptors, axis=0)
 
+
+def _resolve_potential(potentials_dir: Path, potential_name: str) -> Path:
+    if potential_name == "latest":
+        return _latest_potential(potentials_dir)
+    potential_path = potentials_dir / potential_name
+    if not potential_path.exists():
+        raise FileNotFoundError(f"Potential folder not found: {potential_path}")
+    return potential_path
+
+
+def _resolve_compare_target(
+    project_dir: Path,
+    potentials_dir: Path,
+    compare_name: str,
+) -> tuple[Path, Path, str]:
+    """Return (cache_dir, nep_txt_path, label) for a comparison target."""
+    normalized = compare_name.strip()
+    if normalized in {"default", "nep89", "nep89.txt"}:
+        nep_txt = project_dir / "config" / "nep" / "nep89.txt"
+        if not nep_txt.exists():
+            raise FileNotFoundError(f"Default NEP model not found: {nep_txt}")
+        return nep_txt.parent, nep_txt, nep_txt.name
+
+    candidate = Path(normalized)
+    if candidate.suffix == ".txt":
+        if not candidate.is_absolute():
+            if candidate.exists():
+                pass
+            elif (project_dir / candidate).exists():
+                candidate = project_dir / candidate
+            else:
+                candidate = project_dir / candidate
+        if not candidate.exists():
+            raise FileNotFoundError(f"Comparison model file not found: {candidate}")
+        return candidate.parent, candidate, candidate.stem
+
+    potential_path = _resolve_potential(potentials_dir, normalized)
+    nep_txt = potential_path / "nep.txt"
+    if not nep_txt.exists():
+        raise FileNotFoundError(f"nep.txt not found in {potential_path}")
+    return potential_path, nep_txt, potential_path.name
+
+
+def _load_or_compute_descriptors(
+    potential_path: Path,
+    nep_txt: Path,
+    structures: list,
+    *,
+    mean_descriptor: bool,
+    batch_size: int,
+    no_cache: bool,
+) -> np.ndarray:
+    cache_path = potential_path / "descriptors_cache.npy"
+    descriptors = None
+
+    if cache_path.exists() and not no_cache:
+        descriptors = np.load(cache_path)
+        logger.info(f"  Loaded cached descriptors from {cache_path}")
+        if descriptors.shape[0] != len(structures):
+            logger.warning(
+                f"  Cache mismatch: {descriptors.shape[0]} vs {len(structures)} structures - recomputing"
+            )
+            descriptors = None
+
+    if descriptors is None:
+        calc = NepCalculator(str(nep_txt))
+        logger.info(f"  Loaded NepCalculator with {nep_txt.name}")
+        descriptors = _compute_descriptors_batched(
+            calc,
+            structures,
+            mean_descriptor,
+            batch_size,
+        )
+        np.save(cache_path, descriptors)
+        logger.info(f"  Saved descriptor cache to {cache_path}")
+
+    return descriptors
+
+
+def _fit_pca(descriptors: np.ndarray):
+    from sklearn.decomposition import PCA
+
+    pca = PCA(n_components=2)
+    pca.fit(descriptors)
+    return pca
+
+
+def _project_with_pca(descriptors: np.ndarray, pca) -> np.ndarray:
+    return pca.transform(descriptors)
+
+
+def _plot_panel(
+    ax,
+    coords: np.ndarray,
+    train_indices: list[int],
+    test_indices: list[int],
+    nep_train_indices: list[int],
+    title: str,
+) -> None:
+    n = len(coords)
+    train_mask = np.zeros(n, dtype=bool)
+    test_mask = np.zeros(n, dtype=bool)
+    nep_train_mask = np.zeros(n, dtype=bool)
+    if train_indices:
+        train_mask[train_indices] = True
+    if test_indices:
+        test_mask[test_indices] = True
+    if nep_train_indices:
+        nep_train_mask[nep_train_indices] = True
+    unselected = ~(train_mask | test_mask)
+
+    ax.scatter(
+        coords[unselected, 0],
+        coords[unselected, 1],
+        s=4,
+        alpha=0.2,
+        c="gray",
+        label=f"Unselected ({unselected.sum()})",
+    )
+    if train_mask.any():
+        ax.scatter(
+            coords[train_mask, 0],
+            coords[train_mask, 1],
+            s=10,
+            alpha=0.4,
+            c="tab:red",
+            label=f"FPS-selected train ({train_mask.sum()})",
+        )
+    if test_mask.any():
+        ax.scatter(
+            coords[test_mask, 0],
+            coords[test_mask, 1],
+            s=10,
+            alpha=0.7,
+            c="tab:blue",
+            label=f"FPS-selected test ({test_mask.sum()})",
+        )
+    if nep_train_mask.any():
+        ax.scatter(
+            coords[nep_train_mask, 0],
+            coords[nep_train_mask, 1],
+            s=18,
+            alpha=0.9,
+            c="tab:green",
+            label=f"NEP training data ({nep_train_mask.sum()})",
+        )
+
+    ax.set_title(title)
+    ax.legend()
 
 
 def _plot(
@@ -116,67 +274,88 @@ def _plot(
     output_path: Path,
     potential_name: str,
 ) -> None:
-    """PCA 2D scatter.
-
-    Layers (back to front):
-      gray   — unselected (not in FPS selection)
-      red    — FPS-selected train (structures/selected/train.xyz)
-      blue   — FPS-selected test  (structures/selected/test.xyz)
-      green  — NEP training data  (potential/train.xyz, subset of red)
-    """
+    """PCA 2D scatter."""
     import matplotlib
+
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-    from sklearn.decomposition import PCA
 
-    pca = PCA(n_components=2)
-    coords = pca.fit_transform(descriptors)
-
-    n = len(descriptors)
-    train_mask     = np.zeros(n, dtype=bool)
-    test_mask      = np.zeros(n, dtype=bool)
-    nep_train_mask = np.zeros(n, dtype=bool)
-    if train_indices:
-        train_mask[train_indices] = True
-    if test_indices:
-        test_mask[test_indices] = True
-    if nep_train_indices:
-        nep_train_mask[nep_train_indices] = True
-    unselected = ~(train_mask | test_mask)
+    pca = _fit_pca(descriptors)
+    coords = _project_with_pca(descriptors, pca)
 
     fig, ax = plt.subplots(figsize=(10, 8))
-    ax.scatter(
-        coords[unselected, 0], coords[unselected, 1],
-        s=4, alpha=0.2, c="gray",
-        label=f"Unselected ({unselected.sum()})",
+    _plot_panel(
+        ax,
+        coords,
+        train_indices,
+        test_indices,
+        nep_train_indices,
+        f"NEP Descriptor Space - Trained potential: {potential_name}",
     )
-    if train_mask.any():
-        ax.scatter(
-            coords[train_mask, 0], coords[train_mask, 1],
-            s=10, alpha=0.4, c="tab:red",
-            label=f"FPS-selected train ({train_mask.sum()})",
-        )
-    if test_mask.any():
-        ax.scatter(
-            coords[test_mask, 0], coords[test_mask, 1],
-            s=10, alpha=0.7, c="tab:blue",
-            label=f"FPS-selected test ({test_mask.sum()})",
-        )
-    if nep_train_mask.any():
-        ax.scatter(
-            coords[nep_train_mask, 0], coords[nep_train_mask, 1],
-            s=18, alpha=0.9, c="tab:green",
-            label=f"NEP training data ({nep_train_mask.sum()})",
-        )
 
     var = pca.explained_variance_ratio_
-    ax.set_xlabel(f"PC1 ({var[0]*100:.1f}%)")
-    ax.set_ylabel(f"PC2 ({var[1]*100:.1f}%)")
-    ax.set_title(f"NEP Descriptor Space — Trained potential: {potential_name}")
-    ax.legend()
+    ax.set_xlabel(f"PC1 ({var[0] * 100:.1f}%)")
+    ax.set_ylabel(f"PC2 ({var[1] * 100:.1f}%)")
     fig.tight_layout()
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(str(output_path), dpi=150)
+    plt.close(fig)
+    logger.info(f"  Saved plot to {output_path}")
+
+
+def _plot_shared(
+    reference_descriptors: np.ndarray,
+    other_descriptors: np.ndarray,
+    train_indices: list[int],
+    test_indices: list[int],
+    nep_train_indices: list[int],
+    output_path: Path,
+    reference_name: str,
+    other_name: str,
+) -> None:
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    pca = _fit_pca(reference_descriptors)
+    coords_reference = _project_with_pca(reference_descriptors, pca)
+    coords_other = _project_with_pca(other_descriptors, pca)
+    var = pca.explained_variance_ratio_
+
+    stacked = np.vstack([coords_reference, coords_other])
+    mins = stacked.min(axis=0)
+    maxs = stacked.max(axis=0)
+    span = np.maximum(maxs - mins, 1e-12)
+    pad = 0.05 * span
+
+    fig, axes = plt.subplots(1, 2, figsize=(16, 8), sharex=True, sharey=True)
+    _plot_panel(
+        axes[0],
+        coords_reference,
+        train_indices,
+        test_indices,
+        nep_train_indices,
+        f"Reference: {reference_name}",
+    )
+    _plot_panel(
+        axes[1],
+        coords_other,
+        train_indices,
+        test_indices,
+        nep_train_indices,
+        f"Potential: {other_name}",
+    )
+    for ax in axes:
+        ax.set_xlim(mins[0] - pad[0], maxs[0] + pad[0])
+        ax.set_ylim(mins[1] - pad[1], maxs[1] + pad[1])
+        ax.set_xlabel(f"PC1 ({var[0] * 100:.1f}%)")
+        ax.set_ylabel(f"PC2 ({var[1] * 100:.1f}%)")
+
+    fig.suptitle("NEP Descriptor Space - PCA Anchored to Reference", y=1.02)
+    fig.tight_layout()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(str(output_path), dpi=150, bbox_inches="tight")
     plt.close(fig)
     logger.info(f"  Saved plot to {output_path}")
 
@@ -207,6 +386,10 @@ def main() -> None:
                         help="Recompute descriptors even if a cache exists")
     parser.add_argument("--atom", action="store_true",
                         help="Use per-atom descriptors instead of per-structure mean")
+    parser.add_argument("--compare-potential", default=None,
+                        help="Second potential folder inside nep/potentials/ for shared-PCA comparison")
+    parser.add_argument("--shared-pca", action="store_true",
+                        help="Fit one PCA basis on both potentials and plot them side by side")
     args = parser.parse_args()
 
     project_dir = args.project
@@ -215,31 +398,53 @@ def main() -> None:
         sys.exit(1)
     logger.info(f"Project directory: {project_dir}")
 
-    # Resolve potential
     potentials_dir = project_dir / "nep" / "potentials"
-    if args.potential == "latest":
-        potential_path = _latest_potential(potentials_dir)
-        logger.info(f"Using latest potential: {potential_path.name}")
-    else:
-        potential_path = potentials_dir / args.potential
-        if not potential_path.exists():
-            logger.error(f"Potential folder not found: {potential_path}")
-            sys.exit(1)
+    compare_requested = args.compare_potential is not None
+    if args.shared_pca and not compare_requested:
+        logger.error("--shared-pca requires --compare-potential")
+        sys.exit(1)
+
+    try:
+        potential_path = _resolve_potential(potentials_dir, args.potential)
+        logger.info(f"Using potential: {potential_path.name}")
+        compare_potential_path = None
+        compare_cache_dir = None
+        compare_label = None
+        if compare_requested:
+            compare_cache_dir, compare_nep_txt, compare_label = _resolve_compare_target(
+                project_dir,
+                potentials_dir,
+                args.compare_potential,
+            )
+            compare_potential_path = compare_cache_dir
+            logger.info(f"Using comparison target: {compare_nep_txt}")
+    except FileNotFoundError as exc:
+        logger.error(str(exc))
+        sys.exit(1)
 
     nep_txt = potential_path / "nep.txt"
     if not nep_txt.exists():
-        logger.error(f"nep.txt not found in {potential_path} — has training completed?")
+        logger.error(f"nep.txt not found in {potential_path} - has training completed?")
         sys.exit(1)
     logger.info(f"Using potential: {nep_txt}")
 
+    if compare_requested and compare_nep_txt is None:
+        logger.error("Comparison target could not be resolved")
+        sys.exit(1)
+
     structures_path = args.structures or (project_dir / "structures" / "generated" / "generated_structures.xyz")
-    train_xyz       = args.train_xyz  or (project_dir / "structures" / "selected" / "train.xyz")
-    test_xyz        = args.test_xyz   or (project_dir / "structures" / "selected" / "test.xyz")
-    output_path     = args.output     or (project_dir / "reports" / "descriptor_space_trained.png")
+    train_xyz = args.train_xyz or (project_dir / "structures" / "selected" / "train.xyz")
+    test_xyz = args.test_xyz or (project_dir / "structures" / "selected" / "test.xyz")
+    output_path = args.output or (
+        project_dir / "reports" / (
+            "descriptor_space_shared_pca.png" if compare_requested
+            else "descriptor_space_trained.png"
+        )
+    )
     mean_descriptor = not args.atom
 
     # ----------------------------------------------------------
-    # Step 1: Load structures  (same as select.py)
+    # Step 1: Load structures
     # ----------------------------------------------------------
     logger.info("")
     logger.info("Step 1: Loading generated structures")
@@ -248,52 +453,59 @@ def main() -> None:
     ase_structures = ase_read(str(structures_path), index=":", format="extxyz")
     if not isinstance(ase_structures, list):
         ase_structures = [ase_structures]
-    logger.info(f"  Loaded {len(structures)} structures ({time.perf_counter()-t0:.1f}s)")
+    logger.info(f"  Loaded {len(structures)} structures ({time.perf_counter() - t0:.1f}s)")
 
     if len(structures) == 0:
         logger.error("No structures found")
         sys.exit(1)
 
     # ----------------------------------------------------------
-    # Step 2: Load or compute descriptors  (same as select.py)
+    # Step 2: Load or compute descriptors
     # ----------------------------------------------------------
     logger.info("")
     logger.info("Step 2: Computing NEP descriptors")
 
-    cache_path = potential_path / "descriptors_cache.npy"
-    descriptors = None
-
-    if cache_path.exists() and not args.no_cache:
-        descriptors = np.load(cache_path)
-        logger.info(f"  Loaded cached descriptors from {cache_path}")
-        if descriptors.shape[0] != len(structures):
-            logger.warning(
-                f"  Cache mismatch: {descriptors.shape[0]} vs {len(structures)} structures — recomputing"
-            )
-            descriptors = None
-
-    if descriptors is None:
-        calc = NepCalculator(str(nep_txt))
-        logger.info(f"  Loaded NepCalculator with {nep_txt.name}")
-        descriptors = _compute_descriptors_batched(calc, structures, mean_descriptor, args.batch)
-        np.save(cache_path, descriptors)
-        logger.info(f"  Saved descriptor cache to {cache_path}")
-
+    descriptors = _load_or_compute_descriptors(
+        potential_path,
+        nep_txt,
+        structures,
+        mean_descriptor=mean_descriptor,
+        batch_size=args.batch,
+        no_cache=args.no_cache,
+    )
     logger.info(f"  Descriptor shape: {descriptors.shape}")
+
+    compare_descriptors = None
+    if compare_requested:
+        compare_descriptors = _load_or_compute_descriptors(
+            compare_cache_dir,
+            compare_nep_txt,
+            structures,
+            mean_descriptor=mean_descriptor,
+            batch_size=args.batch,
+            no_cache=args.no_cache,
+        )
+        if compare_descriptors.shape[1] != descriptors.shape[1]:
+            logger.error(
+                "Descriptor dimension mismatch between potentials: "
+                f"{descriptors.shape[1]} vs {compare_descriptors.shape[1]}"
+            )
+            sys.exit(1)
+        logger.info(f"  Comparison descriptor shape: {compare_descriptors.shape}")
 
     # ----------------------------------------------------------
     # Step 3: Match train / test / nep-train indices
     # ----------------------------------------------------------
     logger.info("")
     logger.info("Step 3: Matching train/test/NEP-training sets")
-    train_indices     = _match_indices(ase_structures, train_xyz)
-    test_indices      = _match_indices(ase_structures, test_xyz)
-    nep_train_xyz     = potential_path / "train.xyz"
+    train_indices = _match_indices(ase_structures, train_xyz)
+    test_indices = _match_indices(ase_structures, test_xyz)
+    nep_train_xyz = potential_path / "train.xyz"
     nep_train_indices = _match_indices(ase_structures, nep_train_xyz)
     if not nep_train_indices:
         logger.warning(
             f"  No NEP training structures matched from {nep_train_xyz}\n"
-            f"  (train.xyz is copied here by submit_training_job — "
+            f"  (train.xyz is copied here by submit_training_job - "
             f"check that it exists in {potential_path.name})"
         )
 
@@ -314,22 +526,38 @@ def main() -> None:
 
     descriptors_out = output_path.with_suffix(".npz")
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez(
-        descriptors_out,
+    save_kwargs = dict(
         descriptors=descriptors,
         labels=labels,
         train_indices=np.array(train_indices, dtype=int),
         test_indices=np.array(test_indices, dtype=int),
         nep_train_indices=np.array(nep_train_indices, dtype=int),
     )
+    if compare_descriptors is not None:
+        save_kwargs["compare_descriptors"] = compare_descriptors
+        save_kwargs["primary_potential_name"] = np.array(potential_path.name)
+        save_kwargs["compare_potential_name"] = np.array(compare_label)
+    np.savez(descriptors_out, **save_kwargs)
     logger.info(f"  Saved to {descriptors_out}")
 
     # ----------------------------------------------------------
-    # Step 5: Plot  (same style as select.py)
+    # Step 5: Plot
     # ----------------------------------------------------------
     logger.info("")
     logger.info("Step 5: Plotting descriptor space")
-    _plot(descriptors, train_indices, test_indices, nep_train_indices, output_path, potential_path.name)
+    if compare_descriptors is not None:
+        _plot_shared(
+            compare_descriptors,
+            descriptors,
+            train_indices,
+            test_indices,
+            nep_train_indices,
+            output_path,
+            compare_label,
+            potential_path.name,
+        )
+    else:
+        _plot(descriptors, train_indices, test_indices, nep_train_indices, output_path, potential_path.name)
 
     logger.info("")
     logger.info("Done.")

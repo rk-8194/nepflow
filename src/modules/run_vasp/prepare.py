@@ -1,14 +1,26 @@
 """Prepare sub-stage: create VASP job folders and shared runner script."""
 
+import json
 import re
 import time
 from configparser import ConfigParser
 from pathlib import Path
 
-import numpy as np
 from ase.io import iread
 
-from ._common import logger, write_status
+from ._common import (
+    canonical_poscar_text,
+    get_nepflow_root,
+    get_registry_entry,
+    hash_incar_text,
+    hash_potcar_bytes,
+    hash_structure,
+    logger,
+    outcar_is_complete,
+    read_completed_registry,
+    read_status,
+    write_status,
+)
 
 
 # ==================================================================
@@ -21,16 +33,12 @@ def prepare_jobs(
     selected_dir: Path,
     jobs_dir: Path,
     datasets: list[str],
+    project_dir: Path | None = None,
+    project_name: str = "",
 ) -> None:
-    """Create POSCAR/POTCAR/INCAR per structure (skips if already done)."""
-    first_struct = jobs_dir / datasets[0] / "struct_0000"
-    if first_struct.exists() and (first_struct / "POSCAR").exists():
-        logger.info("Job folders already prepared — skipping preparation")
-        return
-
+    """Create POSCAR/POTCAR/INCAR per structure and mark reusable jobs."""
     logger.info("Running VASP job preparation")
 
-    # Validate INCAR template
     incar_template = vasp_config_dir / "INCAR"
     if not incar_template.exists():
         raise FileNotFoundError(
@@ -39,17 +47,21 @@ def prepare_jobs(
         )
     logger.info(f"  INCAR template: {incar_template}")
 
-    incar_text = incar_template.read_text(encoding="utf-8")
-    incar_text = inject_incar_defaults(incar_text, config)
+    incar_text = inject_incar_defaults(
+        incar_template.read_text(encoding="utf-8"),
+        config,
+    )
+    incar_hash = hash_incar_text(incar_text)
+    nepflow_root = get_nepflow_root(project_dir or jobs_dir.parent.parent)
+    registry = read_completed_registry(nepflow_root)
 
-    # Discover all unique elements across all datasets
     all_elements: set[str] = set()
     for ds in datasets:
         xyz_path = selected_dir / f"{ds}.xyz"
         if not xyz_path.exists():
             raise FileNotFoundError(
                 f"Selected structures not found at {xyz_path}\n"
-                f"Run the 'select' stage first."
+                "Run the 'select' stage first."
             )
         for atoms in iread(str(xyz_path), format="extxyz"):
             all_elements.update(atoms.get_chemical_symbols())
@@ -57,7 +69,6 @@ def prepare_jobs(
     sorted_elements = sorted(all_elements)
     logger.info(f"  Elements: {', '.join(sorted_elements)}")
 
-    # Validate pseudopotentials
     missing = [
         f"POTCAR_{e}" for e in sorted_elements
         if not (vasp_config_dir / f"POTCAR_{e}").exists()
@@ -68,12 +79,11 @@ def prepare_jobs(
             + "\n".join(f"  - {m}" for m in missing)
         )
 
-    # Pre-read POTCAR data
-    potcar_data: dict[str, bytes] = {}
-    for elem in sorted_elements:
-        potcar_data[elem] = (vasp_config_dir / f"POTCAR_{elem}").read_bytes()
+    potcar_data = {
+        elem: (vasp_config_dir / f"POTCAR_{elem}").read_bytes()
+        for elem in sorted_elements
+    }
 
-    # Create job folders for each dataset (POSCAR/POTCAR/INCAR only)
     for ds in datasets:
         logger.info(f"  Preparing {ds} jobs")
         xyz_path = selected_dir / f"{ds}.xyz"
@@ -82,27 +92,75 @@ def prepare_jobs(
 
         t0 = time.perf_counter()
         count = 0
+        reused = 0
 
         for i, atoms in enumerate(iread(str(xyz_path), format="extxyz")):
             struct_dir = ds_jobs_dir / f"struct_{i:04d}"
             struct_dir.mkdir(parents=True, exist_ok=True)
 
-            write_poscar(atoms, struct_dir / "POSCAR")
-
             struct_elements = sorted(set(atoms.get_chemical_symbols()))
-            with open(struct_dir / "POTCAR", "wb") as f:
-                for elem in struct_elements:
-                    f.write(potcar_data[elem])
+            potcar_bytes = b"".join(potcar_data[elem] for elem in struct_elements)
+            potcar_hash = hash_potcar_bytes(potcar_bytes)
+            structure_hash = hash_structure(atoms)
+            identity = {
+                "project_name": project_name,
+                "dataset": ds,
+                "selected_index": i,
+                "source_xyz": str(xyz_path.resolve()),
+                "structure_hash": structure_hash,
+                "incar_hash": incar_hash,
+                "potcar_hash": potcar_hash,
+            }
 
+            current_status = read_status(struct_dir).get("status", "pending")
+            if current_status in {"submitted", "completed", "reused"}:
+                if _identity_matches(_read_identity(struct_dir), identity):
+                    count += 1
+                    if current_status == "reused":
+                        reused += 1
+                    continue
+
+            _clean_stale_outputs(struct_dir)
+            write_poscar(atoms, struct_dir / "POSCAR")
+            (struct_dir / "POTCAR").write_bytes(potcar_bytes)
             (struct_dir / "INCAR").write_text(incar_text, encoding="utf-8")
-            write_status(struct_dir, status="pending", retry_level=0)
+            _write_identity(struct_dir, identity)
+
+            reusable_entry = _valid_registry_entry(
+                registry,
+                incar_hash,
+                potcar_hash,
+                structure_hash,
+            )
+            if reusable_entry:
+                reused_from = str(Path(reusable_entry["job_path"]).resolve())
+                write_status(
+                    struct_dir,
+                    status="reused",
+                    retry_level=0,
+                    reused_from=reused_from,
+                    structure_hash=structure_hash,
+                    incar_hash=incar_hash,
+                    potcar_hash=potcar_hash,
+                )
+                reused += 1
+            else:
+                write_status(
+                    struct_dir,
+                    status="pending",
+                    retry_level=0,
+                    structure_hash=structure_hash,
+                    incar_hash=incar_hash,
+                    potcar_hash=potcar_hash,
+                )
 
             count += 1
             if count % 100 == 0:
                 logger.info(f"    {count} structures prepared...")
 
         elapsed = time.perf_counter() - t0
-        logger.info(f"  {ds.capitalize()}: {count} jobs ({elapsed:.1f}s)")
+        reuse_text = f", {reused} reused" if reused else ""
+        logger.info(f"  {ds.capitalize()}: {count} jobs{reuse_text} ({elapsed:.1f}s)")
 
     logger.info("Job preparation complete")
 
@@ -116,19 +174,8 @@ def write_shared_vasp_script(
     slurm_header: str,
     vasp_command: str,
 ) -> None:
-    """Write vasp/run_vasp.sh — VASP runner submitted per structure.
-
-    Submitted for each structure via:
-      sbatch --job-name=<name> --nodes=N --ntasks-per-node=G \\
-             --gres=gpu:G run_vasp.sh <struct_dir>
-
-    The launcher writes NCORE/KPAR into each structure's INCAR before
-    submission (both for initial runs and OOM retries).  The script
-    simply reads INCAR and runs VASP.  On OOM it writes a marker file
-    and exits; the launcher detects this and handles escalation.
-    """
+    """Write vasp/run_vasp.sh - VASP runner submitted per structure."""
     bash_cmd = vasp_command.replace("{ntasks}", "$TOTAL_RANKS")
-    # Prevent OpenMPI hwloc binding errors when requesting < max GPUs
     if "mpirun" in bash_cmd and "--bind-to" not in bash_cmd:
         bash_cmd = bash_cmd.replace("mpirun", "mpirun --bind-to none", 1)
 
@@ -138,9 +185,6 @@ def write_shared_vasp_script(
 # ============================================================================
 # Usage: sbatch --job-name=<name> --nodes=N --ntasks-per-node=G \
 #              --gres=gpu:G run_vasp.sh <struct_dir>
-#
-# NCORE/KPAR are read from INCAR (written by the launcher before submission).
-# On OOM the script writes a marker file; the launcher handles retry/escalation.
 
 STRUCT_DIR="$1"
 if [ -z "$STRUCT_DIR" ]; then
@@ -163,7 +207,6 @@ echo "==========================================================================
 
 cd "$STRUCT_DIR" || exit 1
 
-# Read NCORE/KPAR from INCAR (launcher writes correct values before submission)
 NCORE_VAL=$(grep -i "^[[:space:]]*NCORE" INCAR | grep "=" | head -1 | sed 's/.*=//;s/#.*//' | xargs)
 KPAR_VAL=$(grep -i "^[[:space:]]*KPAR" INCAR | grep "=" | head -1 | sed 's/.*=//;s/#.*//' | xargs)
 [ -z "$NCORE_VAL" ] && NCORE_VAL=2
@@ -189,11 +232,6 @@ if [ -f "${STRUCT_DIR}/OUTCAR" ]; then
     echo "OUTCAR: $(wc -l < "${STRUCT_DIR}/OUTCAR") lines"
 fi
 
-# ============================================================================
-# OOM DETECTION
-# ============================================================================
-# On OOM: write marker file and exit. The launcher detects the marker,
-# escalates parameters (GPU count, NCORE, KPAR), and resubmits.
 if grep -q "oom_kill" "$VASP_LOG" 2>/dev/null || [ $VASP_EXIT -eq 137 ]; then
     echo ""
     echo "OOM detected! Writing marker for launcher to handle retry..."
@@ -201,9 +239,6 @@ if grep -q "oom_kill" "$VASP_LOG" 2>/dev/null || [ $VASP_EXIT -eq 137 ]; then
     exit 1
 fi
 
-# ============================================================================
-# SUCCESS OR ERROR
-# ============================================================================
 if [ $VASP_EXIT -eq 0 ]; then
     echo "VASP completed successfully"
     rm -f CHG CHGCAR WAVECAR CONTCAR DOSCAR EIGENVAL PCDAT
@@ -231,33 +266,61 @@ fi
 
 def write_poscar(atoms, path: Path) -> None:
     """Write an ASE Atoms object as a VASP5 POSCAR with atoms grouped by element."""
-    symbols = np.array(atoms.get_chemical_symbols())
-    unique_elements = sorted(set(symbols))
+    path.write_text(canonical_poscar_text(atoms), encoding="utf-8")
 
-    sorted_indices = []
-    counts = []
-    for elem in unique_elements:
-        mask = symbols == elem
-        indices = np.where(mask)[0]
-        sorted_indices.extend(indices.tolist())
-        counts.append(int(mask.sum()))
 
-    cell = atoms.get_cell()
-    frac_positions = atoms.get_scaled_positions()
+def _read_identity(struct_dir: Path) -> dict:
+    identity_path = struct_dir / ".vasp_identity"
+    if not identity_path.exists():
+        return {}
+    try:
+        data = json.loads(identity_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {}
+    return data if isinstance(data, dict) else {}
 
-    with open(path, "w", encoding="utf-8") as f:
-        info = atoms.info if hasattr(atoms, "info") else {}
-        comment = info.get("config_type", " ".join(unique_elements))
-        f.write(f"{comment}\n")
-        f.write("1.0\n")
-        for row in cell:
-            f.write(f"  {row[0]:20.14f}  {row[1]:20.14f}  {row[2]:20.14f}\n")
-        f.write("  " + "  ".join(unique_elements) + "\n")
-        f.write("  " + "  ".join(str(c) for c in counts) + "\n")
-        f.write("Direct\n")
-        for idx in sorted_indices:
-            p = frac_positions[idx]
-            f.write(f"  {p[0]:20.14f}  {p[1]:20.14f}  {p[2]:20.14f}\n")
+
+def _write_identity(struct_dir: Path, identity: dict) -> None:
+    (struct_dir / ".vasp_identity").write_text(
+        json.dumps(identity, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+
+
+def _identity_matches(existing: dict, expected: dict) -> bool:
+    keys = ("structure_hash", "incar_hash", "potcar_hash")
+    return bool(existing) and all(existing.get(key) == expected[key] for key in keys)
+
+
+def _clean_stale_outputs(struct_dir: Path) -> None:
+    """Remove outputs from an old identity before preparing a new calculation."""
+    for filename in (
+        "OUTCAR",
+        "vasprun.xml",
+        "OSZICAR",
+        "vasp_output.log",
+        ".vasp_oom_detected",
+        "CHG",
+        "CHGCAR",
+        "WAVECAR",
+        "CONTCAR",
+        "DOSCAR",
+        "EIGENVAL",
+        "PCDAT",
+    ):
+        (struct_dir / filename).unlink(missing_ok=True)
+
+
+def _valid_registry_entry(
+    registry: dict,
+    incar_hash: str,
+    potcar_hash: str,
+    structure_hash: str,
+) -> dict | None:
+    entry = get_registry_entry(registry, incar_hash, potcar_hash, structure_hash)
+    if not entry or not entry.get("job_path"):
+        return None
+    return entry if outcar_is_complete(Path(entry["job_path"]) / "OUTCAR") else None
 
 
 # ==================================================================

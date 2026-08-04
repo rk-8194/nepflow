@@ -329,6 +329,8 @@ class WorkflowController:
                         s = _json.loads(sf.read_text(encoding="utf-8")).get("status", "pending") if sf.exists() else "pending"
                     except (OSError, ValueError):
                         s = "pending"
+                    if s == "reused":
+                        s = "completed"
                     tally[s if s in tally else "pending"] += 1
                 failed_dir = ds_dir / "failed"
                 if failed_dir.exists():

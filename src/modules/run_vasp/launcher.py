@@ -8,17 +8,21 @@ import shutil
 import subprocess
 import time
 from configparser import ConfigParser
+from datetime import datetime
 from pathlib import Path
 
 from ._common import (
-    VASP_COMPLETION_MARKERS,
     build_retry_levels_for_gpu,
     estimate_kpoints_irr,
     estimate_n_electrons,
+    file_sha256,
+    get_nepflow_root,
     logger,
+    outcar_is_complete,
     parse_zval,
     predict_vasp_params,
     read_status,
+    upsert_registry_entry,
     write_launcher_state,
     write_status,
 )
@@ -64,7 +68,7 @@ def run_launcher(
     shared_script = vasp_dir / "run_vasp.sh"
 
     # --- VASP memory: pre-run parameter prediction -----------------------
-    nepflow_root = project_dir.parent.parent  # projects/project_X → nepflow root
+    nepflow_root = get_nepflow_root(project_dir)
     zval_cache: dict = {}
     vasp_config_dir = project_dir / "config" / "vasp"
     if vasp_config_dir.exists():
@@ -143,7 +147,7 @@ def run_launcher(
                 struct_num = int(struct_dir.name.split("_")[1])
                 job_name = f"nf_{project_name}_{ds}_{struct_num:04d}"
 
-                if status == "completed":
+                if status in {"completed", "reused"}:
                     completed_count += 1
                     continue
                 
@@ -165,10 +169,20 @@ def run_launcher(
                     # Job left squeue — determine outcome
                     if _check_completed(struct_dir):
                         logger.info(f"  ✓ {ds}/{struct_dir.name}")
-                        _on_success(struct_dir, nepflow_root, gpus_per_node)
+                        _on_success(
+                            struct_dir,
+                            nepflow_root,
+                            gpus_per_node,
+                            project_name,
+                            ds,
+                            struct_num,
+                        )
                         write_status(
                             struct_dir, status="completed",
                             retry_level=status_data.get("retry_level", 0),
+                            structure_hash=status_data.get("structure_hash"),
+                            incar_hash=status_data.get("incar_hash"),
+                            potcar_hash=status_data.get("potcar_hash"),
                         )
                         completed_count += 1
                         continue
@@ -547,18 +561,7 @@ def _job_in_squeue(job_id: str) -> bool:
 
 def _check_completed(struct_dir: Path) -> bool:
     """Check if VASP completed successfully by inspecting OUTCAR tail."""
-    outcar = struct_dir / "OUTCAR"
-    if not outcar.exists():
-        return False
-    try:
-        with open(outcar, "r", encoding="utf-8", errors="replace") as f:
-            f.seek(0, 2)
-            size = f.tell()
-            f.seek(max(0, size - 50_000))
-            tail = f.read()
-        return any(marker in tail for marker in VASP_COMPLETION_MARKERS)
-    except OSError:
-        return False
+    return outcar_is_complete(struct_dir / "OUTCAR")
 
 
 def _cancel_stale_launcher(vasp_dir: Path) -> None:
@@ -654,9 +657,68 @@ def _log_oom(
         logger.debug(f"  Could not log OOM for {struct_dir.name}: {e}")
 
 
-def _on_success(struct_dir: Path, nepflow_root: Path, gpus_per_node: int) -> None:
+def _on_success(
+    struct_dir: Path,
+    nepflow_root: Path,
+    gpus_per_node: int,
+    project_name: str,
+    dataset: str,
+    selected_index: int,
+) -> None:
     """Log performance on successful completion (cleanup done by run_vasp.sh)."""
     _log_performance(struct_dir, nepflow_root, gpus_per_node)
+    _register_completed_job(
+        struct_dir,
+        nepflow_root,
+        project_name,
+        dataset,
+        selected_index,
+    )
+
+
+def _register_completed_job(
+    struct_dir: Path,
+    nepflow_root: Path,
+    project_name: str,
+    dataset: str,
+    selected_index: int,
+) -> None:
+    """Record a completed VASP job in the shared hash registry."""
+    identity_path = struct_dir / ".vasp_identity"
+    if not identity_path.exists():
+        logger.debug("  Not registering %s: missing .vasp_identity", struct_dir.name)
+        return
+    try:
+        identity = json.loads(identity_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as e:
+        logger.debug("  Not registering %s: bad .vasp_identity: %s", struct_dir.name, e)
+        return
+
+    required = ("incar_hash", "potcar_hash", "structure_hash")
+    if not all(identity.get(key) for key in required):
+        logger.debug("  Not registering %s: incomplete identity", struct_dir.name)
+        return
+
+    entry = {
+        "job_path": str(struct_dir.resolve()),
+        "project_name": project_name,
+        "dataset": dataset,
+        "selected_index": selected_index,
+        "completed_at": datetime.now().isoformat(),
+        "structure_hash": identity["structure_hash"],
+        "incar_hash": identity["incar_hash"],
+        "potcar_hash": identity["potcar_hash"],
+        "outcar_hash": file_sha256(struct_dir / "OUTCAR"),
+        "vasprun_hash": file_sha256(struct_dir / "vasprun.xml"),
+    }
+    upsert_registry_entry(
+        nepflow_root,
+        identity["incar_hash"],
+        identity["potcar_hash"],
+        identity["structure_hash"],
+        entry,
+    )
+    logger.debug("  Registered completed VASP job: %s", struct_dir)
 
 
 def _log_performance(struct_dir: Path, nepflow_root: Path, gpus_per_node: int) -> None:
@@ -756,7 +818,7 @@ def _log_summary(jobs_dir: Path, datasets: list[str], nepflow_root: Path) -> Non
             if status_file.exists():
                 try:
                     s = json.loads(status_file.read_text(encoding="utf-8"))
-                    if s.get("status") == "completed":
+                    if s.get("status") in {"completed", "reused"}:
                         completed += 1
                 except (json.JSONDecodeError, OSError):
                     pass

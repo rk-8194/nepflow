@@ -4,6 +4,7 @@ Unified perturbation engine for non-equilibrium structure generation.
 Given a list of base structures (from any configurational generator),
 this module applies the full matrix of perturbations:
   - Volume scaling (isotropic E-V profiles)
+  - Elastic stress sets
   - Rattling (thermal disorder via hiphive MC)
   - Isotropic strain
   - Shear deformation
@@ -24,6 +25,8 @@ from typing import Dict, List, Tuple
 import numpy as np
 from ase import Atom, Atoms
 from ase.io import write
+
+from common.structure_identity import annotate_structure_hashes
 
 logger = logging.getLogger("nepflow.structure_generation")
 
@@ -62,14 +65,17 @@ def _process_one_base(args: tuple) -> List[Atoms]:
     # 2) Volume profile
     results.extend(engine._volume_profile(supercell, base))
 
-    # 3) Perturbations
+    # 3) Deterministic elastic stress sets
+    results.extend(engine._elastic_stress_set(supercell, base))
+
+    # 4) Perturbations
     results.extend(engine._rattled(supercell, base, n_rattled))
     results.extend(engine._strained(supercell, base, n_strained))
     results.extend(engine._deformed(supercell, base, n_deformed))
     results.extend(engine._vacancies(supercell, base, n_vacancies))
     results.extend(engine._interstitials(supercell, base, n_interstitials))
 
-    # 4) Gas-specific perturbations
+    # 5) Gas-specific perturbations
     if engine.gas_elements:
         results.extend(engine._gas_interstitials(supercell, base, n_gas_interstitials))
         results.extend(engine._vacancy_interstitial(supercell, base, n_vacancy_interstitial))
@@ -100,6 +106,8 @@ class PerturbationEngine:
         gas_elements: List[str] | None = None,
         gas_interstitial_d_min: float | None = None,
         max_gas_occupancy: int = 3,
+        elastic_stress_enabled: bool = True,
+        elastic_strain_amplitudes: List[float] | None = None,
     ):
         self.rattle_std = rattle_std
         self.rattle_d_min = rattle_d_min
@@ -115,6 +123,12 @@ class PerturbationEngine:
         self.gas_elements = gas_elements or []
         self.gas_interstitial_d_min = gas_interstitial_d_min if gas_interstitial_d_min is not None else interstitial_d_min
         self.max_gas_occupancy = max_gas_occupancy
+        self.elastic_stress_enabled = elastic_stress_enabled
+        self.elastic_strain_amplitudes = (
+            list(elastic_strain_amplitudes)
+            if elastic_strain_amplitudes is not None
+            else [-0.02, -0.01, -0.005, 0.005, 0.01, 0.02]
+        )
 
         # Lightweight summary counters (no Atoms kept in memory)
         self._total: int = 0
@@ -138,6 +152,8 @@ class PerturbationEngine:
             gas_elements=self.gas_elements,
             gas_interstitial_d_min=self.gas_interstitial_d_min,
             max_gas_occupancy=self.max_gas_occupancy,
+            elastic_stress_enabled=self.elastic_stress_enabled,
+            elastic_strain_amplitudes=self.elastic_strain_amplitudes,
         )
 
     # ------------------------------------------------------------------
@@ -204,6 +220,7 @@ class PerturbationEngine:
         """Append a batch of structures to the output file and update counters."""
         if not batch:
             return
+        annotate_structure_hashes(batch)
         write(str(self._output_file), batch, append=True)
         for a in batch:
             self._total += 1
@@ -271,7 +288,7 @@ class PerturbationEngine:
     def _tag(self, atoms: Atoms, base: Atoms, perturbation_type: str, **extra) -> None:
         """Copy base metadata and set perturbation type."""
         for key in ("composition", "actual_composition", "crystal_structure",
-                     "configurational_type", "source"):
+                     "configurational_type", "source", "seed_id"):
             if key in base.info:
                 atoms.info.setdefault(key, base.info[key])
         atoms.info["perturbation_type"] = perturbation_type
@@ -294,6 +311,66 @@ class PerturbationEngine:
             self._tag(scaled, base, "volume_profile", volume_scale=float(sf), volume_index=i)
             out.append(scaled)
         return out
+
+    def _elastic_stress_set(self, supercell: Atoms, base: Atoms) -> List[Atoms]:
+        """Generate deterministic normal, coupled-normal, and shear strain series."""
+        if not self.elastic_stress_enabled:
+            return []
+
+        modes = (
+            ("normal_xx", self._normal_strain_matrix, (0,)),
+            ("normal_yy", self._normal_strain_matrix, (1,)),
+            ("normal_zz", self._normal_strain_matrix, (2,)),
+            ("coupled_xy", self._coupled_strain_matrix, (0, 1)),
+            ("coupled_xz", self._coupled_strain_matrix, (0, 2)),
+            ("coupled_yz", self._coupled_strain_matrix, (1, 2)),
+            ("shear_xy", self._shear_strain_matrix, (0, 1)),
+            ("shear_xz", self._shear_strain_matrix, (0, 2)),
+            ("shear_yz", self._shear_strain_matrix, (1, 2)),
+        )
+
+        out: List[Atoms] = []
+        for amplitude in self.elastic_strain_amplitudes:
+            d = float(amplitude)
+            if d == 0.0:
+                continue
+            for mode, matrix_fn, axes in modes:
+                M = matrix_fn(d, *axes)
+                strained = supercell.copy()
+                strained.set_cell(M @ strained.cell[:], scale_atoms=True)
+                strain_matrix = M - np.eye(3)
+                self._tag(
+                    strained,
+                    base,
+                    "elastic_stress",
+                    elastic_mode=mode,
+                    strain_amplitude=d,
+                    strain_matrix=strain_matrix.reshape(-1).tolist(),
+                )
+                out.append(strained)
+        return out
+
+    @staticmethod
+    def _normal_strain_matrix(amplitude: float, axis: int) -> np.ndarray:
+        M = np.eye(3)
+        M[axis, axis] += amplitude
+        return M
+
+    @staticmethod
+    def _coupled_strain_matrix(amplitude: float, axis_a: int, axis_b: int) -> np.ndarray:
+        M = np.eye(3)
+        axis_c = ({0, 1, 2} - {axis_a, axis_b}).pop()
+        M[axis_a, axis_a] = 1.0 + amplitude
+        M[axis_b, axis_b] = 1.0 - amplitude
+        M[axis_c, axis_c] = 1.0 / (1.0 - amplitude * amplitude)
+        return M
+
+    @staticmethod
+    def _shear_strain_matrix(amplitude: float, axis_a: int, axis_b: int) -> np.ndarray:
+        M = np.eye(3)
+        M[axis_a, axis_b] = amplitude
+        M[axis_b, axis_a] = amplitude
+        return M
 
     def _rattled(self, supercell: Atoms, base: Atoms, n: int) -> List[Atoms]:
         from hiphive.structure_generation import generate_mc_rattled_structures

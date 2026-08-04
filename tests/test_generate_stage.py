@@ -14,7 +14,11 @@ SRC = ROOT / "src"
 class FakeAtoms:
     def __init__(self, *args, **kwargs):
         self.info = {}
-        self.cell = kwargs.get("cell", [1, 1, 1])
+        self.cell = kwargs.get(
+            "cell",
+            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+        )
+        self.pbc = [True, True, True]
 
     def copy(self):
         other = FakeAtoms()
@@ -24,6 +28,15 @@ class FakeAtoms:
 
     def set_chemical_symbols(self, symbols):
         self.info["symbols"] = list(symbols)
+
+    def get_chemical_symbols(self):
+        return self.info.get("symbols", ["Si"])
+
+    def get_cell(self):
+        return self.cell
+
+    def get_scaled_positions(self):
+        return [[0.0, 0.0, 0.0] for _ in self.get_chemical_symbols()]
 
     def rattle(self, stdev, seed):
         self.info["rattle"] = (stdev, seed)
@@ -88,6 +101,19 @@ def install_test_stubs():
     ase_io = types.ModuleType("ase.io")
     ase_io.write = lambda *args, **kwargs: None
     sys.modules["ase.io"] = ase_io
+
+    common_package = types.ModuleType("common")
+    common_package.__path__ = []
+    sys.modules["common"] = common_package
+
+    identity_spec = importlib.util.spec_from_file_location(
+        "common.structure_identity",
+        SRC / "common" / "structure_identity.py",
+    )
+    identity_module = importlib.util.module_from_spec(identity_spec)
+    sys.modules["common.structure_identity"] = identity_module
+    assert identity_spec.loader is not None
+    identity_spec.loader.exec_module(identity_module)
 
     base_spec = importlib.util.spec_from_file_location(
         "testpkg.modules.base",
@@ -305,6 +331,56 @@ class GenerateStageTests(unittest.TestCase):
             resume_if_needed.assert_called_once()
             execute.assert_called_once()
             finalize.assert_called_once_with(summary)
+
+    def test_build_engine_uses_elastic_stress_defaults(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_dir = Path(tmp)
+            write_project_config(project_dir)
+            stage = self.create_stage(project_dir)
+            config, settings = stage.load_config()
+
+            engine = stage._build_engine(
+                config,
+                settings["target_n_atoms"],
+                settings["random_seed"],
+            )
+
+            self.assertTrue(engine.kwargs["elastic_stress_enabled"])
+            self.assertEqual(
+                engine.kwargs["elastic_strain_amplitudes"],
+                [-0.02, -0.01, -0.005, 0.005, 0.01, 0.02],
+            )
+
+    def test_build_engine_accepts_elastic_stress_config(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_dir = Path(tmp)
+            write_project_config(project_dir)
+            config_path = project_dir / "config" / "project.config"
+            config_text = config_path.read_text(encoding="utf-8")
+            config_path.write_text(
+                config_text.replace(
+                    "n_workers=1",
+                    "\n".join(
+                        [
+                            "n_workers=1",
+                            "elastic_stress_enabled=false",
+                            "elastic_strain_amplitudes=-0.03,0.03",
+                        ]
+                    ),
+                ),
+                encoding="utf-8",
+            )
+            stage = self.create_stage(project_dir)
+            config, settings = stage.load_config()
+
+            engine = stage._build_engine(
+                config,
+                settings["target_n_atoms"],
+                settings["random_seed"],
+            )
+
+            self.assertFalse(engine.kwargs["elastic_stress_enabled"])
+            self.assertEqual(engine.kwargs["elastic_strain_amplitudes"], [-0.03, 0.03])
 
 
 if __name__ == "__main__":

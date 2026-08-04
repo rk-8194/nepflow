@@ -336,6 +336,11 @@ volume_scale_min=0.8
 volume_scale_max=1.2
 n_volume_points=11
 
+# --- Elastic stress sets ---
+# Deterministic normal, coupled-normal, and shear strain series for elastic constants
+elastic_stress_enabled=true
+elastic_strain_amplitudes=-0.02,-0.01,-0.005,0.005,0.01,0.02
+
 # --- Perturbation counts (per base structure at equilibrium) ---
 n_rattled=10
 n_strained=10
@@ -366,6 +371,26 @@ interstitial_max=0.1
 # Download NEP89 from: https://github.com/brucefan1983/GPUMD/tree/master/potentials/nep/nep89_20250409
 # Place this in the config/nep folder.
 nep_model_file=nep89.txt
+
+# Include seed structures from structures/seeds/base_structures.xyz as
+# fixed training anchors before FPS fills the remaining target_train_count.
+include_seed_structures=false
+
+# Include generated elastic stress structures for unary/single-element seeds
+# as fixed training anchors before FPS. Useful for elemental elastic benchmarks.
+include_single_element_elastic_stress_structures=false
+
+# Include all generated elastic stress structures as fixed training anchors before FPS.
+# This can be expensive for large alloy datasets.
+include_elastic_stress_structures=false
+
+# Balance descriptor-space novelty with sparse binary/ternary composition coverage
+# when filling the non-anchor portion of the training set.
+composition_aware_fps=false
+composition_aware_fps_frontier_fraction=0.10
+composition_aware_fps_ternary_weight=1.0
+composition_aware_fps_adaptive_retries=4
+composition_aware_fps_descriptor_floor_fraction=0.95
 
 # Farthest-point sampling parameters
 # Binary search adjusts min_distance to hit these counts (±target_tolerance)
@@ -429,13 +454,13 @@ max_concurrent=20
 walltime=03:00:00
 
 # Individual VASP job walltime (HH:MM:SS format)
-vasp_walltime=00:30:00
+vasp_walltime=01:00:00
 
 # Seconds between squeue polls during the launcher loop
-poll_interval=30
+poll_interval=20
 
 # Max OOM retry escalation level (0-6, see adaptive_healing levels)
-max_retry_level=6
+max_retry_level=100
 
 [hpc]
 # Node architecture — used to generate valid NCORE/KPAR retry levels

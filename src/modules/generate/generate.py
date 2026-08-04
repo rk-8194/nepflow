@@ -19,6 +19,7 @@ from ase import Atoms
 from ase.build import bulk
 from ase.io import write
 
+from common.structure_identity import annotate_structure_hashes
 from ..base import Stage
 from .generators import (
     CompositionGrid,
@@ -108,6 +109,7 @@ class GenerateStage(Stage):
             return None
 
         all_bases: List[Atoms] = []
+        seed_index = 0
         logger.info("")
         logger.info("Step 2: Generating base structures (configurational generators)")
         for composition in compositions:
@@ -124,6 +126,7 @@ class GenerateStage(Stage):
                     settings["elements"],
                     settings["gas_elements"],
                 )
+                seed_index = self._assign_seed_ids(bases, seed_index)
                 all_bases.extend(bases)
                 if bases:
                     logger.debug(f"  {label} / {gen_name}: {len(bases)} structures")
@@ -138,6 +141,7 @@ class GenerateStage(Stage):
 
         seeds_file = self._seeds_file()
         seeds_file.parent.mkdir(parents=True, exist_ok=True)
+        annotate_structure_hashes(all_bases)
         write(str(seeds_file), all_bases)
         logger.info(f"  Saved seeds to {seeds_file}")
         return all_bases
@@ -303,6 +307,12 @@ class GenerateStage(Stage):
             if gas_elements:
                 base.info.setdefault("gas_elements", gas_elements)
 
+    @staticmethod
+    def _assign_seed_ids(bases: List[Atoms], start_index: int) -> int:
+        for offset, base in enumerate(bases):
+            base.info.setdefault("seed_id", f"seed_{start_index + offset:06d}")
+        return start_index + len(bases)
+
     def _extend_with_gas_phase_bases(
         self,
         all_bases: List[Atoms],
@@ -324,6 +334,7 @@ class GenerateStage(Stage):
         for base in gas_bases:
             base.info.setdefault("elements", settings["elements"])
             base.info.setdefault("gas_elements", settings["gas_elements"])
+        self._assign_seed_ids(gas_bases, len(all_bases))
         all_bases.extend(gas_bases)
         logger.info(f"  Gas-phase base structures: {len(gas_bases)}")
 
@@ -419,7 +430,31 @@ class GenerateStage(Stage):
             gas_elements=gas_elements or [],
             gas_interstitial_d_min=config.getfloat("generation", "gas_interstitial_d_min", fallback=1.2),
             max_gas_occupancy=config.getint("generation", "max_gas_occupancy", fallback=3),
+            elastic_stress_enabled=config.getboolean(
+                "generation", "elastic_stress_enabled", fallback=True
+            ),
+            elastic_strain_amplitudes=GenerateStage._parse_float_list(
+                config,
+                "generation",
+                "elastic_strain_amplitudes",
+                fallback="-0.02,-0.01,-0.005,0.005,0.01,0.02",
+            ),
         )
+
+    @staticmethod
+    def _parse_float_list(
+        config: ConfigParser,
+        section: str,
+        option: str,
+        fallback: str,
+    ) -> List[float]:
+        value = config.get(section, option, fallback=fallback)
+        floats: List[float] = []
+        for item in value.split(","):
+            stripped = item.strip()
+            if stripped:
+                floats.append(float(stripped))
+        return floats
 
     def _run_debug(self, elements: List[str], random_seed: int,
                     gas_elements: List[str] | None = None) -> None:
@@ -452,6 +487,7 @@ class GenerateStage(Stage):
             atoms.info["config_type"] = f"debug_{crystal}_{i:04d}"
             atoms.info["generator"] = "debug"
             atoms.info["elements"] = elements
+            atoms.info["seed_id"] = f"seed_{i:06d}"
             if gas_elements:
                 atoms.info["gas_elements"] = gas_elements
             structures.append(atoms)
@@ -478,12 +514,14 @@ class GenerateStage(Stage):
                 base.info["perturbation_type"] = "gas_interstitial"
                 base.info["elements"] = elements
                 base.info["gas_elements"] = gas_elements
+                base.info["seed_id"] = f"seed_{n_gas_debug + i:06d}"
                 structures.append(base)
 
         # Save seeds
         seeds_dir = self.project_dir / "structures" / "seeds"
         seeds_dir.mkdir(parents=True, exist_ok=True)
         seeds_file = seeds_dir / "base_structures.xyz"
+        annotate_structure_hashes(structures)
         write(str(seeds_file), structures)
         logger.info(f"[DEBUG] Saved {len(structures)} seed structures to {seeds_file}")
 

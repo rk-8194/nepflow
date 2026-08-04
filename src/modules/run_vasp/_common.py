@@ -1,6 +1,7 @@
 """Shared constants and utilities for the run_vasp sub-stages."""
 
 import csv
+import hashlib
 import json
 import logging
 import re
@@ -10,9 +11,176 @@ from pathlib import Path
 
 import numpy as np
 
+from common.structure_identity import hash_structure as hash_physical_structure
+
 logger = logging.getLogger("nepflow.run_vasp")
 
 VASP_COMPLETION_MARKERS = ["General timing", "Voluntary context switches"]
+VASP_REGISTRY_VERSION = 1
+
+
+# ==================================================================
+# shared registry + identity helpers
+# ==================================================================
+
+def get_nepflow_root(project_dir: Path) -> Path:
+    """Return the shared NEPFlow root for cross-project VASP memory files."""
+    project_dir = Path(project_dir)
+    if project_dir.name.startswith("project_") and project_dir.parent.name == "projects":
+        return project_dir.parent.parent
+    return project_dir
+
+
+def completed_jobs_registry_path(nepflow_root: Path) -> Path:
+    """Return the shared completed-VASP registry path."""
+    return Path(nepflow_root) / ".vasp_completed_jobs.json"
+
+
+def _sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def file_sha256(path: Path) -> str | None:
+    """Return a file SHA-256 hash, or None when the file is absent."""
+    try:
+        return _sha256_bytes(path.read_bytes())
+    except OSError:
+        return None
+
+
+def canonical_poscar_text(atoms) -> str:
+    """Return NEPFlow's deterministic VASP5 POSCAR representation."""
+    symbols = np.array(atoms.get_chemical_symbols())
+    unique_elements = sorted(set(symbols))
+
+    sorted_indices = []
+    counts = []
+    for elem in unique_elements:
+        mask = symbols == elem
+        indices = np.where(mask)[0]
+        sorted_indices.extend(indices.tolist())
+        counts.append(int(mask.sum()))
+
+    cell = atoms.get_cell()
+    frac_positions = atoms.get_scaled_positions()
+    info = atoms.info if hasattr(atoms, "info") else {}
+    comment = info.get("config_type", " ".join(unique_elements))
+
+    lines = [str(comment), "1.0"]
+    for row in cell:
+        lines.append(f"  {row[0]:20.14f}  {row[1]:20.14f}  {row[2]:20.14f}")
+    lines.append("  " + "  ".join(unique_elements))
+    lines.append("  " + "  ".join(str(c) for c in counts))
+    lines.append("Direct")
+    for idx in sorted_indices:
+        p = frac_positions[idx]
+        lines.append(f"  {p[0]:20.14f}  {p[1]:20.14f}  {p[2]:20.14f}")
+    return "\n".join(lines) + "\n"
+
+
+def canonical_poscar_bytes(atoms) -> bytes:
+    """Return canonical POSCAR bytes for structure hashing."""
+    return canonical_poscar_text(atoms).encode("utf-8")
+
+
+def hash_structure(atoms) -> str:
+    """Hash the physical structure, ignoring mutable metadata."""
+    return hash_physical_structure(atoms)
+
+
+def strip_resource_incar_params(incar_text: str) -> str:
+    """Remove launcher-controlled resource parameters from INCAR text."""
+    kept = []
+    for line in incar_text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            kept.append(line.rstrip())
+            continue
+        if re.match(r"^(NCORE|KPAR)\s*=", stripped, re.IGNORECASE):
+            continue
+        kept.append(line.rstrip())
+    return "\n".join(kept).rstrip() + "\n"
+
+
+def hash_incar_text(incar_text: str) -> str:
+    """Hash scientific INCAR content, excluding launcher resource params."""
+    return _sha256_bytes(strip_resource_incar_params(incar_text).encode("utf-8"))
+
+
+def hash_potcar_bytes(potcar_bytes: bytes) -> str:
+    """Hash concatenated POTCAR bytes for the exact structure element set."""
+    return _sha256_bytes(potcar_bytes)
+
+
+def read_completed_registry(nepflow_root: Path) -> dict:
+    """Read the shared completed-VASP registry."""
+    path = completed_jobs_registry_path(nepflow_root)
+    if not path.exists():
+        return {"version": VASP_REGISTRY_VERSION, "jobs": {}}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        logger.warning("Could not read %s; starting with an empty VASP registry", path)
+        return {"version": VASP_REGISTRY_VERSION, "jobs": {}}
+    if not isinstance(data, dict):
+        return {"version": VASP_REGISTRY_VERSION, "jobs": {}}
+    data.setdefault("version", VASP_REGISTRY_VERSION)
+    data.setdefault("jobs", {})
+    return data
+
+
+def write_completed_registry(nepflow_root: Path, registry: dict) -> None:
+    """Write the shared completed-VASP registry."""
+    path = completed_jobs_registry_path(nepflow_root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    tmp_path.write_text(json.dumps(registry, indent=2, sort_keys=True), encoding="utf-8")
+    tmp_path.replace(path)
+
+
+def get_registry_entry(
+    registry: dict,
+    incar_hash: str,
+    potcar_hash: str,
+    structure_hash: str,
+) -> dict | None:
+    """Return a registry entry for the input identity, if present."""
+    entry = (
+        registry.get("jobs", {})
+        .get(incar_hash, {})
+        .get(potcar_hash, {})
+        .get(structure_hash)
+    )
+    return entry if isinstance(entry, dict) else None
+
+
+def upsert_registry_entry(
+    nepflow_root: Path,
+    incar_hash: str,
+    potcar_hash: str,
+    structure_hash: str,
+    entry: dict,
+) -> None:
+    """Insert or replace a completed-job registry entry."""
+    registry = read_completed_registry(nepflow_root)
+    jobs = registry.setdefault("jobs", {})
+    jobs.setdefault(incar_hash, {}).setdefault(potcar_hash, {})[structure_hash] = entry
+    write_completed_registry(nepflow_root, registry)
+
+
+def outcar_is_complete(outcar_path: Path) -> bool:
+    """Check whether an OUTCAR tail contains a VASP completion marker."""
+    if not outcar_path.exists():
+        return False
+    try:
+        with open(outcar_path, "r", encoding="utf-8", errors="replace") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - 50_000))
+            tail = f.read()
+        return any(marker in tail for marker in VASP_COMPLETION_MARKERS)
+    except OSError:
+        return False
 
 
 # ==================================================================
@@ -107,6 +275,7 @@ def write_status(
     initial_ncore: int | None = None,
     initial_kpar: int | None = None,
     current_gpu: int | None = None,
+    **extra: object,
 ) -> None:
     """Write .vasp_status JSON to a structure directory."""
     data = {
@@ -125,6 +294,7 @@ def write_status(
         data["initial_kpar"] = initial_kpar
     if current_gpu is not None:
         data["current_gpu"] = current_gpu
+    data.update({key: value for key, value in extra.items() if value is not None})
     (struct_dir / ".vasp_status").write_text(
         json.dumps(data, indent=2), encoding="utf-8"
     )
