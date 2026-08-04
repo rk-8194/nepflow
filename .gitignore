@@ -1,12 +1,19 @@
 ./_existing
 projects
 plots
+cafps
+pairs
+run_*
+projects*
 .vasp_memory
 
 # Python cache
 __pycache__/
 *.pyc
 *.pyo
+
+*.npy
+*.txt
 
 # Generated plots
 *.png
