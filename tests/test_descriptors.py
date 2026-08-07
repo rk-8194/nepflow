@@ -47,6 +47,19 @@ class FakeCalculator:
         return sys.modules["numpy"].ones((len(batch), width))
 
 
+class FakeCalculatorV3:
+    def __init__(self, path):
+        self.path = path
+        self.batch_sizes = []
+        self.mean_flags = []
+
+    def descriptors(self, batch, mean=True):
+        self.batch_sizes.append(len(batch))
+        self.mean_flags.append(mean)
+        width = 3 if mean else 2
+        return sys.modules["numpy"].ones((len(batch), width))
+
+
 def install_numpy_stub():
     numpy_module = types.ModuleType("numpy")
     numpy_module.ndarray = FakeArray
@@ -133,6 +146,20 @@ class DescriptorTests(unittest.TestCase):
 
         self.assertEqual(calc.mean_descriptor_flags, [False, False])
         self.assertEqual(descriptors.shape, (2, 2))
+
+    def test_compute_descriptors_batched_supports_neptrainkit_v3_api(self) -> None:
+        calc = FakeCalculatorV3("model.txt")
+
+        descriptors = DESCRIPTORS.compute_descriptors_batched(
+            calc,
+            ["s0", "s1", "s2"],
+            mean_descriptor=False,
+            batch_size=2,
+        )
+
+        self.assertEqual(calc.batch_sizes, [2, 1])
+        self.assertEqual(calc.mean_flags, [False, False])
+        self.assertEqual(descriptors.shape, (3, 2))
 
     def test_load_or_compute_descriptors_uses_cache_when_shape_matches(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

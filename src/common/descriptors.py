@@ -12,6 +12,26 @@ from NepTrainKit.core.calculator import NepCalculator
 logger = logging.getLogger("nepflow.common.descriptors")
 
 
+def compute_structure_descriptors(
+    calc: NepCalculator,
+    structures: list,
+    *,
+    mean_descriptor: bool,
+) -> np.ndarray:
+    """Compute descriptors across NepTrainKit 2.x and 3.x calculator APIs."""
+    if hasattr(calc, "descriptors"):
+        return calc.descriptors(structures, mean=mean_descriptor)
+    if hasattr(calc, "get_structures_descriptor"):
+        return calc.get_structures_descriptor(
+            structures,
+            mean_descriptor=mean_descriptor,
+        )
+    raise AttributeError(
+        "NepCalculator does not provide a supported descriptor API. "
+        "Expected descriptors() or get_structures_descriptor()."
+    )
+
+
 def descriptor_cache_path(project_dir: Path) -> Path:
     """Return the descriptor cache path for a project."""
     return project_dir / "nep" / "datasets" / "descriptors.npy"
@@ -79,7 +99,8 @@ def compute_descriptors_batched(
     for start in range(0, n, batch_size):
         end = min(start + batch_size, n)
         batch = structures[start:end]
-        desc = calc.get_structures_descriptor(
+        desc = compute_structure_descriptors(
+            calc,
             batch,
             mean_descriptor=mean_descriptor,
         )

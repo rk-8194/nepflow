@@ -59,6 +59,25 @@ logger = logging.getLogger("plot_descriptors")
 # helpers - copied / adapted from select.py
 # ---------------------------------------------------------------------------
 
+def _compute_structure_descriptors(
+    calc: NepCalculator,
+    structures: list,
+    *,
+    mean_descriptor: bool,
+) -> np.ndarray:
+    if hasattr(calc, "descriptors"):
+        return calc.descriptors(structures, mean=mean_descriptor)
+    if hasattr(calc, "get_structures_descriptor"):
+        return calc.get_structures_descriptor(
+            structures,
+            mean_descriptor=mean_descriptor,
+        )
+    raise AttributeError(
+        "NepCalculator does not provide a supported descriptor API. "
+        "Expected descriptors() or get_structures_descriptor()."
+    )
+
+
 def _latest_potential(potentials_dir: Path) -> Path:
     candidates = [
         d for d in potentials_dir.iterdir()
@@ -104,7 +123,11 @@ def _compute_descriptors_batched(
     t0 = time.perf_counter()
     for start in range(0, n, batch_size):
         end = min(start + batch_size, n)
-        desc = calc.get_structures_descriptor(structures[start:end], mean_descriptor=mean_descriptor)
+        desc = _compute_structure_descriptors(
+            calc,
+            structures[start:end],
+            mean_descriptor=mean_descriptor,
+        )
         all_descriptors.append(desc)
         elapsed = time.perf_counter() - t0
         rate = end / elapsed if elapsed > 0 else 0
