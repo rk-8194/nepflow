@@ -120,7 +120,7 @@ class TrainNepStage(Stage):
         train_virial = config.getboolean("train_nep", "train_virial", fallback=False)
 
         # Step 3: Prepare datasets (parse OUTCAR and write XYZ files)
-        logger.info("Step 3: Parsing OUTCAR files and writing XYZ datasets")
+        logger.info("Step 3: Parsing OUTCAR files and writing XYZ datasets. Training virials: %s", train_virial)
         train_count = prepare_dataset(
             dataset_path=dataset_path / "train.xyz",
             ase_structures=train_structures,

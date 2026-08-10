@@ -260,17 +260,15 @@ def _parse_outcar(outcar_path: Path, ase_atoms: Atoms) -> dict | None:
             "virial": None,
         }
 
-        # Try to extract virial from atoms.info
-        if "virial" in atoms.info:
-            result["virial"] = atoms.info["virial"]
-        else:
-            # Try manual parsing from OUTCAR
-            try:
-                virial = parse_virial_from_outcar(outcar_path, atoms.get_volume())
-                if virial is not None:
-                    result["virial"] = virial
-            except Exception as e:
-                logger.debug(f"Could not extract virial from {outcar_path}: {e}")
+        try:
+            # ASE stress: eV/Å^3, positive = tension
+            stress = atoms.get_stress(voigt=False)
+
+            # GPUMD virial: eV, positive = compression
+            result["virial"] = -stress * atoms.get_volume()
+
+        except Exception as e:
+            logger.debug(f"Could not extract virial from {outcar_path}: {e}")
 
         # Validate
         if not validate_structure(result):

@@ -1,4 +1,5 @@
 import importlib.util
+import os
 import sys
 import tempfile
 import types
@@ -76,6 +77,60 @@ class ConfigCliTests(unittest.TestCase):
                 check=False,
                 cwd=str(project_dir),
             )
+
+    def test_resolve_resubmit_command_prefers_original_slurm_script(self) -> None:
+        nepflow = load_nepflow_module()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            submit_dir = Path(tmp)
+            script_path = submit_dir / "submit.slurm"
+            script_path.write_text("#!/bin/bash\n", encoding="utf-8")
+
+            scontrol_output = (
+                f"JobId=123 Command={script_path} WorkDir={submit_dir}"
+            )
+
+            with patch.dict(os.environ, {"SLURM_JOB_ID": "123"}, clear=False):
+                with patch.object(
+                    nepflow.subprocess,
+                    "run",
+                    return_value=types.SimpleNamespace(stdout=scontrol_output),
+                ) as run_mock:
+                    command, cwd, source = nepflow._resolve_resubmit_command()
+
+            self.assertEqual(command, ["sbatch", str(script_path)])
+            self.assertEqual(cwd, submit_dir)
+            self.assertEqual(source, "scontrol job 123")
+            run_mock.assert_called_once_with(
+                ["scontrol", "show", "job", "123"],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+
+    def test_resolve_resubmit_command_falls_back_to_submit_dir_script(self) -> None:
+        nepflow = load_nepflow_module()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            submit_dir = Path(tmp)
+            script_path = submit_dir / "submit.slurm"
+            script_path.write_text("#!/bin/bash\n", encoding="utf-8")
+
+            with patch.dict(
+                os.environ,
+                {"SLURM_JOB_ID": "123", "SLURM_SUBMIT_DIR": str(submit_dir)},
+                clear=False,
+            ):
+                with patch.object(
+                    nepflow.subprocess,
+                    "run",
+                    side_effect=FileNotFoundError("scontrol not found"),
+                ):
+                    command, cwd, source = nepflow._resolve_resubmit_command()
+
+            self.assertEqual(command, ["sbatch", str(script_path)])
+            self.assertEqual(cwd, submit_dir)
+            self.assertEqual(source, f"submit.slurm in {submit_dir}")
 
 
 if __name__ == "__main__":

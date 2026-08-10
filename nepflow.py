@@ -9,6 +9,7 @@ import sys
 import argparse
 import logging
 import os
+import re
 import subprocess
 import time
 from pathlib import Path
@@ -73,7 +74,7 @@ def _resolve_project_config_path(project_name: str, output_dir: Path) -> Path:
 def create_parser() -> argparse.ArgumentParser:
     """Create CLI argument parser."""
     parser = argparse.ArgumentParser(
-        description="NEPFlow: HPC workflow orchestrator for VASP→NEP→GPUMD pipelines",
+        description="NEPFlow: HPC workflow orchestrator for VASP->NEP->GPUMD pipelines",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -81,81 +82,81 @@ Examples:
   python nepflow.py --project myproject --local
   python nepflow.py --project myproject --memory
   python nepflow.py --project myproject --debug
-        """
+        """,
     )
-    
+
     # Global options
     parser.add_argument(
         "--project",
         type=str,
         required=True,
-        help="Project name (determines config, state, and output paths)"
+        help="Project name (determines config, state, and output paths)",
     )
     parser.add_argument(
         "--init",
         action="store_true",
-        help="Initialize a new project (required on first run)"
+        help="Initialize a new project (required on first run)",
     )
     parser.add_argument(
         "--config",
         action="store_true",
-        help="Open the project config file in Vim and exit"
+        help="Open the project config file in Vim and exit",
     )
     parser.add_argument(
         "--stage",
         type=str,
         choices=["init", "generate", "select", "run_vasp", "train_nep", "validate"],
         default=None,
-        help="Set the workflow stage (overrides .project file)"
+        help="Set the workflow stage (overrides .project file)",
     )
     parser.add_argument(
         "--local",
         action="store_true",
         help="Fetch base structures locally (seeds only, no perturbations), "
-             "then stop. Use on a machine with web access before transferring "
-             "to HPC."
+        "then stop. Use on a machine with web access before transferring "
+        "to HPC.",
     )
     parser.add_argument(
         "--memory",
         action="store_true",
         help="Run VASP memory/performance benchmarks on BCC W supercells "
-             "to populate .vasp_memory with timing and OOM data. "
-             "Does not advance the workflow stage."
+        "to populate .vasp_memory with timing and OOM data. "
+        "Does not advance the workflow stage.",
     )
     parser.add_argument(
         "--debug",
         action="store_true",
-        help="Enable debug mode (no external dependencies required)"
+        help="Enable debug mode (no external dependencies required)",
     )
     parser.add_argument(
         "--output-dir",
         type=Path,
         default=Path(__file__).parent / "projects",
-        help="Output base directory (default: ./projects)"
+        help="Output base directory (default: ./projects)",
     )
-    
+
     return parser
 
 
 def _get_slurm_walltime_info() -> tuple[int | None, str]:
     """
     Get SLURM job walltime information.
-    
+
     Returns:
         (remaining_seconds, source_description) or (None, "not_in_slurm") if not under SLURM
     """
     slurm_job_id = os.environ.get("SLURM_JOB_ID")
     logger.debug("SLURM_JOB_ID env var: %s", slurm_job_id or "(not set)")
-    
+
     if not slurm_job_id:
         return None, "not_in_slurm"
-    
+
     start_time = time.time()
-    
+
     # Try SLURM_JOB_END_TIME first (Unix timestamp, most accurate)
     slurm_job_end_time = os.environ.get("SLURM_JOB_END_TIME")
     logger.debug("SLURM_JOB_END_TIME env var: %s", slurm_job_end_time or "(not set)")
-    
+
     if slurm_job_end_time:
         try:
             remaining = int(slurm_job_end_time) - int(start_time)
@@ -163,21 +164,92 @@ def _get_slurm_walltime_info() -> tuple[int | None, str]:
             return remaining, "SLURM_JOB_END_TIME"
         except (ValueError, TypeError) as e:
             logger.debug("Failed to parse SLURM_JOB_END_TIME: %s", e)
-    
+
     # Fallback to SLURM_JOB_TIMELIMIT (in minutes)
     slurm_timelimit = os.environ.get("SLURM_JOB_TIMELIMIT")
     logger.debug("SLURM_JOB_TIMELIMIT env var: %s", slurm_timelimit or "(not set)")
-    
+
     if slurm_timelimit:
         try:
             remaining = int(slurm_timelimit) * 60
-            logger.debug("Using SLURM_JOB_TIMELIMIT: %s min → %d seconds", slurm_timelimit, remaining)
+            logger.debug(
+                "Using SLURM_JOB_TIMELIMIT: %s min -> %d seconds",
+                slurm_timelimit,
+                remaining,
+            )
             return remaining, "SLURM_JOB_TIMELIMIT"
         except (ValueError, TypeError) as e:
             logger.debug("Failed to parse SLURM_JOB_TIMELIMIT: %s", e)
-    
+
     logger.debug("No SLURM walltime vars available")
     return None, "slurm_vars_unavailable"
+
+
+def _resolve_resubmit_from_scontrol(slurm_job_id: str) -> tuple[list[str], Path, str] | None:
+    """Try to recover the original batch script path from `scontrol show job`."""
+    try:
+        result = subprocess.run(
+            ["scontrol", "show", "job", slurm_job_id],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except (FileNotFoundError, subprocess.CalledProcessError) as e:
+        logger.debug("Could not inspect SLURM job %s via scontrol: %s", slurm_job_id, e)
+        return None
+
+    command_match = re.search(r"\bCommand=(\S+)", result.stdout)
+    if not command_match:
+        logger.debug("scontrol output for job %s did not include Command=", slurm_job_id)
+        return None
+
+    command_path = Path(command_match.group(1)).expanduser()
+    if not command_path.is_absolute():
+        workdir_match = re.search(r"\bWorkDir=(\S+)", result.stdout)
+        if workdir_match:
+            command_path = Path(workdir_match.group(1)) / command_path
+
+    if not command_path.exists():
+        logger.debug("Recovered SLURM command does not exist: %s", command_path)
+        return None
+
+    submit_cwd = command_path.parent
+    return ["sbatch", str(command_path)], submit_cwd, f"scontrol job {slurm_job_id}"
+
+
+def _resolve_resubmit_command() -> tuple[list[str], Path, str]:
+    """Resolve the best available `sbatch` command for self-resubmission."""
+    slurm_job_id = os.environ.get("SLURM_JOB_ID")
+    if slurm_job_id:
+        resolved = _resolve_resubmit_from_scontrol(slurm_job_id)
+        if resolved is not None:
+            return resolved
+
+    nepflow_root = Path(__file__).parent.resolve()
+    candidate_dirs = []
+    for directory in (
+        os.environ.get("SLURM_SUBMIT_DIR"),
+        os.getcwd(),
+        str(nepflow_root),
+    ):
+        if not directory:
+            continue
+        path = Path(directory).resolve()
+        if path not in candidate_dirs:
+            candidate_dirs.append(path)
+
+    tried = []
+    for directory in candidate_dirs:
+        submit_script = directory / "submit.slurm"
+        tried.append(str(submit_script))
+        if submit_script.exists():
+            return ["sbatch", str(submit_script)], directory, f"submit.slurm in {directory}"
+
+    tried_text = "\n".join(f"  - {candidate}" for candidate in tried)
+    raise FileNotFoundError(
+        "Could not find a resubmission script for nepflow. Tried:\n"
+        f"{tried_text}"
+    )
 
 
 def _resubmit_slurm_job(debug: bool = False) -> None:
@@ -186,24 +258,38 @@ def _resubmit_slurm_job(debug: bool = False) -> None:
 
     If debug=True, simulates the resubmission without actually launching.
     """
-    nepflow_root = Path(__file__).parent
-    submit_script = nepflow_root / "submit.slurm"
+    command, submit_cwd, submit_source = _resolve_resubmit_command()
 
-    logger.info("SLURM walltime deadline approaching — resubmitting nepflow")
+    logger.info("SLURM walltime deadline approaching - resubmitting nepflow")
 
     if debug:
-        logger.info("[DEBUG] Would resubmit with: sbatch %s", submit_script)
+        logger.info(
+            "[DEBUG] Would resubmit with: %s (cwd=%s, source=%s)",
+            " ".join(command),
+            submit_cwd,
+            submit_source,
+        )
         return
 
     try:
         result = subprocess.run(
-            ["sbatch", str(submit_script)],
-            capture_output=True, text=True, check=True,
-            cwd=str(nepflow_root),
+            command,
+            capture_output=True,
+            text=True,
+            check=True,
+            cwd=str(submit_cwd),
         )
         logger.info("Resubmission via sbatch: %s", result.stdout.strip())
     except (FileNotFoundError, subprocess.CalledProcessError) as e:
-        logger.error("Could not resubmit job: %s", e)
+        stderr = getattr(e, "stderr", "") or ""
+        stdout = getattr(e, "stdout", "") or ""
+        logger.error(
+            "Could not resubmit job via %s: %s%s%s",
+            submit_source,
+            e,
+            f" | stdout: {stdout.strip()}" if stdout.strip() else "",
+            f" | stderr: {stderr.strip()}" if stderr.strip() else "",
+        )
         raise
 
 
@@ -221,43 +307,52 @@ def main():
         except FileNotFoundError as e:
             raise FileNotFoundError("vim was not found on PATH") from e
         return
-    
+
     # Setup logging for the project
     # Log directory is inside each project: projects/project_{name}/logs/
     project_dir = args.output_dir / f"project_{args.project}"
     log_dir = project_dir / "logs"
-    
+
     setup_logging(
         project_name=args.project,
         log_dir=log_dir,
-        debug=args.debug
+        debug=args.debug,
     )
-    
+
     logger.info("NEPFlow started for project: %s", args.project)
     if args.debug:
         logger.debug("Debug mode enabled")
-    
-    print(f"[nepflow] Checking SLURM walltime (DEBUG)", file=sys.stderr)
+
+    print("[nepflow] Checking SLURM walltime (DEBUG)", file=sys.stderr)
     logger.debug("Checking for SLURM walltime...")
-    
+
     # Get SLURM walltime info (None if not running under SLURM)
     try:
         walltime_remaining, walltime_source = _get_slurm_walltime_info()
-        print(f"[nepflow] SLURM walltime result: remaining={walltime_remaining}, source={walltime_source}", file=sys.stderr)
+        print(
+            "[nepflow] SLURM walltime result: "
+            f"remaining={walltime_remaining}, source={walltime_source}",
+            file=sys.stderr,
+        )
     except Exception as e:
         print(f"[nepflow] ERROR detecting SLURM walltime: {e}", file=sys.stderr)
         logger.error("Error detecting SLURM walltime: %s", e)
         walltime_remaining, walltime_source = None, "error"
-    
+
     margin_seconds = 300  # 5 minutes before deadline
-    
+
     if walltime_remaining is None:
-        logger.info("Not running under SLURM — no walltime limit, workflow will run indefinitely")
+        logger.info("Not running under SLURM - no walltime limit, workflow will run indefinitely")
         slurm_deadline = None
     else:
         slurm_deadline = time.time() + walltime_remaining - margin_seconds
-        logger.info("SLURM walltime: %ds (source: %s), deadline in %ds", walltime_remaining, walltime_source, walltime_remaining - margin_seconds)
-    
+        logger.info(
+            "SLURM walltime: %ds (source: %s), deadline in %ds",
+            walltime_remaining,
+            walltime_source,
+            walltime_remaining - margin_seconds,
+        )
+
     # Create workflow controller
     controller = WorkflowController(
         project_name=args.project,
@@ -266,48 +361,49 @@ def main():
         debug=args.debug,
         stage_override=args.stage,
         local_mode=args.local,
-        memory_mode=getattr(args, 'memory', False),
+        memory_mode=getattr(args, "memory", False),
         slurm_deadline=slurm_deadline,
     )
-    
+
     # Run workflow: controller determines current stage from .project file
     # If under SLURM and approaching deadline, resubmit before running
     try:
         if slurm_deadline and time.time() >= slurm_deadline:
-            logger.warning("Already past SLURM deadline — resubmitting immediately")
+            logger.warning("Already past SLURM deadline - resubmitting immediately")
             _resubmit_slurm_job(debug=args.debug)
             return
-        
+
         controller.run()
         logger.info("Workflow completed successfully")
-        print("✓ Workflow completed successfully")
-        
+        print("Workflow completed successfully")
+
     except SelfResubmitExit as e:
-        # Workflow reached SLURM deadline — resubmit
+        # Workflow reached SLURM deadline - resubmit
         logger.info("Workflow resubmit triggered: %s", e)
         _resubmit_slurm_job(debug=args.debug)
         logger.info("Resubmission initiated, exiting")
         return
-        
+
     except (ValueError, IOError, RuntimeError) as e:
         # Log the error (message only, not traceback)
         logger.error("Workflow failed: %s", e)
-        
+
         # Print formatted error message
         print("\n" + "=" * 70, file=sys.stderr)
         print("ERROR: Workflow failed", file=sys.stderr)
         print("=" * 70, file=sys.stderr)
         print("  %s: %s" % (type(e).__name__, e), file=sys.stderr)
-        
+
         if args.debug:
             print("\nTraceback:", file=sys.stderr)
             print("-" * 70, file=sys.stderr)
             import traceback
+
             traceback.print_exc(file=sys.stderr)
             print("-" * 70, file=sys.stderr)
         else:
             print("\n  Use --debug for full traceback", file=sys.stderr)
-        
+
         print("=" * 70 + "\n", file=sys.stderr)
         sys.exit(1)
 
