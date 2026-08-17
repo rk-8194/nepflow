@@ -83,6 +83,14 @@ def submit_training_job(
     walltime = config.get("slurm", "train_nep_walltime", fallback=None)
     if not walltime:
         walltime = config.get("slurm", "walltime", fallback="24:00:00")
+
+    nep_command = config.get(
+        "hpc",
+        "nep_command",
+        fallback="mpirun --bind-to none $HOME/src/GPUMD/src/nep",
+    ).strip()
+    if not nep_command:
+        nep_command = "mpirun --bind-to none $HOME/src/GPUMD/src/nep"
     
     # Build script with proper ordering: shebang → SBATCH directives → other commands → execution
     script_lines = [
@@ -99,7 +107,7 @@ def submit_training_job(
         *other_content,
         "",
         f"cd {potential_path}",
-        "mpirun --bind-to none $HOME/src/GPUMD/src/nep",
+        nep_command,
     ]
     
     script_content = "\n".join(script_lines)

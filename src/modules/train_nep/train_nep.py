@@ -363,7 +363,14 @@ class TrainNepStage(Stage):
         lambda_e = config.getfloat("train_nep", "lambda_e", fallback=1.0)
         lambda_f = config.getfloat("train_nep", "lambda_f", fallback=1.0)
         lambda_v = config.getfloat("train_nep", "lambda_v", fallback=1.0)
-        logger.debug(f"Lambda values: E={lambda_e}, F={lambda_f}, V={lambda_v}")
+        lambda_shear = config.getfloat("train_nep", "lambda_shear", fallback=1.0)
+        logger.debug(
+            "Lambda values: E=%s, F=%s, V=%s, shear=%s",
+            lambda_e,
+            lambda_f,
+            lambda_v,
+            lambda_shear,
+        )
 
         # Build output
         output_lines = []
@@ -390,8 +397,18 @@ class TrainNepStage(Stage):
                 output_lines.append(f"lambda_f {lambda_f}")
             elif stripped.startswith("lambda_v ") and "# lambda" not in line:
                 output_lines.append(f"lambda_v {lambda_v}")
+            elif stripped.startswith("lambda_shear ") and "# lambda" not in line:
+                output_lines.append(f"lambda_shear {lambda_shear}")
             else:
                 output_lines.append(line)
+
+        if not any(line.strip().startswith("lambda_shear ") for line in output_lines):
+            insert_at = len(output_lines)
+            for i, line in enumerate(output_lines):
+                if line.strip().startswith("lambda_v "):
+                    insert_at = i + 1
+                    break
+            output_lines.insert(insert_at, f"lambda_shear {lambda_shear}")
 
         if not any(line.strip().startswith("charge_mode ") for line in output_lines):
             insert_at = 0
@@ -442,6 +459,7 @@ neuron     80
 lambda_e   1
 lambda_f   1
 lambda_v   1
+lambda_shear 1
 """
 
     def _get_or_create_dataset_folder(self) -> Path:

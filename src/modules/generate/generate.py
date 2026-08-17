@@ -126,6 +126,7 @@ class GenerateStage(Stage):
                     settings["elements"],
                     settings["gas_elements"],
                 )
+                self._log_generator_output(label, gen_name, bases)
                 seed_index = self._assign_seed_ids(bases, seed_index)
                 all_bases.extend(bases)
                 if bases:
@@ -167,8 +168,16 @@ class GenerateStage(Stage):
             all_bases,
             output_dir=generated_dir,
             n_rattled=config.getint("generation", "n_rattled", fallback=10),
-            n_strained=config.getint("generation", "n_strained", fallback=10),
-            n_deformed=config.getint("generation", "n_deformed", fallback=10),
+            n_liquid_configurations=(
+                config.getint("generation", "n_liquid_configurations", fallback=2)
+                if config.getboolean("generation", "use_liquid", fallback=False)
+                else 0
+            ),
+            n_liquid_snapshots=(
+                config.getint("generation", "n_liquid_snapshots", fallback=5)
+                if config.getboolean("generation", "use_liquid", fallback=False)
+                else 0
+            ),
             n_vacancies=config.getint("generation", "n_vacancies", fallback=10),
             n_interstitials=config.getint("generation", "n_interstitials", fallback=10),
             n_gas_interstitials=(
@@ -338,6 +347,37 @@ class GenerateStage(Stage):
         all_bases.extend(gas_bases)
         logger.info(f"  Gas-phase base structures: {len(gas_bases)}")
 
+    @staticmethod
+    def _log_generator_output(
+        composition_label: str,
+        generator_name: str,
+        bases: List[Atoms],
+    ) -> None:
+        if not bases:
+            return
+
+        if generator_name != "MaterialsProject":
+            logger.info("  %s / %s: %s structure(s)", composition_label, generator_name, len(bases))
+            return
+
+        entries: List[str] = []
+        for atoms in bases:
+            formula = atoms.info.get("formula", "?")
+            material_id = atoms.info.get("material_id", "?")
+            structure_name = atoms.info.get("structure_name")
+            if structure_name and structure_name != "unknown":
+                entries.append(f"{formula} ({material_id}, {structure_name})")
+            else:
+                entries.append(f"{formula} ({material_id})")
+
+        logger.info(
+            "  %s / %s: %s structure(s) -> %s",
+            composition_label,
+            generator_name,
+            len(bases),
+            ", ".join(entries),
+        )
+
     # ==================================================================
     # generation helpers
     # ==================================================================
@@ -404,13 +444,20 @@ class GenerateStage(Stage):
         config: ConfigParser, target_n_atoms: int, random_seed: int,
         gas_elements: List[str] | None = None,
     ) -> PerturbationEngine:
+        rattle_std = config.getfloat("generation", "rattle_std", fallback=0.03)
         return PerturbationEngine(
-            rattle_std=config.getfloat("generation", "rattle_std", fallback=0.03),
-            rattle_d_min=config.getfloat("generation", "rattle_d_min", fallback=1.5),
-            strain_limit=(
-                config.getfloat("generation", "strain_min", fallback=-0.02),
-                config.getfloat("generation", "strain_max", fallback=0.02),
+            rattle_std=rattle_std,
+            rattle_std_min=config.getfloat(
+                "generation",
+                "rattle_std_min",
+                fallback=0.5 * rattle_std,
             ),
+            rattle_std_max=config.getfloat(
+                "generation",
+                "rattle_std_max",
+                fallback=2.0 * rattle_std,
+            ),
+            rattle_d_min=config.getfloat("generation", "rattle_d_min", fallback=1.5),
             vacancy_range=(
                 config.getfloat("generation", "vacancy_min", fallback=0.0),
                 config.getfloat("generation", "vacancy_max", fallback=0.1),
@@ -438,6 +485,22 @@ class GenerateStage(Stage):
                 "generation",
                 "elastic_strain_amplitudes",
                 fallback="-0.02,-0.01,-0.005,0.005,0.01,0.02",
+            ),
+            liquid_enabled=config.getboolean("generation", "use_liquid", fallback=False),
+            liquid_temperature_k=config.getfloat(
+                "generation", "liquid_temperature", fallback=3000.0
+            ),
+            liquid_timestep_fs=config.getfloat(
+                "generation", "liquid_timestep_fs", fallback=1.0
+            ),
+            liquid_equilibration_steps=config.getint(
+                "generation", "liquid_equilibration_steps", fallback=200
+            ),
+            liquid_steps_between_snapshots=config.getint(
+                "generation", "liquid_steps_between_snapshots", fallback=100
+            ),
+            liquid_friction=config.getfloat(
+                "generation", "liquid_friction", fallback=0.02
             ),
         )
 

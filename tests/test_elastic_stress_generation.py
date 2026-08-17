@@ -63,6 +63,9 @@ class FakeRandomState:
     def __init__(self, seed):
         self.seed = seed
 
+    def uniform(self, low, high):
+        return (float(low) + float(high)) / 2.0
+
 
 def fake_eye(n):
     return FakeMatrix([
@@ -95,6 +98,7 @@ class FakeAtoms:
         self.cell = cell.copy() if isinstance(cell, FakeMatrix) else FakeMatrix(cell)
         self.pbc = pbc
         self.info = {}
+        self.calc = None
 
     def copy(self):
         other = FakeAtoms(
@@ -104,7 +108,11 @@ class FakeAtoms:
             self.pbc,
         )
         other.info = dict(self.info)
+        other.calc = self.calc
         return other
+
+    def __len__(self):
+        return len(self.positions)
 
     def set_cell(self, cell, scale_atoms=False):  # noqa: ARG002
         self.cell = cell.copy() if isinstance(cell, FakeMatrix) else FakeMatrix(cell)
@@ -116,7 +124,49 @@ class FakeAtoms:
 ase_module = types.ModuleType("ase")
 ase_module.Atom = object
 ase_module.Atoms = FakeAtoms
+ase_module.units = types.SimpleNamespace(fs=1.0)
 sys.modules["ase"] = ase_module
+
+ase_calculators = types.ModuleType("ase.calculators")
+ase_calculators.__path__ = []
+sys.modules["ase.calculators"] = ase_calculators
+
+
+class FakeLennardJones:
+    pass
+
+
+ase_lj_module = types.ModuleType("ase.calculators.lj")
+ase_lj_module.LennardJones = FakeLennardJones
+sys.modules["ase.calculators.lj"] = ase_lj_module
+
+
+class FakeLangevin:
+    def __init__(self, atoms, timestep, temperature_K, friction):
+        self.atoms = atoms
+        self.timestep = timestep
+        self.temperature_K = temperature_K
+        self.friction = friction
+        self._callbacks = []
+
+    def attach(self, callback, interval):
+        self._callbacks.append((callback, interval))
+
+    def run(self, steps):
+        for callback, interval in self._callbacks:
+            for _ in range(int(steps // interval)):
+                callback()
+
+
+ase_md_module = types.ModuleType("ase.md")
+ase_md_module.Langevin = FakeLangevin
+sys.modules["ase.md"] = ase_md_module
+
+ase_veldist_module = types.ModuleType("ase.md.velocitydistribution")
+ase_veldist_module.MaxwellBoltzmannDistribution = lambda *args, **kwargs: None
+ase_veldist_module.Stationary = lambda *args, **kwargs: None
+ase_veldist_module.ZeroRotation = lambda *args, **kwargs: None
+sys.modules["ase.md.velocitydistribution"] = ase_veldist_module
 
 ase_io_module = types.ModuleType("ase.io")
 ase_io_module.write = lambda *args, **kwargs: None
@@ -231,6 +281,69 @@ class ElasticStressGenerationTests(unittest.TestCase):
         shear = structures["shear_xy"]
         self.assertNotEqual(float(shear.cell[0, 1]), 0.0)
         self.assertNotEqual(float(shear.cell[1, 0]), 0.0)
+
+    def test_rattle_std_defaults_expand_sampling_range(self) -> None:
+        engine = PerturbationEngine(target_n_atoms=2)
+
+        self.assertAlmostEqual(engine.rattle_std_min, 0.03)
+        self.assertAlmostEqual(engine.rattle_std_max, 0.03)
+
+        sampled = engine._sample_rattle_stds(3)
+
+        self.assertEqual(sampled, [0.03, 0.03, 0.03])
+
+    def test_rattle_std_sampling_uses_configured_range(self) -> None:
+        engine = PerturbationEngine(
+            target_n_atoms=2,
+            rattle_std=0.03,
+            rattle_std_min=0.01,
+            rattle_std_max=0.07,
+        )
+
+        sampled = engine._sample_rattle_stds(2)
+
+        self.assertEqual(sampled, [0.01, 0.07])
+
+    def test_rattle_std_sampling_steps_across_range(self) -> None:
+        engine = PerturbationEngine(
+            target_n_atoms=2,
+            rattle_std=0.03,
+            rattle_std_min=0.01,
+            rattle_std_max=0.07,
+        )
+
+        sampled = engine._sample_rattle_stds(4)
+
+        self.assertEqual(sampled, [0.01, 0.03, 0.05, 0.07])
+
+    def test_liquid_snapshots_are_tagged_as_perturbations(self) -> None:
+        base = self.make_base()
+        engine = PerturbationEngine(
+            target_n_atoms=2,
+            liquid_enabled=True,
+            liquid_temperature_k=2500.0,
+            liquid_timestep_fs=1.5,
+            liquid_equilibration_steps=2,
+            liquid_steps_between_snapshots=3,
+            liquid_friction=0.05,
+        )
+
+        structures = engine._liquid_snapshots(base, base, n_configurations=2, n_snapshots=2)
+
+        self.assertEqual(len(structures), 4)
+        self.assertEqual(
+            [atoms.info["liquid_configuration_index"] for atoms in structures],
+            [0, 0, 1, 1],
+        )
+        self.assertEqual(
+            [atoms.info["liquid_snapshot_index"] for atoms in structures],
+            [0, 1, 0, 1],
+        )
+        for atoms in structures:
+            self.assertEqual(atoms.info["perturbation_type"], "liquid")
+            self.assertEqual(atoms.info["configurational_type"], "test_base")
+            self.assertEqual(atoms.info["liquid_temperature_k"], 2500.0)
+            self.assertEqual(atoms.info["liquid_timestep_fs"], 1.5)
 
 
 if __name__ == "__main__":

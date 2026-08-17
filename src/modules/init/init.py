@@ -324,11 +324,23 @@ use_materials_project=true
 use_random_solid_solution=true
 use_sqs=true
 use_segregated=true
+use_liquid=false
 
 # Number of configurations per generator per composition
 n_random_solid_solution=3
 n_sqs=1
 n_segregated=3
+
+# Liquid perturbation (applied during the perturbation stage, not as a seed generator)
+n_liquid_configurations=2
+n_liquid_snapshots=5
+
+# Liquid perturbation (ASE Langevin MD with Lennard-Jones)
+liquid_temperature=3000
+liquid_timestep_fs=1.0
+liquid_equilibration_steps=200
+liquid_steps_between_snapshots=100
+liquid_friction=0.02
 
 # --- Volume profile ---
 # Isotropic volume scaling for E-V curves (applied to unperturbed supercells)
@@ -343,19 +355,15 @@ elastic_strain_amplitudes=-0.02,-0.01,-0.005,0.005,0.01,0.02
 
 # --- Perturbation counts (per base structure at equilibrium) ---
 n_rattled=10
-n_strained=10
-n_deformed=10
 n_vacancies=10
 n_interstitials=10
 
 # --- Perturbation parameters ---
 # Rattling (thermal disorder via hiphive MC)
 rattle_std=0.03
+rattle_std_min=0.015
+rattle_std_max=0.06
 rattle_d_min=1.5
-
-# Strain (isotropic)
-strain_min=-0.02
-strain_max=0.02
 
 # Vacancies (fraction of atoms to remove)
 vacancy_min=0.0
@@ -433,6 +441,7 @@ outerZBL=2.0
 lambda_e=1.0
 lambda_f=1.0
 lambda_v=1.0
+lambda_shear=1.0
 
 # Include virial tensor in training data (requires VASP STRESS calculation)
 train_virial=false
@@ -473,4 +482,7 @@ scp_address={scp_address}
 
 # VASP execution command template ({{ntasks}} is replaced at runtime)
 vasp_command=mpirun -np {{ntasks}} vasp_std
+
+# NEP training command or executable path
+nep_command=mpirun --bind-to none $HOME/src/GPUMD/src/nep
 """.format(project_name=self.project_name, **prompt_values)

@@ -67,14 +67,54 @@ class FakeCompositionGrid:
 
 
 class FakePerturbationEngine:
+    last_instance = None
+
     def __init__(self, **kwargs):
         self.kwargs = kwargs
+        self.process_kwargs = {}
+        FakePerturbationEngine.last_instance = self
 
     def process(self, *args, **kwargs):
+        self.process_kwargs = dict(kwargs)
         return None
 
     def get_summary(self):
         return {"total": 0, "by_type": {}, "by_config": {}}
+
+
+class _FakeGeneratorBase:
+    def __init__(self, *args, **kwargs):
+        self.args = args
+        self.kwargs = kwargs
+
+
+class FakeMaterialsProjectGenerator(_FakeGeneratorBase):
+    def generate(self, *args, **kwargs):
+        first = FakeAtoms()
+        first.info.update({
+            "formula": "WC",
+            "material_id": "mp-1894",
+            "structure_name": "unknown",
+        })
+        second = FakeAtoms()
+        second.info.update({
+            "formula": "W",
+            "material_id": "mp-91",
+            "structure_name": "bcc",
+        })
+        return [first, second]
+
+
+class FakeRandomSolidSolutionGenerator(_FakeGeneratorBase):
+    pass
+
+
+class FakeSegregatedGenerator(_FakeGeneratorBase):
+    pass
+
+
+class FakeSQSGenerator(_FakeGeneratorBase):
+    pass
 
 
 def install_test_stubs():
@@ -133,13 +173,10 @@ def install_test_stubs():
     sys.modules["testpkg.modules.generate.generators"] = generators_package
 
     configurational_module = types.ModuleType("testpkg.modules.generate.generators.configurational")
-    for name in (
-        "MaterialsProjectGenerator",
-        "RandomSolidSolutionGenerator",
-        "SegregatedGenerator",
-        "SQSGenerator",
-    ):
-        setattr(configurational_module, name, type(name, (), {}))
+    configurational_module.MaterialsProjectGenerator = FakeMaterialsProjectGenerator
+    configurational_module.RandomSolidSolutionGenerator = FakeRandomSolidSolutionGenerator
+    configurational_module.SegregatedGenerator = FakeSegregatedGenerator
+    configurational_module.SQSGenerator = FakeSQSGenerator
     sys.modules["testpkg.modules.generate.generators.configurational"] = configurational_module
 
     materials_project_module = types.ModuleType("testpkg.modules.generate.generators.materials_project")
@@ -350,6 +387,9 @@ class GenerateStageTests(unittest.TestCase):
                 engine.kwargs["elastic_strain_amplitudes"],
                 [-0.02, -0.01, -0.005, 0.005, 0.01, 0.02],
             )
+            self.assertNotIn("strain_limit", engine.kwargs)
+            self.assertEqual(engine.kwargs["rattle_std_min"], 0.015)
+            self.assertEqual(engine.kwargs["rattle_std_max"], 0.06)
 
     def test_build_engine_accepts_elastic_stress_config(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -365,6 +405,8 @@ class GenerateStageTests(unittest.TestCase):
                             "n_workers=1",
                             "elastic_stress_enabled=false",
                             "elastic_strain_amplitudes=-0.03,0.03",
+                            "rattle_std_min=0.01",
+                            "rattle_std_max=0.08",
                         ]
                     ),
                 ),
@@ -381,6 +423,112 @@ class GenerateStageTests(unittest.TestCase):
 
             self.assertFalse(engine.kwargs["elastic_stress_enabled"])
             self.assertEqual(engine.kwargs["elastic_strain_amplitudes"], [-0.03, 0.03])
+            self.assertNotIn("strain_limit", engine.kwargs)
+            self.assertEqual(engine.kwargs["rattle_std_min"], 0.01)
+            self.assertEqual(engine.kwargs["rattle_std_max"], 0.08)
+
+    def test_build_engine_accepts_liquid_perturbation_config(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_dir = Path(tmp)
+            write_project_config(project_dir)
+            config_path = project_dir / "config" / "project.config"
+            config_text = config_path.read_text(encoding="utf-8")
+            config_path.write_text(
+                config_text.replace(
+                    "use_segregated=false",
+                    "\n".join(
+                        [
+                            "use_segregated=false",
+                            "use_liquid=true",
+                            "n_liquid_configurations=4",
+                            "n_liquid_snapshots=7",
+                            "liquid_temperature=2500",
+                            "liquid_timestep_fs=1.5",
+                            "liquid_equilibration_steps=25",
+                            "liquid_steps_between_snapshots=11",
+                            "liquid_friction=0.05",
+                        ]
+                    ),
+                ),
+                encoding="utf-8",
+            )
+            stage = self.create_stage(project_dir)
+            config, settings = stage.load_config()
+
+            engine = stage._build_engine(
+                config,
+                settings["target_n_atoms"],
+                settings["random_seed"],
+            )
+
+            self.assertTrue(engine.kwargs["liquid_enabled"])
+            self.assertEqual(engine.kwargs["liquid_temperature_k"], 2500.0)
+            self.assertEqual(engine.kwargs["liquid_timestep_fs"], 1.5)
+            self.assertEqual(engine.kwargs["liquid_equilibration_steps"], 25)
+            self.assertEqual(engine.kwargs["liquid_steps_between_snapshots"], 11)
+            self.assertEqual(engine.kwargs["liquid_friction"], 0.05)
+
+    def test_execute_passes_liquid_perturbation_counts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_dir = Path(tmp)
+            write_project_config(project_dir)
+            config_path = project_dir / "config" / "project.config"
+            config_text = config_path.read_text(encoding="utf-8")
+            config_path.write_text(
+                config_text.replace(
+                    "use_segregated=false",
+                    "\n".join(
+                        [
+                            "use_segregated=false",
+                            "use_liquid=true",
+                            "n_liquid_configurations=4",
+                            "n_liquid_snapshots=7",
+                        ]
+                    ),
+                ),
+                encoding="utf-8",
+            )
+            stage = self.create_stage(project_dir)
+            config, settings = stage.load_config()
+
+            FakePerturbationEngine.last_instance = None
+            summary = stage.execute(config, settings, [FakeAtoms()])
+
+            self.assertEqual(summary, {"total": 0, "by_type": {}, "by_config": {}})
+            self.assertIsNotNone(FakePerturbationEngine.last_instance)
+            self.assertEqual(
+                FakePerturbationEngine.last_instance.process_kwargs["n_liquid_configurations"],
+                4,
+            )
+            self.assertEqual(
+                FakePerturbationEngine.last_instance.process_kwargs["n_liquid_snapshots"],
+                7,
+            )
+
+    def test_prepare_logs_explicit_materials_project_entries(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_dir = Path(tmp)
+            write_project_config(project_dir)
+            config_path = project_dir / "config" / "project.config"
+            config_text = config_path.read_text(encoding="utf-8")
+            config_path.write_text(
+                config_text.replace(
+                    "use_materials_project=false",
+                    "use_materials_project=true",
+                ),
+                encoding="utf-8",
+            )
+            stage = self.create_stage(project_dir)
+            config, settings = stage.load_config()
+
+            with patch("testpkg.modules.generate.generate.logger.info") as info_mock:
+                bases = stage.prepare(config, settings)
+
+            self.assertIsNotNone(bases)
+            logged_messages = [" ".join(str(arg) for arg in call.args) for call in info_mock.call_args_list]
+            self.assertTrue(any("MaterialsProject" in message for message in logged_messages))
+            self.assertTrue(any("WC" in message and "mp-1894" in message for message in logged_messages))
+            self.assertTrue(any("W" in message and "mp-91" in message and "bcc" in message for message in logged_messages))
 
 
 if __name__ == "__main__":

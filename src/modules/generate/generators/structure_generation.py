@@ -6,8 +6,7 @@ this module applies the full matrix of perturbations:
   - Volume scaling (isotropic E-V profiles)
   - Elastic stress sets
   - Rattling (thermal disorder via hiphive MC)
-  - Isotropic strain
-  - Shear deformation
+  - Liquid MD snapshots
   - Vacancies
   - Interstitials
 
@@ -41,8 +40,8 @@ def _process_one_base(args: tuple) -> List[Atoms]:
         base,
         engine_params,
         n_rattled,
-        n_strained,
-        n_deformed,
+        n_liquid_configurations,
+        n_liquid_snapshots,
         n_vacancies,
         n_interstitials,
         n_gas_interstitials,
@@ -70,8 +69,14 @@ def _process_one_base(args: tuple) -> List[Atoms]:
 
     # 4) Perturbations
     results.extend(engine._rattled(supercell, base, n_rattled))
-    results.extend(engine._strained(supercell, base, n_strained))
-    results.extend(engine._deformed(supercell, base, n_deformed))
+    results.extend(
+        engine._liquid_snapshots(
+            supercell,
+            base,
+            n_liquid_configurations,
+            n_liquid_snapshots,
+        )
+    )
     results.extend(engine._vacancies(supercell, base, n_vacancies))
     results.extend(engine._interstitials(supercell, base, n_interstitials))
 
@@ -94,8 +99,9 @@ class PerturbationEngine:
     def __init__(
         self,
         rattle_std: float = 0.03,
+        rattle_std_min: float | None = None,
+        rattle_std_max: float | None = None,
         rattle_d_min: float = 1.5,
-        strain_limit: Tuple[float, float] = (-0.02, 0.02),
         vacancy_range: Tuple[float, float] = (0.0, 0.1),
         interstitial_range: Tuple[float, float] = (0.05, 0.1),
         interstitial_d_min: float = 1.65,
@@ -108,10 +114,25 @@ class PerturbationEngine:
         max_gas_occupancy: int = 3,
         elastic_stress_enabled: bool = True,
         elastic_strain_amplitudes: List[float] | None = None,
+        liquid_enabled: bool = False,
+        liquid_temperature_k: float = 3000.0,
+        liquid_timestep_fs: float = 1.0,
+        liquid_equilibration_steps: int = 200,
+        liquid_steps_between_snapshots: int = 100,
+        liquid_friction: float = 0.02,
     ):
         self.rattle_std = rattle_std
+        self.rattle_std_min = (
+            min(rattle_std_min, rattle_std_max)
+            if rattle_std_min is not None and rattle_std_max is not None
+            else rattle_std
+        )
+        self.rattle_std_max = (
+            max(rattle_std_min, rattle_std_max)
+            if rattle_std_min is not None and rattle_std_max is not None
+            else rattle_std
+        )
         self.rattle_d_min = rattle_d_min
-        self.strain_limit = strain_limit
         self.vacancy_range = vacancy_range
         self.interstitial_range = interstitial_range
         self.interstitial_d_min = interstitial_d_min
@@ -129,6 +150,12 @@ class PerturbationEngine:
             if elastic_strain_amplitudes is not None
             else [-0.02, -0.01, -0.005, 0.005, 0.01, 0.02]
         )
+        self.liquid_enabled = liquid_enabled
+        self.liquid_temperature_k = liquid_temperature_k
+        self.liquid_timestep_fs = liquid_timestep_fs
+        self.liquid_equilibration_steps = liquid_equilibration_steps
+        self.liquid_steps_between_snapshots = liquid_steps_between_snapshots
+        self.liquid_friction = liquid_friction
 
         # Lightweight summary counters (no Atoms kept in memory)
         self._total: int = 0
@@ -140,8 +167,9 @@ class PerturbationEngine:
         """Serialisable dict of constructor kwargs (for worker processes)."""
         return dict(
             rattle_std=self.rattle_std,
+            rattle_std_min=self.rattle_std_min,
+            rattle_std_max=self.rattle_std_max,
             rattle_d_min=self.rattle_d_min,
-            strain_limit=self.strain_limit,
             vacancy_range=self.vacancy_range,
             interstitial_range=self.interstitial_range,
             interstitial_d_min=self.interstitial_d_min,
@@ -154,6 +182,12 @@ class PerturbationEngine:
             max_gas_occupancy=self.max_gas_occupancy,
             elastic_stress_enabled=self.elastic_stress_enabled,
             elastic_strain_amplitudes=self.elastic_strain_amplitudes,
+            liquid_enabled=self.liquid_enabled,
+            liquid_temperature_k=self.liquid_temperature_k,
+            liquid_timestep_fs=self.liquid_timestep_fs,
+            liquid_equilibration_steps=self.liquid_equilibration_steps,
+            liquid_steps_between_snapshots=self.liquid_steps_between_snapshots,
+            liquid_friction=self.liquid_friction,
         )
 
     # ------------------------------------------------------------------
@@ -165,8 +199,8 @@ class PerturbationEngine:
         base_structures: List[Atoms],
         output_dir: Path,
         n_rattled: int = 10,
-        n_strained: int = 10,
-        n_deformed: int = 10,
+        n_liquid_configurations: int = 0,
+        n_liquid_snapshots: int = 0,
         n_vacancies: int = 10,
         n_interstitials: int = 10,
         n_gas_interstitials: int = 0,
@@ -201,7 +235,7 @@ class PerturbationEngine:
         base_seeds = self.rng.randint(0, 2**31, size=total).tolist()
 
         work_args = [
-            (base, params, n_rattled, n_strained, n_deformed,
+            (base, params, n_rattled, n_liquid_configurations, n_liquid_snapshots,
              n_vacancies, n_interstitials,
              n_gas_interstitials, n_vacancy_interstitial, n_gas_in_vacancy,
              base_seeds[i])
@@ -376,42 +410,147 @@ class PerturbationEngine:
         from hiphive.structure_generation import generate_mc_rattled_structures
 
         out: List[Atoms] = []
+        rattle_stds = self._sample_rattle_stds(n)
         try:
-            rattled_list = generate_mc_rattled_structures(
-                supercell, n_structures=n,
-                rattle_std=self.rattle_std, d_min=self.rattle_d_min,
-            )
-            for r in rattled_list:
-                self._tag(r, base, "rattled", rattle_std=self.rattle_std)
-                out.append(r)
+            for idx, rattle_std in enumerate(rattle_stds):
+                rattled_list = generate_mc_rattled_structures(
+                    supercell,
+                    n_structures=1,
+                    rattle_std=rattle_std,
+                    d_min=self.rattle_d_min,
+                )
+                for r in rattled_list:
+                    self._tag(
+                        r,
+                        base,
+                        "rattled",
+                        rattle_std=float(rattle_std),
+                        rattle_index=idx,
+                    )
+                    out.append(r)
         except Exception as e:
             logger.warning(f"hiphive rattling failed ({e}), using Gaussian fallback")
-            for _ in range(n):
+            for idx, rattle_std in enumerate(rattle_stds):
                 r = supercell.copy()
-                r.positions += self.rng.normal(0, self.rattle_std, r.positions.shape)
-                self._tag(r, base, "rattled", rattle_std=self.rattle_std)
+                r.positions += self.rng.normal(0, rattle_std, r.positions.shape)
+                self._tag(
+                    r,
+                    base,
+                    "rattled",
+                    rattle_std=float(rattle_std),
+                    rattle_index=idx,
+                )
                 out.append(r)
         return out
 
-    def _strained(self, supercell: Atoms, base: Atoms, n: int) -> List[Atoms]:
-        out: List[Atoms] = []
-        for _ in range(n):
-            s = supercell.copy()
-            strains = self.rng.uniform(self.strain_limit[0], self.strain_limit[1], (3,))
-            s.set_cell(s.cell[:] * (1 + strains), scale_atoms=True)
-            self._tag(s, base, "strained", strain=strains.tolist())
-            out.append(s)
-        return out
+    def _sample_rattle_stds(self, n: int) -> List[float]:
+        if n <= 0:
+            return []
+        if abs(self.rattle_std_max - self.rattle_std_min) < 1e-12:
+            return [float(self.rattle_std)] * n
+        if n == 1:
+            return [float(self.rattle_std_min)]
+        step = (self.rattle_std_max - self.rattle_std_min) / float(n - 1)
+        return [
+            float(self.rattle_std_min + step * idx)
+            for idx in range(n)
+        ]
 
-    def _deformed(self, supercell: Atoms, base: Atoms, n: int) -> List[Atoms]:
+    def _liquid_snapshots(
+        self,
+        supercell: Atoms,
+        base: Atoms,
+        n_configurations: int,
+        n_snapshots: int,
+    ) -> List[Atoms]:
+        if (
+            not self.liquid_enabled
+            or n_configurations <= 0
+            or n_snapshots <= 0
+        ):
+            return []
+
+        try:
+            from ase import units
+            from ase.calculators.lj import LennardJones
+            from ase.md import Langevin
+            from ase.md.velocitydistribution import (
+                MaxwellBoltzmannDistribution,
+                Stationary,
+                ZeroRotation,
+            )
+        except ImportError:
+            logger.warning("ASE MD components not available; skipping liquid perturbations")
+            return []
+
+        seed_label = base.info.get("seed_id", base.info.get("source", "base"))
+        logger.info(
+            "  Liquid perturbation for %s: %s configuration(s), %s snapshot(s) each at %.1f K",
+            seed_label,
+            n_configurations,
+            n_snapshots,
+            self.liquid_temperature_k,
+        )
+
         out: List[Atoms] = []
-        for _ in range(n):
-            d = supercell.copy()
-            R = self.rng.uniform(self.strain_limit[0], self.strain_limit[1], (3, 3))
-            M = np.eye(3) + R
-            d.set_cell(M @ d.cell[:], scale_atoms=True)
-            self._tag(d, base, "deformed")
-            out.append(d)
+        for config_index in range(n_configurations):
+            logger.info(
+                "  Liquid %s/%s for %s: equilibrating %s atoms for %s MD step(s)",
+                config_index + 1,
+                n_configurations,
+                seed_label,
+                len(supercell),
+                self.liquid_equilibration_steps,
+            )
+            atoms = supercell.copy()
+            atoms.calc = LennardJones()
+            MaxwellBoltzmannDistribution(atoms, temperature_K=self.liquid_temperature_k)
+            Stationary(atoms)
+            ZeroRotation(atoms)
+            dynamics = Langevin(
+                atoms,
+                timestep=self.liquid_timestep_fs * units.fs,
+                temperature_K=self.liquid_temperature_k,
+                friction=self.liquid_friction,
+            )
+            snapshots: List[Atoms] = []
+
+            def capture_snapshot() -> None:
+                snapshot_index = len(snapshots)
+                snapshot = atoms.copy()
+                self._tag(
+                    snapshot,
+                    base,
+                    "liquid",
+                    liquid_configuration_index=config_index,
+                    liquid_snapshot_index=snapshot_index,
+                    liquid_temperature_k=self.liquid_temperature_k,
+                    liquid_timestep_fs=self.liquid_timestep_fs,
+                )
+                snapshots.append(snapshot)
+                logger.info(
+                    "  Liquid %s/%s for %s: captured snapshot %s/%s",
+                    config_index + 1,
+                    n_configurations,
+                    seed_label,
+                    snapshot_index + 1,
+                    n_snapshots,
+                )
+
+            dynamics.run(self.liquid_equilibration_steps)
+            dynamics.attach(capture_snapshot, interval=self.liquid_steps_between_snapshots)
+            logger.info(
+                "  Liquid %s/%s for %s: sampling %s snapshot(s) every %s step(s)",
+                config_index + 1,
+                n_configurations,
+                seed_label,
+                n_snapshots,
+                self.liquid_steps_between_snapshots,
+            )
+            dynamics.run(self.liquid_steps_between_snapshots * n_snapshots)
+            out.extend(snapshots[:n_snapshots])
+
+        logger.info("  Liquid perturbation for %s complete: %s snapshot(s)", seed_label, len(out))
         return out
 
     def _vacancies(self, supercell: Atoms, base: Atoms, n: int) -> List[Atoms]:

@@ -611,6 +611,7 @@ fi
                 f"--gres=gpu:{gpus}",
                 f"--output={job_dir}/vasp_%j.out",
                 f"--error={job_dir}/vasp_%j.err",
+                "--mem=64G",
                 str(shared_script),
                 str(job_dir.resolve()),
             ]
