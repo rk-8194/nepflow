@@ -1,7 +1,4 @@
-import importlib
-import sys
 import tempfile
-import types
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -21,56 +18,12 @@ class StructureStub:
         self.num_atoms = num_atoms
 
 
-class CalculatorBoundary:
-    """External calculator boundary returning real NumPy descriptors."""
+pytest.importorskip("NepTrainKit")
 
-    def __init__(self, path: str):
-        self.path = path
+from common import descriptors as DESCRIPTORS  # noqa: E402
+from modules.select import select as select_module  # noqa: E402
 
-    def get_structures_descriptor(self, batch, mean_descriptor=True):
-        width = 3 if mean_descriptor else 2
-        return np.ones((len(batch), width), dtype=float)
-
-
-def _fake_farthest_point_sampling(descriptors, n_samples, min_dist):
-    del descriptors, min_dist
-    return np.arange(n_samples, dtype=int)
-
-
-def _import_select_module():
-    """Import the stage, scoping only the optional NepTrainKit boundary when absent."""
-    try:
-        import NepTrainKit  # noqa: F401
-    except ImportError:
-        nep_pkg = types.ModuleType("NepTrainKit")
-        nep_pkg.__path__ = []
-        nep_core = types.ModuleType("NepTrainKit.core")
-        nep_core.__path__ = []
-        nep_calc = types.ModuleType("NepTrainKit.core.calculator")
-        nep_calc.NepCalculator = CalculatorBoundary
-        nep_struct = types.ModuleType("NepTrainKit.core.structure")
-        nep_struct.Structure = type(
-            "StructureReader",
-            (),
-            {"read_multiple": staticmethod(lambda path: [StructureStub()])},
-        )
-        nep_io = types.ModuleType("NepTrainKit.core.io")
-        nep_io.farthest_point_sampling = _fake_farthest_point_sampling
-        modules = {
-            "NepTrainKit": nep_pkg,
-            "NepTrainKit.core": nep_core,
-            "NepTrainKit.core.calculator": nep_calc,
-            "NepTrainKit.core.structure": nep_struct,
-            "NepTrainKit.core.io": nep_io,
-        }
-        with patch.dict(sys.modules, modules, clear=False):
-            return importlib.import_module("modules.select.select")
-    return importlib.import_module("modules.select.select")
-
-
-select_module = _import_select_module()
 SelectStage = select_module.SelectStage
-DESCRIPTORS = importlib.import_module("common.descriptors")
 
 
 def make_atoms(symbols: str = "Si", *, x: float = 0.0, composition: dict | None = None) -> Atoms:

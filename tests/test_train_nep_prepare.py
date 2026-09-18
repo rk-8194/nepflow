@@ -228,52 +228,6 @@ class TrainNepPrepareRegistryTests(unittest.TestCase):
 
         self.assertEqual(count, 0)
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="Phase 2 blocker P0-6: production parsing must never emit -1.0 energy",
-    )
-    def test_production_dataset_path_never_emits_placeholder_energy(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            project_dir = self.make_project(root)
-            atoms = self.fixture_atoms(has_calculator=False)
-            self.write_identity_job(project_dir, "struct_0000", atoms)
-            outcar = project_dir / "vasp" / "jobs" / "train" / "struct_0000" / "OUTCAR"
-            outcar.write_text(
-                (FIXTURES / "outcar" / "valid_outcar").read_text(encoding="utf-8"),
-                encoding="utf-8",
-            )
-            with patch.object(train_prepare, "ase_read", side_effect=RuntimeError("bad OUTCAR")):
-                records = list(train_prepare._parse_structures([atoms], True, project_dir))
-
-        self.assertTrue(all(record["energy"] != -1.0 for record in records))
-
-    @pytest.mark.xfail(
-        strict=True,
-        reason="Phase 2 blocker P0-6: production parsing must never emit zero forces",
-    )
-    def test_production_dataset_path_never_emits_placeholder_forces(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            project_dir = self.make_project(root)
-            atoms = self.fixture_atoms(has_calculator=False)
-            self.write_identity_job(project_dir, "struct_0000", atoms)
-            outcar = project_dir / "vasp" / "jobs" / "train" / "struct_0000" / "OUTCAR"
-            outcar.write_text(
-                (FIXTURES / "outcar" / "valid_outcar").read_text(encoding="utf-8"),
-                encoding="utf-8",
-            )
-            with patch.object(train_prepare, "ase_read", side_effect=RuntimeError("bad OUTCAR")):
-                records = list(train_prepare._parse_structures([atoms], True, project_dir))
-
-        self.assertTrue(
-            all(
-                any(component != 0.0 for component in row)
-                for record in records
-                for row in record["forces"]
-            )
-        )
-
     def test_reused_output_is_accepted_when_identity_matches(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

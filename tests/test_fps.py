@@ -1,38 +1,12 @@
-import importlib
-import sys
-import types
 import unittest
 from unittest.mock import patch
 
 import numpy as np
+import pytest
 
+pytest.importorskip("NepTrainKit")
 
-def _import_fps_module():
-    """Import FPS, mocking only the optional NepTrainKit sampling boundary if absent."""
-    try:
-        return importlib.import_module("common.FPS")
-    except ModuleNotFoundError as exc:
-        if not str(exc.name).startswith("NepTrainKit"):
-            raise
-
-        io_module = types.ModuleType("NepTrainKit.core.io")
-        io_module.farthest_point_sampling = lambda descriptors, n_samples, min_dist: list(
-            range(min(len(descriptors), n_samples))
-        )
-        core = types.ModuleType("NepTrainKit.core")
-        core.__path__ = []
-        package = types.ModuleType("NepTrainKit")
-        package.__path__ = []
-        modules = {
-            "NepTrainKit": package,
-            "NepTrainKit.core": core,
-            "NepTrainKit.core.io": io_module,
-        }
-        with patch.dict(sys.modules, modules, clear=False):
-            return importlib.import_module("common.FPS")
-
-
-FPS = _import_fps_module()
+from common import FPS  # noqa: E402
 
 
 class StructureStub:
@@ -45,8 +19,10 @@ class FPSTests(unittest.TestCase):
         descriptors = np.ones((3, 2))
         structures = [StructureStub(), StructureStub(), StructureStub()]
 
-        result = FPS.fps_run(descriptors, structures, True, 0.1)
+        with patch.object(FPS, "farthest_point_sampling", return_value=[2, 0, 1]) as sampler:
+            result = FPS.fps_run(descriptors, structures, True, 0.1)
 
+        sampler.assert_called_once_with(descriptors, n_samples=3, min_dist=0.1)
         self.assertEqual(result, [0, 1, 2])
 
     def test_fps_run_maps_atomic_descriptor_indices_back_to_frames(self) -> None:

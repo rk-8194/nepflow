@@ -1,7 +1,4 @@
-import importlib
-import sys
 import tempfile
-import types
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -9,31 +6,9 @@ from unittest.mock import patch
 import numpy as np
 import pytest
 
+pytest.importorskip("NepTrainKit")
 
-def _import_descriptors_module():
-    """Import descriptors, mocking only the optional NepTrainKit boundary if absent."""
-    try:
-        return importlib.import_module("common.descriptors")
-    except ModuleNotFoundError as exc:
-        if not str(exc.name).startswith("NepTrainKit"):
-            raise
-
-        calculator = types.ModuleType("NepTrainKit.core.calculator")
-        calculator.NepCalculator = object
-        core = types.ModuleType("NepTrainKit.core")
-        core.__path__ = []
-        package = types.ModuleType("NepTrainKit")
-        package.__path__ = []
-        modules = {
-            "NepTrainKit": package,
-            "NepTrainKit.core": core,
-            "NepTrainKit.core.calculator": calculator,
-        }
-        with patch.dict(sys.modules, modules, clear=False):
-            return importlib.import_module("common.descriptors")
-
-
-DESCRIPTORS = _import_descriptors_module()
+from common import descriptors as DESCRIPTORS  # noqa: E402
 
 
 class CalculatorBoundary:
