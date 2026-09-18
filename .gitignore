@@ -4,6 +4,8 @@ plots
 cafps
 pairs
 run_*
+!tests/fixtures/run_layouts/
+!tests/fixtures/run_layouts/model_dataset_layouts.json
 projects*
 .vasp_memory
 archive
