@@ -1,5 +1,4 @@
-import importlib.util
-import json
+import importlib
 import sys
 import tempfile
 import types
@@ -7,34 +6,39 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-
-ROOT = Path(__file__).resolve().parents[1]
-SRC = ROOT / "src"
-
-
-class FakeArray:
-    def __init__(self, data):
-        self.data = data
-
-    @property
-    def shape(self):
-        if not self.data:
-            return (0,)
-        first = self.data[0]
-        if isinstance(first, list):
-            return (len(self.data), len(first))
-        return (len(self.data),)
-
-    def __len__(self):
-        return len(self.data)
-
-    def __getitem__(self, item):
-        if isinstance(item, list):
-            return FakeArray([self.data[i] for i in item])
-        return self.data[item]
+import numpy as np
+import pytest
 
 
-class FakeCalculator:
+def _import_descriptors_module():
+    """Import descriptors, mocking only the optional NepTrainKit boundary if absent."""
+    try:
+        return importlib.import_module("common.descriptors")
+    except ModuleNotFoundError as exc:
+        if not str(exc.name).startswith("NepTrainKit"):
+            raise
+
+        calculator = types.ModuleType("NepTrainKit.core.calculator")
+        calculator.NepCalculator = object
+        core = types.ModuleType("NepTrainKit.core")
+        core.__path__ = []
+        package = types.ModuleType("NepTrainKit")
+        package.__path__ = []
+        modules = {
+            "NepTrainKit": package,
+            "NepTrainKit.core": core,
+            "NepTrainKit.core.calculator": calculator,
+        }
+        with patch.dict(sys.modules, modules, clear=False):
+            return importlib.import_module("common.descriptors")
+
+
+DESCRIPTORS = _import_descriptors_module()
+
+
+class CalculatorBoundary:
+    """Boundary fake for NepTrainKit; descriptor values remain real NumPy arrays."""
+
     def __init__(self, path):
         self.path = path
         self.batch_sizes = []
@@ -44,10 +48,12 @@ class FakeCalculator:
         self.batch_sizes.append(len(batch))
         self.mean_descriptor_flags.append(mean_descriptor)
         width = 3 if mean_descriptor else 2
-        return sys.modules["numpy"].ones((len(batch), width))
+        return np.ones((len(batch), width))
 
 
-class FakeCalculatorV3:
+class CalculatorV3Boundary:
+    """Boundary fake for the NepTrainKit 3.x descriptor method."""
+
     def __init__(self, path):
         self.path = path
         self.batch_sizes = []
@@ -57,58 +63,7 @@ class FakeCalculatorV3:
         self.batch_sizes.append(len(batch))
         self.mean_flags.append(mean)
         width = 3 if mean else 2
-        return sys.modules["numpy"].ones((len(batch), width))
-
-
-def install_numpy_stub():
-    numpy_module = types.ModuleType("numpy")
-    numpy_module.ndarray = FakeArray
-    numpy_module.ones = lambda shape, dtype=None: FakeArray(
-        [[1 for _ in range(shape[1])] for _ in range(shape[0])]
-    )
-    numpy_module.concatenate = lambda arrays, axis=0: FakeArray(
-        [row for array in arrays for row in array.data]
-    )
-    numpy_module.save = lambda path, arr: Path(path).write_text(
-        json.dumps(arr.data),
-        encoding="utf-8",
-    )
-    numpy_module.load = lambda path: FakeArray(
-        json.loads(Path(path).read_text(encoding="utf-8"))
-    )
-    sys.modules["numpy"] = numpy_module
-
-
-def install_test_stubs():
-    install_numpy_stub()
-    for name in ["common", "NepTrainKit", "NepTrainKit.core"]:
-        if name not in sys.modules:
-            module = types.ModuleType(name)
-            module.__path__ = []
-            sys.modules[name] = module
-
-    nep_calc = types.ModuleType("NepTrainKit.core.calculator")
-    nep_calc.NepCalculator = FakeCalculator
-    sys.modules["NepTrainKit.core.calculator"] = nep_calc
-
-
-def load_descriptors_module():
-    install_test_stubs()
-    sys.modules.pop("common.descriptors", None)
-    spec = importlib.util.spec_from_file_location(
-        "common.descriptors",
-        SRC / "common" / "descriptors.py",
-    )
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["common.descriptors"] = module
-    sys.modules["common"].descriptors = module
-    assert spec.loader is not None
-    spec.loader.exec_module(module)
-    return module
-
-
-DESCRIPTORS = load_descriptors_module()
-NP = sys.modules["numpy"]
+        return np.ones((len(batch), width))
 
 
 class DescriptorTests(unittest.TestCase):
@@ -120,12 +75,11 @@ class DescriptorTests(unittest.TestCase):
         self.assertEqual(result, project_dir / "nep" / "datasets" / "descriptors.npy")
 
     def test_compute_descriptors_batched_splits_batches(self) -> None:
-        calc = FakeCalculator("model.txt")
-        structures = ["s0", "s1", "s2"]
+        calc = CalculatorBoundary("model.txt")
 
         descriptors = DESCRIPTORS.compute_descriptors_batched(
             calc,
-            structures,
+            ["s0", "s1", "s2"],
             mean_descriptor=True,
             batch_size=2,
         )
@@ -135,7 +89,7 @@ class DescriptorTests(unittest.TestCase):
         self.assertEqual(calc.mean_descriptor_flags, [True, True])
 
     def test_compute_descriptors_batched_forwards_mean_descriptor_flag(self) -> None:
-        calc = FakeCalculator("model.txt")
+        calc = CalculatorBoundary("model.txt")
 
         descriptors = DESCRIPTORS.compute_descriptors_batched(
             calc,
@@ -148,7 +102,7 @@ class DescriptorTests(unittest.TestCase):
         self.assertEqual(descriptors.shape, (2, 2))
 
     def test_compute_descriptors_batched_supports_neptrainkit_v3_api(self) -> None:
-        calc = FakeCalculatorV3("model.txt")
+        calc = CalculatorV3Boundary("model.txt")
 
         descriptors = DESCRIPTORS.compute_descriptors_batched(
             calc,
@@ -161,23 +115,34 @@ class DescriptorTests(unittest.TestCase):
         self.assertEqual(calc.mean_flags, [False, False])
         self.assertEqual(descriptors.shape, (3, 2))
 
-    def test_load_or_compute_descriptors_uses_cache_when_shape_matches(self) -> None:
+    @pytest.mark.xfail(
+        strict=True,
+        reason="Phase 1 blocker P0-10: descriptor cache reuse must require input identity, not shape alone",
+    )
+    def test_equal_shape_cache_from_different_inputs_is_not_reused(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_dir = Path(tmp)
             cache_path = project_dir / "nep" / "datasets"
             cache_path.mkdir(parents=True, exist_ok=True)
-            NP.save(cache_path / "descriptors.npy", NP.ones((3, 4)))
+            np.save(cache_path / "descriptors.npy", np.ones((3, 4)))
+            model_dir = project_dir / "config" / "nep"
+            model_dir.mkdir(parents=True, exist_ok=True)
+            (model_dir / "nep89.txt").write_text("stub", encoding="utf-8")
 
-            with patch.object(DESCRIPTORS, "NepCalculator") as calc_cls:
+            with patch.object(
+                DESCRIPTORS,
+                "NepCalculator",
+                side_effect=lambda path: CalculatorBoundary(path),
+            ) as calc_cls:
                 descriptors = DESCRIPTORS.load_or_compute_descriptors(
                     project_dir,
-                    ["a", "b", "c"],
+                    ["new-a", "new-b", "new-c"],
                     mean_descriptor=True,
                     batch_size=2,
                     nep_model_file="nep89.txt",
                 )
 
-            calc_cls.assert_not_called()
+            calc_cls.assert_called_once()
             self.assertEqual(descriptors.shape, (3, 4))
 
     def test_load_or_compute_descriptors_computes_and_saves_when_missing(self) -> None:
@@ -185,15 +150,17 @@ class DescriptorTests(unittest.TestCase):
             project_dir = Path(tmp)
             model_dir = project_dir / "config" / "nep"
             model_dir.mkdir(parents=True, exist_ok=True)
-            (model_dir / "nep89.txt").write_text("stub", encoding="utf-8")
+            model_path = model_dir / "nep89.txt"
+            model_path.write_text("stub", encoding="utf-8")
 
-            descriptors = DESCRIPTORS.load_or_compute_descriptors(
-                project_dir,
-                ["a", "b", "c"],
-                mean_descriptor=False,
-                batch_size=2,
-                nep_model_file="nep89.txt",
-            )
+            with patch.object(DESCRIPTORS, "NepCalculator", CalculatorBoundary):
+                descriptors = DESCRIPTORS.load_or_compute_descriptors(
+                    project_dir,
+                    ["a", "b", "c"],
+                    mean_descriptor=False,
+                    batch_size=2,
+                    nep_model_file="nep89.txt",
+                )
 
             self.assertEqual(descriptors.shape, (3, 2))
             self.assertTrue(
@@ -205,20 +172,21 @@ class DescriptorTests(unittest.TestCase):
             project_dir = Path(tmp)
             cache_path = project_dir / "nep" / "datasets"
             cache_path.mkdir(parents=True, exist_ok=True)
-            NP.save(cache_path / "descriptors.npy", NP.ones((2, 9)))
+            np.save(cache_path / "descriptors.npy", np.ones((2, 9)))
             model_dir = project_dir / "config" / "nep"
             model_dir.mkdir(parents=True, exist_ok=True)
             (model_dir / "nep89.txt").write_text("stub", encoding="utf-8")
 
-            with patch.object(DESCRIPTORS, "compute_descriptors_batched") as compute:
-                compute.return_value = NP.ones((3, 2))
-                descriptors = DESCRIPTORS.load_or_compute_descriptors(
-                    project_dir,
-                    ["a", "b", "c"],
-                    mean_descriptor=False,
-                    batch_size=2,
-                    nep_model_file="nep89.txt",
-                )
+            with patch.object(DESCRIPTORS, "NepCalculator", CalculatorBoundary):
+                with patch.object(DESCRIPTORS, "compute_descriptors_batched") as compute:
+                    compute.return_value = np.ones((3, 2))
+                    descriptors = DESCRIPTORS.load_or_compute_descriptors(
+                        project_dir,
+                        ["a", "b", "c"],
+                        mean_descriptor=False,
+                        batch_size=2,
+                        nep_model_file="nep89.txt",
+                    )
 
             compute.assert_called_once()
             self.assertEqual(descriptors.shape, (3, 2))

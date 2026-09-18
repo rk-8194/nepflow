@@ -1,4 +1,3 @@
-import importlib.util
 import json
 import os
 import tempfile
@@ -7,13 +6,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 
-ROOT = Path(__file__).resolve().parents[1]
-UTILITY = ROOT / "utilities" / "gpumd_self_resubmit.py"
-
-spec = importlib.util.spec_from_file_location("gpumd_self_resubmit", UTILITY)
-module = importlib.util.module_from_spec(spec)
-assert spec.loader is not None
-spec.loader.exec_module(module)
+from utilities import gpumd_self_resubmit as module
 
 
 class GpumdSelfResubmitTests(unittest.TestCase):

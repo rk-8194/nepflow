@@ -1,5 +1,3 @@
-import importlib.util
-import sys
 import tempfile
 import types
 import unittest
@@ -7,42 +5,12 @@ from configparser import ConfigParser
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
 
-ROOT = Path(__file__).resolve().parents[1]
-SRC = ROOT / "src"
+pytest.importorskip("ase")
+pytest.importorskip("pymatgen")
 
-
-def ensure_package(name: str) -> None:
-    if name not in sys.modules:
-        module = types.ModuleType(name)
-        module.__path__ = []
-        sys.modules[name] = module
-
-
-def load_module(module_name: str, path: Path):
-    spec = importlib.util.spec_from_file_location(module_name, path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[module_name] = module
-    assert spec.loader is not None
-    spec.loader.exec_module(module)
-    return module
-
-
-for package_name in (
-    "testpkg",
-    "testpkg.modules",
-    "testpkg.modules.train_nep",
-):
-    ensure_package(package_name)
-
-common_module = types.ModuleType("testpkg.modules.train_nep._common")
-common_module.logger = types.SimpleNamespace(info=lambda *a, **k: None, debug=lambda *a, **k: None, warning=lambda *a, **k: None)
-sys.modules["testpkg.modules.train_nep._common"] = common_module
-
-submit_module = load_module(
-    "testpkg.modules.train_nep.submit",
-    SRC / "modules" / "train_nep" / "submit.py",
-)
+from modules.train_nep import submit as submit_module
 
 
 class SubmitTrainingJobTests(unittest.TestCase):
@@ -68,7 +36,11 @@ class SubmitTrainingJobTests(unittest.TestCase):
                 }
             )
 
-            completed = types.SimpleNamespace(returncode=0, stdout="Submitted batch job 12345\n", stderr="")
+            completed = types.SimpleNamespace(
+                returncode=0,
+                stdout="Submitted batch job 12345\n",
+                stderr="",
+            )
             with patch.object(submit_module.subprocess, "run", return_value=completed):
                 job_id = submit_module.submit_training_job(
                     config=config,

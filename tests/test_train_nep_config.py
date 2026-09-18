@@ -1,75 +1,13 @@
-import importlib.util
-import sys
 import tempfile
-import types
 import unittest
 from pathlib import Path
 
+import pytest
 
-ROOT = Path(__file__).resolve().parents[1]
-SRC = ROOT / "src"
+pytest.importorskip("ase")
+pytest.importorskip("pymatgen")
 
-
-def ensure_package(name: str) -> None:
-    if name not in sys.modules:
-        module = types.ModuleType(name)
-        module.__path__ = []
-        sys.modules[name] = module
-
-
-def load_module(module_name: str, path: Path):
-    spec = importlib.util.spec_from_file_location(module_name, path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[module_name] = module
-    assert spec.loader is not None
-    spec.loader.exec_module(module)
-    return module
-
-
-for package_name in (
-    "testpkg",
-    "testpkg.modules",
-    "testpkg.modules.train_nep",
-):
-    ensure_package(package_name)
-
-numpy_module = types.ModuleType("numpy")
-numpy_module.ndarray = object
-sys.modules["numpy"] = numpy_module
-
-ase_module = types.ModuleType("ase")
-ase_module.__path__ = []
-sys.modules["ase"] = ase_module
-
-ase_atoms = types.ModuleType("ase.atoms")
-ase_atoms.Atoms = object
-sys.modules["ase.atoms"] = ase_atoms
-
-ase_io = types.ModuleType("ase.io")
-ase_io.read = lambda *args, **kwargs: []
-sys.modules["ase.io"] = ase_io
-
-base_module = load_module("testpkg.modules.base", SRC / "modules" / "base.py")
-
-prepare_module = types.ModuleType("testpkg.modules.train_nep.prepare")
-prepare_module.prepare_dataset = lambda *args, **kwargs: 0
-sys.modules["testpkg.modules.train_nep.prepare"] = prepare_module
-
-submit_module = types.ModuleType("testpkg.modules.train_nep.submit")
-submit_module.submit_training_job = lambda *args, **kwargs: "0"
-sys.modules["testpkg.modules.train_nep.submit"] = submit_module
-
-launcher_module = types.ModuleType("testpkg.modules.train_nep.launcher")
-launcher_module.run_launcher = lambda *args, **kwargs: None
-launcher_module.read_train_status = lambda *args, **kwargs: {}
-launcher_module.write_train_status = lambda *args, **kwargs: None
-sys.modules["testpkg.modules.train_nep.launcher"] = launcher_module
-
-train_nep_module = load_module(
-    "testpkg.modules.train_nep.train_nep",
-    SRC / "modules" / "train_nep" / "train_nep.py",
-)
-TrainNepStage = train_nep_module.TrainNepStage
+from modules.train_nep.train_nep import TrainNepStage
 
 
 class TrainNepConfigTests(unittest.TestCase):
