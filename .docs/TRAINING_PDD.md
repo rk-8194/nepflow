@@ -140,6 +140,16 @@ The stage should distinguish generic MLIP campaign orchestration from backend-sp
 
 NEP-specific configuration and parsing belong in an MLIP backend interface.
 
+### 3.10 Accuracy takes precedence over simulation speed
+
+The computational performance of a trained potential in GPUMD is an important validation and reporting metric because the final model may be used for very large or long simulations.
+
+However, simulation speed is subordinate to scientific accuracy and required physical-property fidelity.
+
+A faster potential must not outrank or replace a more accurate potential merely because it executes GPUMD simulations more quickly when the accuracy difference is scientifically material.
+
+Performance may be used to distinguish models only after mandatory accuracy and physical-property requirements have been satisfied, or as an explicitly lower-priority objective within a multi-objective comparison.
+
 ---
 
 ## 4. Scope
@@ -1224,7 +1234,10 @@ Potential objectives include:
 - physical-property fidelity;
 - stability;
 - model complexity;
+- GPUMD simulation performance;
 - runtime cost.
+
+GPUMD simulation performance is a secondary objective. Required accuracy and physical-property gates take precedence. A runtime advantage must not compensate for a material failure in energy, force, virial, stability, or required property accuracy.
 
 The stage shall support either:
 
@@ -1255,7 +1268,7 @@ Promotion policy may then select one or more models.
 
 A campaign may define a score conceptually as:
 
-`score = w_E * E_error + w_F * F_error + w_V * V_error + w_P * property_error + w_C * complexity_penalty`
+`score = w_E * E_error + w_F * F_error + w_V * V_error + w_P * property_error + w_C * complexity_penalty + w_T * gpumd_runtime_penalty`
 
 where each component is normalised.
 
@@ -1266,7 +1279,8 @@ The important requirement is that:
 - each component is separately reported;
 - normalisation is explicit;
 - weights are explicit;
-- hard gates are evaluated independently.
+- hard gates are evaluated independently;
+- GPUMD runtime/performance cannot compensate for failure of mandatory accuracy or physical-property gates.
 
 ---
 
@@ -1347,7 +1361,10 @@ The policy may require:
 - acceptable virial accuracy where relevant;
 - acceptable property score;
 - optional stability checks;
+- reported GPUMD simulation performance;
 - acceptable computational cost.
+
+Accuracy and physical-property requirements shall be evaluated before GPUMD runtime is used as a preference. Among candidates that satisfy the required scientific gates, simulation performance may be used as a secondary discriminator.
 
 ### 47.1 Single-winner promotion
 
@@ -1375,6 +1392,7 @@ For every promoted model, the report shall state:
 - hard-gate results;
 - fitting metrics;
 - property metrics;
+- GPUMD simulation runtime/throughput metrics;
 - resource cost;
 - comparison to other finalists.
 
@@ -1482,19 +1500,63 @@ A modest accuracy improvement may not justify a substantially more expensive mod
 
 ---
 
-## 54. Model Complexity and Inference Cost
+## 54. Model Complexity and GPUMD Simulation Performance
 
-The stage should track model complexity because the final potential may be used in simulations containing millions of atoms.
+The stage should track model complexity and actual GPUMD execution performance because the final potential may be used in simulations containing millions of atoms over long trajectories.
 
 Relevant measures may include:
 
 - parameter count;
 - descriptor complexity;
 - cutoff radius;
-- benchmarked GPUMD throughput;
+- wall-clock time for a standard GPUMD benchmark;
+- atom-steps per second;
+- ns/day where meaningful for the benchmark;
+- GPU utilisation;
 - memory usage.
 
-Training-stage model selection should therefore be able to trade predictive accuracy against production-simulation cost.
+### 54.1 Standardised GPUMD benchmark
+
+Runtime comparisons between candidate potentials must use a reproducible benchmark protocol.
+
+The benchmark definition should record:
+
+- reference atomic system;
+- atom count;
+- composition;
+- GPUMD input;
+- timestep;
+- number of steps;
+- ensemble;
+- hardware model;
+- GPU count;
+- GPUMD version;
+- relevant software environment.
+
+The same benchmark must be used when comparing candidates within a campaign unless the report explicitly marks results as non-comparable.
+
+### 54.2 Performance reporting
+
+For each finalist, the campaign should report both:
+
+- total benchmark wall time; and
+- a normalised throughput measure such as atom-steps per second.
+
+This allows users to estimate the practical cost of subsequent large-scale simulations.
+
+### 54.3 Priority relative to accuracy
+
+GPUMD execution speed is not a substitute for model quality.
+
+The preferred ordering is:
+
+1. satisfy mandatory fitting-accuracy gates;
+2. satisfy mandatory physical-property and stability gates;
+3. compare scientifically acceptable candidates on secondary objectives such as GPUMD simulation speed, model complexity, and resource cost.
+
+A slower model with materially better required accuracy must not be rejected solely in favour of a faster but less accurate model.
+
+When two models are scientifically comparable within declared tolerances, GPUMD performance may be used as an important tie-breaker or secondary optimisation objective.
 
 ---
 
@@ -1680,6 +1742,7 @@ A completed campaign report shall include:
 - completed/failed/pruned trial counts;
 - best fitting metrics;
 - best property metrics;
+- GPUMD simulation runtime/throughput for finalists;
 - hard-gate results;
 - promoted models.
 
