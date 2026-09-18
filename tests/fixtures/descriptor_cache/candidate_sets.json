@@ -1,0 +1,15 @@
+{
+  "descriptor_units": "dimensionless model output",
+  "descriptor_shape": [3, 2],
+  "candidate_set_a": [
+    {"structure_id": "structure_alpha", "descriptor": [0.0, 0.0]},
+    {"structure_id": "structure_beta", "descriptor": [1.0, 0.0]},
+    {"structure_id": "structure_gamma", "descriptor": [0.0, 1.0]}
+  ],
+  "candidate_set_b": [
+    {"structure_id": "structure_gamma", "descriptor": [0.0, 1.0]},
+    {"structure_id": "structure_alpha", "descriptor": [0.0, 0.0]},
+    {"structure_id": "structure_delta", "descriptor": [1.0, 1.0]}
+  ],
+  "identity_rule": "same row count and descriptor width do not imply cache compatibility; ordered structure IDs differ"
+}

@@ -8,6 +8,8 @@ projects*
 .vasp_memory
 archive
 
+task.md
+
 # Python cache
 __pycache__/
 *.pyc

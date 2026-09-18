@@ -1,0 +1,12 @@
+ vasp.6.4.2 64-bit
+ VRHFIN =Si: s2p2
+ NIONS =      2 ions per type = 2
+
+ direct lattice vectors                 reciprocal lattice vectors
+   3.00000000  0.00000000  0.00000000    2.09439510  0.00000000  0.00000000
+   0.00000000  3.00000000  0.00000000    0.00000000  2.09439510  0.00000000
+   0.00000000  0.00000000  3.00000000    0.00000000  0.00000000  2.09439510
+
+ free  energy   TOTEN  =       -10.50000000 eV
+ General timing and accounting informations for this job:
+ ==========================================================
