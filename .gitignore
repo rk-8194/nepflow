@@ -6,6 +6,7 @@ pairs
 run_*
 projects*
 .vasp_memory
+archive
 
 # Python cache
 __pycache__/
