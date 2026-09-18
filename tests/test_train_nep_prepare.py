@@ -233,7 +233,9 @@ class TrainNepPrepareRegistryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             project_dir = self.make_project(root)
-            atoms = self.fixture_atoms(has_calculator=False)
+            # Keep a usable selected-structure calculator so the current fallback
+            # actually writes its fabricated label after OUTCAR parsing fails.
+            atoms = self.fixture_atoms(energy=-1.0)
             struct_dir = self.write_identity_job(project_dir, "struct_0000", atoms)
             (struct_dir / "OUTCAR").write_text(
                 (FIXTURES / "outcar" / "valid_outcar").read_text(encoding="utf-8"),
@@ -271,7 +273,8 @@ class TrainNepPrepareRegistryTests(unittest.TestCase):
         count, rendered = self.prepare_dataset_after_ase_parse_failure()
 
         self.assertEqual(count, 0, "an unparsable OUTCAR must not produce an accepted dataset record")
-        self.assertNotIn("Properties=species:S:1:pos:R:3:force:R:3", rendered)
+        atom_rows = [line for line in rendered.splitlines() if line.startswith("Si ")]
+        self.assertEqual(atom_rows, [])
 
     def test_reused_output_is_accepted_when_identity_matches(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
