@@ -228,6 +228,51 @@ class TrainNepPrepareRegistryTests(unittest.TestCase):
 
         self.assertEqual(count, 0)
 
+    def prepare_dataset_after_ase_parse_failure(self) -> tuple[int, str]:
+        """Run the production dataset path with a completed but unparsable OUTCAR."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            project_dir = self.make_project(root)
+            atoms = self.fixture_atoms(has_calculator=False)
+            struct_dir = self.write_identity_job(project_dir, "struct_0000", atoms)
+            (struct_dir / "OUTCAR").write_text(
+                (FIXTURES / "outcar" / "valid_outcar").read_text(encoding="utf-8"),
+                encoding="utf-8",
+            )
+            dataset_path = root / "train.xyz"
+
+            with patch.object(train_prepare, "ase_read", side_effect=RuntimeError("bad OUTCAR")):
+                count = train_prepare.prepare_dataset(
+                    dataset_path=dataset_path,
+                    ase_structures=[atoms],
+                    is_train=True,
+                    project_dir=project_dir,
+                )
+
+            rendered = dataset_path.read_text(encoding="utf-8")
+
+        return count, rendered
+
+    @pytest.mark.xfail(
+        strict=True,
+        reason="Phase 2 blocker P0-6: production dataset path must reject parser failure instead of emitting -1.0 energy",
+    )
+    def test_production_dataset_path_rejects_placeholder_energy(self) -> None:
+        count, rendered = self.prepare_dataset_after_ase_parse_failure()
+
+        self.assertEqual(count, 0, "an unparsable OUTCAR must not produce an accepted dataset record")
+        self.assertNotIn("energy=-1.0000000000", rendered)
+
+    @pytest.mark.xfail(
+        strict=True,
+        reason="Phase 2 blocker P0-6: production dataset path must reject parser failure instead of emitting zero-force labels",
+    )
+    def test_production_dataset_path_rejects_placeholder_forces(self) -> None:
+        count, rendered = self.prepare_dataset_after_ase_parse_failure()
+
+        self.assertEqual(count, 0, "an unparsable OUTCAR must not produce an accepted dataset record")
+        self.assertNotIn("Properties=species:S:1:pos:R:3:force:R:3", rendered)
+
     def test_reused_output_is_accepted_when_identity_matches(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
