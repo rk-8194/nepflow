@@ -1035,6 +1035,51 @@ Broad catches are allowed only at application/process boundaries where they:
 
 If an error is intentionally ignored, the reason must be explicit and safe.
 
+### 27.3 Prefer fail-fast behavior over fallbacks
+
+NEPFlow shall avoid fallback behavior wherever practical.
+
+If an operation, dependency, parser, backend, configuration value, scientific calculation, or external command fails, the default behavior should be to stop the current operation and raise a clear typed error rather than silently substitute another implementation, guessed value, placeholder result, degraded calculation, or alternative algorithm.
+
+A fallback is acceptable only when all of the following are true:
+
+- the fallback is explicitly designed and documented;
+- it preserves the required scientific or operational semantics;
+- using it cannot make invalid output appear valid;
+- provenance records that the fallback path was used;
+- the behavior is covered by tests;
+- the caller can distinguish fallback execution from the primary path where that distinction matters.
+
+Do not use fallbacks merely to keep the workflow running.
+
+Examples of prohibited fallback behavior include:
+
+- replacing missing or unparsable energies, forces, stresses, or virials with fabricated values;
+- changing scientific algorithms after an implementation fails while retaining the original algorithm's provenance label;
+- using guessed resource, path, configuration, or identity values after required data cannot be resolved;
+- treating scheduler communication failure as evidence that a job completed or disappeared;
+- substituting a different dataset, model, potential, or artifact because the requested one cannot be found;
+- catching a backend failure and continuing with partial results unless partial results are an explicit supported output contract.
+
+Prefer:
+
+```python
+result = backend.calculate(...)
+if result is None:
+    raise BackendError("Backend produced no calculation result")
+```
+
+over:
+
+```python
+try:
+    result = backend.calculate(...)
+except Exception:
+    result = make_placeholder_result()
+```
+
+Where graceful degradation is genuinely required, implement it as an explicit policy or strategy with a precise name rather than an implicit `except` branch.
+
 ---
 
 ## 28. Error Messages
@@ -2097,6 +2142,8 @@ Reviewers should ask:
 ### Reliability
 
 - Are failures typed and visible?
+- Does the code fail fast instead of silently falling back to guessed, placeholder, or scientifically different behavior?
+- Is any permitted fallback explicit, provenance-recorded, and tested?
 - Is state persisted through the canonical store?
 - Is restart behaviour safe?
 - Is file writing atomic where needed?
@@ -2122,6 +2169,8 @@ The following patterns are prohibited in new code unless explicitly justified:
 - duplicate file-hash helpers;
 - bare `except:`;
 - silent `except Exception: pass`;
+- implicit or scientifically non-equivalent fallback behavior;
+- placeholder, guessed, or fabricated values used to conceal failed required operations;
 - mutable default arguments;
 - hidden global RNG state;
 - untyped public APIs;
