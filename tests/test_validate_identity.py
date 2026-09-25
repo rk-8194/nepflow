@@ -210,9 +210,9 @@ def test_finalize_preserves_the_resolved_model_dataset_pair() -> None:
         project_dir, models, datasets = materialize_layout(Path(tmp), single_pair)
         finalized_path, dataset_name = finalize_nep_potential(project_dir)
 
-    assert finalized_path == project_dir / "gpumd" / datasets["dataset_old"].name / models["model_old"].name
-    assert dataset_name == datasets["dataset_old"].name
-    assert (finalized_path / "nep.txt").exists()
+        assert finalized_path == project_dir / "gpumd" / datasets["dataset_old"].name / models["model_old"].name
+        assert dataset_name == datasets["dataset_old"].name
+        assert (finalized_path / "nep.txt").exists()
 
 
 def test_validation_entry_point_preserves_model_dataset_association_through_preparation() -> None:
