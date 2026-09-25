@@ -187,7 +187,11 @@ class SelectStageTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "frontier_fraction"):
                 stage.load_config()
 
-    def test_descriptor_loader_reuses_cache_with_real_numpy(self) -> None:
+    @pytest.mark.xfail(
+        strict=True,
+        reason="Phase 1 blocker P0-10: descriptor cache identity is incomplete",
+    )
+    def test_descriptor_loader_rejects_shape_only_cache_without_identity(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_dir = Path(tmp)
             cache_path = project_dir / "nep" / "datasets" / "descriptors.npy"
@@ -196,18 +200,26 @@ class SelectStageTests(unittest.TestCase):
             np.save(cache_path, expected)
             stage = self.create_stage(project_dir)
             structures = [StructureStub(), StructureStub(), StructureStub()]
+            model_dir = project_dir / "config" / "nep"
+            model_dir.mkdir(parents=True)
+            (model_dir / "nep89.txt").write_text("stub", encoding="utf-8")
 
-            with patch.object(DESCRIPTORS, "NepCalculator") as calculator:
-                result = DESCRIPTORS.load_or_compute_descriptors(
-                    project_dir,
-                    structures,
-                    mean_descriptor=True,
-                    batch_size=2,
-                    nep_model_file="missing.nep",
-                )
+            with patch.object(DESCRIPTORS, "NepCalculator", return_value=Mock()):
+                with patch.object(
+                    DESCRIPTORS,
+                    "compute_descriptors_batched",
+                    return_value=np.full((3, 4), 2.0),
+                ) as compute:
+                    result = DESCRIPTORS.load_or_compute_descriptors(
+                        project_dir,
+                        structures,
+                        mean_descriptor=True,
+                        batch_size=2,
+                        nep_model_file="nep89.txt",
+                    )
 
-            np.testing.assert_array_equal(result, expected)
-            calculator.assert_not_called()
+            compute.assert_called_once()
+            np.testing.assert_array_equal(result, np.full((3, 4), 2.0))
             self.assertIsNotNone(stage)
 
     def test_execute_uses_shared_descriptor_loader_and_selection(self) -> None:
