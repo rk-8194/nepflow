@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+from itertools import permutations
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -24,6 +25,14 @@ from common import descriptors as DESCRIPTORS  # noqa: E402
 from modules.select import select as select_module  # noqa: E402
 
 SelectStage = select_module.SelectStage
+
+SEED_LINEAGE_FIXTURE = (
+    Path(__file__).parent / "fixtures" / "structures" / "seed_lineage.extxyz.fixture"
+)
+P0_9_XFAIL_REASON = (
+    "Phase 1 blocker P0-9: seed anchors must resolve the exact unperturbed "
+    "physical structure"
+)
 
 
 def make_atoms(symbols: str = "Si", *, x: float = 0.0, composition: dict | None = None) -> Atoms:
@@ -94,6 +103,39 @@ class SelectStageTests(unittest.TestCase):
             project_dir=project_dir,
             debug=False,
         )
+
+    @staticmethod
+    def physical_fingerprint(atoms) -> tuple:
+        """Return a metadata-independent identity for the fixture geometry."""
+        return (
+            tuple(atoms.get_chemical_symbols()),
+            tuple(np.asarray(atoms.cell.array, dtype=float).round(12).ravel()),
+            tuple(np.asarray(atoms.positions, dtype=float).round(12).ravel()),
+            tuple(bool(value) for value in atoms.pbc),
+        )
+
+    def load_seed_lineage(
+        self, project_dir: Path
+    ) -> tuple[SelectStage, list[Atoms], Atoms]:
+        """Prepare the base seed file and return its generated lineage."""
+        stage = self.create_stage(project_dir)
+        lineage = select_module.ase_read(
+            str(SEED_LINEAGE_FIXTURE), index=":", format="extxyz"
+        )
+        if not isinstance(lineage, list):
+            lineage = [lineage]
+        base_candidates = [
+            atoms
+            for atoms in lineage
+            if str(atoms.info.get("perturbation_type", "")) == "unperturbed"
+        ]
+        if len(base_candidates) != 1:
+            raise AssertionError("seed lineage fixture must contain one unperturbed base")
+        base = base_candidates[0]
+        seed_path = project_dir / "structures" / "seeds" / "base_structures.xyz"
+        seed_path.parent.mkdir(parents=True)
+        select_module.ase_write(str(seed_path), base, format="extxyz")
+        return stage, lineage, base
 
     def test_prepare_requires_generated_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -259,6 +301,133 @@ class SelectStageTests(unittest.TestCase):
                     seed_indices=[0, 1],
                     elastic_indices=[2],
                 )
+
+    @pytest.mark.xfail(strict=True, reason=P0_9_XFAIL_REASON)
+    def test_seed_loader_selects_exact_base_across_descendant_orderings(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            stage, lineage, base = self.load_seed_lineage(Path(tmp))
+            base_fingerprint = self.physical_fingerprint(base)
+
+            for ordered_lineage in permutations(lineage):
+                candidates = list(ordered_lineage)
+                seed_indices = stage._load_seed_indices(candidates)
+
+                self.assertEqual(len(seed_indices), 1)
+                self.assertEqual(
+                    self.physical_fingerprint(candidates[seed_indices[0]]),
+                    base_fingerprint,
+                )
+
+    @pytest.mark.xfail(strict=True, reason=P0_9_XFAIL_REASON)
+    def test_composition_aware_selection_preserves_exact_seed_anchor(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            stage, candidates, base = self.load_seed_lineage(Path(tmp))
+            composition_candidates = [
+                make_atoms("SiGe", x=3.0),
+                make_atoms("SiAl", x=4.0),
+            ]
+            for offset, atoms in enumerate(composition_candidates):
+                atoms.info["seed_id"] = f"seed_extra_{offset}"
+            candidates.extend(composition_candidates)
+            settings = {
+                "target_train": 2,
+                "composition_aware_fps": True,
+                "composition_aware_fps_frontier_fraction": 0.1,
+                "composition_aware_fps_ternary_weight": 1.0,
+                "composition_aware_fps_adaptive_retries": 1,
+                "composition_aware_fps_descriptor_floor_fraction": 0.0,
+                "mean_descriptor": True,
+                "tolerance": 1,
+                "max_iterations": 4,
+            }
+            descriptors = np.array([[0.0], [1.0], [0.01], [5.0], [6.0]])
+            structures = [StructureStub() for _ in candidates]
+            seed_indices = stage._load_seed_indices(candidates)
+
+            train_indices, _ = stage._select_training_set(
+                descriptors,
+                structures,
+                settings,
+                ase_structures=candidates,
+                seed_indices=seed_indices,
+            )
+
+            self.assertIn(
+                self.physical_fingerprint(base),
+                [self.physical_fingerprint(candidates[index]) for index in train_indices],
+            )
+
+    @pytest.mark.xfail(strict=True, reason=P0_9_XFAIL_REASON)
+    def test_plain_fps_selection_preserves_exact_seed_anchor(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            stage, candidates, base = self.load_seed_lineage(Path(tmp))
+            settings = {
+                "target_train": 2,
+                "composition_aware_fps": False,
+                "mean_descriptor": True,
+                "tolerance": 1,
+                "max_iterations": 4,
+            }
+            descriptors = np.array([[0.0], [1.0], [2.0]])
+            structures = [StructureStub() for _ in candidates]
+            seed_indices = stage._load_seed_indices(candidates)
+
+            with patch.object(stage, "_fps_target_count", return_value=([1], 0.25)):
+                train_indices, _ = stage._select_training_set(
+                    descriptors,
+                    structures,
+                    settings,
+                    seed_indices=seed_indices,
+                )
+
+            self.assertIn(
+                self.physical_fingerprint(base),
+                [self.physical_fingerprint(candidates[index]) for index in train_indices],
+            )
+
+    @pytest.mark.xfail(strict=True, reason=P0_9_XFAIL_REASON)
+    def test_duplicate_anchor_categories_deduplicate_exact_seed_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            stage, candidates, base = self.load_seed_lineage(Path(tmp))
+            settings = {
+                "target_train": 2,
+                "composition_aware_fps": False,
+                "mean_descriptor": True,
+                "tolerance": 1,
+                "max_iterations": 4,
+            }
+            descriptors = np.array([[0.0], [1.0], [2.0]])
+            structures = [StructureStub() for _ in candidates]
+            seed_indices = stage._load_seed_indices(candidates)
+
+            with patch.object(stage, "_fps_target_count", return_value=([1], 0.25)):
+                train_indices, _ = stage._select_training_set(
+                    descriptors,
+                    structures,
+                    settings,
+                    seed_indices=seed_indices,
+                    single_element_elastic_indices=seed_indices,
+                    elastic_indices=seed_indices,
+                )
+
+            self.assertEqual(len(train_indices), 2)
+            self.assertEqual(
+                sum(
+                    self.physical_fingerprint(candidates[index])
+                    == self.physical_fingerprint(base)
+                    for index in train_indices
+                ),
+                1,
+            )
+
+    @pytest.mark.xfail(strict=True, reason=P0_9_XFAIL_REASON)
+    def test_unresolved_seed_anchor_fails_without_descendant_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            stage, lineage, _ = self.load_seed_lineage(Path(tmp))
+            descendants = lineage[1:]
+
+            with self.assertRaises(ValueError):
+                stage._load_seed_indices(descendants)
 
     def test_selection_helpers_use_real_numpy_distances(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
