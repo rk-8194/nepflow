@@ -10,10 +10,18 @@ pytest.importorskip("ase")
 pytest.importorskip("pymatgen")
 from ase import Atoms  # noqa: E402
 
+from common.structure_identity import hash_structure  # noqa: E402
 from modules.generate import generate as generate_module
 
 
 GenerateStage = generate_module.GenerateStage
+P0_11_XFAIL_REASON = (
+    "Phase 1 blocker P0-11: Materials Project composition provenance must preserve "
+    "realised source composition"
+)
+DEDUP_CONTRACT_XFAIL_REASON = (
+    "Structure Generation PDD: exact physical duplicates must be merged before selection"
+)
 
 
 def write_project_config(
@@ -279,6 +287,81 @@ class GenerateStageTests(unittest.TestCase):
             self.assertTrue(any("MaterialsProject" in message for message in logged_messages))
             self.assertTrue(any("WC" in message and "mp-1894" in message for message in logged_messages))
             self.assertTrue(any("W" in message and "mp-91" in message and "bcc" in message for message in logged_messages))
+
+    @pytest.mark.xfail(strict=True, reason=P0_11_XFAIL_REASON)
+    def test_materials_project_preserves_requested_and_realised_compositions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_dir = Path(tmp)
+            source_atoms = make_atoms("Si3Ge")
+            source_atoms.info.update(
+                {
+                    "material_id": "mp-1234",
+                    "formula": "Si3Ge",
+                    "source": "mp-Si3Ge",
+                }
+            )
+            fetcher = Mock()
+            fetcher.fetch_compounds.return_value = [source_atoms]
+            generator = generate_module.MaterialsProjectGenerator(
+                fetcher,
+                max_per_composition=5,
+            )
+            requested = {"Si": 0.5, "Ge": 0.5}
+            expected_realised = {"Si": 0.75, "Ge": 0.25}
+
+            result = generator.generate(requested, ["fcc"], target_n_atoms=8)
+
+            fetcher.fetch_compounds.assert_called_once_with(
+                ["Si", "Ge"],
+                max_per_query=5,
+                use_cache=True,
+            )
+            self.assertEqual(len(result), 1)
+            candidate = result[0]
+            self.assertEqual(candidate.info["composition"], requested)
+            self.assertEqual(candidate.info["actual_composition"], expected_realised)
+            self.assertNotEqual(candidate.info["composition"], candidate.info["actual_composition"])
+            self.assertEqual(candidate.info["material_id"], "mp-1234")
+            self.assertEqual(candidate.info["source"], "mp-Si3Ge")
+
+    def test_physical_duplicate_identity_ignores_generation_metadata(self) -> None:
+        first = make_atoms("Si2")
+        second = first.copy()
+        first.info["source"] = "random-solid-solution"
+        second.info["source"] = "materials-project"
+
+        self.assertEqual(hash_structure(first), hash_structure(second))
+
+    @pytest.mark.xfail(strict=True, reason=DEDUP_CONTRACT_XFAIL_REASON)
+    def test_prepare_merges_exact_duplicates_and_retains_origin_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_dir = Path(tmp)
+            write_project_config(project_dir)
+            stage = self.create_stage(project_dir)
+            config, settings = stage.load_config()
+            first = make_atoms("Si2")
+            second = first.copy()
+            first.info["source"] = "path-a"
+            second.info["source"] = "path-b"
+            generator = Mock()
+            generator.generate.return_value = [first, second]
+
+            with patch.object(stage, "_build_compositions", return_value=[{"Si": 1.0}]):
+                with patch.object(
+                    stage,
+                    "_build_generators",
+                    return_value=[("RandomSolidSolution", generator)],
+                ):
+                    bases = stage.prepare(config, settings)
+
+            self.assertIsNotNone(bases)
+            assert bases is not None
+            self.assertEqual(len(bases), 1)
+            self.assertEqual(len({hash_structure(base) for base in bases}), 1)
+            self.assertCountEqual(
+                bases[0].info["provenance_paths"],
+                ["path-a", "path-b"],
+            )
 
 
 if __name__ == "__main__":
