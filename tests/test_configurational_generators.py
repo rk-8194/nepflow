@@ -64,6 +64,21 @@ class ConfigurationalGeneratorTests(unittest.TestCase):
             [atoms.get_chemical_symbols() for atoms in second],
         )
 
+    def test_random_solution_different_seeds_change_assignment(self) -> None:
+        first = configurational_module.RandomSolidSolutionGenerator(
+            n_structures=1,
+            random_seed=7,
+        ).generate(self.composition, ["bcc"], target_n_atoms=16)
+        second = configurational_module.RandomSolidSolutionGenerator(
+            n_structures=1,
+            random_seed=8,
+        ).generate(self.composition, ["bcc"], target_n_atoms=16)
+
+        self.assertNotEqual(
+            first[0].get_chemical_symbols(),
+            second[0].get_chemical_symbols(),
+        )
+
     @pytest.mark.xfail(strict=True, reason=P0_12_XFAIL_REASON)
     def test_segregated_quota_is_per_crystal_and_deterministic(self) -> None:
         first = configurational_module.SegregatedGenerator(
