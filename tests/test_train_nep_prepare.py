@@ -421,7 +421,10 @@ class TrainNepMetadataTests(unittest.TestCase):
         dataset_path = project_dir / "nep" / "datasets" / "dataset_0001"
         dataset_path.mkdir(parents=True, exist_ok=True)
         config = ConfigParser()
-        config["train_nep"] = {"train_virial": "false"}
+        config["train_nep"] = {
+            "train_virial": "false",
+            "allow_partial_dataset": "true",
+        }
         config["slurm"] = {"enabled": "false"}
         stage = train_stage_module.TrainNepStage(
             project_name="demo",
@@ -450,10 +453,6 @@ class TrainNepMetadataTests(unittest.TestCase):
 
         return json.loads((dataset_path / ".dataset").read_text(encoding="utf-8"))
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="Phase 2 blocker P0-7: dataset metadata must describe accepted records, not selected counts",
-    )
     def test_metadata_counts_match_actual_accepted_records(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             metadata = self.run_stage_with_extraction_counts(
@@ -464,10 +463,6 @@ class TrainNepMetadataTests(unittest.TestCase):
         self.assertEqual(metadata["test_structures"], 1)
         self.assertEqual(metadata["total_structures"], 2)
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="Phase 2 blocker P0-7: dataset exclusions must be observable with machine-readable reasons",
-    )
     def test_metadata_exposes_exclusion_reasons(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             metadata = self.run_stage_with_extraction_counts(
@@ -479,6 +474,108 @@ class TrainNepMetadataTests(unittest.TestCase):
         self.assertIn("rejected_train_structures", metadata)
         self.assertIn("exclusion_reasons", metadata)
         self.assertTrue(metadata["exclusion_reasons"])
+
+    @staticmethod
+    def accepted_result(structure_id: str, energy: float, source_hash: str):
+        return train_prepare.VaspParseResult(
+            structure_id=structure_id,
+            calculation_identity=(
+                ("incar_hash", "incar-1"),
+                ("potcar_hash", "potcar-1"),
+                ("structure_hash", structure_id),
+            ),
+            source_outcar=f"/tmp/{structure_id}/OUTCAR",
+            source_outcar_hash=source_hash,
+            status="accepted",
+            rejection_reason=None,
+            energy_ev=energy,
+            forces_ev_per_angstrom=np.array([[0.1, 0.0, 0.0]]),
+            virial_ev=np.eye(3),
+            positions_angstrom=np.array([[0.0, 0.0, 0.0]]),
+            lattice_angstrom=np.eye(3),
+            species=("Si",),
+            pbc=(True, True, True),
+        )
+
+    def test_dataset_id_changes_when_accepted_content_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_dir = self.make_project(Path(tmp))
+            stage = train_stage_module.TrainNepStage(
+                project_name="demo",
+                config_file=project_dir / "config" / "demo.ini",
+                state_file=project_dir / "state.db",
+                project_dir=project_dir,
+                debug=False,
+            )
+            base_report = {
+                "requested_count": 1,
+                "accepted_count": 1,
+                "rejected_count": 0,
+                "rejected_reason_counts": {},
+                "accepted_results": [self.accepted_result("calc-1", -1.0, "hash-1")],
+            }
+            metadata_a = stage._build_dataset_metadata(
+                project_dir / "nep" / "datasets" / "dataset_0001",
+                base_report,
+                {"requested_count": 0, "accepted_count": 0, "rejected_count": 0, "rejected_reason_counts": {}, "accepted_results": []},
+                train_virial=True,
+                allow_partial=False,
+            )
+            changed_report = {**base_report, "accepted_results": [self.accepted_result("calc-1", -2.0, "hash-1")]}
+            metadata_b = stage._build_dataset_metadata(
+                project_dir / "nep" / "datasets" / "dataset_0001",
+                changed_report,
+                {"requested_count": 0, "accepted_count": 0, "rejected_count": 0, "rejected_reason_counts": {}, "accepted_results": []},
+                train_virial=True,
+                allow_partial=False,
+            )
+
+        self.assertNotEqual(metadata_a["dataset_id"], metadata_b["dataset_id"])
+
+    def test_metadata_preserves_ordered_identity_hash_and_virial_convention(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_dir = self.make_project(Path(tmp))
+            stage = train_stage_module.TrainNepStage(
+                project_name="demo",
+                config_file=project_dir / "config" / "demo.ini",
+                state_file=project_dir / "state.db",
+                project_dir=project_dir,
+                debug=False,
+            )
+            train_report = {
+                "requested_count": 2,
+                "accepted_count": 2,
+                "rejected_count": 0,
+                "rejected_reason_counts": {},
+                "accepted_results": [
+                    self.accepted_result("calc-1", -1.0, "hash-1"),
+                    self.accepted_result("calc-2", -2.0, "hash-2"),
+                ],
+            }
+            empty_report = {
+                "requested_count": 0,
+                "accepted_count": 0,
+                "rejected_count": 0,
+                "rejected_reason_counts": {},
+                "accepted_results": [],
+            }
+            metadata = stage._build_dataset_metadata(
+                project_dir / "nep" / "datasets" / "dataset_0001",
+                train_report,
+                empty_report,
+                train_virial=True,
+                allow_partial=False,
+            )
+
+        self.assertEqual(
+            [entry["structure_id"] for entry in metadata["accepted_calculation_identities"]],
+            ["calc-1", "calc-2"],
+        )
+        self.assertEqual(metadata["source_output_hashes"], ["hash-1", "hash-2"])
+        self.assertTrue(metadata["virial_required"])
+        self.assertTrue(metadata["virial_included"])
+        self.assertEqual(metadata["units"]["virial"], "eV")
+        self.assertEqual(metadata["virial_convention"], "positive_compression")
 
 
 if __name__ == "__main__":

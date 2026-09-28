@@ -446,6 +446,10 @@ lambda_shear=1.0
 # Include virial tensor in training data (requires VASP STRESS calculation)
 train_virial=false
 
+# Permit an explicitly partial dataset; false fails creation when any selected
+# structure is rejected during DFT extraction.
+allow_partial_dataset=false
+
 # Maximum number of resubmission attempts if training job fails
 max_resubmit=3
 

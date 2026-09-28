@@ -96,6 +96,7 @@ def prepare_dataset(
     project_dir: Path,
     train_virial: bool = False,
     debug: bool = False,
+    extraction_report: dict | None = None,
 ) -> int:
     """Parse OUTCAR files and write XYZ dataset in streaming mode.
     
@@ -115,6 +116,16 @@ def prepare_dataset(
     dataset_type = "train" if is_train else "test"
     logger.info(f"Processing {len(ase_structures)} {dataset_type} structures")
 
+    report = extraction_report if extraction_report is not None else {}
+    report.clear()
+    report.update(
+        {
+            "requested_count": len(ase_structures),
+            "accepted_results": [],
+            "rejected_reason_counts": {},
+        }
+    )
+
     # Create generator for parsing (doesn't load all into memory)
     structure_generator = _parse_structures(
         ase_structures,
@@ -122,6 +133,7 @@ def prepare_dataset(
         project_dir=project_dir,
         require_virial=train_virial,
         debug=debug,
+        extraction_report=report,
     )
 
     # Wrap generator with progress bar if tqdm available
@@ -136,6 +148,9 @@ def prepare_dataset(
     # Write XYZ file, streaming structures one at a time
     count = _write_xyz_file(dataset_path, structure_generator, include_virial=train_virial)
 
+    report["accepted_count"] = count
+    report["rejected_count"] = report["requested_count"] - count
+
     logger.info(f"Wrote {count}/{len(ase_structures)} {dataset_type} structures to {dataset_path.name}")
 
     return count
@@ -147,6 +162,7 @@ def _parse_structures(
     project_dir: Path,
     require_virial: bool = False,
     debug: bool = False,
+    extraction_report: dict | None = None,
 ) -> Generator[dict, None, None]:
     """Generator: parse structures from ASE Atoms objects and find corresponding OUTCAR files.
     
@@ -160,6 +176,8 @@ def _parse_structures(
         logger.warning(f"VASP jobs path not found: {vasp_jobs_path}")
         if not debug:
             logger.info("Cannot find OUTCAR files. Skipping this dataset.")
+            for _ in ase_structures:
+                _record_rejection(extraction_report, "vasp_jobs_path_missing")
             return
         # In debug mode, yield synthetic data
         for struct_idx, atoms in enumerate(ase_structures):
@@ -169,6 +187,8 @@ def _parse_structures(
 
     if input_context is None:
         logger.warning("Cannot build VASP input hashes. Skipping this dataset.")
+        for _ in ase_structures:
+            _record_rejection(extraction_report, "vasp_input_context_missing")
         return
 
     for struct_idx, atoms in enumerate(ase_structures):
@@ -183,10 +203,15 @@ def _parse_structures(
             )
         except Exception as e:
             logger.warning(f"[{dataset_type}] Skipping struct_{struct_idx:04d}: {e}")
+            _record_rejection(
+                extraction_report,
+                f"identity_resolution_failed:{type(e).__name__}",
+            )
             continue
 
         if outcar_path is None:
             logger.warning(f"[{dataset_type}] Skipping struct_{struct_idx:04d}: no completed OUTCAR found")
+            _record_rejection(extraction_report, "completed_outcar_missing")
             continue
 
         try:
@@ -199,8 +224,10 @@ def _parse_structures(
                 calculation_identity=identity,
             )
             if result.accepted:
+                _record_acceptance(extraction_report, result)
                 yield result.as_structure_dict()
             else:
+                _record_rejection(extraction_report, result.rejection_reason or "record_rejected")
                 logger.warning(
                     "[%s] Rejecting struct_%04d: %s",
                     dataset_type,
@@ -209,6 +236,20 @@ def _parse_structures(
                 )
         except Exception as e:
             logger.warning(f"[{dataset_type}] Skipping struct_{struct_idx:04d}: {e}")
+            _record_rejection(extraction_report, f"extraction_failed:{type(e).__name__}")
+
+
+def _record_acceptance(report: dict | None, result: VaspParseResult) -> None:
+    """Record an accepted immutable parse result for manifest finalization."""
+    if report is not None:
+        report.setdefault("accepted_results", []).append(result)
+
+
+def _record_rejection(report: dict | None, reason: str) -> None:
+    """Record one machine-readable extraction rejection."""
+    if report is not None:
+        reasons = report.setdefault("rejected_reason_counts", {})
+        reasons[reason] = reasons.get(reason, 0) + 1
 
 
 def _build_vasp_input_context(project_dir: Path) -> dict | None:

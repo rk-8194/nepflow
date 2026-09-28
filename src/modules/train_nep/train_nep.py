@@ -109,15 +109,13 @@ class TrainNepStage(Stage):
         dataset_path = self._get_or_create_dataset_folder()
         logger.info(f"Using dataset folder: {dataset_path}")
 
-        # Write dataset metadata
-        self._write_dataset_metadata(
-            dataset_path,
-            len(train_structures),
-            len(test_structures),
-        )
-
         # Extract config options
         train_virial = config.getboolean("train_nep", "train_virial", fallback=False)
+        allow_partial = config.getboolean(
+            "train_nep", "allow_partial_dataset", fallback=False
+        )
+        train_report: dict = {}
+        test_report: dict = {}
 
         # Step 3: Prepare datasets (parse OUTCAR and write XYZ files)
         logger.info("Step 3: Parsing OUTCAR files and writing XYZ datasets. Training virials: %s", train_virial)
@@ -128,6 +126,7 @@ class TrainNepStage(Stage):
             project_dir=self.project_dir,
             train_virial=train_virial,
             debug=self.debug,
+            extraction_report=train_report,
         )
         test_count = prepare_dataset(
             dataset_path=dataset_path / "test.xyz",
@@ -136,11 +135,29 @@ class TrainNepStage(Stage):
             project_dir=self.project_dir,
             train_virial=train_virial,
             debug=self.debug,
+            extraction_report=test_report,
         )
 
+        self._complete_extraction_report(train_report, len(train_structures), train_count)
+        self._complete_extraction_report(test_report, len(test_structures), test_count)
+        rejected_total = train_report["rejected_count"] + test_report["rejected_count"]
+        if rejected_total and not allow_partial:
+            raise RuntimeError(
+                "Dataset creation rejected selected structures; "
+                "set train_nep.allow_partial_dataset=true to allow explicit partial data"
+            )
+
         if train_count == 0 or test_count == 0:
-            logger.error("No valid structures found. Cannot proceed.")
-            return
+            raise RuntimeError("No valid structures found; cannot create a training dataset")
+
+        metadata = self._build_dataset_metadata(
+            dataset_path,
+            train_report,
+            test_report,
+            train_virial=train_virial,
+            allow_partial=allow_partial,
+        )
+        self._write_dataset_metadata(dataset_path, metadata)
 
         logger.info(f"Successfully processed {train_count} train and {test_count} test structures")
 
@@ -481,24 +498,129 @@ lambda_shear 1
 
         return dataset_path
 
-    def _write_dataset_metadata(
+    @staticmethod
+    def _complete_extraction_report(report: dict, requested_count: int, accepted_count: int) -> None:
+        """Normalize reports from the parser, including test doubles."""
+        report.setdefault("requested_count", requested_count)
+        report.setdefault("accepted_results", [])
+        report.setdefault("rejected_reason_counts", {})
+        report["requested_count"] = requested_count
+        report["accepted_count"] = accepted_count
+        report["rejected_count"] = requested_count - accepted_count
+        accounted_for = sum(report["rejected_reason_counts"].values())
+        missing_rejections = report["rejected_count"] - accounted_for
+        if missing_rejections > 0:
+            report["rejected_reason_counts"]["record_rejected"] = (
+                report["rejected_reason_counts"].get("record_rejected", 0)
+                + missing_rejections
+            )
+
+    def _build_dataset_metadata(
         self,
         dataset_path: Path,
-        train_count: int,
-        test_count: int,
-    ) -> None:
-        """Write .dataset metadata file."""
-        metadata = {
-            "dataset_id": dataset_path.name,
-            "created": datetime.now().isoformat(),
-            "train_structures": train_count,
-            "test_structures": test_count,
-            "total_structures": train_count + test_count,
+        train_report: dict,
+        test_report: dict,
+        *,
+        train_virial: bool,
+        allow_partial: bool,
+    ) -> dict:
+        """Build manifest data from accepted parse results and extraction outcomes."""
+        accepted_records = []
+        accepted_identities = []
+        source_output_hashes = []
+        for split, report in (("train", train_report), ("test", test_report)):
+            for result in report.get("accepted_results", []):
+                content_record = {
+                    "split": split,
+                    "structure_id": result.structure_id,
+                    "calculation_identity": dict(result.calculation_identity),
+                    "source_outcar": result.source_outcar,
+                    "source_outcar_hash": result.source_outcar_hash,
+                    "energy": result.energy_ev,
+                    "forces": result.forces_ev_per_angstrom.tolist(),
+                    "virial": result.virial_ev.tolist() if result.virial_ev is not None else None,
+                    "positions": result.positions_angstrom.tolist(),
+                    "lattice": result.lattice_angstrom.tolist(),
+                    "species": list(result.species),
+                    "pbc": list(result.pbc),
+                }
+                accepted_records.append(content_record)
+                accepted_identities.append(
+                    {
+                        "split": split,
+                        "structure_id": result.structure_id,
+                        "calculation_identity": dict(result.calculation_identity),
+                        "source_outcar": result.source_outcar,
+                        "source_outcar_hash": result.source_outcar_hash,
+                    }
+                )
+                if result.source_outcar_hash:
+                    source_output_hashes.append(result.source_outcar_hash)
+
+        # Test doubles and debug-only synthetic records have no DFT parse result;
+        # retain a deterministic count-based fallback without affecting production identity.
+        if not accepted_records:
+            accepted_records = [
+                {"split": "train", "ordinal": index}
+                for index in range(train_report["accepted_count"])
+            ] + [
+                {"split": "test", "ordinal": index}
+                for index in range(test_report["accepted_count"])
+            ]
+
+        content_bytes = json.dumps(
+            accepted_records,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+        dataset_id = f"dataset_{hashlib.sha256(content_bytes).hexdigest()}"
+
+        train_reasons = dict(train_report["rejected_reason_counts"])
+        test_reasons = dict(test_report["rejected_reason_counts"])
+        rejection_reasons = {}
+        for reason, count in (*train_reasons.items(), *test_reasons.items()):
+            rejection_reasons[reason] = rejection_reasons.get(reason, 0) + count
+
+        created = datetime.now().isoformat()
+        return {
+            "dataset_id": dataset_id,
+            "created": created,
+            "creation_timestamp": created,
+            "dataset_folder": dataset_path.name,
+            "requested_train_structures": train_report["requested_count"],
+            "requested_test_structures": test_report["requested_count"],
+            "accepted_train_structures": train_report["accepted_count"],
+            "accepted_test_structures": test_report["accepted_count"],
+            "rejected_train_structures": train_report["rejected_count"],
+            "rejected_test_structures": test_report["rejected_count"],
+            "train_structures": train_report["accepted_count"],
+            "test_structures": test_report["accepted_count"],
+            "total_structures": train_report["accepted_count"] + test_report["accepted_count"],
+            "rejection_reason_counts": rejection_reasons,
+            "exclusion_reasons": rejection_reasons,
+            "train_rejection_reason_counts": train_reasons,
+            "test_rejection_reason_counts": test_reasons,
+            "accepted_calculation_identities": accepted_identities,
+            "source_output_hashes": source_output_hashes,
+            "virial_required": train_virial,
+            "virial_included": train_virial,
+            "units": {
+                "energy": "eV",
+                "forces": "eV/Angstrom",
+                "virial": "eV",
+            },
+            "virial_convention": "positive_compression",
+            "virial_tensor_convention": "cartesian_3x3",
+            "partial_dataset_allowed": allow_partial,
         }
 
+    @staticmethod
+    def _write_dataset_metadata(dataset_path: Path, metadata: dict) -> None:
+        """Write the finalized content-derived .dataset manifest."""
         metadata_path = dataset_path / ".dataset"
         metadata_path.write_text(json.dumps(metadata, indent=2))
-        logger.debug(f"Wrote metadata to {metadata_path}")
+        logger.debug("Wrote metadata to %s", metadata_path)
 
     @staticmethod
     def _generate_params_hash(
