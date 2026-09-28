@@ -155,7 +155,7 @@ def test_missing_runtime_project_dir_is_explicit_error_not_guessed_fallback() ->
         struct_dir.mkdir(parents=True)
         config = initialized_default_config(root)
 
-        with pytest.raises((TypeError, ValueError), match="project_dir|runtime"):
+        with pytest.raises(ValueError, match="project_dir|runtime"):
             launcher_module._generate_slurm_script(
                 struct_dir,
                 "gpumd_val_struct_0000",
