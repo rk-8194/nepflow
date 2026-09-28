@@ -183,6 +183,30 @@ def outcar_is_complete(outcar_path: Path) -> bool:
         return False
 
 
+def parse_virial_from_outcar(outcar_path: Path, volume: float) -> np.ndarray | None:
+    """Parse VASP stress and convert it to the NEPFlow virial convention.
+
+    VASP reports stress in kB.  NEPFlow stores virial in eV with positive
+    compression, hence ``virial = -stress * volume / 1602.17663``.
+    """
+    try:
+        outcar_text = outcar_path.read_text(encoding="utf-8", errors="replace")
+        stress_pattern = (
+            r"STRESS\s+in cartesian coordinates \(kB\)\n"
+            r"\s+([-+.\d]+)\s+([-+.\d]+)\s+([-+.\d]+)\n"
+            r"\s+([-+.\d]+)\s+([-+.\d]+)\s+([-+.\d]+)\n"
+            r"\s+([-+.\d]+)\s+([-+.\d]+)\s+([-+.\d]+)"
+        )
+        matches = list(re.finditer(stress_pattern, outcar_text))
+        if not matches:
+            return None
+        values = [float(matches[-1].group(index)) for index in range(1, 10)]
+        stress = np.asarray(values, dtype=float).reshape(3, 3)
+        return -stress * float(volume) / 1602.17663
+    except (OSError, TypeError, ValueError):
+        return None
+
+
 # ==================================================================
 # HPC-aware retry level generation
 # ==================================================================

@@ -2,6 +2,7 @@
 
 import json
 from configparser import ConfigParser
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Generator, List
 
@@ -13,16 +14,79 @@ import numpy as np
 from ..run_vasp._common import (
     get_nepflow_root,
     get_registry_entry,
+    file_sha256,
     hash_incar_text,
     hash_potcar_bytes,
     hash_structure,
     outcar_is_complete,
+    parse_virial_from_outcar,
     read_completed_registry,
     read_status,
 )
 from ..run_vasp.prepare import inject_incar_defaults
 
-from ._common import HAS_TQDM, logger, parse_virial_from_outcar, tqdm, validate_structure
+from ._common import HAS_TQDM, StructureValidationError, logger, tqdm, validate_structure
+
+
+@dataclass(frozen=True)
+class VaspParseResult:
+    """Immutable, authoritative result of parsing one VASP OUTCAR."""
+
+    structure_id: str
+    calculation_identity: tuple[tuple[str, str], ...]
+    source_outcar: str
+    source_outcar_hash: str | None
+    status: str
+    rejection_reason: str | None
+    energy_ev: float | None
+    forces_ev_per_angstrom: np.ndarray | None
+    virial_ev: np.ndarray | None
+    positions_angstrom: np.ndarray | None
+    lattice_angstrom: np.ndarray | None
+    species: tuple[str, ...]
+    pbc: tuple[bool, ...]
+    energy_unit: str = "eV"
+    force_unit: str = "eV/Angstrom"
+    virial_unit: str = "eV"
+    virial_convention: str = "positive_compression"
+
+    def __post_init__(self) -> None:
+        for field_name in (
+            "forces_ev_per_angstrom",
+            "virial_ev",
+            "positions_angstrom",
+            "lattice_angstrom",
+        ):
+            value = getattr(self, field_name)
+            if value is not None:
+                immutable = np.array(value, dtype=float, copy=True)
+                immutable.setflags(write=False)
+                object.__setattr__(self, field_name, immutable)
+
+    @property
+    def accepted(self) -> bool:
+        return self.status == "accepted"
+
+    def as_structure_dict(self) -> dict:
+        if not self.accepted:
+            raise ValueError(self.rejection_reason or "rejected_parse_result")
+        return {
+            "energy": self.energy_ev,
+            "forces": self.forces_ev_per_angstrom,
+            "positions": self.positions_angstrom,
+            "lattice": self.lattice_angstrom,
+            "species": list(self.species),
+            "pbc": list(self.pbc),
+            "virial": self.virial_ev,
+            "structure_id": self.structure_id,
+            "calculation_identity": dict(self.calculation_identity),
+            "source_outcar": self.source_outcar,
+            "source_outcar_hash": self.source_outcar_hash,
+            "energy_unit": self.energy_unit,
+            "force_unit": self.force_unit,
+            "virial_unit": self.virial_unit,
+            "virial_convention": self.virial_convention,
+        }
 
 
 def prepare_dataset(
@@ -53,7 +117,11 @@ def prepare_dataset(
 
     # Create generator for parsing (doesn't load all into memory)
     structure_generator = _parse_structures(
-        ase_structures, is_train=is_train, project_dir=project_dir, debug=debug
+        ase_structures,
+        is_train=is_train,
+        project_dir=project_dir,
+        require_virial=train_virial,
+        debug=debug,
     )
 
     # Wrap generator with progress bar if tqdm available
@@ -77,6 +145,7 @@ def _parse_structures(
     ase_structures: List[Atoms],
     is_train: bool,
     project_dir: Path,
+    require_virial: bool = False,
     debug: bool = False,
 ) -> Generator[dict, None, None]:
     """Generator: parse structures from ASE Atoms objects and find corresponding OUTCAR files.
@@ -122,11 +191,22 @@ def _parse_structures(
 
         try:
             logger.debug(f"[{dataset_type}] Parsing struct_{struct_idx:04d}")
-            result = _parse_outcar(outcar_path, atoms)
-            if result:
-                yield result
+            identity = _identity_for_structure(atoms, input_context)
+            result = _parse_outcar_result(
+                outcar_path,
+                atoms,
+                require_virial=require_virial,
+                calculation_identity=identity,
+            )
+            if result.accepted:
+                yield result.as_structure_dict()
             else:
-                logger.warning(f"[{dataset_type}] Skipping struct_{struct_idx:04d}: parse failed")
+                logger.warning(
+                    "[%s] Rejecting struct_%04d: %s",
+                    dataset_type,
+                    struct_idx,
+                    result.rejection_reason,
+                )
         except Exception as e:
             logger.warning(f"[{dataset_type}] Skipping struct_{struct_idx:04d}: {e}")
 
@@ -171,20 +251,10 @@ def _resolve_outcar_for_structure(
     input_context: dict,
 ) -> Path | None:
     """Resolve the completed OUTCAR for one selected structure by input hashes."""
-    structure_hash = hash_structure(atoms)
-    potcar_data = input_context["potcar_data"]
-    struct_elements = sorted(set(atoms.get_chemical_symbols()))
-    missing = [elem for elem in struct_elements if elem not in potcar_data]
-    if missing:
-        raise FileNotFoundError(f"missing POTCAR files for: {', '.join(missing)}")
-
-    potcar_hash = hash_potcar_bytes(b"".join(potcar_data[elem] for elem in struct_elements))
-    incar_hash = input_context["incar_hash"]
-    identity = {
-        "structure_hash": structure_hash,
-        "incar_hash": incar_hash,
-        "potcar_hash": potcar_hash,
-    }
+    identity = _identity_for_structure(atoms, input_context)
+    structure_hash = identity["structure_hash"]
+    incar_hash = identity["incar_hash"]
+    potcar_hash = identity["potcar_hash"]
 
     preferred = vasp_jobs_path / f"struct_{struct_idx:04d}"
     outcar = _outcar_from_local_job(preferred, identity)
@@ -213,6 +283,24 @@ def _resolve_outcar_for_structure(
             return outcar
 
     return None
+
+
+def _identity_for_structure(atoms: Atoms, input_context: dict) -> dict[str, str]:
+    """Build the exact VASP calculation identity for a selected structure."""
+    structure_hash = hash_structure(atoms)
+    potcar_data = input_context["potcar_data"]
+    struct_elements = sorted(set(atoms.get_chemical_symbols()))
+    missing = [elem for elem in struct_elements if elem not in potcar_data]
+    if missing:
+        raise FileNotFoundError(f"missing POTCAR files for: {', '.join(missing)}")
+    potcar_hash = hash_potcar_bytes(
+        b"".join(potcar_data[elem] for elem in struct_elements)
+    )
+    return {
+        "structure_hash": structure_hash,
+        "incar_hash": input_context["incar_hash"],
+        "potcar_hash": potcar_hash,
+    }
 
 
 def _outcar_from_local_job(struct_dir: Path, identity: dict) -> Path | None:
@@ -244,43 +332,124 @@ def _read_identity(struct_dir: Path) -> dict:
     return data if isinstance(data, dict) else {}
 
 
-def _parse_outcar(outcar_path: Path, ase_atoms: Atoms) -> dict | None:
-    """Parse OUTCAR file using ASE with fallback to manual parsing."""
+def _parse_outcar(
+    outcar_path: Path,
+    ase_atoms: Atoms,
+    require_virial: bool = False,
+    calculation_identity: dict[str, str] | None = None,
+) -> dict | None:
+    """Return legacy structure data only when the authoritative parse succeeds."""
+    result = _parse_outcar_result(
+        outcar_path,
+        ase_atoms,
+        require_virial=require_virial,
+        calculation_identity=calculation_identity,
+    )
+    if not result.accepted:
+        logger.warning("Rejected %s: %s", outcar_path, result.rejection_reason)
+        return None
+    return result.as_structure_dict()
+
+
+def _parse_outcar_result(
+    outcar_path: Path,
+    ase_atoms: Atoms,
+    require_virial: bool = False,
+    calculation_identity: dict[str, str] | None = None,
+) -> VaspParseResult:
+    """Parse one OUTCAR into an immutable accepted/rejected result."""
+    structure_id = hash_structure(ase_atoms)
+    identity = calculation_identity or {"structure_hash": structure_id}
+    identity_items = tuple(sorted((str(key), str(value)) for key, value in identity.items()))
+    source_outcar = str(outcar_path.resolve())
+    source_hash = file_sha256(outcar_path)
+
+    def rejected(reason: str) -> VaspParseResult:
+        return VaspParseResult(
+            structure_id=structure_id,
+            calculation_identity=identity_items,
+            source_outcar=source_outcar,
+            source_outcar_hash=source_hash,
+            status="rejected",
+            rejection_reason=reason,
+            energy_ev=None,
+            forces_ev_per_angstrom=None,
+            virial_ev=None,
+            positions_angstrom=None,
+            lattice_angstrom=None,
+            species=(),
+            pbc=(),
+        )
+
+    if calculation_identity is not None:
+        source_identity = _read_identity(outcar_path.parent)
+        if source_identity and any(
+            source_identity.get(key) != value for key, value in calculation_identity.items()
+        ):
+            return rejected("incompatible_calculation_identity")
+
     try:
-        # Try to read with ASE
         atoms = ase_read(str(outcar_path))
+    except Exception as exc:
+        return rejected(f"outcar_parse_failed:{type(exc).__name__}:{exc}")
 
-        result = {
-            "energy": atoms.get_potential_energy(),
-            "forces": atoms.get_forces(),
-            "positions": atoms.get_positions(),
-            "lattice": atoms.get_cell().array,
-            "species": atoms.get_chemical_symbols(),
-            "pbc": atoms.pbc.tolist(),
-            "virial": None,
-        }
+    expected_species = tuple(ase_atoms.get_chemical_symbols())
+    actual_species = tuple(atoms.get_chemical_symbols())
+    if len(atoms) != len(ase_atoms):
+        return rejected(f"atom_count_mismatch:expected={len(ase_atoms)}:actual={len(atoms)}")
+    if actual_species != expected_species:
+        return rejected(f"species_mismatch:expected={expected_species}:actual={actual_species}")
 
-        try:
-            # ASE stress: eV/Å^3, positive = tension
-            stress = atoms.get_stress(voigt=False)
+    try:
+        energy = float(atoms.get_potential_energy())
+    except Exception as exc:
+        return rejected(f"missing_energy:{type(exc).__name__}")
+    try:
+        forces = np.asarray(atoms.get_forces(), dtype=float)
+    except Exception as exc:
+        return rejected(f"missing_forces:{type(exc).__name__}")
 
-            # GPUMD virial: eV, positive = compression
-            result["virial"] = -stress * atoms.get_volume()
+    try:
+        positions = np.asarray(atoms.get_positions(), dtype=float)
+        lattice = np.asarray(atoms.get_cell().array, dtype=float)
+        pbc = atoms.pbc.tolist()
+        volume = float(atoms.get_volume())
+    except Exception as exc:
+        return rejected(f"invalid_structure_geometry:{type(exc).__name__}")
 
-        except Exception as e:
-            logger.debug(f"Could not extract virial from {outcar_path}: {e}")
+    virial = parse_virial_from_outcar(outcar_path, volume)
+    if require_virial and virial is None:
+        return rejected("missing_required_virial")
 
-        # Validate
-        if not validate_structure(result):
-            logger.warning(f"Validation failed for {outcar_path}")
-            return None
+    structure = {
+        "energy": energy,
+        "forces": forces,
+        "positions": positions,
+        "lattice": lattice,
+        "species": list(actual_species),
+        "pbc": pbc,
+        "virial": virial,
+    }
+    try:
+        validate_structure(structure)
+    except StructureValidationError as exc:
+        return rejected(f"invalid_dft_labels:{exc}")
 
-        return result
-
-    except Exception as e:
-        logger.warning(f"ASE failed to parse {outcar_path}: {e}. Trying fallback.")
-        # Fallback: use provided atoms if ASE fails
-        return _extract_from_atoms(ase_atoms)
+    return VaspParseResult(
+        structure_id=structure_id,
+        calculation_identity=identity_items,
+        source_outcar=source_outcar,
+        source_outcar_hash=source_hash,
+        status="accepted",
+        rejection_reason=None,
+        energy_ev=energy,
+        forces_ev_per_angstrom=forces,
+        virial_ev=virial,
+        positions_angstrom=positions,
+        lattice_angstrom=lattice,
+        species=actual_species,
+        pbc=tuple(bool(value) for value in pbc),
+    )
 
 
 def _extract_from_atoms(atoms: Atoms) -> dict:

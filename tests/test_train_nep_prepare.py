@@ -142,10 +142,6 @@ class TrainNepPrepareRegistryTests(unittest.TestCase):
 
             self.assertEqual(parsed, [])
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="Phase 2 blocker P0-6: parser failure must reject instead of using selected atoms",
-    )
     def test_rejects_unparsable_outcar_instead_of_falling_back(self) -> None:
         outcar = FIXTURES / "outcar" / "completed_without_stress"
         with patch.object(train_prepare, "ase_read", side_effect=RuntimeError("bad OUTCAR")):
@@ -153,10 +149,6 @@ class TrainNepPrepareRegistryTests(unittest.TestCase):
 
         self.assertIsNone(result)
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="Phase 2 blocker P0-6: missing energy must reject instead of emitting -1.0",
-    )
     def test_rejects_missing_energy(self) -> None:
         outcar = FIXTURES / "outcar" / "valid_outcar"
         parsed_atoms = self.fixture_atoms(energy_available=False)
@@ -166,10 +158,6 @@ class TrainNepPrepareRegistryTests(unittest.TestCase):
 
         self.assertIsNone(result)
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="Phase 2 blocker P0-6: missing forces must reject instead of emitting zeros",
-    )
     def test_rejects_missing_forces(self) -> None:
         outcar = FIXTURES / "outcar" / "valid_outcar"
         parsed_atoms = self.fixture_atoms(forces_available=False)
@@ -178,10 +166,6 @@ class TrainNepPrepareRegistryTests(unittest.TestCase):
 
         self.assertIsNone(result)
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="Phase 2 blocker P0-6: atom-count mismatch must reject the DFT record",
-    )
     def test_rejects_atom_count_mismatch(self) -> None:
         outcar = FIXTURES / "outcar" / "valid_outcar"
         parsed_atoms = make_atoms("Si")
@@ -190,10 +174,6 @@ class TrainNepPrepareRegistryTests(unittest.TestCase):
 
         self.assertIsNone(result)
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="Phase 2 blocker P0-6: species mismatch must reject the DFT record",
-    )
     def test_rejects_species_mismatch(self) -> None:
         outcar = FIXTURES / "outcar" / "valid_outcar"
         parsed_atoms = make_atoms("Ge2")
@@ -202,10 +182,6 @@ class TrainNepPrepareRegistryTests(unittest.TestCase):
 
         self.assertIsNone(result)
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="Phase 2 blocker P0-6: required virial absence must reject the record",
-    )
     def test_rejects_missing_required_virial(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -233,9 +209,8 @@ class TrainNepPrepareRegistryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             project_dir = self.make_project(root)
-            # Keep a usable selected-structure calculator so the current fallback
-            # actually writes its fabricated label after OUTCAR parsing fails.
-            atoms = self.fixture_atoms(energy=-1.0)
+            # A parser failure must leave the production dataset empty.
+            atoms = self.fixture_atoms(has_calculator=False)
             struct_dir = self.write_identity_job(project_dir, "struct_0000", atoms)
             (struct_dir / "OUTCAR").write_text(
                 (FIXTURES / "outcar" / "valid_outcar").read_text(encoding="utf-8"),
@@ -255,20 +230,12 @@ class TrainNepPrepareRegistryTests(unittest.TestCase):
 
         return count, rendered
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="Phase 2 blocker P0-6: production dataset path must reject parser failure instead of emitting -1.0 energy",
-    )
     def test_production_dataset_path_rejects_placeholder_energy(self) -> None:
         count, rendered = self.prepare_dataset_after_ase_parse_failure()
 
         self.assertEqual(count, 0, "an unparsable OUTCAR must not produce an accepted dataset record")
         self.assertNotIn("energy=-1.0000000000", rendered)
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="Phase 2 blocker P0-6: production dataset path must reject parser failure instead of emitting zero-force labels",
-    )
     def test_production_dataset_path_rejects_placeholder_forces(self) -> None:
         count, rendered = self.prepare_dataset_after_ase_parse_failure()
 
