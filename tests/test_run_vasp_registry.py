@@ -76,6 +76,96 @@ class RunVaspRegistryTests(unittest.TestCase):
 
         self.assertEqual(common.hash_incar_text(original), common.hash_incar_text(rewritten))
 
+    def test_effective_incar_defaults_participate_in_identity(self) -> None:
+        template = "ENCUT = 520\n"
+        first_config = ConfigParser()
+        first_config["vasp"] = {"kspacing": "0.30", "kgamma": ".TRUE."}
+        second_config = ConfigParser()
+        second_config["vasp"] = {"kspacing": "0.35", "kgamma": ".TRUE."}
+
+        first_effective = prepare.inject_incar_defaults(template, first_config)
+        second_effective = prepare.inject_incar_defaults(template, second_config)
+
+        self.assertNotEqual(
+            common.hash_incar_text(first_effective),
+            common.hash_incar_text(second_effective),
+        )
+        self.assertNotEqual(
+            common.hash_incar_text(template),
+            common.hash_incar_text(first_effective),
+        )
+
+    def test_scheduler_and_resource_provenance_do_not_change_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            atoms = self.silicon_atoms()
+            incar = prepare.inject_incar_defaults(
+                "ENCUT = 520\nNCORE = 16\nKPAR = 1\n",
+                ConfigParser(),
+            )
+            identity = (
+                common.hash_incar_text(incar),
+                common.hash_potcar_bytes(b"Si-potcar-v1"),
+                common.hash_structure(atoms),
+            )
+
+            for index, attempt_provenance in enumerate(
+                (
+                    {"slurm_job_id": "1001", "nodes": 1, "gpus": 1, "walltime": "01:00:00"},
+                    {"slurm_job_id": "2002", "nodes": 4, "gpus": 8, "walltime": "24:00:00"},
+                )
+            ):
+                project_dir = self.make_project(root, f"demo_{index}")
+                completed_job = (
+                    root
+                    / "projects"
+                    / f"project_old_{index}"
+                    / "vasp"
+                    / "jobs"
+                    / "train"
+                    / "struct_0007"
+                )
+                completed_job.mkdir(parents=True)
+                (completed_job / "OUTCAR").write_text(
+                    "General timing\n",
+                    encoding="utf-8",
+                )
+                common.upsert_registry_entry(
+                    root,
+                    identity[0],
+                    identity[1],
+                    identity[2],
+                    {"job_path": str(completed_job.resolve()), **attempt_provenance},
+                )
+
+                self.run_prepare_jobs(project_dir, atoms)
+
+                status = json.loads(
+                    (
+                        project_dir
+                        / "vasp"
+                        / "jobs"
+                        / "train"
+                        / "struct_0000"
+                        / ".vasp_status"
+                    ).read_text(encoding="utf-8")
+                )
+                self.assertEqual(status["status"], "reused")
+
+    def test_missing_identity_fields_never_match(self) -> None:
+        expected = {
+            "structure_hash": "structure-hash",
+            "incar_hash": "incar-hash",
+            "potcar_hash": "potcar-hash",
+        }
+
+        self.assertFalse(
+            prepare._identity_matches(
+                {"structure_hash": "structure-hash", "incar_hash": "incar-hash"},
+                expected,
+            )
+        )
+
     def test_potcar_hash_changes_when_content_changes(self) -> None:
         self.assertNotEqual(
             common.hash_potcar_bytes(b"Si-potcar-v1"),
@@ -100,7 +190,13 @@ class RunVaspRegistryTests(unittest.TestCase):
                 common.hash_incar_text(incar),
                 common.hash_potcar_bytes(b"Si-potcar-v1"),
                 common.hash_structure(atoms),
-                {"job_path": str(completed_job.resolve())},
+                {
+                    "job_path": str(completed_job.resolve()),
+                    "slurm_job_id": "12345",
+                    "nodes": 1,
+                    "gpus": 1,
+                    "walltime": "01:00:00",
+                },
             )
 
             self.run_prepare_jobs(project_dir, atoms)
@@ -111,6 +207,91 @@ class RunVaspRegistryTests(unittest.TestCase):
             )
             self.assertEqual(status["status"], "reused")
             self.assertEqual(Path(status["reused_from"]), completed_job.resolve())
+            self.assertNotEqual(status["status"], "pending")
+
+    def test_prepare_does_not_reuse_when_structure_differs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            project_dir = self.make_project(root)
+            atoms = self.silicon_atoms()
+            changed = self.silicon_atoms()
+            changed.set_scaled_positions([[0.25, 0.0, 0.0]])
+            completed_job = root / "projects" / "project_old" / "vasp" / "jobs" / "train" / "struct_0007"
+            completed_job.mkdir(parents=True)
+            (completed_job / "OUTCAR").write_text("General timing\n", encoding="utf-8")
+            incar = prepare.inject_incar_defaults(
+                "ENCUT = 520\nNCORE = 16\nKPAR = 1\n",
+                ConfigParser(),
+            )
+            common.upsert_registry_entry(
+                root,
+                common.hash_incar_text(incar),
+                common.hash_potcar_bytes(b"Si-potcar-v1"),
+                common.hash_structure(changed),
+                {"job_path": str(completed_job.resolve())},
+            )
+
+            self.run_prepare_jobs(project_dir, atoms)
+
+            status = json.loads(
+                (project_dir / "vasp" / "jobs" / "train" / "struct_0000" / ".vasp_status")
+                .read_text(encoding="utf-8")
+            )
+            self.assertEqual(status["status"], "pending")
+
+    def test_prepare_does_not_reuse_incomplete_output(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            project_dir = self.make_project(root)
+            atoms = self.silicon_atoms()
+            incomplete_job = root / "projects" / "project_old" / "vasp" / "jobs" / "train" / "struct_0007"
+            incomplete_job.mkdir(parents=True)
+            (incomplete_job / "OUTCAR").write_text("not complete\n", encoding="utf-8")
+            incar = prepare.inject_incar_defaults(
+                "ENCUT = 520\nNCORE = 16\nKPAR = 1\n",
+                ConfigParser(),
+            )
+            common.upsert_registry_entry(
+                root,
+                common.hash_incar_text(incar),
+                common.hash_potcar_bytes(b"Si-potcar-v1"),
+                common.hash_structure(atoms),
+                {"job_path": str(incomplete_job.resolve())},
+            )
+
+            self.run_prepare_jobs(project_dir, atoms)
+
+            status = json.loads(
+                (project_dir / "vasp" / "jobs" / "train" / "struct_0000" / ".vasp_status")
+                .read_text(encoding="utf-8")
+            )
+            self.assertEqual(status["status"], "pending")
+
+    def test_prepare_does_not_reuse_stale_registry_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            project_dir = self.make_project(root)
+            atoms = self.silicon_atoms()
+            stale_job = root / "projects" / "project_old" / "vasp" / "jobs" / "train" / "missing"
+            incar = prepare.inject_incar_defaults(
+                "ENCUT = 520\nNCORE = 16\nKPAR = 1\n",
+                ConfigParser(),
+            )
+            common.upsert_registry_entry(
+                root,
+                common.hash_incar_text(incar),
+                common.hash_potcar_bytes(b"Si-potcar-v1"),
+                common.hash_structure(atoms),
+                {"job_path": str(stale_job.resolve())},
+            )
+
+            self.run_prepare_jobs(project_dir, atoms)
+
+            status = json.loads(
+                (project_dir / "vasp" / "jobs" / "train" / "struct_0000" / ".vasp_status")
+                .read_text(encoding="utf-8")
+            )
+            self.assertEqual(status["status"], "pending")
 
     def test_prepare_does_not_reuse_when_incar_differs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -191,6 +372,98 @@ class RunVaspRegistryTests(unittest.TestCase):
             self.assertEqual(entry["dataset"], "train")
             self.assertEqual(entry["selected_index"], 42)
             self.assertIn("completed_at", entry)
+
+    @pytest.mark.xfail(
+        strict=True,
+        reason="Phase 1 blocker P0-16: malformed VASP status must fail fast",
+    )
+    def test_prepare_fails_on_malformed_status_record(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            project_dir = self.make_project(root)
+            struct_dir = project_dir / "vasp" / "jobs" / "train" / "struct_0000"
+            struct_dir.mkdir(parents=True)
+            (struct_dir / ".vasp_status").write_text("{malformed", encoding="utf-8")
+
+            with patch.object(
+                prepare,
+                "iread",
+                side_effect=lambda path, **_kwargs: iter(
+                    [self.silicon_atoms()] if "train.xyz" in str(path) else []
+                ),
+            ):
+                with self.assertRaises(ValueError):
+                    prepare.prepare_jobs(
+                        ConfigParser(),
+                        project_dir / "config" / "vasp",
+                        project_dir / "structures" / "selected",
+                        project_dir / "vasp" / "jobs",
+                        ["train", "test"],
+                        project_dir=project_dir,
+                        project_name="demo",
+                    )
+
+    @pytest.mark.xfail(
+        strict=True,
+        reason="Phase 1 blocker P0-16: malformed VASP identity must fail fast",
+    )
+    def test_prepare_fails_on_malformed_identity_record(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            project_dir = self.make_project(root)
+            struct_dir = project_dir / "vasp" / "jobs" / "train" / "struct_0000"
+            struct_dir.mkdir(parents=True)
+            common.write_status(struct_dir, "submitted")
+            (struct_dir / ".vasp_identity").write_text("{malformed", encoding="utf-8")
+
+            with patch.object(
+                prepare,
+                "iread",
+                side_effect=lambda path, **_kwargs: iter(
+                    [self.silicon_atoms()] if "train.xyz" in str(path) else []
+                ),
+            ):
+                with self.assertRaises(ValueError):
+                    prepare.prepare_jobs(
+                        ConfigParser(),
+                        project_dir / "config" / "vasp",
+                        project_dir / "structures" / "selected",
+                        project_dir / "vasp" / "jobs",
+                        ["train", "test"],
+                        project_dir=project_dir,
+                        project_name="demo",
+                    )
+
+    @pytest.mark.xfail(
+        strict=True,
+        reason="Phase 1 blocker P0-16: corrupt VASP registry data must fail fast",
+    )
+    def test_prepare_fails_on_corrupt_registry_data(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            project_dir = self.make_project(root)
+            common.completed_jobs_registry_path(root).write_text(
+                "{malformed",
+                encoding="utf-8",
+            )
+
+            with patch.object(
+                prepare,
+                "iread",
+                side_effect=lambda path, **_kwargs: iter(
+                    [self.silicon_atoms()] if "train.xyz" in str(path) else []
+                ),
+            ):
+                with self.assertRaises(ValueError):
+                    prepare.prepare_jobs(
+                        ConfigParser(),
+                        project_dir / "config" / "vasp",
+                        project_dir / "structures" / "selected",
+                        project_dir / "vasp" / "jobs",
+                        ["train", "test"],
+                        project_dir=project_dir,
+                        project_name="demo",
+                    )
 
 
 if __name__ == "__main__":
