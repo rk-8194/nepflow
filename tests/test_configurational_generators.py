@@ -80,6 +80,21 @@ class ConfigurationalGeneratorTests(unittest.TestCase):
             second[0].get_chemical_symbols(),
         )
 
+    def test_random_solution_same_seed_repeats_assignment_independently_of_quota(self) -> None:
+        first = configurational_module.RandomSolidSolutionGenerator(
+            n_structures=2,
+            random_seed=17,
+        ).generate(self.composition, ["bcc"], target_n_atoms=16)
+        second = configurational_module.RandomSolidSolutionGenerator(
+            n_structures=2,
+            random_seed=17,
+        ).generate(self.composition, ["bcc"], target_n_atoms=16)
+
+        self.assertEqual(
+            [atoms.get_chemical_symbols() for atoms in first],
+            [atoms.get_chemical_symbols() for atoms in second],
+        )
+
     @pytest.mark.xfail(strict=True, reason=P0_12_XFAIL_REASON)
     def test_segregated_quota_is_per_composition_and_deterministic(self) -> None:
         first = configurational_module.SegregatedGenerator(

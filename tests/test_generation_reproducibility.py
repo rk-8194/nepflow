@@ -61,6 +61,56 @@ class GenerationReproducibilityTests(unittest.TestCase):
 
         self.assert_structures_equal(first, second)
 
+    @pytest.mark.xfail(
+        strict=True,
+        reason="Phase 1 blocker P0-14: primary hiphive rattling must receive explicit RNG state",
+    )
+    def test_primary_rattling_path_repeats_with_same_seed(self) -> None:
+        base = self.make_base()
+        ambient_rng = np.random.RandomState(90210)
+
+        def fake_primary_rattling(atoms, n_structures, rattle_std, d_min, **kwargs):
+            del d_min
+            supplied_rng = kwargs.get("rng")
+            if supplied_rng is None:
+                supplied_rng = kwargs.get("random_state")
+            supplied_seed = kwargs.get("random_seed")
+            if supplied_seed is None:
+                supplied_seed = kwargs.get("seed")
+
+            if supplied_rng is None and supplied_seed is None:
+                # Model hiphive's uncontrolled ambient state.  The test must
+                # not pass by forcing the Gaussian fallback.
+                rng = ambient_rng
+            elif supplied_rng is not None:
+                rng = supplied_rng
+            else:
+                rng = np.random.RandomState(supplied_seed)
+
+            outputs = []
+            for _ in range(n_structures):
+                rattled = atoms.copy()
+                rattled.positions += rng.normal(
+                    0.0, rattle_std, rattled.positions.shape
+                )
+                outputs.append(rattled)
+            return outputs
+
+        with patch(
+            "hiphive.structure_generation.generate_mc_rattled_structures",
+            side_effect=fake_primary_rattling,
+        ):
+            first = PerturbationEngine(
+                target_n_atoms=len(base),
+                random_seed=21,
+            )._rattled(base, base, n=1)
+            second = PerturbationEngine(
+                target_n_atoms=len(base),
+                random_seed=21,
+            )._rattled(base, base, n=1)
+
+        self.assert_structures_equal(first, second)
+
     def test_stochastic_vacancy_choices_repeat_with_same_seed(self) -> None:
         base = self.make_base()
         kwargs = {
@@ -96,6 +146,24 @@ class GenerationReproducibilityTests(unittest.TestCase):
         engine = PerturbationEngine(target_n_atoms=16, random_seed=1234)
 
         self.assertEqual(engine._engine_params()["random_seed"], 1234)
+
+    @pytest.mark.xfail(
+        strict=True,
+        reason="Phase 1 blocker P0-14: stochastic candidates must retain seed provenance",
+    )
+    def test_stochastic_candidate_records_parent_and_seed_provenance(self) -> None:
+        base = self.make_base()
+        candidate = PerturbationEngine(
+            target_n_atoms=len(base),
+            random_seed=1234,
+            vacancy_range=(0.25, 0.25),
+        )._vacancies(base, base, n=1)[0]
+
+        self.assertEqual(candidate.info["seed_id"], base.info["seed_id"])
+        self.assertEqual(candidate.info["source"], base.info["source"])
+        self.assertEqual(candidate.info["perturbation_type"], "vacancy")
+        self.assertEqual(candidate.info["n_vacancies"], 4)
+        self.assertEqual(candidate.info["random_seed"], 1234)
 
 
 if __name__ == "__main__":
