@@ -168,6 +168,34 @@ def test_existing_incomplete_status_is_not_treated_as_fresh_run() -> None:
                 stage.run()
 
 
+def test_invalid_persisted_field_type_fails_explicitly() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        stage, _, _ = resume_state(root)
+        write_validation_status(root, analysis_complete="false")
+
+        with (
+            patch.object(stage, "_find_config_file", return_value=root / "config" / "demo.yaml"),
+            patch.object(stage, "_load_config", return_value=make_config()),
+        ):
+            with pytest.raises(ValueError):
+                stage.run()
+
+
+def test_missing_persisted_resume_potential_fails_explicitly() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        stage, _, potential_path = resume_state(root)
+        potential_path.rmdir()
+
+        with (
+            patch.object(stage, "_find_config_file", return_value=root / "config" / "demo.yaml"),
+            patch.object(stage, "_load_config", return_value=make_config()),
+        ):
+            with pytest.raises(RuntimeError):
+                stage.run()
+
+
 def test_malformed_validation_status_is_an_explicit_failure() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)

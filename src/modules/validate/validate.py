@@ -29,6 +29,8 @@ class ValidateStage(Stage):
     @staticmethod
     def _require_resume_state(status: dict) -> None:
         """Reject incomplete persisted state instead of guessing recovery."""
+        if status.get("status") != "running":
+            raise ValueError("Validation status must have status='running' to resume")
         required = (
             "model_run_id",
             "potential_path",
@@ -43,8 +45,29 @@ class ValidateStage(Stage):
             raise ValueError(
                 "Validation status is missing required fields: " + ", ".join(missing)
             )
+        for field in ("model_run_id", "potential_path", "dataset_path", "dataset_name"):
+            if not isinstance(status[field], str) or not status[field].strip():
+                raise ValueError(f"Validation status field {field!r} must be a non-empty string")
+        for field in ("validation_complete", "analysis_complete"):
+            if not isinstance(status[field], bool):
+                raise ValueError(f"Validation status field {field!r} must be a boolean")
         if not isinstance(status["preparation_state"], dict):
             raise ValueError("Validation status preparation_state must be an object")
+        preparation_state = status["preparation_state"]
+        for field in ("validation_root", "struct_count", "struct_folders"):
+            if field not in preparation_state:
+                raise ValueError(
+                    f"Validation preparation_state is missing required field {field!r}"
+                )
+        if (
+            not isinstance(preparation_state["validation_root"], str)
+            or not preparation_state["validation_root"].strip()
+        ):
+            raise ValueError("Validation preparation_state validation_root must be a non-empty string")
+        if not isinstance(preparation_state["struct_count"], int):
+            raise ValueError("Validation preparation_state struct_count must be an integer")
+        if not isinstance(preparation_state["struct_folders"], list):
+            raise ValueError("Validation preparation_state struct_folders must be a list")
 
     def _model_run_id(self, config: ConfigParser, status: dict) -> str:
         """Return the explicitly requested model-run identity."""
@@ -123,8 +146,10 @@ class ValidateStage(Stage):
                     self._run_analysis(config, status)
                 
                 return
-            else:
-                logger.info("Preparation state not available — starting fresh")
+            raise RuntimeError(
+                "Persisted validation state cannot be resumed: required potential "
+                "or preparation artifacts are missing"
+            )
         
         # === NEW SUBMISSION ===
         logger.info("Starting new validation run")
