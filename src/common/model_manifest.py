@@ -11,6 +11,7 @@ from typing import Any
 
 MODEL_RUN_MANIFEST_FILENAME = "model_run_manifest.json"
 MODEL_RUN_MANIFEST_SCHEMA = "nepflow.model_run_manifest.v1"
+MODEL_RUN_IDENTITY_SCHEMA = "nepflow.model_run_identity.v1"
 
 
 class ModelManifestError(ValueError):
@@ -56,6 +57,24 @@ def write_model_run_manifest(path: Path, manifest: dict[str, Any]) -> None:
     _write_json(path, manifest)
 
 
+def compute_model_run_id(
+    *,
+    dataset_id: str,
+    nep_in_sha256: str,
+    hyperparameters_hash: str,
+) -> str:
+    """Compute the stable scientific identity for one effective NEP run."""
+    identity_payload = {
+        "schema_version": MODEL_RUN_IDENTITY_SCHEMA,
+        "dataset_id": dataset_id,
+        "nep_in_sha256": nep_in_sha256,
+        "hyperparameters_hash": hyperparameters_hash,
+    }
+    return "model_run_" + hashlib.sha256(
+        json.dumps(identity_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
 def create_model_run_manifest(
     *,
     potential_path: Path,
@@ -74,22 +93,19 @@ def create_model_run_manifest(
 
     nep_in_hash = sha256_file(nep_in_path)
     created_at = _now()
-    identity_payload = {
-        "schema_version": MODEL_RUN_MANIFEST_SCHEMA,
-        "dataset_id": dataset_id,
-        "nep_in_sha256": nep_in_hash,
-        "hyperparameters_hash": hyperparameters_hash,
-        "created_at": created_at,
-    }
-    model_run_id = "model_run_" + hashlib.sha256(
-        json.dumps(identity_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    ).hexdigest()
+    model_run_id = compute_model_run_id(
+        dataset_id=dataset_id,
+        nep_in_sha256=nep_in_hash,
+        hyperparameters_hash=hyperparameters_hash,
+    )
     artifact_path = (potential_path / "nep.txt").resolve()
     manifest = {
         "schema_version": MODEL_RUN_MANIFEST_SCHEMA,
         "model_run_id": model_run_id,
         "dataset_id": dataset_id,
         "dataset_path": str(dataset_path.resolve()),
+        "identity_schema_version": MODEL_RUN_IDENTITY_SCHEMA,
+        "hyperparameters_hash": hyperparameters_hash,
         "potential_artifact_path": str(artifact_path),
         "potential_artifact_sha256": None,
         "nep_in_path": str(nep_in_path),
@@ -124,9 +140,13 @@ def update_model_run_status(
                 for path in potential_path.glob("nep*.txt")
                 if path.is_file() and path.stat().st_size > 0
             )
-            if alternate:
-                artifact_path = alternate[0].resolve()
-                manifest["potential_artifact_path"] = str(artifact_path)
+            if len(alternate) != 1:
+                raise ModelManifestError(
+                    "Expected exactly one supported alternate NEP artifact when "
+                    f"nep.txt is absent; found {len(alternate)}"
+                )
+            artifact_path = alternate[0].resolve()
+            manifest["potential_artifact_path"] = str(artifact_path)
         if not artifact_path.is_file() or artifact_path.stat().st_size == 0:
             raise ModelManifestError(
                 f"Completed model run has no non-empty potential artifact: {artifact_path}"
@@ -164,6 +184,8 @@ def validate_model_run_manifest(
     required = (
         "model_run_id",
         "dataset_id",
+        "identity_schema_version",
+        "hyperparameters_hash",
         "dataset_path",
         "potential_artifact_path",
         "potential_artifact_sha256",
@@ -186,6 +208,21 @@ def validate_model_run_manifest(
         raise ModelManifestError(
             f"Model run {manifest['model_run_id']} is not completed "
             f"(status={manifest['status']!r})"
+        )
+
+    if manifest["identity_schema_version"] != MODEL_RUN_IDENTITY_SCHEMA:
+        raise ModelManifestError(
+            f"Unsupported model-run identity schema: {manifest['identity_schema_version']}"
+        )
+    computed_model_run_id = compute_model_run_id(
+        dataset_id=str(manifest["dataset_id"]),
+        nep_in_sha256=str(manifest["nep_in_sha256"]),
+        hyperparameters_hash=str(manifest["hyperparameters_hash"]),
+    )
+    if manifest["model_run_id"] != computed_model_run_id:
+        raise ModelManifestError(
+            f"Model-run identity hash mismatch: expected {computed_model_run_id}, "
+            f"found {manifest['model_run_id']}"
         )
 
     dataset_path = Path(str(manifest["dataset_path"]))

@@ -15,7 +15,7 @@ from ase.io import read as ase_read
 from ase.atoms import Atoms
 
 from ..base import Stage, SelfResubmitExit
-from ...common.model_manifest import (
+from common.model_manifest import (
     MODEL_RUN_MANIFEST_FILENAME,
     ModelManifestError,
     create_model_run_manifest,

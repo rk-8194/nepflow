@@ -12,7 +12,9 @@ pytest.importorskip("pymatgen")
 
 from modules.train_nep.train_nep import TrainNepStage  # noqa: E402
 from common.model_manifest import (  # noqa: E402
+    ModelManifestError,
     create_model_run_manifest,
+    read_model_run_manifest,
     update_model_run_status,
     write_model_run_manifest,
 )
@@ -63,17 +65,12 @@ def materialize_layout(
             encoding="utf-8",
         )
         if write_manifests:
-            manifest = create_model_run_manifest(
+            create_model_run_manifest(
                 potential_path=model_path,
                 dataset_path=datasets[model["dataset_id"]],
                 dataset_id=model["dataset_id"],
                 nep_in_path=model_path / "nep.in",
                 hyperparameters_hash=f"fixture-{model['model_id']}",
-            )
-            manifest["model_run_id"] = model["model_id"]
-            write_model_run_manifest(
-                model_path / "model_run_manifest.json",
-                manifest,
             )
             update_model_run_status(model_path, "completed")
         models[model["model_id"]] = model_path
@@ -108,6 +105,12 @@ def validate_stage_for(project_dir: Path) -> ValidateStage:
         project_dir=project_dir,
         debug=False,
     )
+
+
+def model_run_id_for(model_path: Path) -> str:
+    return json.loads(
+        (model_path / "model_run_manifest.json").read_text(encoding="utf-8")
+    )["model_run_id"]
 
 
 def test_one_explicit_model_dataset_pair_resolves_exactly() -> None:
@@ -192,7 +195,11 @@ def test_storage_path_is_not_the_scientific_model_identity() -> None:
 
     with tempfile.TemporaryDirectory() as tmp:
         project_dir, _, _ = materialize_layout(Path(tmp), layout)
-        potential, dataset = find_latest_potential_and_dataset(project_dir, "model_a")
+        model_path = project_dir / "nep" / "potentials" / "arbitrary_model_storage"
+        potential, dataset = find_latest_potential_and_dataset(
+            project_dir,
+            model_run_id_for(model_path),
+        )
 
     assert potential.name == "arbitrary_model_storage"
     assert dataset.name == "data_a"
@@ -206,7 +213,118 @@ def test_manifest_artifact_hash_mismatch_is_rejected() -> None:
         project_dir, models, _ = materialize_layout(Path(tmp), single_pair)
         (models["model_old"] / "nep.txt").write_text("tampered\n", encoding="utf-8")
         with pytest.raises(RuntimeError):
-            find_latest_potential_and_dataset(project_dir, "model_old")
+            find_latest_potential_and_dataset(
+                project_dir,
+                model_run_id_for(models["model_old"]),
+            )
+
+
+def test_model_run_id_is_stable_and_scientific_inputs_change_it() -> None:
+    with tempfile.TemporaryDirectory() as first_tmp, tempfile.TemporaryDirectory() as second_tmp:
+        manifests = []
+        for root in (Path(first_tmp), Path(second_tmp)):
+            dataset_path = root / "nep" / "datasets" / "dataset_a"
+            potential_path = root / "nep" / "potentials" / "run"
+            dataset_path.mkdir(parents=True, exist_ok=True)
+            potential_path.mkdir(parents=True, exist_ok=True)
+            (dataset_path / ".dataset").write_text(
+                json.dumps({"dataset_id": "dataset_a"}),
+                encoding="utf-8",
+            )
+            (potential_path / "nep.in").write_text("type 1 Si\n", encoding="utf-8")
+            manifests.append(
+                create_model_run_manifest(
+                    potential_path=potential_path,
+                    dataset_path=dataset_path,
+                    dataset_id="dataset_a",
+                    nep_in_path=potential_path / "nep.in",
+                    hyperparameters_hash="hyperparameters_a",
+                )
+            )
+
+        assert manifests[0]["model_run_id"] == manifests[1]["model_run_id"]
+
+        changed_dataset = create_model_run_manifest(
+            potential_path=Path(first_tmp) / "nep" / "potentials" / "dataset_variant",
+            dataset_path=Path(first_tmp) / "nep" / "datasets" / "dataset_a",
+            dataset_id="dataset_b",
+            nep_in_path=Path(first_tmp) / "nep" / "potentials" / "run" / "nep.in",
+            hyperparameters_hash="hyperparameters_a",
+        )
+        changed_hyperparameters = create_model_run_manifest(
+            potential_path=Path(first_tmp) / "nep" / "potentials" / "hyperparameter_variant",
+            dataset_path=Path(first_tmp) / "nep" / "datasets" / "dataset_a",
+            dataset_id="dataset_a",
+            nep_in_path=Path(first_tmp) / "nep" / "potentials" / "run" / "nep.in",
+            hyperparameters_hash="hyperparameters_b",
+        )
+        changed_input_path = Path(first_tmp) / "nep" / "potentials" / "input_variant"
+        changed_input_path.mkdir(parents=True, exist_ok=True)
+        (changed_input_path / "nep.in").write_text("type 1 Ge\n", encoding="utf-8")
+        changed_input = create_model_run_manifest(
+            potential_path=changed_input_path,
+            dataset_path=Path(first_tmp) / "nep" / "datasets" / "dataset_a",
+            dataset_id="dataset_a",
+            nep_in_path=changed_input_path / "nep.in",
+            hyperparameters_hash="hyperparameters_a",
+        )
+        assert changed_dataset["model_run_id"] != manifests[0]["model_run_id"]
+        assert changed_hyperparameters["model_run_id"] != manifests[0]["model_run_id"]
+        assert changed_input["model_run_id"] != manifests[0]["model_run_id"]
+
+
+def test_tampered_model_run_id_is_rejected() -> None:
+    layout = load_layout("lexical_order_conflicts_with_explicit_association")
+    single_pair = {"datasets": [layout["datasets"][0]], "models": [layout["models"][0]]}
+
+    with tempfile.TemporaryDirectory() as tmp:
+        project_dir, models, _ = materialize_layout(Path(tmp), single_pair)
+        manifest_path = models["model_old"] / "model_run_manifest.json"
+        manifest = read_model_run_manifest(manifest_path)
+        manifest["model_run_id"] = "model_run_tampered"
+        write_model_run_manifest(manifest_path, manifest)
+        with pytest.raises(RuntimeError):
+            find_latest_potential_and_dataset(project_dir, "model_run_tampered")
+
+
+def test_multiple_alternate_model_artifacts_are_rejected() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        dataset_path = root / "nep" / "datasets" / "dataset_a"
+        potential_path = root / "nep" / "potentials" / "run"
+        dataset_path.mkdir(parents=True, exist_ok=True)
+        potential_path.mkdir(parents=True, exist_ok=True)
+        (dataset_path / ".dataset").write_text(
+            json.dumps({"dataset_id": "dataset_a"}),
+            encoding="utf-8",
+        )
+        (potential_path / "nep.in").write_text("type 1 Si\n", encoding="utf-8")
+        create_model_run_manifest(
+            potential_path=potential_path,
+            dataset_path=dataset_path,
+            dataset_id="dataset_a",
+            nep_in_path=potential_path / "nep.in",
+            hyperparameters_hash="hyperparameters_a",
+        )
+        (potential_path / "nep_first.txt").write_text("first\n", encoding="utf-8")
+        (potential_path / "nep_second.txt").write_text("second\n", encoding="utf-8")
+
+        with pytest.raises(ModelManifestError):
+            update_model_run_status(potential_path, "completed")
+
+
+def test_requested_validation_model_id_wins_over_training_status() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        project_dir = Path(tmp)
+        (project_dir / "nep").mkdir(parents=True, exist_ok=True)
+        (project_dir / "nep" / ".train_nep_status").write_text(
+            json.dumps({"status": "completed", "model_run_id": "model_run_from_training"}),
+            encoding="utf-8",
+        )
+        config = ConfigParser()
+        config["gpumd"] = {"model_run_id": "model_run_requested"}
+
+        assert validate_stage_for(project_dir)._model_run_id(config, {}) == "model_run_requested"
 
 
 def test_finalize_preserves_the_resolved_model_dataset_pair() -> None:
@@ -215,7 +333,10 @@ def test_finalize_preserves_the_resolved_model_dataset_pair() -> None:
 
     with tempfile.TemporaryDirectory() as tmp:
         project_dir, models, datasets = materialize_layout(Path(tmp), single_pair)
-        finalized_path, dataset_name = finalize_nep_potential(project_dir, "model_old")
+        finalized_path, dataset_name = finalize_nep_potential(
+            project_dir,
+            model_run_id_for(models["model_old"]),
+        )
 
         assert finalized_path == project_dir / "gpumd" / datasets["dataset_old"].name / models["model_old"].name
         assert dataset_name == datasets["dataset_old"].name

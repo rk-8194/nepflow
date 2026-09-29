@@ -10,7 +10,7 @@ from configparser import ConfigParser
 from pathlib import Path
 
 from ..base import SelfResubmitExit
-from ...common.model_manifest import ModelManifestError, update_model_run_status
+from common.model_manifest import ModelManifestError, update_model_run_status
 from ._common import logger
 
 # Status file format: json dict with keys: potential_path, job_id, status, job_name, attempt, created, updated, error

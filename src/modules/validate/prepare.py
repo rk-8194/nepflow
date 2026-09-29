@@ -10,7 +10,7 @@ import numpy as np
 from ase.io import read as ase_read
 from ase.atoms import Atoms
 
-from ...common.model_manifest import (
+from common.model_manifest import (
     ModelManifestError,
     find_model_run_manifest,
     validate_model_run_manifest,
@@ -101,8 +101,12 @@ def finalize_nep_potential(
     src_nep = potential_src / "nep.txt"
     if not src_nep.exists():
         alternate_artifacts = sorted(potential_src.glob("nep*.txt"))
-        if alternate_artifacts:
-            src_nep = alternate_artifacts[0]
+        if len(alternate_artifacts) != 1:
+            raise ModelManifestError(
+                "Expected exactly one supported alternate NEP artifact when "
+                f"nep.txt is absent; found {len(alternate_artifacts)}"
+            )
+        src_nep = alternate_artifacts[0]
     dst_nep = gpumd_potential_dir / "nep.txt"
     
     if src_nep.exists() and not dst_nep.exists():
