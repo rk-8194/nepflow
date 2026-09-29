@@ -152,6 +152,22 @@ def test_missing_required_resume_status_fields_fail_explicitly() -> None:
                 stage.run()
 
 
+def test_existing_incomplete_status_is_not_treated_as_fresh_run() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        status_file = root / "gpumd" / ".validation_status"
+        status_file.parent.mkdir(parents=True, exist_ok=True)
+        status_file.write_text(json.dumps({"foo": "bar"}), encoding="utf-8")
+        stage = make_validate_stage(root)
+
+        with (
+            patch.object(stage, "_find_config_file", return_value=root / "config" / "demo.yaml"),
+            patch.object(stage, "_load_config", return_value=make_config()),
+        ):
+            with pytest.raises(ValueError):
+                stage.run()
+
+
 def test_malformed_validation_status_is_an_explicit_failure() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)

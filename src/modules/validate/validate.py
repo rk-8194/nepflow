@@ -81,11 +81,21 @@ class ValidateStage(Stage):
         logger.debug(f"Loaded config: {config_path}")
         
         # Check if this is a resubmission
+        status_file = self.project_dir / "gpumd" / ".validation_status"
+        status_exists = status_file.exists()
         status = read_validation_status(self.project_dir)
+        if status_exists:
+            if status.get("status") != "running":
+                raise ValueError(
+                    "Existing validation status has unsupported or missing status"
+                )
+            self._require_resume_state(status)
+            if status["analysis_complete"] is True:
+                logger.info("Validation analysis is already complete; nothing to resume")
+                return
         
         # === RESUBMISSION PATH ===
         if status.get("status") == "running" and not status.get("analysis_complete"):
-            self._require_resume_state(status)
             logger.info("Resubmitting from previous run")
             model_run_id = self._model_run_id(config, status)
             logger.info("Resuming validation for model_run_id=%s", model_run_id)

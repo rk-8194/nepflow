@@ -232,10 +232,6 @@ def test_plotting_cannot_substitute_missing_model_predictions() -> None:
             )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="Phase 2 blocker P0-4: validation cannot persist analysis_complete without required metric output",
-)
 def test_validation_analysis_cannot_complete_without_required_metrics() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
