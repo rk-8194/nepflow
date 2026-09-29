@@ -1,7 +1,6 @@
 """Prepare validation structures and datasets for GPUMD simulations."""
 
 import logging
-import re
 import shutil
 from pathlib import Path
 from typing import Tuple, List, Optional, Dict
@@ -404,32 +403,44 @@ def prepare_validation_structures(
             logger.warning(f"  Failed to calculate replicates for {struct_name}: {e}, using defaults")
             nx, ny, nz = 2, 2, 2
         
-        # Create run.in with updated replicate line
-        run_in_content = template_content
-        # Replace "replicate 2 2 2" with calculated values
-        run_in_content = re.sub(
-            r"replicate\s+\d+\s+\d+\s+\d+",
-            f"replicate {nx} {ny} {nz}",
-            run_in_content,
-        )
+        # Build a dedicated single-point protocol.  Dynamic template commands
+        # are excluded so validation cannot advance or alter the reference
+        # geometry before the prediction frame is written.
+        dynamic_keywords = {
+            "deform",
+            "dump_exyz",
+            "dump_observer",
+            "dump_xyz",
+            "ensemble",
+            "minimize",
+            "run",
+            "time_step",
+            "velocity",
+        }
+        setup_lines = []
+        replicate_seen = False
+        for line in template_content.splitlines():
+            parts = line.split("#", 1)[0].split()
+            if not parts:
+                setup_lines.append(line)
+                continue
+            if parts[0] == "replicate":
+                if replicate_seen:
+                    raise ValueError(f"Multiple replicate commands in {template_run_in}")
+                setup_lines.append(f"replicate {nx} {ny} {nz}")
+                replicate_seen = True
+                continue
+            if parts[0] in dynamic_keywords:
+                continue
+            setup_lines.append(line)
+        if not replicate_seen:
+            setup_lines.append(f"replicate {nx} {ny} {nz}")
 
         # GPUMD's dump_xyz artifact is the authoritative source for model
-        # energy, forces, and virial used by the analysis stage.  Insert it
-        # before the run command so every validation job emits a complete
-        # extended-XYZ prediction frame at out.xyz.
+        # energy, forces, and virial used by the analysis stage.
         dump_command = "dump_xyz 1 out.xyz precision double force potential virial"
-        run_lines = run_in_content.rstrip().splitlines()
-        if not any(line.strip() == dump_command for line in run_lines):
-            run_index = next(
-                (
-                    index
-                    for index in range(len(run_lines) - 1, -1, -1)
-                    if run_lines[index].strip().startswith("run ")
-                ),
-                len(run_lines),
-            )
-            run_lines.insert(run_index, dump_command)
-        run_in_content = "\n".join(run_lines) + "\n"
+        setup_lines.extend(["ensemble nve", "time_step 0", dump_command, "run 1"])
+        run_in_content = "\n".join(setup_lines).rstrip() + "\n"
         
         run_in_path = struct_dir / "run.in"
         run_in_path.write_text(run_in_content)

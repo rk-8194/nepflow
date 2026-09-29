@@ -52,6 +52,9 @@ def write_model_output(root: Path, frame_count: int = 2) -> Path:
     for struct_idx in range(frame_count):
         struct_dir = validation_root / f"struct_{struct_idx:04d}"
         struct_dir.mkdir(parents=True, exist_ok=True)
+        (struct_dir / "run.in").write_text(
+            "replicate 1 1 1\nrun 1\n", encoding="utf-8"
+        )
         (struct_dir / "out.xyz").write_text(
             ML_FIXTURE.read_text(encoding="utf-8"),
             encoding="utf-8",
@@ -146,7 +149,9 @@ def test_prepared_model_xyz_preserves_periodic_reference_without_labels() -> Non
             "version 4\ntype 1 Si\ncutoff 6 5 112 60\n", encoding="utf-8"
         )
         (config_gpumd_dir / "run.in_validate").write_text(
-            "replicate 1 1 1\nrun 1\n", encoding="utf-8"
+            "ensemble nvt 300 300 100\ntime_step 2\nvelocity 300\n"
+            "replicate 1 1 1\nrun 100\n",
+            encoding="utf-8",
         )
 
         source = ase_read(str(DFT_FIXTURE), index=0, format="extxyz")
@@ -158,6 +163,9 @@ def test_prepared_model_xyz_preserves_periodic_reference_without_labels() -> Non
         )
         model_path = Path(state["struct_folders"][0]["path"]) / "model.xyz"
         model = ase_read(str(model_path), index=0, format="extxyz")
+        run_text = (Path(state["struct_folders"][0]["path"]) / "run.in").read_text(
+            encoding="utf-8"
+        )
 
     assert model.get_chemical_symbols() == source.get_chemical_symbols()
     np.testing.assert_allclose(model.positions, source.positions)
@@ -165,6 +173,12 @@ def test_prepared_model_xyz_preserves_periodic_reference_without_labels() -> Non
     np.testing.assert_array_equal(model.pbc, source.pbc)
     assert "energy" not in model.info
     assert "force" not in model.arrays
+    assert "ensemble nve" in run_text
+    assert "time_step 0" in run_text
+    assert "dump_xyz 1 out.xyz precision double force potential virial" in run_text
+    assert [line for line in run_text.splitlines() if line.startswith("run ")] == ["run 1"]
+    assert "ensemble nvt" not in run_text
+    assert "velocity 300" not in run_text
 
 
 def test_replicated_model_output_normalizes_to_reference_metrics() -> None:
@@ -240,6 +254,36 @@ def test_displaced_model_frame_cannot_be_paired_with_dft_reference() -> None:
                     test_xyz_path=DFT_FIXTURE,
                     output_csv_path=root / "comparison.csv",
                 )
+
+
+def test_missing_replication_provenance_fails_explicitly() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        validation_root = write_model_output(root, frame_count=1)
+        (validation_root / "struct_0000" / "run.in").unlink()
+
+        with pytest.raises(FileNotFoundError, match="replication provenance"):
+            analyze_module.generate_comparison_csv(
+                validation_root=validation_root,
+                test_xyz_path=DFT_FIXTURE,
+                output_csv_path=root / "comparison.csv",
+            )
+
+
+def test_malformed_replication_provenance_fails_explicitly() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        validation_root = write_model_output(root, frame_count=1)
+        (validation_root / "struct_0000" / "run.in").write_text(
+            "replicate 2 1\nrun 1\n", encoding="utf-8"
+        )
+
+        with pytest.raises(ValueError, match="replicate"):
+            analyze_module.generate_comparison_csv(
+                validation_root=validation_root,
+                test_xyz_path=DFT_FIXTURE,
+                output_csv_path=root / "comparison.csv",
+            )
 
 
 def test_comparison_reports_model_energy_and_hand_checkable_per_atom_error() -> None:

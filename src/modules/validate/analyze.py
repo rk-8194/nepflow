@@ -193,18 +193,27 @@ def _read_replication_factors(struct_dir: Path) -> Tuple[int, int, int]:
     """Read the explicit GPUMD supercell factors used for one structure."""
     run_in_path = struct_dir / "run.in"
     if not run_in_path.exists():
-        return (1, 1, 1)
+        raise FileNotFoundError(
+            f"Validation replication provenance is missing: {run_in_path}"
+        )
+    commands = []
     for line in run_in_path.read_text(encoding="utf-8").splitlines():
         parts = line.split("#", 1)[0].split()
-        if len(parts) == 4 and parts[0] == "replicate":
+        if parts and parts[0] == "replicate":
+            if len(parts) != 4:
+                raise ValueError(f"Malformed replicate command in {run_in_path}")
             try:
                 factors = tuple(int(value) for value in parts[1:])
             except ValueError as exc:
                 raise ValueError(f"Invalid replicate command in {run_in_path}") from exc
             if any(value < 1 for value in factors):
                 raise ValueError(f"Replicate factors must be positive in {run_in_path}")
-            return factors
-    return (1, 1, 1)
+            commands.append(factors)
+    if len(commands) != 1:
+        raise ValueError(
+            f"Validation run.in must contain exactly one replicate command: {run_in_path}"
+        )
+    return commands[0]
 
 
 def _periodic_distance(first: np.ndarray, second: np.ndarray) -> float:
@@ -432,7 +441,7 @@ def generate_comparison_csv(
                 "struct_id": struct_idx,
                 "atom_id": atom_idx,
                 "reference_atom_id": item["reference_indices"][atom_idx],
-                "species": dft["species"][atom_idx],
+                "species": dft["species"][item["reference_indices"][atom_idx]],
                 "composition": dft.get("composition", ""),
                 "perturbation_family": dft.get("perturbation_family", ""),
                 "energy_unit": "eV",
