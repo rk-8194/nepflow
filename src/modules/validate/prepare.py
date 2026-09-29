@@ -13,14 +13,15 @@ from ase.atoms import Atoms
 from common.model_manifest import (
     ModelManifestError,
     find_model_run_manifest,
+    sha256_file,
     validate_model_run_manifest,
 )
 
 logger = logging.getLogger("nepflow.validate")
 
 
-def find_model_run_and_dataset(project_dir: Path, model_run_id: str) -> Tuple[Path, Path]:
-    """Resolve one completed model run through its persisted manifest."""
+def _validated_model_run(project_dir: Path, model_run_id: str) -> dict:
+    """Load and validate the manifest for one explicitly requested run."""
     manifest_path = find_model_run_manifest(project_dir, model_run_id)
     try:
         manifest = validate_model_run_manifest(
@@ -29,6 +30,18 @@ def find_model_run_and_dataset(project_dir: Path, model_run_id: str) -> Tuple[Pa
         )
     except (FileNotFoundError, ModelManifestError) as exc:
         raise RuntimeError(f"Invalid model-run manifest for {model_run_id}") from exc
+    artifact_path = Path(str(manifest["potential_artifact_path"])).resolve()
+    canonical_dir = (project_dir / "nep" / "potentials").resolve()
+    if artifact_path.parent.parent != canonical_dir:
+        raise RuntimeError(
+            f"Model artifact is outside canonical NEP storage: {artifact_path}"
+        )
+    return manifest
+
+
+def find_model_run_and_dataset(project_dir: Path, model_run_id: str) -> Tuple[Path, Path]:
+    """Resolve one completed model run through its persisted manifest."""
+    manifest = _validated_model_run(project_dir, model_run_id)
 
     potential_artifact = Path(str(manifest["potential_artifact_path"])).resolve()
     potential_path = potential_artifact.parent
@@ -86,7 +99,10 @@ def finalize_nep_potential(
     
     if not model_run_id:
         raise ValueError("model_run_id is required to finalize a potential")
-    potential_src, dataset_path = find_model_run_and_dataset(project_dir, model_run_id)
+    manifest = _validated_model_run(project_dir, model_run_id)
+    source_artifact = Path(str(manifest["potential_artifact_path"])).resolve()
+    potential_src = source_artifact.parent
+    dataset_path = Path(str(manifest["dataset_path"])).resolve()
     
     # Extract folder names
     potential_name = potential_src.name  # potential_XXXX
@@ -97,23 +113,23 @@ def finalize_nep_potential(
     gpumd_potential_dir = gpumd_dataset_dir / potential_name
     gpumd_potential_dir.mkdir(parents=True, exist_ok=True)
     
-    # Move nep.txt to destination
-    src_nep = potential_src / "nep.txt"
-    if not src_nep.exists():
-        alternate_artifacts = sorted(potential_src.glob("nep*.txt"))
-        if len(alternate_artifacts) != 1:
-            raise ModelManifestError(
-                "Expected exactly one supported alternate NEP artifact when "
-                f"nep.txt is absent; found {len(alternate_artifacts)}"
-            )
-        src_nep = alternate_artifacts[0]
+    # Copy exactly the artifact path validated from the manifest.
+    src_nep = source_artifact
     dst_nep = gpumd_potential_dir / "nep.txt"
     
+    if src_nep.exists() and sha256_file(src_nep) != manifest["potential_artifact_sha256"]:
+        raise ModelManifestError(
+            f"Manifest-bound artifact changed after validation: {src_nep}"
+        )
     if src_nep.exists() and not dst_nep.exists():
         logger.info(f"Moving nep.txt to {gpumd_potential_dir}")
         shutil.copy2(src_nep, dst_nep)
         logger.debug(f"Copied nep.txt: {src_nep} → {dst_nep}")
     elif dst_nep.exists():
+        if sha256_file(dst_nep) != manifest["potential_artifact_sha256"]:
+            raise ModelManifestError(
+                f"Existing finalized artifact does not match manifest: {dst_nep}"
+            )
         logger.info(f"nep.txt already exists at {dst_nep}")
     else:
         raise FileNotFoundError(f"nep.txt not found at {src_nep}")

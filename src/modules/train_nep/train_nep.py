@@ -255,8 +255,9 @@ class TrainNepStage(Stage):
         # Materialize the exact input files used by the canonical potential run.
         for filename in ("train.xyz", "test.xyz", "nep.in"):
             source = dataset_path / filename
-            if source.exists():
-                shutil.copy2(source, potential_path / filename)
+            destination = potential_path / filename
+            if source.exists() and source.resolve() != destination.resolve():
+                shutil.copy2(source, destination)
         dataset_id = metadata.get("dataset_id")
         if not dataset_id:
             raise RuntimeError(f"Dataset manifest has no dataset_id: {dataset_path / '.dataset'}")

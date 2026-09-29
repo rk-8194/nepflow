@@ -451,6 +451,12 @@ class TrainNepMetadataTests(unittest.TestCase):
             ]
             return accepted_count
 
+        def fake_generate_nep_config(*_args, **_kwargs):
+            (dataset_path / "nep.in").write_text(
+                "type 1 Si\ncutoff 6 5\n",
+                encoding="utf-8",
+            )
+
         with (
             patch.object(stage, "_load_config", return_value=config),
             patch.object(
@@ -463,7 +469,7 @@ class TrainNepMetadataTests(unittest.TestCase):
             ),
             patch.object(stage, "_get_or_create_dataset_folder", return_value=dataset_path),
             patch.object(train_stage_module, "prepare_dataset", side_effect=fake_prepare_dataset),
-            patch.object(stage, "_generate_nep_config"),
+            patch.object(stage, "_generate_nep_config", side_effect=fake_generate_nep_config),
             patch.object(stage, "_create_potential_folder", return_value=dataset_path),
         ):
             stage.run()

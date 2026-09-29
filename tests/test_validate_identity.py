@@ -313,6 +313,34 @@ def test_multiple_alternate_model_artifacts_are_rejected() -> None:
             update_model_run_status(potential_path, "completed")
 
 
+def test_finalization_uses_manifest_artifact_after_later_nep_file_appears() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        dataset_path = root / "nep" / "datasets" / "dataset_a"
+        potential_path = root / "nep" / "potentials" / "run"
+        dataset_path.mkdir(parents=True, exist_ok=True)
+        potential_path.mkdir(parents=True, exist_ok=True)
+        (dataset_path / ".dataset").write_text(
+            json.dumps({"dataset_id": "dataset_a"}),
+            encoding="utf-8",
+        )
+        (potential_path / "nep.in").write_text("type 1 Si\n", encoding="utf-8")
+        (potential_path / "nep_model.txt").write_text("manifest-bound\n", encoding="utf-8")
+        create_model_run_manifest(
+            potential_path=potential_path,
+            dataset_path=dataset_path,
+            dataset_id="dataset_a",
+            nep_in_path=potential_path / "nep.in",
+            hyperparameters_hash="hyperparameters_a",
+        )
+        manifest = update_model_run_status(potential_path, "completed")
+        (potential_path / "nep.txt").write_text("later-unrelated\n", encoding="utf-8")
+
+        finalized_path, _ = finalize_nep_potential(root, manifest["model_run_id"])
+
+        assert (finalized_path / "nep.txt").read_text(encoding="utf-8") == "manifest-bound\n"
+
+
 def test_requested_validation_model_id_wins_over_training_status() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         project_dir = Path(tmp)
