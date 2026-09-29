@@ -375,9 +375,6 @@ def prepare_validation_structures(
     if not template_run_in.exists():
         raise FileNotFoundError(f"Template run.in_validate not found: {template_run_in}")
     
-    template_content = template_run_in.read_text()
-    logger.debug(f"Loaded template from {template_run_in}")
-    
     struct_folders = []
     
     for struct_idx, struct_data in enumerate(structures):
@@ -403,55 +400,19 @@ def prepare_validation_structures(
             logger.warning(f"  Failed to calculate replicates for {struct_name}: {e}, using defaults")
             nx, ny, nz = 2, 2, 2
         
-        # Build a dedicated single-point protocol.  Dynamic template commands
-        # are excluded so validation cannot advance or alter the reference
-        # geometry before the prediction frame is written.
-        unsafe_keywords = {
-            "add_efield",
-            "add_force",
-            "change_box",
-            "deform",
-            "delete_atoms",
-            "deposit",
-            "displace_atoms",
-            "dump_exyz",
-            "dump_observer",
-            "dump_xyz",
-            "ensemble",
-            "fix",
-            "minimize",
-            "potential",
-            "run",
-            "set",
-            "time_step",
-            "velocity",
-        }
-        safe_setup_lines = []
-        replicate_seen = False
-        for line in template_content.splitlines():
-            parts = line.split("#", 1)[0].split()
-            if not parts:
-                safe_setup_lines.append(line)
-                continue
-            if parts[0] == "replicate":
-                if replicate_seen:
-                    raise ValueError(f"Multiple replicate commands in {template_run_in}")
-                replicate_seen = True
-                continue
-            if parts[0] in unsafe_keywords:
-                continue
-            safe_setup_lines.append(line)
-
-        # GPUMD's dump_xyz artifact is the authoritative source for model
-        # energy, forces, and virial used by the analysis stage.
+        # Generate the authoritative static NEP protocol.  The template is
+        # intentionally not inherited: arbitrary GPUMD commands could alter
+        # the physical configuration or select a different model artifact.
         dump_command = "dump_xyz 1 out.xyz precision double force potential virial"
         setup_lines = [
             f"replicate {nx} {ny} {nz}",
             "potential nep.txt",
-            *safe_setup_lines,
+            "ensemble nve",
+            "time_step 0",
+            dump_command,
+            "run 1",
         ]
-        setup_lines.extend(["ensemble nve", "time_step 0", dump_command, "run 1"])
-        run_in_content = "\n".join(setup_lines).rstrip() + "\n"
+        run_in_content = "\n".join(setup_lines) + "\n"
         
         run_in_path = struct_dir / "run.in"
         run_in_path.write_text(run_in_content)

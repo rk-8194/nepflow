@@ -199,7 +199,7 @@ def test_template_potential_and_geometry_commands_cannot_override_model_protocol
         )
         (config_gpumd_dir / "run.in_validate").write_text(
             "potential wrong_model.txt\nchange_box x final 0 10\n"
-            "add_force 0 1 0 0\nreplicate 1 1 1\nrun 20\n",
+            "add_force 0 1 0 0\ndftd3 on\nreplicate 1 1 1\nrun 20\n",
             encoding="utf-8",
         )
 
@@ -212,15 +212,28 @@ def test_template_potential_and_geometry_commands_cannot_override_model_protocol
         run_text = (Path(state["struct_folders"][0]["path"]) / "run.in").read_text(
             encoding="utf-8"
         )
+        nx, ny, nz = state["struct_folders"][0]["replicates"]
 
     lines = [line.strip() for line in run_text.splitlines()]
+    expected_replicate = f"replicate {nx} {ny} {nz}"
+    executable_lines = [line for line in lines if line and not line.startswith("#")]
+    assert executable_lines == [
+        expected_replicate,
+        "potential nep.txt",
+        "ensemble nve",
+        "time_step 0",
+        "dump_xyz 1 out.xyz precision double force potential virial",
+        "run 1",
+    ]
     assert lines.count("potential nep.txt") == 1
     assert not any("wrong_model.txt" in line for line in lines)
     assert not any(line.startswith("change_box ") for line in lines)
     assert not any(line.startswith("add_force ") for line in lines)
+    assert not any(line.startswith("dftd3 ") for line in lines)
     assert lines.count("run 1") == 1
     assert lines.count("dump_xyz 1 out.xyz precision double force potential virial") == 1
-    assert lines.index("replicate 1 1 1") < lines.index("potential nep.txt")
+    assert lines.count(expected_replicate) == 1
+    assert lines.index(expected_replicate) < lines.index("potential nep.txt")
 
 
 def test_replicated_model_output_normalizes_to_reference_metrics() -> None:
