@@ -416,6 +416,7 @@ class TrainNepMetadataTests(unittest.TestCase):
         selected_test: int,
         accepted_train: int,
         accepted_test: int,
+        allow_partial: bool = True,
     ) -> dict:
         project_dir = self.make_project(root)
         dataset_path = project_dir / "nep" / "datasets" / "dataset_0001"
@@ -423,9 +424,12 @@ class TrainNepMetadataTests(unittest.TestCase):
         config = ConfigParser()
         config["train_nep"] = {
             "train_virial": "false",
-            "allow_partial_dataset": "true",
+            "allow_partial_dataset": str(allow_partial).lower(),
         }
         config["slurm"] = {"enabled": "false"}
+        config_path = project_dir / "config" / "demo.ini"
+        with config_path.open("w", encoding="utf-8") as handle:
+            config.write(handle)
         stage = train_stage_module.TrainNepStage(
             project_name="demo",
             config_file=project_dir / "config" / "demo.ini",
@@ -433,6 +437,19 @@ class TrainNepMetadataTests(unittest.TestCase):
             project_dir=project_dir,
             debug=False,
         )
+
+        def fake_prepare_dataset(*, is_train, extraction_report, **_kwargs):
+            accepted_count = accepted_train if is_train else accepted_test
+            split = "train" if is_train else "test"
+            extraction_report["accepted_results"] = [
+                self.accepted_result(
+                    f"{split}-{index}",
+                    -1.0 - index,
+                    f"{split}-hash-{index}",
+                )
+                for index in range(accepted_count)
+            ]
+            return accepted_count
 
         with (
             patch.object(stage, "_load_config", return_value=config),
@@ -445,7 +462,7 @@ class TrainNepMetadataTests(unittest.TestCase):
                 ),
             ),
             patch.object(stage, "_get_or_create_dataset_folder", return_value=dataset_path),
-            patch.object(train_stage_module, "prepare_dataset", side_effect=[accepted_train, accepted_test]),
+            patch.object(train_stage_module, "prepare_dataset", side_effect=fake_prepare_dataset),
             patch.object(stage, "_generate_nep_config"),
             patch.object(stage, "_create_potential_folder", return_value=dataset_path),
         ):
@@ -475,8 +492,32 @@ class TrainNepMetadataTests(unittest.TestCase):
         self.assertIn("exclusion_reasons", metadata)
         self.assertTrue(metadata["exclusion_reasons"])
 
+    def test_rejections_fail_before_manifest_without_partial_opt_in(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with self.assertRaises(RuntimeError):
+                self.run_stage_with_extraction_counts(
+                    root,
+                    selected_train=2,
+                    selected_test=1,
+                    accepted_train=1,
+                    accepted_test=1,
+                    allow_partial=False,
+                )
+
+            manifest = root / "projects" / "project_demo" / "nep" / "datasets" / "dataset_0001" / ".dataset"
+            self.assertFalse(manifest.exists())
+
     @staticmethod
-    def accepted_result(structure_id: str, energy: float, source_hash: str):
+    def accepted_result(
+        structure_id: str,
+        energy: float,
+        source_hash: str,
+        source_path: str | None = None,
+        virial_scale: float = 1.0,
+        force_unit: str = "eV/Angstrom",
+        virial_convention: str = "positive_compression",
+    ):
         return train_prepare.VaspParseResult(
             structure_id=structure_id,
             calculation_identity=(
@@ -484,17 +525,19 @@ class TrainNepMetadataTests(unittest.TestCase):
                 ("potcar_hash", "potcar-1"),
                 ("structure_hash", structure_id),
             ),
-            source_outcar=f"/tmp/{structure_id}/OUTCAR",
+            source_outcar=source_path or f"/tmp/{structure_id}/OUTCAR",
             source_outcar_hash=source_hash,
             status="accepted",
             rejection_reason=None,
             energy_ev=energy,
             forces_ev_per_angstrom=np.array([[0.1, 0.0, 0.0]]),
-            virial_ev=np.eye(3),
+            virial_ev=np.eye(3) * virial_scale,
             positions_angstrom=np.array([[0.0, 0.0, 0.0]]),
             lattice_angstrom=np.eye(3),
             species=("Si",),
             pbc=(True, True, True),
+            force_unit=force_unit,
+            virial_convention=virial_convention,
         )
 
     def test_dataset_id_changes_when_accepted_content_changes(self) -> None:
@@ -531,6 +574,129 @@ class TrainNepMetadataTests(unittest.TestCase):
             )
 
         self.assertNotEqual(metadata_a["dataset_id"], metadata_b["dataset_id"])
+
+    def test_dataset_id_ignores_storage_path_and_unused_virial(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_dir = self.make_project(Path(tmp))
+            stage = train_stage_module.TrainNepStage(
+                project_name="demo",
+                config_file=project_dir / "config" / "demo.ini",
+                state_file=project_dir / "state.db",
+                project_dir=project_dir,
+                debug=False,
+            )
+            base = self.accepted_result(
+                "calc-1", -1.0, "hash-1", source_path="C:/one/OUTCAR", virial_scale=1.0
+            )
+            moved_and_changed_virial = self.accepted_result(
+                "calc-1", -1.0, "hash-1", source_path="D:/two/OUTCAR", virial_scale=2.0
+            )
+            report_a = {
+                "requested_count": 1,
+                "accepted_count": 1,
+                "rejected_count": 0,
+                "rejected_reason_counts": {},
+                "accepted_results": [base],
+            }
+            report_b = {**report_a, "accepted_results": [moved_and_changed_virial]}
+            empty_report = {
+                "requested_count": 0,
+                "accepted_count": 0,
+                "rejected_count": 0,
+                "rejected_reason_counts": {},
+                "accepted_results": [],
+            }
+            metadata_a = stage._build_dataset_metadata(
+                project_dir / "nep" / "datasets" / "dataset_0001",
+                report_a,
+                empty_report,
+                train_virial=False,
+                allow_partial=False,
+            )
+            metadata_b = stage._build_dataset_metadata(
+                project_dir / "nep" / "datasets" / "dataset_0001",
+                report_b,
+                empty_report,
+                train_virial=False,
+                allow_partial=False,
+            )
+
+        self.assertEqual(metadata_a["dataset_id"], metadata_b["dataset_id"])
+
+    def test_dataset_id_includes_virial_only_when_materialized(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_dir = self.make_project(Path(tmp))
+            stage = train_stage_module.TrainNepStage(
+                project_name="demo",
+                config_file=project_dir / "config" / "demo.ini",
+                state_file=project_dir / "state.db",
+                project_dir=project_dir,
+                debug=False,
+            )
+            low_virial = self.accepted_result("calc-1", -1.0, "hash-1", virial_scale=1.0)
+            high_virial = self.accepted_result("calc-1", -1.0, "hash-1", virial_scale=2.0)
+            report_a = {
+                "requested_count": 1,
+                "accepted_count": 1,
+                "rejected_count": 0,
+                "rejected_reason_counts": {},
+                "accepted_results": [low_virial],
+            }
+            report_b = {**report_a, "accepted_results": [high_virial]}
+            empty_report = {
+                "requested_count": 0,
+                "accepted_count": 0,
+                "rejected_count": 0,
+                "rejected_reason_counts": {},
+                "accepted_results": [],
+            }
+            without_virial_a = stage._build_dataset_metadata(
+                project_dir / "nep" / "datasets" / "dataset_0001",
+                report_a,
+                empty_report,
+                train_virial=False,
+                allow_partial=False,
+            )
+            without_virial_b = stage._build_dataset_metadata(
+                project_dir / "nep" / "datasets" / "dataset_0001",
+                report_b,
+                empty_report,
+                train_virial=False,
+                allow_partial=False,
+            )
+            with_virial_a = stage._build_dataset_metadata(
+                project_dir / "nep" / "datasets" / "dataset_0001",
+                report_a,
+                empty_report,
+                train_virial=True,
+                allow_partial=False,
+            )
+            with_virial_b = stage._build_dataset_metadata(
+                project_dir / "nep" / "datasets" / "dataset_0001",
+                report_b,
+                empty_report,
+                train_virial=True,
+                allow_partial=False,
+            )
+            different_units = self.accepted_result(
+                "calc-1",
+                -1.0,
+                "hash-1",
+                force_unit="hartree/bohr",
+                virial_convention="positive_tension",
+            )
+            with_different_units = stage._build_dataset_metadata(
+                project_dir / "nep" / "datasets" / "dataset_0001",
+                {**report_a, "accepted_results": [different_units]},
+                empty_report,
+                train_virial=True,
+                allow_partial=False,
+            )
+
+        self.assertEqual(without_virial_a["dataset_id"], without_virial_b["dataset_id"])
+        self.assertNotEqual(with_virial_a["dataset_id"], with_virial_b["dataset_id"])
+        self.assertNotEqual(without_virial_a["dataset_id"], with_virial_a["dataset_id"])
+        self.assertNotEqual(with_virial_a["dataset_id"], with_different_units["dataset_id"])
 
     def test_metadata_preserves_ordered_identity_hash_and_virial_convention(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

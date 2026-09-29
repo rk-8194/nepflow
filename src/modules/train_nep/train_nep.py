@@ -503,6 +503,7 @@ lambda_shear 1
         """Normalize reports from the parser, including test doubles."""
         report.setdefault("requested_count", requested_count)
         report.setdefault("accepted_results", [])
+        report.setdefault("accepted_content_records", [])
         report.setdefault("rejected_reason_counts", {})
         report["requested_count"] = requested_count
         report["accepted_count"] = accepted_count
@@ -525,26 +526,34 @@ lambda_shear 1
         allow_partial: bool,
     ) -> dict:
         """Build manifest data from accepted parse results and extraction outcomes."""
-        accepted_records = []
+        canonical_records = []
         accepted_identities = []
         source_output_hashes = []
         for split, report in (("train", train_report), ("test", test_report)):
             for result in report.get("accepted_results", []):
-                content_record = {
+                canonical_record = {
                     "split": split,
                     "structure_id": result.structure_id,
                     "calculation_identity": dict(result.calculation_identity),
-                    "source_outcar": result.source_outcar,
                     "source_outcar_hash": result.source_outcar_hash,
                     "energy": result.energy_ev,
                     "forces": result.forces_ev_per_angstrom.tolist(),
-                    "virial": result.virial_ev.tolist() if result.virial_ev is not None else None,
                     "positions": result.positions_angstrom.tolist(),
                     "lattice": result.lattice_angstrom.tolist(),
                     "species": list(result.species),
                     "pbc": list(result.pbc),
+                    "label_units": {
+                        "energy": result.energy_unit,
+                        "forces": result.force_unit,
+                    },
                 }
-                accepted_records.append(content_record)
+                if train_virial:
+                    canonical_record["virial"] = (
+                        result.virial_ev.tolist() if result.virial_ev is not None else None
+                    )
+                    canonical_record["label_units"]["virial"] = result.virial_unit
+                    canonical_record["virial_convention"] = result.virial_convention
+                canonical_records.append(canonical_record)
                 accepted_identities.append(
                     {
                         "split": split,
@@ -557,19 +566,37 @@ lambda_shear 1
                 if result.source_outcar_hash:
                     source_output_hashes.append(result.source_outcar_hash)
 
-        # Test doubles and debug-only synthetic records have no DFT parse result;
-        # retain a deterministic count-based fallback without affecting production identity.
-        if not accepted_records:
-            accepted_records = [
-                {"split": "train", "ordinal": index}
-                for index in range(train_report["accepted_count"])
-            ] + [
-                {"split": "test", "ordinal": index}
-                for index in range(test_report["accepted_count"])
-            ]
+        canonical_records.extend(train_report.get("accepted_content_records", []))
+        canonical_records.extend(test_report.get("accepted_content_records", []))
+        accepted_count = train_report["accepted_count"] + test_report["accepted_count"]
+        if accepted_count and len(canonical_records) != accepted_count:
+            raise RuntimeError(
+                "Accepted dataset records are missing immutable content provenance"
+            )
+
+        label_schema = {
+            "version": "nepflow.extxyz.labels.v1",
+            "geometry": ["positions", "lattice", "species", "pbc"],
+            "energy": True,
+            "forces": True,
+            "virial": train_virial,
+        }
+        units = {
+            "energy": "eV",
+            "forces": "eV/Angstrom",
+            "virial": "eV",
+        }
+        identity_payload = {
+            "schema_version": "nepflow.dataset.v1",
+            "label_schema": label_schema,
+            "units": units,
+            "virial_convention": "positive_compression" if train_virial else None,
+            "virial_tensor_convention": "cartesian_3x3" if train_virial else None,
+            "records": canonical_records,
+        }
 
         content_bytes = json.dumps(
-            accepted_records,
+            identity_payload,
             sort_keys=True,
             separators=(",", ":"),
             allow_nan=False,
@@ -585,6 +612,8 @@ lambda_shear 1
         created = datetime.now().isoformat()
         return {
             "dataset_id": dataset_id,
+            "dataset_schema_version": "nepflow.dataset.v1",
+            "label_schema": label_schema,
             "created": created,
             "creation_timestamp": created,
             "dataset_folder": dataset_path.name,
@@ -605,11 +634,7 @@ lambda_shear 1
             "source_output_hashes": source_output_hashes,
             "virial_required": train_virial,
             "virial_included": train_virial,
-            "units": {
-                "energy": "eV",
-                "forces": "eV/Angstrom",
-                "virial": "eV",
-            },
+            "units": units,
             "virial_convention": "positive_compression",
             "virial_tensor_convention": "cartesian_3x3",
             "partial_dataset_allowed": allow_partial,

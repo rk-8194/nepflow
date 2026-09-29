@@ -122,6 +122,7 @@ def prepare_dataset(
         {
             "requested_count": len(ase_structures),
             "accepted_results": [],
+            "accepted_content_records": [],
             "rejected_reason_counts": {},
         }
     )
@@ -182,7 +183,22 @@ def _parse_structures(
         # In debug mode, yield synthetic data
         for struct_idx, atoms in enumerate(ase_structures):
             logger.debug(f"  [{dataset_type}] Generating synthetic structure {struct_idx}")
-            yield _extract_from_atoms(atoms)
+            synthetic = _extract_from_atoms(atoms)
+            if extraction_report is not None:
+                extraction_report.setdefault("accepted_content_records", []).append(
+                    {
+                        "record_type": "debug_synthetic",
+                        "split": dataset_type,
+                        "ordinal": struct_idx,
+                        "energy": synthetic["energy"],
+                        "forces": np.asarray(synthetic["forces"]).tolist(),
+                        "positions": np.asarray(synthetic["positions"]).tolist(),
+                        "lattice": np.asarray(synthetic["lattice"]).tolist(),
+                        "species": list(synthetic["species"]),
+                        "pbc": list(synthetic["pbc"]),
+                    }
+                )
+            yield synthetic
         return
 
     if input_context is None:
