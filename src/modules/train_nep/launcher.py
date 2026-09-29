@@ -10,6 +10,7 @@ from configparser import ConfigParser
 from pathlib import Path
 
 from ..base import SelfResubmitExit
+from ...common.model_manifest import ModelManifestError, update_model_run_status
 from ._common import logger
 
 # Status file format: json dict with keys: potential_path, job_id, status, job_name, attempt, created, updated, error
@@ -386,15 +387,29 @@ def run_launcher(
                     
                     # Job finished — check for success
                     if _check_nep_complete(potential_path):
-                        logger.info(f"  ✓ NEP training completed successfully")
-                        write_train_status(
-                            project_dir,
-                            potential_path=str(potential_path),
-                            job_id=job_id,
-                            status="completed",
-                            attempt=attempt,
-                        )
-                        return
+                        try:
+                            manifest = update_model_run_status(potential_path, "completed")
+                        except ModelManifestError as exc:
+                            logger.error("Training artifact could not be finalized: %s", exc)
+                            write_train_status(
+                                project_dir,
+                                potential_path=str(potential_path),
+                                job_id=job_id,
+                                status="failed",
+                                attempt=attempt,
+                                error=str(exc),
+                            )
+                        else:
+                            logger.info(f"  ✓ NEP training completed successfully")
+                            write_train_status(
+                                project_dir,
+                                potential_path=str(potential_path),
+                                model_run_id=manifest["model_run_id"],
+                                job_id=job_id,
+                                status="completed",
+                                attempt=attempt,
+                            )
+                            return
                     
                     # Training failed — check error
                     error_msg = _check_training_error(potential_path)
@@ -411,6 +426,14 @@ def run_launcher(
                         attempt=attempt,
                         error=error_msg,
                     )
+                    try:
+                        update_model_run_status(
+                            potential_path,
+                            "failed",
+                            error=error_msg,
+                        )
+                    except ModelManifestError as exc:
+                        logger.error("Could not update model-run manifest: %s", exc)
                     
                     # Check if we should retry
                     if attempt < max_attempts:

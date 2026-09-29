@@ -17,13 +17,13 @@
       ],
       "models": [
         {
-          "directory": "runs/potential_0001",
+          "directory": "potentials/potential_0001",
           "model_id": "model_old",
           "dataset_id": "dataset_old",
           "created_at": "2026-09-18T12:05:00Z"
         },
         {
-          "directory": "runs/potential_0002",
+          "directory": "potentials/potential_0002",
           "model_id": "model_new",
           "dataset_id": "dataset_new",
           "created_at": "2026-09-17T12:05:00Z"
@@ -50,13 +50,13 @@
       ],
       "models": [
         {
-          "directory": "runs/potential_0009",
+          "directory": "potentials/potential_0009",
           "model_id": "model_for_eight",
           "dataset_id": "dataset_eight",
           "created_at": "2026-09-18T12:25:00Z"
         },
         {
-          "directory": "runs/potential_0010",
+          "directory": "potentials/potential_0010",
           "model_id": "model_for_seven",
           "dataset_id": "dataset_seven",
           "created_at": "2026-09-18T12:30:00Z"

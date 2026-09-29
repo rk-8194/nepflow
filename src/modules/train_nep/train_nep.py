@@ -3,6 +3,7 @@
 import hashlib
 import json
 import logging
+import shutil
 from configparser import ConfigParser
 from datetime import datetime
 from dataclasses import dataclass
@@ -14,6 +15,13 @@ from ase.io import read as ase_read
 from ase.atoms import Atoms
 
 from ..base import Stage, SelfResubmitExit
+from ...common.model_manifest import (
+    MODEL_RUN_MANIFEST_FILENAME,
+    ModelManifestError,
+    create_model_run_manifest,
+    read_model_run_manifest,
+    update_model_run_status,
+)
 from .prepare import prepare_dataset
 from .submit import submit_training_job
 from .launcher import run_launcher, read_train_status, write_train_status
@@ -110,18 +118,16 @@ class TrainNepStage(Stage):
         if status.get("status") in ["running", "failed"] and status.get("potential_path"):
             logger.info("Resubmitting from previous run")
             potential_path = Path(status["potential_path"])
-            # Use saved dataset_path if available, otherwise try to find it
+            dataset_path = self._find_dataset_for_potential(potential_path)
             if status.get("dataset_path"):
-                dataset_path = Path(status["dataset_path"])
-            else:
-                try:
-                    dataset_path = self._find_dataset_for_potential(potential_path)
-                except FileNotFoundError:
-                    logger.warning("Could not find dataset from previous run — starting fresh")
-                    dataset_path = None
+                persisted_path = Path(status["dataset_path"]).resolve()
+                if persisted_path != dataset_path.resolve():
+                    raise RuntimeError(
+                        "Training status dataset_path conflicts with the model-run manifest"
+                    )
             
             # If dataset still exists, proceed with resubmission
-            if dataset_path and dataset_path.exists():
+            if dataset_path.exists():
                 # Also check if the training script exists
                 train_script = potential_path / "train_nep.sh"
                 if train_script.exists():
@@ -246,6 +252,23 @@ class TrainNepStage(Stage):
         )
         logger.info(f"Training will run in: {potential_path.name}")
 
+        # Materialize the exact input files used by the canonical potential run.
+        for filename in ("train.xyz", "test.xyz", "nep.in"):
+            source = dataset_path / filename
+            if source.exists():
+                shutil.copy2(source, potential_path / filename)
+        dataset_id = metadata.get("dataset_id")
+        if not dataset_id:
+            raise RuntimeError(f"Dataset manifest has no dataset_id: {dataset_path / '.dataset'}")
+        model_manifest = create_model_run_manifest(
+            potential_path=potential_path,
+            dataset_path=dataset_path,
+            dataset_id=dataset_id,
+            nep_in_path=potential_path / "nep.in",
+            hyperparameters_hash=hyperparameters.identity_hash(),
+        )
+        logger.info("Created model-run manifest for %s", model_manifest["model_run_id"])
+
         # Step 6: Submit job and enter monitoring loop
         if config.getboolean("slurm", "enabled", fallback=False):
             logger.info("Step 6: Submitting SLURM training job")
@@ -264,16 +287,23 @@ class TrainNepStage(Stage):
                     self.project_dir,
                     potential_path=str(potential_path),
                     dataset_path=str(dataset_path),
+                    model_run_id=model_manifest["model_run_id"],
                     job_id=job_id,
                     status="running",
                     attempt=1,
                 )
             except Exception as e:
                 logger.error(f"Could not submit SLURM job: {e}")
+                update_model_run_status(
+                    potential_path,
+                    "failed",
+                    error=str(e),
+                )
                 write_train_status(
                     self.project_dir,
                     potential_path=str(potential_path),
                     status="failed",
+                    model_run_id=model_manifest["model_run_id"],
                     attempt=1,
                     error=str(e),
                 )
@@ -298,27 +328,33 @@ class TrainNepStage(Stage):
             logger.info("SLURM not enabled. To run training, use the dataset and nep.in files manually:")
 
     def _find_dataset_for_potential(self, potential_path: Path) -> Path:
-        """Find which dataset folder was used for a given potential.
-        
-        For now, assumes the latest dataset (dataset_XXXX with highest number).
-        In future, could track this in potential folder metadata.
-        """
-        datasets_dir = self.project_dir / "nep" / "datasets"
-        if not datasets_dir.exists():
-            raise FileNotFoundError(f"No datasets found in {datasets_dir}")
-        
-        # Find all dataset folders and return the latest
-        existing = [
-            (int(d.name.split("_")[1]), d)
-            for d in datasets_dir.iterdir()
-            if d.is_dir() and d.name.startswith("dataset_")
-        ]
-        
-        if not existing:
-            raise FileNotFoundError(f"No dataset folders found in {datasets_dir}")
-        
-        dataset_path = max(existing)[1]
-        logger.debug(f"Found dataset: {dataset_path}")
+        """Resolve the dataset from the potential's explicit run manifest."""
+        manifest_path = potential_path / MODEL_RUN_MANIFEST_FILENAME
+        try:
+            manifest = read_model_run_manifest(manifest_path)
+        except FileNotFoundError:
+            raise
+        except ModelManifestError as exc:
+            raise RuntimeError(
+                f"Cannot resolve dataset for {potential_path} without a valid model-run manifest"
+            ) from exc
+        dataset_path = Path(str(manifest.get("dataset_path", "")))
+        dataset_id = manifest.get("dataset_id")
+        if not dataset_id or not dataset_path.is_dir():
+            raise RuntimeError(
+                f"Model-run manifest has no valid dataset association: {manifest_path}"
+            )
+        try:
+            dataset_metadata = json.loads(
+                (dataset_path / ".dataset").read_text(encoding="utf-8")
+            )
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError(f"Cannot read dataset manifest: {dataset_path / '.dataset'}") from exc
+        if dataset_metadata.get("dataset_id") != dataset_id:
+            raise RuntimeError(
+                f"Dataset identity mismatch for model run {manifest.get('model_run_id')}"
+            )
+        logger.debug("Resolved model run %s to dataset %s", manifest.get("model_run_id"), dataset_path)
         return dataset_path
 
     @staticmethod

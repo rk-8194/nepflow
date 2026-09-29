@@ -10,51 +10,68 @@ import numpy as np
 from ase.io import read as ase_read
 from ase.atoms import Atoms
 
+from ...common.model_manifest import (
+    ModelManifestError,
+    find_model_run_manifest,
+    validate_model_run_manifest,
+)
+
 logger = logging.getLogger("nepflow.validate")
 
 
-def find_latest_potential_and_dataset(project_dir: Path) -> Tuple[Path, Path]:
-    """Find the latest trained NEP potential and its associated dataset.
-    
-    Args:
-        project_dir: Project root directory
-        
-    Returns:
-        Tuple of (potential_path, dataset_path)
-        
-    Raises:
-        FileNotFoundError: If no potential or dataset found
+def find_model_run_and_dataset(project_dir: Path, model_run_id: str) -> Tuple[Path, Path]:
+    """Resolve one completed model run through its persisted manifest."""
+    manifest_path = find_model_run_manifest(project_dir, model_run_id)
+    try:
+        manifest = validate_model_run_manifest(
+            manifest_path,
+            expected_model_run_id=model_run_id,
+        )
+    except (FileNotFoundError, ModelManifestError) as exc:
+        raise RuntimeError(f"Invalid model-run manifest for {model_run_id}") from exc
+
+    potential_artifact = Path(str(manifest["potential_artifact_path"])).resolve()
+    potential_path = potential_artifact.parent
+    canonical_dir = (project_dir / "nep" / "potentials").resolve()
+    try:
+        if potential_path.parent != canonical_dir:
+            raise ModelManifestError(
+                f"Model artifact is outside canonical NEP storage: {potential_artifact}"
+            )
+    except OSError as exc:
+        raise RuntimeError(f"Could not resolve model artifact path: {potential_artifact}") from exc
+
+    dataset_path = Path(str(manifest["dataset_path"])).resolve()
+    logger.info(
+        "Resolved model_run_id=%s to potential=%s and dataset_id=%s",
+        model_run_id,
+        potential_path,
+        manifest["dataset_id"],
+    )
+    return potential_path, dataset_path
+
+
+def find_latest_potential_and_dataset(
+    project_dir: Path,
+    model_run_id: str | None = None,
+) -> Tuple[Path, Path]:
+    """Compatibility wrapper requiring an explicit model-run identity.
+
+    The historical name is retained for callers during the Phase 2 migration;
+    it never performs latest-directory discovery.
     """
-    nep_dir = project_dir / "nep"
-    
-    # Find latest potential folder (highest potential_XXXX number)
-    potential_runs = sorted(nep_dir.glob("runs/potential_*"))
-    if not potential_runs:
-        raise FileNotFoundError("No potential folders found in nep/runs/")
-    
-    latest_potential = potential_runs[-1]
-    nep_txt = latest_potential / "nep.txt"
-    
-    if not nep_txt.exists():
-        raise FileNotFoundError(f"nep.txt not found in {latest_potential}")
-    
-    logger.info(f"Found latest potential: {latest_potential.name}")
-    
-    # Find latest dataset folder (highest dataset_XXXX number)
-    datasets = sorted(nep_dir.glob("datasets/dataset_*"))
-    if not datasets:
-        raise FileNotFoundError("No dataset folders found in nep/datasets/")
-    
-    latest_dataset = datasets[-1]
-    logger.info(f"Associated dataset: {latest_dataset.name}")
-    
-    return latest_potential, latest_dataset
+    if not model_run_id:
+        raise ValueError("model_run_id is required; latest model discovery is disabled")
+    return find_model_run_and_dataset(project_dir, model_run_id)
 
 
-def finalize_nep_potential(project_dir: Path) -> Tuple[Path, Path]:
+def finalize_nep_potential(
+    project_dir: Path,
+    model_run_id: str | None = None,
+) -> Tuple[Path, Path]:
     """Finalize trained potential by moving it to gpumd structure.
     
-    Moves nep.txt from nep/runs/potential_XXXX/ to gpumd/dataset_XXXX/potential_XXXX/
+    Copies nep.txt from nep/potentials/<run>/ to gpumd/dataset_XXXX/<run>/
     
     Args:
         project_dir: Project root directory
@@ -65,11 +82,11 @@ def finalize_nep_potential(project_dir: Path) -> Tuple[Path, Path]:
     Raises:
         FileNotFoundError: If no potential found
     """
-    nep_dir = project_dir / "nep"
     gpumd_dir = project_dir / "gpumd"
     
-    # Find latest potential and dataset
-    potential_src, dataset_path = find_latest_potential_and_dataset(project_dir)
+    if not model_run_id:
+        raise ValueError("model_run_id is required to finalize a potential")
+    potential_src, dataset_path = find_model_run_and_dataset(project_dir, model_run_id)
     
     # Extract folder names
     potential_name = potential_src.name  # potential_XXXX
@@ -82,6 +99,10 @@ def finalize_nep_potential(project_dir: Path) -> Tuple[Path, Path]:
     
     # Move nep.txt to destination
     src_nep = potential_src / "nep.txt"
+    if not src_nep.exists():
+        alternate_artifacts = sorted(potential_src.glob("nep*.txt"))
+        if alternate_artifacts:
+            src_nep = alternate_artifacts[0]
     dst_nep = gpumd_potential_dir / "nep.txt"
     
     if src_nep.exists() and not dst_nep.exists():

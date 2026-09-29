@@ -5,6 +5,7 @@ from configparser import ConfigParser
 from pathlib import Path
 
 from ..base import Stage, SelfResubmitExit
+from ..train_nep.launcher import read_train_status
 from .prepare import (
     finalize_nep_potential,
     prepare_validation_structures,
@@ -24,6 +25,22 @@ logger = logging.getLogger("nepflow.validate")
 
 class ValidateStage(Stage):
     """Validate trained models with GPUMD simulations."""
+
+    def _model_run_id(self, config: ConfigParser, status: dict) -> str:
+        """Return the explicitly requested model-run identity."""
+        persisted = status.get("model_run_id")
+        if persisted:
+            return str(persisted)
+        for section in ("validate", "gpumd"):
+            value = config.get(section, "model_run_id", fallback="").strip()
+            if value:
+                return value
+        training_status = read_train_status(self.project_dir)
+        if training_status.get("status") == "completed" and training_status.get("model_run_id"):
+            return str(training_status["model_run_id"])
+        raise ValueError(
+            "Validation requires an explicit model_run_id in [validate] or [gpumd]"
+        )
     
     def run(self) -> None:
         """Execute GPUMD validation workflow.
@@ -53,6 +70,8 @@ class ValidateStage(Stage):
         # === RESUBMISSION PATH ===
         if status.get("status") == "running" and not status.get("analysis_complete"):
             logger.info("Resubmitting from previous run")
+            model_run_id = self._model_run_id(config, status)
+            logger.info("Resuming validation for model_run_id=%s", model_run_id)
             
             gpumd_potential_dir = Path(status["potential_path"])
             preparation_state = status.get("preparation_state")
@@ -81,11 +100,15 @@ class ValidateStage(Stage):
         
         # === NEW SUBMISSION ===
         logger.info("Starting new validation run")
+        model_run_id = self._model_run_id(config, status)
         
         # Phase 1: Finalize NEP potential
         logger.info("\n--- Phase 1: Finalizing NEP potential ---")
         try:
-            gpumd_potential_dir, dataset_name = finalize_nep_potential(self.project_dir)
+            gpumd_potential_dir, dataset_name = finalize_nep_potential(
+                self.project_dir,
+                model_run_id=model_run_id,
+            )
             logger.info(f"NEP potential finalized at: {gpumd_potential_dir}")
         except FileNotFoundError as e:
             logger.error(f"Failed to finalize potential: {e}")
@@ -115,6 +138,7 @@ class ValidateStage(Stage):
         # Save initial status
         status = {
             "status": "running",
+            "model_run_id": model_run_id,
             "potential_path": str(gpumd_potential_dir),
             "dataset_path": str(dataset_path),
             "dataset_name": dataset_name,

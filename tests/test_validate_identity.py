@@ -11,9 +11,15 @@ pytest.importorskip("ase")
 pytest.importorskip("pymatgen")
 
 from modules.train_nep.train_nep import TrainNepStage  # noqa: E402
+from common.model_manifest import (  # noqa: E402
+    create_model_run_manifest,
+    update_model_run_status,
+    write_model_run_manifest,
+)
 from modules.validate import validate as validate_stage_module  # noqa: E402
 from modules.validate.prepare import (  # noqa: E402
     finalize_nep_potential,
+    find_model_run_and_dataset,
     find_latest_potential_and_dataset,
 )
 from modules.validate.validate import ValidateStage  # noqa: E402
@@ -52,16 +58,24 @@ def materialize_layout(
         model_path = project_dir / "nep" / model["directory"]
         model_path.mkdir(parents=True, exist_ok=True)
         (model_path / "nep.txt").write_text(f"model={model['model_id']}\n", encoding="utf-8")
+        (model_path / "nep.in").write_text(
+            f"type 1 {model['model_id']}\n",
+            encoding="utf-8",
+        )
         if write_manifests:
-            (model_path / "model_manifest.json").write_text(
-                json.dumps(
-                    {
-                        "model_id": model["model_id"],
-                        "dataset_id": model["dataset_id"],
-                    }
-                ),
-                encoding="utf-8",
+            manifest = create_model_run_manifest(
+                potential_path=model_path,
+                dataset_path=datasets[model["dataset_id"]],
+                dataset_id=model["dataset_id"],
+                nep_in_path=model_path / "nep.in",
+                hyperparameters_hash=f"fixture-{model['model_id']}",
             )
+            manifest["model_run_id"] = model["model_id"]
+            write_model_run_manifest(
+                model_path / "model_run_manifest.json",
+                manifest,
+            )
+            update_model_run_status(model_path, "completed")
         models[model["model_id"]] = model_path
 
     # Deliberately make lower lexical indices newer on disk. Correct resolution
@@ -114,10 +128,6 @@ def test_one_explicit_model_dataset_pair_resolves_exactly() -> None:
         "latest_model_directory_points_to_older_dataset",
     ],
 )
-@pytest.mark.xfail(
-    strict=True,
-    reason="Phase 2 blocker P0-1: model-to-dataset resolution must use explicit association, not latest ordering",
-)
 def test_model_specific_resolution_ignores_directory_and_mtime_order(layout_name: str) -> None:
     layout = load_layout(layout_name)
 
@@ -143,10 +153,6 @@ def test_model_specific_resolution_ignores_directory_and_mtime_order(layout_name
         "latest_model_directory_points_to_older_dataset",
     ],
 )
-@pytest.mark.xfail(
-    strict=True,
-    reason="Phase 2 blocker P0-1: validation must reject ambiguous latest discovery",
-)
 def test_validation_discovery_rejects_ambiguous_latest_pair(layout_name: str) -> None:
     layout = load_layout(layout_name)
 
@@ -156,10 +162,6 @@ def test_validation_discovery_rejects_ambiguous_latest_pair(layout_name: str) ->
             find_latest_potential_and_dataset(project_dir)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="Phase 2 blocker P0-1: missing model-to-dataset association must be an explicit error",
-)
 def test_missing_model_dataset_association_is_an_error() -> None:
     layout = load_layout("lexical_order_conflicts_with_explicit_association")
     single_pair = {"datasets": [layout["datasets"][0]], "models": [layout["models"][0]]}
@@ -170,36 +172,41 @@ def test_missing_model_dataset_association_is_an_error() -> None:
             train_stage_for(project_dir)._find_dataset_for_potential(models["model_old"])
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="Phase 2 blocker P0-1: a missing requested model must be an explicit error",
-)
 def test_missing_requested_model_is_an_error() -> None:
     layout = load_layout("lexical_order_conflicts_with_explicit_association")
 
     with tempfile.TemporaryDirectory() as tmp:
         project_dir, _, _ = materialize_layout(Path(tmp), layout)
-        missing_model = project_dir / "nep" / "runs" / "potential_missing"
+        missing_model = project_dir / "nep" / "potentials" / "potential_missing"
         with pytest.raises(FileNotFoundError):
             train_stage_for(project_dir)._find_dataset_for_potential(missing_model)
+        with pytest.raises(FileNotFoundError):
+            find_model_run_and_dataset(project_dir, "model_missing")
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="Phase 2 blocker P0-1: storage paths must not stand in for scientific model identity",
-)
 def test_storage_path_is_not_the_scientific_model_identity() -> None:
     layout = {
         "datasets": [{"directory": "datasets/data_a", "dataset_id": "dataset_a"}],
-        "models": [{"directory": "runs/arbitrary_model_storage", "model_id": "model_a", "dataset_id": "dataset_a"}],
+        "models": [{"directory": "potentials/arbitrary_model_storage", "model_id": "model_a", "dataset_id": "dataset_a"}],
     }
 
     with tempfile.TemporaryDirectory() as tmp:
         project_dir, _, _ = materialize_layout(Path(tmp), layout)
-        potential, dataset = find_latest_potential_and_dataset(project_dir)
+        potential, dataset = find_latest_potential_and_dataset(project_dir, "model_a")
 
     assert potential.name == "arbitrary_model_storage"
     assert dataset.name == "data_a"
+
+
+def test_manifest_artifact_hash_mismatch_is_rejected() -> None:
+    layout = load_layout("lexical_order_conflicts_with_explicit_association")
+    single_pair = {"datasets": [layout["datasets"][0]], "models": [layout["models"][0]]}
+
+    with tempfile.TemporaryDirectory() as tmp:
+        project_dir, models, _ = materialize_layout(Path(tmp), single_pair)
+        (models["model_old"] / "nep.txt").write_text("tampered\n", encoding="utf-8")
+        with pytest.raises(RuntimeError):
+            find_latest_potential_and_dataset(project_dir, "model_old")
 
 
 def test_finalize_preserves_the_resolved_model_dataset_pair() -> None:
@@ -208,7 +215,7 @@ def test_finalize_preserves_the_resolved_model_dataset_pair() -> None:
 
     with tempfile.TemporaryDirectory() as tmp:
         project_dir, models, datasets = materialize_layout(Path(tmp), single_pair)
-        finalized_path, dataset_name = finalize_nep_potential(project_dir)
+        finalized_path, dataset_name = finalize_nep_potential(project_dir, "model_old")
 
         assert finalized_path == project_dir / "gpumd" / datasets["dataset_old"].name / models["model_old"].name
         assert dataset_name == datasets["dataset_old"].name
@@ -227,6 +234,7 @@ def test_validation_entry_point_preserves_model_dataset_association_through_prep
         stage = validate_stage_for(project_dir)
         config = ConfigParser()
         config["slurm"] = {"enabled": "false"}
+        config["gpumd"] = {"model_run_id": "model_old"}
         preparation_state = {"struct_count": 1, "validation_root": str(project_dir / "validation")}
 
         with (

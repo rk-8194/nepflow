@@ -165,7 +165,7 @@ class InitStage(Stage):
             self.project_dir / "vasp" / "jobs",
             self.project_dir / "vasp" / "results",
             self.project_dir / "nep" / "datasets",
-            self.project_dir / "nep" / "runs",
+            self.project_dir / "nep" / "potentials",
             self.project_dir / "gpumd" / "validation",
             self.project_dir / "logs",
             self.project_dir / "reports",
@@ -455,6 +455,8 @@ max_resubmit=3
 
 [gpumd]
 enabled=true
+# Explicit model_run_id to validate; generated after NEP training completes.
+model_run_id=
 
 [slurm]
 enabled=false
