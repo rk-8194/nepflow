@@ -70,13 +70,9 @@ def prepare_state_fixture(root: Path) -> tuple[dict, Path]:
             config_gpumd_dir=config_gpumd_dir,
         )
 
-    return state, state["struct_folders"][0]["path"]
+    return state, Path(state["struct_folders"][0]["path"])
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="Phase 2 blocker P0-2: validation preparation state must be JSON serializable",
-)
 def test_preparation_state_serializes_without_raw_paths() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         state, _ = prepare_state_fixture(Path(tmp))
@@ -84,10 +80,6 @@ def test_preparation_state_serializes_without_raw_paths() -> None:
     json.dumps(state)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="Phase 2 blocker P0-2: persisted validation state must round-trip structure paths",
-)
 def test_persisted_preparation_paths_round_trip_after_reload() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
@@ -109,6 +101,7 @@ def resume_state(root: Path) -> tuple[ValidateStage, dict, Path]:
     }
     status = {
         "status": "running",
+        "model_run_id": "model_run_resume_fixture",
         "potential_path": str(potential_path),
         "dataset_path": str(root / "nep" / "datasets" / "dataset_0001"),
         "dataset_name": "dataset_0001",
@@ -120,10 +113,6 @@ def resume_state(root: Path) -> tuple[ValidateStage, dict, Path]:
     return make_validate_stage(root), status, potential_path
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="Phase 2 blocker P0-5: resumed validation must reload launcher-updated completion state",
-)
 def test_resumed_stage_observes_persisted_launcher_completion_before_analysis() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
@@ -163,10 +152,6 @@ def test_missing_required_resume_status_fields_fail_explicitly() -> None:
                 stage.run()
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="Phase 2 blocker P0-5: malformed validation state must fail fast instead of becoming an empty state",
-)
 def test_malformed_validation_status_is_an_explicit_failure() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
@@ -230,10 +215,6 @@ def test_scheduler_query_failure_does_not_complete_submitted_validation_job() ->
         assert persisted["struct_status"]["struct_0000"]["status"] != "completed"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="Phase 2 blocker P0-5: failed analysis must not persist analysis_complete",
-)
 def test_analysis_failure_cannot_mark_validation_analysis_complete() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)

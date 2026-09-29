@@ -13,16 +13,31 @@ from ..base import SelfResubmitExit
 logger = logging.getLogger("nepflow.validate")
 
 
+def _json_safe(value):
+    """Convert persisted workflow values to JSON-native values."""
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    raise TypeError(f"Validation status contains non-serializable value: {type(value).__name__}")
+
+
 def read_validation_status(project_dir: Path) -> dict:
     """Read validation job status from .validation_status file."""
     status_file = project_dir / "gpumd" / ".validation_status"
-    if status_file.exists():
-        try:
-            return json.loads(status_file.read_text())
-        except (json.JSONDecodeError, OSError) as e:
-            logger.warning(f"Could not read validation status file: {e}")
-            return {}
-    return {}
+    if not status_file.exists():
+        return {}
+    try:
+        status = json.loads(status_file.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as exc:
+        raise ValueError(f"Could not read validation status file: {status_file}") from exc
+    if not isinstance(status, dict):
+        raise ValueError(f"Validation status must be a JSON object: {status_file}")
+    return status
 
 
 def write_validation_status(project_dir: Path, **kwargs) -> None:
@@ -32,10 +47,15 @@ def write_validation_status(project_dir: Path, **kwargs) -> None:
     status_file = status_dir / ".validation_status"
     
     status_data = read_validation_status(project_dir)
-    status_data.update(kwargs)
+    status_data.update(_json_safe(kwargs))
     status_data["updated"] = time.time()
     
-    status_file.write_text(json.dumps(status_data, indent=2))
+    temporary_status_file = status_file.with_suffix(".tmp")
+    temporary_status_file.write_text(
+        json.dumps(status_data, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    temporary_status_file.replace(status_file)
 
 
 def _check_struct_complete(struct_dir: Path) -> bool:

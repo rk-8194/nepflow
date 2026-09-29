@@ -26,6 +26,26 @@ logger = logging.getLogger("nepflow.validate")
 class ValidateStage(Stage):
     """Validate trained models with GPUMD simulations."""
 
+    @staticmethod
+    def _require_resume_state(status: dict) -> None:
+        """Reject incomplete persisted state instead of guessing recovery."""
+        required = (
+            "model_run_id",
+            "potential_path",
+            "dataset_path",
+            "dataset_name",
+            "preparation_state",
+            "validation_complete",
+            "analysis_complete",
+        )
+        missing = [key for key in required if key not in status]
+        if missing:
+            raise ValueError(
+                "Validation status is missing required fields: " + ", ".join(missing)
+            )
+        if not isinstance(status["preparation_state"], dict):
+            raise ValueError("Validation status preparation_state must be an object")
+
     def _model_run_id(self, config: ConfigParser, status: dict) -> str:
         """Return the explicitly requested model-run identity."""
         persisted = status.get("model_run_id")
@@ -61,14 +81,11 @@ class ValidateStage(Stage):
         logger.debug(f"Loaded config: {config_path}")
         
         # Check if this is a resubmission
-        try:
-            status = read_validation_status(self.project_dir)
-        except Exception as e:
-            logger.debug(f"Could not read status: {e}")
-            status = {}
+        status = read_validation_status(self.project_dir)
         
         # === RESUBMISSION PATH ===
         if status.get("status") == "running" and not status.get("analysis_complete"):
+            self._require_resume_state(status)
             logger.info("Resubmitting from previous run")
             model_run_id = self._model_run_id(config, status)
             logger.info("Resuming validation for model_run_id=%s", model_run_id)
@@ -89,8 +106,9 @@ class ValidateStage(Stage):
                     logger.warning(f"Resubmit needed: {e}")
                     raise
                 
-                # If launcher returns, check validation completion
-                if status.get("validation_complete"):
+                # Reload the authoritative state written by the launcher.
+                status = read_validation_status(self.project_dir)
+                if status.get("validation_complete") is True:
                     logger.info("Validation jobs completed, proceeding to analysis...")
                     self._run_analysis(config, status)
                 
@@ -162,9 +180,12 @@ class ValidateStage(Stage):
             logger.warning(f"Resubmit needed: {e}")
             raise
         
-        # Update status: validation complete
-        status["validation_complete"] = True
-        write_validation_status(self.project_dir, **status)
+        # Reload the authoritative state written by the launcher. The launcher
+        # is the only component that decides whether validation completed.
+        status = read_validation_status(self.project_dir)
+        if status.get("validation_complete") is not True:
+            logger.warning("Validation launcher did not report successful completion")
+            return
         logger.info("All validation jobs completed")
         
         # Phase 4: Analyze results
@@ -185,6 +206,8 @@ class ValidateStage(Stage):
         try:
             preparation_state = status.get("preparation_state")
             dataset_name = status.get("dataset_name")
+            if not isinstance(preparation_state, dict) or not dataset_name:
+                raise ValueError("Validation analysis state is incomplete")
             gpumd_potential_dir = Path(status["potential_path"])
             
             if not preparation_state:
@@ -206,34 +229,27 @@ class ValidateStage(Stage):
             csv_path = reports_dir / f"{dataset_name}_{potential_name}_comparison.csv"
             logger.info(f"Generating comparison CSV: {csv_path}")
             
-            try:
-                generate_comparison_csv(
-                    validation_root=validation_root,
-                    test_xyz_path=test_xyz_path,
-                    output_csv_path=csv_path,
-                )
-            except Exception as e:
-                logger.error(f"Failed to generate CSV: {e}")
-                import traceback
-                traceback.print_exc()
+            generate_comparison_csv(
+                validation_root=validation_root,
+                test_xyz_path=test_xyz_path,
+                output_csv_path=csv_path,
+            )
+            if not csv_path.exists() or csv_path.stat().st_size == 0:
+                raise RuntimeError(f"Comparison CSV was not produced: {csv_path}")
             
             # Generate plots
             logger.info("Generating comparison plots...")
-            try:
-                plot_comparison_results(
-                    csv_path=csv_path,
-                    output_dir=reports_dir,
-                    dataset_name=dataset_name,
-                    potential_name=potential_name,
-                )
-            except Exception as e:
-                logger.error(f"Failed to generate plots: {e}")
-                import traceback
-                traceback.print_exc()
+            plot_comparison_results(
+                csv_path=csv_path,
+                output_dir=reports_dir,
+                dataset_name=dataset_name,
+                potential_name=potential_name,
+            )
             
             # Mark analysis complete
-            status["analysis_complete"] = True
-            write_validation_status(self.project_dir, **status)
+            persisted_status = read_validation_status(self.project_dir)
+            persisted_status["analysis_complete"] = True
+            write_validation_status(self.project_dir, **persisted_status)
             
             logger.info("Analysis complete")
         

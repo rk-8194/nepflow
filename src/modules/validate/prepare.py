@@ -408,9 +408,9 @@ def prepare_validation_structures(
         
         struct_folders.append({
             "name": struct_name,
-            "path": struct_dir,
+            "path": str(struct_dir),
             "atoms_count": len(atoms),
-            "replicates": (nx, ny, nz),
+            "replicates": [nx, ny, nz],
         })
     
     logger.info(f"Prepared {len(struct_folders)} validation structures")
