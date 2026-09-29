@@ -243,6 +243,11 @@ def run_validation_launcher(
     
     # Load or initialize status
     status = read_validation_status(project_dir)
+    started_at = status.get("validation_started_at")
+    if not isinstance(started_at, (int, float)):
+        started_at = time.time()
+        status["validation_started_at"] = started_at
+        write_validation_status(project_dir, **status)
     
     if not status.get("struct_status"):
         # Initialize struct tracking
@@ -339,12 +344,14 @@ def run_validation_launcher(
         if len(completed) == struct_count:
             logger.info("All validation jobs completed successfully!")
             status["validation_complete"] = True
+            status["validation_runtime_seconds"] = max(0.0, time.time() - started_at)
             write_validation_status(project_dir, **status)
             break
         
         if len(failed) + len(completed) == struct_count:
             logger.warning(f"Validation finished with {len(failed)} failures")
             status["validation_complete"] = False
+            status["validation_runtime_seconds"] = max(0.0, time.time() - started_at)
             write_validation_status(project_dir, **status)
             break
         

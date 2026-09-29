@@ -396,6 +396,24 @@ def prepare_validation_structures(
             f"replicate {nx} {ny} {nz}",
             run_in_content,
         )
+
+        # GPUMD's dump_xyz artifact is the authoritative source for model
+        # energy, forces, and virial used by the analysis stage.  Insert it
+        # before the run command so every validation job emits a complete
+        # extended-XYZ prediction frame at out.xyz.
+        dump_command = "dump_xyz 1 out.xyz precision double force potential virial"
+        run_lines = run_in_content.rstrip().splitlines()
+        if not any(line.strip() == dump_command for line in run_lines):
+            run_index = next(
+                (
+                    index
+                    for index in range(len(run_lines) - 1, -1, -1)
+                    if run_lines[index].strip().startswith("run ")
+                ),
+                len(run_lines),
+            )
+            run_lines.insert(run_index, dump_command)
+        run_in_content = "\n".join(run_lines) + "\n"
         
         run_in_path = struct_dir / "run.in"
         run_in_path.write_text(run_in_content)

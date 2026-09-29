@@ -1,4 +1,4 @@
-"""Post-validation analysis: compare DFT vs GPUMD results and generate reports."""
+"""Post-validation analysis: compare DFT labels with genuine GPUMD output."""
 
 import csv
 import logging
@@ -6,94 +6,179 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
-from ase.io import read as ase_read
 from ase.atoms import Atoms
+from ase.io import read as ase_read
 
 logger = logging.getLogger("nepflow.validate")
 
+_VIRIAL_COMPONENTS = ("xx", "xy", "xz", "yx", "yy", "yz", "zx", "zy", "zz")
+
+
+def _finite_scalar(value: object, label: str) -> float:
+    """Return one finite numeric value or raise a precise validation error."""
+    try:
+        result = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{label} is not numeric") from exc
+    if not np.isfinite(result):
+        raise ValueError(f"{label} is not finite")
+    return result
+
+
+def _finite_force_array(value: object, atoms_count: int, label: str) -> np.ndarray:
+    """Validate a per-atom Cartesian force array in eV/Angstrom."""
+    if value is None:
+        raise ValueError(f"{label} is missing; GPUMD validation requires forces")
+    forces = np.asarray(value, dtype=float)
+    if forces.shape != (atoms_count, 3):
+        raise ValueError(
+            f"{label} must have shape ({atoms_count}, 3), got {forces.shape}"
+        )
+    if not np.isfinite(forces).all():
+        raise ValueError(f"{label} contains non-finite values")
+    return forces
+
+
+def _tensor_from_value(value: object, label: str) -> np.ndarray:
+    """Normalize a row-major 3x3 tensor and reject malformed values."""
+    if value is None:
+        raise ValueError(f"{label} is missing")
+    tensor = np.asarray(value, dtype=float)
+    if tensor.shape == (9,):
+        tensor = tensor.reshape(3, 3)
+    if tensor.shape != (3, 3):
+        raise ValueError(f"{label} must have shape (3, 3), got {tensor.shape}")
+    if not np.isfinite(tensor).all():
+        raise ValueError(f"{label} contains non-finite values")
+    return tensor
+
+
+def _stress_to_virial(atoms: Atoms, stress: object) -> np.ndarray:
+    """Convert stress in eV/Angstrom^3 to positive-compression virial in eV."""
+    stress_array = np.asarray(stress, dtype=float)
+    if stress_array.shape == (6,):
+        xx, yy, zz, yz, xz, xy = stress_array
+        stress_array = np.array(
+            [[xx, xy, xz], [xy, yy, yz], [xz, yz, zz]], dtype=float
+        )
+    stress_array = _tensor_from_value(stress_array, "stress")
+    volume = float(atoms.get_volume())
+    if not np.isfinite(volume) or volume <= 0:
+        raise ValueError("stress-to-virial conversion requires a positive cell volume")
+    return -stress_array * volume
+
+
+def _extract_energy(atoms: Atoms, label: str) -> float:
+    """Read the explicit total-energy field written by an extended-XYZ parser."""
+    if "energy" not in atoms.info:
+        raise ValueError(f"{label} is missing total energy in the XYZ frame metadata")
+    return _finite_scalar(atoms.info["energy"], f"{label} energy")
+
+
+def _extract_forces(atoms: Atoms, label: str) -> np.ndarray:
+    """Read the force array emitted by DFT or GPUMD."""
+    force_value = atoms.arrays.get("force")
+    if force_value is None:
+        force_value = atoms.arrays.get("forces")
+    return _finite_force_array(force_value, len(atoms), f"{label} forces")
+
+
+def _extract_virial(atoms: Atoms, label: str, required: bool) -> Optional[np.ndarray]:
+    """Read a virial tensor, converting an explicit stress field when needed."""
+    if "virial" in atoms.info:
+        return _tensor_from_value(atoms.info["virial"], f"{label} virial")
+    if "stress" in atoms.info:
+        return _stress_to_virial(atoms, atoms.info["stress"])
+    if required:
+        raise ValueError(f"{label} is missing required virial/stress output")
+    return None
+
+
+def _read_last_frame(path: Path, label: str) -> Atoms:
+    """Read the final extended-XYZ frame from one validation artifact."""
+    if not path.exists():
+        raise FileNotFoundError(f"{label} not found: {path}")
+    try:
+        frames = ase_read(str(path), index=":", format="extxyz")
+    except Exception as exc:
+        raise ValueError(f"Could not parse {label}: {exc}") from exc
+    if isinstance(frames, Atoms):
+        return frames
+    if not frames:
+        raise ValueError(f"{label} contains no XYZ frames: {path}")
+    return frames[-1]
+
+
+def _composition(atoms: Atoms) -> str:
+    counts: Dict[str, int] = {}
+    for symbol in atoms.get_chemical_symbols():
+        counts[symbol] = counts.get(symbol, 0) + 1
+    return " ".join(f"{symbol}{counts[symbol]}" for symbol in sorted(counts))
+
 
 def parse_dft_properties(test_xyz_path: Path) -> Dict[int, Dict]:
-    """Parse DFT properties from test.xyz file.
-    
-    Returns dict mapping structure index → {atoms_count, energy, forces, stress, species}
-    
-    Args:
-        test_xyz_path: Path to test.xyz file
-        
-    Returns:
-        Dict with DFT properties per structure
+    """Parse required DFT energy/force labels and optional virial labels.
+
+    Energies are eV, forces are eV/Angstrom, and virials are eV in row-major
+    order using the positive-compression convention.  Stress labels are
+    converted with ``virial = -stress * volume`` when supplied instead.
     """
     if not test_xyz_path.exists():
         raise FileNotFoundError(f"test.xyz not found: {test_xyz_path}")
-    
-    dft_data = {}
-    
     try:
-        atoms_list = ase_read(str(test_xyz_path), index=":")
-        if isinstance(atoms_list, Atoms):
-            atoms_list = [atoms_list]
-        
-        for idx, atoms in enumerate(atoms_list):
-            energy = atoms.get_potential_energy() if hasattr(atoms, "get_potential_energy") else None
-            forces = atoms.get_forces() if hasattr(atoms, "get_forces") else None
-            stress = atoms.info.get("stress", None)
-            
-            # Normalize stress to virial if needed
-            virial = None
-            if stress is not None:
-                # Stress is typically in kB, convert to virial (eV) if volume known
-                volume = atoms.get_volume() if hasattr(atoms, "get_volume") else None
-                if volume is not None:
-                    # Virial = -Stress * Volume (converting units appropriately)
-                    # For now, store stress as-is and handle in comparison
-                    virial = np.array(stress)
-            
-            dft_data[idx] = {
-                "atoms_count": len(atoms),
-                "energy": energy,
-                "forces": forces,
-                "stress": stress,
-                "virial": virial,
-                "species": list(atoms.get_chemical_symbols()),
-            }
-    
-    except Exception as e:
-        logger.error(f"Failed to parse test.xyz: {e}")
-        raise ValueError(f"Could not parse test.xyz: {e}") from e
-    
-    logger.info(f"Parsed DFT data for {len(dft_data)} structures")
+        frames = ase_read(str(test_xyz_path), index=":", format="extxyz")
+    except Exception as exc:
+        raise ValueError(f"Could not parse test.xyz: {exc}") from exc
+    if isinstance(frames, Atoms):
+        frames = [frames]
+    if not frames:
+        raise ValueError(f"test.xyz contains no structures: {test_xyz_path}")
+
+    dft_data: Dict[int, Dict] = {}
+    for idx, atoms in enumerate(frames):
+        dft_data[idx] = {
+            "atoms_count": len(atoms),
+            "energy": _extract_energy(atoms, f"DFT structure {idx}"),
+            "forces": _extract_forces(atoms, f"DFT structure {idx}"),
+            "virial": _extract_virial(atoms, f"DFT structure {idx}", required=False),
+            "species": list(atoms.get_chemical_symbols()),
+            "composition": _composition(atoms),
+            "perturbation_family": str(
+                atoms.info.get("perturbation_type", atoms.info.get("configuration_family", ""))
+            ),
+        }
+
+    logger.info("Parsed DFT data for %d structures", len(dft_data))
     return dft_data
 
 
-def parse_gpumd_output(out_xyz_path: Path) -> Tuple[int, Optional[np.ndarray], Optional[np.ndarray]]:
-    """Parse GPUMD output from out.xyz file.
-    
-    GPUMD output format: standard XYZ without energy/forces/virials.
-    Only positions matter for force comparison (not needed here).
-    
-    Args:
-        out_xyz_path: Path to out.xyz file
-        
-    Returns:
-        Tuple of (atoms_count, positions, None for forces since GPUMD doesn't output them)
+def parse_gpumd_output(
+    out_xyz_path: Path,
+    require_virial: bool = True,
+) -> Tuple[int, np.ndarray, Dict[str, Optional[np.ndarray]]]:
+    """Parse genuine model predictions from GPUMD's ``dump_xyz`` output.
+
+    GPUMD writes total energy and total virial/stress in the extended-XYZ
+    frame metadata and per-atom forces in the ``force:R:3`` array.  The final
+    frame is used because the launcher may append on resumed runs.  Missing
+    energy or forces always fails; virial is required when the validation
+    contract requests it.
     """
-    if not out_xyz_path.exists():
-        raise FileNotFoundError(f"out.xyz not found: {out_xyz_path}")
-    
-    try:
-        # Read last frame if multiple frames exist
-        atoms_list = ase_read(str(out_xyz_path), index=":")
-        if isinstance(atoms_list, Atoms):
-            atoms = atoms_list
-        else:
-            atoms = atoms_list[-1]  # Last frame
-        
-        positions = atoms.get_positions()
-        return len(atoms), positions, None
-    
-    except Exception as e:
-        logger.error(f"Failed to parse out.xyz: {e}")
-        raise ValueError(f"Could not parse out.xyz: {e}") from e
+    atoms = _read_last_frame(out_xyz_path, "GPUMD out.xyz")
+    predictions: Dict[str, Optional[np.ndarray]] = {
+        "energy": _extract_energy(atoms, "GPUMD output"),
+        "forces": _extract_forces(atoms, "GPUMD output"),
+        "virial": _extract_virial(atoms, "GPUMD output", required=require_virial),
+    }
+    return len(atoms), np.asarray(atoms.positions, dtype=float), predictions
+
+
+def _metrics(errors: np.ndarray) -> Tuple[float, float]:
+    """Return MAE and RMSE for a non-empty finite error array."""
+    values = np.asarray(errors, dtype=float)
+    if values.size == 0 or not np.isfinite(values).all():
+        raise ValueError("Cannot calculate metrics from empty or non-finite errors")
+    return float(np.mean(np.abs(values))), float(np.sqrt(np.mean(values**2)))
 
 
 def generate_comparison_csv(
@@ -101,105 +186,166 @@ def generate_comparison_csv(
     test_xyz_path: Path,
     output_csv_path: Path,
 ) -> None:
-    """Generate CSV comparing DFT vs ML results per structure and atom.
-    
-    CSV columns:
-    struct_id, atom_id, species, energy_per_atom_dft, energy_per_atom_ml,
-    force_magnitude_dft, force_magnitude_ml, 
-    [virial_xx, virial_xy, virial_xz, virial_yx, virial_yy, virial_yz, virial_zx, virial_zy, virial_zz]
-    
-    Note: GPUMD only outputs final positions, not forces. Forces are set to NaN.
-    
-    Args:
-        validation_root: Path to gpumd/[dataset]/[potential]/validation/
-        test_xyz_path: Path to original test.xyz (has DFT properties)
-        output_csv_path: Path where CSV will be written
-    """
-    # Parse DFT data
+    """Generate a complete DFT-vs-model report from paired predictions."""
     dft_data = parse_dft_properties(test_xyz_path)
-    
-    logger.info(f"Generating comparison CSV: {output_csv_path}")
-    
-    rows = []
-    
-    for struct_idx in sorted(dft_data.keys()):
-        struct_name = f"struct_{struct_idx:04d}"
-        struct_dir = validation_root / struct_name
-        out_xyz_path = struct_dir / "out.xyz"
-        
+    if not dft_data:
+        raise ValueError("No DFT structures are available for validation")
+
+    virial_required = any(record.get("virial") is not None for record in dft_data.values())
+    if virial_required and any(record.get("virial") is None for record in dft_data.values()):
+        raise ValueError("Validation requires virial labels for every DFT structure")
+
+    paired = []
+    for struct_idx in sorted(dft_data):
         dft = dft_data[struct_idx]
-        atoms_count = dft["atoms_count"]
-        
-        if not out_xyz_path.exists():
-            logger.warning(f"{struct_name}: out.xyz not found, skipping")
-            continue
-        
-        try:
-            ml_atoms_count, ml_positions, _ = parse_gpumd_output(out_xyz_path)
-        except Exception as e:
-            logger.error(f"{struct_name}: failed to parse out.xyz: {e}")
-            continue
-        
-        # Verify atom counts match
-        if ml_atoms_count != atoms_count:
-            logger.warning(
-                f"{struct_name}: atom count mismatch (DFT: {atoms_count}, ML: {ml_atoms_count})"
+        out_xyz_path = validation_root / f"struct_{struct_idx:04d}" / "out.xyz"
+        ml_count, _, ml = parse_gpumd_output(out_xyz_path, require_virial=virial_required)
+        if ml_count != dft["atoms_count"]:
+            raise ValueError(
+                f"struct_{struct_idx:04d}: atom count mismatch "
+                f"(DFT: {dft['atoms_count']}, GPUMD: {ml_count})"
             )
-        
-        # Per-atom energy (normalize by atom count)
-        energy_dft_per_atom = dft["energy"] / atoms_count if dft["energy"] is not None else None
-        energy_ml_per_atom = energy_dft_per_atom  # ML energy not available from GPUMD
-        
-        # Per-atom forces (GPUMD doesn't output forces, use NaN)
-        forces_dft = dft["forces"]
-        forces_ml = None  # GPUMD output doesn't include forces
-        
-        # Virials/stress
-        virial_dft = dft["virial"]
-        virial_ml = None  # GPUMD output doesn't include virial
-        
-        # Write per-atom rows
-        for atom_idx in range(atoms_count):
-            species = dft["species"][atom_idx] if atom_idx < len(dft["species"]) else "?"
-            
-            force_mag_dft = None
-            if forces_dft is not None and atom_idx < len(forces_dft):
-                force_mag_dft = np.linalg.norm(forces_dft[atom_idx])
-            
+
+        ml_forces = _finite_force_array(
+            ml.get("forces"), ml_count, f"struct_{struct_idx:04d} GPUMD forces"
+        )
+        ml_virial = ml.get("virial")
+        if virial_required and ml_virial is None:
+            raise ValueError(f"struct_{struct_idx:04d}: required GPUMD virial is missing")
+        paired.append(
+            {
+                "struct_idx": struct_idx,
+                "dft": dft,
+                "ml_energy": _finite_scalar(
+                    ml.get("energy"), f"struct_{struct_idx:04d} GPUMD energy"
+                ),
+                "ml_forces": ml_forces,
+                "ml_virial": ml_virial,
+            }
+        )
+
+    energy_errors = np.array(
+        [
+            item["ml_energy"] / item["dft"]["atoms_count"]
+            - item["dft"]["energy"] / item["dft"]["atoms_count"]
+            for item in paired
+        ]
+    )
+    energy_mae, energy_rmse = _metrics(energy_errors)
+    force_errors = np.concatenate(
+        [item["ml_forces"] - item["dft"]["forces"] for item in paired], axis=0
+    )
+    force_component_mae, force_component_rmse = _metrics(force_errors.reshape(-1))
+    force_magnitude_errors = np.concatenate(
+        [
+            np.linalg.norm(item["ml_forces"], axis=1)
+            - np.linalg.norm(item["dft"]["forces"], axis=1)
+            for item in paired
+        ]
+    )
+    force_magnitude_mae, force_magnitude_rmse = _metrics(force_magnitude_errors)
+
+    virial_mae = virial_rmse = None
+    if virial_required:
+        virial_errors = np.concatenate(
+            [
+                (item["ml_virial"] - item["dft"]["virial"]).reshape(-1)
+                for item in paired
+            ]
+        )
+        virial_mae, virial_rmse = _metrics(virial_errors)
+
+    rows = []
+    for item in paired:
+        struct_idx = item["struct_idx"]
+        dft = item["dft"]
+        dft_forces = np.asarray(dft["forces"], dtype=float)
+        ml_forces = item["ml_forces"]
+        dft_energy_per_atom = dft["energy"] / dft["atoms_count"]
+        ml_energy_per_atom = item["ml_energy"] / dft["atoms_count"]
+        for atom_idx in range(dft["atoms_count"]):
             row = {
                 "struct_id": struct_idx,
                 "atom_id": atom_idx,
-                "species": species,
-                "energy_per_atom_dft": energy_dft_per_atom,
-                "energy_per_atom_ml": energy_ml_per_atom,
-                "force_magnitude_dft": force_mag_dft,
-                "force_magnitude_ml": None,
+                "species": dft["species"][atom_idx],
+                "composition": dft.get("composition", ""),
+                "perturbation_family": dft.get("perturbation_family", ""),
+                "energy_unit": "eV",
+                "force_unit": "eV/Angstrom",
+                "energy_per_atom_dft": dft_energy_per_atom,
+                "energy_per_atom_ml": ml_energy_per_atom,
+                "energy_error_per_atom": ml_energy_per_atom - dft_energy_per_atom,
+                "energy_mae": energy_mae,
+                "energy_rmse": energy_rmse,
+                "force_x_dft": dft_forces[atom_idx, 0],
+                "force_y_dft": dft_forces[atom_idx, 1],
+                "force_z_dft": dft_forces[atom_idx, 2],
+                "force_x_ml": ml_forces[atom_idx, 0],
+                "force_y_ml": ml_forces[atom_idx, 1],
+                "force_z_ml": ml_forces[atom_idx, 2],
+                "force_x_error": ml_forces[atom_idx, 0] - dft_forces[atom_idx, 0],
+                "force_y_error": ml_forces[atom_idx, 1] - dft_forces[atom_idx, 1],
+                "force_z_error": ml_forces[atom_idx, 2] - dft_forces[atom_idx, 2],
+                "force_magnitude_dft": np.linalg.norm(dft_forces[atom_idx]),
+                "force_magnitude_ml": np.linalg.norm(ml_forces[atom_idx]),
+                "force_magnitude_error": np.linalg.norm(ml_forces[atom_idx])
+                - np.linalg.norm(dft_forces[atom_idx]),
+                "force_component_mae": force_component_mae,
+                "force_component_rmse": force_component_rmse,
+                "force_magnitude_mae": force_magnitude_mae,
+                "force_magnitude_rmse": force_magnitude_rmse,
             }
-            
-            # Add virial components if available
-            if virial_dft is not None:
-                for i in range(3):
-                    for j in range(3):
-                        row[f"virial_{['x','y','z'][i]}{['x','y','z'][j]}"] = virial_dft[i, j]
-            else:
-                for i in range(3):
-                    for j in range(3):
-                        row[f"virial_{['x','y','z'][i]}{['x','y','z'][j]}"] = None
-            
+            if virial_required:
+                row["virial_unit"] = "eV"
+                row["virial_convention"] = "positive_compression"
+                for component, dft_value, ml_value in zip(
+                    _VIRIAL_COMPONENTS,
+                    dft["virial"].reshape(-1),
+                    item["ml_virial"].reshape(-1),
+                ):
+                    row[f"virial_{component}_dft"] = dft_value
+                    row[f"virial_{component}_ml"] = ml_value
+                    row[f"virial_{component}_error"] = ml_value - dft_value
+                row["virial_mae"] = virial_mae
+                row["virial_rmse"] = virial_rmse
             rows.append(row)
-    
-    if not rows:
-        logger.warning("No comparison data generated")
-        return
-    
-    # Write CSV
-    fieldnames = rows[0].keys()
-    with open(output_csv_path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
+
+    output_csv_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_csv_path.open("w", newline="", encoding="utf-8") as output_file:
+        writer = csv.DictWriter(output_file, fieldnames=list(rows[0]))
         writer.writeheader()
         writer.writerows(rows)
-    
-    logger.info(f"CSV generated: {len(rows)} atoms from {len(dft_data)} structures")
+    logger.info("CSV generated: %d paired atoms from %d structures", len(rows), len(paired))
+
+
+def _read_csv_rows(csv_path: Path) -> List[dict]:
+    if not csv_path.exists():
+        raise FileNotFoundError(f"Comparison CSV not found: {csv_path}")
+    with csv_path.open("r", newline="", encoding="utf-8") as input_file:
+        rows = list(csv.DictReader(input_file))
+    if not rows:
+        raise ValueError(f"Comparison CSV contains no paired rows: {csv_path}")
+    return rows
+
+
+def _paired_column_values(
+    rows: List[dict], dft_key: str, ml_key: str
+) -> Tuple[List[float], List[float]]:
+    if not all(dft_key in row and ml_key in row for row in rows):
+        raise ValueError(f"Comparison CSV is missing paired columns {dft_key!r}/{ml_key!r}")
+    dft_values = []
+    ml_values = []
+    for index, row in enumerate(rows):
+        try:
+            dft_value = _finite_scalar(row[dft_key], f"CSV row {index} {dft_key}")
+            ml_value = _finite_scalar(row[ml_key], f"CSV row {index} {ml_key}")
+        except ValueError as exc:
+            raise ValueError(
+                f"Comparison CSV row {index} lacks a complete DFT/ML pair for {dft_key}/{ml_key}"
+            ) from exc
+        dft_values.append(dft_value)
+        ml_values.append(ml_value)
+    return dft_values, ml_values
 
 
 def plot_comparison_results(
@@ -208,84 +354,57 @@ def plot_comparison_results(
     dataset_name: str,
     potential_name: str,
 ) -> None:
-    """Generate scatter plots comparing DFT vs ML predictions.
-    
-    Creates plots for:
-    - Energy per atom
-    - Force magnitude per atom
-    - Virial tensor components (if available)
-    
-    Naming convention: dataset_XXXX_potential_YYYY_[metric].png
-    
-    Args:
-        csv_path: Path to comparison CSV
-        output_dir: Directory where plots will be saved (reports/)
-        dataset_name: Dataset folder name (dataset_XXXX)
-        potential_name: Potential folder name (potential_YYYY)
-    """
+    """Generate parity plots only from complete paired DFT/ML values."""
     try:
-        import matplotlib.pyplot as plt
-        from scipy import stats
-    except ImportError:
-        logger.warning("matplotlib/scipy not available, skipping plots")
-        return
-    
-    if not csv_path.exists():
-        logger.warning(f"CSV not found: {csv_path}")
-        return
-    
-    logger.info(f"Generating comparison plots...")
-    
-    # Parse CSV
-    data = {}
-    with open(csv_path, "r") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            for key in ["struct_id", "atom_id"]:
-                row[key] = int(row[key])
-            for key in ["energy_per_atom_dft", "energy_per_atom_ml", "force_magnitude_dft", "force_magnitude_ml"]:
-                if key in row:
-                    try:
-                        row[key] = float(row[key]) if row[key] else None
-                    except ValueError:
-                        row[key] = None
-            data.setdefault("rows", []).append(row)
-    
-    if not data.get("rows"):
-        logger.warning("No data in CSV")
-        return
-    
-    rows = data["rows"]
+        import matplotlib.pyplot as plt  # noqa: F401
+    except ImportError as exc:
+        raise RuntimeError("Plotting validation results requires matplotlib") from exc
+
+    rows = _read_csv_rows(csv_path)
+    energy_dft, energy_ml = _paired_column_values(
+        rows, "energy_per_atom_dft", "energy_per_atom_ml"
+    )
+    force_dft, force_ml = _paired_column_values(
+        rows, "force_magnitude_dft", "force_magnitude_ml"
+    )
+
     output_dir.mkdir(parents=True, exist_ok=True)
-    
-    # Extract dataset and potential numbers
     dataset_num = dataset_name.split("_")[-1]
     potential_num = potential_name.split("_")[-1]
-    
-    # Plot 1: Energy per atom
-    energy_dft = [r["energy_per_atom_dft"] for r in rows if r["energy_per_atom_dft"] is not None]
-    if energy_dft and len(set(energy_dft)) > 1:  # Only plot if we have variation
+    _create_scatter_plot(
+        energy_dft,
+        energy_ml,
+        output_dir / f"dataset_{dataset_num}_potential_{potential_num}_energy.png",
+        "DFT Energy (eV/atom)",
+        "ML Energy (eV/atom)",
+    )
+    _create_scatter_plot(
+        force_dft,
+        force_ml,
+        output_dir / f"dataset_{dataset_num}_potential_{potential_num}_force.png",
+        "DFT Force (eV/Angstrom)",
+        "ML Force (eV/Angstrom)",
+    )
+
+    if all(
+        f"virial_{component}_dft" in rows[0] and f"virial_{component}_ml" in rows[0]
+        for component in _VIRIAL_COMPONENTS
+    ):
+        virial_dft = []
+        virial_ml = []
+        for component in _VIRIAL_COMPONENTS:
+            dft_values, ml_values = _paired_column_values(
+                rows, f"virial_{component}_dft", f"virial_{component}_ml"
+            )
+            virial_dft.extend(dft_values)
+            virial_ml.extend(ml_values)
         _create_scatter_plot(
-            energy_dft,
-            energy_dft,  # Placeholder: use same for now since ML energy not available
-            output_dir / f"dataset_{dataset_num}_potential_{potential_num}_energy.png",
-            "DFT Energy (eV/atom)",
-            "ML Energy (eV/atom)",
+            virial_dft,
+            virial_ml,
+            output_dir / f"dataset_{dataset_num}_potential_{potential_num}_virial.png",
+            "DFT Virial (eV)",
+            "ML Virial (eV)",
         )
-    
-    # Plot 2: Force magnitude (if available)
-    force_dft = [r["force_magnitude_dft"] for r in rows if r["force_magnitude_dft"] is not None]
-    if force_dft and len(set(force_dft)) > 1:
-        force_ml = [r["force_magnitude_ml"] or 0 for r in rows if r["force_magnitude_dft"] is not None]
-        _create_scatter_plot(
-            force_dft,
-            force_ml,
-            output_dir / f"dataset_{dataset_num}_potential_{potential_num}_force.png",
-            "DFT Force (eV/Å)",
-            "ML Force (eV/Å)",
-        )
-    
-    logger.info(f"Plots saved to {output_dir}")
 
 
 def _create_scatter_plot(
@@ -295,53 +414,49 @@ def _create_scatter_plot(
     xlabel: str,
     ylabel: str,
 ) -> None:
-    """Helper function to create scatter plot."""
-    try:
-        import matplotlib.pyplot as plt
-        from scipy import stats
-    except ImportError:
-        return
-    
+    """Create one parity plot from finite, paired values."""
+    if len(dft_values) != len(ml_values) or not dft_values:
+        raise ValueError(f"No complete paired data available for plot: {output_path}")
+    dft_vals = np.asarray(dft_values, dtype=float)
+    ml_vals = np.asarray(ml_values, dtype=float)
+    if not np.isfinite(dft_vals).all() or not np.isfinite(ml_vals).all():
+        raise ValueError(f"Plot data contains non-finite values: {output_path}")
+
+    import matplotlib.pyplot as plt
+
     fig, ax = plt.subplots(figsize=(8, 8))
-    
-    # Filter out None/NaN values
-    valid_pairs = [
-        (d, m) for d, m in zip(dft_values, ml_values)
-        if d is not None and m is not None and not (np.isnan(d) or np.isnan(m))
-    ]
-    
-    if not valid_pairs:
-        logger.warning(f"No valid data for plot: {output_path}")
-        return
-    
-    dft_vals, ml_vals = zip(*valid_pairs)
-    
-    # Scatter plot
-    ax.scatter(dft_vals, ml_vals, alpha=0.5, s=20)
-    
-    # Add diagonal reference line
-    min_val = min(min(dft_vals), min(ml_vals))
-    max_val = max(max(dft_vals), max(ml_vals))
-    ax.plot([min_val, max_val], [min_val, max_val], "r--", alpha=0.5, label="Perfect prediction")
-    
-    # Linear regression and statistics
-    slope, intercept, r_value, p_value, std_err = stats.linregress(dft_vals, ml_vals)
-    rmse = np.sqrt(np.mean((np.array(ml_vals) - np.array(dft_vals)) ** 2))
-    
-    # Add regression line
-    x_line = np.array([min_val, max_val])
-    y_line = slope * x_line + intercept
-    ax.plot(x_line, y_line, "b-", alpha=0.7, label=f"Linear fit (R²={r_value**2:.3f})")
-    
-    # Labels and legend
-    ax.set_xlabel(xlabel, fontsize=12)
-    ax.set_ylabel(ylabel, fontsize=12)
-    ax.set_title(f"{xlabel} vs {ylabel}\nRMSE={rmse:.4f}", fontsize=14)
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-    
-    plt.tight_layout()
-    plt.savefig(output_path, dpi=150)
-    plt.close()
-    
-    logger.debug(f"Saved plot: {output_path}")
+    try:
+        min_val = min(float(dft_vals.min()), float(ml_vals.min()))
+        max_val = max(float(dft_vals.max()), float(ml_vals.max()))
+        ax.scatter(dft_vals, ml_vals, alpha=0.5, s=20)
+        ax.plot(
+            [min_val, max_val],
+            [min_val, max_val],
+            "r--",
+            alpha=0.5,
+            label="Perfect prediction",
+        )
+
+        if len(dft_vals) >= 2 and not np.allclose(dft_vals, dft_vals[0]):
+            from scipy import stats
+
+            slope, intercept, r_value, _, _ = stats.linregress(dft_vals, ml_vals)
+            x_line = np.array([min_val, max_val])
+            ax.plot(
+                x_line,
+                slope * x_line + intercept,
+                "b-",
+                alpha=0.7,
+                label=f"Linear fit (R²={r_value**2:.3f})",
+            )
+
+        rmse = float(np.sqrt(np.mean((ml_vals - dft_vals) ** 2)))
+        ax.set_xlabel(xlabel, fontsize=12)
+        ax.set_ylabel(ylabel, fontsize=12)
+        ax.set_title(f"{xlabel} vs {ylabel}\nRMSE={rmse:.4f}", fontsize=14)
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        fig.tight_layout()
+        fig.savefig(output_path, dpi=150)
+    finally:
+        plt.close(fig)

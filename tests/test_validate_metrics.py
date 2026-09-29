@@ -92,10 +92,6 @@ def test_paired_reference_fixtures_are_intentionally_different() -> None:
     assert not np.allclose(dft["virial"], ml["virial"])
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="Phase 2 blocker P0-4: DFT parser must consume paired energy and force labels",
-)
 def test_dft_parser_consumes_fixture_energy_forces_and_virial() -> None:
     parsed = analyze_module.parse_dft_properties(DFT_FIXTURE)
     record = parsed[0]
@@ -105,10 +101,6 @@ def test_dft_parser_consumes_fixture_energy_forces_and_virial() -> None:
     assert record["virial"] is not None
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="Phase 2 blocker P0-4: model parser must expose genuine energy, force, and virial predictions",
-)
 def test_model_parser_exposes_fixture_predictions() -> None:
     atoms_count, _, predictions = analyze_module.parse_gpumd_output(ML_FIXTURE)
     expected = fixture_properties(ML_FIXTURE)
@@ -119,10 +111,6 @@ def test_model_parser_exposes_fixture_predictions() -> None:
     np.testing.assert_allclose(predictions["virial"], expected["virial"])
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="Phase 2 blocker P0-4: comparison output must use distinct model energy and explicit eV/atom error",
-)
 def test_comparison_reports_model_energy_and_hand_checkable_per_atom_error() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         report_path = generate_report(Path(tmp))
@@ -133,15 +121,13 @@ def test_comparison_reports_model_energy_and_hand_checkable_per_atom_error() -> 
     ml_per_atom = float(rows[0]["energy_per_atom_ml"])
     assert dft_per_atom == -5.25
     assert ml_per_atom == -5.125
+    assert float(rows[0]["energy_error_per_atom"]) == pytest.approx(0.125)
     assert float(rows[2]["energy_per_atom_ml"]) == -5.0
+    assert float(rows[2]["energy_error_per_atom"]) == pytest.approx(0.25)
     assert float(rows[0]["energy_mae"]) == pytest.approx(0.1875)
     assert float(rows[0]["energy_rmse"]) == pytest.approx(np.sqrt(0.0390625))
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="Phase 2 blocker P0-4: comparison output must preserve predicted force components and magnitudes",
-)
 def test_comparison_reports_force_components_and_hand_checkable_metrics() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         report_path = generate_report(Path(tmp))
@@ -158,10 +144,6 @@ def test_comparison_reports_force_components_and_hand_checkable_metrics() -> Non
     assert float(rows[0]["force_magnitude_rmse"]) == pytest.approx(0.01990345882)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="Phase 2 blocker P0-4: comparison output must preserve predicted virial values and convention",
-)
 def test_comparison_reports_virial_components_and_errors() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         report_path = generate_report(Path(tmp))
@@ -177,10 +159,6 @@ def test_comparison_reports_virial_components_and_errors() -> None:
 
 
 @pytest.mark.parametrize("missing_key", ["energy", "forces", "virial"])
-@pytest.mark.xfail(
-    strict=True,
-    reason="Phase 2 blocker P0-4: missing required validation labels must raise instead of defaulting or writing partial reports",
-)
 def test_missing_required_prediction_is_an_error(missing_key: str) -> None:
     dft_data, ml_predictions = comparison_inputs()
     # This represents a validation configuration in which the DFT reference
@@ -209,10 +187,6 @@ def test_missing_required_prediction_is_an_error(missing_key: str) -> None:
                 )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="Phase 2 blocker P0-4: plotting must reject missing model predictions rather than substituting zeros or DFT values",
-)
 def test_plotting_cannot_substitute_missing_model_predictions() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         csv_path = Path(tmp) / "comparison.csv"
