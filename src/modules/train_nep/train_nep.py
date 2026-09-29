@@ -5,6 +5,7 @@ import json
 import logging
 from configparser import ConfigParser
 from datetime import datetime
+from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -18,6 +19,78 @@ from .submit import submit_training_job
 from .launcher import run_launcher, read_train_status, write_train_status
 
 logger = logging.getLogger("nepflow.train_nep")
+
+
+def _canonical_tokens(value: str) -> tuple[str, ...]:
+    """Normalize a space/comma-separated numeric NEP setting."""
+    tokens = value.replace(",", " ").split()
+    normalized = []
+    for token in tokens:
+        try:
+            normalized.append(format(float(token), ".15g"))
+        except ValueError:
+            normalized.append(token)
+    return tuple(normalized)
+
+
+@dataclass(frozen=True)
+class NepHyperparameters:
+    """Canonical NEP settings shared by rendering and run identity."""
+
+    elements: tuple[str, ...]
+    gas_elements: tuple[str, ...]
+    cutoff: tuple[str, ...]
+    n_max: tuple[str, ...]
+    basis_size: tuple[str, ...]
+    l_max: tuple[str, ...]
+    neuron: tuple[str, ...]
+    population: int
+    batch: int
+    generations: int
+    outer_zbl: float
+    charge_mode: int
+    weights: tuple[float, ...]
+    lambda_e: float
+    lambda_f: float
+    lambda_v: float
+    lambda_shear: float
+
+    @property
+    def all_elements(self) -> tuple[str, ...]:
+        return self.elements + self.gas_elements
+
+    @staticmethod
+    def _float(value: float) -> str:
+        return format(value, ".15g")
+
+    def canonical_dict(self) -> dict:
+        """Return deterministic, JSON-serializable scientific settings."""
+        return {
+            "schema_version": "nep.hyperparameters.v1",
+            "elements": list(self.elements),
+            "gas_elements": list(self.gas_elements),
+            "cutoff": list(self.cutoff),
+            "n_max": list(self.n_max),
+            "basis_size": list(self.basis_size),
+            "l_max": list(self.l_max),
+            "neuron": list(self.neuron),
+            "population": self.population,
+            "batch": self.batch,
+            "generations": self.generations,
+            "outer_zbl": self._float(self.outer_zbl),
+            "charge_mode": self.charge_mode,
+            "weights": [self._float(value) for value in self.weights],
+            "lambda_e": self._float(self.lambda_e),
+            "lambda_f": self._float(self.lambda_f),
+            "lambda_v": self._float(self.lambda_v),
+            "lambda_shear": self._float(self.lambda_shear),
+        }
+
+    def identity_hash(self) -> str:
+        payload = json.dumps(
+            self.canonical_dict(), sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        return hashlib.sha256(payload).hexdigest()
 
 
 class TrainNepStage(Stage):
@@ -88,6 +161,7 @@ class TrainNepStage(Stage):
         config_path = self._find_config_file()
         config = self._load_config()
         logger.debug(f"Loaded config from {config_path}")
+        hyperparameters = self._get_nep_hyperparameters(config)
 
         # Read train/test split from existing XYZ files
         logger.info("Step 1: Reading train/test split")
@@ -163,12 +237,14 @@ class TrainNepStage(Stage):
 
         # Step 4: Generate customized nep.in
         logger.info("Step 4: Generating customized nep.in")
-        self._generate_nep_config(config, dataset_path)
+        self._generate_nep_config(config, dataset_path, hyperparameters)
         logger.info(f"nep.in written to {dataset_path / 'nep.in'}")
 
         # Step 5: Create training run folder
         logger.info("Step 5: Creating potential training folder")
-        potential_path = self._create_potential_folder(config, train_count)
+        potential_path = self._create_potential_folder(
+            config, train_count, hyperparameters
+        )
         logger.info(f"Training will run in: {potential_path.name}")
 
         # Step 6: Submit job and enter monitoring loop
@@ -252,6 +328,60 @@ class TrainNepStage(Stage):
         value = config.get(section, option)
         return [item.strip() for item in value.split(",") if item.strip()]
 
+    def _get_nep_hyperparameters(self, config: ConfigParser) -> NepHyperparameters:
+        """Resolve all exposed NEP settings into one immutable value object."""
+        try:
+            elements = tuple(self._parse_list(config, "composition", "elements"))
+        except Exception:
+            elements = ("W", "O")
+
+        try:
+            gas_elements = tuple(self._parse_list(config, "composition", "gasElements"))
+        except Exception:
+            gas_elements = ()
+
+        all_elements = elements + gas_elements
+        weights_str = config.get("train_nep", "weights", fallback="")
+        try:
+            weights = tuple(
+                float(weight)
+                for weight in weights_str.replace(",", " ").split()
+            )
+            if len(weights) != len(all_elements):
+                raise ValueError("weight count does not match element count")
+        except ValueError:
+            weights = tuple(1.0 for _ in all_elements)
+
+        charge_mode = config.getint("train_nep", "charge_mode", fallback=0)
+        if charge_mode not in (0, 1):
+            logger.warning(
+                "Unsupported train_nep.charge_mode=%s. Falling back to 0 (NEP).",
+                charge_mode,
+            )
+            charge_mode = 0
+
+        return NepHyperparameters(
+            elements=elements,
+            gas_elements=gas_elements,
+            cutoff=_canonical_tokens(config.get("train_nep", "cutoff", fallback="6 5")),
+            n_max=_canonical_tokens(config.get("train_nep", "n_max", fallback="4 4")),
+            basis_size=_canonical_tokens(
+                config.get("train_nep", "basis_size", fallback="8 8")
+            ),
+            l_max=_canonical_tokens(config.get("train_nep", "l_max", fallback="4 2 1")),
+            neuron=_canonical_tokens(config.get("train_nep", "neuron", fallback="80")),
+            population=config.getint("train_nep", "population", fallback=50),
+            batch=config.getint("train_nep", "batch", fallback=3000),
+            generations=config.getint("train_nep", "generation", fallback=250000),
+            outer_zbl=config.getfloat("train_nep", "outerZBL", fallback=2.0),
+            charge_mode=charge_mode,
+            weights=weights,
+            lambda_e=config.getfloat("train_nep", "lambda_e", fallback=1.0),
+            lambda_f=config.getfloat("train_nep", "lambda_f", fallback=1.0),
+            lambda_v=config.getfloat("train_nep", "lambda_v", fallback=1.0),
+            lambda_shear=config.getfloat("train_nep", "lambda_shear", fallback=1.0),
+        )
+
     def _read_train_test_split(self) -> Tuple[List[Atoms], List[Atoms]]:
         """Read train and test structures from existing XYZ files."""
         train_path = self.project_dir / "structures" / "selected" / "train.xyz"
@@ -307,7 +437,12 @@ class TrainNepStage(Stage):
 
         return train_structures, test_structures
 
-    def _generate_nep_config(self, config: ConfigParser, dataset_path: Path) -> None:
+    def _generate_nep_config(
+        self,
+        config: ConfigParser,
+        dataset_path: Path,
+        hyperparameters: NepHyperparameters | None = None,
+    ) -> None:
         """Generate customized nep.in based on project config."""
         # Read template
         template_path = self.project_dir / "config" / "nep" / "nep.in"
@@ -322,72 +457,25 @@ class TrainNepStage(Stage):
             logger.error("Template is empty! Cannot generate nep.in")
             return
 
-        # Parse elements
-        try:
-            elements = self._parse_list(config, "composition", "elements")
-            logger.debug(f"Parsed {len(elements)} solid elements: {elements}")
-        except Exception as e:
-            logger.error(f"Failed to parse composition.elements: {e}. Using fallback W O.")
-            elements = ["W", "O"]
+        hyperparameters = hyperparameters or self._get_nep_hyperparameters(config)
+        all_elements = hyperparameters.all_elements
+        logger.info("NEP will train on %s element types: %s", len(all_elements), all_elements)
 
-        gas_elements = config.get("composition", "gasElements", fallback="")
-        if gas_elements:
-            try:
-                gas_elements = self._parse_list(config, "composition", "gasElements")
-                logger.debug(f"Parsed {len(gas_elements)} gas elements: {gas_elements}")
-            except Exception as e:
-                logger.warning(f"Failed to parse composition.gasElements: {e}")
-                gas_elements = []
-        else:
-            gas_elements = []
-
-        all_elements = elements + gas_elements
-        logger.info(f"NEP will train on {len(all_elements)} element types: {all_elements}")
-
-        # Get NEP training parameters
-        population = config.getint("train_nep", "population", fallback=50)
-        batch = config.getint("train_nep", "batch", fallback=3000)
-        generation = config.getint("train_nep", "generation", fallback=250000)
-        charge_mode = config.getint("train_nep", "charge_mode", fallback=0)
-        outer_zbl = config.getfloat("train_nep", "outerZBL", fallback=2.0)
-        weights_str = config.get("train_nep", "weights", fallback=None)
-        if charge_mode not in (0, 1):
-            logger.warning(
-                "Unsupported train_nep.charge_mode=%s. Falling back to 0 (NEP).",
-                charge_mode,
-            )
-            charge_mode = 0
-
-        # Parse weights
-        if weights_str:
-            try:
-                weights = [float(w.strip()) for w in weights_str.replace(",", " ").split()]
-                if len(weights) != len(all_elements):
-                    logger.warning(
-                        f"Weight count ({len(weights)}) != element count ({len(all_elements)}). Using defaults."
-                    )
-                    weights = [1.0] * len(all_elements)
-                else:
-                    logger.debug(f"Parsed weights: {weights}")
-            except ValueError as e:
-                logger.warning(f"Could not parse weights '{weights_str}': {e}. Using defaults.")
-                weights = [1.0] * len(all_elements)
-        else:
-            logger.debug("No weights specified, using uniform weights")
-            weights = [1.0] * len(all_elements)
-
-        # Get lambda values
-        lambda_e = config.getfloat("train_nep", "lambda_e", fallback=1.0)
-        lambda_f = config.getfloat("train_nep", "lambda_f", fallback=1.0)
-        lambda_v = config.getfloat("train_nep", "lambda_v", fallback=1.0)
-        lambda_shear = config.getfloat("train_nep", "lambda_shear", fallback=1.0)
-        logger.debug(
-            "Lambda values: E=%s, F=%s, V=%s, shear=%s",
-            lambda_e,
-            lambda_f,
-            lambda_v,
-            lambda_shear,
-        )
+        population = hyperparameters.population
+        batch = hyperparameters.batch
+        generation = hyperparameters.generations
+        charge_mode = hyperparameters.charge_mode
+        outer_zbl = hyperparameters.outer_zbl
+        weights = hyperparameters.weights
+        cutoff = " ".join(hyperparameters.cutoff)
+        n_max = " ".join(hyperparameters.n_max)
+        basis_size = " ".join(hyperparameters.basis_size)
+        l_max = " ".join(hyperparameters.l_max)
+        neuron = " ".join(hyperparameters.neuron)
+        lambda_e = hyperparameters.lambda_e
+        lambda_f = hyperparameters.lambda_f
+        lambda_v = hyperparameters.lambda_v
+        lambda_shear = hyperparameters.lambda_shear
 
         # Build output
         output_lines = []
@@ -398,6 +486,16 @@ class TrainNepStage(Stage):
                 output_lines.append(f"type {len(all_elements)} {' '.join(all_elements)}")
             elif stripped.startswith("type_weight ") and "# type" not in line:
                 output_lines.append(f"type_weight {' '.join(str(w) for w in weights)}")
+            elif stripped.startswith("cutoff ") and "# cutoff" not in line:
+                output_lines.append(f"cutoff {cutoff}")
+            elif stripped.startswith("n_max ") and "# n_max" not in line:
+                output_lines.append(f"n_max {n_max}")
+            elif stripped.startswith("basis_size ") and "# basis_size" not in line:
+                output_lines.append(f"basis_size {basis_size}")
+            elif stripped.startswith("l_max ") and "# l_max" not in line:
+                output_lines.append(f"l_max {l_max}")
+            elif stripped.startswith("neuron ") and "# neuron" not in line:
+                output_lines.append(f"neuron {neuron}")
             elif stripped.startswith("population ") and "# population" not in line:
                 output_lines.append(f"population {population}")
             elif stripped.startswith("batch ") and "# batch" not in line:
@@ -419,21 +517,30 @@ class TrainNepStage(Stage):
             else:
                 output_lines.append(line)
 
-        if not any(line.strip().startswith("lambda_shear ") for line in output_lines):
-            insert_at = len(output_lines)
-            for i, line in enumerate(output_lines):
-                if line.strip().startswith("lambda_v "):
-                    insert_at = i + 1
-                    break
-            output_lines.insert(insert_at, f"lambda_shear {lambda_shear}")
-
-        if not any(line.strip().startswith("charge_mode ") for line in output_lines):
-            insert_at = 0
-            for i, line in enumerate(output_lines):
-                if line.strip().startswith("generation "):
-                    insert_at = i + 1
-                    break
-            output_lines.insert(insert_at, f"charge_mode {charge_mode}")
+        required_lines = [
+            ("type", f"type {len(all_elements)} {' '.join(all_elements)}"),
+            ("type_weight", f"type_weight {' '.join(str(w) for w in weights)}"),
+            ("cutoff", f"cutoff {cutoff}"),
+            ("n_max", f"n_max {n_max}"),
+            ("basis_size", f"basis_size {basis_size}"),
+            ("l_max", f"l_max {l_max}"),
+            ("neuron", f"neuron {neuron}"),
+            ("population", f"population {population}"),
+            ("batch", f"batch {batch}"),
+            ("generation", f"generation {generation}"),
+            ("charge_mode", f"charge_mode {charge_mode}"),
+            ("zbl", f"zbl {outer_zbl}"),
+            ("lambda_e", f"lambda_e {lambda_e}"),
+            ("lambda_f", f"lambda_f {lambda_f}"),
+            ("lambda_v", f"lambda_v {lambda_v}"),
+            ("lambda_shear", f"lambda_shear {lambda_shear}"),
+        ]
+        for key, rendered_line in required_lines:
+            if not any(
+                line.strip().startswith(f"{key} ") and f"# {key}" not in line
+                for line in output_lines
+            ):
+                output_lines.append(rendered_line)
 
         # Write customized config
         output_path = dataset_path / "nep.in"
@@ -648,91 +755,25 @@ lambda_shear 1
         logger.debug("Wrote metadata to %s", metadata_path)
 
     @staticmethod
-    def _generate_params_hash(
-        cutoff: str,
-        n_max: str,
-        basis_size: str,
-        l_max: str,
-        neuron: str,
-    ) -> str:
-        """Generate short hash from NEP parameters."""
-        params_str = f"{cutoff}_{n_max}_{basis_size}_{l_max}_{neuron}"
-        hash_obj = hashlib.md5(params_str.encode())
-        return hash_obj.hexdigest()[:8]
+    def _generate_params_hash(hyperparameters: NepHyperparameters) -> str:
+        """Generate the run identity directly from canonical hyperparameters."""
+        return hyperparameters.identity_hash()
 
-    @staticmethod
-    def _is_weights_uniform(weights_str: str, num_elements: int) -> bool:
-        """Check if all weights are uniform (all 1.0)."""
-        if not weights_str or not weights_str.strip():
-            return True  # No weights specified = uniform
-        try:
-            weights = [float(w.strip()) for w in weights_str.replace(",", " ").split()]
-            if len(weights) != num_elements:
-                return False
-            return all(abs(w - 1.0) < 1e-6 for w in weights)
-        except ValueError:
-            return False
-
-    def _create_potential_folder(self, config: ConfigParser, train_count: int) -> Path:
-        """Create and return potential folder with proper naming convention.
-        
-        Naming: [num_train][v?]_[zbl]_[w?]_[params]_[index]
-        where:
-        - [num_train] = number of training configurations
-        - [v?] = "v" if lambda_v > 0, else omitted
-        - [zbl] = outerZBL value if > 0
-        - [w?] = "w" if weights are not uniform
-        - [params] = short hash of NEP parameters
-        - [index] = integer for multiple runs with same config
-        """
+    def _create_potential_folder(
+        self,
+        config: ConfigParser,
+        train_count: int,
+        hyperparameters: NepHyperparameters | None = None,
+    ) -> Path:
+        """Create a potential folder whose identity covers every NEP setting."""
         potentials_dir = self.project_dir / "nep" / "potentials"
         potentials_dir.mkdir(parents=True, exist_ok=True)
 
-        # Gather NEP parameters
-        lambda_v = config.getfloat("train_nep", "lambda_v", fallback=1.0)
-        outer_zbl = config.getfloat("train_nep", "outerZBL", fallback=2.0)
-        weights_str = config.get("train_nep", "weights", fallback="")
+        hyperparameters = hyperparameters or self._get_nep_hyperparameters(config)
+        params_hash = self._generate_params_hash(hyperparameters)[:16]
+        base_name = f"{train_count}_{params_hash}"
 
-        # Parse composition for element count
-        try:
-            elements = self._parse_list(config, "composition", "elements")
-            gas_elements = self._parse_list(config, "composition", "gasElements")
-        except Exception:
-            elements = ["W", "O"]
-            gas_elements = []
-        all_elements = elements + gas_elements
-
-        # Parse params for hash
-        try:
-            cutoff = config.get("train_nep", "cutoff", fallback="6 5")
-            n_max = config.get("train_nep", "n_max", fallback="4 4")
-            basis_size = config.get("train_nep", "basis_size", fallback="8 8")
-            l_max = config.get("train_nep", "l_max", fallback="4 2 1")
-            neuron = config.get("train_nep", "neuron", fallback="80")
-        except Exception:
-            cutoff = n_max = basis_size = l_max = neuron = "default"
-
-        # Build folder name components
-        parts = [f"{train_count}"]
-
-        # Add "v" if lambda_v > 0
-        if lambda_v > 0:
-            parts.append("v")
-
-        # Add ZBL radius if > 0
-        if outer_zbl > 0:
-            parts.append(str(outer_zbl).replace(".", "_"))
-
-        # Add "w" if weights are not uniform
-        if not self._is_weights_uniform(weights_str, len(all_elements)):
-            parts.append("w")
-
-        # Add params hash
-        params_hash = self._generate_params_hash(cutoff, n_max, basis_size, l_max, neuron)
-        parts.append(params_hash)
-
-        # Find next available index
-        base_name = "_".join(parts)
+        # Find next available index for this exact hyperparameter identity.
         existing_indices = []
         for d in potentials_dir.iterdir():
             if d.is_dir() and d.name.startswith(base_name + "_"):
