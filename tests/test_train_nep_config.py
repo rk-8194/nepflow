@@ -40,7 +40,12 @@ def make_train_config(**overrides: object) -> ConfigParser:
     return config
 
 
-def render_and_identify(**overrides: object) -> tuple[str, str]:
+def render_and_identify(
+    *,
+    composition_elements: str = "Si,Ge",
+    composition_gas_elements: str = "",
+    **overrides: object,
+) -> tuple[str, str]:
     """Render nep.in and return it with the path-independent folder identity."""
     with tempfile.TemporaryDirectory() as tmp:
         project_dir = Path(tmp)
@@ -55,6 +60,8 @@ def render_and_identify(**overrides: object) -> tuple[str, str]:
             debug=False,
         )
         config = make_train_config(**overrides)
+        config["composition"]["elements"] = composition_elements
+        config["composition"]["gasElements"] = composition_gas_elements
         stage._generate_nep_config(config, dataset_dir)
         potential_path = stage._create_potential_folder(config, train_count=10)
 
@@ -103,6 +110,44 @@ def test_equivalent_effective_inputs_have_stable_identity_across_paths_and_forma
 
     assert comma_rendered == spaced_rendered
     assert comma_identity == spaced_identity
+
+
+def test_effective_type_list_change_changes_render_and_identity() -> None:
+    baseline_rendered, baseline_identity = render_and_identify(
+        composition_elements="Si,Ge",
+    )
+    variant_rendered, variant_identity = render_and_identify(
+        composition_elements="Si,Ge,O",
+    )
+
+    assert baseline_rendered != variant_rendered
+    assert baseline_identity != variant_identity
+
+
+def test_effective_type_order_change_changes_render_and_identity() -> None:
+    baseline_rendered, baseline_identity = render_and_identify(
+        composition_elements="Si,Ge",
+    )
+    variant_rendered, variant_identity = render_and_identify(
+        composition_elements="Ge,Si",
+    )
+
+    assert baseline_rendered != variant_rendered
+    assert baseline_identity != variant_identity
+
+
+def test_solid_gas_partition_does_not_change_effective_type_identity() -> None:
+    solid_rendered, solid_identity = render_and_identify(
+        composition_elements="Si,Ge",
+        composition_gas_elements="",
+    )
+    partitioned_rendered, partitioned_identity = render_and_identify(
+        composition_elements="Si",
+        composition_gas_elements="Ge",
+    )
+
+    assert solid_rendered == partitioned_rendered
+    assert solid_identity == partitioned_identity
 
 
 class TrainNepConfigTests(unittest.TestCase):

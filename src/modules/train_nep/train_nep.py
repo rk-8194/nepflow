@@ -67,8 +67,7 @@ class NepHyperparameters:
         """Return deterministic, JSON-serializable scientific settings."""
         return {
             "schema_version": "nep.hyperparameters.v1",
-            "elements": list(self.elements),
-            "gas_elements": list(self.gas_elements),
+            "types": list(self.all_elements),
             "cutoff": list(self.cutoff),
             "n_max": list(self.n_max),
             "basis_size": list(self.basis_size),
