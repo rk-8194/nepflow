@@ -406,39 +406,50 @@ def prepare_validation_structures(
         # Build a dedicated single-point protocol.  Dynamic template commands
         # are excluded so validation cannot advance or alter the reference
         # geometry before the prediction frame is written.
-        dynamic_keywords = {
+        unsafe_keywords = {
+            "add_efield",
+            "add_force",
+            "change_box",
             "deform",
+            "delete_atoms",
+            "deposit",
+            "displace_atoms",
             "dump_exyz",
             "dump_observer",
             "dump_xyz",
             "ensemble",
+            "fix",
             "minimize",
+            "potential",
             "run",
+            "set",
             "time_step",
             "velocity",
         }
-        setup_lines = []
+        safe_setup_lines = []
         replicate_seen = False
         for line in template_content.splitlines():
             parts = line.split("#", 1)[0].split()
             if not parts:
-                setup_lines.append(line)
+                safe_setup_lines.append(line)
                 continue
             if parts[0] == "replicate":
                 if replicate_seen:
                     raise ValueError(f"Multiple replicate commands in {template_run_in}")
-                setup_lines.append(f"replicate {nx} {ny} {nz}")
                 replicate_seen = True
                 continue
-            if parts[0] in dynamic_keywords:
+            if parts[0] in unsafe_keywords:
                 continue
-            setup_lines.append(line)
-        if not replicate_seen:
-            setup_lines.append(f"replicate {nx} {ny} {nz}")
+            safe_setup_lines.append(line)
 
         # GPUMD's dump_xyz artifact is the authoritative source for model
         # energy, forces, and virial used by the analysis stage.
         dump_command = "dump_xyz 1 out.xyz precision double force potential virial"
+        setup_lines = [
+            f"replicate {nx} {ny} {nz}",
+            "potential nep.txt",
+            *safe_setup_lines,
+        ]
         setup_lines.extend(["ensemble nve", "time_step 0", dump_command, "run 1"])
         run_in_content = "\n".join(setup_lines).rstrip() + "\n"
         

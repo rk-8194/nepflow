@@ -175,10 +175,52 @@ def test_prepared_model_xyz_preserves_periodic_reference_without_labels() -> Non
     assert "force" not in model.arrays
     assert "ensemble nve" in run_text
     assert "time_step 0" in run_text
+    assert run_text.count("potential nep.txt") == 1
+    assert run_text.index("replicate ") < run_text.index("potential nep.txt")
     assert "dump_xyz 1 out.xyz precision double force potential virial" in run_text
+    assert run_text.count("dump_xyz 1 out.xyz precision double force potential virial") == 1
     assert [line for line in run_text.splitlines() if line.startswith("run ")] == ["run 1"]
     assert "ensemble nvt" not in run_text
     assert "velocity 300" not in run_text
+
+
+def test_template_potential_and_geometry_commands_cannot_override_model_protocol() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        dataset_path = root / "nep" / "datasets" / "dataset_0001"
+        potential_path = root / "gpumd" / "dataset_0001" / "potential_0001"
+        config_gpumd_dir = root / "config" / "gpumd"
+        dataset_path.mkdir(parents=True)
+        potential_path.mkdir(parents=True)
+        config_gpumd_dir.mkdir(parents=True)
+        shutil.copy2(DFT_FIXTURE, dataset_path / "test.xyz")
+        (potential_path / "nep.txt").write_text(
+            "version 4\ntype 1 Si\ncutoff 6 5 112 60\n", encoding="utf-8"
+        )
+        (config_gpumd_dir / "run.in_validate").write_text(
+            "potential wrong_model.txt\nchange_box x final 0 10\n"
+            "add_force 0 1 0 0\nreplicate 1 1 1\nrun 20\n",
+            encoding="utf-8",
+        )
+
+        state = prepare_module.prepare_validation_structures(
+            dataset_path=dataset_path,
+            gpumd_potential_dir=potential_path,
+            project_dir=root,
+            config_gpumd_dir=config_gpumd_dir,
+        )
+        run_text = (Path(state["struct_folders"][0]["path"]) / "run.in").read_text(
+            encoding="utf-8"
+        )
+
+    lines = [line.strip() for line in run_text.splitlines()]
+    assert lines.count("potential nep.txt") == 1
+    assert not any("wrong_model.txt" in line for line in lines)
+    assert not any(line.startswith("change_box ") for line in lines)
+    assert not any(line.startswith("add_force ") for line in lines)
+    assert lines.count("run 1") == 1
+    assert lines.count("dump_xyz 1 out.xyz precision double force potential virial") == 1
+    assert lines.index("replicate 1 1 1") < lines.index("potential nep.txt")
 
 
 def test_replicated_model_output_normalizes_to_reference_metrics() -> None:
