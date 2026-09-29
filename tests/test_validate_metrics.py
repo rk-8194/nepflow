@@ -1,4 +1,5 @@
 import csv
+import shutil
 import tempfile
 from configparser import ConfigParser
 from pathlib import Path
@@ -11,9 +12,10 @@ pytest.importorskip("ase")
 pytest.importorskip("pymatgen")
 
 from modules.validate import analyze as analyze_module  # noqa: E402
+from modules.validate import prepare as prepare_module  # noqa: E402
 from modules.validate import validate as validate_stage_module  # noqa: E402
 from modules.validate.validate import ValidateStage  # noqa: E402
-from ase.io import read as ase_read  # noqa: E402
+from ase.io import read as ase_read, write as ase_write  # noqa: E402
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -109,6 +111,135 @@ def test_model_parser_exposes_fixture_predictions() -> None:
     assert predictions["energy"] == -10.25
     np.testing.assert_allclose(predictions["forces"], expected["forces"])
     np.testing.assert_allclose(predictions["virial"], expected["virial"])
+
+
+def test_unmocked_extxyz_parser_to_csv_path_preserves_real_predictions() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        validation_root = write_model_output(root, frame_count=1)
+        report_path = root / "comparison.csv"
+        analyze_module.generate_comparison_csv(
+            validation_root=validation_root,
+            test_xyz_path=DFT_FIXTURE,
+            output_csv_path=report_path,
+        )
+        rows = list(csv.DictReader(report_path.open(newline="", encoding="utf-8")))
+
+    assert len(rows) == 2
+    assert float(rows[0]["energy_per_atom_ml"]) == pytest.approx(-5.125)
+    assert float(rows[0]["energy_mae"]) == pytest.approx(0.125)
+    assert float(rows[0]["force_component_mae"]) == pytest.approx(0.01)
+    assert float(rows[0]["virial_mae"]) == pytest.approx(5.18426037271)
+
+
+def test_prepared_model_xyz_preserves_periodic_reference_without_labels() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        dataset_path = root / "nep" / "datasets" / "dataset_0001"
+        potential_path = root / "gpumd" / "dataset_0001" / "potential_0001"
+        config_gpumd_dir = root / "config" / "gpumd"
+        dataset_path.mkdir(parents=True)
+        potential_path.mkdir(parents=True)
+        config_gpumd_dir.mkdir(parents=True)
+        shutil.copy2(DFT_FIXTURE, dataset_path / "test.xyz")
+        (potential_path / "nep.txt").write_text(
+            "version 4\ntype 1 Si\ncutoff 6 5 112 60\n", encoding="utf-8"
+        )
+        (config_gpumd_dir / "run.in_validate").write_text(
+            "replicate 1 1 1\nrun 1\n", encoding="utf-8"
+        )
+
+        source = ase_read(str(DFT_FIXTURE), index=0, format="extxyz")
+        state = prepare_module.prepare_validation_structures(
+            dataset_path=dataset_path,
+            gpumd_potential_dir=potential_path,
+            project_dir=root,
+            config_gpumd_dir=config_gpumd_dir,
+        )
+        model_path = Path(state["struct_folders"][0]["path"]) / "model.xyz"
+        model = ase_read(str(model_path), index=0, format="extxyz")
+
+    assert model.get_chemical_symbols() == source.get_chemical_symbols()
+    np.testing.assert_allclose(model.positions, source.positions)
+    np.testing.assert_allclose(model.cell.array, source.cell.array)
+    np.testing.assert_array_equal(model.pbc, source.pbc)
+    assert "energy" not in model.info
+    assert "force" not in model.arrays
+
+
+def test_replicated_model_output_normalizes_to_reference_metrics() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        reference_root = root / "reference"
+        reference_struct_dir = reference_root / "validation" / "struct_0000"
+        reference_struct_dir.mkdir(parents=True)
+        (reference_struct_dir / "run.in").write_text(
+            "replicate 1 1 1\nrun 1\n", encoding="utf-8"
+        )
+        shutil.copy2(ML_FIXTURE, reference_struct_dir / "out.xyz")
+        reference_report = reference_root / "comparison.csv"
+        analyze_module.generate_comparison_csv(
+            validation_root=reference_root / "validation",
+            test_xyz_path=DFT_FIXTURE,
+            output_csv_path=reference_report,
+        )
+        reference_rows = list(
+            csv.DictReader(reference_report.open(newline="", encoding="utf-8"))
+        )
+
+        validation_root = root / "validation"
+        struct_dir = validation_root / "struct_0000"
+        struct_dir.mkdir(parents=True)
+        (struct_dir / "run.in").write_text("replicate 2 1 1\nrun 1\n", encoding="utf-8")
+        model = ase_read(str(ML_FIXTURE), index=0, format="extxyz")
+        repeated = model.repeat((2, 1, 1))
+        repeated.calc = None
+        repeated.info["energy"] = model.get_potential_energy() * 2
+        repeated.info["virial"] = np.asarray(model.info["virial"], dtype=float) * 2
+        ase_write(struct_dir / "out.xyz", repeated, format="extxyz")
+        report_path = root / "comparison.csv"
+
+        analyze_module.generate_comparison_csv(
+            validation_root=validation_root,
+            test_xyz_path=DFT_FIXTURE,
+            output_csv_path=report_path,
+        )
+        rows = list(csv.DictReader(report_path.open(newline="", encoding="utf-8")))
+
+    assert len(rows) == 4
+    assert float(rows[0]["energy_per_atom_ml"]) == pytest.approx(-5.125)
+    assert float(rows[0]["energy_mae"]) == pytest.approx(float(reference_rows[0]["energy_mae"]))
+    assert float(rows[0]["force_component_mae"]) == pytest.approx(
+        float(reference_rows[0]["force_component_mae"])
+    )
+    assert float(rows[0]["virial_mae"]) == pytest.approx(float(reference_rows[0]["virial_mae"]))
+
+
+def test_displaced_model_frame_cannot_be_paired_with_dft_reference() -> None:
+    dft_data, ml_predictions = comparison_inputs()
+    ml_predictions[0]["positions"] = ml_predictions[0]["positions"].copy()
+    ml_predictions[0]["positions"][0, 0] += 0.25
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        validation_root = write_model_output(root, frame_count=2)
+        with (
+            patch.object(analyze_module, "parse_dft_properties", return_value=dft_data),
+            patch.object(
+                analyze_module,
+                "parse_gpumd_output",
+                side_effect=[
+                    (prediction["atoms_count"], prediction["positions"], prediction)
+                    for prediction in ml_predictions
+                ],
+            ),
+        ):
+            with pytest.raises(ValueError, match="positions|configuration"):
+                analyze_module.generate_comparison_csv(
+                    validation_root=validation_root,
+                    test_xyz_path=DFT_FIXTURE,
+                    output_csv_path=root / "comparison.csv",
+                )
 
 
 def test_comparison_reports_model_energy_and_hand_checkable_per_atom_error() -> None:

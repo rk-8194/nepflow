@@ -281,11 +281,18 @@ def parse_test_xyz(test_xyz_path: Path) -> List[Dict]:
             atoms_list = [atoms_list]
         
         for idx, atoms in enumerate(atoms_list):
+            try:
+                energy = float(atoms.get_potential_energy())
+            except Exception:
+                energy = None
+            force_value = atoms.arrays.get("force")
+            if force_value is None:
+                force_value = atoms.arrays.get("forces")
             struct_data = {
                 "atoms": atoms,
                 "index": idx,
-                "energy": atoms.get_potential_energy() if "energy" in atoms.info else None,
-                "forces": atoms.get_forces() if hasattr(atoms, "arrays") and "forces" in atoms.arrays else None,
+                "energy": energy,
+                "forces": force_value,
                 "stress": atoms.info.get("stress", None),
             }
             structures.append(struct_data)
@@ -310,8 +317,17 @@ def create_model_xyz_from_structure(atoms: Atoms) -> str:
     from ase.io import write
     from io import StringIO
     
+    # GPUMD consumes extended XYZ so the reference cell and PBC survive into
+    # its model evaluation.  Build a label-free copy: DFT energy/force/virial
+    # fields must never be copied into the model input as predictions.
+    model_atoms = Atoms(
+        symbols=atoms.get_chemical_symbols(),
+        positions=np.asarray(atoms.positions, dtype=float),
+        cell=np.asarray(atoms.cell, dtype=float),
+        pbc=np.asarray(atoms.pbc, dtype=bool),
+    )
     output = StringIO()
-    write(output, atoms, format="xyz")
+    write(output, model_atoms, format="extxyz", write_info=False, write_results=False)
     return output.getvalue()
 
 

@@ -69,10 +69,12 @@ def _stress_to_virial(atoms: Atoms, stress: object) -> np.ndarray:
 
 
 def _extract_energy(atoms: Atoms, label: str) -> float:
-    """Read the explicit total-energy field written by an extended-XYZ parser."""
-    if "energy" not in atoms.info:
-        raise ValueError(f"{label} is missing total energy in the XYZ frame metadata")
-    return _finite_scalar(atoms.info["energy"], f"{label} energy")
+    """Read the calculator-backed total energy from an extended-XYZ frame."""
+    try:
+        energy = atoms.get_potential_energy()
+    except Exception as exc:
+        raise ValueError(f"{label} is missing a readable total energy") from exc
+    return _finite_scalar(energy, f"{label} energy")
 
 
 def _extract_forces(atoms: Atoms, label: str) -> np.ndarray:
@@ -142,6 +144,9 @@ def parse_dft_properties(test_xyz_path: Path) -> Dict[int, Dict]:
             "forces": _extract_forces(atoms, f"DFT structure {idx}"),
             "virial": _extract_virial(atoms, f"DFT structure {idx}", required=False),
             "species": list(atoms.get_chemical_symbols()),
+            "positions": np.asarray(atoms.positions, dtype=float),
+            "cell": np.asarray(atoms.cell, dtype=float),
+            "pbc": np.asarray(atoms.pbc, dtype=bool),
             "composition": _composition(atoms),
             "perturbation_family": str(
                 atoms.info.get("perturbation_type", atoms.info.get("configuration_family", ""))
@@ -155,7 +160,7 @@ def parse_dft_properties(test_xyz_path: Path) -> Dict[int, Dict]:
 def parse_gpumd_output(
     out_xyz_path: Path,
     require_virial: bool = True,
-) -> Tuple[int, np.ndarray, Dict[str, Optional[np.ndarray]]]:
+) -> Tuple[int, np.ndarray, Dict[str, object]]:
     """Parse genuine model predictions from GPUMD's ``dump_xyz`` output.
 
     GPUMD writes total energy and total virial/stress in the extended-XYZ
@@ -165,10 +170,13 @@ def parse_gpumd_output(
     contract requests it.
     """
     atoms = _read_last_frame(out_xyz_path, "GPUMD out.xyz")
-    predictions: Dict[str, Optional[np.ndarray]] = {
+    predictions: Dict[str, object] = {
         "energy": _extract_energy(atoms, "GPUMD output"),
         "forces": _extract_forces(atoms, "GPUMD output"),
         "virial": _extract_virial(atoms, "GPUMD output", required=require_virial),
+        "species": list(atoms.get_chemical_symbols()),
+        "cell": np.asarray(atoms.cell, dtype=float),
+        "pbc": np.asarray(atoms.pbc, dtype=bool),
     }
     return len(atoms), np.asarray(atoms.positions, dtype=float), predictions
 
@@ -179,6 +187,149 @@ def _metrics(errors: np.ndarray) -> Tuple[float, float]:
     if values.size == 0 or not np.isfinite(values).all():
         raise ValueError("Cannot calculate metrics from empty or non-finite errors")
     return float(np.mean(np.abs(values))), float(np.sqrt(np.mean(values**2)))
+
+
+def _read_replication_factors(struct_dir: Path) -> Tuple[int, int, int]:
+    """Read the explicit GPUMD supercell factors used for one structure."""
+    run_in_path = struct_dir / "run.in"
+    if not run_in_path.exists():
+        return (1, 1, 1)
+    for line in run_in_path.read_text(encoding="utf-8").splitlines():
+        parts = line.split("#", 1)[0].split()
+        if len(parts) == 4 and parts[0] == "replicate":
+            try:
+                factors = tuple(int(value) for value in parts[1:])
+            except ValueError as exc:
+                raise ValueError(f"Invalid replicate command in {run_in_path}") from exc
+            if any(value < 1 for value in factors):
+                raise ValueError(f"Replicate factors must be positive in {run_in_path}")
+            return factors
+    return (1, 1, 1)
+
+
+def _periodic_distance(first: np.ndarray, second: np.ndarray) -> float:
+    delta = np.asarray(first, dtype=float) - np.asarray(second, dtype=float)
+    delta -= np.rint(delta)
+    return float(np.linalg.norm(delta))
+
+
+def _map_model_atoms_to_reference(
+    dft: dict,
+    ml_positions: np.ndarray,
+    ml_species: Optional[List[str]],
+    ml_cell: Optional[np.ndarray],
+    ml_pbc: Optional[np.ndarray],
+    factors: Tuple[int, int, int],
+) -> np.ndarray:
+    """Map each model supercell atom to an equivalent reference atom."""
+    reference_positions = np.asarray(dft["positions"], dtype=float)
+    reference_cell = np.asarray(dft["cell"], dtype=float)
+    output_positions = np.asarray(ml_positions, dtype=float)
+    if ml_cell is None or ml_pbc is None:
+        raise ValueError("GPUMD output is missing cell/PBC metadata for configuration pairing")
+    output_cell = np.asarray(ml_cell, dtype=float)
+    if not np.allclose(output_cell, reference_cell * np.asarray(factors)[:, None], atol=1e-7):
+        raise ValueError("GPUMD output cell does not match the requested replicated reference cell")
+    if not np.array_equal(np.asarray(ml_pbc, dtype=bool), np.asarray(dft["pbc"], dtype=bool)):
+        raise ValueError("GPUMD output PBC flags do not match the DFT reference")
+
+    try:
+        reference_fractional = reference_positions @ np.linalg.inv(reference_cell)
+        output_fractional = output_positions @ np.linalg.inv(output_cell)
+    except np.linalg.LinAlgError as exc:
+        raise ValueError("Configuration pairing requires non-singular reference/output cells") from exc
+
+    scaled_output_fractional = output_fractional * np.asarray(factors, dtype=float)
+    reference_species = list(dft["species"])
+    if ml_species is not None and len(ml_species) != len(output_positions):
+        raise ValueError("GPUMD output species count does not match its positions")
+    used = np.zeros(len(reference_positions), dtype=int)
+    maximum_uses = int(np.prod(factors))
+    mapping = []
+    for output_index, fractional in enumerate(scaled_output_fractional):
+        candidates = []
+        for reference_index, reference_fractional_value in enumerate(reference_fractional):
+            if used[reference_index] >= maximum_uses:
+                continue
+            if ml_species is not None and ml_species[output_index] != reference_species[reference_index]:
+                continue
+            candidates.append(
+                (
+                    _periodic_distance(fractional, reference_fractional_value),
+                    reference_index,
+                )
+            )
+        if not candidates:
+            raise ValueError(
+                "GPUMD output contains an atom that cannot be mapped to the DFT reference"
+            )
+        distance, reference_index = min(candidates)
+        if distance > 1e-6:
+            raise ValueError(
+                "GPUMD output positions do not match the DFT reference configuration"
+            )
+        used[reference_index] += 1
+        mapping.append(reference_index)
+
+    if not np.all(used == maximum_uses):
+        raise ValueError("GPUMD output does not contain every replicated DFT atom")
+    return np.asarray(mapping, dtype=int)
+
+
+def _pair_model_configuration(
+    dft: dict,
+    ml_positions: np.ndarray,
+    ml_predictions: dict,
+    factors: Tuple[int, int, int],
+) -> np.ndarray:
+    """Validate physical identity and return reference indices for model atoms."""
+    reference_count = int(dft["atoms_count"])
+    model_count = len(ml_positions)
+    repeat_count = int(np.prod(factors))
+    if model_count != reference_count * repeat_count:
+        raise ValueError(
+            "GPUMD output atom count does not match the reference count and "
+            f"replication factors {factors}: DFT={reference_count}, GPUMD={model_count}"
+        )
+
+    reference_positions = dft.get("positions")
+    if reference_positions is None:
+        if factors != (1, 1, 1):
+            raise ValueError("Replicated comparison requires DFT positions and cell metadata")
+        return np.arange(reference_count, dtype=int)
+
+    if factors == (1, 1, 1):
+        if not np.allclose(np.asarray(ml_positions), np.asarray(reference_positions), atol=1e-6):
+            raise ValueError("GPUMD output positions do not match the DFT reference configuration")
+        if (
+            ml_predictions.get("species") is not None
+            and list(ml_predictions["species"]) != list(dft["species"])
+        ):
+            raise ValueError("GPUMD output species do not match the DFT reference")
+        if dft.get("cell") is not None and ml_predictions.get("cell") is not None:
+            if not np.allclose(ml_predictions["cell"], dft["cell"], atol=1e-7):
+                raise ValueError("GPUMD output cell does not match the DFT reference cell")
+        if dft.get("pbc") is not None and ml_predictions.get("pbc") is not None:
+            if not np.array_equal(ml_predictions["pbc"], dft["pbc"]):
+                raise ValueError("GPUMD output PBC flags do not match the DFT reference")
+        return np.arange(reference_count, dtype=int)
+
+    required_geometry = (
+        dft.get("cell"),
+        dft.get("pbc"),
+        ml_predictions.get("cell"),
+        ml_predictions.get("pbc"),
+    )
+    if any(value is None for value in required_geometry):
+        raise ValueError("Replicated comparison requires complete DFT and GPUMD cell/PBC metadata")
+    return _map_model_atoms_to_reference(
+        dft,
+        ml_positions,
+        ml_predictions.get("species"),
+        ml_predictions.get("cell"),
+        ml_predictions.get("pbc"),
+        factors,
+    )
 
 
 def generate_comparison_csv(
@@ -198,13 +349,16 @@ def generate_comparison_csv(
     paired = []
     for struct_idx in sorted(dft_data):
         dft = dft_data[struct_idx]
-        out_xyz_path = validation_root / f"struct_{struct_idx:04d}" / "out.xyz"
-        ml_count, _, ml = parse_gpumd_output(out_xyz_path, require_virial=virial_required)
-        if ml_count != dft["atoms_count"]:
-            raise ValueError(
-                f"struct_{struct_idx:04d}: atom count mismatch "
-                f"(DFT: {dft['atoms_count']}, GPUMD: {ml_count})"
-            )
+        struct_dir = validation_root / f"struct_{struct_idx:04d}"
+        out_xyz_path = struct_dir / "out.xyz"
+        ml_count, ml_positions, ml = parse_gpumd_output(
+            out_xyz_path, require_virial=virial_required
+        )
+        factors = _read_replication_factors(struct_dir)
+        reference_indices = _pair_model_configuration(
+            dft, ml_positions, ml, factors
+        )
+        repeat_count = int(np.prod(factors))
 
         ml_forces = _finite_force_array(
             ml.get("forces"), ml_count, f"struct_{struct_idx:04d} GPUMD forces"
@@ -221,25 +375,32 @@ def generate_comparison_csv(
                 ),
                 "ml_forces": ml_forces,
                 "ml_virial": ml_virial,
+                "reference_indices": reference_indices,
+                "repeat_count": repeat_count,
             }
         )
 
     energy_errors = np.array(
         [
             item["ml_energy"] / item["dft"]["atoms_count"]
+            / item["repeat_count"]
             - item["dft"]["energy"] / item["dft"]["atoms_count"]
             for item in paired
         ]
     )
     energy_mae, energy_rmse = _metrics(energy_errors)
     force_errors = np.concatenate(
-        [item["ml_forces"] - item["dft"]["forces"] for item in paired], axis=0
+        [
+            item["ml_forces"] - item["dft"]["forces"][item["reference_indices"]]
+            for item in paired
+        ],
+        axis=0,
     )
     force_component_mae, force_component_rmse = _metrics(force_errors.reshape(-1))
     force_magnitude_errors = np.concatenate(
         [
             np.linalg.norm(item["ml_forces"], axis=1)
-            - np.linalg.norm(item["dft"]["forces"], axis=1)
+            - np.linalg.norm(item["dft"]["forces"][item["reference_indices"]], axis=1)
             for item in paired
         ]
     )
@@ -249,7 +410,10 @@ def generate_comparison_csv(
     if virial_required:
         virial_errors = np.concatenate(
             [
-                (item["ml_virial"] - item["dft"]["virial"]).reshape(-1)
+                (
+                    item["ml_virial"] / item["repeat_count"]
+                    - item["dft"]["virial"]
+                ).reshape(-1)
                 for item in paired
             ]
         )
@@ -259,14 +423,15 @@ def generate_comparison_csv(
     for item in paired:
         struct_idx = item["struct_idx"]
         dft = item["dft"]
-        dft_forces = np.asarray(dft["forces"], dtype=float)
+        dft_forces = np.asarray(dft["forces"], dtype=float)[item["reference_indices"]]
         ml_forces = item["ml_forces"]
         dft_energy_per_atom = dft["energy"] / dft["atoms_count"]
-        ml_energy_per_atom = item["ml_energy"] / dft["atoms_count"]
-        for atom_idx in range(dft["atoms_count"]):
+        ml_energy_per_atom = item["ml_energy"] / item["repeat_count"] / dft["atoms_count"]
+        for atom_idx in range(len(ml_forces)):
             row = {
                 "struct_id": struct_idx,
                 "atom_id": atom_idx,
+                "reference_atom_id": item["reference_indices"][atom_idx],
                 "species": dft["species"][atom_idx],
                 "composition": dft.get("composition", ""),
                 "perturbation_family": dft.get("perturbation_family", ""),
@@ -301,7 +466,7 @@ def generate_comparison_csv(
                 for component, dft_value, ml_value in zip(
                     _VIRIAL_COMPONENTS,
                     dft["virial"].reshape(-1),
-                    item["ml_virial"].reshape(-1),
+                    (item["ml_virial"] / item["repeat_count"]).reshape(-1),
                 ):
                     row[f"virial_{component}_dft"] = dft_value
                     row[f"virial_{component}_ml"] = ml_value
