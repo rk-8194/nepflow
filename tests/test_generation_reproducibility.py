@@ -9,6 +9,7 @@ pytest.importorskip("pymatgen")
 pytest.importorskip("hiphive")
 from ase import Atoms  # noqa: E402
 
+from modules.generate.generators import structure_generation as structure_generation_module  # noqa: E402
 from modules.generate.generators.structure_generation import PerturbationEngine  # noqa: E402
 
 
@@ -61,10 +62,6 @@ class GenerationReproducibilityTests(unittest.TestCase):
 
         self.assert_structures_equal(first, second)
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="Phase 1 blocker P0-14: primary hiphive rattling must receive explicit RNG state",
-    )
     def test_primary_rattling_path_repeats_with_same_seed(self) -> None:
         base = self.make_base()
         ambient_rng = np.random.RandomState(90210)
@@ -111,6 +108,30 @@ class GenerationReproducibilityTests(unittest.TestCase):
 
         self.assert_structures_equal(first, second)
 
+    def test_different_effective_seeds_reach_primary_rattling_boundary(self) -> None:
+        base = self.make_base()
+        received_seeds = []
+
+        def fake_primary_rattling(atoms, n_structures, rattle_std, d_min, **kwargs):
+            del d_min, rattle_std
+            received_seeds.append(kwargs["seed"])
+            return [atoms.copy() for _ in range(n_structures)]
+
+        with patch(
+            "hiphive.structure_generation.generate_mc_rattled_structures",
+            side_effect=fake_primary_rattling,
+        ):
+            PerturbationEngine(
+                target_n_atoms=len(base),
+                random_seed=21,
+            )._rattled(base, base, n=1)
+            PerturbationEngine(
+                target_n_atoms=len(base),
+                random_seed=22,
+            )._rattled(base, base, n=1)
+
+        self.assertEqual(received_seeds, [21, 22])
+
     def test_stochastic_vacancy_choices_repeat_with_same_seed(self) -> None:
         base = self.make_base()
         kwargs = {
@@ -147,10 +168,47 @@ class GenerationReproducibilityTests(unittest.TestCase):
 
         self.assertEqual(engine._engine_params()["random_seed"], 1234)
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="Phase 1 blocker P0-14: stochastic candidates must retain seed provenance",
-    )
+    def test_worker_derived_seed_is_recorded_on_stochastic_candidate(self) -> None:
+        base = self.make_base()
+        parent_engine = PerturbationEngine(
+            target_n_atoms=len(base),
+            random_seed=1234,
+            n_volume_points=0,
+            elastic_stress_enabled=False,
+        )
+        child_seed = 9876
+
+        def fake_primary_rattling(atoms, n_structures, rattle_std, d_min, **kwargs):
+            del d_min, rattle_std, kwargs
+            return [atoms.copy() for _ in range(n_structures)]
+
+        with patch(
+            "hiphive.structure_generation.generate_mc_rattled_structures",
+            side_effect=fake_primary_rattling,
+        ):
+            results = structure_generation_module._process_one_base(
+                (
+                    base,
+                    parent_engine._engine_params(),
+                    1,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    child_seed,
+                )
+            )
+
+        rattled = [
+            atoms for atoms in results if atoms.info["perturbation_type"] == "rattled"
+        ]
+        self.assertEqual(len(rattled), 1)
+        self.assertEqual(rattled[0].info["random_seed"], child_seed)
+        self.assertNotEqual(rattled[0].info["random_seed"], parent_engine._random_seed)
+
     def test_stochastic_candidate_records_parent_and_seed_provenance(self) -> None:
         base = self.make_base()
         candidate = PerturbationEngine(

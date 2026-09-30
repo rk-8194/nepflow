@@ -35,8 +35,7 @@ class _SeededFakeDynamics:
         self.atoms = atoms
         self.callback = None
         self.interval = None
-        seed = kwargs.get("random_seed")
-        self.rng = np.random.default_rng(seed)
+        self.rng = kwargs["rng"]
 
     def attach(self, callback, interval):
         self.callback = callback
@@ -277,10 +276,6 @@ class ElasticStressGenerationTests(unittest.TestCase):
             self.assertEqual(atoms.info["liquid_temperature_k"], 2500.0)
             self.assertEqual(atoms.info["liquid_timestep_fs"], 1.5)
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="Phase 1 blocker P0-14: liquid MD must receive an explicit reproducibility seed",
-    )
     def test_liquid_snapshots_repeat_with_same_seed(self) -> None:
         base = self.make_base()
         kwargs = {
@@ -312,6 +307,42 @@ class ElasticStressGenerationTests(unittest.TestCase):
             )
 
         np.testing.assert_allclose(first[0].positions, second[0].positions)
+        self.assertEqual(first[0].info["random_seed"], 17)
+        self.assertEqual(first[0].info["liquid_random_seed"], 17)
+
+    def test_liquid_configurations_receive_distinct_deterministic_rng_state(self) -> None:
+        base = self.make_base()
+        observed_states = []
+
+        class RecordingDynamics(_SeededFakeDynamics):
+            def __init__(self, atoms, *_args, **kwargs):
+                super().__init__(atoms, *_args, **kwargs)
+                observed_states.append(self.rng.get_state()[1][0])
+
+        kwargs = {
+            "target_n_atoms": 2,
+            "random_seed": 17,
+            "liquid_enabled": True,
+            "liquid_equilibration_steps": 1,
+            "liquid_steps_between_snapshots": 1,
+        }
+
+        with (
+            patch("ase.calculators.lj.LennardJones", return_value=object()),
+            patch("ase.md.Langevin", RecordingDynamics),
+            patch("ase.md.velocitydistribution.MaxwellBoltzmannDistribution"),
+            patch("ase.md.velocitydistribution.Stationary"),
+            patch("ase.md.velocitydistribution.ZeroRotation"),
+        ):
+            structures = PerturbationEngine(**kwargs)._liquid_snapshots(
+                base,
+                base,
+                n_configurations=2,
+                n_snapshots=1,
+            )
+
+        self.assertEqual(len(structures), 2)
+        self.assertEqual(observed_states, [17, 18])
 
 
 if __name__ == "__main__":

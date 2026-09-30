@@ -52,6 +52,7 @@ def _process_one_base(args: tuple) -> List[Atoms]:
 
     engine = PerturbationEngine(**engine_params)
     engine.rng = np.random.RandomState(seed)
+    engine._random_seed = int(seed)
 
     supercell = engine._ensure_supercell(base)
     results: List[Atoms] = []
@@ -326,6 +327,16 @@ class PerturbationEngine:
             if key in base.info:
                 atoms.info.setdefault(key, base.info[key])
         atoms.info["perturbation_type"] = perturbation_type
+        if perturbation_type in {
+            "rattled",
+            "liquid",
+            "vacancy",
+            "interstitial",
+            "gas_interstitial",
+            "vacancy_interstitial",
+            "gas_in_vacancy",
+        }:
+            atoms.info["random_seed"] = self._random_seed
         atoms.info.update(extra)
 
     # ------------------------------------------------------------------
@@ -418,6 +429,7 @@ class PerturbationEngine:
                     n_structures=1,
                     rattle_std=rattle_std,
                     d_min=self.rattle_d_min,
+                    seed=self._random_seed,
                 )
                 for r in rattled_list:
                     self._tag(
@@ -504,7 +516,13 @@ class PerturbationEngine:
             )
             atoms = supercell.copy()
             atoms.calc = LennardJones()
-            MaxwellBoltzmannDistribution(atoms, temperature_K=self.liquid_temperature_k)
+            liquid_seed = (int(self._random_seed) + config_index) % (2**32)
+            liquid_rng = np.random.RandomState(liquid_seed)
+            MaxwellBoltzmannDistribution(
+                atoms,
+                temperature_K=self.liquid_temperature_k,
+                rng=liquid_rng,
+            )
             Stationary(atoms)
             ZeroRotation(atoms)
             dynamics = Langevin(
@@ -512,6 +530,7 @@ class PerturbationEngine:
                 timestep=self.liquid_timestep_fs * units.fs,
                 temperature_K=self.liquid_temperature_k,
                 friction=self.liquid_friction,
+                rng=liquid_rng,
             )
             snapshots: List[Atoms] = []
 
@@ -526,6 +545,7 @@ class PerturbationEngine:
                     liquid_snapshot_index=snapshot_index,
                     liquid_temperature_k=self.liquid_temperature_k,
                     liquid_timestep_fs=self.liquid_timestep_fs,
+                    liquid_random_seed=liquid_seed,
                 )
                 snapshots.append(snapshot)
                 logger.info(
