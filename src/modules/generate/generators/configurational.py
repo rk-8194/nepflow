@@ -106,6 +106,30 @@ def _composition_label(composition: Dict[str, float]) -> str:
     return "-".join(parts)
 
 
+def _allocate_crystal_quota(
+    total: int,
+    crystal_structures: List[str],
+) -> List[tuple[str, int]]:
+    """Allocate a total per-composition quota across crystals in configured order."""
+    if total < 0:
+        raise ValueError("n_structures must be non-negative")
+    if len(set(crystal_structures)) != len(crystal_structures):
+        raise ValueError("crystal_structures must not contain duplicate names")
+    if total > 0 and not crystal_structures:
+        raise ValueError(
+            "positive n_structures requires at least one crystal structure"
+        )
+
+    if not crystal_structures:
+        return []
+
+    base, remainder = divmod(total, len(crystal_structures))
+    return [
+        (crystal, base + (1 if index < remainder else 0))
+        for index, crystal in enumerate(crystal_structures)
+    ]
+
+
 # ======================================================================
 # 1) Materials Project generator
 # ======================================================================
@@ -205,6 +229,8 @@ class RandomSolidSolutionGenerator(ConfigurationalGenerator):
         crystal_structures: List[str],
         target_n_atoms: int = 250,
     ) -> List[Atoms]:
+        quota_plan = _allocate_crystal_quota(self.n_structures, crystal_structures)
+
         # For pure elements random substitution is pointless
         if sum(1 for f in composition.values() if f > 0) <= 1:
             return []
@@ -213,12 +239,16 @@ class RandomSolidSolutionGenerator(ConfigurationalGenerator):
         # Use the majority element to build the lattice
         majority_el = max(composition, key=composition.get)
 
-        for cs in crystal_structures:
+        for cs, crystal_quota in quota_plan:
+            if crystal_quota == 0:
+                continue
             supercell = _make_supercell(majority_el, cs, target_n_atoms)
             if supercell is None:
-                continue
+                raise RuntimeError(
+                    f"Random solid-solution generation failed for crystal {cs}"
+                )
 
-            for i in range(self.n_structures):
+            for i in range(crystal_quota):
                 assigned = _assign_composition(supercell, composition, self.rng)
                 label = _composition_label(composition)
                 assigned.info.update({
@@ -229,7 +259,7 @@ class RandomSolidSolutionGenerator(ConfigurationalGenerator):
                 })
                 results.append(assigned)
 
-        return results[:self.n_structures]
+        return results
 
 
 # ======================================================================
@@ -249,6 +279,8 @@ class SQSGenerator(ConfigurationalGenerator):
         crystal_structures: List[str],
         target_n_atoms: int = 250,
     ) -> List[Atoms]:
+        quota_plan = _allocate_crystal_quota(self.n_structures, crystal_structures)
+
         if sum(1 for f in composition.values() if f > 0) <= 1:
             return []
 
@@ -268,44 +300,65 @@ class SQSGenerator(ConfigurationalGenerator):
         active_elements = sorted(el for el, f in composition.items() if f > 0)
         target_concentrations = {el: composition.get(el, 0.0) for el in active_elements}
 
-        for cs in crystal_structures:
+        output_slot = 0
+        for cs, crystal_quota in quota_plan:
+            if crystal_quota == 0:
+                continue
             supercell = _make_supercell(majority_el, cs, target_n_atoms)
             if supercell is None:
-                continue
+                raise RuntimeError(f"SQS generation failed for crystal {cs}")
 
-            try:
-                prim = bulk(majority_el, cs, a=3.0) if cs != "hcp" else bulk(majority_el, "hcp", a=3.0, c=3.0 * 1.633)
-                cluster_space = ClusterSpace(prim, cutoffs=[6.0], chemical_symbols=[active_elements])
-
-                sqs_atoms = generate_sqs_from_supercells(
-                    cluster_space=cluster_space,
-                    max_size=len(supercell),
-                    target_concentrations=target_concentrations,
-                    n_steps=5000,
-                    random_seed=self.random_seed,
-                )
-
-                label = _composition_label(composition)
-                sqs_atoms.info.update({
-                    "composition": composition,
-                    "crystal_structure": cs,
-                    "configurational_type": "sqs",
-                    "source": f"sqs-{label}-{cs}",
-                })
-                results.append(sqs_atoms)
-
-            except Exception as e:
-                logger.debug(f"SQS generation failed for {composition} on {cs}: {e}")
-                # Fall back to monte-carlo approach
+            for crystal_slot in range(crystal_quota):
+                slot_seed = self.random_seed + output_slot
                 try:
-                    from icet.tools.structure_generation import generate_target_structure
-                    mc_atoms = self._mc_fallback(supercell, composition, active_elements, cs)
-                    if mc_atoms is not None:
-                        results.append(mc_atoms)
-                except Exception as e2:
-                    logger.debug(f"SQS MC fallback also failed: {e2}")
+                    prim = bulk(majority_el, cs, a=3.0) if cs != "hcp" else bulk(
+                        majority_el,
+                        "hcp",
+                        a=3.0,
+                        c=3.0 * 1.633,
+                    )
+                    cluster_space = ClusterSpace(
+                        prim,
+                        cutoffs=[6.0],
+                        chemical_symbols=[active_elements],
+                    )
+                    sqs_atoms = generate_sqs_from_supercells(
+                        cluster_space=cluster_space,
+                        max_size=len(supercell),
+                        target_concentrations=target_concentrations,
+                        n_steps=5000,
+                        random_seed=slot_seed,
+                    )
 
-        return results[:self.n_structures]
+                    label = _composition_label(composition)
+                    sqs_atoms.info.update({
+                        "composition": composition,
+                        "crystal_structure": cs,
+                        "configurational_type": "sqs",
+                        "source": f"sqs-{label}-{cs}-{crystal_slot}",
+                    })
+                    results.append(sqs_atoms)
+
+                except Exception as e:
+                    logger.debug(f"SQS generation failed for {composition} on {cs}: {e}")
+                    # Fall back to monte-carlo approach
+                    try:
+                        from icet.tools.structure_generation import generate_target_structure
+                        mc_atoms = self._mc_fallback(
+                            supercell,
+                            composition,
+                            active_elements,
+                            cs,
+                            random_seed=slot_seed,
+                            source_slot=crystal_slot,
+                        )
+                        if mc_atoms is not None:
+                            results.append(mc_atoms)
+                    except Exception as e2:
+                        logger.debug(f"SQS MC fallback also failed: {e2}")
+                output_slot += 1
+
+        return results
 
     def _mc_fallback(
         self,
@@ -313,16 +366,20 @@ class SQSGenerator(ConfigurationalGenerator):
         composition: Dict[str, float],
         active_elements: List[str],
         cs: str,
+        random_seed: int | None = None,
+        source_slot: int = 0,
     ) -> Optional[Atoms]:
         """Simple MC-based SQS via random swaps."""
-        rng = np.random.RandomState(self.random_seed)
+        rng = np.random.RandomState(
+            self.random_seed if random_seed is None else random_seed
+        )
         assigned = _assign_composition(supercell, composition, rng)
         label = _composition_label(composition)
         assigned.info.update({
             "composition": composition,
             "crystal_structure": cs,
             "configurational_type": "sqs",
-            "source": f"sqs-mc-{label}-{cs}",
+            "source": f"sqs-mc-{label}-{cs}-{source_slot}",
         })
         return assigned
 
@@ -344,6 +401,8 @@ class SegregatedGenerator(ConfigurationalGenerator):
         crystal_structures: List[str],
         target_n_atoms: int = 250,
     ) -> List[Atoms]:
+        quota_plan = _allocate_crystal_quota(self.n_structures, crystal_structures)
+
         if sum(1 for f in composition.values() if f > 0) <= 1:
             return []
 
@@ -354,12 +413,21 @@ class SegregatedGenerator(ConfigurationalGenerator):
         # Segregation strategies: one per axis direction (x, y, z)
         strategies = ["x", "y", "z"]
 
-        for cs in crystal_structures:
+        for cs, crystal_quota in quota_plan:
+            if crystal_quota == 0:
+                continue
+            if crystal_quota > len(strategies):
+                raise ValueError(
+                    f"Segregated generation supports at most {len(strategies)} "
+                    f"structures per crystal, requested {crystal_quota} for {cs}"
+                )
             supercell = _make_supercell(majority_el, cs, target_n_atoms)
             if supercell is None:
-                continue
+                raise RuntimeError(
+                    f"Segregated generation failed for crystal {cs}"
+                )
 
-            for i, strategy in enumerate(strategies[:self.n_structures]):
+            for strategy in strategies[:crystal_quota]:
                 seg = self._layered_segregation(supercell, composition, active_elements, strategy)
                 label = _composition_label(composition)
                 seg.info.update({
@@ -371,7 +439,7 @@ class SegregatedGenerator(ConfigurationalGenerator):
                 })
                 results.append(seg)
 
-        return results[:self.n_structures]
+        return results
 
     def _layered_segregation(
         self,

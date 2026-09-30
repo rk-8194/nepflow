@@ -14,9 +14,6 @@ from ase import Atoms  # noqa: E402
 from modules.generate.generators import configurational as configurational_module  # noqa: E402
 
 
-P0_12_XFAIL_REASON = (
-    "Phase 1 blocker P0-12: per-composition quotas must cover requested crystals"
-)
 P0_13_XFAIL_REASON = (
     "Phase 1 blocker P0-13: public SQS generation must fail fast on unavailable paths"
 )
@@ -48,7 +45,43 @@ class ConfigurationalGeneratorTests(unittest.TestCase):
             Counter({"bcc": expected_total // 2, "fcc": expected_total // 2}),
         )
 
-    @pytest.mark.xfail(strict=True, reason=P0_12_XFAIL_REASON)
+    def test_crystal_quota_allocation_balances_in_configured_order(self) -> None:
+        self.assertEqual(
+            configurational_module._allocate_crystal_quota(5, ["bcc", "fcc"]),
+            [("bcc", 3), ("fcc", 2)],
+        )
+
+    def test_crystal_quota_allocation_gives_remainder_to_first_crystal(self) -> None:
+        self.assertEqual(
+            configurational_module._allocate_crystal_quota(1, ["bcc", "fcc"]),
+            [("bcc", 1), ("fcc", 0)],
+        )
+
+    def test_crystal_quota_allocation_zero_has_no_outputs(self) -> None:
+        self.assertEqual(
+            configurational_module._allocate_crystal_quota(0, ["bcc", "fcc"]),
+            [("bcc", 0), ("fcc", 0)],
+        )
+
+    def test_crystal_quota_allocation_rejects_invalid_crystal_inputs(self) -> None:
+        with self.assertRaisesRegex(ValueError, "duplicate"):
+            configurational_module._allocate_crystal_quota(4, ["bcc", "bcc"])
+        with self.assertRaisesRegex(ValueError, "at least one"):
+            configurational_module._allocate_crystal_quota(1, [])
+        with self.assertRaisesRegex(ValueError, "non-negative"):
+            configurational_module._allocate_crystal_quota(-1, ["bcc"])
+
+    def test_random_solution_reversed_crystal_order_uses_ordered_remainder(self) -> None:
+        results = configurational_module.RandomSolidSolutionGenerator(
+            n_structures=3,
+            random_seed=7,
+        ).generate(self.composition, ["fcc", "bcc"], target_n_atoms=8)
+
+        self.assertEqual(
+            [atoms.info["crystal_structure"] for atoms in results],
+            ["fcc", "fcc", "bcc"],
+        )
+
     def test_random_solution_quota_is_per_composition_and_deterministic(self) -> None:
         first = configurational_module.RandomSolidSolutionGenerator(
             n_structures=4,
@@ -95,7 +128,6 @@ class ConfigurationalGeneratorTests(unittest.TestCase):
             [atoms.get_chemical_symbols() for atoms in second],
         )
 
-    @pytest.mark.xfail(strict=True, reason=P0_12_XFAIL_REASON)
     def test_segregated_quota_is_per_composition_and_deterministic(self) -> None:
         first = configurational_module.SegregatedGenerator(
             n_structures=4,
@@ -112,7 +144,6 @@ class ConfigurationalGeneratorTests(unittest.TestCase):
             [atoms.get_chemical_symbols() for atoms in second],
         )
 
-    @pytest.mark.xfail(strict=True, reason=P0_12_XFAIL_REASON)
     def test_sqs_quota_is_per_composition_and_deterministic(self) -> None:
         fake_icet = ModuleType("icet")
         fake_icet_tools = ModuleType("icet.tools")
