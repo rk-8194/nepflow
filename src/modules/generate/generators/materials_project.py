@@ -255,27 +255,28 @@ class MaterialsProjectFetcher:
                         "symmetry",
                     ],
                 )
-
-                if not docs:
-                    logger.debug(f"No materials found for {element}")
-                    continue
-
-                # Filter by crystal structure
-                filtered_docs = self._filter_by_structure(docs, crystal_structures)
-                logger.debug(f"Found {len(filtered_docs)} structures for {element}")
-
-                # Convert to serializable format
-                results = [self._serialize_structure(doc) for doc in filtered_docs]
-
-                # Cache results
-                with open(cache_path, "w") as f:
-                    json.dump(results, f, indent=2)
-
-                all_results.extend(results)
-
             except Exception as e:
-                logger.error(f"Error fetching structures for {element}: {e}")
+                raise RuntimeError(
+                    "Materials Project query failed for "
+                    f"element={element}, structures={crystal_structures}"
+                ) from e
+
+            if not docs:
+                logger.debug(f"No materials found for {element}")
                 continue
+
+            # Filter by crystal structure
+            filtered_docs = self._filter_by_structure(docs, crystal_structures)
+            logger.debug(f"Found {len(filtered_docs)} structures for {element}")
+
+            # Convert to serializable format
+            results = [self._serialize_structure(doc) for doc in filtered_docs]
+
+            # Cache results
+            with open(cache_path, "w") as f:
+                json.dump(results, f, indent=2)
+
+            all_results.extend(results)
 
         return all_results
 
@@ -358,8 +359,9 @@ class MaterialsProjectFetcher:
                 ],
             )
         except Exception as e:
-            logger.error(f"MP query failed for {elements}: {e}")
-            return []
+            raise RuntimeError(
+                f"Materials Project query failed for elements={elements}"
+            ) from e
 
         if not docs:
             logger.debug(f"No compounds found for {elements}")

@@ -12,16 +12,10 @@ from ase import Atoms  # noqa: E402
 
 from common.structure_identity import hash_structure  # noqa: E402
 from modules.generate import generate as generate_module
+from modules.generate.generators.materials_project import MaterialsProjectFetcher  # noqa: E402
 
 
 GenerateStage = generate_module.GenerateStage
-P0_11_XFAIL_REASON = (
-    "Phase 1 blocker P0-11: Materials Project composition provenance must preserve "
-    "realised source composition"
-)
-DEDUP_CONTRACT_XFAIL_REASON = (
-    "Structure Generation PDD: exact physical duplicates must be merged before selection"
-)
 
 
 def write_project_config(
@@ -288,7 +282,6 @@ class GenerateStageTests(unittest.TestCase):
             self.assertTrue(any("WC" in message and "mp-1894" in message for message in logged_messages))
             self.assertTrue(any("W" in message and "mp-91" in message and "bcc" in message for message in logged_messages))
 
-    @pytest.mark.xfail(strict=True, reason=P0_11_XFAIL_REASON)
     def test_materials_project_preserves_requested_and_realised_compositions(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_dir = Path(tmp)
@@ -332,7 +325,24 @@ class GenerateStageTests(unittest.TestCase):
 
         self.assertEqual(hash_structure(first), hash_structure(second))
 
-    @pytest.mark.xfail(strict=True, reason=DEDUP_CONTRACT_XFAIL_REASON)
+    def test_materials_project_query_exception_raises(self) -> None:
+        fetcher = MaterialsProjectFetcher.__new__(MaterialsProjectFetcher)
+        fetcher._mpr = Mock()
+        fetcher._mpr.materials.summary.search.side_effect = ConnectionError("offline")
+
+        with self.assertRaisesRegex(RuntimeError, r"elements=\['Si', 'Ge'\]"):
+            fetcher.fetch_compounds(["Si", "Ge"], use_cache=False)
+
+    def test_materials_project_zero_results_returns_empty_list(self) -> None:
+        fetcher = MaterialsProjectFetcher.__new__(MaterialsProjectFetcher)
+        fetcher._mpr = Mock()
+        fetcher._mpr.materials.summary.search.return_value = []
+
+        self.assertEqual(
+            fetcher.fetch_compounds(["Si", "Ge"], use_cache=False),
+            [],
+        )
+
     def test_prepare_merges_exact_duplicates_and_retains_origin_paths(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_dir = Path(tmp)
@@ -341,10 +351,13 @@ class GenerateStageTests(unittest.TestCase):
             config, settings = stage.load_config()
             first = make_atoms("Si2")
             second = first.copy()
+            third = make_atoms("Ge2")
             first.info["source"] = "path-a"
             second.info["source"] = "path-b"
+            third.info["source"] = "path-c"
+            first.info["material_id"] = "mp-1234"
             generator = Mock()
-            generator.generate.return_value = [first, second]
+            generator.generate.return_value = [first, second, third]
 
             with patch.object(stage, "_build_compositions", return_value=[{"Si": 1.0}]):
                 with patch.object(
@@ -361,6 +374,11 @@ class GenerateStageTests(unittest.TestCase):
             self.assertCountEqual(
                 bases[0].info["provenance_paths"],
                 ["path-a", "path-b"],
+            )
+            self.assertEqual(bases[0].info["provenance_material_ids"], ["mp-1234"])
+            self.assertEqual(
+                [base.info["seed_id"] for base in bases],
+                ["seed_000000", "seed_000001"],
             )
 
 

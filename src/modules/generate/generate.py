@@ -19,7 +19,7 @@ from ase import Atoms
 from ase.build import bulk
 from ase.io import write
 
-from common.structure_identity import annotate_structure_hashes
+from common.structure_identity import annotate_structure_hashes, hash_structure
 from ..base import Stage
 from .generators import (
     CompositionGrid,
@@ -109,7 +109,6 @@ class GenerateStage(Stage):
             return None
 
         all_bases: List[Atoms] = []
-        seed_index = 0
         logger.info("")
         logger.info("Step 2: Generating base structures (configurational generators)")
         for composition in compositions:
@@ -127,7 +126,6 @@ class GenerateStage(Stage):
                     settings["gas_elements"],
                 )
                 self._log_generator_output(label, gen_name, bases)
-                seed_index = self._assign_seed_ids(bases, seed_index)
                 all_bases.extend(bases)
                 if bases:
                     logger.debug(f"  {label} / {gen_name}: {len(bases)} structures")
@@ -135,6 +133,8 @@ class GenerateStage(Stage):
         if settings["gas_elements"]:
             self._extend_with_gas_phase_bases(all_bases, generators, settings)
 
+        all_bases = self._deduplicate_base_structures(all_bases)
+        self._assign_seed_ids(all_bases, 0)
         logger.info(f"  Total base structures: {len(all_bases)}")
         if not all_bases:
             logger.warning("No base structures generated - aborting")
@@ -319,8 +319,73 @@ class GenerateStage(Stage):
     @staticmethod
     def _assign_seed_ids(bases: List[Atoms], start_index: int) -> int:
         for offset, base in enumerate(bases):
-            base.info.setdefault("seed_id", f"seed_{start_index + offset:06d}")
+            base.info["seed_id"] = f"seed_{start_index + offset:06d}"
         return start_index + len(bases)
+
+    @staticmethod
+    def _deduplicate_base_structures(bases: List[Atoms]) -> List[Atoms]:
+        """Merge physically identical bases while retaining their provenance."""
+        unique_bases: List[Atoms] = []
+        by_hash: dict[str, Atoms] = {}
+
+        for base in bases:
+            structure_hash = hash_structure(base)
+            representative = by_hash.get(structure_hash)
+            if representative is None:
+                GenerateStage._merge_provenance(representative=base, duplicate=None)
+                by_hash[structure_hash] = base
+                unique_bases.append(base)
+                continue
+
+            GenerateStage._merge_provenance(
+                representative=representative,
+                duplicate=base,
+            )
+
+        if len(unique_bases) != len(bases):
+            logger.info(
+                "  Merged %d physically duplicate base structure(s)",
+                len(bases) - len(unique_bases),
+            )
+        return unique_bases
+
+    @staticmethod
+    def _merge_provenance(
+        representative: Atoms,
+        duplicate: Atoms | None,
+    ) -> None:
+        """Merge source and Materials Project provenance into one base."""
+        path_values: List[str] = []
+        material_values: List[str] = []
+
+        for atoms in (representative, duplicate):
+            if atoms is None:
+                continue
+            path_values.extend(
+                GenerateStage._metadata_values(atoms.info.get("provenance_paths"))
+            )
+            path_values.extend(GenerateStage._metadata_values(atoms.info.get("source")))
+            material_values.extend(
+                GenerateStage._metadata_values(
+                    atoms.info.get("provenance_material_ids")
+                )
+            )
+            material_values.extend(
+                GenerateStage._metadata_values(atoms.info.get("material_id"))
+            )
+
+        representative.info["provenance_paths"] = sorted(set(path_values))
+        distinct_materials = sorted(set(material_values))
+        if distinct_materials:
+            representative.info["provenance_material_ids"] = distinct_materials
+
+    @staticmethod
+    def _metadata_values(value) -> List[str]:
+        if value is None:
+            return []
+        if isinstance(value, (list, tuple, set)):
+            return [str(item) for item in value if item is not None]
+        return [str(value)]
 
     def _extend_with_gas_phase_bases(
         self,
@@ -343,7 +408,6 @@ class GenerateStage(Stage):
         for base in gas_bases:
             base.info.setdefault("elements", settings["elements"])
             base.info.setdefault("gas_elements", settings["gas_elements"])
-        self._assign_seed_ids(gas_bases, len(all_bases))
         all_bases.extend(gas_bases)
         logger.info(f"  Gas-phase base structures: {len(gas_bases)}")
 

@@ -11,6 +11,7 @@ and returns ASE Atoms objects representing different atomic arrangements:
 
 import logging
 from abc import ABC, abstractmethod
+from collections import Counter
 from typing import Dict, List, Optional
 
 import numpy as np
@@ -136,9 +137,17 @@ class MaterialsProjectGenerator(ConfigurationalGenerator):
                 elements, max_per_query=self.max_per_composition, use_cache=True,
             )
 
-        # Annotate
+        # MP's query composition is the requested composition.  The physical
+        # composition comes from the returned structure and can differ from it.
         for atoms in atoms_list:
-            atoms.info.setdefault("composition", composition)
+            atoms.info["composition"] = dict(composition)
+            symbols = atoms.get_chemical_symbols()
+            counts = Counter(symbols)
+            total = len(symbols)
+            atoms.info["actual_composition"] = {
+                element: counts[element] / total
+                for element in sorted(counts)
+            }
             atoms.info.setdefault("configurational_type", "mp_phase")
 
         return atoms_list[:self.max_per_composition]
