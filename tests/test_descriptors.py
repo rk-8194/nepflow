@@ -1,4 +1,5 @@
 import hashlib
+import hashlib
 import json
 import tempfile
 import unittest
@@ -14,7 +15,6 @@ from common import descriptors as DESCRIPTORS  # noqa: E402
 
 
 CACHE_SCHEMA_VERSION = "descriptor-cache-v1"
-P0_10_XFAIL_REASON = "Phase 1 blocker P0-10: descriptor cache identity is incomplete"
 
 
 class CacheStructure:
@@ -170,10 +170,6 @@ class DescriptorTests(unittest.TestCase):
         self.assertEqual(calc.mean_flags, [False, False])
         self.assertEqual(descriptors.shape, (3, 2))
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason=P0_10_XFAIL_REASON,
-    )
     def test_equal_shape_cache_from_changed_structure_content_is_not_reused(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_dir = Path(tmp)
@@ -187,7 +183,6 @@ class DescriptorTests(unittest.TestCase):
 
             self.assert_cache_recomputed(project_dir, changed_structures)
 
-    @pytest.mark.xfail(strict=True, reason=P0_10_XFAIL_REASON)
     def test_equal_shape_cache_from_changed_structure_order_is_not_reused(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_dir = Path(tmp)
@@ -196,7 +191,6 @@ class DescriptorTests(unittest.TestCase):
 
             self.assert_cache_recomputed(project_dir, list(reversed(structures)))
 
-    @pytest.mark.xfail(strict=True, reason=P0_10_XFAIL_REASON)
     def test_equal_shape_cache_from_changed_model_is_not_reused(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_dir = Path(tmp)
@@ -206,7 +200,6 @@ class DescriptorTests(unittest.TestCase):
 
             self.assert_cache_recomputed(project_dir, structures)
 
-    @pytest.mark.xfail(strict=True, reason=P0_10_XFAIL_REASON)
     def test_equal_shape_cache_from_changed_representation_settings_is_not_reused(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_dir = Path(tmp)
@@ -219,7 +212,6 @@ class DescriptorTests(unittest.TestCase):
                 mean_descriptor=False,
             )
 
-    @pytest.mark.xfail(strict=True, reason=P0_10_XFAIL_REASON)
     def test_equal_shape_cache_from_changed_schema_is_not_reused(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_dir = Path(tmp)
@@ -251,7 +243,24 @@ class DescriptorTests(unittest.TestCase):
             compute.assert_not_called()
             np.testing.assert_array_equal(descriptors, expected)
 
-    @pytest.mark.xfail(strict=True, reason=P0_10_XFAIL_REASON)
+    def test_changed_batch_size_does_not_invalidate_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_dir = Path(tmp)
+            structures = [CacheStructure(f"structure-{i}") for i in range(3)]
+            self.write_cache_fixture(project_dir, structures)
+
+            with patch.object(DESCRIPTORS, "compute_descriptors_batched") as compute:
+                descriptors = DESCRIPTORS.load_or_compute_descriptors(
+                    project_dir,
+                    structures,
+                    mean_descriptor=True,
+                    batch_size=99,
+                    nep_model_file="nep89.txt",
+                )
+
+            compute.assert_not_called()
+            self.assertEqual(descriptors.shape, (3, 4))
+
     def test_missing_cache_identity_metadata_is_not_trusted(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_dir = Path(tmp)
@@ -260,7 +269,6 @@ class DescriptorTests(unittest.TestCase):
 
             self.assert_cache_recomputed(project_dir, structures)
 
-    @pytest.mark.xfail(strict=True, reason=P0_10_XFAIL_REASON)
     def test_malformed_cache_identity_metadata_is_not_trusted(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_dir = Path(tmp)
@@ -270,7 +278,6 @@ class DescriptorTests(unittest.TestCase):
 
             self.assert_cache_recomputed(project_dir, structures)
 
-    @pytest.mark.xfail(strict=True, reason=P0_10_XFAIL_REASON)
     def test_descriptor_and_manifest_shape_disagreement_invalidates_cache(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_dir = Path(tmp)
@@ -294,7 +301,7 @@ class DescriptorTests(unittest.TestCase):
             with patch.object(DESCRIPTORS, "NepCalculator", CalculatorBoundary):
                 descriptors = DESCRIPTORS.load_or_compute_descriptors(
                     project_dir,
-                    ["a", "b", "c"],
+                    [CacheStructure(f"structure-{i}") for i in range(3)],
                     mean_descriptor=False,
                     batch_size=2,
                     nep_model_file="nep89.txt",
@@ -320,7 +327,7 @@ class DescriptorTests(unittest.TestCase):
                     compute.return_value = np.ones((3, 2))
                     descriptors = DESCRIPTORS.load_or_compute_descriptors(
                         project_dir,
-                        ["a", "b", "c"],
+                        [CacheStructure(f"structure-{i}") for i in range(3)],
                         mean_descriptor=False,
                         batch_size=2,
                         nep_model_file="nep89.txt",
@@ -329,6 +336,32 @@ class DescriptorTests(unittest.TestCase):
             compute.assert_called_once()
             self.assertEqual(descriptors.shape, (3, 2))
 
+    def test_cache_write_saves_manifest_with_descriptor_shape(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_dir = Path(tmp)
+            model_dir = project_dir / "config" / "nep"
+            model_dir.mkdir(parents=True, exist_ok=True)
+            (model_dir / "nep89.txt").write_text("stub", encoding="utf-8")
+            structures = [CacheStructure(f"structure-{i}") for i in range(3)]
+
+            with patch.object(DESCRIPTORS, "NepCalculator", CalculatorBoundary):
+                descriptors = DESCRIPTORS.load_or_compute_descriptors(
+                    project_dir,
+                    structures,
+                    mean_descriptor=False,
+                    batch_size=2,
+                    nep_model_file="nep89.txt",
+                )
+
+            cache_path = project_dir / "nep" / "datasets" / "descriptors.npy"
+            manifest_path = self.cache_manifest_path(project_dir)
+            saved = np.load(cache_path)
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            self.assertTrue(cache_path.exists())
+            self.assertTrue(manifest_path.exists())
+            np.testing.assert_array_equal(saved, descriptors)
+            self.assertEqual(manifest["descriptor_shape"], list(saved.shape))
+
     def test_load_or_compute_descriptors_raises_when_model_file_missing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_dir = Path(tmp)
@@ -336,7 +369,23 @@ class DescriptorTests(unittest.TestCase):
             with self.assertRaisesRegex(FileNotFoundError, "NEP model not found"):
                 DESCRIPTORS.load_or_compute_descriptors(
                     project_dir,
-                    ["a"],
+                    [CacheStructure("structure-0")],
+                    mean_descriptor=True,
+                    batch_size=2,
+                    nep_model_file="nep89.txt",
+                )
+
+    def test_missing_model_file_is_not_ignored_when_cache_exists(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_dir = Path(tmp)
+            structures = [CacheStructure(f"structure-{i}") for i in range(3)]
+            model_path = self.write_cache_fixture(project_dir, structures)
+            model_path.unlink()
+
+            with self.assertRaisesRegex(FileNotFoundError, "NEP model not found"):
+                DESCRIPTORS.load_or_compute_descriptors(
+                    project_dir,
+                    structures,
                     mean_descriptor=True,
                     batch_size=2,
                     nep_model_file="nep89.txt",

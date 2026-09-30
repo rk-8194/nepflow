@@ -15,8 +15,10 @@ from ase import Atoms  # noqa: E402
 class StructureStub:
     """Minimal NepTrainKit structure boundary used by selection tests."""
 
-    def __init__(self, num_atoms: int = 1):
+    def __init__(self, num_atoms: int = 1, structure_id: str | None = None):
         self.num_atoms = num_atoms
+        if structure_id is not None:
+            self.structure_id = structure_id
 
 
 pytest.importorskip("NepTrainKit")
@@ -183,10 +185,6 @@ class SelectStageTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "frontier_fraction"):
                 stage.load_config()
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="Phase 1 blocker P0-10: descriptor cache identity is incomplete",
-    )
     def test_descriptor_loader_rejects_shape_only_cache_without_identity(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_dir = Path(tmp)
@@ -195,7 +193,9 @@ class SelectStageTests(unittest.TestCase):
             expected = np.ones((3, 4), dtype=float)
             np.save(cache_path, expected)
             stage = self.create_stage(project_dir)
-            structures = [StructureStub(), StructureStub(), StructureStub()]
+            structures = [
+                StructureStub(structure_id=f"structure-{i}") for i in range(3)
+            ]
             model_dir = project_dir / "config" / "nep"
             model_dir.mkdir(parents=True)
             (model_dir / "nep89.txt").write_text("stub", encoding="utf-8")
