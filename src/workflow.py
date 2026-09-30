@@ -18,6 +18,7 @@ from modules import (
     ValidateStage,
     MemoryStage,
 )
+from modules.validate.launcher import read_validation_status
 
 logger = logging.getLogger("nepflow.workflow")
 
@@ -125,7 +126,7 @@ class WorkflowController:
         Determine the current workflow stage from .project file.
         
         Returns:
-            Current stage name: 'init', 'generate', 'select', 'run_vasp', 'train_nep', 'validate'
+            Current stage name, including the terminal 'completed' state.
             Defaults to 'init' if .project file doesn't exist.
         """
         if not self.project_file.exists():
@@ -137,7 +138,10 @@ class WorkflowController:
                 stage = f.read().strip()
             
             # Validate stage name
-            valid_stages = {"init", "generate", "select", "run_vasp", "train_nep", "validate"}
+            valid_stages = {
+                "init", "generate", "select", "run_vasp", "train_nep",
+                "validate", "completed",
+            }
             if stage not in valid_stages:
                 logger.warning("Invalid stage '%s' in %s, resetting to 'init'", stage, self.project_file)
                 return "init"
@@ -156,7 +160,10 @@ class WorkflowController:
         Args:
             stage: Stage name to set
         """
-        valid_stages = {"init", "generate", "select", "run_vasp", "train_nep", "validate"}
+        valid_stages = {
+            "init", "generate", "select", "run_vasp", "train_nep",
+            "validate", "completed",
+        }
         if stage not in valid_stages:
             logger.error("Invalid stage '%s' - must be one of %s", stage, valid_stages)
             raise ValueError("Invalid stage: %s" % stage)
@@ -237,6 +244,14 @@ class WorkflowController:
             slurm_deadline=self.slurm_deadline,
         )
         stage.run()
+
+    def _validation_is_complete(self) -> bool:
+        """Return whether persisted validation and analysis both completed."""
+        status = read_validation_status(self.project_dir)
+        return (
+            status.get("validation_complete") is True
+            and status.get("analysis_complete") is True
+        )
     
     def _memory(self) -> None:
         """Run VASP memory benchmarks."""
@@ -308,6 +323,7 @@ class WorkflowController:
             "run_vasp":  "4/6  run_vasp",
             "train_nep": "5/6  train_nep",
             "validate":  "6/6  validate",
+            "completed": "completed",
         }
         label = STAGE_LABELS.get(stage, stage)
 
@@ -379,6 +395,9 @@ class WorkflowController:
             else:
                 stage_fn()
 
+        if self._validation_is_complete():
+            self._set_current_stage("completed")
+
         logger.info("")
         logger.info("=" * 60)
         logger.info("[DEBUG] All stages completed successfully")
@@ -422,6 +441,12 @@ class WorkflowController:
 
         self._print_status_summary()
 
+        stage = self._determine_current_stage()
+        if stage == "completed":
+            logger.info("Workflow is already complete; no stage will be run")
+            print("✓ Workflow already complete")
+            return
+
         # Memory mode: run VASP benchmarks, no stage progression
         if self.memory_mode:
             logger.info("Running VASP memory benchmarks")
@@ -439,7 +464,6 @@ class WorkflowController:
             self._run_local()
             return
 
-        stage = self._determine_current_stage()
         logger.info("Executing stage: %s", stage)
         
         if stage == "init":
@@ -482,6 +506,8 @@ class WorkflowController:
             except SelfResubmitExit:
                 logger.info("GPUMD validation deadline reached — resubmitting workflow")
                 raise
+            if self._validation_is_complete():
+                self._set_current_stage("completed")
         else:
             logger.error("Unknown stage: %s", stage)
             raise ValueError("Unknown stage: %s" % stage)
