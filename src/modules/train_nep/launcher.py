@@ -19,13 +19,15 @@ from ._common import logger
 def read_train_status(project_dir: Path) -> dict:
     """Read NEP training status from .train_nep_status file."""
     status_file = project_dir / "nep" / ".train_nep_status"
-    if status_file.exists():
-        try:
-            return json.loads(status_file.read_text())
-        except (json.JSONDecodeError, OSError) as e:
-            logger.warning(f"Could not read status file: {e}")
-            return {}
-    return {}
+    if not status_file.exists():
+        return {}
+    try:
+        status = json.loads(status_file.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as exc:
+        raise ValueError(f"Could not read training status file: {status_file}") from exc
+    if not isinstance(status, dict):
+        raise ValueError(f"Training status must be a JSON object: {status_file}")
+    return status
 
 
 def write_train_status(project_dir: Path, **kwargs) -> None:

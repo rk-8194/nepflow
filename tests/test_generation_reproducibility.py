@@ -45,7 +45,7 @@ class GenerationReproducibilityTests(unittest.TestCase):
             if self_info != other_info:
                 raise AssertionError(f"different structure metadata: {self_info} != {other_info}")
 
-    def test_rattled_outputs_repeat_with_same_seed_without_global_rng(self) -> None:
+    def test_rattling_failure_is_not_replaced_by_gaussian_output(self) -> None:
         base = self.make_base()
         kwargs = {
             "target_n_atoms": len(base),
@@ -55,12 +55,10 @@ class GenerationReproducibilityTests(unittest.TestCase):
 
         with patch(
             "hiphive.structure_generation.generate_mc_rattled_structures",
-            side_effect=RuntimeError("use deterministic Gaussian fallback"),
+            side_effect=RuntimeError("primary rattling unavailable"),
         ):
-            first = PerturbationEngine(**kwargs)._rattled(base, base, n=3)
-            second = PerturbationEngine(**kwargs)._rattled(base, base, n=3)
-
-        self.assert_structures_equal(first, second)
+            with self.assertRaisesRegex(RuntimeError, "Gaussian substitution is disabled"):
+                PerturbationEngine(**kwargs)._rattled(base, base, n=3)
 
     def test_primary_rattling_path_repeats_with_same_seed(self) -> None:
         base = self.make_base()

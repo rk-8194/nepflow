@@ -195,6 +195,29 @@ class TrainNepConfigTests(unittest.TestCase):
             self.assertIn("lambda_v 4.0", nep_in)
             self.assertIn("lambda_shear 5.0", nep_in)
 
+    def test_debug_synthetic_split_is_seeded(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            stage = self.create_stage(Path(tmp))
+            first_train, first_test = stage._generate_synthetic_split(17)
+            second_train, second_test = stage._generate_synthetic_split(17)
+
+        self.assertEqual(
+            [atoms.arrays["forces"].tolist() for atoms in first_train],
+            [atoms.arrays["forces"].tolist() for atoms in second_train],
+        )
+        self.assertEqual(
+            [atoms.arrays["forces"].tolist() for atoms in first_test],
+            [atoms.arrays["forces"].tolist() for atoms in second_test],
+        )
+
+    def test_invalid_nonempty_weights_are_not_replaced_by_equal_weights(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            stage = self.create_stage(Path(tmp))
+            config = make_train_config(weights="1")
+
+            with self.assertRaisesRegex(ValueError, "weights"):
+                stage._get_nep_hyperparameters(config)
+
 
 if __name__ == "__main__":
     unittest.main()

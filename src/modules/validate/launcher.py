@@ -101,6 +101,11 @@ def _generate_slurm_script(
     gpumd_walltime = config.get("slurm", "gpumd_walltime", fallback="00:10:00")
     gpumd_nodes = config.getint("slurm", "gpumd_nodes", fallback=1)
     gpumd_gpus = config.getint("slurm", "gpumd_gpus", fallback=1)
+    gpumd_command = config.get("hpc", "gpumd_command", fallback="").strip()
+    if not gpumd_command:
+        raise ValueError(
+            "Required configuration hpc.gpumd_command is missing or blank"
+        )
     
     script_lines = [
         header.rstrip(),
@@ -115,7 +120,7 @@ def _generate_slurm_script(
         f"cd {struct_dir}",
         "",
         "# Run GPUMD",
-        'mpirun -np 1 --bind-to none "$HOME/src/GPUMD/src/gpumd" < run.in > gpumd.log 2>&1',
+        f'{gpumd_command} < run.in > gpumd.log 2>&1',
         "",
     ]
     

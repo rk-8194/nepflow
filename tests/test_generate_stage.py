@@ -152,6 +152,26 @@ class GenerateStageTests(unittest.TestCase):
 
             self.assertIsNone(result)
 
+    def test_enabled_materials_project_failure_is_not_silent_partial_generation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_dir = Path(tmp)
+            write_project_config(project_dir)
+            stage = self.create_stage(project_dir)
+            config, settings = stage.load_config()
+            config["generation"]["use_materials_project"] = "true"
+
+            with patch.object(
+                generate_module,
+                "get_materials_project_fetcher",
+                side_effect=ValueError("missing API key"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "Materials Project"):
+                    stage._build_generators(
+                        config,
+                        settings["elements"],
+                        settings["random_seed"],
+                    )
+
     def test_run_executes_and_finalizes_after_prepare(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_dir = Path(tmp)

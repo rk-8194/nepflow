@@ -468,8 +468,10 @@ class GenerateStage(Stage):
                         gas_elements=gas_elements,
                     ),
                 ))
-            except Exception as e:
-                logger.warning(f"Cannot initialise MP fetcher: {e}")
+            except Exception as exc:
+                raise RuntimeError(
+                    "Cannot initialise the enabled Materials Project generator"
+                ) from exc
 
         n_rss = config.getint("generation", "n_random_solid_solution", fallback=3)
         if config.getboolean("generation", "use_random_solid_solution", fallback=True):

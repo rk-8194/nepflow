@@ -149,6 +149,36 @@ class TrainNepPrepareRegistryTests(unittest.TestCase):
 
         self.assertIsNone(result)
 
+    def test_malformed_vasp_identity_is_not_treated_as_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            struct_dir = Path(tmp) / "struct_0000"
+            struct_dir.mkdir()
+            (struct_dir / ".vasp_identity").write_text("{malformed", encoding="utf-8")
+
+            with self.assertRaises(ValueError):
+                train_prepare._read_identity(struct_dir)
+
+    def test_debug_dataset_rejects_unlabelled_structure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            project_dir = root / "project_demo"
+            project_dir.mkdir()
+            atoms = Atoms(
+                "Si",
+                positions=[[0.0, 0.0, 0.0]],
+                cell=np.eye(3) * 3.0,
+                pbc=True,
+            )
+
+            with self.assertRaisesRegex(ValueError, "missing (an )?(energy|force) label"):
+                train_prepare.prepare_dataset(
+                    dataset_path=root / "train.xyz",
+                    ase_structures=[atoms],
+                    is_train=True,
+                    project_dir=project_dir,
+                    debug=True,
+                )
+
     def test_rejects_missing_energy(self) -> None:
         outcar = FIXTURES / "outcar" / "valid_outcar"
         parsed_atoms = self.fixture_atoms(energy_available=False)
@@ -422,6 +452,7 @@ class TrainNepMetadataTests(unittest.TestCase):
         dataset_path = project_dir / "nep" / "datasets" / "dataset_0001"
         dataset_path.mkdir(parents=True, exist_ok=True)
         config = ConfigParser()
+        config["composition"] = {"elements": "Si"}
         config["train_nep"] = {
             "train_virial": "false",
             "allow_partial_dataset": str(allow_partial).lower(),

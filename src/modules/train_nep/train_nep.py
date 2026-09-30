@@ -108,11 +108,22 @@ class TrainNepStage(Stage):
         logger.info("NEP Training Stage")
         
         # Check if this is a resubmission
-        try:
-            status = read_train_status(self.project_dir)
-        except Exception as e:
-            logger.debug(f"Could not read status: {e}")
-            status = {}
+        status_file = self.project_dir / "nep" / ".train_nep_status"
+        status = read_train_status(self.project_dir)
+        if status_file.exists():
+            status_value = status.get("status")
+            if status_value not in {"running", "failed", "completed"}:
+                raise ValueError(
+                    "Training status has an invalid or missing status field"
+                )
+            if status_value == "completed":
+                raise RuntimeError(
+                    "Training status is already completed; refusing to start a fresh run"
+                )
+            if not isinstance(status.get("potential_path"), str) or not status["potential_path"].strip():
+                raise ValueError(
+                    "Training status is missing required potential_path for resume"
+                )
         
         # If resubmission, skip dataset prep and go straight to launcher
         if status.get("status") in ["running", "failed"] and status.get("potential_path"):
@@ -149,13 +160,16 @@ class TrainNepStage(Stage):
                     
                     return
                 else:
-                    logger.warning("Training script not found — starting fresh")
+                    raise RuntimeError(
+                        f"Persisted training state is missing its launcher script: {train_script}"
+                    )
             else:
-                logger.info("Dataset no longer available — starting fresh run")
+                raise RuntimeError(
+                    f"Persisted training state is missing its dataset: {dataset_path}"
+                )
 
         # === NEW SUBMISSION ===
-        # Clear old status file before starting fresh
-        status_file = self.project_dir / "nep" / ".train_nep_status"
+        # Clear old status file before starting a new run.
         if status_file.exists():
             status_file.unlink()
             logger.debug("Cleared previous status file")
@@ -175,7 +189,9 @@ class TrainNepStage(Stage):
         except Exception as e:
             if self.debug:
                 logger.warning(f"Could not read train/test split: {e}. Using debug mode.")
-                train_structures, test_structures = self._generate_synthetic_split()
+                train_structures, test_structures = self._generate_synthetic_split(
+                    config.getint("project", "random_seed", fallback=0)
+                )
             else:
                 raise
 
@@ -368,8 +384,12 @@ class TrainNepStage(Stage):
         """Resolve all exposed NEP settings into one immutable value object."""
         try:
             elements = tuple(self._parse_list(config, "composition", "elements"))
-        except Exception:
-            elements = ("W", "O")
+        except Exception as exc:
+            raise ValueError(
+                "Required configuration composition.elements is missing or invalid"
+            ) from exc
+        if not elements:
+            raise ValueError("Required configuration composition.elements must not be empty")
 
         try:
             gas_elements = tuple(self._parse_list(config, "composition", "gasElements"))
@@ -378,23 +398,29 @@ class TrainNepStage(Stage):
 
         all_elements = elements + gas_elements
         weights_str = config.get("train_nep", "weights", fallback="")
-        try:
-            weights = tuple(
-                float(weight)
-                for weight in weights_str.replace(",", " ").split()
-            )
-            if len(weights) != len(all_elements):
-                raise ValueError("weight count does not match element count")
-        except ValueError:
+        if not weights_str.strip():
             weights = tuple(1.0 for _ in all_elements)
+        else:
+            try:
+                weights = tuple(
+                    float(weight)
+                    for weight in weights_str.replace(",", " ").split()
+                )
+            except ValueError as exc:
+                raise ValueError("train_nep.weights must contain only numbers") from exc
+            if len(weights) != len(all_elements):
+                raise ValueError(
+                    "train_nep.weights count must match the configured element count"
+                )
+            if not all(np.isfinite(weight) and weight >= 0.0 for weight in weights):
+                raise ValueError("train_nep.weights must be finite and non-negative")
 
         charge_mode = config.getint("train_nep", "charge_mode", fallback=0)
         if charge_mode not in (0, 1):
-            logger.warning(
-                "Unsupported train_nep.charge_mode=%s. Falling back to 0 (NEP).",
-                charge_mode,
+            raise ValueError(
+                "Unsupported train_nep.charge_mode=%s; expected 0 (NEP) or 1 (qNEP)"
+                % charge_mode
             )
-            charge_mode = 0
 
         return NepHyperparameters(
             elements=elements,
@@ -442,9 +468,12 @@ class TrainNepStage(Stage):
 
         return train_structures, test_structures
 
-    def _generate_synthetic_split(self) -> Tuple[List[Atoms], List[Atoms]]:
+    def _generate_synthetic_split(
+        self, random_seed: int = 0
+    ) -> Tuple[List[Atoms], List[Atoms]]:
         """Generate synthetic structures for debug mode."""
         logger.warning("Generating synthetic train/test split for debug mode")
+        rng = np.random.RandomState(random_seed)
 
         train_structures = []
         test_structures = []
@@ -457,7 +486,7 @@ class TrainNepStage(Stage):
                 pbc=True,
             )
             atoms.info["energy"] = -10.0 + i * 0.1
-            atoms.arrays["forces"] = np.random.rand(2, 3) * 0.1
+            atoms.arrays["forces"] = rng.rand(2, 3) * 0.1
             train_structures.append(atoms)
 
         for i in range(2):
@@ -468,7 +497,7 @@ class TrainNepStage(Stage):
                 pbc=True,
             )
             atoms.info["energy"] = -10.0 + i * 0.2
-            atoms.arrays["forces"] = np.random.rand(2, 3) * 0.1
+            atoms.arrays["forces"] = rng.rand(2, 3) * 0.1
             test_structures.append(atoms)
 
         return train_structures, test_structures

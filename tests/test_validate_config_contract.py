@@ -168,3 +168,21 @@ def test_missing_runtime_slurm_header_is_explicit_error() -> None:
                 config,
                 project_dir=project_dir,
             )
+
+
+def test_missing_gpumd_command_is_explicit_error() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        project_dir = Path(tmp) / "project_demo"
+        struct_dir = project_dir / "gpumd" / "validation" / "struct_0000"
+        struct_dir.mkdir(parents=True)
+        write_header(project_dir, "RUNTIME HEADER")
+        config = initialized_default_config(project_dir)
+        config.remove_option("hpc", "gpumd_command")
+
+        with pytest.raises(ValueError, match="hpc\\.gpumd_command"):
+            launcher_module._generate_slurm_script(
+                struct_dir,
+                "gpumd_val_struct_0000",
+                config,
+                project_dir=project_dir,
+            )

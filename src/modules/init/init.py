@@ -491,4 +491,7 @@ vasp_command=mpirun -np {{ntasks}} vasp_std
 
 # NEP training command or executable path
 nep_command=mpirun --bind-to none $HOME/src/GPUMD/src/nep
+
+# GPUMD validation command or executable path
+gpumd_command=mpirun -np 1 --bind-to none $HOME/src/GPUMD/src/gpumd
 """.format(project_name=self.project_name, **prompt_values)

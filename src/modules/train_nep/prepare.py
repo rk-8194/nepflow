@@ -384,9 +384,18 @@ def _read_identity(struct_dir: Path) -> dict:
         return {}
     try:
         data = json.loads(identity_path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
-        return {}
-    return data if isinstance(data, dict) else {}
+    except (json.JSONDecodeError, OSError) as exc:
+        raise ValueError(f"Could not read VASP identity: {identity_path}") from exc
+    if not isinstance(data, dict):
+        raise ValueError(f"VASP identity must contain a JSON object: {identity_path}")
+
+    for key in ("structure_hash", "incar_hash", "potcar_hash"):
+        value = data.get(key)
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(
+                f"VASP identity is missing a valid {key}: {identity_path}"
+            )
+    return data
 
 
 def _parse_outcar(
@@ -440,8 +449,11 @@ def _parse_outcar_result(
 
     if calculation_identity is not None:
         source_identity = _read_identity(outcar_path.parent)
-        if source_identity and any(
-            source_identity.get(key) != value for key, value in calculation_identity.items()
+        if not source_identity:
+            return rejected("missing_calculation_identity")
+        if any(
+            source_identity.get(key) != value
+            for key, value in calculation_identity.items()
         ):
             return rejected("incompatible_calculation_identity")
 
@@ -510,17 +522,37 @@ def _parse_outcar_result(
 
 
 def _extract_from_atoms(atoms: Atoms) -> dict:
-    """Extract structure data from ASE Atoms object."""
-    result = {
-        "energy": atoms.get_potential_energy() if "energy" in atoms.info or hasattr(atoms, "calc") else -1.0,
-        "forces": atoms.get_forces() if "forces" in atoms.arrays else np.zeros((len(atoms), 3)),
+    """Extract already-materialized labels without fabricating placeholders."""
+    if "energy" in atoms.info:
+        energy = float(atoms.info["energy"])
+    elif atoms.calc is not None:
+        energy = float(atoms.get_potential_energy())
+    else:
+        raise ValueError("Debug structure is missing an energy label")
+
+    if "forces" in atoms.arrays:
+        forces = np.asarray(atoms.arrays["forces"], dtype=float)
+    elif "force" in atoms.arrays:
+        forces = np.asarray(atoms.arrays["force"], dtype=float)
+    elif atoms.calc is not None:
+        forces = np.asarray(atoms.get_forces(), dtype=float)
+    else:
+        raise ValueError("Debug structure is missing force labels")
+
+    if forces.shape != (len(atoms), 3) or not np.isfinite(forces).all():
+        raise ValueError("Debug structure force labels are invalid")
+    if not np.isfinite(energy):
+        raise ValueError("Debug structure energy label is not finite")
+
+    return {
+        "energy": energy,
+        "forces": forces,
         "positions": atoms.get_positions(),
         "lattice": atoms.get_cell().array,
         "species": atoms.get_chemical_symbols(),
         "pbc": atoms.pbc.tolist(),
         "virial": atoms.info.get("virial", None),
     }
-    return result
 
 
 def _write_xyz_file(

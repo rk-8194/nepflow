@@ -409,9 +409,10 @@ class MaterialsProjectFetcher:
                     atoms = bulk(element, "hcp", a=a, c=a * 1.633)
                 else:
                     atoms = bulk(element, struct_type, a=a)
-            except Exception as e:
-                logger.warning(f"Could not build {element}-{struct_type}: {e}")
-                continue
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Could not build Materials Project structure {element}-{struct_type}"
+                ) from exc
 
             atoms.info.update({
                 "material_id": r["material_id"],
@@ -445,9 +446,10 @@ class MaterialsProjectFetcher:
 
             try:
                 atoms = adaptor.get_atoms(conv)
-            except Exception as e:
-                logger.warning(f"pymatgen→ASE conversion failed for {doc.material_id}: {e}")
-                continue
+            except Exception as exc:
+                raise RuntimeError(
+                    f"pymatgen→ASE conversion failed for {doc.material_id}"
+                ) from exc
 
             sg = doc.symmetry.number if doc.symmetry else 0
             struct_name = self.SPACE_GROUP_TO_STRUCTURE.get(sg, "unknown")

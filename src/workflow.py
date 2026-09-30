@@ -19,6 +19,7 @@ from modules import (
     MemoryStage,
 )
 from modules.validate.launcher import read_validation_status
+from modules.run_vasp._common import read_status
 
 logger = logging.getLogger("nepflow.workflow")
 
@@ -143,15 +144,15 @@ class WorkflowController:
                 "validate", "completed",
             }
             if stage not in valid_stages:
-                logger.warning("Invalid stage '%s' in %s, resetting to 'init'", stage, self.project_file)
-                return "init"
+                raise ValueError(
+                    f"Invalid workflow stage {stage!r} in {self.project_file}"
+                )
             
             logger.debug("Read stage from %s: %s", self.project_file, stage)
             return stage
             
-        except IOError as e:
-            logger.warning("Failed to read project file %s: %s, defaulting to 'init'", self.project_file, e)
-            return "init"
+        except IOError as exc:
+            raise RuntimeError(f"Failed to read project file {self.project_file}") from exc
     
     def _set_current_stage(self, stage: str) -> None:
         """
@@ -312,8 +313,6 @@ class WorkflowController:
 
     def _print_status_summary(self) -> None:
         """Log a summary of the current workflow state."""
-        import json as _json
-
         stage = self._determine_current_stage()
 
         STAGE_LABELS = {
@@ -340,11 +339,7 @@ class WorkflowController:
                     continue
                 tally: dict[str, int] = {"completed": 0, "submitted": 0, "pending": 0, "failed": 0}
                 for struct_dir in (d for d in ds_dir.iterdir() if d.is_dir() and d.name.startswith("struct_")):
-                    sf = struct_dir / ".vasp_status"
-                    try:
-                        s = _json.loads(sf.read_text(encoding="utf-8")).get("status", "pending") if sf.exists() else "pending"
-                    except (OSError, ValueError):
-                        s = "pending"
+                    s = read_status(struct_dir).get("status", "pending")
                     if s == "reused":
                         s = "completed"
                     tally[s if s in tally else "pending"] += 1

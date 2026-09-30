@@ -84,13 +84,11 @@ def submit_training_job(
     if not walltime:
         walltime = config.get("slurm", "walltime", fallback="24:00:00")
 
-    nep_command = config.get(
-        "hpc",
-        "nep_command",
-        fallback="mpirun --bind-to none $HOME/src/GPUMD/src/nep",
-    ).strip()
+    nep_command = config.get("hpc", "nep_command", fallback="").strip()
     if not nep_command:
-        nep_command = "mpirun --bind-to none $HOME/src/GPUMD/src/nep"
+        raise ValueError(
+            "Required configuration hpc.nep_command is missing or blank"
+        )
     
     # Build script with proper ordering: shebang → SBATCH directives → other commands → execution
     script_lines = [

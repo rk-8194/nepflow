@@ -440,19 +440,10 @@ class PerturbationEngine:
                         rattle_index=idx,
                     )
                     out.append(r)
-        except Exception as e:
-            logger.warning(f"hiphive rattling failed ({e}), using Gaussian fallback")
-            for idx, rattle_std in enumerate(rattle_stds):
-                r = supercell.copy()
-                r.positions += self.rng.normal(0, rattle_std, r.positions.shape)
-                self._tag(
-                    r,
-                    base,
-                    "rattled",
-                    rattle_std=float(rattle_std),
-                    rattle_index=idx,
-                )
-                out.append(r)
+        except Exception as exc:
+            raise RuntimeError(
+                "HipHive rattling failed; Gaussian substitution is disabled"
+            ) from exc
         return out
 
     def _sample_rattle_stds(self, n: int) -> List[float]:
