@@ -19,12 +19,6 @@ from modules.init.init import InitStage  # noqa: E402
 from modules.validate import launcher as launcher_module  # noqa: E402
 
 
-P0_3_XFAIL_REASON = (
-    "Phase 2 blocker P0-3: validation must use explicit runtime project_dir "
-    "instead of config paths.project_dir"
-)
-
-
 def initialized_default_config(project_dir: Path) -> ConfigParser:
     """Render the real current initialization config shape."""
     stage = InitStage(
@@ -63,7 +57,6 @@ def test_initialized_config_does_not_define_project_dir_as_scientific_config() -
     assert not config.has_option("paths", "project_dir")
 
 
-@pytest.mark.xfail(strict=True, reason=P0_3_XFAIL_REASON)
 def test_slurm_script_uses_explicit_runtime_project_dir_without_config_workaround() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         project_dir = Path(tmp) / "project_demo"
@@ -84,7 +77,6 @@ def test_slurm_script_uses_explicit_runtime_project_dir_without_config_workaroun
         assert f"cd {struct_dir}" in script
 
 
-@pytest.mark.xfail(strict=True, reason=P0_3_XFAIL_REASON)
 def test_wrong_config_project_dir_cannot_override_runtime_context() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
@@ -109,7 +101,6 @@ def test_wrong_config_project_dir_cannot_override_runtime_context() -> None:
         assert "# WRONG CONFIG HEADER" not in script
 
 
-@pytest.mark.xfail(strict=True, reason=P0_3_XFAIL_REASON)
 def test_validation_launcher_threads_runtime_project_dir_to_submission_boundary() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         project_dir = Path(tmp) / "project_demo"
@@ -147,7 +138,6 @@ def test_validation_launcher_threads_runtime_project_dir_to_submission_boundary(
         )
 
 
-@pytest.mark.xfail(strict=True, reason=P0_3_XFAIL_REASON)
 def test_missing_runtime_project_dir_is_explicit_error_not_guessed_fallback() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
@@ -161,4 +151,20 @@ def test_missing_runtime_project_dir_is_explicit_error_not_guessed_fallback() ->
                 "gpumd_val_struct_0000",
                 config,
                 project_dir=None,
+            )
+
+
+def test_missing_runtime_slurm_header_is_explicit_error() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        project_dir = Path(tmp) / "project_demo"
+        struct_dir = project_dir / "gpumd" / "validation" / "struct_0000"
+        struct_dir.mkdir(parents=True)
+        config = initialized_default_config(project_dir)
+
+        with pytest.raises(FileNotFoundError, match="header\\.slurm"):
+            launcher_module._generate_slurm_script(
+                struct_dir,
+                "gpumd_val_struct_0000",
+                config,
+                project_dir=project_dir,
             )

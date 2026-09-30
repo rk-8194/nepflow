@@ -14,7 +14,7 @@ import os
 import re
 import subprocess
 import time
-from configparser import ConfigParser
+from configparser import ConfigParser, NoOptionError, NoSectionError
 from pathlib import Path
 from typing import Optional
 
@@ -300,9 +300,12 @@ class MemoryStage(Stage):
             stripped_lines.append(line)
         slurm_header = "".join(stripped_lines)
 
-        vasp_command = config.get(
-            "hpc", "vasp_command", fallback="mpirun -np {ntasks} vasp_std",
-        )
+        try:
+            vasp_command = config.get("hpc", "vasp_command")
+        except (NoOptionError, NoSectionError) as exc:
+            raise ValueError("Required configuration hpc.vasp_command is missing") from exc
+        if not vasp_command.strip():
+            raise ValueError("Required configuration hpc.vasp_command must not be blank")
         bash_cmd = vasp_command.replace("{ntasks}", "$TOTAL_RANKS")
         # Prevent OpenMPI hwloc binding errors when requesting < max GPUs
         if "mpirun" in bash_cmd and "--bind-to" not in bash_cmd:

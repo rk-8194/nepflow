@@ -74,6 +74,8 @@ def _generate_slurm_script(
     struct_dir: Path,
     job_name: str,
     config: ConfigParser,
+    *,
+    project_dir: Path | None,
 ) -> str:
     """Generate SLURM batch script for single GPUMD validation job.
     
@@ -85,14 +87,15 @@ def _generate_slurm_script(
     Returns:
         SLURM script content as string
     """
-    # Read SLURM header template
-    slurm_header_path = Path(config.get("paths", "project_dir")) / "config" / "slurm" / "header.slurm"
-    
-    if slurm_header_path.exists():
-        header = slurm_header_path.read_text()
-    else:
-        logger.warning(f"SLURM header not found at {slurm_header_path}, using minimal template")
-        header = "#!/bin/bash\n#SBATCH --job-name=gpumd_validate\n"
+    if project_dir is None:
+        raise ValueError("Runtime project_dir is required to generate a validation script")
+
+    # Read the SLURM header from the runtime project context.  The generated
+    # config intentionally does not contain a project path.
+    slurm_header_path = project_dir / "config" / "slurm" / "header.slurm"
+    if not slurm_header_path.exists():
+        raise FileNotFoundError(f"SLURM header not found: {slurm_header_path}")
+    header = slurm_header_path.read_text(encoding="utf-8")
     
     # Add validation-specific settings
     gpumd_walltime = config.get("slurm", "gpumd_walltime", fallback="00:10:00")
@@ -122,6 +125,8 @@ def _generate_slurm_script(
 def submit_struct_validation_job(
     struct_dir: Path,
     config: ConfigParser,
+    *,
+    project_dir: Path | None,
     debug: bool = False,
 ) -> str:
     """Submit GPUMD validation job for a single structure.
@@ -137,11 +142,19 @@ def submit_struct_validation_job(
     Raises:
         RuntimeError: If batch submission fails
     """
+    if project_dir is None:
+        raise ValueError("Runtime project_dir is required to submit a validation job")
+
     struct_name = struct_dir.name
     job_name = f"gpumd_val_{struct_name}"
     
     # Generate SLURM script
-    script_content = _generate_slurm_script(struct_dir, job_name, config)
+    script_content = _generate_slurm_script(
+        struct_dir,
+        job_name,
+        config,
+        project_dir=project_dir,
+    )
     
     # Write script to file
     script_path = struct_dir / "validate.slurm"
@@ -230,6 +243,9 @@ def run_validation_launcher(
     Raises:
         SelfResubmitExit: If walltime deadline approaching, triggers job resubmission
     """
+    if project_dir is None:
+        raise ValueError("Runtime project_dir is required to launch validation jobs")
+
     max_concurrent = config.getint("slurm", "max_concurrent", fallback=20)
     poll_interval = 0 if debug else config.getint("slurm", "poll_interval", fallback=30)
     max_attempts = config.getint("slurm", "max_retry_level", fallback=3)
@@ -295,11 +311,18 @@ def run_validation_launcher(
             struct_dir = validation_root / struct_name
             
             try:
-                job_id = submit_struct_validation_job(struct_dir, config, debug=debug)
+                job_id = submit_struct_validation_job(
+                    struct_dir,
+                    config,
+                    project_dir=project_dir,
+                    debug=debug,
+                )
                 info["job_id"] = job_id
                 info["status"] = "submitted"
                 info["attempts"] += 1
                 logger.info(f"Submitted {struct_name} (attempt {info['attempts']}/{max_attempts})")
+            except FileNotFoundError:
+                raise
             except Exception as e:
                 logger.error(f"Failed to submit {struct_name}: {e}")
                 info["attempts"] += 1

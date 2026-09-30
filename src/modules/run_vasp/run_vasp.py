@@ -8,7 +8,7 @@ Sub-stages:
 """
 
 import logging
-from configparser import ConfigParser
+from configparser import ConfigParser, NoOptionError, NoSectionError
 from pathlib import Path
 
 from ase.io import iread, write as ase_write
@@ -26,6 +26,13 @@ class RunVaspStage(Stage):
     def run(self) -> None:
         config_path = self._find_config_file()
         config = self._load_config()
+
+        try:
+            vasp_command = config.get("hpc", "vasp_command")
+        except (NoOptionError, NoSectionError) as exc:
+            raise ValueError("Required configuration hpc.vasp_command is missing") from exc
+        if not vasp_command.strip():
+            raise ValueError("Required configuration hpc.vasp_command must not be blank")
 
         selected_dir = self.project_dir / "structures" / "selected"
         jobs_dir = self.project_dir / "vasp" / "jobs"
@@ -62,8 +69,6 @@ class RunVaspStage(Stage):
                 and any(flag in line for flag in resource_flags)
             )
         )
-
-        vasp_command = config.get("slurm", "vasp_command", fallback="mpirun -np {ntasks} vasp_std")
 
         # ----------------------------------------------------------
         # Phase 1a: Prepare job folders (idempotent — skips if done)
