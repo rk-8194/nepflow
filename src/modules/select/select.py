@@ -26,6 +26,7 @@ from NepTrainKit.core.structure import Structure
 
 from common.FPS import cross_distance_stats, fps_target_count
 from common.descriptors import descriptor_cache_path, load_or_compute_descriptors
+from common.structure_identity import hash_structure
 from ..base import Stage
 
 logger = logging.getLogger("nepflow.select")
@@ -1407,47 +1408,30 @@ class SelectStage(Stage):
                 f"Seed inclusion enabled, but no structures were found in {seeds_path}"
             )
 
-        ref_index: dict[str, int] = {}
-        missing_generated_metadata = 0
+        reference_index: dict[str, int] = {}
         for i, atoms in enumerate(reference_ase):
-            seed_id = self._seed_id(atoms)
-            if seed_id is None:
-                missing_generated_metadata += 1
-                continue
-            ref_index[seed_id] = i
-
-        if missing_generated_metadata:
-            raise ValueError(
-                "Generated structures are missing seed_id metadata. "
-                "Regenerate the project with the updated generator before enabling seed inclusion."
-            )
+            physical_hash = hash_structure(atoms)
+            reference_index.setdefault(physical_hash, i)
 
         seed_indices: list[int] = []
-        missing_seed_metadata = 0
-        for atom in seed_ase:
-            seed_id = self._seed_id(atom)
-            if seed_id is None:
-                missing_seed_metadata += 1
+        missing_seeds: list[str] = []
+        for seed in seed_ase:
+            physical_hash = hash_structure(seed)
+            reference_index_for_seed = reference_index.get(physical_hash)
+            if reference_index_for_seed is None:
+                missing_seeds.append(physical_hash)
                 continue
-            if seed_id in ref_index:
-                seed_indices.append(ref_index[seed_id])
+            seed_indices.append(reference_index_for_seed)
 
-        if missing_seed_metadata:
+        if missing_seeds:
             raise ValueError(
-                "Seed structures are missing seed_id metadata. "
-                "Regenerate the project with the updated generator before enabling seed inclusion."
-            )
-
-        missing = len(seed_ase) - len(seed_indices)
-        if missing:
-            raise ValueError(
-                f"Seed inclusion enabled, but {missing}/{len(seed_ase)} seed structures "
-                f"did not match any generated structure by seed_id"
+                f"Seed inclusion enabled, but {len(missing_seeds)}/{len(seed_ase)} "
+                "seed structures had no physically identical generated candidate"
             )
 
         seed_indices = sorted(set(seed_indices))
         logger.info(
-            f"  Matched {len(seed_indices)}/{len(seed_ase)} seed structures against generated structures"
+            f"  Matched {len(seed_indices)}/{len(seed_ase)} seed structures by physical hash"
         )
         return seed_indices
 

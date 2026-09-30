@@ -29,10 +29,6 @@ SelectStage = select_module.SelectStage
 SEED_LINEAGE_FIXTURE = (
     Path(__file__).parent / "fixtures" / "structures" / "seed_lineage.extxyz.fixture"
 )
-P0_9_XFAIL_REASON = (
-    "Phase 1 blocker P0-9: seed anchors must resolve the exact unperturbed "
-    "physical structure"
-)
 
 
 def make_atoms(symbols: str = "Si", *, x: float = 0.0, composition: dict | None = None) -> Atoms:
@@ -314,7 +310,6 @@ class SelectStageTests(unittest.TestCase):
                     elastic_indices=[2],
                 )
 
-    @pytest.mark.xfail(strict=True, reason=P0_9_XFAIL_REASON)
     def test_seed_loader_selects_exact_base_across_descendant_orderings(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             stage, lineage, base = self.load_seed_lineage(Path(tmp))
@@ -330,7 +325,6 @@ class SelectStageTests(unittest.TestCase):
                     base_fingerprint,
                 )
 
-    @pytest.mark.xfail(strict=True, reason=P0_9_XFAIL_REASON)
     def test_composition_aware_selection_preserves_exact_seed_anchor(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             stage, candidates, base = self.load_seed_lineage(Path(tmp))
@@ -369,7 +363,6 @@ class SelectStageTests(unittest.TestCase):
                 [self.physical_fingerprint(candidates[index]) for index in train_indices],
             )
 
-    @pytest.mark.xfail(strict=True, reason=P0_9_XFAIL_REASON)
     def test_plain_fps_selection_preserves_exact_seed_anchor(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             stage, candidates, base = self.load_seed_lineage(Path(tmp))
@@ -397,7 +390,6 @@ class SelectStageTests(unittest.TestCase):
                 [self.physical_fingerprint(candidates[index]) for index in train_indices],
             )
 
-    @pytest.mark.xfail(strict=True, reason=P0_9_XFAIL_REASON)
     def test_duplicate_anchor_categories_deduplicate_exact_seed_candidate(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             stage, candidates, base = self.load_seed_lineage(Path(tmp))
@@ -432,7 +424,6 @@ class SelectStageTests(unittest.TestCase):
                 1,
             )
 
-    @pytest.mark.xfail(strict=True, reason=P0_9_XFAIL_REASON)
     def test_unresolved_seed_anchor_fails_without_descendant_fallback(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             stage, lineage, _ = self.load_seed_lineage(Path(tmp))
@@ -440,6 +431,15 @@ class SelectStageTests(unittest.TestCase):
 
             with self.assertRaises(ValueError):
                 stage._load_seed_indices(descendants)
+
+    def test_seed_loader_deduplicates_identical_candidates_deterministically(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            stage, lineage, base = self.load_seed_lineage(Path(tmp))
+            duplicate = base.copy()
+            duplicate.info["seed_id"] = "different_lineage"
+            candidates = [lineage[1], duplicate, base.copy()]
+
+            self.assertEqual(stage._load_seed_indices(candidates), [1])
 
     def test_selection_helpers_use_real_numpy_distances(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -553,7 +553,7 @@ class SelectStageTests(unittest.TestCase):
             seed_path = project_dir / "structures" / "seeds" / "base_structures.xyz"
             seed_path.parent.mkdir(parents=True)
             seed_path.write_text("1\n\nSi 0 0 0\n", encoding="utf-8")
-            generated = [make_atoms(), make_atoms("Ge")]
+            generated = [make_atoms("Ge"), make_atoms()]
             generated[0].info["seed_id"] = "seed_000000"
             generated[1].info["seed_id"] = "seed_000001"
             seed = make_atoms()
