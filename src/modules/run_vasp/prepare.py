@@ -113,8 +113,9 @@ def prepare_jobs(
             }
 
             current_status = read_status(struct_dir).get("status", "pending")
+            existing_identity = _read_identity(struct_dir)
             if current_status in {"submitted", "completed", "reused"}:
-                if _identity_matches(_read_identity(struct_dir), identity):
+                if _identity_matches(existing_identity, identity):
                     count += 1
                     if current_status == "reused":
                         reused += 1
@@ -271,13 +272,23 @@ def write_poscar(atoms, path: Path) -> None:
 
 def _read_identity(struct_dir: Path) -> dict:
     identity_path = struct_dir / ".vasp_identity"
-    if not identity_path.exists():
-        return {}
     try:
         data = json.loads(identity_path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
+    except FileNotFoundError:
         return {}
-    return data if isinstance(data, dict) else {}
+    except (json.JSONDecodeError, OSError) as exc:
+        raise ValueError(f"Could not read VASP identity: {identity_path}") from exc
+    if not isinstance(data, dict):
+        raise ValueError(f"VASP identity must contain a JSON object: {identity_path}")
+
+    required = ("structure_hash", "incar_hash", "potcar_hash")
+    for key in required:
+        value = data.get(key)
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(
+                f"VASP identity is missing a valid {key}: {identity_path}"
+            )
+    return data
 
 
 def _write_identity(struct_dir: Path, identity: dict) -> None:
@@ -318,7 +329,7 @@ def _valid_registry_entry(
     structure_hash: str,
 ) -> dict | None:
     entry = get_registry_entry(registry, incar_hash, potcar_hash, structure_hash)
-    if not entry or not entry.get("job_path"):
+    if entry is None:
         return None
     return entry if outcar_is_complete(Path(entry["job_path"]) / "OUTCAR") else None
 

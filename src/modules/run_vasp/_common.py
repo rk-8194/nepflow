@@ -17,6 +17,9 @@ logger = logging.getLogger("nepflow.run_vasp")
 
 VASP_COMPLETION_MARKERS = ["General timing", "Voluntary context switches"]
 VASP_REGISTRY_VERSION = 1
+VALID_VASP_STATUSES = frozenset(
+    {"pending", "submitted", "completed", "reused", "failed", "oom"}
+)
 
 
 # ==================================================================
@@ -115,17 +118,25 @@ def hash_potcar_bytes(potcar_bytes: bytes) -> str:
 def read_completed_registry(nepflow_root: Path) -> dict:
     """Read the shared completed-VASP registry."""
     path = completed_jobs_registry_path(nepflow_root)
-    if not path.exists():
-        return {"version": VASP_REGISTRY_VERSION, "jobs": {}}
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
-        logger.warning("Could not read %s; starting with an empty VASP registry", path)
+    except FileNotFoundError:
         return {"version": VASP_REGISTRY_VERSION, "jobs": {}}
+    except (json.JSONDecodeError, OSError) as exc:
+        raise ValueError(f"Could not read VASP registry: {path}") from exc
     if not isinstance(data, dict):
-        return {"version": VASP_REGISTRY_VERSION, "jobs": {}}
-    data.setdefault("version", VASP_REGISTRY_VERSION)
-    data.setdefault("jobs", {})
+        raise ValueError(f"VASP registry must contain a JSON object: {path}")
+    version = data.get("version")
+    if (
+        isinstance(version, bool)
+        or not isinstance(version, int)
+        or version != VASP_REGISTRY_VERSION
+    ):
+        raise ValueError(
+            f"Unsupported VASP registry version in {path}: {version!r}"
+        )
+    if "jobs" not in data or not isinstance(data["jobs"], dict):
+        raise ValueError(f"VASP registry jobs must be an object: {path}")
     return data
 
 
@@ -145,13 +156,40 @@ def get_registry_entry(
     structure_hash: str,
 ) -> dict | None:
     """Return a registry entry for the input identity, if present."""
-    entry = (
-        registry.get("jobs", {})
-        .get(incar_hash, {})
-        .get(potcar_hash, {})
-        .get(structure_hash)
-    )
-    return entry if isinstance(entry, dict) else None
+    jobs = registry.get("jobs")
+    if not isinstance(jobs, dict):
+        raise ValueError("VASP registry jobs must be an object")
+
+    incar_entries = jobs.get(incar_hash)
+    if incar_entries is None:
+        return None
+    if not isinstance(incar_entries, dict):
+        raise ValueError(
+            f"Registry entries for INCAR hash are malformed: {incar_hash}"
+        )
+
+    potcar_entries = incar_entries.get(potcar_hash)
+    if potcar_entries is None:
+        return None
+    if not isinstance(potcar_entries, dict):
+        raise ValueError(
+            f"Registry entries for POTCAR hash are malformed: {potcar_hash}"
+        )
+
+    if structure_hash not in potcar_entries:
+        return None
+    entry = potcar_entries[structure_hash]
+    if not isinstance(entry, dict):
+        raise ValueError(
+            f"Registry entry for structure hash is malformed: {structure_hash}"
+        )
+    job_path = entry.get("job_path")
+    if not isinstance(job_path, str) or not job_path.strip():
+        raise ValueError(
+            "Registry entry for structure hash lacks a valid job_path: "
+            f"{structure_hash}"
+        )
+    return entry
 
 
 def upsert_registry_entry(
@@ -163,7 +201,7 @@ def upsert_registry_entry(
 ) -> None:
     """Insert or replace a completed-job registry entry."""
     registry = read_completed_registry(nepflow_root)
-    jobs = registry.setdefault("jobs", {})
+    jobs = registry["jobs"]
     jobs.setdefault(incar_hash, {}).setdefault(potcar_hash, {})[structure_hash] = entry
     write_completed_registry(nepflow_root, registry)
 
@@ -327,12 +365,29 @@ def write_status(
 def read_status(struct_dir: Path) -> dict:
     """Read .vasp_status JSON from a structure directory."""
     status_file = struct_dir / ".vasp_status"
-    if status_file.exists():
-        try:
-            return json.loads(status_file.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
-            pass
-    return {"status": "pending", "retry_level": 0}
+    try:
+        data = json.loads(status_file.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {"status": "pending", "retry_level": 0}
+    except (json.JSONDecodeError, OSError) as exc:
+        raise ValueError(f"Could not read VASP status: {status_file}") from exc
+
+    if not isinstance(data, dict):
+        raise ValueError(f"VASP status must contain a JSON object: {status_file}")
+
+    status = data.get("status")
+    if not isinstance(status, str) or status not in VALID_VASP_STATUSES:
+        raise ValueError(f"VASP status is missing or invalid: {status_file}")
+
+    retry_level = data.get("retry_level", 0)
+    if (
+        isinstance(retry_level, bool)
+        or not isinstance(retry_level, int)
+        or retry_level < 0
+    ):
+        raise ValueError(f"VASP status retry_level is invalid: {status_file}")
+
+    return data
 
 
 def write_launcher_state(vasp_dir: Path, job_id: str, walltime_seconds: int) -> None:

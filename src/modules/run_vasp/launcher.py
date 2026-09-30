@@ -11,6 +11,7 @@ from configparser import ConfigParser
 from datetime import datetime
 from pathlib import Path
 
+from .prepare import _read_identity
 from ._common import (
     build_retry_levels_for_gpu,
     estimate_kpoints_irr,
@@ -684,19 +685,9 @@ def _register_completed_job(
     selected_index: int,
 ) -> None:
     """Record a completed VASP job in the shared hash registry."""
-    identity_path = struct_dir / ".vasp_identity"
-    if not identity_path.exists():
+    identity = _read_identity(struct_dir)
+    if not identity:
         logger.debug("  Not registering %s: missing .vasp_identity", struct_dir.name)
-        return
-    try:
-        identity = json.loads(identity_path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError) as e:
-        logger.debug("  Not registering %s: bad .vasp_identity: %s", struct_dir.name, e)
-        return
-
-    required = ("incar_hash", "potcar_hash", "structure_hash")
-    if not all(identity.get(key) for key in required):
-        logger.debug("  Not registering %s: incomplete identity", struct_dir.name)
         return
 
     entry = {
@@ -815,13 +806,11 @@ def _log_summary(jobs_dir: Path, datasets: list[str], nepflow_root: Path) -> Non
             if not d.is_dir() or d.name == "failed":
                 continue
             status_file = d / ".vasp_status"
-            if status_file.exists():
-                try:
-                    s = json.loads(status_file.read_text(encoding="utf-8"))
-                    if s.get("status") in {"completed", "reused"}:
-                        completed += 1
-                except (json.JSONDecodeError, OSError):
-                    pass
+            if (
+                status_file.exists()
+                and read_status(d)["status"] in {"completed", "reused"}
+            ):
+                completed += 1
         if failed_dir.exists():
             failed = sum(1 for d in failed_dir.iterdir() if d.is_dir())
         logger.info(f"  {ds:<8s} ✓ {completed:>4d} completed   ✗ {failed:>4d} failed")

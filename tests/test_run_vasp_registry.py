@@ -373,10 +373,6 @@ class RunVaspRegistryTests(unittest.TestCase):
             self.assertEqual(entry["selected_index"], 42)
             self.assertIn("completed_at", entry)
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="Phase 1 blocker P0-16: malformed VASP status must fail fast",
-    )
     def test_prepare_fails_on_malformed_status_record(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -403,10 +399,6 @@ class RunVaspRegistryTests(unittest.TestCase):
                         project_name="demo",
                     )
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="Phase 1 blocker P0-16: malformed VASP identity must fail fast",
-    )
     def test_prepare_fails_on_malformed_identity_record(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -434,10 +426,6 @@ class RunVaspRegistryTests(unittest.TestCase):
                         project_name="demo",
                     )
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="Phase 1 blocker P0-16: corrupt VASP registry data must fail fast",
-    )
     def test_prepare_fails_on_corrupt_registry_data(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -464,6 +452,122 @@ class RunVaspRegistryTests(unittest.TestCase):
                         project_dir=project_dir,
                         project_name="demo",
                     )
+
+    def test_status_json_list_is_corrupt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            struct_dir = Path(tmp)
+            (struct_dir / ".vasp_status").write_text("[]", encoding="utf-8")
+
+            with self.assertRaises(ValueError):
+                common.read_status(struct_dir)
+
+    def test_status_missing_status_field_is_corrupt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            struct_dir = Path(tmp)
+            (struct_dir / ".vasp_status").write_text(
+                json.dumps({"retry_level": 0}),
+                encoding="utf-8",
+            )
+
+            with self.assertRaises(ValueError):
+                common.read_status(struct_dir)
+
+    def test_identity_missing_required_hash_is_corrupt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            struct_dir = Path(tmp)
+            (struct_dir / ".vasp_identity").write_text(
+                json.dumps(
+                    {
+                        "structure_hash": "structure-hash",
+                        "incar_hash": "incar-hash",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaises(ValueError):
+                prepare._read_identity(struct_dir)
+
+    def test_registry_missing_jobs_field_is_corrupt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            registry_path = common.completed_jobs_registry_path(Path(tmp))
+            registry_path.write_text(
+                json.dumps({"version": common.VASP_REGISTRY_VERSION}),
+                encoding="utf-8",
+            )
+
+            with self.assertRaises(ValueError):
+                common.read_completed_registry(Path(tmp))
+
+    def test_registry_unsupported_version_is_corrupt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            registry_path = common.completed_jobs_registry_path(Path(tmp))
+            registry_path.write_text(
+                json.dumps(
+                    {
+                        "version": common.VASP_REGISTRY_VERSION + 1,
+                        "jobs": {},
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaises(ValueError):
+                common.read_completed_registry(Path(tmp))
+
+    def test_registry_jobs_must_be_an_object(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            registry_path = common.completed_jobs_registry_path(Path(tmp))
+            registry_path.write_text(
+                json.dumps(
+                    {
+                        "version": common.VASP_REGISTRY_VERSION,
+                        "jobs": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaises(ValueError):
+                common.read_completed_registry(Path(tmp))
+
+    def test_matching_registry_entry_must_have_job_path(self) -> None:
+        for malformed_entry in ([], {}):
+            with self.subTest(malformed_entry=malformed_entry):
+                registry = {
+                    "version": common.VASP_REGISTRY_VERSION,
+                    "jobs": {
+                        "incar-hash": {
+                            "potcar-hash": {
+                                "structure-hash": malformed_entry,
+                            }
+                        }
+                    },
+                }
+
+                with self.assertRaises(ValueError):
+                    common.get_registry_entry(
+                        registry,
+                        "incar-hash",
+                        "potcar-hash",
+                        "structure-hash",
+                    )
+
+    def test_absent_state_keeps_initial_behavior(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            struct_dir = root / "struct_0000"
+            struct_dir.mkdir()
+
+            self.assertEqual(
+                common.read_status(struct_dir),
+                {"status": "pending", "retry_level": 0},
+            )
+            self.assertEqual(prepare._read_identity(struct_dir), {})
+            self.assertEqual(
+                common.read_completed_registry(root),
+                {"version": common.VASP_REGISTRY_VERSION, "jobs": {}},
+            )
 
 
 if __name__ == "__main__":
