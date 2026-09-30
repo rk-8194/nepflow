@@ -47,12 +47,27 @@ class ConfigurationalGenerator(ABC):
         """
 
 
+class SQSGenerationError(RuntimeError):
+    """Raised when a requested SQS structure cannot be generated."""
+
+
 # ======================================================================
 # Helper: build a supercell of a pure-element lattice
 # ======================================================================
 
-def _make_supercell(element: str, crystal_structure: str, target_n_atoms: int) -> Optional[Atoms]:
-    """Create a pure-element supercell close to *target_n_atoms*."""
+def _make_supercell(
+    element: str,
+    crystal_structure: str,
+    target_n_atoms: int,
+    *,
+    raise_on_error: bool = False,
+) -> Optional[Atoms]:
+    """Create a pure-element supercell close to *target_n_atoms*.
+
+    The default preserves the generators' skip-on-invalid-lattice behavior.
+    SQS requests can opt into re-raising the construction cause so the public
+    SQS error remains actionable.
+    """
     try:
         if crystal_structure == "hcp":
             base = bulk(element, "hcp", a=3.0, c=3.0 * 1.633)
@@ -60,6 +75,8 @@ def _make_supercell(element: str, crystal_structure: str, target_n_atoms: int) -
             base = bulk(element, crystal_structure, a=3.0)
     except Exception as e:
         logger.debug(f"Cannot build {element}-{crystal_structure}: {e}")
+        if raise_on_error:
+            raise
         return None
 
     n_base = len(base)
@@ -279,20 +296,21 @@ class SQSGenerator(ConfigurationalGenerator):
         crystal_structures: List[str],
         target_n_atoms: int = 250,
     ) -> List[Atoms]:
-        quota_plan = _allocate_crystal_quota(self.n_structures, crystal_structures)
-
         if sum(1 for f in composition.values() if f > 0) <= 1:
             return []
+
+        quota_plan = _allocate_crystal_quota(self.n_structures, crystal_structures)
 
         try:
             from icet import ClusterSpace
             from icet.tools.structure_generation import (
                 generate_sqs_from_supercells,
-                _get_sqs_cluster_vector,
             )
-        except ImportError:
-            logger.warning("icet not installed — skipping SQS generation")
-            return []
+        except ImportError as error:
+            raise ImportError(
+                "SQS generation requires icet and its "
+                "structure_generation.generate_sqs_from_supercells API"
+            ) from error
 
         results: List[Atoms] = []
         majority_el = max(composition, key=composition.get)
@@ -304,9 +322,22 @@ class SQSGenerator(ConfigurationalGenerator):
         for cs, crystal_quota in quota_plan:
             if crystal_quota == 0:
                 continue
-            supercell = _make_supercell(majority_el, cs, target_n_atoms)
-            if supercell is None:
-                raise RuntimeError(f"SQS generation failed for crystal {cs}")
+
+            try:
+                supercell = _make_supercell(
+                    majority_el,
+                    cs,
+                    target_n_atoms,
+                    raise_on_error=True,
+                )
+                if supercell is None:
+                    raise RuntimeError("unable to build the SQS supercell")
+            except Exception as error:
+                raise SQSGenerationError(
+                    "SQS generation failed for "
+                    f"composition {composition!r}, crystal structure {cs!r}, "
+                    f"output slot {output_slot} setup: {error}"
+                ) from error
 
             for crystal_slot in range(crystal_quota):
                 slot_seed = self.random_seed + output_slot
@@ -339,49 +370,15 @@ class SQSGenerator(ConfigurationalGenerator):
                     })
                     results.append(sqs_atoms)
 
-                except Exception as e:
-                    logger.debug(f"SQS generation failed for {composition} on {cs}: {e}")
-                    # Fall back to monte-carlo approach
-                    try:
-                        from icet.tools.structure_generation import generate_target_structure
-                        mc_atoms = self._mc_fallback(
-                            supercell,
-                            composition,
-                            active_elements,
-                            cs,
-                            random_seed=slot_seed,
-                            source_slot=crystal_slot,
-                        )
-                        if mc_atoms is not None:
-                            results.append(mc_atoms)
-                    except Exception as e2:
-                        logger.debug(f"SQS MC fallback also failed: {e2}")
+                except Exception as error:
+                    raise SQSGenerationError(
+                        "SQS generation failed for "
+                        f"composition {composition!r}, crystal structure {cs!r}, "
+                        f"output slot {crystal_slot}: {error}"
+                    ) from error
                 output_slot += 1
 
         return results
-
-    def _mc_fallback(
-        self,
-        supercell: Atoms,
-        composition: Dict[str, float],
-        active_elements: List[str],
-        cs: str,
-        random_seed: int | None = None,
-        source_slot: int = 0,
-    ) -> Optional[Atoms]:
-        """Simple MC-based SQS via random swaps."""
-        rng = np.random.RandomState(
-            self.random_seed if random_seed is None else random_seed
-        )
-        assigned = _assign_composition(supercell, composition, rng)
-        label = _composition_label(composition)
-        assigned.info.update({
-            "composition": composition,
-            "crystal_structure": cs,
-            "configurational_type": "sqs",
-            "source": f"sqs-mc-{label}-{cs}-{source_slot}",
-        })
-        return assigned
 
 
 # ======================================================================
