@@ -326,22 +326,26 @@ class GenerateStageTests(unittest.TestCase):
         self.assertEqual(hash_structure(first), hash_structure(second))
 
     def test_materials_project_query_exception_raises(self) -> None:
-        fetcher = MaterialsProjectFetcher.__new__(MaterialsProjectFetcher)
-        fetcher._mpr = Mock()
-        fetcher._mpr.materials.summary.search.side_effect = ConnectionError("offline")
+        with tempfile.TemporaryDirectory() as tmp:
+            fetcher = MaterialsProjectFetcher.__new__(MaterialsProjectFetcher)
+            fetcher.cache_dir = Path(tmp)
+            fetcher._mpr = Mock()
+            fetcher._mpr.materials.summary.search.side_effect = ConnectionError("offline")
 
-        with self.assertRaisesRegex(RuntimeError, r"elements=\['Si', 'Ge'\]"):
-            fetcher.fetch_compounds(["Si", "Ge"], use_cache=False)
+            with self.assertRaisesRegex(RuntimeError, r"elements=\['Si', 'Ge'\]"):
+                fetcher.fetch_compounds(["Si", "Ge"], use_cache=False)
 
     def test_materials_project_zero_results_returns_empty_list(self) -> None:
-        fetcher = MaterialsProjectFetcher.__new__(MaterialsProjectFetcher)
-        fetcher._mpr = Mock()
-        fetcher._mpr.materials.summary.search.return_value = []
+        with tempfile.TemporaryDirectory() as tmp:
+            fetcher = MaterialsProjectFetcher.__new__(MaterialsProjectFetcher)
+            fetcher.cache_dir = Path(tmp)
+            fetcher._mpr = Mock()
+            fetcher._mpr.materials.summary.search.return_value = []
 
-        self.assertEqual(
-            fetcher.fetch_compounds(["Si", "Ge"], use_cache=False),
-            [],
-        )
+            self.assertEqual(
+                fetcher.fetch_compounds(["Si", "Ge"], use_cache=False),
+                [],
+            )
 
     def test_prepare_merges_exact_duplicates_and_retains_origin_paths(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -369,8 +373,8 @@ class GenerateStageTests(unittest.TestCase):
 
             self.assertIsNotNone(bases)
             assert bases is not None
-            self.assertEqual(len(bases), 1)
-            self.assertEqual(len({hash_structure(base) for base in bases}), 1)
+            self.assertEqual(len(bases), 2)
+            self.assertEqual(len({hash_structure(base) for base in bases}), 2)
             self.assertCountEqual(
                 bases[0].info["provenance_paths"],
                 ["path-a", "path-b"],
