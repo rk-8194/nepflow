@@ -13,18 +13,9 @@ import pytest
 
 pytest.importorskip("ase")
 
+from ase import Atoms  # noqa: E402
+
 from modules.validate import prepare as prepare_module  # noqa: E402
-
-
-P0_15_TRICLINIC_XFAIL_REASON = (
-    "Phase 1 blocker P0-15: validation replication must use perpendicular cell heights"
-)
-P0_15_STRICT_THRESHOLD_XFAIL_REASON = (
-    "Phase 1 blocker P0-15: validation replication must satisfy a strict height threshold"
-)
-P0_15_DEGENERATE_CELL_XFAIL_REASON = (
-    "Phase 1 blocker P0-15: invalid validation cells must raise a clear ValueError"
-)
 
 
 class _CellFixture:
@@ -121,7 +112,6 @@ def test_orthogonal_anisotropic_cell_uses_each_axis_length() -> None:
     assert_strict_threshold(cell, cutoff_angstrom, actual)
 
 
-@pytest.mark.xfail(strict=True, reason=P0_15_TRICLINIC_XFAIL_REASON)
 def test_skewed_triclinic_cell_uses_perpendicular_plane_heights() -> None:
     cell = np.array(
         [
@@ -146,7 +136,6 @@ def test_skewed_triclinic_cell_uses_perpendicular_plane_heights() -> None:
     assert_strict_threshold(cell, cutoff_angstrom, actual)
 
 
-@pytest.mark.xfail(strict=True, reason=P0_15_TRICLINIC_XFAIL_REASON)
 def test_strongly_anisotropic_triclinic_cell_uses_perpendicular_heights() -> None:
     cell = np.array(
         [
@@ -171,7 +160,6 @@ def test_strongly_anisotropic_triclinic_cell_uses_perpendicular_heights() -> Non
     assert_strict_threshold(cell, cutoff_angstrom, actual)
 
 
-@pytest.mark.xfail(strict=True, reason=P0_15_STRICT_THRESHOLD_XFAIL_REASON)
 def test_exact_threshold_requires_one_additional_repeat() -> None:
     cell = np.diag([3.0, 4.0, 5.0])
     cutoff_angstrom = 1.5
@@ -198,9 +186,45 @@ def test_no_unnecessary_repeat_when_height_exceeds_twice_cutoff() -> None:
     assert_strict_threshold(cell, cutoff_angstrom, actual)
 
 
-@pytest.mark.xfail(strict=True, reason=P0_15_DEGENERATE_CELL_XFAIL_REASON)
 def test_degenerate_cell_raises_clear_value_error() -> None:
     cell = np.zeros((3, 3))
 
     with pytest.raises(ValueError, match="cell|volume|height"):
         calculate_replicates(cell, cutoff_angstrom=2.0)
+
+
+def test_prepare_validation_structures_propagates_invalid_cell_failure(
+    tmp_path: Path,
+) -> None:
+    invalid_atoms = Atoms(
+        "Si",
+        positions=[[0.0, 0.0, 0.0]],
+        cell=np.zeros((3, 3)),
+        pbc=True,
+    )
+    dataset_path = tmp_path / "nep" / "datasets" / "dataset_0001"
+    potential_path = tmp_path / "gpumd" / "dataset_0001" / "potential_0001"
+    config_gpumd_dir = tmp_path / "config" / "gpumd"
+    dataset_path.mkdir(parents=True)
+    potential_path.mkdir(parents=True)
+    config_gpumd_dir.mkdir(parents=True)
+    (potential_path / "nep.txt").write_text(
+        "version 4\ntype 1 Si\ncutoff 2 5 112 60\n", encoding="utf-8"
+    )
+    (config_gpumd_dir / "run.in_validate").write_text(
+        "replicate 1 1 1\n", encoding="utf-8"
+    )
+
+    with patch.object(
+        prepare_module, "parse_test_xyz", return_value=[{"atoms": invalid_atoms}]
+    ):
+        with pytest.raises(ValueError, match="cell|volume|height"):
+            prepare_module.prepare_validation_structures(
+                dataset_path=dataset_path,
+                gpumd_potential_dir=potential_path,
+                project_dir=tmp_path,
+                config_gpumd_dir=config_gpumd_dir,
+            )
+
+    run_in_path = potential_path / "validation" / "struct_0000" / "run.in"
+    assert not run_in_path.exists()

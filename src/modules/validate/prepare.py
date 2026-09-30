@@ -186,6 +186,51 @@ def parse_lattice_from_xyz(atoms: Atoms) -> np.ndarray:
     return np.array(lattice)
 
 
+def _cell_perpendicular_heights_angstrom(cell: np.ndarray) -> np.ndarray:
+    """Return perpendicular lattice-plane heights for row-wise cell vectors.
+
+    For cell rows ``a``, ``b``, and ``c``, the heights are ``V / |b x c|``,
+    ``V / |c x a|``, and ``V / |a x b|``, respectively, where ``V`` is the
+    absolute cell volume.
+
+    Raises:
+        ValueError: If the cell is not a finite, non-degenerate 3x3 matrix.
+    """
+    try:
+        vectors = np.asarray(cell, dtype=float)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"Invalid cell: could not convert cell to floats: {exc}") from exc
+
+    if vectors.shape != (3, 3):
+        raise ValueError(
+            f"Invalid cell shape {vectors.shape}; expected a 3x3 cell matrix"
+        )
+    if not np.all(np.isfinite(vectors)):
+        raise ValueError("Invalid cell: all cell entries must be finite")
+
+    with np.errstate(over="ignore", invalid="ignore"):
+        volume = abs(float(np.linalg.det(vectors)))
+        face_areas = np.array(
+            [
+                np.linalg.norm(np.cross(vectors[1], vectors[2])),
+                np.linalg.norm(np.cross(vectors[2], vectors[0])),
+                np.linalg.norm(np.cross(vectors[0], vectors[1])),
+            ],
+            dtype=float,
+        )
+
+    if not np.isfinite(volume) or volume <= 0.0:
+        raise ValueError(f"Invalid cell volume: {volume!r}")
+    if not np.all(np.isfinite(face_areas)) or np.any(face_areas <= 0.0):
+        raise ValueError(f"Invalid cell opposite-face area: {face_areas!r}")
+
+    with np.errstate(over="ignore", divide="ignore", invalid="ignore"):
+        heights = volume / face_areas
+    if not np.all(np.isfinite(heights)) or np.any(heights <= 0.0):
+        raise ValueError(f"Invalid cell height: {heights!r}")
+    return heights
+
+
 def calculate_required_replicates(
     model_xyz_path: Path, nep_path: Path
 ) -> Tuple[int, int, int]:
@@ -204,7 +249,16 @@ def calculate_required_replicates(
         ValueError: If parsing fails or constraint cannot be satisfied
     """
     cutoff = parse_cutoff_from_nep(nep_path)
-    min_required_thickness = 2 * cutoff
+    if not np.isfinite(cutoff) or cutoff <= 0.0:
+        raise ValueError(
+            f"Invalid cutoff {cutoff!r}: cutoff must be finite and strictly positive"
+        )
+    with np.errstate(over="ignore", invalid="ignore"):
+        min_required_thickness = 2.0 * cutoff
+    if not np.isfinite(min_required_thickness):
+        raise ValueError(
+            f"Invalid cutoff {cutoff!r}: required height is not finite"
+        )
     
     try:
         atoms = ase_read(str(model_xyz_path))
@@ -212,27 +266,25 @@ def calculate_required_replicates(
         logger.error(f"Failed to read model.xyz: {e}")
         raise ValueError(f"Could not read model.xyz: {e}") from e
     
-    cell = atoms.get_cell()
-    
-    # Calculate thickness in each direction as the projection of the cell on its normal
-    # For a cubic/orthorhombic cell, this is simply the diagonal element
-    # For arbitrary cells, compute the perpendicular distance
-    thicknesses = []
-    for i in range(3):
-        # Normal direction is the i-th Cartesian axis
-        # Compute perpendicular distance as |cell_vector_dot_normal| / |normal|
-        height = abs(cell[i, i]) if np.abs(cell[i, i]) > 1e-10 else np.linalg.norm(cell[i, :])
-        thicknesses.append(height)
+    thicknesses = _cell_perpendicular_heights_angstrom(atoms.get_cell())
     
     logger.debug(f"Cutoff: {cutoff} Å, min required thickness: {min_required_thickness} Å")
     logger.debug(f"Model thicknesses: {thicknesses}")
     
     replicates = []
     for i, thickness in enumerate(thicknesses):
-        # Calculate minimum replicates needed
-        n_replicate = int(np.ceil(min_required_thickness / thickness))
-        # Ensure at least 1
-        n_replicate = max(1, n_replicate)
+        with np.errstate(over="ignore", divide="ignore", invalid="ignore"):
+            ratio = min_required_thickness / thickness
+        if not np.isfinite(ratio):
+            raise ValueError(
+                f"Could not calculate repeat count for cell height {thickness!r} "
+                f"and cutoff {cutoff!r}"
+            )
+
+        # Start above the quotient, then verify the strict inequality below.
+        n_replicate = max(1, int(np.floor(ratio)) + 1)
+        while n_replicate * thickness <= min_required_thickness:
+            n_replicate += 1
         replicates.append(n_replicate)
         logger.debug(
             f"  Direction {i}: thickness={thickness:.3f} Å, "
@@ -241,11 +293,11 @@ def calculate_required_replicates(
     
     nx, ny, nz = replicates
     
-    # Verify constraint
+    # Verify the strict constraint after the guarded estimate.
     for i, (n, thickness) in enumerate(zip(replicates, thicknesses)):
         effective_thickness = thickness * n
         if effective_thickness <= min_required_thickness:
-            logger.warning(
+            raise ValueError(
                 f"Direction {i}: thickness constraint may not be fully satisfied "
                 f"({effective_thickness:.3f} Å ≈ {min_required_thickness:.3f} Å)"
             )
@@ -393,12 +445,9 @@ def prepare_validation_structures(
         model_xyz_path.write_text(model_xyz_content)
         logger.debug(f"  Created model.xyz ({len(atoms)} atoms)")
         
-        # Calculate required replicates
-        try:
-            nx, ny, nz = calculate_required_replicates(model_xyz_path, nep_path)
-        except ValueError as e:
-            logger.warning(f"  Failed to calculate replicates for {struct_name}: {e}, using defaults")
-            nx, ny, nz = 2, 2, 2
+        # Calculate required replicates. Geometry failures must stop
+        # preparation rather than producing an unsafe default protocol.
+        nx, ny, nz = calculate_required_replicates(model_xyz_path, nep_path)
         
         # Generate the authoritative static NEP protocol.  The template is
         # intentionally not inherited: arbitrary GPUMD commands could alter
