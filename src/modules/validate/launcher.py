@@ -1,18 +1,19 @@
 """Launcher sub-stage: submit, monitor, and resubmit GPUMD validation jobs."""
 
 import logging
-import os
-import subprocess
 import time
 from configparser import ConfigParser
 from pathlib import Path
 
 from nepflow.errors import StateError
+from nepflow.hpc.resources import JobResources, render_slurm_header
+from nepflow.hpc.slurm import SlurmScheduler
 from nepflow.io.json import read_json_object, write_json
 
 from nepflow.workflow.resubmission import SelfResubmitExit
 
 logger = logging.getLogger("nepflow.validate")
+scheduler = SlurmScheduler(user="")
 
 
 def read_validation_status(project_dir: Path) -> dict:
@@ -82,15 +83,18 @@ def _generate_slurm_script(
             "Required configuration hpc.gpumd_command is missing or blank"
         )
     
+    rendered_header = render_slurm_header(
+        JobResources(
+            nodes=gpumd_nodes,
+            gpus_per_node=gpumd_gpus,
+            walltime=gpumd_walltime,
+        ),
+        base_header=header,
+        job_name=job_name,
+        site_prologue=("# Load environment", "module load cuda"),
+    )
     script_lines = [
-        header.rstrip(),
-        f"#SBATCH --job-name={job_name}",
-        f"#SBATCH --time={gpumd_walltime}",
-        f"#SBATCH --nodes={gpumd_nodes}",
-        f"#SBATCH --gpus-per-node={gpumd_gpus}",
-        "",
-        "# Load environment",
-        "module load cuda",
+        rendered_header.rstrip(),
         "",
         f"cd {struct_dir}",
         "",
@@ -145,60 +149,20 @@ def submit_struct_validation_job(
         logger.debug(f"[DEBUG] Would submit: sbatch {script_path}")
         return "debug-job-id"
     
-    # Submit via sbatch
-    try:
-        result = subprocess.run(
-            ["sbatch", str(script_path)],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        
-        if result.returncode != 0:
-            raise RuntimeError(f"sbatch failed: {result.stderr}")
-        
-        # Parse job ID from output: "Submitted batch job 12345"
-        output = result.stdout.strip()
-        if "Submitted batch job" in output:
-            job_id = output.split()[-1]
-            logger.info(f"  {struct_name}: submitted as job {job_id}")
-            return job_id
-        else:
-            raise RuntimeError(f"Unexpected sbatch output: {output}")
-    
-    except subprocess.TimeoutExpired:
-        raise RuntimeError("sbatch submission timed out")
-    except Exception as e:
-        logger.error(f"Failed to submit job: {e}")
-        raise
+    # Submit via the shared scheduler boundary.  The generated script body
+    # remains owned by the validation backend.
+    result = scheduler.submit(["sbatch", str(script_path)], timeout=10)
+    logger.info(f"  {struct_name}: submitted as job {result.job_id}")
+    return result.job_id
 
 
-def _get_running_job_ids() -> set:
+def _get_running_job_ids() -> set[str]:
     """Get set of currently running SLURM job IDs.
     
     Uses squeue to query the scheduler.
     """
-    try:
-        result = subprocess.run(
-            ["squeue", "-ho", "%i"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        
-        if result.returncode != 0:
-            logger.warning("squeue failed, assuming no running jobs")
-            return set()
-        
-        job_ids = {line.strip() for line in result.stdout.strip().split("\n") if line.strip()}
-        return job_ids
-    
-    except subprocess.TimeoutExpired:
-        logger.warning("squeue timed out")
-        return set()
-    except Exception as e:
-        logger.warning(f"Could not query squeue: {e}")
-        return set()
+    result = scheduler.list_active_jobs(timeout=10)
+    return {job.job_id for job in result.jobs}
 
 
 def run_validation_launcher(

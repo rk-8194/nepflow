@@ -10,9 +10,7 @@ Usage: python nepflow_cli.py --project <name> --memory [--debug]
 
 import csv
 import json
-import os
 import re
-import subprocess
 import time
 from configparser import ConfigParser, NoOptionError, NoSectionError
 from pathlib import Path
@@ -23,6 +21,9 @@ from ase.build import bulk
 from ase.io import write as ase_write
 
 from ..base import Stage
+from nepflow.errors import SchedulerError
+from nepflow.hpc.slurm import SlurmScheduler
+
 from ..run_vasp._common import (
     VASP_COMPLETION_MARKERS,
     logger,
@@ -36,6 +37,8 @@ CSV_HEADER = [
     "n_atoms", "n_kpoints_irr", "n_electrons",
     "nodes", "gpus", "ncore", "kpar", "avg_loop_time", "oom",
 ]
+
+scheduler = SlurmScheduler()
 
 
 class MemoryStage(Stage):
@@ -542,26 +545,14 @@ fi
         running: set[str] = set()
         pending: set[str] = set()
         prefix = f"nf_{self.project_name}_mem_"
-        try:
-            result = subprocess.run(
-                ["squeue", "-u", os.environ.get("USER", ""), "--noheader",
-                 "-o", "%j %T", "--states=RUNNING,PENDING"],
-                capture_output=True, text=True, timeout=15, check=False,
-            )
-            if result.returncode == 0:
-                for line in result.stdout.strip().split("\n"):
-                    if not line.strip():
-                        continue
-                    parts = line.strip().rsplit(None, 1)
-                    if len(parts) == 2:
-                        name, state = parts
-                        if name.startswith(prefix):
-                            if state == "RUNNING":
-                                running.add(name)
-                            elif state == "PENDING":
-                                pending.add(name)
-        except (subprocess.TimeoutExpired, FileNotFoundError):
-            pass
+        result = scheduler.list_active_jobs(timeout=15)
+        for job in result.jobs:
+            if not job.name or not job.name.startswith(prefix):
+                continue
+            if job.state.value == "running":
+                running.add(job.name)
+            elif job.state.value == "pending":
+                pending.add(job.name)
         return running, pending
 
     @staticmethod
@@ -618,22 +609,13 @@ fi
                 str(shared_script),
                 str(job_dir.resolve()),
             ]
-            result = subprocess.run(
-                sbatch_args,
-                capture_output=True, text=True, timeout=30, check=False,
+            result = scheduler.submit(sbatch_args, timeout=30)
+            logger.info(
+                f"    {job_dir.parent.name}/{job_dir.name}: "
+                f"submitted (gpus={gpus}) job {result.job_id}"
             )
-            if result.returncode == 0 and "Submitted batch job" in result.stdout:
-                job_id = result.stdout.strip().split()[-1]
-                logger.info(
-                    f"    {job_dir.parent.name}/{job_dir.name}: "
-                    f"submitted (gpus={gpus}) job {job_id}"
-                )
-                return job_id
-            logger.warning(
-                f"    sbatch failed for {job_dir.name}: "
-                f"{result.stderr.strip()}"
-            )
-        except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+            return result.job_id
+        except SchedulerError as e:
             logger.warning(f"    sbatch error for {job_dir.name}: {e}")
         return None
 

@@ -21,8 +21,26 @@ import time
 from pathlib import Path
 from typing import Any
 
+try:
+    from nepflow.errors import SchedulerError
+    from nepflow.hpc.slurm import SlurmScheduler
+except ModuleNotFoundError:
+    source_root = Path(__file__).resolve().parent.parent / "src"
+    if source_root.exists() and str(source_root) not in sys.path:
+        sys.path.insert(0, str(source_root))
+    # A copied utility may not have NEPFlow installed.  Keep this narrow
+    # scheduler fallback until the standalone distribution can bundle the
+    # shared scheduler boundary (Phase 4); parsing remains identical here.
+    try:
+        from nepflow.errors import SchedulerError
+        from nepflow.hpc.slurm import SlurmScheduler
+    except ModuleNotFoundError:  # standalone copied utility without NEPFlow
+        SchedulerError = None  # type: ignore[assignment,misc]
+        SlurmScheduler = None  # type: ignore[assignment,misc]
+
 STATE_FILE_NAME = ".gpumd_self_resubmit_state.json"
 DEFAULT_ARCHIVE_DIR = "final_xyz_history"
+scheduler = SlurmScheduler() if SlurmScheduler is not None else None
 
 
 def parse_args() -> argparse.Namespace:
@@ -185,6 +203,26 @@ def _load_nepflow_module(nepflow_root: Path):
 
 
 def _resolve_resubmit_from_scontrol(slurm_job_id: str) -> tuple[list[str], Path, str] | None:
+    if scheduler is not None:
+        try:
+            output = scheduler.show_job(slurm_job_id)
+        except SchedulerError:
+            return None
+
+        command_match = re.search(r"\bCommand=(\S+)", output)
+        if not command_match:
+            return None
+        command_path = Path(command_match.group(1)).expanduser()
+        if not command_path.is_absolute():
+            workdir_match = re.search(r"\bWorkDir=(\S+)", output)
+            if workdir_match:
+                command_path = Path(workdir_match.group(1)) / command_path
+        if not command_path.exists():
+            return None
+        return ["sbatch", str(command_path)], command_path.parent, f"scontrol job {slurm_job_id}"
+
+    # A copied utility without NEPFlow retains this narrow legacy fallback;
+    # repository executions use the canonical scheduler above.
     try:
         result = subprocess.run(
             ["scontrol", "show", "job", slurm_job_id],
@@ -289,14 +327,19 @@ def resubmit_job(
     if dry_run:
         return
 
-    result = subprocess.run(
-        command,
-        capture_output=True,
-        text=True,
-        check=True,
-        cwd=str(submit_cwd),
-    )
-    stdout = result.stdout.strip()
+    if scheduler is not None:
+        result = scheduler.submit(command, cwd=submit_cwd)
+        stdout = result.stdout.strip()
+    else:
+        # Standalone-copy fallback; repository executions use SlurmScheduler.
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            check=True,
+            cwd=str(submit_cwd),
+        )
+        stdout = result.stdout.strip()
     if stdout:
         print(f"[gpumd-self-resubmit] sbatch output: {stdout}")
 

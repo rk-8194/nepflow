@@ -1,6 +1,5 @@
 import tempfile
 import json
-import types
 import unittest
 from configparser import ConfigParser
 from pathlib import Path
@@ -15,6 +14,7 @@ from modules.train_nep import submit as submit_module
 from modules.train_nep import launcher as launcher_module
 from modules.train_nep.train_nep import TrainNepStage
 from nepflow.errors import StateError
+from nepflow.hpc.jobs import SubmissionResult
 
 
 class SubmitTrainingJobTests(unittest.TestCase):
@@ -40,12 +40,17 @@ class SubmitTrainingJobTests(unittest.TestCase):
                 }
             )
 
-            completed = types.SimpleNamespace(
-                returncode=0,
+            completed = SubmissionResult(
+                job_id="12345",
                 stdout="Submitted batch job 12345\n",
                 stderr="",
+                command=("sbatch", str(potential_dir / "train_nep.sh")),
             )
-            with patch.object(submit_module.subprocess, "run", return_value=completed):
+            with patch.object(
+                submit_module.scheduler,
+                "submit",
+                return_value=completed,
+            ) as submit_mock:
                 job_id = submit_module.submit_training_job(
                     config=config,
                     dataset_path=dataset_dir,
@@ -55,6 +60,10 @@ class SubmitTrainingJobTests(unittest.TestCase):
                 )
 
             self.assertEqual(job_id, "12345")
+            submit_mock.assert_called_once_with(
+                ["sbatch", str(potential_dir / "train_nep.sh")],
+                cwd=potential_dir,
+            )
             script_text = (potential_dir / "train_nep.sh").read_text(encoding="utf-8")
             self.assertIn("/opt/gpumd/bin/nep", script_text)
             self.assertNotIn("$HOME/src/GPUMD/src/nep", script_text)

@@ -4,13 +4,13 @@ import csv
 import os
 import re
 import shutil
-import subprocess
 import time
 from configparser import ConfigParser
 from datetime import datetime
 from pathlib import Path
 
-from nepflow.errors import StateError
+from nepflow.errors import SchedulerError, StateError
+from nepflow.hpc.slurm import SlurmScheduler
 from nepflow.io.hashing import sha256_file
 from nepflow.io.json import read_json
 
@@ -30,6 +30,8 @@ from ._common import (
     write_status,
 )
 from nepflow.workflow.resubmission import SelfResubmitExit
+
+scheduler = SlurmScheduler()
 
 
 # ==================================================================
@@ -439,29 +441,17 @@ def run_launcher(
 
 def _get_project_job_names(project_name: str) -> tuple[set[str], set[str]]:
     """Batch squeue query: return (running_names, pending_names) for this project."""
-    running = set()
-    pending = set()
-    try:
-        result = subprocess.run(
-            ["squeue", "-u", os.environ.get("USER", ""), "--noheader",
-             "-o", "%j %T", "--states=RUNNING,PENDING"],
-            capture_output=True, text=True, timeout=15, check=False,
-        )
-        if result.returncode == 0:
-            prefix = f"nf_{project_name}_"
-            for line in result.stdout.strip().split("\n"):
-                if not line.strip():
-                    continue
-                parts = line.strip().rsplit(None, 1)
-                if len(parts) == 2:
-                    name, state = parts
-                    if name.startswith(prefix):
-                        if state == "RUNNING":
-                            running.add(name)
-                        elif state == "PENDING":
-                            pending.add(name)
-    except (subprocess.TimeoutExpired, FileNotFoundError):
-        pass
+    running: set[str] = set()
+    pending: set[str] = set()
+    result = scheduler.list_active_jobs(timeout=15)
+    prefix = f"nf_{project_name}_"
+    for job in result.jobs:
+        if not job.name or not job.name.startswith(prefix):
+            continue
+        if job.state.value == "running":
+            running.add(job.name)
+        elif job.state.value == "pending":
+            pending.add(job.name)
     return running, pending
 
 
@@ -512,15 +502,9 @@ def _submit_job(
             str(shared_script),
             str(struct_dir.resolve()),
         ]
-        result = subprocess.run(
-            sbatch_args,
-            capture_output=True, text=True, timeout=30, check=False,
-        )
-        if result.returncode == 0 and "Submitted batch job" in result.stdout:
-            job_id = result.stdout.strip().split()[-1]
-            return job_id
-        logger.warning(f"  sbatch failed for {struct_dir.name}: {result.stderr.strip()}")
-    except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+        result = scheduler.submit(sbatch_args, timeout=30)
+        return result.job_id
+    except SchedulerError as e:
         logger.warning(f"  sbatch error for {struct_dir.name}: {e}")
     return None
 
@@ -555,14 +539,7 @@ def _submit_job_debug(struct_dir: Path, counter: int, fail: bool = False) -> str
 
 def _job_in_squeue(job_id: str) -> bool:
     """Check if a specific job ID is still in squeue."""
-    try:
-        result = subprocess.run(
-            ["squeue", "-j", job_id, "--noheader"],
-            capture_output=True, text=True, timeout=10, check=False,
-        )
-        return result.returncode == 0 and bool(result.stdout.strip())
-    except (subprocess.TimeoutExpired, FileNotFoundError):
-        return False
+    return scheduler.queue_status(job_id, timeout=10).present
 
 
 def _check_completed(struct_dir: Path) -> bool:
@@ -581,7 +558,10 @@ def _cancel_stale_launcher(vasp_dir: Path) -> None:
         my_id = os.environ.get("SLURM_JOB_ID", "")
         if old_id != my_id:
             logger.info(f"  Cancelling stale launcher job {old_id}")
-            subprocess.run(["scancel", old_id], capture_output=True, timeout=10, check=False)
+            try:
+                scheduler.cancel(old_id, timeout=10)
+            except SchedulerError as exc:
+                logger.warning("  Could not cancel stale launcher job %s: %s", old_id, exc)
 
 
 # ==================================================================

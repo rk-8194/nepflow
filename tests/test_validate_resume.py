@@ -18,7 +18,7 @@ from modules.validate.launcher import (  # noqa: E402
     write_validation_status,
 )
 from modules.validate.validate import ValidateStage  # noqa: E402
-from nepflow.errors import StateError  # noqa: E402
+from nepflow.errors import SchedulerError, StateError  # noqa: E402
 
 
 def make_validate_stage(project_dir: Path) -> ValidateStage:
@@ -208,20 +208,16 @@ def test_malformed_validation_status_is_an_explicit_failure() -> None:
             read_validation_status(root)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="Phase 3 deferred scheduler abstraction: scheduler-query failure must be distinguishable from no running jobs",
-)
 def test_scheduler_query_failure_is_not_an_empty_running_job_set() -> None:
-    with patch.object(launcher_module.subprocess, "run", side_effect=OSError("squeue unavailable")):
-        with pytest.raises(RuntimeError):
+    with patch.object(
+        launcher_module.scheduler,
+        "list_active_jobs",
+        side_effect=SchedulerError("squeue unavailable", kind="process_os_error"),
+    ):
+        with pytest.raises(SchedulerError):
             launcher_module._get_running_job_ids()
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="Phase 3 deferred scheduler abstraction: query failure must not mark submitted jobs completed",
-)
 def test_scheduler_query_failure_does_not_complete_submitted_validation_job() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
@@ -245,15 +241,14 @@ def test_scheduler_query_failure_does_not_complete_submitted_validation_job() ->
             validation_complete=False,
         )
 
-        query_failure = launcher_module.subprocess.CompletedProcess(
-            args=["squeue"], returncode=1, stdout="", stderr="scheduler unavailable"
-        )
         config = make_config()
-        with patch.object(launcher_module.subprocess, "run", return_value=query_failure):
-            try:
+        with patch.object(
+            launcher_module.scheduler,
+            "list_active_jobs",
+            side_effect=SchedulerError("scheduler unavailable", kind="command_failed"),
+        ):
+            with pytest.raises(SchedulerError):
                 launcher_module.run_validation_launcher(config, preparation_state, root)
-            except RuntimeError:
-                pass
 
         persisted = read_validation_status(root)
         assert persisted.get("validation_complete") is not True

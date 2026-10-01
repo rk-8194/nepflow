@@ -1,19 +1,20 @@
 """Launcher sub-stage: submit, monitor, and resubmit NEP training jobs."""
 
-import logging
 import os
-import re
-import subprocess
 import time
 from configparser import ConfigParser
 from pathlib import Path
 
-from nepflow.errors import StateError
+from nepflow.errors import SchedulerError, StateError
+from nepflow.hpc.jobs import SchedulerJobState
+from nepflow.hpc.slurm import SlurmScheduler
 from nepflow.io.json import read_json, write_json
 
 from nepflow.workflow.resubmission import SelfResubmitExit
 from common.model_manifest import ModelManifestError, update_model_run_status
 from ._common import logger
+
+scheduler = SlurmScheduler()
 
 # Status file format: json dict with keys: potential_path, job_id, status, job_name, attempt, created, updated, error
 
@@ -164,18 +165,8 @@ def _check_training_error(potential_path: Path) -> str | None:
 
 def _get_slurm_job_id(job_name: str) -> str | None:
     """Get SLURM job ID for a job by name."""
-    try:
-        result = subprocess.run(
-            ["squeue", "-h", "-j", job_name, "-o", "%i"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            return result.stdout.strip().split()[0]
-    except (subprocess.TimeoutExpired, OSError):
-        pass
-    return None
+    job = scheduler.find_job_by_name(job_name, timeout=10)
+    return job.job_id if job is not None else None
 
 
 def run_launcher(
@@ -263,16 +254,16 @@ def run_launcher(
     if not already_submitted_this_attempt:
         logger.info(f"Submitting training job: {job_name}")
         try:
-            result = subprocess.run(
+            result = scheduler.submit(
                 ["sbatch", str(train_script)],
-                capture_output=True,
-                text=True,
-                cwd=str(potential_path),
+                cwd=potential_path,
                 timeout=10,
             )
-            if result.returncode != 0:
-                error_msg = result.stderr.strip() if result.stderr else "Unknown error"
-                logger.error(f"sbatch failed: {error_msg}")
+            job_id = result.job_id
+        except SchedulerError as exc:
+            logger.error("Failed to submit training job: %s", exc)
+            if exc.kind == "command_failed":
+                error_msg = exc.stderr.strip() if exc.stderr else str(exc)
                 write_train_status(
                     project_dir,
                     potential_path=str(potential_path),
@@ -280,18 +271,6 @@ def run_launcher(
                     attempt=attempt,
                     error=f"sbatch failed: {error_msg}",
                 )
-                return
-            
-            # Extract job ID
-            match = re.search(r"Submitted batch job (\d+)", result.stdout)
-            job_id = match.group(1) if match else None
-            if not job_id:
-                logger.warning(f"Could not parse job ID from sbatch output: {result.stdout}")
-        except subprocess.TimeoutExpired:
-            logger.error("sbatch command timed out")
-            return
-        except OSError as e:
-            logger.error(f"Failed to submit job: {e}")
             return
     
     if not job_id:
@@ -340,22 +319,18 @@ def run_launcher(
             last_check_time = current_time
             
             if not debug:
-                try:
-                    result = subprocess.run(
-                        ["squeue", "-h", "-j", job_id, "-o", "%T"],
-                        capture_output=True,
-                        text=True,
-                        timeout=5,
-                    )
-                    job_state = result.stdout.strip()
-                except (subprocess.TimeoutExpired, OSError):
-                    job_state = ""
+                query = scheduler.queue_status(job_id, timeout=5)
+                job_state = query.job.state if query.job is not None else None
             else:
                 # Debug mode: assume job completes after a few polls
-                job_state = "COMPLETED" if poll_count > 3 else "RUNNING"
+                job_state = (
+                    SchedulerJobState.COMPLETED
+                    if poll_count > 3
+                    else SchedulerJobState.RUNNING
+                )
             
             if job_state:
-                logger.debug(f"  Poll {poll_count}: Job state = {job_state}")
+                logger.debug(f"  Poll {poll_count}: Job state = {job_state.value}")
                 
                 # Get current training generation/progress
                 training_stats = _get_training_generation(potential_path)
@@ -376,11 +351,17 @@ def run_launcher(
                         last_generation = generation
                     
                     logger.info(f"  Generation: {generation}/{target_generations or '?'}, Loss: {loss:.6f}{eta_str}")
-                elif job_state == "RUNNING":
+                elif job_state is SchedulerJobState.RUNNING:
                     logger.info(f"  Job running (generation not yet available)")
                 
-                if job_state in ["COMPLETED", "FAILED", "CANCELLED", "NODE_FAIL"]:
-                    logger.info(f"Job left queue: {job_state}")
+                if job_state in {
+                    SchedulerJobState.COMPLETED,
+                    SchedulerJobState.FAILED,
+                    SchedulerJobState.OOM,
+                    SchedulerJobState.CANCELLED,
+                    SchedulerJobState.TIMEOUT,
+                }:
+                    logger.info(f"Job left queue: {job_state.value}")
                     
                     # Job finished — check for success
                     if _check_nep_complete(potential_path):
@@ -411,7 +392,7 @@ def run_launcher(
                     # Training failed — check error
                     error_msg = _check_training_error(potential_path)
                     if not error_msg:
-                        error_msg = f"Training did not produce output (state: {job_state})"
+                        error_msg = f"Training did not produce output (state: {job_state.value})"
                     
                     logger.warning(f"  ✗ Training failed: {error_msg}")
                     # Clear job_id so resubmission knows to increment attempt

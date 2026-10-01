@@ -10,7 +10,6 @@ import argparse
 import logging
 import os
 import re
-import subprocess
 import time
 from pathlib import Path
 
@@ -49,14 +48,16 @@ sys.path.insert(0, str(Path(__file__).parent / "src"))
 # foundation is imported from the canonical installed package.
 # pylint: disable=import-error
 from workflow import WorkflowController
-from nepflow.errors import StateError, ValidationError
+from nepflow.errors import SchedulerError, StateError, ValidationError
 from nepflow.hpc.process import ProcessError, ProcessRunner
+from nepflow.hpc.slurm import SlurmScheduler
 from nepflow.logging import configure_logging
 from nepflow.config.loader import canonical_config_path
 from nepflow.workflow.resubmission import SelfResubmitExit
 
 logger = logging.getLogger("nepflow")
 process_runner = ProcessRunner(logger=logger)
+scheduler = SlurmScheduler(process_runner=process_runner)
 
 
 def _resolve_project_config_path(project_name: str, output_dir: Path) -> Path:
@@ -182,24 +183,19 @@ def _get_slurm_walltime_info() -> tuple[int | None, str]:
 def _resolve_resubmit_from_scontrol(slurm_job_id: str) -> tuple[list[str], Path, str] | None:
     """Try to recover the original batch script path from `scontrol show job`."""
     try:
-        result = subprocess.run(
-            ["scontrol", "show", "job", slurm_job_id],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-    except (FileNotFoundError, subprocess.CalledProcessError) as e:
+        output = scheduler.show_job(slurm_job_id)
+    except SchedulerError as e:
         logger.debug("Could not inspect SLURM job %s via scontrol: %s", slurm_job_id, e)
         return None
 
-    command_match = re.search(r"\bCommand=(\S+)", result.stdout)
+    command_match = re.search(r"\bCommand=(\S+)", output)
     if not command_match:
         logger.debug("scontrol output for job %s did not include Command=", slurm_job_id)
         return None
 
     command_path = Path(command_match.group(1)).expanduser()
     if not command_path.is_absolute():
-        workdir_match = re.search(r"\bWorkDir=(\S+)", result.stdout)
+        workdir_match = re.search(r"\bWorkDir=(\S+)", output)
         if workdir_match:
             command_path = Path(workdir_match.group(1)) / command_path
 
@@ -266,17 +262,11 @@ def _resubmit_slurm_job(debug: bool = False) -> None:
         return
 
     try:
-        result = subprocess.run(
-            command,
-            capture_output=True,
-            text=True,
-            check=True,
-            cwd=str(submit_cwd),
-        )
+        result = scheduler.submit(command, cwd=submit_cwd)
         logger.info("Resubmission via sbatch: %s", result.stdout.strip())
-    except (FileNotFoundError, subprocess.CalledProcessError) as e:
-        stderr = getattr(e, "stderr", "") or ""
-        stdout = getattr(e, "stdout", "") or ""
+    except SchedulerError as e:
+        stderr = e.stderr or ""
+        stdout = e.stdout or ""
         logger.error(
             "Could not resubmit job via %s: %s%s%s",
             submit_source,

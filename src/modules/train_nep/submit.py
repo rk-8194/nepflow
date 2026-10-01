@@ -1,12 +1,16 @@
 """Submit sub-stage: create and submit SLURM training job."""
 
 import shutil
-import subprocess
 from configparser import ConfigParser
 from datetime import datetime
 from pathlib import Path
 
+from nepflow.hpc.resources import JobResources, render_slurm_header
+from nepflow.hpc.slurm import SlurmScheduler
+
 from ._common import logger
+
+scheduler = SlurmScheduler()
 
 
 def submit_training_job(
@@ -35,7 +39,7 @@ def submit_training_job(
         
     Raises:
         FileNotFoundError: If SLURM header not found
-        RuntimeError: If sbatch submission fails
+        SchedulerError: If sbatch submission fails or returns malformed output
     """
     # Copy dataset files to potential folder
     logger.info(f"Copying dataset files from {dataset_path.name} to {potential_path.name}")
@@ -58,26 +62,6 @@ def submit_training_job(
 
     header_text = slurm_header_path.read_text(encoding="utf-8")
     
-    # Separate SBATCH directives from other content
-    sbatch_directives = []
-    other_content = []
-    shebang = ""
-    
-    for line in header_text.splitlines():
-        if line.startswith("#!"):
-            shebang = line
-        elif line.strip().startswith("#SBATCH"):
-            # Filter out resource-specific directives (we'll add our own)
-            resource_flags = ("--nodes", "--ntasks-per-node", "--gres", "--time", "--output", "--error")
-            if not any(flag in line for flag in resource_flags):
-                sbatch_directives.append(line)
-        else:
-            other_content.append(line)
-    
-    # Ensure we have a shebang
-    if not shebang:
-        shebang = "#!/bin/bash"
-    
     # Get walltime from config (default 24h for NEP training)
     # Check for train_nep_walltime first, fall back to general walltime, then default
     walltime = config.get("slurm", "train_nep_walltime", fallback=None)
@@ -90,19 +74,18 @@ def submit_training_job(
             "Required configuration hpc.nep_command is missing or blank"
         )
     
-    # Build script with proper ordering: shebang → SBATCH directives → other commands → execution
+    job_name = f"nep_train_{project_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    rendered_header = render_slurm_header(
+        JobResources(nodes=1, gpus_per_node=1, mpi_ranks=1, walltime=walltime),
+        base_header=header_text,
+        job_name=job_name,
+        stdout_path="train_nep_%j.log",
+        stderr_path="train_nep_%j.err",
+    )
+
+    # Backend command body remains owned by the NEP training stage.
     script_lines = [
-        shebang,
-        *sbatch_directives,
-        f"#SBATCH --nodes=1",
-        f"#SBATCH --ntasks-per-node=1",
-        f"#SBATCH --gres=gpu:1",
-        f"#SBATCH --time={walltime}",
-        f"#SBATCH --job-name=nep_train_{project_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
-        f"#SBATCH --output=train_nep_%j.log",
-        f"#SBATCH --error=train_nep_%j.err",
-        "",
-        *other_content,
+        rendered_header.rstrip(),
         "",
         f"cd {potential_path}",
         nep_command,
@@ -117,19 +100,8 @@ def submit_training_job(
     logger.debug(f"Created SLURM script: {script_path}")
 
     # Submit script
-    result = subprocess.run(
+    result = scheduler.submit(
         ["sbatch", str(script_path)],
-        capture_output=True,
-        text=True,
-        cwd=str(potential_path),
+        cwd=potential_path,
     )
-
-    if result.returncode != 0:
-        raise RuntimeError(f"sbatch failed: {result.stderr}")
-
-    # Extract job ID from output
-    # sbatch outputs "Submitted batch job XXXXX"
-    output = result.stdout.strip()
-    job_id = output.split()[-1] if output else "UNKNOWN"
-
-    return job_id
+    return result.job_id

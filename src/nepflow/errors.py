@@ -20,6 +20,25 @@ class StateError(NepflowError):
 class SchedulerError(NepflowError):
     """Raised when scheduler interaction fails."""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        command: tuple[str, ...] | None = None,
+        cwd: str | None = None,
+        returncode: int | None = None,
+        stdout: str | None = None,
+        stderr: str | None = None,
+        kind: str = "scheduler",
+    ) -> None:
+        self.command = command
+        self.cwd = cwd
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+        self.kind = kind
+        super().__init__(message)
+
 
 class ProcessError(NepflowError):
     """Raised when an external process cannot be executed successfully."""

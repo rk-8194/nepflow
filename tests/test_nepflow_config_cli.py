@@ -3,7 +3,6 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -67,21 +66,16 @@ class ConfigCliTests(unittest.TestCase):
 
             with patch.dict(os.environ, {"SLURM_JOB_ID": "123"}, clear=False):
                 with patch.object(
-                    nepflow.subprocess,
-                    "run",
-                    return_value=SimpleNamespace(stdout=scontrol_output),
+                    nepflow.scheduler,
+                    "show_job",
+                    return_value=scontrol_output,
                 ) as run_mock:
                     command, cwd, source = nepflow._resolve_resubmit_command()
 
             self.assertEqual(command, ["sbatch", str(script_path)])
             self.assertEqual(cwd, submit_dir)
             self.assertEqual(source, "scontrol job 123")
-            run_mock.assert_called_once_with(
-                ["scontrol", "show", "job", "123"],
-                capture_output=True,
-                text=True,
-                check=True,
-            )
+            run_mock.assert_called_once_with("123")
 
     def test_resolve_resubmit_command_falls_back_to_submit_dir_script(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -95,9 +89,9 @@ class ConfigCliTests(unittest.TestCase):
                 clear=False,
             ):
                 with patch.object(
-                    nepflow.subprocess,
-                    "run",
-                    side_effect=FileNotFoundError("scontrol not found"),
+                    nepflow.scheduler,
+                    "show_job",
+                    side_effect=nepflow.SchedulerError("scontrol not found"),
                 ):
                     command, cwd, source = nepflow._resolve_resubmit_command()
 
