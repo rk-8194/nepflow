@@ -70,7 +70,7 @@ def test_deterministic_dft_to_validation_identity_trace() -> None:
         vasp_job.mkdir(parents=True)
         outcar_path = vasp_job / "OUTCAR"
         shutil.copy2(OUTCAR_FIXTURE, outcar_path)
-        selected = ase_read(str(outcar_path), format="vasp-out")
+        selected = ase_read(str(DFT_FIXTURE), format="extxyz")
         calculation_identity = {
             "structure_hash": hash_structure(selected),
             "incar_hash": "incar-hash-v1",
