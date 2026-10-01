@@ -19,7 +19,7 @@ from ase import Atoms
 from ase.build import bulk
 from ase.io import write
 
-from common.structure_identity import annotate_structure_hashes, hash_structure
+from nepflow.domain.identities import annotate_structure_ids, calculate_structure_id
 from ..base import Stage
 from .generators import (
     CompositionGrid,
@@ -142,7 +142,7 @@ class GenerateStage(Stage):
 
         seeds_file = self._seeds_file()
         seeds_file.parent.mkdir(parents=True, exist_ok=True)
-        annotate_structure_hashes(all_bases)
+        annotate_structure_ids(all_bases)
         write(str(seeds_file), all_bases)
         logger.info(f"  Saved seeds to {seeds_file}")
         return all_bases
@@ -329,11 +329,11 @@ class GenerateStage(Stage):
         by_hash: dict[str, Atoms] = {}
 
         for base in bases:
-            structure_hash = hash_structure(base)
-            representative = by_hash.get(structure_hash)
+            structure_id = calculate_structure_id(base)
+            representative = by_hash.get(structure_id)
             if representative is None:
                 GenerateStage._merge_provenance(representative=base, duplicate=None)
-                by_hash[structure_hash] = base
+                by_hash[structure_id] = base
                 unique_bases.append(base)
                 continue
 
@@ -650,7 +650,7 @@ class GenerateStage(Stage):
         seeds_dir = self.project_dir / "structures" / "seeds"
         seeds_dir.mkdir(parents=True, exist_ok=True)
         seeds_file = seeds_dir / "base_structures.xyz"
-        annotate_structure_hashes(structures)
+        annotate_structure_ids(structures)
         write(str(seeds_file), structures)
         logger.info(f"[DEBUG] Saved {len(structures)} seed structures to {seeds_file}")
 

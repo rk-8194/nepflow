@@ -97,8 +97,6 @@ class GenerationConfig:
     interstitial_d_min: float = 1.65
     interstitial_min: float = 0.05
     interstitial_max: float = 0.1
-    volume_scale_minimum: float | None = None
-    interstitial_d_max: float | None = None
     gas_interstitial_d_min: float = 1.2
     max_gas_occupancy: int = 3
 
@@ -229,11 +227,17 @@ class NepflowConfig:
     hpc: HpcConfig = field(default_factory=HpcConfig)
     slurm: SlurmConfig = field(default_factory=SlurmConfig)
     source_path: Path | None = field(default=None, compare=False, repr=False)
+    raw_sections: frozenset[str] = field(
+        default_factory=frozenset,
+        compare=False,
+        repr=False,
+    )
 
     def effective_mapping(self, *, redact_secrets: bool = True) -> dict[str, object]:
         """Return a deterministic, serializable view of the effective config."""
         mapping = asdict(self)
         mapping.pop("source_path", None)
+        mapping.pop("raw_sections", None)
         if redact_secrets:
             materials_project = mapping["materials_project"]
             if isinstance(materials_project, dict):

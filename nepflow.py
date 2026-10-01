@@ -50,28 +50,16 @@ sys.path.insert(0, str(Path(__file__).parent / "src"))
 # pylint: disable=import-error
 from workflow import WorkflowController
 from nepflow.logging import configure_logging
+from nepflow.config.loader import canonical_config_path
 from modules import SelfResubmitExit
 
 logger = logging.getLogger("nepflow")
 
 
 def _resolve_project_config_path(project_name: str, output_dir: Path) -> Path:
-    """
-    Resolve the config file path for a project.
-
-    Prefer existing files in the same order used by workflow stages.
-    If none exist yet, return the primary config path so Vim can create it.
-    """
+    """Return the canonical project.config path used by the workflow."""
     project_dir = Path(output_dir) / f"project_{project_name}"
-    candidates = [
-        project_dir / "config" / "project.config",
-        project_dir / "config" / f"{project_name}.yaml",
-        project_dir / "config" / f"{project_name}.ini",
-    ]
-    for candidate in candidates:
-        if candidate.exists():
-            return candidate
-    return candidates[0]
+    return canonical_config_path(project_dir)
 
 
 def create_parser() -> argparse.ArgumentParser:

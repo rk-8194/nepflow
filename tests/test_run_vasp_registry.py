@@ -14,6 +14,7 @@ pytest.importorskip("pymatgen")
 from ase import Atoms
 from modules.run_vasp import _common as common
 from modules.run_vasp import launcher, prepare
+from nepflow.domain.identities import calculate_structure_id
 
 
 class RunVaspRegistryTests(unittest.TestCase):
@@ -67,8 +68,8 @@ class RunVaspRegistryTests(unittest.TestCase):
         larger_cell = self.silicon_atoms()
         larger_cell.set_cell([[2.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
 
-        self.assertNotEqual(common.hash_structure(first), common.hash_structure(moved))
-        self.assertNotEqual(common.hash_structure(first), common.hash_structure(larger_cell))
+        self.assertNotEqual(calculate_structure_id(first), calculate_structure_id(moved))
+        self.assertNotEqual(calculate_structure_id(first), calculate_structure_id(larger_cell))
 
     def test_incar_hash_ignores_resource_params(self) -> None:
         original = "ENCUT = 520\nNCORE = 16\nKPAR = 1\nISMEAR = 0\n"
@@ -106,7 +107,7 @@ class RunVaspRegistryTests(unittest.TestCase):
             identity = (
                 common.hash_incar_text(incar),
                 common.hash_potcar_bytes(b"Si-potcar-v1"),
-                common.hash_structure(atoms),
+                calculate_structure_id(atoms),
             )
 
             for index, attempt_provenance in enumerate(
@@ -189,7 +190,7 @@ class RunVaspRegistryTests(unittest.TestCase):
                 root,
                 common.hash_incar_text(incar),
                 common.hash_potcar_bytes(b"Si-potcar-v1"),
-                common.hash_structure(atoms),
+                calculate_structure_id(atoms),
                 {
                     "job_path": str(completed_job.resolve()),
                     "slurm_job_id": "12345",
@@ -227,7 +228,7 @@ class RunVaspRegistryTests(unittest.TestCase):
                 root,
                 common.hash_incar_text(incar),
                 common.hash_potcar_bytes(b"Si-potcar-v1"),
-                common.hash_structure(changed),
+                calculate_structure_id(changed),
                 {"job_path": str(completed_job.resolve())},
             )
 
@@ -255,7 +256,7 @@ class RunVaspRegistryTests(unittest.TestCase):
                 root,
                 common.hash_incar_text(incar),
                 common.hash_potcar_bytes(b"Si-potcar-v1"),
-                common.hash_structure(atoms),
+                calculate_structure_id(atoms),
                 {"job_path": str(incomplete_job.resolve())},
             )
 
@@ -281,7 +282,7 @@ class RunVaspRegistryTests(unittest.TestCase):
                 root,
                 common.hash_incar_text(incar),
                 common.hash_potcar_bytes(b"Si-potcar-v1"),
-                common.hash_structure(atoms),
+                calculate_structure_id(atoms),
                 {"job_path": str(stale_job.resolve())},
             )
 
@@ -309,7 +310,7 @@ class RunVaspRegistryTests(unittest.TestCase):
                 root,
                 common.hash_incar_text("ENCUT = 520\n"),
                 common.hash_potcar_bytes(b"Si-potcar-v1"),
-                common.hash_structure(atoms),
+                calculate_structure_id(atoms),
                 {"job_path": str(completed_job.resolve())},
             )
 
@@ -338,7 +339,7 @@ class RunVaspRegistryTests(unittest.TestCase):
                 root,
                 common.hash_incar_text(incar),
                 common.hash_potcar_bytes(b"Si-potcar-v1"),
-                common.hash_structure(atoms),
+                calculate_structure_id(atoms),
                 {"job_path": str(completed_job.resolve())},
             )
 

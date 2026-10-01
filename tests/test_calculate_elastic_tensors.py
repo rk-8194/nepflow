@@ -52,7 +52,7 @@ class CalculateElasticTensorsTests(unittest.TestCase):
             module.ElasticRecord(
                 group_key="seed_000001",
                 source_label=f"mode_{idx}",
-                structure_hash=f"structure-{idx}",
+                structure_id=f"structure-{idx}",
                 reference_hash="reference-000001",
                 formula="Si2",
                 material_id=None,

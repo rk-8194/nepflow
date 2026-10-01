@@ -26,7 +26,7 @@ from NepTrainKit.core.structure import Structure
 
 from common.FPS import cross_distance_stats, fps_target_count
 from common.descriptors import descriptor_cache_path, load_or_compute_descriptors
-from common.structure_identity import hash_structure
+from nepflow.domain.identities import calculate_structure_id
 from ..base import Stage
 
 logger = logging.getLogger("nepflow.select")
@@ -1410,13 +1410,13 @@ class SelectStage(Stage):
 
         reference_index: dict[str, int] = {}
         for i, atoms in enumerate(reference_ase):
-            physical_hash = hash_structure(atoms)
+            physical_hash = calculate_structure_id(atoms)
             reference_index.setdefault(physical_hash, i)
 
         seed_indices: list[int] = []
         missing_seeds: list[str] = []
         for seed in seed_ase:
-            physical_hash = hash_structure(seed)
+            physical_hash = calculate_structure_id(seed)
             reference_index_for_seed = reference_index.get(physical_hash)
             if reference_index_for_seed is None:
                 missing_seeds.append(physical_hash)

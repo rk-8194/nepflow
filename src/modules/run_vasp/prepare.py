@@ -8,13 +8,18 @@ from pathlib import Path
 
 from ase.io import iread
 
+from nepflow.domain.identities import (
+    DftCalculationIdentity,
+    calculate_structure_id,
+    normalise_dft_calculation_identity,
+)
+
 from ._common import (
     canonical_poscar_text,
     get_nepflow_root,
     get_registry_entry,
     hash_incar_text,
     hash_potcar_bytes,
-    hash_structure,
     logger,
     outcar_is_complete,
     read_completed_registry,
@@ -101,15 +106,21 @@ def prepare_jobs(
             struct_elements = sorted(set(atoms.get_chemical_symbols()))
             potcar_bytes = b"".join(potcar_data[elem] for elem in struct_elements)
             potcar_hash = hash_potcar_bytes(potcar_bytes)
-            structure_hash = hash_structure(atoms)
+            structure_id = calculate_structure_id(atoms)
+            calculation = DftCalculationIdentity(
+                structure_id=structure_id,
+                incar_hash=incar_hash,
+                potcar_hash=potcar_hash,
+            )
             identity = {
                 "project_name": project_name,
                 "dataset": ds,
                 "selected_index": i,
                 "source_xyz": str(xyz_path.resolve()),
-                "structure_hash": structure_hash,
+                "structure_id": structure_id,
                 "incar_hash": incar_hash,
                 "potcar_hash": potcar_hash,
+                "calculation_id": calculation.calculation_id,
             }
 
             current_status = read_status(struct_dir).get("status", "pending")
@@ -131,7 +142,7 @@ def prepare_jobs(
                 registry,
                 incar_hash,
                 potcar_hash,
-                structure_hash,
+                structure_id,
             )
             if reusable_entry:
                 reused_from = str(Path(reusable_entry["job_path"]).resolve())
@@ -140,7 +151,8 @@ def prepare_jobs(
                     status="reused",
                     retry_level=0,
                     reused_from=reused_from,
-                    structure_hash=structure_hash,
+                    structure_id=structure_id,
+                    calculation_id=calculation.calculation_id,
                     incar_hash=incar_hash,
                     potcar_hash=potcar_hash,
                 )
@@ -150,7 +162,8 @@ def prepare_jobs(
                     struct_dir,
                     status="pending",
                     retry_level=0,
-                    structure_hash=structure_hash,
+                    structure_id=structure_id,
+                    calculation_id=calculation.calculation_id,
                     incar_hash=incar_hash,
                     potcar_hash=potcar_hash,
                 )
@@ -281,7 +294,11 @@ def _read_identity(struct_dir: Path) -> dict:
     if not isinstance(data, dict):
         raise ValueError(f"VASP identity must contain a JSON object: {identity_path}")
 
-    required = ("structure_hash", "incar_hash", "potcar_hash")
+    # Read the Phase 2 spelling as a compatibility boundary, but normalize
+    # immediately so all new comparisons use the canonical vocabulary.
+    data = normalise_dft_calculation_identity(data)
+
+    required = ("structure_id", "incar_hash", "potcar_hash", "calculation_id")
     for key in required:
         value = data.get(key)
         if not isinstance(value, str) or not value.strip():
@@ -299,7 +316,9 @@ def _write_identity(struct_dir: Path, identity: dict) -> None:
 
 
 def _identity_matches(existing: dict, expected: dict) -> bool:
-    keys = ("structure_hash", "incar_hash", "potcar_hash")
+    existing = normalise_dft_calculation_identity(existing)
+    expected = normalise_dft_calculation_identity(expected)
+    keys = ("structure_id", "incar_hash", "potcar_hash", "calculation_id")
     return bool(existing) and all(existing.get(key) == expected[key] for key in keys)
 
 
@@ -326,9 +345,9 @@ def _valid_registry_entry(
     registry: dict,
     incar_hash: str,
     potcar_hash: str,
-    structure_hash: str,
+    structure_id: str,
 ) -> dict | None:
-    entry = get_registry_entry(registry, incar_hash, potcar_hash, structure_hash)
+    entry = get_registry_entry(registry, incar_hash, potcar_hash, structure_id)
     if entry is None:
         return None
     return entry if outcar_is_complete(Path(entry["job_path"]) / "OUTCAR") else None

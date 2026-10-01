@@ -48,7 +48,7 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from common.structure_identity import annotate_structure_hash, hash_structure
+from nepflow.domain.identities import annotate_structure_id, calculate_structure_id
 
 
 DEFAULT_PATTERNS = [
@@ -335,20 +335,20 @@ def load_folder_list(list_path: Path) -> set[Path]:
     return selected
 
 
-def merge_unique_by_structure_hash(
+def merge_unique_by_structure_id(
     existing: list[Atoms],
     incoming: list[Atoms],
 ) -> tuple[list[Atoms], int]:
     merged = list(existing)
-    seen = {hash_structure(atoms) for atoms in existing}
+    seen = {calculate_structure_id(atoms) for atoms in existing}
     skipped = 0
     for atoms in incoming:
-        structure_hash = hash_structure(atoms)
-        if structure_hash in seen:
+        structure_id = calculate_structure_id(atoms)
+        if structure_id in seen:
             skipped += 1
             continue
         merged.append(atoms)
-        seen.add(structure_hash)
+        seen.add(structure_id)
     return merged, skipped
 
 
@@ -415,7 +415,7 @@ def main() -> int:
     existing_hashes: set[str] = set()
     if output_path.exists() and not args.overwrite:
         existing_structures = load_existing_output(output_path)
-        existing_hashes = {hash_structure(atoms) for atoms in existing_structures}
+        existing_hashes = {calculate_structure_id(atoms) for atoms in existing_structures}
 
     seed_index = (
         args.seed_start
@@ -447,8 +447,8 @@ def main() -> int:
             continue
 
         for frame_index, atoms in enumerate(structures):
-            structure_hash = hash_structure(atoms)
-            if not args.allow_duplicates and structure_hash in existing_hashes:
+            structure_id = calculate_structure_id(atoms)
+            if not args.allow_duplicates and structure_id in existing_hashes:
                 skipped_duplicates += 1
                 continue
 
@@ -482,11 +482,11 @@ def main() -> int:
                 atoms.info["seed_id"] = f"{args.seed_prefix}{seed_index:06d}"
                 seed_index += 1
 
-            annotate_structure_hash(atoms, overwrite=True)
+            annotate_structure_id(atoms, overwrite=True)
             imported.append(atoms)
             if structure_file in seed_list_paths:
                 imported_seed_structures.append(atoms.copy())
-            existing_hashes.add(structure_hash)
+            existing_hashes.add(structure_id)
 
     print(f"Matched files: {len(input_files)}")
     print(f"Imported structures: {len(imported)}")
@@ -518,7 +518,7 @@ def main() -> int:
         for atoms in seeds_to_write:
             atoms.info = dict(getattr(atoms, "info", {}) or {})
             atoms.info["source"] = f"seed:{atoms.info.get('source', 'manual')}"
-        merged_seeds, skipped_seed_duplicates = merge_unique_by_structure_hash(
+        merged_seeds, skipped_seed_duplicates = merge_unique_by_structure_id(
             seed_existing,
             seeds_to_write,
         )

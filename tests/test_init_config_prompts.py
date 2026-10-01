@@ -44,7 +44,7 @@ class InitConfigPromptTests(unittest.TestCase):
             config_text = (project_dir / "config" / "project.config").read_text(encoding="utf-8")
             self.assertIn("api_key=mp-test-key", config_text)
             self.assertIn("elements=W,Cr,Y,Zr", config_text)
-            self.assertIn("gasElements=", config_text)
+            self.assertIn("gas_elements=", config_text)
             self.assertIn("crystal_structures=bcc,fcc", config_text)
             self.assertIn("target_n_atoms=128", config_text)
             self.assertIn("scp_address=user@host:/opt/nepflow", config_text)
@@ -57,6 +57,31 @@ class InitConfigPromptTests(unittest.TestCase):
                 config_text,
             )
             self.assertEqual(input_mock.call_count, 6)
+
+    def test_materials_project_environment_key_is_not_persisted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_dir = Path(tmp)
+            (project_dir / "config").mkdir(parents=True, exist_ok=True)
+            stage = self._make_stage(project_dir)
+
+            with patch.dict(os.environ, {"MP_API_KEY": "environment-secret"}, clear=True):
+                with patch(
+                    "modules.init.init.input",
+                    side_effect=[
+                        "W",
+                        "",
+                        "BCC",
+                        "",
+                        "user@host:/opt/nepflow",
+                    ],
+                ):
+                    stage._setup_config()
+
+            config_text = (project_dir / "config" / "project.config").read_text(
+                encoding="utf-8"
+            )
+            self.assertIn("api_key=\n", config_text)
+            self.assertNotIn("environment-secret", config_text)
 
     def test_unknown_element_raises_value_error(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

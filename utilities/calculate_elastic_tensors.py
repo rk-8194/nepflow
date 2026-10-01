@@ -9,7 +9,6 @@ from completed ``OUTCAR`` files, and fits 6x6 elastic stiffness tensors in GPa.
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import re
 import sys
@@ -26,6 +25,8 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
+from nepflow.domain.identities import calculate_structure_id, sha256_bytes
+
 
 VOIGT_LABELS = ("xx", "yy", "zz", "yz", "xz", "xy")
 DEFAULT_DATASETS = ("train", "test")
@@ -33,7 +34,6 @@ PROGRESS_EVERY_FRAMES = 500
 PREVIEW_LIMIT = 8
 MATCHED_PREVIEW_LIMIT = 5
 VASP_COMPLETION_MARKERS = ("General timing", "Voluntary context switches")
-STRUCTURE_HASH_VERSION = "structure-v1"
 STRESS_PATTERN = re.compile(
     r"STRESS\s+in cartesian coordinates \(kB\)\n"
     r"\s+([-.\d]+)\s+([-.\d]+)\s+([-.\d]+)\n"
@@ -58,8 +58,8 @@ class LocalJobRecord:
 class ElasticRecord:
     group_key: str
     source_label: str
-    structure_hash: str
-    reference_hash: str
+    structure_id: str
+    reference_structure_id: str
     formula: str | None
     material_id: str | None
     structure_name: str | None
@@ -343,10 +343,10 @@ def build_group_key(atoms) -> str:
     return f"{symbols}:{metadata.get('structure_name', 'unknown')}"
 
 
-def build_reference_hash(atoms, reference_cell: np.ndarray) -> str:
+def build_reference_structure_id(atoms, reference_cell: np.ndarray) -> str:
     reference_atoms = atoms.copy()
     reference_atoms.set_cell(reference_cell, scale_atoms=True)
-    return hash_structure(reference_atoms)
+    return calculate_structure_id(reference_atoms)
 
 
 def build_source_label(metadata: dict) -> str:
@@ -391,58 +391,12 @@ def strip_resource_incar_params(incar_text: str) -> str:
     return "\n".join(kept).rstrip() + "\n"
 
 
-def sha256_bytes(data: bytes) -> str:
-    return hashlib.sha256(data).hexdigest()
-
-
 def hash_incar_text(incar_text: str) -> str:
     return sha256_bytes(strip_resource_incar_params(incar_text).encode("utf-8"))
 
 
 def hash_potcar_bytes(potcar_bytes: bytes) -> str:
     return sha256_bytes(potcar_bytes)
-
-
-def format_vector(values) -> str:
-    return " ".join(f"{float(values[i]):.14f}" for i in range(3))
-
-
-def pbc_values(atoms) -> list[bool]:
-    pbc = getattr(atoms, "pbc", (True, True, True))
-    if hasattr(pbc, "tolist"):
-        pbc = pbc.tolist()
-    if isinstance(pbc, bool):
-        return [pbc, pbc, pbc]
-    values = list(pbc)
-    if len(values) == 0:
-        return [True, True, True]
-    if len(values) == 1:
-        return [bool(values[0])] * 3
-    return [bool(value) for value in values[:3]]
-
-
-def canonical_structure_text(atoms) -> str:
-    symbols = list(atoms.get_chemical_symbols())
-    unique_elements = sorted(set(symbols))
-    scaled_positions = atoms.get_scaled_positions()
-    cell = atoms.get_cell()
-    pbc = pbc_values(atoms)
-
-    lines = [STRUCTURE_HASH_VERSION]
-    lines.append("pbc " + " ".join("1" if value else "0" for value in pbc))
-    lines.append("cell")
-    for row in cell:
-        lines.append(format_vector(row))
-    lines.append("atoms")
-    for elem in unique_elements:
-        indices = [i for i, symbol in enumerate(symbols) if symbol == elem]
-        for idx in indices:
-            lines.append(f"{elem} {format_vector(scaled_positions[idx])}")
-    return "\n".join(lines) + "\n"
-
-
-def hash_structure(atoms) -> str:
-    return sha256_bytes(canonical_structure_text(atoms).encode("utf-8"))
 
 
 def outcar_is_complete(outcar_path: Path) -> bool:
@@ -568,7 +522,7 @@ def load_input_context(project_dir: Path) -> dict:
 
 
 def structure_identity_tuple(atoms, input_context: dict) -> tuple[str, str, str]:
-    structure_hash = hash_structure(atoms)
+    structure_id = calculate_structure_id(atoms)
     potcar_data = input_context["potcar_data"]
     struct_elements = sorted(set(atoms.get_chemical_symbols()))
     missing = [elem for elem in struct_elements if elem not in potcar_data]
@@ -576,17 +530,17 @@ def structure_identity_tuple(atoms, input_context: dict) -> tuple[str, str, str]
         raise FileNotFoundError(f"missing POTCAR files for: {', '.join(missing)}")
 
     potcar_hash = hash_potcar_bytes(b"".join(potcar_data[elem] for elem in struct_elements))
-    return (structure_hash, input_context["incar_hash"], potcar_hash)
+    return (structure_id, input_context["incar_hash"], potcar_hash)
 
 
 def resolve_registry_outcar(identity: tuple[str, str, str], input_context: dict) -> Path | None:
-    structure_hash, incar_hash, potcar_hash = identity
+    structure_id, incar_hash, potcar_hash = identity
     entry = (
         input_context.get("registry", {})
         .get("jobs", {})
         .get(incar_hash, {})
         .get(potcar_hash, {})
-        .get(structure_hash)
+        .get(structure_id)
     )
     if not isinstance(entry, dict):
         return None
@@ -624,7 +578,7 @@ def resolve_local_job(project_dir: Path, dataset: str, structure_index: int) -> 
         dataset=dataset,
         struct_dir=struct_dir,
         identity=(
-            str(identity.get("structure_hash", "")),
+            str(identity.get("structure_id", identity.get("structure_hash", ""))),
             str(identity.get("incar_hash", "")),
             str(identity.get("potcar_hash", "")),
         ),
@@ -948,7 +902,7 @@ def summarise_group(
     return {
         "group_key": records[0].group_key,
         "source_label": records[0].source_label,
-        "structure_hash": records[0].structure_hash,
+        "structure_id": records[0].structure_id,
         "formula": records[0].formula,
         "material_id": records[0].material_id,
         "structure_name": records[0].structure_name,
@@ -1203,7 +1157,7 @@ def stream_elastic_records(
             try:
                 reference_cell = reference_cell_from_metadata(atoms.get_cell(), strain_matrix)
                 strain_voigt = cell_strain_voigt(reference_cell, atoms.get_cell())
-                reference_hash = build_reference_hash(atoms, reference_cell)
+                reference_structure_id = build_reference_structure_id(atoms, reference_cell)
             except np.linalg.LinAlgError:
                 stats["reference_reconstruction_failures"] += 1
                 if stats["reference_reconstruction_failures"] <= PREVIEW_LIMIT:
@@ -1214,7 +1168,7 @@ def stream_elastic_records(
                     )
                 reference_cell = np.array(atoms.get_cell(), dtype=float)
                 strain_voigt = strain_matrix_to_voigt(strain_matrix)
-                reference_hash = identity[0]
+                reference_structure_id = identity[0]
 
             structure_name = metadata.get("structure_name")
             rotation_rows = conventional_rotation_rows(reference_cell, structure_name)
@@ -1232,8 +1186,8 @@ def stream_elastic_records(
                 ElasticRecord(
                     group_key=build_source_label(metadata),
                     source_label=build_source_label(metadata),
-                    structure_hash=identity[0],
-                    reference_hash=reference_hash,
+                    structure_id=identity[0],
+                    reference_structure_id=reference_structure_id,
                     formula=metadata.get("formula"),
                     material_id=metadata.get("material_id"),
                     structure_name=structure_name,

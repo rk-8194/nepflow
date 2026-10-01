@@ -25,7 +25,7 @@ import numpy as np
 from ase import Atom, Atoms
 from ase.io import write
 
-from common.structure_identity import annotate_structure_hashes
+from nepflow.domain.identities import annotate_structure_ids
 
 logger = logging.getLogger("nepflow.structure_generation")
 
@@ -255,7 +255,7 @@ class PerturbationEngine:
         """Append a batch of structures to the output file and update counters."""
         if not batch:
             return
-        annotate_structure_hashes(batch)
+        annotate_structure_ids(batch)
         write(str(self._output_file), batch, append=True)
         for a in batch:
             self._total += 1

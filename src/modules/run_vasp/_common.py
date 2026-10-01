@@ -1,7 +1,6 @@
 """Shared constants and utilities for the run_vasp sub-stages."""
 
 import csv
-import hashlib
 import json
 import logging
 import re
@@ -11,7 +10,8 @@ from pathlib import Path
 
 import numpy as np
 
-from common.structure_identity import hash_structure as hash_physical_structure
+from nepflow.domain.identities import sha256_bytes
+from nepflow.domain.units import stress_kbar_to_ev_per_angstrom3, virial_from_stress
 
 logger = logging.getLogger("nepflow.run_vasp")
 
@@ -40,7 +40,7 @@ def completed_jobs_registry_path(nepflow_root: Path) -> Path:
 
 
 def _sha256_bytes(data: bytes) -> str:
-    return hashlib.sha256(data).hexdigest()
+    return sha256_bytes(data)
 
 
 def file_sha256(path: Path) -> str | None:
@@ -84,11 +84,6 @@ def canonical_poscar_text(atoms) -> str:
 def canonical_poscar_bytes(atoms) -> bytes:
     """Return canonical POSCAR bytes for structure hashing."""
     return canonical_poscar_text(atoms).encode("utf-8")
-
-
-def hash_structure(atoms) -> str:
-    """Hash the physical structure, ignoring mutable metadata."""
-    return hash_physical_structure(atoms)
 
 
 def strip_resource_incar_params(incar_text: str) -> str:
@@ -153,7 +148,7 @@ def get_registry_entry(
     registry: dict,
     incar_hash: str,
     potcar_hash: str,
-    structure_hash: str,
+    structure_id: str,
 ) -> dict | None:
     """Return a registry entry for the input identity, if present."""
     jobs = registry.get("jobs")
@@ -176,18 +171,18 @@ def get_registry_entry(
             f"Registry entries for POTCAR hash are malformed: {potcar_hash}"
         )
 
-    if structure_hash not in potcar_entries:
+    if structure_id not in potcar_entries:
         return None
-    entry = potcar_entries[structure_hash]
+    entry = potcar_entries[structure_id]
     if not isinstance(entry, dict):
         raise ValueError(
-            f"Registry entry for structure hash is malformed: {structure_hash}"
+            f"Registry entry for structure ID is malformed: {structure_id}"
         )
     job_path = entry.get("job_path")
     if not isinstance(job_path, str) or not job_path.strip():
         raise ValueError(
-            "Registry entry for structure hash lacks a valid job_path: "
-            f"{structure_hash}"
+            "Registry entry for structure ID lacks a valid job_path: "
+            f"{structure_id}"
         )
     return entry
 
@@ -196,13 +191,13 @@ def upsert_registry_entry(
     nepflow_root: Path,
     incar_hash: str,
     potcar_hash: str,
-    structure_hash: str,
+    structure_id: str,
     entry: dict,
 ) -> None:
     """Insert or replace a completed-job registry entry."""
     registry = read_completed_registry(nepflow_root)
     jobs = registry["jobs"]
-    jobs.setdefault(incar_hash, {}).setdefault(potcar_hash, {})[structure_hash] = entry
+    jobs.setdefault(incar_hash, {}).setdefault(potcar_hash, {})[structure_id] = entry
     write_completed_registry(nepflow_root, registry)
 
 
@@ -240,7 +235,10 @@ def parse_virial_from_outcar(outcar_path: Path, volume: float) -> np.ndarray | N
             return None
         values = [float(matches[-1].group(index)) for index in range(1, 10)]
         stress = np.asarray(values, dtype=float).reshape(3, 3)
-        return -stress * float(volume) / 1602.17663
+        return virial_from_stress(
+            stress_kbar_to_ev_per_angstrom3(stress),
+            float(volume),
+        )
     except (OSError, TypeError, ValueError):
         return None
 

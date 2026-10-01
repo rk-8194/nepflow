@@ -1,6 +1,5 @@
 """NEP model training stage — prepare datasets and submit training jobs."""
 
-import hashlib
 import json
 import logging
 import shutil
@@ -22,6 +21,8 @@ from common.model_manifest import (
     read_model_run_manifest,
     update_model_run_status,
 )
+from nepflow.domain.datasets import DatasetIdentity
+from nepflow.domain.identities import canonical_json_bytes, sha256_bytes
 from .prepare import prepare_dataset
 from .submit import submit_training_job
 from .launcher import run_launcher, read_train_status, write_train_status
@@ -94,10 +95,7 @@ class NepHyperparameters:
         }
 
     def identity_hash(self) -> str:
-        payload = json.dumps(
-            self.canonical_dict(), sort_keys=True, separators=(",", ":")
-        ).encode("utf-8")
-        return hashlib.sha256(payload).hexdigest()
+        return sha256_bytes(canonical_json_bytes(self.canonical_dict()))
 
 
 class TrainNepStage(Stage):
@@ -767,13 +765,7 @@ lambda_shear 1
             "records": canonical_records,
         }
 
-        content_bytes = json.dumps(
-            identity_payload,
-            sort_keys=True,
-            separators=(",", ":"),
-            allow_nan=False,
-        ).encode("utf-8")
-        dataset_id = f"dataset_{hashlib.sha256(content_bytes).hexdigest()}"
+        dataset_id = DatasetIdentity.from_identity_payload(identity_payload).dataset_id
 
         train_reasons = dict(train_report["rejected_reason_counts"])
         test_reasons = dict(test_report["rejected_reason_counts"])

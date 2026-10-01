@@ -2,8 +2,11 @@
 
 from pathlib import Path
 from abc import ABC, abstractmethod
-from configparser import ConfigParser
 import logging
+
+from configparser import ConfigParser
+
+from nepflow.config.loader import find_config_path, load_legacy_config
 
 logger = logging.getLogger(__name__)
 
@@ -29,7 +32,7 @@ class Stage(ABC):
         
         Args:
             project_name: Name of the project
-            config_file: Path to project config file (YAML/TOML)
+            config_file: Legacy path hint; the shared boundary resolves project.config
             state_file: Path to project state database
             project_dir: Base directory for project outputs
             debug: Enable debug mode
@@ -47,24 +50,17 @@ class Stage(ABC):
         """Execute this stage."""
 
     def _find_config_file(self) -> Path:
-        """Resolve the project config file using the shared stage search order."""
-        candidates = [
-            self.project_dir / "config" / "project.config",
-            self.config_file,
-            self.project_dir / "config" / f"{self.project_name}.ini",
-        ]
-        for candidate in candidates:
-            if candidate.exists():
-                return candidate
-        tried = "\n".join(f"  - {candidate}" for candidate in candidates)
-        raise FileNotFoundError(f"Config file not found. Tried:\n{tried}")
+        """Resolve the one supported project configuration path."""
+        return find_config_path(self.project_dir, explicit_path=self.config_file)
 
     def _load_config(self) -> ConfigParser:
-        """Load and return the project config using the shared resolution logic."""
+        """Load the typed config through the temporary legacy stage adapter."""
         config_path = self._find_config_file()
-        config = ConfigParser()
-        config.read(config_path)
-        return config
+        return load_legacy_config(
+            config_path,
+            project_name=self.project_name,
+            require_scientific_fields=False,
+        )
     
     @property
     def stage_name(self) -> str:

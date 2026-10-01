@@ -1,7 +1,6 @@
 """Prepare sub-stage: parse OUTCAR files and write XYZ datasets."""
 
 import json
-from configparser import ConfigParser
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Generator, List
@@ -11,13 +10,25 @@ from ase.io import read as ase_read
 
 import numpy as np
 
+from nepflow.config.loader import load_legacy_config
+from nepflow.domain.identities import (
+    DftCalculationIdentity,
+    calculate_structure_id,
+    normalise_dft_calculation_identity,
+)
+from nepflow.domain.units import (
+    ENERGY_UNIT_EV,
+    FORCE_UNIT_EV_PER_ANGSTROM,
+    VIRIAL_CONVENTION_POSITIVE_COMPRESSION,
+    VIRIAL_UNIT_EV,
+)
+
 from ..run_vasp._common import (
     get_nepflow_root,
     get_registry_entry,
     file_sha256,
     hash_incar_text,
     hash_potcar_bytes,
-    hash_structure,
     outcar_is_complete,
     parse_virial_from_outcar,
     read_completed_registry,
@@ -45,10 +56,10 @@ class VaspParseResult:
     lattice_angstrom: np.ndarray | None
     species: tuple[str, ...]
     pbc: tuple[bool, ...]
-    energy_unit: str = "eV"
-    force_unit: str = "eV/Angstrom"
-    virial_unit: str = "eV"
-    virial_convention: str = "positive_compression"
+    energy_unit: str = ENERGY_UNIT_EV
+    force_unit: str = FORCE_UNIT_EV_PER_ANGSTROM
+    virial_unit: str = VIRIAL_UNIT_EV
+    virial_convention: str = VIRIAL_CONVENTION_POSITIVE_COMPRESSION
 
     def __post_init__(self) -> None:
         for field_name in (
@@ -285,14 +296,11 @@ def _build_vasp_input_context(project_dir: Path) -> dict | None:
     if not incar_template.exists():
         return None
 
-    config = ConfigParser()
-    for candidate in (
+    config = load_legacy_config(
         project_dir / "config" / "project.config",
-        project_dir / "config" / f"{project_dir.name.removeprefix('project_')}.ini",
-    ):
-        if candidate.exists():
-            config.read(candidate)
-            break
+        project_name=project_dir.name.removeprefix("project_"),
+        require_scientific_fields=False,
+    )
 
     incar_text = inject_incar_defaults(
         incar_template.read_text(encoding="utf-8"),
@@ -319,7 +327,7 @@ def _resolve_outcar_for_structure(
 ) -> ResolvedVaspOutput | None:
     """Resolve the completed OUTCAR for one selected structure by input hashes."""
     identity = _identity_for_structure(atoms, input_context)
-    structure_hash = identity["structure_hash"]
+    structure_id = identity["structure_id"]
     incar_hash = identity["incar_hash"]
     potcar_hash = identity["potcar_hash"]
 
@@ -342,7 +350,7 @@ def _resolve_outcar_for_structure(
         input_context["registry"],
         incar_hash,
         potcar_hash,
-        structure_hash,
+        structure_id,
     )
     if entry and entry.get("job_path"):
         outcar = Path(entry["job_path"]) / "OUTCAR"
@@ -358,7 +366,7 @@ def _resolve_outcar_for_structure(
 
 def _identity_for_structure(atoms: Atoms, input_context: dict) -> dict[str, str]:
     """Build the exact VASP calculation identity for a selected structure."""
-    structure_hash = hash_structure(atoms)
+    structure_id = calculate_structure_id(atoms)
     potcar_data = input_context["potcar_data"]
     struct_elements = sorted(set(atoms.get_chemical_symbols()))
     missing = [elem for elem in struct_elements if elem not in potcar_data]
@@ -368,9 +376,14 @@ def _identity_for_structure(atoms: Atoms, input_context: dict) -> dict[str, str]
         b"".join(potcar_data[elem] for elem in struct_elements)
     )
     return {
-        "structure_hash": structure_hash,
+        "structure_id": structure_id,
         "incar_hash": input_context["incar_hash"],
         "potcar_hash": potcar_hash,
+        "calculation_id": DftCalculationIdentity(
+            structure_id=structure_id,
+            incar_hash=input_context["incar_hash"],
+            potcar_hash=potcar_hash,
+        ).calculation_id,
     }
 
 
@@ -416,7 +429,9 @@ def _read_identity(struct_dir: Path) -> dict:
     if not isinstance(data, dict):
         raise ValueError(f"VASP identity must contain a JSON object: {identity_path}")
 
-    for key in ("structure_hash", "incar_hash", "potcar_hash"):
+    data = normalise_dft_calculation_identity(data)
+
+    for key in ("structure_id", "incar_hash", "potcar_hash", "calculation_id"):
         value = data.get(key)
         if not isinstance(value, str) or not value.strip():
             raise ValueError(
@@ -452,9 +467,15 @@ def _parse_outcar_result(
     identity_evidence: ResolvedVaspOutput | None = None,
 ) -> VaspParseResult:
     """Parse one OUTCAR into an immutable accepted/rejected result."""
-    structure_id = hash_structure(ase_atoms)
-    identity = calculation_identity or {"structure_hash": structure_id}
-    identity_items = tuple(sorted((str(key), str(value)) for key, value in identity.items()))
+    structure_id = calculate_structure_id(ase_atoms)
+    identity_items_source = dict(calculation_identity or {"structure_id": structure_id})
+    comparison_identity = normalise_dft_calculation_identity(identity_items_source)
+    identity_items = tuple(
+        sorted((str(key), str(value)) for key, value in identity_items_source.items())
+    )
+    comparison_items = tuple(
+        sorted((str(key), str(value)) for key, value in comparison_identity.items())
+    )
     source_outcar = str(outcar_path.resolve())
     source_hash = file_sha256(outcar_path)
 
@@ -482,12 +503,12 @@ def _parse_outcar_result(
                 return rejected("missing_calculation_identity")
             if any(
                 source_identity.get(key) != value
-                for key, value in calculation_identity.items()
+                for key, value in comparison_identity.items()
             ):
                 return rejected("incompatible_calculation_identity")
         elif (
             identity_evidence.outcar_path.resolve() != outcar_path.resolve()
-            or identity_evidence.calculation_identity != identity_items
+            or identity_evidence.calculation_identity != comparison_items
         ):
             return rejected("incompatible_calculation_identity")
 

@@ -8,6 +8,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from nepflow.domain.identities import ModelRunIdentity
+
 
 MODEL_RUN_MANIFEST_FILENAME = "model_run_manifest.json"
 MODEL_RUN_MANIFEST_SCHEMA = "nepflow.model_run_manifest.v1"
@@ -64,15 +66,11 @@ def compute_model_run_id(
     hyperparameters_hash: str,
 ) -> str:
     """Compute the stable scientific identity for one effective NEP run."""
-    identity_payload = {
-        "schema_version": MODEL_RUN_IDENTITY_SCHEMA,
-        "dataset_id": dataset_id,
-        "nep_in_sha256": nep_in_sha256,
-        "hyperparameters_hash": hyperparameters_hash,
-    }
-    return "model_run_" + hashlib.sha256(
-        json.dumps(identity_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    ).hexdigest()
+    return ModelRunIdentity.from_inputs(
+        dataset_id=dataset_id,
+        nep_in_sha256=nep_in_sha256,
+        hyperparameters_hash=hyperparameters_hash,
+    ).model_run_id
 
 
 def create_model_run_manifest(

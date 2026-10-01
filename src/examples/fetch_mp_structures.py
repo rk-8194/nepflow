@@ -8,12 +8,12 @@ parameters for elements and crystal structures specified in project.config.
 import sys
 import logging
 from pathlib import Path
-from configparser import ConfigParser
 
 # Add src to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from modules.generate.generators.materials_project import get_materials_project_fetcher
+from nepflow.config.loader import load_config
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -28,19 +28,20 @@ def main():
         logger.error(f"Config file not found: {config_path}")
         return
 
-    config = ConfigParser()
-    config.read(config_path)
+    config = load_config(config_path)
 
     # Get generation parameters
-    elements = [e.strip() for e in config.get("generation", "elements").split(",")]
-    structures = [s.strip() for s in config.get("generation", "crystal_structures").split(",")]
+    elements = list(config.composition.elements)
+    structures = list(config.generation.crystal_structures)
 
     logger.info(f"Elements: {elements}")
     logger.info(f"Structures: {structures}")
 
     # Create fetcher
     try:
-        fetcher = get_materials_project_fetcher(dict(config))
+        fetcher = get_materials_project_fetcher(
+            {"materialsproject": {"api_key": config.materials_project.api_key}}
+        )
     except ValueError as e:
         logger.error(f"Failed to initialize fetcher: {e}")
         logger.info("Please set MP_API_KEY environment variable or add api_key to project.config")

@@ -109,7 +109,7 @@ CONFIG_PROMPTS: tuple[ConfigPrompt, ...] = (
         required=True,
     ),
     ConfigPrompt(
-        key="gasElements",
+        key="gas_elements",
         label="Gas elements",
         message="Enter gas-phase elements, comma-separated",
         normalize=_normalize_optional_elements,
@@ -222,7 +222,10 @@ class InitStage(Stage):
         for index, prompt in enumerate(prompts, start=1):
             env_value = os.environ.get(prompt.env_var) if prompt.env_var else None
             if env_value is not None and env_value != "":
-                values[prompt.key] = prompt.normalize(env_value)
+                # Environment credentials are runtime inputs, never project
+                # configuration. The Materials Project client will read
+                # MP_API_KEY when it is needed.
+                values[prompt.key] = "" if prompt.key == "materialsproject_api_key" else prompt.normalize(env_value)
                 logger.debug("Using %s from environment variable %s", prompt.key, prompt.env_var)
                 continue
 
@@ -269,6 +272,11 @@ class InitStage(Stage):
 
     def _render_default_config(self, prompt_values: dict[str, str]) -> str:
         """Render the default project config using collected prompt values."""
+        render_values = dict(prompt_values)
+        render_values["gas_elements"] = prompt_values.get(
+            "gas_elements", prompt_values.get("gasElements", "")
+        )
+        render_values.setdefault("materialsproject_api_key", "")
         return """# Project Configuration File
 # Project: {project_name}
 
@@ -276,6 +284,7 @@ class InitStage(Stage):
 name={project_name}
 description=NEPFlow project for atomic structure generation and validation
 status=initialized
+schema_version=1
 # Random seed for reproducibility (used across all stages)
 random_seed=42
 
@@ -295,7 +304,7 @@ api_key={materialsproject_api_key}
 # Elements to include (comma-separated)
 elements={elements}
 # Gas elements to include (comma-separated, optional)
-gasElements={gasElements}
+gas_elements={gas_elements}
 
 # Composition step size (atomic fraction)
 # Controls granularity of the simplex grid
@@ -494,4 +503,4 @@ nep_command=mpirun --bind-to none $HOME/src/GPUMD/src/nep
 
 # GPUMD validation command or executable path
 gpumd_command=mpirun -np 1 --bind-to none $HOME/src/GPUMD/src/gpumd
-""".format(project_name=self.project_name, **prompt_values)
+""".format(project_name=self.project_name, **render_values)

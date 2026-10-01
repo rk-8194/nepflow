@@ -181,7 +181,10 @@ def run_launcher(
                         write_status(
                             struct_dir, status="completed",
                             retry_level=status_data.get("retry_level", 0),
-                            structure_hash=status_data.get("structure_hash"),
+                            structure_id=status_data.get(
+                                "structure_id", status_data.get("structure_hash")
+                            ),
+                            calculation_id=status_data.get("calculation_id"),
                             incar_hash=status_data.get("incar_hash"),
                             potcar_hash=status_data.get("potcar_hash"),
                         )
@@ -696,7 +699,8 @@ def _register_completed_job(
         "dataset": dataset,
         "selected_index": selected_index,
         "completed_at": datetime.now().isoformat(),
-        "structure_hash": identity["structure_hash"],
+        "structure_id": identity["structure_id"],
+        "calculation_id": identity["calculation_id"],
         "incar_hash": identity["incar_hash"],
         "potcar_hash": identity["potcar_hash"],
         "outcar_hash": file_sha256(struct_dir / "OUTCAR"),
@@ -706,7 +710,7 @@ def _register_completed_job(
         nepflow_root,
         identity["incar_hash"],
         identity["potcar_hash"],
-        identity["structure_hash"],
+        identity["structure_id"],
         entry,
     )
     logger.debug("  Registered completed VASP job: %s", struct_dir)

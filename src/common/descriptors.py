@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 import os
@@ -13,12 +12,17 @@ from pathlib import Path
 import numpy as np
 from NepTrainKit.core.calculator import NepCalculator
 
-from common.structure_identity import hash_structure
+from nepflow.domain.identities import (
+    DESCRIPTOR_CACHE_SCHEMA,
+    DescriptorCacheIdentity,
+    calculate_structure_id,
+    sha256_bytes,
+)
 
 logger = logging.getLogger("nepflow.common.descriptors")
 
 
-DESCRIPTOR_CACHE_SCHEMA_VERSION = "descriptor-cache-v1"
+DESCRIPTOR_CACHE_SCHEMA_VERSION = DESCRIPTOR_CACHE_SCHEMA
 
 
 def compute_structure_descriptors(
@@ -69,11 +73,11 @@ def _structure_identity(structure: object) -> str:
                     return identity
 
     try:
-        return hash_structure(structure)
+        return calculate_structure_id(structure)
     except (AttributeError, TypeError, ValueError) as exc:
         raise ValueError(
             "Structure has no stable identity; provide structure_id, "
-            "structure_hash, or a real ASE structure"
+            "structure_id, structure_hash, or a real ASE structure"
         ) from exc
 
 
@@ -88,7 +92,7 @@ def _model_identity(model_path: Path, model_filename: str) -> dict[str, str]:
         )
     return {
         "filename": model_filename,
-        "sha256": hashlib.sha256(model_path.read_bytes()).hexdigest(),
+        "sha256": sha256_bytes(model_path.read_bytes()),
     }
 
 
@@ -99,13 +103,13 @@ def _descriptor_manifest(
     descriptors: np.ndarray,
 ) -> dict:
     """Build the deterministic manifest for one descriptor array."""
-    return {
-        "schema_version": DESCRIPTOR_CACHE_SCHEMA_VERSION,
-        "structure_ids": structure_ids,
-        "model": model,
-        "settings": {"mean_descriptor": bool(mean_descriptor)},
-        "descriptor_shape": list(descriptors.shape),
-    }
+    return DescriptorCacheIdentity(
+        structure_ids=tuple(structure_ids),
+        model_filename=model["filename"],
+        model_sha256=model["sha256"],
+        mean_descriptor=bool(mean_descriptor),
+        descriptor_shape=tuple(int(value) for value in descriptors.shape),
+    ).to_manifest()
 
 
 def _load_valid_cached_descriptors(

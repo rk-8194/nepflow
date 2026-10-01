@@ -23,7 +23,7 @@ from common.model_manifest import (  # noqa: E402
     update_model_run_status,
     validate_model_run_manifest,
 )
-from common.structure_identity import hash_structure  # noqa: E402
+from nepflow.domain.identities import calculate_structure_id  # noqa: E402
 from modules.train_nep import prepare as train_prepare  # noqa: E402
 from modules.train_nep.train_nep import TrainNepStage  # noqa: E402
 from modules.validate.analyze import generate_comparison_csv  # noqa: E402
@@ -90,7 +90,7 @@ def test_deterministic_dft_to_validation_identity_trace() -> None:
         shutil.copy2(OUTCAR_FIXTURE, outcar_path)
         selected = read_dft_fixture_as_vasp_result()
         calculation_identity = {
-            "structure_hash": hash_structure(selected),
+            "structure_hash": calculate_structure_id(selected),
             "incar_hash": "incar-hash-v1",
             "potcar_hash": "potcar-hash-v1",
         }

@@ -16,6 +16,7 @@ from ase.calculators.singlepoint import SinglePointCalculator  # noqa: E402
 from modules.run_vasp import _common as common
 from modules.train_nep import prepare as train_prepare
 from modules.train_nep import train_nep as train_stage_module
+from nepflow.domain.identities import calculate_structure_id
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -73,6 +74,13 @@ class TrainNepPrepareRegistryTests(unittest.TestCase):
         (project_dir / "vasp" / "jobs" / "train").mkdir(parents=True, exist_ok=True)
         (project_dir / "config" / "vasp" / "INCAR").write_text("ENCUT = 520\n", encoding="utf-8")
         (project_dir / "config" / "vasp" / "POTCAR_Si").write_bytes(b"Si-potcar-v1")
+        (project_dir / "config" / "project.config").write_text(
+            "[project]\nschema_version=1\n\n"
+            "[composition]\nelements=Si\n\n"
+            "[generation]\ncrystal_structures=bcc\n\n"
+            "[hpc]\nvasp_command=vasp_std\n",
+            encoding="utf-8",
+        )
         return project_dir
 
     def write_identity_job(
@@ -85,7 +93,7 @@ class TrainNepPrepareRegistryTests(unittest.TestCase):
         struct_dir = project_dir / "vasp" / "jobs" / "train" / struct_name
         struct_dir.mkdir(parents=True, exist_ok=True)
         identity = {
-            "structure_hash": common.hash_structure(atoms),
+            "structure_hash": calculate_structure_id(atoms),
             "incar_hash": current_incar_hash(),
             "potcar_hash": common.hash_potcar_bytes(b"Si-potcar-v1"),
         }
@@ -326,7 +334,7 @@ class TrainNepPrepareRegistryTests(unittest.TestCase):
                 root,
                 current_incar_hash(),
                 common.hash_potcar_bytes(b"Si-potcar-v1"),
-                common.hash_structure(atoms),
+                calculate_structure_id(atoms),
                 {"job_path": str(old_job.resolve())},
             )
 
@@ -348,7 +356,7 @@ class TrainNepPrepareRegistryTests(unittest.TestCase):
             )
             selected = self.fixture_atoms()
             identity = {
-                "structure_hash": common.hash_structure(selected),
+                "structure_hash": calculate_structure_id(selected),
                 "incar_hash": current_incar_hash(),
                 "potcar_hash": common.hash_potcar_bytes(b"Si-potcar-v1"),
             }
@@ -381,7 +389,7 @@ class TrainNepPrepareRegistryTests(unittest.TestCase):
                 root,
                 current_incar_hash(),
                 common.hash_potcar_bytes(b"Si-potcar-v1"),
-                common.hash_structure(registered_for),
+                calculate_structure_id(registered_for),
                 {"job_path": str(old_job.resolve())},
             )
 
@@ -416,7 +424,7 @@ class TrainNepPrepareRegistryTests(unittest.TestCase):
                 root,
                 current_incar_hash(),
                 common.hash_potcar_bytes(b"Si-potcar-v1"),
-                common.hash_structure(atoms),
+                calculate_structure_id(atoms),
                 {"job_path": str(old_job.resolve())},
             )
 
@@ -491,6 +499,13 @@ class TrainNepMetadataTests(unittest.TestCase):
         (project_dir / "vasp" / "jobs" / "train").mkdir(parents=True, exist_ok=True)
         (project_dir / "config" / "vasp" / "INCAR").write_text("ENCUT = 520\n", encoding="utf-8")
         (project_dir / "config" / "vasp" / "POTCAR_Si").write_bytes(b"Si-potcar-v1")
+        (project_dir / "config" / "project.config").write_text(
+            "[project]\nschema_version=1\n\n"
+            "[composition]\nelements=Si\n\n"
+            "[generation]\ncrystal_structures=bcc\n\n"
+            "[hpc]\nvasp_command=vasp_std\n",
+            encoding="utf-8",
+        )
         return project_dir
 
     def run_stage_with_extraction_counts(

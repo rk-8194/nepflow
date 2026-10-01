@@ -20,21 +20,23 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import re
 import sys
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
+
+ROOT = Path(__file__).resolve().parents[1]
+SRC = ROOT / "src"
+if str(SRC) not in sys.path:
+    sys.path.insert(0, str(SRC))
+
+from nepflow.domain.identities import DftCalculationIdentity, calculate_structure_id, sha256_bytes
 
 VASP_COMPLETION_MARKERS = ["General timing", "Voluntary context switches"]
 VASP_REGISTRY_VERSION = 1
-STRUCTURE_HASH_VERSION = "structure-v1"
-
-
-def sha256_bytes(data: bytes) -> str:
-    return hashlib.sha256(data).hexdigest()
 
 
 def file_sha256(path: Path) -> str | None:
@@ -79,34 +81,15 @@ def hash_incar_file(incar_path: Path) -> str:
     )
 
 
-def canonical_poscar_text(poscar: dict[str, Any]) -> str:
-    symbols = poscar["symbols"]
-    unique_elements = sorted(set(symbols))
-
-    sorted_indices = []
-    counts = []
-    for elem in unique_elements:
-        indices = [i for i, symbol in enumerate(symbols) if symbol == elem]
-        sorted_indices.extend(indices)
-        counts.append(len(indices))
-
-    cell = poscar["cell"]
-    frac_positions = poscar["scaled_positions"]
-    lines = [STRUCTURE_HASH_VERSION]
-    lines.append("pbc 1 1 1")
-    lines.append("cell")
-    for row in cell:
-        lines.append(_format_vector(row))
-    lines.append("atoms")
-    for idx in sorted_indices:
-        p = frac_positions[idx]
-        lines.append(f"{symbols[idx]} {_format_vector(p)}")
-    return "\n".join(lines) + "\n"
-
-
-def hash_poscar_structure(poscar_path: Path) -> str:
+def calculate_poscar_structure_id(poscar_path: Path) -> str:
     poscar = parse_poscar(poscar_path)
-    return sha256_bytes(canonical_poscar_text(poscar).encode("utf-8"))
+    structure = SimpleNamespace(
+        get_chemical_symbols=lambda: poscar["symbols"],
+        get_scaled_positions=lambda: poscar["scaled_positions"],
+        get_cell=lambda: poscar["cell"],
+        pbc=(True, True, True),
+    )
+    return calculate_structure_id(structure)
 
 
 def parse_poscar(poscar_path: Path) -> dict[str, Any]:
@@ -180,10 +163,6 @@ def _is_number(value: str) -> bool:
         return False
 
 
-def _format_vector(values: list[float]) -> str:
-    return " ".join(f"{float(values[i]):.14f}" for i in range(3))
-
-
 def _row_matmul(row: list[float], matrix: list[list[float]]) -> list[float]:
     return [
         row[0] * matrix[0][col] + row[1] * matrix[1][col] + row[2] * matrix[2][col]
@@ -229,19 +208,19 @@ def write_registry(registry_path: Path, registry: dict) -> None:
     tmp_path.replace(registry_path)
 
 
-def registry_contains(registry: dict, incar_hash: str, potcar_hash: str, structure_hash: str) -> bool:
+def registry_contains(registry: dict, incar_hash: str, potcar_hash: str, structure_id: str) -> bool:
     return (
         registry.get("jobs", {})
         .get(incar_hash, {})
         .get(potcar_hash, {})
-        .get(structure_hash)
+        .get(structure_id)
         is not None
     )
 
 
-def upsert_registry(registry: dict, incar_hash: str, potcar_hash: str, structure_hash: str, entry: dict) -> None:
+def upsert_registry(registry: dict, incar_hash: str, potcar_hash: str, structure_id: str, entry: dict) -> None:
     jobs = registry.setdefault("jobs", {})
-    jobs.setdefault(incar_hash, {}).setdefault(potcar_hash, {})[structure_hash] = entry
+    jobs.setdefault(incar_hash, {}).setdefault(potcar_hash, {})[structure_id] = entry
 
 
 def parse_job_context(struct_dir: Path, projects_dir: Path) -> dict:
@@ -280,7 +259,7 @@ def build_entry(
         return None
 
     try:
-        structure_hash = hash_poscar_structure(poscar)
+        structure_id = calculate_poscar_structure_id(poscar)
         incar_hash = hash_incar_file(incar)
         potcar_hash = sha256_bytes(potcar.read_bytes())
     except Exception as e:
@@ -296,13 +275,18 @@ def build_entry(
         "selected_index": context["selected_index"],
         "completed_at": datetime.now().isoformat(),
         "backfilled_at": datetime.now().isoformat(),
-        "structure_hash": structure_hash,
+        "structure_id": structure_id,
+        "calculation_id": DftCalculationIdentity(
+            structure_id=structure_id,
+            incar_hash=incar_hash,
+            potcar_hash=potcar_hash,
+        ).calculation_id,
         "incar_hash": incar_hash,
         "potcar_hash": potcar_hash,
         "outcar_hash": file_sha256(outcar),
         "vasprun_hash": file_sha256(struct_dir / "vasprun.xml"),
     }
-    return incar_hash, potcar_hash, structure_hash, entry
+    return incar_hash, potcar_hash, structure_id, entry
 
 
 def write_identity(struct_dir: Path, entry: dict, dry_run: bool) -> bool:
@@ -314,7 +298,8 @@ def write_identity(struct_dir: Path, entry: dict, dry_run: bool) -> bool:
         "dataset": entry.get("dataset", ""),
         "selected_index": entry.get("selected_index"),
         "source_xyz": "",
-        "structure_hash": entry["structure_hash"],
+        "structure_id": entry["structure_id"],
+        "calculation_id": entry["calculation_id"],
         "incar_hash": entry["incar_hash"],
         "potcar_hash": entry["potcar_hash"],
         "backfilled": True,
@@ -374,12 +359,12 @@ def main() -> None:
             continue
 
         completed += 1
-        incar_hash, potcar_hash, structure_hash, entry = built
+        incar_hash, potcar_hash, structure_id, entry = built
         identity_written = write_identity(struct_dir, entry, args.dry_run)
         if identity_written:
             identities += 1
 
-        if registry_contains(registry, incar_hash, potcar_hash, structure_hash):
+        if registry_contains(registry, incar_hash, potcar_hash, structure_id):
             already += 1
             print(f"EXISTS {struct_dir}")
             continue
@@ -387,7 +372,7 @@ def main() -> None:
         added += 1
         print(f"ADD    {struct_dir}")
         if not args.dry_run:
-            upsert_registry(registry, incar_hash, potcar_hash, structure_hash, entry)
+            upsert_registry(registry, incar_hash, potcar_hash, structure_id, entry)
 
     if not args.dry_run:
         write_registry(registry_path, registry)

@@ -10,7 +10,7 @@ pytest.importorskip("ase")
 pytest.importorskip("pymatgen")
 from ase import Atoms  # noqa: E402
 
-from common.structure_identity import hash_structure  # noqa: E402
+from nepflow.domain.identities import calculate_structure_id  # noqa: E402
 from modules.generate import generate as generate_module
 from modules.generate.generators.materials_project import MaterialsProjectFetcher  # noqa: E402
 
@@ -343,7 +343,7 @@ class GenerateStageTests(unittest.TestCase):
         first.info["source"] = "random-solid-solution"
         second.info["source"] = "materials-project"
 
-        self.assertEqual(hash_structure(first), hash_structure(second))
+        self.assertEqual(calculate_structure_id(first), calculate_structure_id(second))
 
     def test_materials_project_query_exception_raises(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -394,7 +394,7 @@ class GenerateStageTests(unittest.TestCase):
             self.assertIsNotNone(bases)
             assert bases is not None
             self.assertEqual(len(bases), 2)
-            self.assertEqual(len({hash_structure(base) for base in bases}), 2)
+            self.assertEqual(len({calculate_structure_id(base) for base in bases}), 2)
             self.assertCountEqual(
                 bases[0].info["provenance_paths"],
                 ["path-a", "path-b"],
