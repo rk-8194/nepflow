@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-import hashlib
-import json
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from nepflow.domain.identities import ModelRunIdentity
+from nepflow.errors import ArtifactError
+from nepflow.io.hashing import sha256_file
+from nepflow.io.json import read_json_object, write_json
 
 
 MODEL_RUN_MANIFEST_FILENAME = "model_run_manifest.json"
@@ -16,47 +17,26 @@ MODEL_RUN_MANIFEST_SCHEMA = "nepflow.model_run_manifest.v1"
 MODEL_RUN_IDENTITY_SCHEMA = "nepflow.model_run_identity.v1"
 
 
-class ModelManifestError(ValueError):
+class ModelManifestError(ArtifactError):
     """Raised when a model-run manifest is missing or inconsistent."""
-
-
-def sha256_file(path: Path) -> str:
-    """Return the SHA-256 digest of one file."""
-    digest = hashlib.sha256()
-    try:
-        with path.open("rb") as handle:
-            for block in iter(lambda: handle.read(1024 * 1024), b""):
-                digest.update(block)
-    except OSError as exc:
-        raise ModelManifestError(f"Cannot hash manifest artifact {path}: {exc}") from exc
-    return digest.hexdigest()
 
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _write_json(path: Path, value: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-
-
 def read_model_run_manifest(path: Path) -> dict[str, Any]:
     """Read one manifest and reject malformed JSON or non-object content."""
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
+        value = read_json_object(path, error_type=ModelManifestError)
     except FileNotFoundError as exc:
         raise FileNotFoundError(f"Model-run manifest not found: {path}") from exc
-    except (OSError, json.JSONDecodeError) as exc:
-        raise ModelManifestError(f"Could not read model-run manifest {path}: {exc}") from exc
-    if not isinstance(value, dict):
-        raise ModelManifestError(f"Model-run manifest must be an object: {path}")
     return value
 
 
 def write_model_run_manifest(path: Path, manifest: dict[str, Any]) -> None:
-    """Write one complete manifest atomically enough for local workflow use."""
-    _write_json(path, manifest)
+    """Write one complete model-run manifest through the atomic JSON layer."""
+    write_json(path, manifest)
 
 
 def compute_model_run_id(
@@ -89,7 +69,11 @@ def create_model_run_manifest(
     if not dataset_id:
         raise ModelManifestError("Cannot create a model run without dataset_id")
 
-    nep_in_hash = sha256_file(nep_in_path)
+    nep_in_hash = sha256_file(
+        nep_in_path,
+        required=True,
+        error_type=ModelManifestError,
+    )
     created_at = _now()
     model_run_id = compute_model_run_id(
         dataset_id=dataset_id,
@@ -149,7 +133,11 @@ def update_model_run_status(
             raise ModelManifestError(
                 f"Completed model run has no non-empty potential artifact: {artifact_path}"
             )
-        artifact_hash = sha256_file(artifact_path)
+        artifact_hash = sha256_file(
+            artifact_path,
+            required=True,
+            error_type=ModelManifestError,
+        )
         manifest["potential_artifact_sha256"] = artifact_hash
         evidence = {
             "status": "completed",
@@ -161,7 +149,11 @@ def update_model_run_status(
         evidence = {
             "status": status,
             "artifact_exists": artifact_path.is_file(),
-            "artifact_sha256": sha256_file(artifact_path) if artifact_path.is_file() else None,
+            "artifact_sha256": sha256_file(
+                artifact_path,
+                required=False,
+                error_type=ModelManifestError,
+            ),
         }
         if error:
             evidence["error"] = error
@@ -227,10 +219,7 @@ def validate_model_run_manifest(
     metadata_path = dataset_path / ".dataset"
     if not dataset_path.is_dir() or not metadata_path.is_file():
         raise ModelManifestError(f"Manifest dataset artifact is missing: {dataset_path}")
-    try:
-        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise ModelManifestError(f"Could not read dataset manifest {metadata_path}: {exc}") from exc
+    metadata = read_json_object(metadata_path, error_type=ModelManifestError)
     if metadata.get("dataset_id") != manifest["dataset_id"]:
         raise ModelManifestError(
             f"Dataset identity mismatch for {dataset_path}: "
@@ -245,7 +234,11 @@ def validate_model_run_manifest(
         expected_hash = manifest[hash_key]
         if not artifact.is_file():
             raise ModelManifestError(f"Manifest artifact is missing: {artifact}")
-        if not expected_hash or sha256_file(artifact) != expected_hash:
+        if not expected_hash or sha256_file(
+            artifact,
+            required=True,
+            error_type=ModelManifestError,
+        ) != expected_hash:
             raise ModelManifestError(f"Manifest hash mismatch for {artifact}")
 
     return manifest

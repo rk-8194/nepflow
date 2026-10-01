@@ -5,7 +5,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from .identities import StructureIdentity, _freeze, _jsonable
+from nepflow.io.json import to_jsonable
+
+from .identities import StructureIdentity, _freeze
 
 
 @dataclass(frozen=True)
@@ -35,12 +37,12 @@ class StructureProvenance:
         return {
             "parent_structure_id": self.parent_structure_id,
             "generator": self.generator,
-            "requested_composition": _jsonable(self.requested_composition),
-            "realised_composition": _jsonable(self.realised_composition),
+            "requested_composition": to_jsonable(self.requested_composition),
+            "realised_composition": to_jsonable(self.realised_composition),
             "source_database_id": self.source_database_id,
             "crystal_structure": self.crystal_structure,
             "perturbation_family": self.perturbation_family,
-            "perturbation_parameters": _jsonable(self.perturbation_parameters),
+            "perturbation_parameters": to_jsonable(self.perturbation_parameters),
             "random_seed": self.random_seed,
             "operation_id": self.operation_id,
             "code_version": self.code_version,
@@ -66,6 +68,6 @@ class GeneratedStructureRecord:
         result = self.identity.to_dict()
         result["provenance"] = self.provenance.to_dict()
         if self.metadata is not None:
-            result["metadata"] = _jsonable(self.metadata)
+            result["metadata"] = to_jsonable(self.metadata)
         return result
 

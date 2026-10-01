@@ -5,11 +5,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Iterable, Mapping
 
+from nepflow.io.hashing import sha256_canonical_json
+from nepflow.io.json import to_jsonable
+
 from .identities import (
     _freeze,
-    _jsonable,
     normalise_dft_calculation_identity,
-    sha256_canonical_json,
 )
 
 
@@ -77,7 +78,7 @@ class DatasetIdentity:
 
     @classmethod
     def from_identity_payload(cls, payload: Mapping[str, Any]) -> "DatasetIdentity":
-        frozen_payload = _jsonable(dict(payload))
+        frozen_payload = to_jsonable(dict(payload))
         return cls("dataset_" + sha256_canonical_json(frozen_payload), frozen_payload)
 
     @classmethod
@@ -96,7 +97,7 @@ class DatasetIdentity:
             "units": dict(units),
             "virial_convention": virial_convention,
             "records": [
-                _jsonable(
+                to_jsonable(
                     {
                         key: value
                         for key, value in record.items()
@@ -110,7 +111,7 @@ class DatasetIdentity:
         return cls.from_identity_payload(payload)
 
     def to_dict(self) -> dict[str, Any]:
-        return {"dataset_id": self.dataset_id, **_jsonable(self.identity_payload)}
+        return {"dataset_id": self.dataset_id, **to_jsonable(self.identity_payload)}
 
 
 @dataclass(frozen=True)
@@ -137,7 +138,7 @@ class TrainingDatasetManifest:
         result: dict[str, Any] = {
             "dataset_id": self.identity.dataset_id,
             "identity": self.identity.to_dict(),
-            "records": [_jsonable(record) for record in self.records],
+            "records": [to_jsonable(record) for record in self.records],
         }
         for key, value in (
             ("selection_method", self.selection_method),
@@ -147,6 +148,6 @@ class TrainingDatasetManifest:
             ("code_version", self.code_version),
         ):
             if value is not None:
-                result[key] = _jsonable(value)
+                result[key] = to_jsonable(value)
         return result
 

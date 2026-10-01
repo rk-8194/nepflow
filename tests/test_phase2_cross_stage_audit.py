@@ -19,11 +19,11 @@ from ase.calculators.singlepoint import SinglePointCalculator  # noqa: E402
 from common.model_manifest import (  # noqa: E402
     compute_model_run_id,
     create_model_run_manifest,
-    sha256_file,
     update_model_run_status,
     validate_model_run_manifest,
 )
 from nepflow.domain.identities import calculate_structure_id  # noqa: E402
+from nepflow.io.hashing import sha256_file  # noqa: E402
 from modules.train_nep import prepare as train_prepare  # noqa: E402
 from modules.train_nep.train_nep import TrainNepStage  # noqa: E402
 from modules.validate.analyze import generate_comparison_csv  # noqa: E402

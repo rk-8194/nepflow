@@ -1,6 +1,5 @@
 """Launcher sub-stage: submit, monitor, and resubmit NEP training jobs."""
 
-import json
 import logging
 import os
 import re
@@ -8,6 +7,9 @@ import subprocess
 import time
 from configparser import ConfigParser
 from pathlib import Path
+
+from nepflow.errors import StateError
+from nepflow.io.json import read_json, write_json
 
 from ..base import SelfResubmitExit
 from common.model_manifest import ModelManifestError, update_model_run_status
@@ -21,13 +23,7 @@ def read_train_status(project_dir: Path) -> dict:
     status_file = project_dir / "nep" / ".train_nep_status"
     if not status_file.exists():
         return {}
-    try:
-        status = json.loads(status_file.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError) as exc:
-        raise ValueError(f"Could not read training status file: {status_file}") from exc
-    if not isinstance(status, dict):
-        raise ValueError(f"Training status must be a JSON object: {status_file}")
-    return status
+    return read_json(status_file, error_type=StateError, require_object=True)
 
 
 def write_train_status(project_dir: Path, **kwargs) -> None:
@@ -39,8 +35,7 @@ def write_train_status(project_dir: Path, **kwargs) -> None:
     status_data = read_train_status(project_dir)
     status_data.update(kwargs)
     status_data["updated"] = time.time()
-    
-    status_file.write_text(json.dumps(status_data, indent=2))
+    write_json(status_file, status_data)
 
 
 def _get_job_name_from_potential(potential_path: Path) -> str:

@@ -5,7 +5,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Mapping
 
-from .identities import ArtifactIdentity, ModelRunIdentity, ValidationRunIdentity, _freeze, _jsonable
+from nepflow.io.json import to_jsonable
+
+from .identities import ArtifactIdentity, ModelRunIdentity, ValidationRunIdentity, _freeze
 
 
 @dataclass(frozen=True)
@@ -29,7 +31,7 @@ class ModelArtifactMetadata:
         if self.nep_in is not None:
             result["nep_in"] = self.nep_in.to_dict()
         if self.metrics is not None:
-            result["metrics"] = _jsonable(self.metrics)
+            result["metrics"] = to_jsonable(self.metrics)
         if self.started_at is not None:
             result["started_at"] = self.started_at
         if self.completed_at is not None:
@@ -56,7 +58,7 @@ class ModelRunRecord:
         if self.artifact is not None:
             result["artifact"] = self.artifact.to_dict()
         if self.execution_metadata is not None:
-            result["execution_metadata"] = _jsonable(self.execution_metadata)
+            result["execution_metadata"] = to_jsonable(self.execution_metadata)
         return result
 
 
@@ -81,9 +83,9 @@ class ValidationArtifactMetadata:
         if self.trajectory is not None:
             result["trajectory"] = self.trajectory.to_dict()
         if self.metrics is not None:
-            result["metrics"] = _jsonable(self.metrics)
+            result["metrics"] = to_jsonable(self.metrics)
         if self.thresholds is not None:
-            result["thresholds"] = _jsonable(self.thresholds)
+            result["thresholds"] = to_jsonable(self.thresholds)
         if self.passed is not None:
             result["passed"] = self.passed
         return result
@@ -108,6 +110,6 @@ class ValidationRunRecord:
         if self.artifact is not None:
             result["artifact"] = self.artifact.to_dict()
         if self.metadata is not None:
-            result["metadata"] = _jsonable(self.metadata)
+            result["metadata"] = to_jsonable(self.metadata)
         return result
 

@@ -1,6 +1,5 @@
 """Prepare sub-stage: create VASP job folders and shared runner script."""
 
-import json
 import re
 import time
 from configparser import ConfigParser
@@ -13,6 +12,8 @@ from nepflow.domain.identities import (
     calculate_structure_id,
     normalise_dft_calculation_identity,
 )
+from nepflow.errors import StateError
+from nepflow.io.json import read_json, write_json
 
 from ._common import (
     canonical_poscar_text,
@@ -285,14 +286,9 @@ def write_poscar(atoms, path: Path) -> None:
 
 def _read_identity(struct_dir: Path) -> dict:
     identity_path = struct_dir / ".vasp_identity"
-    try:
-        data = json.loads(identity_path.read_text(encoding="utf-8"))
-    except FileNotFoundError:
+    if not identity_path.exists():
         return {}
-    except (json.JSONDecodeError, OSError) as exc:
-        raise ValueError(f"Could not read VASP identity: {identity_path}") from exc
-    if not isinstance(data, dict):
-        raise ValueError(f"VASP identity must contain a JSON object: {identity_path}")
+    data = read_json(identity_path, error_type=StateError, require_object=True)
 
     # Read the Phase 2 spelling as a compatibility boundary, but normalize
     # immediately so all new comparisons use the canonical vocabulary.
@@ -302,17 +298,14 @@ def _read_identity(struct_dir: Path) -> dict:
     for key in required:
         value = data.get(key)
         if not isinstance(value, str) or not value.strip():
-            raise ValueError(
+            raise StateError(
                 f"VASP identity is missing a valid {key}: {identity_path}"
             )
     return data
 
 
 def _write_identity(struct_dir: Path, identity: dict) -> None:
-    (struct_dir / ".vasp_identity").write_text(
-        json.dumps(identity, indent=2, sort_keys=True),
-        encoding="utf-8",
-    )
+    write_json(struct_dir / ".vasp_identity", identity)
 
 
 def _identity_matches(existing: dict, expected: dict) -> bool:

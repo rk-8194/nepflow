@@ -9,7 +9,6 @@ from completed ``OUTCAR`` files, and fits 6x6 elastic stiffness tensors in GPa.
 from __future__ import annotations
 
 import argparse
-import json
 import re
 import sys
 from configparser import ConfigParser
@@ -25,7 +24,18 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from nepflow.domain.identities import calculate_structure_id, sha256_bytes
+from nepflow.domain.identities import calculate_structure_id
+from nepflow.errors import StateError
+from nepflow.io.json import write_json
+from nepflow.io.json import read_json_object
+from modules.run_vasp._common import (
+    get_nepflow_root,
+    hash_incar_text,
+    hash_potcar_bytes,
+    outcar_is_complete,
+    read_completed_registry,
+    read_status,
+)
 
 
 VOIGT_LABELS = ("xx", "yy", "zz", "yz", "xz", "xy")
@@ -33,7 +43,6 @@ DEFAULT_DATASETS = ("train", "test")
 PROGRESS_EVERY_FRAMES = 500
 PREVIEW_LIMIT = 8
 MATCHED_PREVIEW_LIMIT = 5
-VASP_COMPLETION_MARKERS = ("General timing", "Voluntary context switches")
 STRESS_PATTERN = re.compile(
     r"STRESS\s+in cartesian coordinates \(kB\)\n"
     r"\s+([-.\d]+)\s+([-.\d]+)\s+([-.\d]+)\n"
@@ -357,72 +366,6 @@ def build_source_label(metadata: dict) -> str:
     return "unknown"
 
 
-def read_json_dict(path: Path) -> dict:
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return {}
-    return data if isinstance(data, dict) else {}
-
-
-def get_nepflow_root(project_dir: Path) -> Path:
-    if project_dir.name.startswith("project_") and project_dir.parent.name == "projects":
-        return project_dir.parent.parent
-    return project_dir
-
-
-def read_completed_registry(nepflow_root: Path) -> dict:
-    path = nepflow_root / ".vasp_completed_jobs.json"
-    if not path.exists():
-        return {"jobs": {}}
-    return read_json_dict(path) or {"jobs": {}}
-
-
-def strip_resource_incar_params(incar_text: str) -> str:
-    kept = []
-    for line in incar_text.splitlines():
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#"):
-            kept.append(line.rstrip())
-            continue
-        if re.match(r"^(NCORE|KPAR)\s*=", stripped, re.IGNORECASE):
-            continue
-        kept.append(line.rstrip())
-    return "\n".join(kept).rstrip() + "\n"
-
-
-def hash_incar_text(incar_text: str) -> str:
-    return sha256_bytes(strip_resource_incar_params(incar_text).encode("utf-8"))
-
-
-def hash_potcar_bytes(potcar_bytes: bytes) -> str:
-    return sha256_bytes(potcar_bytes)
-
-
-def outcar_is_complete(outcar_path: Path) -> bool:
-    if not outcar_path.exists():
-        return False
-    try:
-        with open(outcar_path, "r", encoding="utf-8", errors="replace") as handle:
-            handle.seek(0, 2)
-            size = handle.tell()
-            handle.seek(max(0, size - 50_000))
-            tail = handle.read()
-        return any(marker in tail for marker in VASP_COMPLETION_MARKERS)
-    except OSError:
-        return False
-
-
-def read_status(struct_dir: Path) -> dict:
-    status_file = struct_dir / ".vasp_status"
-    if status_file.exists():
-        try:
-            return json.loads(status_file.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
-            pass
-    return {"status": "pending", "retry_level": 0}
-
-
 def inject_incar_defaults(incar_text: str, config: ConfigParser) -> str:
     lines = incar_text.rstrip("\n")
     has_kspacing = bool(re.search(r"^\s*KSPACING\s*=", incar_text, re.MULTILINE | re.IGNORECASE))
@@ -553,7 +496,11 @@ def resolve_registry_outcar(identity: tuple[str, str, str], input_context: dict)
 
 def resolve_local_job(project_dir: Path, dataset: str, structure_index: int) -> LocalJobRecord:
     struct_dir = project_dir / "vasp" / "jobs" / dataset / f"struct_{structure_index:04d}"
-    identity = read_json_dict(struct_dir / ".vasp_identity")
+    identity = read_json_object(
+        struct_dir / ".vasp_identity",
+        default={},
+        error_type=StateError,
+    )
     status = read_status(struct_dir)
     reused_from_raw = status.get("reused_from")
     reused_from = Path(reused_from_raw) if reused_from_raw else None
@@ -1310,7 +1257,7 @@ def main() -> int:
 
     if args.output_json is not None:
         args.output_json.parent.mkdir(parents=True, exist_ok=True)
-        args.output_json.write_text(json.dumps(results, indent=2), encoding="utf-8")
+        write_json(args.output_json, results)
 
     return 0
 

@@ -5,7 +5,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from .identities import ArtifactIdentity, DftCalculationIdentity, _freeze, _jsonable
+from nepflow.io.json import to_jsonable
+
+from .identities import ArtifactIdentity, DftCalculationIdentity, _freeze
 
 
 @dataclass(frozen=True)
@@ -59,6 +61,6 @@ class DftResultArtifact:
         if self.vasprun is not None:
             result["vasprun"] = self.vasprun.to_dict()
         if self.metadata is not None:
-            result["metadata"] = _jsonable(self.metadata)
+            result["metadata"] = to_jsonable(self.metadata)
         return result
 

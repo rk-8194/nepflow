@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 import tempfile
@@ -12,12 +11,14 @@ from pathlib import Path
 import numpy as np
 from NepTrainKit.core.calculator import NepCalculator
 
+from nepflow.errors import StateError
 from nepflow.domain.identities import (
     DESCRIPTOR_CACHE_SCHEMA,
     DescriptorCacheIdentity,
     calculate_structure_id,
-    sha256_bytes,
 )
+from nepflow.io.hashing import sha256_file
+from nepflow.io.json import dumps, read_json
 
 logger = logging.getLogger("nepflow.common.descriptors")
 
@@ -92,7 +93,7 @@ def _model_identity(model_path: Path, model_filename: str) -> dict[str, str]:
         )
     return {
         "filename": model_filename,
-        "sha256": sha256_bytes(model_path.read_bytes()),
+        "sha256": sha256_file(model_path, required=True),
     }
 
 
@@ -124,7 +125,7 @@ def _load_valid_cached_descriptors(
         return None
 
     try:
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest = read_json(manifest_path, error_type=StateError)
         if not isinstance(manifest, dict):
             return None
         if manifest.get("schema_version") != DESCRIPTOR_CACHE_SCHEMA_VERSION:
@@ -155,7 +156,7 @@ def _load_valid_cached_descriptors(
         if not np.all(np.isfinite(descriptors)):
             return None
         return descriptors
-    except (OSError, TypeError, ValueError, EOFError, json.JSONDecodeError) as exc:
+    except (OSError, StateError, TypeError, ValueError, EOFError) as exc:
         logger.warning("  Ignoring invalid descriptor cache metadata: %s", exc)
         return None
 
@@ -209,8 +210,7 @@ def _write_descriptor_cache(
         ) as manifest_file:
             manifest_temp = Path(manifest_file.name)
             temporary_paths.append(manifest_temp)
-            json.dump(manifest, manifest_file, sort_keys=True)
-            manifest_file.write("\n")
+            manifest_file.write(dumps(manifest, indent=None))
             manifest_file.flush()
             os.fsync(manifest_file.fileno())
 

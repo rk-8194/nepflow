@@ -20,7 +20,6 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import json
 import re
 import sys
 from datetime import datetime
@@ -33,17 +32,12 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from nepflow.domain.identities import DftCalculationIdentity, calculate_structure_id, sha256_bytes
+from nepflow.domain.identities import DftCalculationIdentity, calculate_structure_id
+from nepflow.io.hashing import sha256_bytes, sha256_file
+from nepflow.io.json import read_json, write_json
 
 VASP_COMPLETION_MARKERS = ["General timing", "Voluntary context switches"]
 VASP_REGISTRY_VERSION = 1
-
-
-def file_sha256(path: Path) -> str | None:
-    try:
-        return sha256_bytes(path.read_bytes())
-    except OSError:
-        return None
 
 
 def outcar_is_complete(outcar_path: Path) -> bool:
@@ -192,20 +186,16 @@ def read_registry(registry_path: Path) -> dict:
     if not registry_path.exists():
         return {"version": VASP_REGISTRY_VERSION, "jobs": {}}
     try:
-        data = json.loads(registry_path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError) as e:
+        data = read_json(registry_path, error_type=ValueError, require_object=True)
+    except (FileNotFoundError, ValueError) as e:
         sys.exit(f"Error: could not read {registry_path}: {e}")
-    if not isinstance(data, dict):
-        sys.exit(f"Error: registry is not a JSON object: {registry_path}")
     data.setdefault("version", VASP_REGISTRY_VERSION)
     data.setdefault("jobs", {})
     return data
 
 
 def write_registry(registry_path: Path, registry: dict) -> None:
-    tmp_path = registry_path.with_suffix(registry_path.suffix + ".tmp")
-    tmp_path.write_text(json.dumps(registry, indent=2, sort_keys=True), encoding="utf-8")
-    tmp_path.replace(registry_path)
+    write_json(registry_path, registry)
 
 
 def registry_contains(registry: dict, incar_hash: str, potcar_hash: str, structure_id: str) -> bool:
@@ -283,8 +273,8 @@ def build_entry(
         ).calculation_id,
         "incar_hash": incar_hash,
         "potcar_hash": potcar_hash,
-        "outcar_hash": file_sha256(outcar),
-        "vasprun_hash": file_sha256(struct_dir / "vasprun.xml"),
+        "outcar_hash": sha256_file(outcar, required=True),
+        "vasprun_hash": sha256_file(struct_dir / "vasprun.xml", required=False),
     }
     return incar_hash, potcar_hash, structure_id, entry
 
@@ -305,7 +295,7 @@ def write_identity(struct_dir: Path, entry: dict, dry_run: bool) -> bool:
         "backfilled": True,
     }
     if not dry_run:
-        identity_path.write_text(json.dumps(identity, indent=2, sort_keys=True), encoding="utf-8")
+        write_json(identity_path, identity)
     return True
 
 

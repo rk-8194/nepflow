@@ -1,7 +1,6 @@
 """Shared constants and utilities for the run_vasp sub-stages."""
 
 import csv
-import json
 import logging
 import re
 from configparser import ConfigParser
@@ -10,8 +9,10 @@ from pathlib import Path
 
 import numpy as np
 
-from nepflow.domain.identities import sha256_bytes
 from nepflow.domain.units import stress_kbar_to_ev_per_angstrom3, virial_from_stress
+from nepflow.errors import ArtifactError, StateError
+from nepflow.io.hashing import sha256_bytes
+from nepflow.io.json import read_json_object, write_json
 
 logger = logging.getLogger("nepflow.run_vasp")
 
@@ -37,18 +38,6 @@ def get_nepflow_root(project_dir: Path) -> Path:
 def completed_jobs_registry_path(nepflow_root: Path) -> Path:
     """Return the shared completed-VASP registry path."""
     return Path(nepflow_root) / ".vasp_completed_jobs.json"
-
-
-def _sha256_bytes(data: bytes) -> str:
-    return sha256_bytes(data)
-
-
-def file_sha256(path: Path) -> str | None:
-    """Return a file SHA-256 hash, or None when the file is absent."""
-    try:
-        return _sha256_bytes(path.read_bytes())
-    except OSError:
-        return None
 
 
 def canonical_poscar_text(atoms) -> str:
@@ -102,46 +91,40 @@ def strip_resource_incar_params(incar_text: str) -> str:
 
 def hash_incar_text(incar_text: str) -> str:
     """Hash scientific INCAR content, excluding launcher resource params."""
-    return _sha256_bytes(strip_resource_incar_params(incar_text).encode("utf-8"))
+    return sha256_bytes(strip_resource_incar_params(incar_text).encode("utf-8"))
 
 
 def hash_potcar_bytes(potcar_bytes: bytes) -> str:
     """Hash concatenated POTCAR bytes for the exact structure element set."""
-    return _sha256_bytes(potcar_bytes)
+    return sha256_bytes(potcar_bytes)
 
 
 def read_completed_registry(nepflow_root: Path) -> dict:
     """Read the shared completed-VASP registry."""
     path = completed_jobs_registry_path(nepflow_root)
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        return {"version": VASP_REGISTRY_VERSION, "jobs": {}}
-    except (json.JSONDecodeError, OSError) as exc:
-        raise ValueError(f"Could not read VASP registry: {path}") from exc
-    if not isinstance(data, dict):
-        raise ValueError(f"VASP registry must contain a JSON object: {path}")
+    data = read_json_object(
+        path,
+        default={"version": VASP_REGISTRY_VERSION, "jobs": {}},
+        error_type=ArtifactError,
+    )
     version = data.get("version")
     if (
         isinstance(version, bool)
         or not isinstance(version, int)
         or version != VASP_REGISTRY_VERSION
     ):
-        raise ValueError(
+        raise ArtifactError(
             f"Unsupported VASP registry version in {path}: {version!r}"
         )
     if "jobs" not in data or not isinstance(data["jobs"], dict):
-        raise ValueError(f"VASP registry jobs must be an object: {path}")
+        raise ArtifactError(f"VASP registry jobs must be an object: {path}")
     return data
 
 
 def write_completed_registry(nepflow_root: Path, registry: dict) -> None:
     """Write the shared completed-VASP registry."""
     path = completed_jobs_registry_path(nepflow_root)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    tmp_path.write_text(json.dumps(registry, indent=2, sort_keys=True), encoding="utf-8")
-    tmp_path.replace(path)
+    write_json(path, registry)
 
 
 def get_registry_entry(
@@ -153,13 +136,13 @@ def get_registry_entry(
     """Return a registry entry for the input identity, if present."""
     jobs = registry.get("jobs")
     if not isinstance(jobs, dict):
-        raise ValueError("VASP registry jobs must be an object")
+        raise ArtifactError("VASP registry jobs must be an object")
 
     incar_entries = jobs.get(incar_hash)
     if incar_entries is None:
         return None
     if not isinstance(incar_entries, dict):
-        raise ValueError(
+        raise ArtifactError(
             f"Registry entries for INCAR hash are malformed: {incar_hash}"
         )
 
@@ -167,7 +150,7 @@ def get_registry_entry(
     if potcar_entries is None:
         return None
     if not isinstance(potcar_entries, dict):
-        raise ValueError(
+        raise ArtifactError(
             f"Registry entries for POTCAR hash are malformed: {potcar_hash}"
         )
 
@@ -175,12 +158,12 @@ def get_registry_entry(
         return None
     entry = potcar_entries[structure_id]
     if not isinstance(entry, dict):
-        raise ValueError(
+        raise ArtifactError(
             f"Registry entry for structure ID is malformed: {structure_id}"
         )
     job_path = entry.get("job_path")
     if not isinstance(job_path, str) or not job_path.strip():
-        raise ValueError(
+        raise ArtifactError(
             "Registry entry for structure ID lacks a valid job_path: "
             f"{structure_id}"
         )
@@ -355,27 +338,21 @@ def write_status(
     if current_gpu is not None:
         data["current_gpu"] = current_gpu
     data.update({key: value for key, value in extra.items() if value is not None})
-    (struct_dir / ".vasp_status").write_text(
-        json.dumps(data, indent=2), encoding="utf-8"
-    )
+    write_json(struct_dir / ".vasp_status", data)
 
 
 def read_status(struct_dir: Path) -> dict:
     """Read .vasp_status JSON from a structure directory."""
     status_file = struct_dir / ".vasp_status"
-    try:
-        data = json.loads(status_file.read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        return {"status": "pending", "retry_level": 0}
-    except (json.JSONDecodeError, OSError) as exc:
-        raise ValueError(f"Could not read VASP status: {status_file}") from exc
-
-    if not isinstance(data, dict):
-        raise ValueError(f"VASP status must contain a JSON object: {status_file}")
+    data = read_json_object(
+        status_file,
+        default={"status": "pending", "retry_level": 0},
+        error_type=StateError,
+    )
 
     status = data.get("status")
     if not isinstance(status, str) or status not in VALID_VASP_STATUSES:
-        raise ValueError(f"VASP status is missing or invalid: {status_file}")
+        raise StateError(f"VASP status is missing or invalid: {status_file}")
 
     retry_level = data.get("retry_level", 0)
     if (
@@ -383,7 +360,7 @@ def read_status(struct_dir: Path) -> dict:
         or not isinstance(retry_level, int)
         or retry_level < 0
     ):
-        raise ValueError(f"VASP status retry_level is invalid: {status_file}")
+        raise StateError(f"VASP status retry_level is invalid: {status_file}")
 
     return data
 
@@ -396,9 +373,7 @@ def write_launcher_state(vasp_dir: Path, job_id: str, walltime_seconds: int) -> 
         "start_time": datetime.now().isoformat(),
         "walltime_seconds": walltime_seconds,
     }
-    (vasp_dir / ".launcher_state").write_text(
-        json.dumps(state, indent=2), encoding="utf-8"
-    )
+    write_json(vasp_dir / ".launcher_state", state)
 
 
 # ==================================================================

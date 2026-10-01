@@ -7,13 +7,14 @@ scientific inputs that define an artifact's meaning.
 
 from __future__ import annotations
 
-import hashlib
-import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any
+
+from nepflow.io.hashing import sha256_bytes, sha256_canonical_json
+from nepflow.io.json import to_jsonable
 
 
 STRUCTURE_IDENTITY_SCHEMA = "structure-v1"
@@ -72,7 +73,7 @@ def canonical_structure_text(atoms: Any) -> str:
 def calculate_structure_id(atoms: Any) -> str:
     """Calculate the stable structure ID using the Phase 2 byte semantics."""
 
-    return hashlib.sha256(canonical_structure_text(atoms).encode("utf-8")).hexdigest()
+    return sha256_bytes(canonical_structure_text(atoms).encode("utf-8"))
 
 
 def annotate_structure_id(atoms: Any, *, overwrite: bool = True) -> str:
@@ -94,40 +95,6 @@ def annotate_structure_ids(structures: list[Any], *, overwrite: bool = True) -> 
         annotate_structure_id(atoms, overwrite=overwrite)
 
 
-def canonical_json_bytes(value: Any) -> bytes:
-    """Serialize an identity payload with the repository's canonical JSON rules."""
-
-    return json.dumps(
-        _jsonable(value),
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=True,
-        allow_nan=False,
-    ).encode("utf-8")
-
-
-def sha256_bytes(value: bytes) -> str:
-    return hashlib.sha256(value).hexdigest()
-
-
-def sha256_canonical_json(value: Any) -> str:
-    return sha256_bytes(canonical_json_bytes(value))
-
-
-def _jsonable(value: Any) -> Any:
-    if isinstance(value, Mapping):
-        return {str(key): _jsonable(item) for key, item in value.items()}
-    if isinstance(value, (tuple, list)):
-        return [_jsonable(item) for item in value]
-    if isinstance(value, Path):
-        return str(value)
-    if hasattr(value, "tolist") and callable(value.tolist):
-        return _jsonable(value.tolist())
-    if hasattr(value, "item") and callable(value.item):
-        return _jsonable(value.item())
-    return value
-
-
 def _freeze(value: Any) -> Any:
     """Recursively freeze JSON-shaped metadata for immutable records."""
 
@@ -145,7 +112,7 @@ def _normalise_pairs(values: Mapping[str, Any] | Sequence[tuple[str, Any]]) -> t
         items = values.items()
     else:
         items = values
-    return tuple(sorted(((str(key), _jsonable(value)) for key, value in items), key=lambda item: item[0]))
+    return tuple(sorted(((str(key), to_jsonable(value)) for key, value in items), key=lambda item: item[0]))
 
 
 def normalise_dft_calculation_identity(value: Mapping[str, Any]) -> dict[str, Any]:
@@ -331,7 +298,7 @@ class ValidationRunIdentity:
         }
 
     def to_dict(self) -> dict[str, Any]:
-        return {"validation_run_id": self.validation_run_id, **_jsonable(self.identity_payload())}
+        return {"validation_run_id": self.validation_run_id, **to_jsonable(self.identity_payload())}
 
 
 @dataclass(frozen=True)

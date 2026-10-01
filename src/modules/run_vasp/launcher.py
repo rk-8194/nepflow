@@ -1,7 +1,6 @@
 """Launcher sub-stage: submit, monitor, and handle OOM escalation for VASP jobs."""
 
 import csv
-import json
 import os
 import re
 import shutil
@@ -11,12 +10,15 @@ from configparser import ConfigParser
 from datetime import datetime
 from pathlib import Path
 
+from nepflow.errors import StateError
+from nepflow.io.hashing import sha256_file
+from nepflow.io.json import read_json
+
 from .prepare import _read_identity
 from ._common import (
     build_retry_levels_for_gpu,
     estimate_kpoints_irr,
     estimate_n_electrons,
-    file_sha256,
     get_nepflow_root,
     logger,
     outcar_is_complete,
@@ -573,16 +575,13 @@ def _cancel_stale_launcher(vasp_dir: Path) -> None:
     state_file = vasp_dir / ".launcher_state"
     if not state_file.exists():
         return
-    try:
-        state = json.loads(state_file.read_text(encoding="utf-8"))
-        old_id = state.get("launcher_job_id", "")
-        if old_id and old_id != "local" and _job_in_squeue(old_id):
-            my_id = os.environ.get("SLURM_JOB_ID", "")
-            if old_id != my_id:
-                logger.info(f"  Cancelling stale launcher job {old_id}")
-                subprocess.run(["scancel", old_id], capture_output=True, timeout=10, check=False)
-    except (json.JSONDecodeError, OSError):
-        pass
+    state = read_json(state_file, error_type=StateError, require_object=True)
+    old_id = state.get("launcher_job_id", "")
+    if old_id and old_id != "local" and _job_in_squeue(old_id):
+        my_id = os.environ.get("SLURM_JOB_ID", "")
+        if old_id != my_id:
+            logger.info(f"  Cancelling stale launcher job {old_id}")
+            subprocess.run(["scancel", old_id], capture_output=True, timeout=10, check=False)
 
 
 # ==================================================================
@@ -703,8 +702,10 @@ def _register_completed_job(
         "calculation_id": identity["calculation_id"],
         "incar_hash": identity["incar_hash"],
         "potcar_hash": identity["potcar_hash"],
-        "outcar_hash": file_sha256(struct_dir / "OUTCAR"),
-        "vasprun_hash": file_sha256(struct_dir / "vasprun.xml"),
+        # OUTCAR is required for a completed job; vasprun.xml remains an
+        # optional backend artifact and retains its previous None semantics.
+        "outcar_hash": sha256_file(struct_dir / "OUTCAR", required=True),
+        "vasprun_hash": sha256_file(struct_dir / "vasprun.xml", required=False),
     }
     upsert_registry_entry(
         nepflow_root,

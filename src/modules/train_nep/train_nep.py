@@ -1,6 +1,5 @@
 """NEP model training stage — prepare datasets and submit training jobs."""
 
-import json
 import logging
 import shutil
 from configparser import ConfigParser
@@ -22,7 +21,9 @@ from common.model_manifest import (
     update_model_run_status,
 )
 from nepflow.domain.datasets import DatasetIdentity
-from nepflow.domain.identities import canonical_json_bytes, sha256_bytes
+from nepflow.io.atomic import atomic_write_text
+from nepflow.io.hashing import sha256_bytes
+from nepflow.io.json import canonical_json_bytes, read_json, write_json
 from .prepare import prepare_dataset
 from .submit import submit_training_job
 from .launcher import run_launcher, read_train_status, write_train_status
@@ -360,10 +361,13 @@ class TrainNepStage(Stage):
                 f"Model-run manifest has no valid dataset association: {manifest_path}"
             )
         try:
-            dataset_metadata = json.loads(
-                (dataset_path / ".dataset").read_text(encoding="utf-8")
+            dataset_metadata = read_json(
+                dataset_path / ".dataset",
+                error_type=ModelManifestError,
+                missing_error_type=ModelManifestError,
+                require_object=True,
             )
-        except (OSError, json.JSONDecodeError) as exc:
+        except ModelManifestError as exc:
             raise RuntimeError(f"Cannot read dataset manifest: {dataset_path / '.dataset'}") from exc
         if dataset_metadata.get("dataset_id") != dataset_id:
             raise RuntimeError(
@@ -613,7 +617,7 @@ class TrainNepStage(Stage):
             logger.error(f"Generated nep.in is empty! Template had {len(template_lines)} lines, output has {len(output_lines)} lines.")
             return
         
-        output_path.write_text(content)
+        atomic_write_text(output_path, content)
         logger.info(f"Wrote {len(output_lines)} lines to {output_path}")
 
     @staticmethod
@@ -808,7 +812,7 @@ lambda_shear 1
     def _write_dataset_metadata(dataset_path: Path, metadata: dict) -> None:
         """Write the finalized content-derived .dataset manifest."""
         metadata_path = dataset_path / ".dataset"
-        metadata_path.write_text(json.dumps(metadata, indent=2))
+        write_json(metadata_path, metadata)
         logger.debug("Wrote metadata to %s", metadata_path)
 
     @staticmethod

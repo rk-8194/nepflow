@@ -1,6 +1,5 @@
 """Prepare sub-stage: parse OUTCAR files and write XYZ datasets."""
 
-import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Generator, List
@@ -22,11 +21,13 @@ from nepflow.domain.units import (
     VIRIAL_CONVENTION_POSITIVE_COMPRESSION,
     VIRIAL_UNIT_EV,
 )
+from nepflow.errors import StateError
+from nepflow.io.hashing import sha256_file
+from nepflow.io.json import read_json
 
 from ..run_vasp._common import (
     get_nepflow_root,
     get_registry_entry,
-    file_sha256,
     hash_incar_text,
     hash_potcar_bytes,
     outcar_is_complete,
@@ -422,19 +423,14 @@ def _read_identity(struct_dir: Path) -> dict:
     identity_path = struct_dir / ".vasp_identity"
     if not identity_path.exists():
         return {}
-    try:
-        data = json.loads(identity_path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError) as exc:
-        raise ValueError(f"Could not read VASP identity: {identity_path}") from exc
-    if not isinstance(data, dict):
-        raise ValueError(f"VASP identity must contain a JSON object: {identity_path}")
+    data = read_json(identity_path, error_type=StateError, require_object=True)
 
     data = normalise_dft_calculation_identity(data)
 
     for key in ("structure_id", "incar_hash", "potcar_hash", "calculation_id"):
         value = data.get(key)
         if not isinstance(value, str) or not value.strip():
-            raise ValueError(
+            raise StateError(
                 f"VASP identity is missing a valid {key}: {identity_path}"
             )
     return data
@@ -477,7 +473,9 @@ def _parse_outcar_result(
         sorted((str(key), str(value)) for key, value in comparison_identity.items())
     )
     source_outcar = str(outcar_path.resolve())
-    source_hash = file_sha256(outcar_path)
+    # Parsing can return a rejected record, so preserve the prior optional
+    # source-hash behavior while making the missing-file policy explicit.
+    source_hash = sha256_file(outcar_path, required=False)
 
     def rejected(reason: str) -> VaspParseResult:
         return VaspParseResult(

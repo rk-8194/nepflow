@@ -1,6 +1,9 @@
 """Domain records and scientific identities for NEPFlow."""
 from .calculations import DftExecutionResources, DftResultArtifact
 from .datasets import DatasetIdentity, SelectedDatasetMember, TrainingDatasetManifest
+from nepflow.io.hashing import sha256_canonical_json
+from nepflow.io.json import canonical_json_bytes
+
 from .identities import (
     ArtifactIdentity,
     DescriptorCacheIdentity,
@@ -12,10 +15,8 @@ from .identities import (
     annotate_structure_id,
     annotate_structure_ids,
     calculate_structure_id,
-    canonical_json_bytes,
     canonical_structure_text,
     normalise_dft_calculation_identity,
-    sha256_canonical_json,
 )
 from .models import (
     ModelArtifactMetadata,

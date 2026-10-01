@@ -12,9 +12,9 @@ from ase.atoms import Atoms
 from common.model_manifest import (
     ModelManifestError,
     find_model_run_manifest,
-    sha256_file,
     validate_model_run_manifest,
 )
+from nepflow.io.hashing import sha256_file
 
 logger = logging.getLogger("nepflow.validate")
 
@@ -116,7 +116,11 @@ def finalize_nep_potential(
     src_nep = source_artifact
     dst_nep = gpumd_potential_dir / "nep.txt"
     
-    if src_nep.exists() and sha256_file(src_nep) != manifest["potential_artifact_sha256"]:
+    if src_nep.exists() and sha256_file(
+        src_nep,
+        required=True,
+        error_type=ModelManifestError,
+    ) != manifest["potential_artifact_sha256"]:
         raise ModelManifestError(
             f"Manifest-bound artifact changed after validation: {src_nep}"
         )
@@ -125,7 +129,11 @@ def finalize_nep_potential(
         shutil.copy2(src_nep, dst_nep)
         logger.debug(f"Copied nep.txt: {src_nep} → {dst_nep}")
     elif dst_nep.exists():
-        if sha256_file(dst_nep) != manifest["potential_artifact_sha256"]:
+        if sha256_file(
+            dst_nep,
+            required=True,
+            error_type=ModelManifestError,
+        ) != manifest["potential_artifact_sha256"]:
             raise ModelManifestError(
                 f"Existing finalized artifact does not match manifest: {dst_nep}"
             )
