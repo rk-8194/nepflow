@@ -50,11 +50,13 @@ sys.path.insert(0, str(Path(__file__).parent / "src"))
 # pylint: disable=import-error
 from workflow import WorkflowController
 from nepflow.errors import StateError, ValidationError
+from nepflow.hpc.process import ProcessError, ProcessRunner
 from nepflow.logging import configure_logging
 from nepflow.config.loader import canonical_config_path
 from nepflow.workflow.resubmission import SelfResubmitExit
 
 logger = logging.getLogger("nepflow")
+process_runner = ProcessRunner(logger=logger)
 
 
 def _resolve_project_config_path(project_name: str, output_dir: Path) -> Path:
@@ -295,8 +297,15 @@ def main():
         project_dir = args.output_dir / f"project_{args.project}"
         project_dir.mkdir(parents=True, exist_ok=True)
         try:
-            subprocess.run(["vim", str(project_config)], check=False, cwd=str(project_dir))
-        except FileNotFoundError as e:
+            process_runner.run(
+                ["vim", str(project_config)],
+                check=False,
+                cwd=project_dir,
+                capture_output=False,
+            )
+        except ProcessError as e:
+            if e.kind != "not_found":
+                raise
             raise FileNotFoundError("vim was not found on PATH") from e
         return
 

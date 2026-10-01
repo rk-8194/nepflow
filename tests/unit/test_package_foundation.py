@@ -17,6 +17,7 @@ from nepflow.errors import (
     ConfigurationError,
     MlipError,
     NepflowError,
+    ProcessError,
     SchedulerError,
     StateError,
     ValidationError,
@@ -120,6 +121,7 @@ def test_exception_hierarchy() -> None:
         ValidationError,
         StateError,
         SchedulerError,
+        ProcessError,
         BackendError,
         ArtifactError,
     )

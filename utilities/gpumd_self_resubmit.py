@@ -21,7 +21,6 @@ import time
 from pathlib import Path
 from typing import Any
 
-
 STATE_FILE_NAME = ".gpumd_self_resubmit_state.json"
 DEFAULT_ARCHIVE_DIR = "final_xyz_history"
 
@@ -131,6 +130,12 @@ def run_gpumd(command: str, workdir: Path, dry_run: bool = False) -> None:
     if dry_run:
         return
 
+    # This utility is copied and run standalone, so it deliberately retains
+    # its explicit shell command boundary.  The command supports redirection
+    # and variable expansion; ProcessRunner's argument-list API is not a drop-
+    # in replacement for that standalone contract.  Phase 4 owns revisiting
+    # this standalone boundary once the utility can share the runner without
+    # making a package import a runtime requirement.
     result = subprocess.run(command, shell=True, cwd=str(workdir), check=False)
     if result.returncode != 0:
         raise RuntimeError(f"GPUMD command failed with exit code {result.returncode}.")

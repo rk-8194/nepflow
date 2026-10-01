@@ -10,7 +10,6 @@ Pipeline:
 
 import logging
 import random
-import subprocess
 from configparser import ConfigParser
 from pathlib import Path
 from typing import List
@@ -20,6 +19,7 @@ from ase.build import bulk
 from ase.io import write
 
 from nepflow.domain.identities import annotate_structure_ids, calculate_structure_id
+from nepflow.hpc.process import ProcessError, ProcessRunner
 from ..base import Stage
 from .generators import (
     CompositionGrid,
@@ -32,6 +32,7 @@ from .generators import (
 )
 
 logger = logging.getLogger("nepflow.generate")
+process_runner = ProcessRunner(logger=logger)
 
 
 class GenerateStage(Stage):
@@ -229,11 +230,14 @@ class GenerateStage(Stage):
 
         logger.info("Uploading project to %s", remote_target)
         try:
-            subprocess.run(
+            process_runner.run(
                 ["scp", "-r", str(self.project_dir), remote_target],
                 check=True,
+                capture_output=False,
             )
-        except FileNotFoundError as e:
+        except ProcessError as e:
+            if e.kind != "not_found":
+                raise
             raise FileNotFoundError("scp was not found on PATH") from e
         logger.info("Project upload complete")
 

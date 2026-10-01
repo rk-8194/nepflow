@@ -97,7 +97,7 @@ class GenerateStageTests(unittest.TestCase):
 
             with patch.object(stage, "prepare", return_value=[make_atoms()]):
                 with patch("builtins.input", return_value="y") as input_mock:
-                    with patch("subprocess.run") as run_mock:
+                    with patch("modules.generate.generate.process_runner.run") as run_mock:
                         stage.run(seeds_only=True)
 
             input_mock.assert_called_once()
@@ -109,6 +109,7 @@ class GenerateStageTests(unittest.TestCase):
                     "user@host:/opt/nepflow/projects/project_demo",
                 ],
                 check=True,
+                capture_output=False,
             )
 
     def test_resume_if_needed_reuses_existing_seeds(self) -> None:

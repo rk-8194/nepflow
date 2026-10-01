@@ -48,13 +48,14 @@ class ConfigCliTests(unittest.TestCase):
                     str(output_dir),
                 ],
             ):
-                with patch.object(nepflow.subprocess, "run") as run_mock:
+                with patch.object(nepflow.process_runner, "run") as run_mock:
                     nepflow.main()
 
             run_mock.assert_called_once_with(
                 ["vim", str(config_file)],
                 check=False,
-                cwd=str(project_dir),
+                cwd=project_dir,
+                capture_output=False,
             )
 
     def test_resolve_resubmit_command_prefers_original_slurm_script(self) -> None:
