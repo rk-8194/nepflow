@@ -10,6 +10,7 @@ pytest.importorskip("ase")
 pytest.importorskip("pymatgen")
 
 from modules.init.init import ConfigPrompt, InitStage
+from nepflow.state import StateStore
 
 
 class InitConfigPromptTests(unittest.TestCase):
@@ -135,6 +136,31 @@ class InitConfigPromptTests(unittest.TestCase):
                     "secret_value": "from-prompt",
                 },
             )
+
+    def test_run_initializes_authoritative_state_db(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_dir = Path(tmp)
+            stage = self._make_stage(project_dir)
+
+            with patch.dict(os.environ, {}, clear=True):
+                with patch(
+                    "modules.init.init.input",
+                    side_effect=[
+                        "",
+                        "W",
+                        "",
+                        "BCC",
+                        "",
+                        "user@host:/opt/nepflow",
+                    ],
+                ):
+                    stage.run()
+
+            with StateStore(project_dir / "state.db") as store:
+                project = store.get_project("demo")
+
+            assert project is not None
+            assert project["root_path"] == str(project_dir)
 
 
 if __name__ == "__main__":

@@ -8,6 +8,7 @@ from typing import Callable, Iterable
 from ase.data import chemical_symbols
 
 from ..base import Stage
+from nepflow.state import StateStore
 
 logger = logging.getLogger(__name__)
 
@@ -149,6 +150,15 @@ class InitStage(Stage):
         
         # Load or create config
         self._setup_config()
+
+        # Establish the authoritative ledger without migrating legacy marker
+        # files. Later stage migrations can reconcile those files explicitly.
+        with StateStore(self.state_file) as store:
+            store.upsert_project(
+                self.project_name,
+                name=self.project_name,
+                root_path=str(self.project_dir),
+            )
         
         logger.info("Project initialization complete")
     
