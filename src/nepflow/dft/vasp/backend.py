@@ -24,11 +24,14 @@ from nepflow.domain.identities import (
     StructureIdentity,
 )
 from nepflow.errors import BackendError, ValidationError
-from nepflow.io.hashing import sha256_bytes, sha256_file
 from nepflow.io.json import write_json
 
 from .failures import VaspFailureEvidence, classify_failure
-from .inputs import canonical_poscar_bytes, hash_incar_text, hash_potcar_bytes
+from .inputs import (
+    canonical_poscar_bytes,
+    hash_incar_text,
+    identity_for_structure,
+)
 from .outputs import (
     ResolvedVaspOutput,
     VaspParseResult,
@@ -43,8 +46,8 @@ class VaspBackend:
 
     ``source_structure`` is the source POSCAR (or an ASE-readable structure
     file).  INCAR and POTCAR are required beside it unless ``input_files``
-    supplies explicit paths.  KPOINTS is optional, but when present its hash
-    participates in scientific identity.
+    supplies explicit paths.  The current Phase 2 identity contract consists
+    of structure, scientific INCAR, and POTCAR identity only.
     """
 
     def __init__(
@@ -64,53 +67,108 @@ class VaspBackend:
     def _source_inputs(self, request: DftInputRequest) -> dict[str, Path]:
         source = Path(request.source_structure)
         root = source if source.is_dir() else source.parent
-        paths = {
+        paths: dict[str, Path] = {
             "POSCAR": self._input_files.get(
                 "POSCAR", source / "POSCAR" if source.is_dir() else source
             ),
             "INCAR": self._input_files.get("INCAR", root / "INCAR"),
-            "POTCAR": self._input_files.get("POTCAR", root / "POTCAR"),
         }
-        kpoints = self._input_files.get("KPOINTS", root / "KPOINTS")
-        if kpoints.exists():
-            paths["KPOINTS"] = kpoints
-        missing = [name for name in ("POSCAR", "INCAR", "POTCAR") if not paths[name].is_file()]
+        missing = [name for name in ("POSCAR", "INCAR") if not paths[name].is_file()]
         if missing:
             raise BackendError(
                 "VASP required input artifact(s) missing: " + ", ".join(missing)
             )
         return paths
 
-    def _identity_payload(self, request: DftInputRequest) -> dict[str, str]:
+    def _input_material(
+        self,
+        request: DftInputRequest,
+    ) -> tuple[dict[str, Path], dict[str, bytes]]:
         paths = self._source_inputs(request)
-        incar_hash = hash_incar_text(paths["INCAR"].read_text(encoding="utf-8"))
-        potcar_hash = hash_potcar_bytes(paths["POTCAR"].read_bytes())
-        payload = {
-            "structure_id": request.structure.structure_id,
-            "incar_hash": incar_hash,
-            "potcar_hash": potcar_hash,
-        }
         try:
-            canonical_poscar = canonical_poscar_bytes(ase_read(str(paths["POSCAR"])))
+            poscar_atoms = ase_read(str(paths["POSCAR"]))
+        except Exception as exc:
+            raise BackendError(
+                f"Could not read required VASP artifact {paths['POSCAR']}"
+            ) from exc
+        root = Path(request.source_structure)
+        root = root if root.is_dir() else root.parent
+        unique_elements = sorted(set(poscar_atoms.get_chemical_symbols()))
+        combined = self._input_files.get("POTCAR", root / "POTCAR")
+        potcar_data: dict[str, bytes] = {}
+        if combined.is_file():
+            if len(unique_elements) != 1:
+                raise BackendError(
+                    "A combined POTCAR is supported only for single-element VASP inputs"
+                )
+            try:
+                potcar_data[unique_elements[0]] = combined.read_bytes()
+            except (OSError, UnicodeError) as exc:
+                raise BackendError(
+                    f"Could not read required VASP artifact {combined}"
+                ) from exc
+            paths["POTCAR"] = combined
+            return paths, potcar_data
+
+        missing: list[str] = []
+        for element in unique_elements:
+            element_path = self._input_files.get(
+                f"POTCAR_{element.upper()}",
+                root / f"POTCAR_{element}",
+            )
+            if not element_path.is_file():
+                missing.append(element)
+                continue
+            try:
+                potcar_data[element] = element_path.read_bytes()
+            except (OSError, UnicodeError) as exc:
+                raise BackendError(
+                    f"Could not read required VASP artifact {element_path}"
+                ) from exc
+        if missing:
+            raise BackendError(
+                "VASP required POTCAR artifact(s) missing for: "
+                + ", ".join(missing)
+            )
+        return paths, potcar_data
+
+    def _calculation_identity_and_material(
+        self,
+        request: DftInputRequest,
+    ) -> tuple[DftCalculationIdentity, dict[str, Path], dict[str, bytes]]:
+        paths, potcar_data = self._input_material(request)
+        try:
+            atoms = ase_read(str(paths["POSCAR"]))
         except Exception as exc:
             raise BackendError("Could not canonicalize VASP POSCAR") from exc
-        poscar_hash = sha256_bytes(canonical_poscar)
-        payload["poscar_hash"] = poscar_hash
-        if "KPOINTS" in paths:
-            payload["kpoints_hash"] = sha256_file(paths["KPOINTS"])
-        return payload
+        try:
+            incar_text = paths["INCAR"].read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as exc:
+            raise BackendError(
+                f"Could not read required VASP artifact {paths['INCAR']}"
+            ) from exc
+        incar_hash = hash_incar_text(incar_text)
+        identity = identity_for_structure(
+            atoms,
+            {"incar_hash": incar_hash, "potcar_data": potcar_data},
+        ).calculation
+        if identity.structure_id != request.structure.structure_id:
+            raise ValidationError(
+                "VASP source structure does not match requested structure identity"
+            )
+        return identity, paths, potcar_data
 
     def calculation_identity(self, request: DftInputRequest) -> DftCalculationIdentity:
-        payload = self._identity_payload(request)
-        return DftCalculationIdentity(**payload)
+        identity, _, _ = self._calculation_identity_and_material(request)
+        return identity
 
     def prepare_inputs(self, request: DftInputRequest) -> DftInputArtifacts:
-        calculation = self.calculation_identity(request)
-        source_paths = self._source_inputs(request)
+        calculation, source_paths, potcar_data = self._calculation_identity_and_material(request)
         working = Path(request.working_directory)
         working.mkdir(parents=True, exist_ok=True)
         files: list[Path] = []
-        for name, source in source_paths.items():
+        for name in ("POSCAR", "INCAR"):
+            source = source_paths[name]
             destination = working / name
             try:
                 if name == "POSCAR":
@@ -125,15 +183,26 @@ class VaspBackend:
                     f"Could not prepare required VASP artifact {source}: {exc}"
                 ) from exc
             files.append(destination)
-        write_json(
-            working / ".vasp_identity",
-            {
-                "structure_id": calculation.structure_id,
-                "incar_hash": calculation.incar_hash,
-                "potcar_hash": calculation.potcar_hash,
-                "calculation_id": calculation.calculation_id,
-            },
-        )
+        potcar_path = working / "POTCAR"
+        try:
+            potcar_path.write_bytes(
+                b"".join(potcar_data[element] for element in sorted(potcar_data))
+            )
+        except OSError as exc:
+            raise BackendError(f"Could not prepare required VASP artifact POTCAR: {exc}") from exc
+        files.append(potcar_path)
+        try:
+            write_json(
+                working / ".vasp_identity",
+                {
+                    **calculation.scientific_payload(),
+                    "calculation_id": calculation.calculation_id,
+                },
+            )
+        except (OSError, TypeError, ValueError) as exc:
+            raise BackendError(
+                f"Could not persist required VASP identity sidecar in {working}"
+            ) from exc
         return DftInputArtifacts(
             calculation=calculation,
             working_directory=working,
@@ -161,16 +230,13 @@ class VaspBackend:
         outcar = inputs.working_directory / "OUTCAR"
         if not outcar.is_file():
             raise BackendError(f"Required VASP output artifact is missing: {outcar}")
+        if not outcar_is_complete(outcar):
+            raise BackendError(f"VASP OUTCAR is incomplete: {outcar}")
         try:
             expected = ase_read(str(inputs.working_directory / "POSCAR"))
         except Exception as exc:
             raise BackendError("Could not read prepared VASP POSCAR") from exc
-        identity = {
-            "structure_id": inputs.calculation.structure_id,
-            "incar_hash": inputs.calculation.incar_hash,
-            "potcar_hash": inputs.calculation.potcar_hash,
-            "calculation_id": inputs.calculation.calculation_id,
-        }
+        identity = inputs.calculation.to_dict()
         evidence = ResolvedVaspOutput(
             outcar_path=outcar,
             calculation_identity=tuple(sorted(identity.items())),
@@ -207,13 +273,32 @@ class VaspBackend:
         )
 
     def classify_failure(self, evidence: DftFailureEvidence) -> DftFailure:
+        process_output = "\n".join(
+            value
+            for value in (
+                evidence.process.stdout if evidence.process is not None else None,
+                evidence.process.stderr if evidence.process is not None else None,
+            )
+            if value
+        )
+        returncode = (
+            evidence.completion.returncode
+            if evidence.process is None
+            else evidence.process.returncode
+        )
+        output_lower = process_output.lower()
+        output_parts = tuple(evidence.markers) + ((process_output,) if process_output else ())
         return classify_failure(
             VaspFailureEvidence(
-                job_directory=Path(evidence.calculation.structure_id),
+                job_directory=None,
                 completed=evidence.completion.completed,
-                oom_marker=any("oom" in marker.lower() for marker in evidence.markers),
-                output_log=" ".join(evidence.markers),
-                returncode=None if evidence.process is None else evidence.process.returncode,
+                oom_marker=(
+                    any("oom" in marker.lower() for marker in evidence.markers)
+                    or "oom" in output_lower
+                    or returncode == 137
+                ),
+                output_log="\n".join(output_parts),
+                returncode=returncode,
             )
         )
 

@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from numbers import Real
 from pathlib import Path
-from typing import Callable, Mapping
+from typing import Callable, Iterable, Mapping
 
 import numpy as np
 from ase.atoms import Atoms
@@ -24,6 +24,7 @@ from nepflow.domain.units import (
     stress_kbar_to_ev_per_angstrom3,
     virial_from_stress,
 )
+from nepflow.errors import StateError
 from nepflow.io.hashing import sha256_file
 
 from .inputs import read_identity
@@ -191,6 +192,107 @@ class ResolvedVaspOutput:
     verification_source: str
 
 
+@dataclass(frozen=True, slots=True)
+class VaspJobEvidence:
+    """Identity/status evidence supplied by a current job-directory caller."""
+
+    job_directory: Path
+    identity: Mapping[str, object] | None
+    status: Mapping[str, object] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
+class VaspRegistryEvidence:
+    """An exact registry-key match supplied by the registry caller."""
+
+    outcar_path: Path
+    calculation_identity: Mapping[str, object]
+
+
+_IDENTITY_KEYS = ("structure_id", "incar_hash", "potcar_hash", "calculation_id")
+
+
+def _validated_identity(
+    value: Mapping[str, object],
+    *,
+    label: str,
+) -> dict[str, str]:
+    if not isinstance(value, Mapping):
+        raise StateError(f"{label} must be an object")
+    normalized = normalise_dft_calculation_identity(value)
+    for key in _IDENTITY_KEYS:
+        item = normalized.get(key)
+        if not isinstance(item, str) or not item.strip():
+            raise StateError(f"{label} is missing a valid {key}")
+    return {key: str(normalized[key]) for key in _IDENTITY_KEYS}
+
+
+def _identity_items(identity: Mapping[str, str]) -> tuple[tuple[str, str], ...]:
+    return tuple(sorted(identity.items()))
+
+
+def resolve_verified_output(
+    expected_identity: Mapping[str, object],
+    *,
+    current_jobs: Iterable[VaspJobEvidence] = (),
+    registry_evidence: VaspRegistryEvidence | None = None,
+) -> ResolvedVaspOutput | None:
+    """Resolve only outputs whose scientific identity is already evidenced.
+
+    The caller owns directory enumeration, status-file reads, and registry
+    persistence.  This function owns the trust rule: a current job must have
+    a matching identity sidecar, while a reused or registry OUTCAR may be in a
+    historical directory without a sidecar of its own.
+    """
+    expected = _validated_identity(expected_identity, label="expected VASP identity")
+    expected_items = _identity_items(expected)
+
+    for job in current_jobs:
+        if not isinstance(job.status, Mapping):
+            raise StateError("VASP job status evidence must be an object")
+        if job.identity is None:
+            continue
+        observed = _validated_identity(job.identity, label="current VASP identity")
+        if observed != expected:
+            continue
+
+        status = job.status.get("status")
+        reused_from = job.status.get("reused_from")
+        if reused_from is not None and not isinstance(reused_from, str):
+            raise StateError("VASP reused_from status evidence must be a path")
+        if status == "reused" and reused_from:
+            reused_outcar = Path(reused_from) / "OUTCAR"
+            if outcar_is_complete(reused_outcar):
+                return ResolvedVaspOutput(
+                    outcar_path=reused_outcar,
+                    calculation_identity=expected_items,
+                    verification_source="current_job_identity_reuse",
+                )
+
+        outcar = Path(job.job_directory) / "OUTCAR"
+        if outcar_is_complete(outcar):
+            return ResolvedVaspOutput(
+                outcar_path=outcar,
+                calculation_identity=expected_items,
+                verification_source="current_job_identity",
+            )
+
+    if registry_evidence is not None:
+        observed = _validated_identity(
+            registry_evidence.calculation_identity,
+            label="registry VASP identity",
+        )
+        if observed != expected:
+            return None
+        if outcar_is_complete(registry_evidence.outcar_path):
+            return ResolvedVaspOutput(
+                outcar_path=Path(registry_evidence.outcar_path),
+                calculation_identity=expected_items,
+                verification_source="completed_registry_key",
+            )
+    return None
+
+
 def parse_outcar_result(
     outcar_path: Path,
     ase_atoms: Atoms,
@@ -205,13 +307,9 @@ def parse_outcar_result(
     reader = ase_read if reader is None else reader
     identity_reader = read_identity if identity_reader is None else identity_reader
     structure_id = calculate_structure_id(ase_atoms)
-    identity_items_source = dict(calculation_identity or {"structure_id": structure_id})
-    comparison_identity = normalise_dft_calculation_identity(identity_items_source)
+    identity_items_source = dict(calculation_identity or {})
     identity_items = tuple(
         sorted((str(key), str(value)) for key, value in identity_items_source.items())
-    )
-    comparison_items = tuple(
-        sorted((str(key), str(value)) for key, value in comparison_identity.items())
     )
     source_outcar = str(Path(outcar_path).resolve())
     source_hash = sha256_file(Path(outcar_path), required=False)
@@ -233,20 +331,33 @@ def parse_outcar_result(
             pbc=(),
         )
 
-    if calculation_identity is not None:
-        if identity_evidence is None:
-            source_identity = identity_reader(Path(outcar_path).parent)
-            if not source_identity:
-                return rejected("missing_calculation_identity")
-            if any(
-                source_identity.get(key) != value
-                for key, value in comparison_identity.items()
-            ):
-                return rejected("incompatible_calculation_identity")
-        elif (
-            identity_evidence.outcar_path.resolve() != Path(outcar_path).resolve()
-            or identity_evidence.calculation_identity != comparison_items
+    if calculation_identity is None:
+        return rejected("missing_calculation_identity")
+    comparison_identity = _validated_identity(
+        calculation_identity,
+        label="expected VASP identity",
+    )
+
+    if identity_evidence is None:
+        source_identity = identity_reader(Path(outcar_path).parent)
+        if not source_identity:
+            return rejected("missing_calculation_identity")
+        if any(
+            source_identity.get(key) != value
+            for key, value in comparison_identity.items()
         ):
+            return rejected("incompatible_calculation_identity")
+    else:
+        if identity_evidence.outcar_path.resolve() != Path(outcar_path).resolve():
+            return rejected("incompatible_calculation_identity")
+        try:
+            evidence_identity = _validated_identity(
+                dict(identity_evidence.calculation_identity),
+                label="verified VASP identity",
+            )
+        except StateError:
+            return rejected("incompatible_calculation_identity")
+        if evidence_identity != comparison_identity:
             return rejected("incompatible_calculation_identity")
 
     try:
@@ -382,6 +493,8 @@ def parse_performance_evidence(outcar_text: str) -> VaspPerformanceEvidence:
 __all__ = [
     "DftOutputValidationError",
     "ResolvedVaspOutput",
+    "VaspJobEvidence",
+    "VaspRegistryEvidence",
     "VASP_COMPLETION_MARKERS",
     "VaspParseResult",
     "VaspPerformanceEvidence",
@@ -391,5 +504,6 @@ __all__ = [
     "parse_outcar_result",
     "parse_performance_evidence",
     "parse_virial_from_outcar",
+    "resolve_verified_output",
     "validate_dft_result_labels",
 ]

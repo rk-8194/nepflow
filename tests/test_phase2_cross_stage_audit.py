@@ -23,6 +23,8 @@ from common.model_manifest import (  # noqa: E402
     validate_model_run_manifest,
 )
 from nepflow.domain.identities import calculate_structure_id  # noqa: E402
+from nepflow.dft.vasp.inputs import read_identity  # noqa: E402
+from nepflow.dft.vasp.outputs import parse_outcar_result  # noqa: E402
 from nepflow.io.hashing import sha256_file  # noqa: E402
 from modules.train_nep import prepare as train_prepare  # noqa: E402
 from modules.train_nep.train_nep import TrainNepStage  # noqa: E402
@@ -98,17 +100,14 @@ def test_deterministic_dft_to_validation_identity_trace() -> None:
             json.dumps(calculation_identity), encoding="utf-8"
         )
 
-        with patch.object(
-            train_prepare,
-            "ase_read",
-            side_effect=lambda *_args, **_kwargs: read_dft_fixture_as_vasp_result(),
-        ):
-            accepted = train_prepare._parse_outcar_result(
-                outcar_path,
-                selected,
-                require_virial=True,
-                calculation_identity=calculation_identity,
-            )
+        accepted = parse_outcar_result(
+            outcar_path,
+            selected,
+            require_virial=True,
+            calculation_identity=calculation_identity,
+            reader=lambda _path: read_dft_fixture_as_vasp_result(),
+            identity_reader=read_identity,
+        )
 
         assert accepted.accepted, accepted.rejection_reason
         assert accepted.structure_id == calculation_identity["structure_hash"]

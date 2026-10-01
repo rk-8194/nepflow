@@ -16,13 +16,16 @@ from .inputs import (
 )
 from .outputs import (
     ResolvedVaspOutput,
+    VaspJobEvidence,
     VaspParseResult,
     VaspPerformanceEvidence,
+    VaspRegistryEvidence,
     outcar_is_complete,
     parse_outcar,
     parse_outcar_result,
     parse_performance_evidence,
     parse_virial_from_outcar,
+    resolve_verified_output,
 )
 from .recovery import (
     VaspRecoveryDecision,
@@ -36,9 +39,11 @@ __all__ = [
     "VaspBackend",
     "VaspFailureEvidence",
     "VaspInputIdentity",
+    "VaspJobEvidence",
     "VaspInputContext",
     "VaspParseResult",
     "VaspPerformanceEvidence",
+    "VaspRegistryEvidence",
     "VaspRecoveryDecision",
     "build_retry_levels_for_gpu",
     "build_input_context",
@@ -54,6 +59,7 @@ __all__ = [
     "parse_outcar_result",
     "parse_performance_evidence",
     "parse_virial_from_outcar",
+    "resolve_verified_output",
     "read_identity",
     "strip_resource_incar_params",
     "write_incar_resource_parameters",

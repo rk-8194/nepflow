@@ -1,10 +1,19 @@
 from configparser import ConfigParser
 
+import pytest
+
+from nepflow.dft.backend import DftCompletionEvidence, DftFailureEvidence
 from nepflow.dft.vasp.failures import (
     VaspFailureEvidence,
     classify_failure,
 )
+from nepflow.dft.vasp.backend import VaspBackend
+from nepflow.domain.identities import DftCalculationIdentity
+from nepflow.hpc.process import ProcessResult
 from nepflow.dft.vasp.recovery import build_retry_levels_for_gpu, decide_retry
+from nepflow.dft.vasp.recovery import write_incar_resource_parameters
+from nepflow.dft.vasp.inputs import hash_incar_text
+from nepflow.errors import VaspError
 
 
 def test_failure_classification_distinguishes_oom_from_incomplete(tmp_path) -> None:
@@ -30,3 +39,64 @@ def test_recovery_decision_records_the_next_resource_level() -> None:
     assert decision.reason == "oom_escalation"
     exhausted = decide_retry(levels, len(levels), max_retry_level=6)
     assert not exhausted.retry
+
+
+def test_backend_classifies_process_evidence_without_fabricating_paths() -> None:
+    calculation = DftCalculationIdentity("structure", "incar", "potcar")
+    backend = VaspBackend()
+    failed = backend.classify_failure(
+        DftFailureEvidence(
+            calculation=calculation,
+            completion=DftCompletionEvidence(completed=False),
+            process=ProcessResult(
+                command=("vasp_std",),
+                cwd=None,
+                returncode=9,
+                stdout="",
+                stderr="",
+                duration_seconds=0.1,
+            ),
+        )
+    )
+    assert failed.kind == "vasp_execution_failed"
+    assert not failed.recoverable
+
+    oom = backend.classify_failure(
+        DftFailureEvidence(
+            calculation=calculation,
+            completion=DftCompletionEvidence(completed=False),
+            markers=("oom_kill",),
+        )
+    )
+    assert oom.kind == "out_of_memory"
+    assert oom.recoverable
+
+
+def test_recovery_application_fails_explicitly_and_preserves_scientific_hash(tmp_path) -> None:
+    with pytest.raises(VaspError):
+        write_incar_resource_parameters(tmp_path, 4, 2)
+
+    incar = tmp_path / "INCAR"
+    original = "ENCUT = 520\nNCORE = 2\nKPAR = 1\n"
+    incar.write_text(original)
+    before = hash_incar_text(original)
+    write_incar_resource_parameters(tmp_path, 8, 4)
+    after = incar.read_text()
+    assert "NCORE = 8" in after
+    assert "KPAR = 4" in after
+    assert hash_incar_text(after) == before
+
+
+def test_recovery_write_failure_is_typed(monkeypatch, tmp_path) -> None:
+    incar = tmp_path / "INCAR"
+    incar.write_text("NCORE = 2\nKPAR = 1\n")
+    original_write_text = type(incar).write_text
+
+    def fail_write(path, *args, **kwargs):
+        if path == incar:
+            raise OSError("read-only test")
+        return original_write_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(type(incar), "write_text", fail_write)
+    with pytest.raises(VaspError, match="Could not apply"):
+        write_incar_resource_parameters(tmp_path, 8, 4)

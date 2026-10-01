@@ -8,6 +8,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
+from nepflow.errors import VaspError
+
 
 def build_retry_levels_for_gpu(
     starting_gpu: int,
@@ -76,7 +78,7 @@ def write_incar_resource_parameters(
     if not incar_path.exists():
         if warn is not None:
             warn(f"    INCAR not found: {incar_path}")
-        return
+        raise VaspError(f"Required VASP recovery artifact is missing: {incar_path}")
     try:
         content = incar_path.read_text(encoding="utf-8")
         output = []
@@ -91,9 +93,10 @@ def write_incar_resource_parameters(
             else:
                 output.append(line)
         incar_path.write_text("".join(output), encoding="utf-8")
-    except OSError as exc:
+    except (OSError, UnicodeError) as exc:
         if warn is not None:
             warn(f"    Failed to write INCAR: {exc}")
+        raise VaspError(f"Could not apply VASP recovery to {incar_path}: {exc}") from exc
 
 
 @dataclass(frozen=True, slots=True)

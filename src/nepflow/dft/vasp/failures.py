@@ -22,7 +22,7 @@ LEGACY_OOM_MARKER = ".vasp_oom_marker"
 class VaspFailureEvidence:
     """Filesystem evidence collected after a VASP job leaves the queue."""
 
-    job_directory: Path
+    job_directory: Path | None
     completed: bool
     oom_marker: bool
     output_log: str = ""
@@ -57,6 +57,12 @@ def classify_failure(evidence: VaspFailureEvidence) -> DftFailure:
             kind="out_of_memory",
             recoverable=True,
             reason="VASP runner reported an out-of-memory termination",
+        )
+    if evidence.returncode not in (None, 0):
+        return DftFailure(
+            kind="vasp_execution_failed",
+            recoverable=False,
+            reason=f"VASP process exited with return code {evidence.returncode}",
         )
     if evidence.output_log:
         return DftFailure(

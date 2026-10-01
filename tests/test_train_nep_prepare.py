@@ -17,7 +17,19 @@ from modules.run_vasp import _common as common
 from modules.train_nep import prepare as train_prepare
 from nepflow.errors import StateError
 from modules.train_nep import train_nep as train_stage_module
-from nepflow.domain.identities import calculate_structure_id
+from nepflow.domain.identities import DftCalculationIdentity, calculate_structure_id
+from nepflow.dft.vasp.inputs import (
+    hash_incar_text,
+    hash_potcar_bytes,
+    inject_incar_defaults,
+    read_identity,
+)
+from nepflow.dft.vasp.outputs import (
+    ResolvedVaspOutput,
+    VaspParseResult,
+    parse_outcar_result,
+    parse_virial_from_outcar,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -64,8 +76,55 @@ def make_atoms(
 
 
 def current_incar_hash() -> str:
-    incar = train_prepare.inject_incar_defaults("ENCUT = 520\n", ConfigParser())
-    return common.hash_incar_text(incar)
+    incar = inject_incar_defaults("ENCUT = 520\n", ConfigParser())
+    return hash_incar_text(incar)
+
+
+def calculation_identity_for(atoms: Atoms) -> dict[str, str]:
+    structure_id = calculate_structure_id(atoms)
+    return {
+        "structure_id": structure_id,
+        "incar_hash": current_incar_hash(),
+        "potcar_hash": hash_potcar_bytes(b"Si-potcar-v1"),
+        "calculation_id": DftCalculationIdentity(
+            structure_id=structure_id,
+            incar_hash=current_incar_hash(),
+            potcar_hash=hash_potcar_bytes(b"Si-potcar-v1"),
+        ).calculation_id,
+    }
+
+
+def canonical_parse(
+    outcar: Path,
+    selected: Atoms,
+    *,
+    parsed: Atoms | None = None,
+    reader_error: Exception | None = None,
+    require_virial: bool = False,
+    identity: dict[str, str] | None = None,
+    evidence: ResolvedVaspOutput | None = None,
+):
+    identity = identity or calculation_identity_for(selected)
+    evidence = evidence or ResolvedVaspOutput(
+        outcar_path=outcar,
+        calculation_identity=tuple(sorted(identity.items())),
+        verification_source="test",
+    )
+
+    def reader(_path: str) -> Atoms:
+        if reader_error is not None:
+            raise reader_error
+        return parsed if parsed is not None else selected
+
+    return parse_outcar_result(
+        outcar,
+        selected,
+        require_virial=require_virial,
+        calculation_identity=identity,
+        identity_evidence=evidence,
+        reader=reader,
+        identity_reader=read_identity,
+    )
 
 
 class TrainNepPrepareRegistryTests(unittest.TestCase):
@@ -96,7 +155,7 @@ class TrainNepPrepareRegistryTests(unittest.TestCase):
         identity = {
             "structure_hash": calculate_structure_id(atoms),
             "incar_hash": current_incar_hash(),
-            "potcar_hash": common.hash_potcar_bytes(b"Si-potcar-v1"),
+            "potcar_hash": hash_potcar_bytes(b"Si-potcar-v1"),
         }
         (struct_dir / ".vasp_identity").write_text(json.dumps(identity), encoding="utf-8")
         status = {"status": "completed"}
@@ -114,22 +173,31 @@ class TrainNepPrepareRegistryTests(unittest.TestCase):
 
     def test_extracts_energy_from_valid_outcar_fixture(self) -> None:
         outcar = FIXTURES / "outcar" / "valid_outcar"
-        with patch.object(train_prepare, "ase_read", return_value=self.parsed_outcar()):
-            result = train_prepare._parse_outcar(outcar, self.fixture_atoms())
+        result = canonical_parse(
+            outcar,
+            self.fixture_atoms(),
+            parsed=self.parsed_outcar(),
+        )
 
-        self.assertIsNotNone(result)
-        self.assertAlmostEqual(result["energy"], -10.5, places=12)
+        self.assertTrue(result.accepted)
+        self.assertAlmostEqual(result.energy_ev, -10.5, places=12)
 
     def test_extracts_per_atom_forces_from_valid_outcar_fixture(self) -> None:
         outcar = FIXTURES / "outcar" / "valid_outcar"
-        with patch.object(train_prepare, "ase_read", return_value=self.parsed_outcar()):
-            result = train_prepare._parse_outcar(outcar, self.fixture_atoms())
+        result = canonical_parse(
+            outcar,
+            self.fixture_atoms(),
+            parsed=self.parsed_outcar(),
+        )
 
-        self.assertIsNotNone(result)
-        np.testing.assert_allclose(result["forces"], [[0.1, 0.0, 0.0], [-0.1, 0.0, 0.0]])
+        self.assertTrue(result.accepted)
+        np.testing.assert_allclose(
+            result.forces_ev_per_angstrom,
+            [[0.1, 0.0, 0.0], [-0.1, 0.0, 0.0]],
+        )
 
     def test_converts_fixture_virial_with_explicit_units_and_order(self) -> None:
-        virial = train_prepare.parse_virial_from_outcar(
+        virial = parse_virial_from_outcar(
             FIXTURES / "outcar" / "valid_outcar", volume=27.0
         )
 
@@ -153,10 +221,13 @@ class TrainNepPrepareRegistryTests(unittest.TestCase):
 
     def test_rejects_unparsable_outcar_instead_of_falling_back(self) -> None:
         outcar = FIXTURES / "outcar" / "completed_without_stress"
-        with patch.object(train_prepare, "ase_read", side_effect=RuntimeError("bad OUTCAR")):
-            result = train_prepare._parse_outcar(outcar, self.fixture_atoms())
+        result = canonical_parse(
+            outcar,
+            self.fixture_atoms(),
+            reader_error=RuntimeError("bad OUTCAR"),
+        )
 
-        self.assertIsNone(result)
+        self.assertFalse(result.accepted)
 
     def test_malformed_vasp_identity_is_not_treated_as_missing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -165,7 +236,7 @@ class TrainNepPrepareRegistryTests(unittest.TestCase):
             (struct_dir / ".vasp_identity").write_text("{malformed", encoding="utf-8")
 
             with self.assertRaises(StateError):
-                train_prepare._read_identity(struct_dir)
+                read_identity(struct_dir)
 
     def test_debug_dataset_rejects_unlabelled_structure(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -192,34 +263,30 @@ class TrainNepPrepareRegistryTests(unittest.TestCase):
         outcar = FIXTURES / "outcar" / "valid_outcar"
         parsed_atoms = self.fixture_atoms(energy_available=False)
         selected_atoms = self.fixture_atoms(has_calculator=False)
-        with patch.object(train_prepare, "ase_read", return_value=parsed_atoms):
-            result = train_prepare._parse_outcar(outcar, selected_atoms)
+        result = canonical_parse(outcar, selected_atoms, parsed=parsed_atoms)
 
-        self.assertIsNone(result)
+        self.assertFalse(result.accepted)
 
     def test_rejects_missing_forces(self) -> None:
         outcar = FIXTURES / "outcar" / "valid_outcar"
         parsed_atoms = self.fixture_atoms(forces_available=False)
-        with patch.object(train_prepare, "ase_read", return_value=parsed_atoms):
-            result = train_prepare._parse_outcar(outcar, self.fixture_atoms())
+        result = canonical_parse(outcar, self.fixture_atoms(), parsed=parsed_atoms)
 
-        self.assertIsNone(result)
+        self.assertFalse(result.accepted)
 
     def test_rejects_atom_count_mismatch(self) -> None:
         outcar = FIXTURES / "outcar" / "valid_outcar"
         parsed_atoms = make_atoms("Si")
-        with patch.object(train_prepare, "ase_read", return_value=parsed_atoms):
-            result = train_prepare._parse_outcar(outcar, self.fixture_atoms())
+        result = canonical_parse(outcar, self.fixture_atoms(), parsed=parsed_atoms)
 
-        self.assertIsNone(result)
+        self.assertFalse(result.accepted)
 
     def test_rejects_species_mismatch(self) -> None:
         outcar = FIXTURES / "outcar" / "valid_outcar"
         parsed_atoms = make_atoms("Ge2")
-        with patch.object(train_prepare, "ase_read", return_value=parsed_atoms):
-            result = train_prepare._parse_outcar(outcar, self.fixture_atoms())
+        result = canonical_parse(outcar, self.fixture_atoms(), parsed=parsed_atoms)
 
-        self.assertIsNone(result)
+        self.assertFalse(result.accepted)
 
     def test_rejects_missing_required_virial(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -334,7 +401,7 @@ class TrainNepPrepareRegistryTests(unittest.TestCase):
             common.upsert_registry_entry(
                 root,
                 current_incar_hash(),
-                common.hash_potcar_bytes(b"Si-potcar-v1"),
+                hash_potcar_bytes(b"Si-potcar-v1"),
                 calculate_structure_id(atoms),
                 {"job_path": str(old_job.resolve())},
             )
@@ -359,15 +426,16 @@ class TrainNepPrepareRegistryTests(unittest.TestCase):
             identity = {
                 "structure_hash": calculate_structure_id(selected),
                 "incar_hash": current_incar_hash(),
-                "potcar_hash": common.hash_potcar_bytes(b"Si-potcar-v1"),
+                "potcar_hash": hash_potcar_bytes(b"Si-potcar-v1"),
             }
 
-            with patch.object(train_prepare, "ase_read", return_value=self.fixture_atoms()):
-                result = train_prepare._parse_outcar_result(
-                    outcar,
-                    selected,
-                    calculation_identity=identity,
-                )
+            result = parse_outcar_result(
+                outcar,
+                selected,
+                calculation_identity=identity,
+                reader=lambda _path: self.fixture_atoms(),
+                identity_reader=read_identity,
+            )
 
         self.assertFalse(result.accepted)
         self.assertEqual(result.rejection_reason, "missing_calculation_identity")
@@ -389,7 +457,7 @@ class TrainNepPrepareRegistryTests(unittest.TestCase):
             common.upsert_registry_entry(
                 root,
                 current_incar_hash(),
-                common.hash_potcar_bytes(b"Si-potcar-v1"),
+                hash_potcar_bytes(b"Si-potcar-v1"),
                 calculate_structure_id(registered_for),
                 {"job_path": str(old_job.resolve())},
             )
@@ -424,7 +492,7 @@ class TrainNepPrepareRegistryTests(unittest.TestCase):
             common.upsert_registry_entry(
                 root,
                 current_incar_hash(),
-                common.hash_potcar_bytes(b"Si-potcar-v1"),
+                hash_potcar_bytes(b"Si-potcar-v1"),
                 calculate_structure_id(atoms),
                 {"job_path": str(old_job.resolve())},
             )
@@ -626,7 +694,7 @@ class TrainNepMetadataTests(unittest.TestCase):
         force_unit: str = "eV/Angstrom",
         virial_convention: str = "positive_compression",
     ):
-        return train_prepare.VaspParseResult(
+        return VaspParseResult(
             structure_id=structure_id,
             calculation_identity=(
                 ("incar_hash", "incar-1"),
