@@ -10,7 +10,10 @@ pytest.importorskip("ase")
 pytest.importorskip("pymatgen")
 
 from modules.init.init import ConfigPrompt, InitStage
-from nepflow.state import StateStore
+from nepflow.config import load_config
+from nepflow.errors import ConfigurationError, StateError
+from nepflow.state import CURRENT_SCHEMA_VERSION, StateStore
+from nepflow.workflow.stages import StageRunState, WorkflowStage
 
 
 class InitConfigPromptTests(unittest.TestCase):
@@ -156,11 +159,114 @@ class InitConfigPromptTests(unittest.TestCase):
                 ):
                     stage.run()
 
+            config = load_config(project_dir / "config" / "project.config")
             with StateStore(project_dir / "state.db") as store:
                 project = store.get_project("demo")
+                stage_run = store.get_stage_run("demo:init")
 
             assert project is not None
             assert project["root_path"] == str(project_dir)
+            assert config.project.name == "demo"
+            assert project["config_fingerprint"] == project["metadata"]["config_fingerprint"]
+            assert project["metadata"]["config_schema_version"] == config.schema_version
+            assert project["metadata"]["state_schema_version"] == CURRENT_SCHEMA_VERSION
+            assert stage_run is not None
+            assert stage_run["stage"] == WorkflowStage.INIT.value
+            assert stage_run["status"] == StageRunState.RUNNING.value
+
+    def test_repeated_init_is_non_destructive_and_does_not_prompt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_dir = Path(tmp)
+            stage = self._make_stage(project_dir)
+            prompts = ["", "W", "", "BCC", "", "user@host:/opt/nepflow"]
+            with patch.dict(os.environ, {}, clear=True), patch(
+                "modules.init.init.input", side_effect=prompts
+            ):
+                stage.run()
+
+            config_path = project_dir / "config" / "project.config"
+            state_path = project_dir / "state.db"
+            first_config = config_path.read_bytes()
+            with StateStore(state_path) as store:
+                first_project = store.get_project("demo")
+                first_stage = store.get_stage_run("demo:init")
+
+            with patch("modules.init.init.input") as input_mock:
+                stage.run()
+
+            assert config_path.read_bytes() == first_config
+            input_mock.assert_not_called()
+            with StateStore(state_path) as store:
+                assert store.get_project("demo") == first_project
+                assert store.get_stage_run("demo:init") == first_stage
+
+    def test_invalid_rendered_config_does_not_create_authoritative_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_dir = Path(tmp)
+            stage = self._make_stage(project_dir)
+            invalid_config = "[project]\nname=demo\nschema_version=999\n"
+
+            with patch.object(stage, "_render_default_config", return_value=invalid_config):
+                with pytest.raises(ConfigurationError, match="schema_version"):
+                    with patch.dict(os.environ, {}, clear=True), patch(
+                        "modules.init.init.input", side_effect=["", "W", "", "BCC", "", ""]
+                    ):
+                        stage.run()
+
+            assert not (project_dir / "config" / "project.config").exists()
+            assert not (project_dir / "state.db").exists()
+
+    def test_state_transaction_rolls_back_project_when_stage_record_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_dir = Path(tmp)
+            stage = self._make_stage(project_dir)
+
+            with patch.object(
+                StateStore,
+                "upsert_stage_run",
+                side_effect=RuntimeError("stage write failed"),
+            ):
+                with pytest.raises(RuntimeError, match="stage write failed"):
+                    with patch.dict(os.environ, {}, clear=True), patch(
+                        "modules.init.init.input", side_effect=["", "W", "", "BCC", "", ""]
+                    ):
+                        stage.run()
+
+            with StateStore(project_dir / "state.db") as store:
+                assert store.get_project("demo") is None
+                assert store.get_stage_run("demo:init") is None
+
+    def test_corrupt_existing_state_fails_without_replacing_it(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_dir = Path(tmp)
+            state_path = project_dir / "state.db"
+            state_path.parent.mkdir(parents=True)
+            state_path.write_bytes(b"not a sqlite database")
+            stage = self._make_stage(project_dir)
+
+            with pytest.raises(StateError, match="state database"):
+                stage.run()
+
+            assert state_path.read_bytes() == b"not a sqlite database"
+
+    def test_existing_state_without_config_requires_explicit_repair(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_dir = Path(tmp)
+            project_dir.mkdir(parents=True, exist_ok=True)
+            with StateStore(project_dir / "state.db"):
+                pass
+
+            with pytest.raises(ConfigurationError, match="canonical config"):
+                self._make_stage(project_dir).run()
+
+    def test_legacy_marker_requires_explicit_migration(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_dir = Path(tmp)
+            project_dir.mkdir(parents=True, exist_ok=True)
+            (project_dir / ".project").write_text("generate", encoding="utf-8")
+
+            with pytest.raises(StateError, match="explicit migration"):
+                self._make_stage(project_dir).run()
 
 
 if __name__ == "__main__":

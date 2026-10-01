@@ -133,6 +133,7 @@ _ALLOWED_KEYS: dict[str, frozenset[str]] = {
         "train_nep_walltime",
         "poll_interval",
         "max_retry_level",
+        "vasp_walltime",
         "gpumd_walltime",
         "gpumd_nodes",
         "gpumd_gpus",

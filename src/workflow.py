@@ -21,6 +21,7 @@ from modules import (
 from modules.validate.launcher import read_validation_status
 from modules.run_vasp._common import read_status
 from nepflow.io.atomic import atomic_write_text
+from nepflow.config import canonical_config_path
 from nepflow.errors import StateError
 from nepflow.state import StateStore
 from nepflow.workflow.resubmission import (
@@ -89,21 +90,24 @@ class WorkflowController:
         
         # Derived paths - config is now per-project
         self.config_dir = self.project_dir / "config"
-        self.config_file = self.config_dir / f"{project_name}.yaml"
+        self.config_file = canonical_config_path(self.project_dir)
         self.project_file = self.project_dir / ".project"
         self.state_file = self.project_dir / "state.db"
         self.log_dir = self.project_dir / "logs"
 
         # The controller remains in its legacy location until Phase 4, but
-        # stage identity is already ledger-backed.  This bridge does not read
-        # or migrate any legacy state file beyond the .project cache marker.
-        self._state_store = StateStore(self.state_file)
-        if self._state_store.get_project(self.project_name) is None:
-            self._state_store.upsert_project(
-                self.project_name,
-                name=self.project_name,
-                root_path=str(self.project_dir),
-            )
+        # stage identity is already ledger-backed.  Initialization must own
+        # the first authoritative write, so do not create/populate state.db
+        # before InitStage has validated and installed the canonical config.
+        self._state_store = None
+        if not self.init_mode:
+            self._state_store = StateStore(self.state_file)
+            if self._state_store.get_project(self.project_name) is None:
+                self._state_store.upsert_project(
+                    self.project_name,
+                    name=self.project_name,
+                    root_path=str(self.project_dir),
+                )
         
         logger.info("Initialized controller for project: %s", project_name)
         if self.debug:
@@ -607,9 +611,16 @@ class WorkflowController:
         # If in init mode, only run initialization
         if self.init_mode:
             logger.info("Running in init mode - initializing project only")
-            self._determine_current_stage()
             self._initialize()
-            self._set_current_stage(WorkflowStage.GENERATE)
+            self._state_store = StateStore(self.state_file)
+            current = self._determine_current_stage()
+            if current is WorkflowStage.INIT:
+                self._set_current_stage(WorkflowStage.GENERATE)
+            elif current is not WorkflowStage.GENERATE:
+                raise StateError(
+                    "Project initialization cannot move an existing workflow backward; "
+                    f"current stage is {current.value!r}"
+                )
             logger.info("Project initialization complete. Initialization stage finished.")
             if not self.local_mode and not self.debug:
                 return

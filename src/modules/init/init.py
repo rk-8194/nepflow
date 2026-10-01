@@ -1,14 +1,21 @@
 """Project initialization stage."""
 
-from dataclasses import dataclass
 import logging
 import os
+import tempfile
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable, Iterable
 
 from ase.data import chemical_symbols
 
 from ..base import Stage
-from nepflow.state import StateStore
+from nepflow.config import NepflowConfig, canonical_config_path, load_config
+from nepflow.errors import ConfigurationError, StateError
+from nepflow.io.atomic import atomic_write_text
+from nepflow.io.hashing import sha256_canonical_json
+from nepflow.state import CURRENT_SCHEMA_VERSION, StateStore
+from nepflow.workflow.stages import StageRunState, StageRunStatus, WorkflowStage
 
 logger = logging.getLogger(__name__)
 
@@ -140,27 +147,45 @@ CONFIG_PROMPTS: tuple[ConfigPrompt, ...] = (
 
 class InitStage(Stage):
     """Initialize a new project."""
-    
+
     def run(self) -> None:
         """Execute initialization."""
         logger.info("Initializing project")
-        
-        # Create project directory structure
-        self._create_directories()
-        
-        # Load or create config
-        self._setup_config()
 
-        # Establish the authoritative ledger without migrating legacy marker
-        # files. Later stage migrations can reconcile those files explicitly.
-        with StateStore(self.state_file) as store:
-            store.upsert_project(
-                self.project_name,
-                name=self.project_name,
-                root_path=str(self.project_dir),
-            )
-        
+        # Validate an existing ledger before creating or interpreting any
+        # project files.  StateStore owns schema creation and corruption
+        # detection; InitStage only supplies the initialization record.
+        if self.state_file.exists():
+            self._validate_existing_state()
+
+        self._create_directories()
+
+        config_path = canonical_config_path(self.project_dir)
+        config_was_present = config_path.is_file()
+        config = self._setup_config()
+        try:
+            self._initialize_state(config)
+        except BaseException:
+            # A newly rendered config is not useful without its authoritative
+            # ledger.  Remove only the file created by this invocation; an
+            # existing config is never destroyed during failed initialization.
+            if not config_was_present:
+                try:
+                    config_path.unlink(missing_ok=True)
+                except OSError:
+                    logger.warning("Could not remove failed initialization config: %s", config_path)
+            raise
+
         logger.info("Project initialization complete")
+
+    def _validate_existing_state(self) -> None:
+        """Open an existing ledger so StateStore applies its strict checks."""
+        with StateStore(self.state_file) as store:
+            if store.schema_version != CURRENT_SCHEMA_VERSION:
+                raise StateError(
+                    "Existing project state uses an unsupported schema version: "
+                    f"{store.schema_version}"
+                )
     
     def _create_directories(self) -> None:
         """Create project directory structure."""
@@ -185,33 +210,39 @@ class InitStage(Stage):
             d.mkdir(parents=True, exist_ok=True)
             logger.debug("Created directory: %s", d)
     
-    def _setup_config(self) -> None:
+    def _setup_config(self) -> NepflowConfig:
         """Load or create configuration."""
         config_dir = self.project_dir / "config"
-        project_config_file = config_dir / "project.config"
-        
-        # Create default project.config if it doesn't exist
-        if not project_config_file.exists():
+        project_config_file = canonical_config_path(self.project_dir)
+        legacy_config = self.config_file
+
+        if project_config_file.is_file():
+            config = load_config(project_config_file, project_name=self.project_name)
+            self._validate_project_identity(config)
+        else:
+            if self.state_file.exists():
+                raise ConfigurationError(
+                    "Existing state.db has no canonical config at "
+                    f"{project_config_file}; restore it or perform an explicit migration"
+                )
+            legacy_marker = self.project_dir / ".project"
+            if legacy_marker.exists():
+                raise StateError(
+                    "Legacy project state was found at "
+                    f"{legacy_marker}; perform an explicit migration before initialization"
+                )
+            if legacy_config.exists() and legacy_config.resolve() != project_config_file.resolve():
+                raise ConfigurationError(
+                    "Only the canonical project.config is supported; migrate the existing "
+                    f"config explicitly from {legacy_config}"
+                )
             self._print_init_header()
             prompt_values = self._collect_prompt_values(CONFIG_PROMPTS)
             default_config = self._render_default_config(prompt_values)
-            try:
-                with open(project_config_file, "w", encoding="utf-8") as f:
-                    f.write(default_config)
-                logger.info("Created default project config: %s", project_config_file)
-            except IOError as e:
-                logger.error("Failed to create project config file: %s", e)
-                raise
-        else:
-            logger.debug("Project config file already exists: %s", project_config_file)
-        
-        # Check for per-project YAML config
-        if self.config_file.exists():
-            logger.debug("Config file already exists: %s", self.config_file)
-        else:
-            logger.debug("Config file not found: %s", self.config_file)
-            logger.info("Please create config file at: %s", self.config_file)
-        
+
+            config = self._write_validated_config(project_config_file, default_config)
+            logger.info("Created default project config: %s", project_config_file)
+
         # Log template directory location
         logger.info("Project config directory: %s", config_dir)
         logger.info("  - Project config: %s", project_config_file)
@@ -219,6 +250,108 @@ class InitStage(Stage):
         logger.info("  - NEP templates: %s", config_dir / "nep")
         logger.info("  - GPUMD templates: %s", config_dir / "gpumd")
         logger.info("  - VASP templates: %s", config_dir / "vasp")
+        return config
+
+    def _write_validated_config(self, config_path: Path, rendered: str) -> NepflowConfig:
+        """Validate rendered text before atomically installing the config."""
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary_path: Path | None = None
+        file_descriptor: int | None = None
+        try:
+            file_descriptor, temporary_name = tempfile.mkstemp(
+                prefix=f".{config_path.name}.",
+                suffix=".tmp",
+                dir=config_path.parent,
+            )
+            os.close(file_descriptor)
+            file_descriptor = None
+            temporary_path = Path(temporary_name)
+            atomic_write_text(temporary_path, rendered, encoding="utf-8")
+            config = load_config(temporary_path, project_name=self.project_name)
+            self._validate_project_identity(config)
+            atomic_write_text(config_path, rendered, encoding="utf-8")
+            config = load_config(config_path, project_name=self.project_name)
+            self._validate_project_identity(config)
+            return config
+        finally:
+            if file_descriptor is not None:
+                os.close(file_descriptor)
+            if temporary_path is not None:
+                try:
+                    temporary_path.unlink(missing_ok=True)
+                except OSError:
+                    logger.warning("Could not remove temporary config: %s", temporary_path)
+
+    def _validate_project_identity(self, config: NepflowConfig) -> None:
+        """Ensure the typed config belongs to this runtime project."""
+        if config.project.name != self.project_name:
+            raise ConfigurationError(
+                "Project config name does not match the requested project: "
+                f"{config.project.name!r} != {self.project_name!r}"
+            )
+
+    def _initialize_state(self, config: NepflowConfig) -> None:
+        """Record project and initial workflow state through StateStore APIs."""
+        config_fingerprint = sha256_canonical_json(
+            config.effective_mapping(redact_secrets=True)
+        )
+        project_root = str(self.project_dir.resolve())
+        metadata = {
+            "project_id": self.project_name,
+            "project_name": config.project.name,
+            "config_fingerprint": config_fingerprint,
+            "config_schema_version": config.schema_version,
+            "config_version": config.project.config_version,
+            "state_schema_version": CURRENT_SCHEMA_VERSION,
+            "initial_stage": WorkflowStage.INIT.value,
+        }
+
+        with StateStore(self.state_file) as store:
+            existing = store.get_project(self.project_name)
+            if existing is not None:
+                existing_root = existing.get("root_path")
+                if existing_root and str(Path(existing_root).resolve()) != project_root:
+                    raise StateError(
+                        "Existing project state belongs to a different project root: "
+                        f"{existing_root}"
+                    )
+                if existing.get("config_fingerprint") != config_fingerprint:
+                    raise StateError(
+                        "Existing project has a different configuration fingerprint; "
+                        "refusing to overwrite authoritative state"
+                    )
+                existing_metadata = existing.get("metadata")
+                if not isinstance(existing_metadata, dict) or any(
+                    existing_metadata.get(key) != value
+                    for key, value in metadata.items()
+                ):
+                    raise StateError(
+                        "Existing project metadata is incomplete or incompatible; "
+                        "perform an explicit state migration"
+                    )
+
+                latest = store.get_latest_stage_run(self.project_name)
+                if latest is not None:
+                    StageRunStatus.from_mapping(latest)
+                    return
+
+            with store.transaction():
+                if existing is None:
+                    store.upsert_project(
+                        self.project_name,
+                        name=config.project.name,
+                        root_path=project_root,
+                        config_fingerprint=config_fingerprint,
+                        metadata=metadata,
+                    )
+                store.upsert_stage_run(
+                    f"{self.project_name}:{WorkflowStage.INIT.value}",
+                    self.project_name,
+                    WorkflowStage.INIT.value,
+                    status=StageRunState.RUNNING.value,
+                    input_fingerprint=config_fingerprint,
+                    metadata=metadata,
+                )
 
     def _collect_prompt_values(self, prompts: Iterable[ConfigPrompt]) -> dict[str, str]:
         """
@@ -295,6 +428,7 @@ name={project_name}
 description=NEPFlow project for atomic structure generation and validation
 status=initialized
 schema_version=1
+config_version=1
 # Random seed for reproducibility (used across all stages)
 random_seed=42
 
