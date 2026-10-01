@@ -29,12 +29,19 @@ def test_same_stage_resume_is_valid() -> None:
     assert validate_transition(WorkflowStage.VALIDATE, "validate") is WorkflowStage.VALIDATE
 
 
+def test_validate_to_completed_is_valid() -> None:
+    assert (
+        validate_transition(WorkflowStage.VALIDATE, WorkflowStage.COMPLETED)
+        is WorkflowStage.COMPLETED
+    )
+
+
 @pytest.mark.parametrize(
     ("previous", "target"),
     [
         (WorkflowStage.SELECT, WorkflowStage.GENERATE),
         (WorkflowStage.GENERATE, WorkflowStage.RUN_VASP),
-        (WorkflowStage.VALIDATE, WorkflowStage.COMPLETED),
+        (WorkflowStage.TRAIN_NEP, WorkflowStage.COMPLETED),
         (WorkflowStage.COMPLETED, WorkflowStage.VALIDATE),
     ],
 )

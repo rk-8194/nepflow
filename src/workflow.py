@@ -3,7 +3,7 @@ Workflow controller and stage orchestration.
 """
 
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import logging
 import time
 
@@ -20,6 +20,7 @@ from modules import (
 )
 from modules.validate.launcher import read_validation_status
 from modules.run_vasp._common import read_status
+from nepflow.io.atomic import atomic_write_text
 from nepflow.errors import StateError
 from nepflow.state import StateStore
 from nepflow.workflow.resubmission import (
@@ -36,10 +37,6 @@ from nepflow.workflow.stages import (
 )
 
 logger = logging.getLogger("nepflow.workflow")
-
-
-class _InvalidWorkflowMarkerError(StateError, ValueError):
-    """Keep the legacy ValueError surface while exposing typed state failure."""
 
 
 class WorkflowController:
@@ -169,27 +166,32 @@ class WorkflowController:
         try:
             return parse_legacy_stage(marker)
         except StateError as exc:
-            raise _InvalidWorkflowMarkerError(
+            raise StateError(
                 f"Invalid workflow stage marker in {self.project_file}: {exc}"
             ) from exc
 
     def _read_authoritative_stage(
         self,
-    ) -> tuple[WorkflowStage | None, WorkflowStage | None, StageRunStatus | None]:
-        """Read the store and marker without allowing either to mask the other."""
+    ) -> tuple[
+        WorkflowStage | None,
+        WorkflowStage | None,
+        StageRunStatus | None,
+        StateError | None,
+    ]:
+        """Read StateStore and marker values without choosing an authority."""
 
-        marker_stage = self._read_marker_stage()
         row = self._state_store.get_latest_stage_run(self.project_name)
         stored_run = StageRunStatus.from_mapping(row) if row is not None else None
         stored_stage = stored_run.stage if stored_run is not None else None
-
-        if stored_stage is not None and marker_stage is not None:
-            if stored_stage is not marker_stage:
-                raise StateError(
-                    "Workflow stage marker contradicts authoritative state: "
-                    f"marker={marker_stage.value!r}, store={stored_stage.value!r}"
-                )
-        return stored_stage or marker_stage, marker_stage, stored_run
+        marker_stage: WorkflowStage | None = None
+        marker_error: StateError | None = None
+        try:
+            marker_stage = self._read_marker_stage()
+        except StateError as exc:
+            # Reconciliation decides whether this malformed cache can be
+            # repaired from an existing authoritative StateStore row.
+            marker_error = exc
+        return stored_stage, marker_stage, stored_run, marker_error
 
     def _stage_run_id(self, stage: WorkflowStage) -> str:
         """Return the stable ledger identity for this project's stage."""
@@ -222,7 +224,11 @@ class WorkflowController:
 
         try:
             self.project_file.parent.mkdir(parents=True, exist_ok=True)
-            self.project_file.write_text(stage_to_legacy(stage), encoding="utf-8")
+            atomic_write_text(
+                self.project_file,
+                stage_to_legacy(stage),
+                encoding="utf-8",
+            )
         except OSError as exc:
             logger.error("Failed to write project file %s: %s", self.project_file, exc)
             raise
@@ -230,19 +236,36 @@ class WorkflowController:
     def _reconcile_stage(self) -> ReconciliationResult:
         """Reconcile legacy marker state with the StateStore ledger."""
 
-        stage, marker_stage, stored_run = self._read_authoritative_stage()
+        stored_stage, marker_stage, stored_run, marker_error = (
+            self._read_authoritative_stage()
+        )
         if stored_run is not None:
-            if marker_stage is None:
-                # The marker is only a compatibility cache; repair a missing
-                # cache from authoritative state, never the reverse.
+            marker_needs_repair = marker_error is not None or marker_stage is not stored_stage
+            if marker_needs_repair:
+                # The marker is only a compatibility cache; repair missing,
+                # malformed, and stale values from authoritative state.
                 self._write_stage_marker(stored_run.stage)
+            if marker_error is not None:
+                reason = "repaired invalid legacy marker from StateStore"
+            elif marker_stage is None:
+                reason = "repaired missing legacy marker from StateStore"
+            elif marker_stage is not stored_stage:
+                reason = "repaired stale legacy marker from StateStore"
+            else:
+                reason = None
             return ReconciliationResult(
                 stage=stored_run.stage,
                 source="state_store",
                 marker_stage=marker_stage,
                 authoritative_stage=stored_run.stage,
-                changed=marker_stage is None,
+                changed=marker_needs_repair,
+                reason=reason,
             )
+
+        if marker_error is not None:
+            # Without authoritative state there is nothing safe to repair
+            # from, so preserve the explicit corruption failure.
+            raise marker_error
 
         if marker_stage is not None:
             # Existing projects have no stage-run history yet.  This one-time
@@ -302,13 +325,12 @@ class WorkflowController:
         """
 
         target = parse_legacy_stage(stage)
-        current, marker_stage, stored_run = self._read_authoritative_stage()
-        if current is None:
-            # Only INIT is a valid empty-ledger state.  The init-mode bridge
-            # calls _determine_current_stage before advancing to GENERATE.
-            validate_transition(None, target)
-        else:
-            validate_transition(current, target)
+        current = self._reconcile_stage().stage
+        row = self._state_store.get_latest_stage_run(self.project_name)
+        stored_run = StageRunStatus.from_mapping(row) if row is not None else None
+        if stored_run is None:
+            raise StateError("Workflow stage reconciliation did not create authoritative state")
+        validate_transition(current, target)
 
         now = self._timestamp()
         with self._state_store.transaction():
@@ -316,13 +338,17 @@ class WorkflowController:
                 self._record_stage(
                     current,
                     status=StageRunState.COMPLETED,
-                    started_at=(stored_run.started_at if stored_run is not None else now),
+                    started_at=stored_run.started_at,
                     completed_at=now,
                     metadata={"source": "workflow_controller"},
                 )
                 # Make the new stage the most recent row even when both rows
                 # are transitioned within the same microsecond.
                 target_started_at = self._timestamp()
+                if target_started_at <= now:
+                    target_started_at = (
+                        datetime.fromisoformat(now) + timedelta(microseconds=1)
+                    ).isoformat()
             else:
                 target_started_at = now
             self._record_stage(

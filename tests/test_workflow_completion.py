@@ -138,7 +138,7 @@ def test_debug_completion_uses_persisted_validation_evidence(tmp_path: Path) -> 
 def test_corrupt_workflow_stage_is_not_reset_to_init(tmp_path: Path) -> None:
     controller = make_controller(tmp_path, stage="not-a-stage")
 
-    with pytest.raises(ValueError, match="Invalid workflow stage"):
+    with pytest.raises(StateError, match="Invalid workflow stage"):
         controller._determine_current_stage()
 
 
