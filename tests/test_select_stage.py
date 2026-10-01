@@ -25,6 +25,7 @@ pytest.importorskip("NepTrainKit")
 
 from common import descriptors as DESCRIPTORS  # noqa: E402
 from modules.select import select as select_module  # noqa: E402
+from nepflow.errors import ConfigurationError
 
 SelectStage = select_module.SelectStage
 
@@ -182,7 +183,7 @@ class SelectStageTests(unittest.TestCase):
             project_dir = Path(tmp)
             write_project_config(project_dir, frontier_fraction=0.0)
             stage = self.create_stage(project_dir)
-            with self.assertRaisesRegex(ValueError, "frontier_fraction"):
+            with self.assertRaisesRegex(ConfigurationError, "frontier_fraction"):
                 stage.load_config()
 
     def test_descriptor_loader_rejects_shape_only_cache_without_identity(self) -> None:

@@ -123,22 +123,6 @@ class SelectStage(Stage):
                 "selection", "nep_model_file", fallback="nep89.txt"
             ),
         }
-        if not 0.0 < settings["composition_aware_fps_frontier_fraction"] <= 1.0:
-            raise ValueError(
-                "selection.composition_aware_fps_frontier_fraction must be in (0, 1]"
-            )
-        if settings["composition_aware_fps_ternary_weight"] < 0.0:
-            raise ValueError(
-                "selection.composition_aware_fps_ternary_weight must be >= 0"
-            )
-        if settings["composition_aware_fps_adaptive_retries"] < 1:
-            raise ValueError(
-                "selection.composition_aware_fps_adaptive_retries must be >= 1"
-            )
-        if not 0.0 < settings["composition_aware_fps_descriptor_floor_fraction"] <= 1.0:
-            raise ValueError(
-                "selection.composition_aware_fps_descriptor_floor_fraction must be in (0, 1]"
-            )
         return config, settings
 
     def prepare(self) -> dict | None:
