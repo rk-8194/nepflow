@@ -99,6 +99,21 @@ def hash_potcar_bytes(potcar_bytes: bytes) -> str:
     return sha256_bytes(potcar_bytes)
 
 
+def validate_completed_registry(data: dict, path: Path | None = None) -> dict:
+    """Validate the shared completed-VASP registry schema."""
+    location = f" in {path}" if path is not None else ""
+    version = data.get("version")
+    if (
+        isinstance(version, bool)
+        or not isinstance(version, int)
+        or version != VASP_REGISTRY_VERSION
+    ):
+        raise ArtifactError(f"Unsupported VASP registry version{location}: {version!r}")
+    if "jobs" not in data or not isinstance(data["jobs"], dict):
+        raise ArtifactError(f"VASP registry jobs must be an object{location}")
+    return data
+
+
 def read_completed_registry(nepflow_root: Path) -> dict:
     """Read the shared completed-VASP registry."""
     path = completed_jobs_registry_path(nepflow_root)
@@ -107,18 +122,7 @@ def read_completed_registry(nepflow_root: Path) -> dict:
         default={"version": VASP_REGISTRY_VERSION, "jobs": {}},
         error_type=ArtifactError,
     )
-    version = data.get("version")
-    if (
-        isinstance(version, bool)
-        or not isinstance(version, int)
-        or version != VASP_REGISTRY_VERSION
-    ):
-        raise ArtifactError(
-            f"Unsupported VASP registry version in {path}: {version!r}"
-        )
-    if "jobs" not in data or not isinstance(data["jobs"], dict):
-        raise ArtifactError(f"VASP registry jobs must be an object: {path}")
-    return data
+    return validate_completed_registry(data, path)
 
 
 def write_completed_registry(nepflow_root: Path, registry: dict) -> None:

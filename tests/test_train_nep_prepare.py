@@ -15,6 +15,7 @@ from ase.calculators.singlepoint import SinglePointCalculator  # noqa: E402
 
 from modules.run_vasp import _common as common
 from modules.train_nep import prepare as train_prepare
+from nepflow.errors import StateError
 from modules.train_nep import train_nep as train_stage_module
 from nepflow.domain.identities import calculate_structure_id
 
@@ -163,7 +164,7 @@ class TrainNepPrepareRegistryTests(unittest.TestCase):
             struct_dir.mkdir()
             (struct_dir / ".vasp_identity").write_text("{malformed", encoding="utf-8")
 
-            with self.assertRaises(ValueError):
+            with self.assertRaises(StateError):
                 train_prepare._read_identity(struct_dir)
 
     def test_debug_dataset_rejects_unlabelled_structure(self) -> None:

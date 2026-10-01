@@ -14,7 +14,7 @@ from nepflow.io.hashing import (
     sha256_file,
     sha256_text,
 )
-from nepflow.io.json import canonical_json_bytes, read_json, write_json
+from nepflow.io.json import canonical_json_bytes, read_json, read_json_object, write_json
 
 
 def test_file_hash_is_deterministic(tmp_path) -> None:
@@ -53,12 +53,58 @@ def test_malformed_json_raises_state_error(tmp_path) -> None:
         read_json(path)
 
 
+@pytest.mark.parametrize("constant", ["NaN", "Infinity", "-Infinity"])
+def test_non_standard_json_constants_are_rejected(tmp_path, constant) -> None:
+    path = tmp_path / "non-standard.json"
+    path.write_text(f'{{"nested": {{"value": {constant}}}}}', encoding="utf-8")
+
+    with pytest.raises(StateError):
+        read_json(path)
+
+
+def test_required_and_optional_json_files_are_explicit(tmp_path) -> None:
+    missing = tmp_path / "missing.json"
+
+    with pytest.raises(FileNotFoundError):
+        read_json(missing)
+    with pytest.raises(ArtifactError):
+        read_json(missing, missing_error_type=ArtifactError)
+    assert read_json_object(missing, default={}) == {}
+
+
+def test_json_object_default_is_validated(tmp_path) -> None:
+    with pytest.raises(ArtifactError):
+        read_json_object(
+            tmp_path / "missing.json",
+            default=[],
+            error_type=ArtifactError,
+        )
+
+
+def test_malformed_json_can_use_artifact_error(tmp_path) -> None:
+    path = tmp_path / "broken.json"
+    path.write_text("{not-json", encoding="utf-8")
+
+    with pytest.raises(ArtifactError):
+        read_json(path, error_type=ArtifactError)
+
+
 def test_required_and_optional_missing_file_hashes_are_explicit(tmp_path) -> None:
     path = tmp_path / "missing.bin"
 
     with pytest.raises(ArtifactError):
         sha256_file(path)
     assert sha256_file(path, required=False) is None
+
+
+def test_optional_hash_still_rejects_unreadable_artifact(tmp_path) -> None:
+    directory = tmp_path / "artifact-directory"
+    directory.mkdir()
+
+    with pytest.raises(ArtifactError):
+        sha256_file(directory)
+    with pytest.raises(ArtifactError):
+        sha256_file(directory, required=False)
 
 
 def test_atomic_replacement_succeeds(tmp_path) -> None:
@@ -80,6 +126,21 @@ def test_failed_atomic_replace_preserves_target_and_cleans_temp(tmp_path, monkey
     monkeypatch.setattr(atomic_module.os, "replace", fail_replace)
     with pytest.raises(OSError, match="controlled replace failure"):
         atomic_write_text(path, "partial content")
+
+    assert path.read_text(encoding="utf-8") == "valid"
+    assert list(tmp_path.glob(f".{path.name}.*.tmp")) == []
+
+
+def test_failed_atomic_fsync_preserves_target_and_cleans_temp(tmp_path, monkeypatch) -> None:
+    path = tmp_path / "state.json"
+    path.write_text("valid", encoding="utf-8")
+
+    def fail_fsync(_file_descriptor):
+        raise OSError("controlled fsync failure")
+
+    monkeypatch.setattr(atomic_module.os, "fsync", fail_fsync)
+    with pytest.raises(OSError, match="controlled fsync failure"):
+        atomic_write_text(path, "partial content", durable=True)
 
     assert path.read_text(encoding="utf-8") == "valid"
     assert list(tmp_path.glob(f".{path.name}.*.tmp")) == []

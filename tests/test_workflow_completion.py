@@ -4,6 +4,7 @@ from unittest.mock import patch
 import pytest
 
 from modules.validate.launcher import write_validation_status
+from nepflow.errors import StateError
 from workflow import WorkflowController
 
 
@@ -97,7 +98,7 @@ def test_corrupt_validation_status_propagates_without_completion(tmp_path: Path)
     status_file.write_text("{malformed", encoding="utf-8")
 
     with patch.object(controller, "_validate") as validate_mock:
-        with pytest.raises(ValueError, match="validation status"):
+        with pytest.raises(StateError):
             controller.run()
 
     validate_mock.assert_called_once_with()
@@ -147,5 +148,5 @@ def test_corrupt_vasp_status_is_not_reported_as_pending(tmp_path: Path) -> None:
     status_file.parent.mkdir(parents=True)
     status_file.write_text("{malformed", encoding="utf-8")
 
-    with pytest.raises(ValueError, match="VASP status"):
+    with pytest.raises(StateError):
         controller._print_status_summary()

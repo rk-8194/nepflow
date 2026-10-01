@@ -14,6 +14,7 @@ pytest.importorskip("pymatgen")
 from modules.train_nep import submit as submit_module
 from modules.train_nep import launcher as launcher_module
 from modules.train_nep.train_nep import TrainNepStage
+from nepflow.errors import StateError
 
 
 class SubmitTrainingJobTests(unittest.TestCase):
@@ -83,7 +84,7 @@ class SubmitTrainingJobTests(unittest.TestCase):
             status_file.parent.mkdir(parents=True)
             status_file.write_text("{malformed", encoding="utf-8")
 
-            with self.assertRaises(ValueError):
+            with self.assertRaises(StateError):
                 launcher_module.read_train_status(project_dir)
 
     def test_incomplete_training_state_is_not_treated_as_a_new_run(self) -> None:

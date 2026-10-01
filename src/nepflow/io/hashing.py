@@ -8,7 +8,7 @@ from typing import Any
 
 from nepflow.errors import ArtifactError
 
-from .json import canonical_json_bytes
+from .json import canonical_json_bytes as _canonical_json_bytes
 
 
 def sha256_bytes(value: bytes) -> str:
@@ -50,11 +50,10 @@ def sha256_file(
 def sha256_canonical_json(value: Any) -> str:
     """Hash a JSON-compatible value using canonical JSON bytes."""
 
-    return sha256_bytes(canonical_json_bytes(value))
+    return sha256_bytes(_canonical_json_bytes(value))
 
 
 __all__ = [
-    "canonical_json_bytes",
     "sha256_bytes",
     "sha256_canonical_json",
     "sha256_file",

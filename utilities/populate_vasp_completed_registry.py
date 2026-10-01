@@ -33,11 +33,15 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from nepflow.domain.identities import DftCalculationIdentity, calculate_structure_id
+from nepflow.errors import ArtifactError
 from nepflow.io.hashing import sha256_bytes, sha256_file
-from nepflow.io.json import read_json, write_json
+from nepflow.io.json import read_json_object, write_json
+from modules.run_vasp._common import (
+    VASP_REGISTRY_VERSION,
+    validate_completed_registry,
+)
 
 VASP_COMPLETION_MARKERS = ["General timing", "Voluntary context switches"]
-VASP_REGISTRY_VERSION = 1
 
 
 def outcar_is_complete(outcar_path: Path) -> bool:
@@ -183,15 +187,12 @@ def _invert_3x3(matrix: list[list[float]]) -> list[list[float]]:
 
 
 def read_registry(registry_path: Path) -> dict:
-    if not registry_path.exists():
-        return {"version": VASP_REGISTRY_VERSION, "jobs": {}}
-    try:
-        data = read_json(registry_path, error_type=ValueError, require_object=True)
-    except (FileNotFoundError, ValueError) as e:
-        sys.exit(f"Error: could not read {registry_path}: {e}")
-    data.setdefault("version", VASP_REGISTRY_VERSION)
-    data.setdefault("jobs", {})
-    return data
+    data = read_json_object(
+        registry_path,
+        default={"version": VASP_REGISTRY_VERSION, "jobs": {}},
+        error_type=ArtifactError,
+    )
+    return validate_completed_registry(data, registry_path)
 
 
 def write_registry(registry_path: Path, registry: dict) -> None:
@@ -333,7 +334,10 @@ def main() -> None:
     if not projects_dir.is_dir():
         sys.exit(f"Error: projects directory not found: {projects_dir}")
 
-    registry = read_registry(registry_path)
+    try:
+        registry = read_registry(registry_path)
+    except ArtifactError as exc:
+        sys.exit(f"Error: could not read {registry_path}: {exc}")
     struct_dirs = sorted(
         path for path in projects_dir.glob("project_*/vasp/jobs/*/struct_*")
         if path.is_dir()

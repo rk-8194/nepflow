@@ -8,22 +8,17 @@ from pathlib import Path
 
 
 def _sync_directory(directory: Path) -> None:
-    """Best-effort sync of a replaced file's parent directory.
+    """Sync a replaced file's parent directory when durability is requested.
 
     Directory descriptors cannot be opened on every supported platform (notably
-    Windows), so the file fsync remains the portable durability guarantee.
+    Windows), so directory syncing remains an explicit platform exception there.
     """
 
     if os.name == "nt":
         return
-    try:
-        directory_fd = os.open(directory, os.O_RDONLY)
-    except OSError:
-        return
+    directory_fd = os.open(directory, os.O_RDONLY)
     try:
         os.fsync(directory_fd)
-    except OSError:
-        pass
     finally:
         os.close(directory_fd)
 

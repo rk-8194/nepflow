@@ -15,6 +15,7 @@ from ase import Atoms
 from modules.run_vasp import _common as common
 from modules.run_vasp import launcher, prepare
 from nepflow.domain.identities import calculate_structure_id
+from nepflow.errors import ArtifactError, StateError
 
 
 class RunVaspRegistryTests(unittest.TestCase):
@@ -389,7 +390,7 @@ class RunVaspRegistryTests(unittest.TestCase):
                     [self.silicon_atoms()] if "train.xyz" in str(path) else []
                 ),
             ):
-                with self.assertRaises(ValueError):
+                with self.assertRaises(StateError):
                     prepare.prepare_jobs(
                         ConfigParser(),
                         project_dir / "config" / "vasp",
@@ -416,7 +417,7 @@ class RunVaspRegistryTests(unittest.TestCase):
                     [self.silicon_atoms()] if "train.xyz" in str(path) else []
                 ),
             ):
-                with self.assertRaises(ValueError):
+                with self.assertRaises(StateError):
                     prepare.prepare_jobs(
                         ConfigParser(),
                         project_dir / "config" / "vasp",
@@ -443,7 +444,7 @@ class RunVaspRegistryTests(unittest.TestCase):
                     [self.silicon_atoms()] if "train.xyz" in str(path) else []
                 ),
             ):
-                with self.assertRaises(ValueError):
+                with self.assertRaises(ArtifactError):
                     prepare.prepare_jobs(
                         ConfigParser(),
                         project_dir / "config" / "vasp",
@@ -459,7 +460,7 @@ class RunVaspRegistryTests(unittest.TestCase):
             struct_dir = Path(tmp)
             (struct_dir / ".vasp_status").write_text("[]", encoding="utf-8")
 
-            with self.assertRaises(ValueError):
+            with self.assertRaises(StateError):
                 common.read_status(struct_dir)
 
     def test_status_missing_status_field_is_corrupt(self) -> None:
@@ -470,7 +471,7 @@ class RunVaspRegistryTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            with self.assertRaises(ValueError):
+            with self.assertRaises(StateError):
                 common.read_status(struct_dir)
 
     def test_identity_missing_required_hash_is_corrupt(self) -> None:
@@ -486,7 +487,7 @@ class RunVaspRegistryTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            with self.assertRaises(ValueError):
+            with self.assertRaises(StateError):
                 prepare._read_identity(struct_dir)
 
     def test_registry_missing_jobs_field_is_corrupt(self) -> None:
@@ -497,7 +498,7 @@ class RunVaspRegistryTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            with self.assertRaises(ValueError):
+            with self.assertRaises(ArtifactError):
                 common.read_completed_registry(Path(tmp))
 
     def test_registry_unsupported_version_is_corrupt(self) -> None:
@@ -513,7 +514,7 @@ class RunVaspRegistryTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            with self.assertRaises(ValueError):
+            with self.assertRaises(ArtifactError):
                 common.read_completed_registry(Path(tmp))
 
     def test_registry_jobs_must_be_an_object(self) -> None:
@@ -529,7 +530,7 @@ class RunVaspRegistryTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            with self.assertRaises(ValueError):
+            with self.assertRaises(ArtifactError):
                 common.read_completed_registry(Path(tmp))
 
     def test_matching_registry_entry_must_have_job_path(self) -> None:
@@ -546,7 +547,7 @@ class RunVaspRegistryTests(unittest.TestCase):
                     },
                 }
 
-                with self.assertRaises(ValueError):
+                with self.assertRaises(ArtifactError):
                     common.get_registry_entry(
                         registry,
                         "incar-hash",

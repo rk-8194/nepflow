@@ -17,6 +17,12 @@ _MISSING = object()
 _ErrorT = TypeVar("_ErrorT", bound=Exception)
 
 
+def _reject_json_constant(value: str) -> Any:
+    """Reject Python-only numeric constants that are not valid JSON."""
+
+    raise ValueError(f"Non-standard JSON constant is not allowed: {value}")
+
+
 def to_jsonable(value: Any) -> Any:
     """Convert common repository values to strict JSON-compatible values."""
 
@@ -63,7 +69,7 @@ def dumps(
 def loads(text: str) -> Any:
     """Deserialize JSON text without converting malformed input to a default."""
 
-    return _json.loads(text)
+    return _json.loads(text, parse_constant=_reject_json_constant)
 
 
 def read_json(
@@ -87,11 +93,12 @@ def read_json(
         value = loads(source.read_text(encoding="utf-8"))
     except FileNotFoundError as exc:
         if default is not _MISSING:
-            return copy.deepcopy(default)
-        if missing_error_type is None:
+            value = copy.deepcopy(default)
+        elif missing_error_type is None:
             raise FileNotFoundError(f"JSON file not found: {source}") from exc
-        raise missing_error_type(f"JSON file not found: {source}") from exc
-    except (OSError, UnicodeError, _json.JSONDecodeError) as exc:
+        else:
+            raise missing_error_type(f"JSON file not found: {source}") from exc
+    except (OSError, UnicodeError, ValueError) as exc:
         raise error_type(f"Could not read JSON file {source}: {exc}") from exc
     if require_object and not isinstance(value, dict):
         raise error_type(f"JSON file must contain an object: {source}")

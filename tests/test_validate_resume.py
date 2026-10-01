@@ -18,6 +18,7 @@ from modules.validate.launcher import (  # noqa: E402
     write_validation_status,
 )
 from modules.validate.validate import ValidateStage  # noqa: E402
+from nepflow.errors import StateError  # noqa: E402
 
 
 def make_validate_stage(project_dir: Path) -> ValidateStage:
@@ -203,7 +204,7 @@ def test_malformed_validation_status_is_an_explicit_failure() -> None:
         status_file.parent.mkdir(parents=True, exist_ok=True)
         status_file.write_text("{not-json", encoding="utf-8")
 
-        with pytest.raises((ValueError, json.JSONDecodeError)):
+        with pytest.raises(StateError):
             read_validation_status(root)
 
 
