@@ -166,9 +166,9 @@ def archive_and_promote_final(
 
 
 def _load_nepflow_module(nepflow_root: Path):
-    nepflow_py = nepflow_root / "nepflow.py"
+    nepflow_py = nepflow_root / "nepflow_cli.py"
     if not nepflow_py.exists():
-        raise FileNotFoundError(f"nepflow.py not found under {nepflow_root}")
+        raise FileNotFoundError(f"nepflow_cli.py not found under {nepflow_root}")
 
     spec = importlib.util.spec_from_file_location("nepflow_cli_for_md_utility", nepflow_py)
     if spec is None or spec.loader is None:

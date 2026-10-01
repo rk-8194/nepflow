@@ -7,6 +7,7 @@ import logging.handlers
 import os
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -66,6 +67,43 @@ def test_installed_package_import_is_collection_order_independent(tmp_path) -> N
             "import nepflow; import nepflow.config; import nepflow.logging",
         ],
         cwd=tmp_path,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_installed_package_import_from_repository_root() -> None:
+    """The installed package must win over repository-root launcher names."""
+    try:
+        importlib.metadata.version("nepflow")
+    except importlib.metadata.PackageNotFoundError:
+        pytest.skip("nepflow is not installed in this test environment")
+
+    repository_root = Path(__file__).resolve().parents[2]
+    expected_package = repository_root / "src" / "nepflow" / "__init__.py"
+    environment = os.environ.copy()
+    environment.pop("PYTHONPATH", None)
+    code = f"""
+from pathlib import Path
+
+import nepflow
+import nepflow.config
+import nepflow.domain
+from nepflow.domain.identities import calculate_structure_id
+
+expected = Path({str(expected_package)!r}).resolve()
+actual = Path(nepflow.__file__).resolve()
+assert actual == expected, f"{{actual}} != {{expected}}"
+assert callable(calculate_structure_id)
+"""
+
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=repository_root,
         env=environment,
         capture_output=True,
         text=True,

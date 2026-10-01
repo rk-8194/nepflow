@@ -5,7 +5,7 @@ Runs systematic VASP benchmarks on BCC W supercells across GPU counts
 and NCORE/KPAR combinations. Records timings and OOM events to
 .vasp_memory for use by the production parameter predictor.
 
-Usage: python nepflow.py --project <name> --memory [--debug]
+Usage: python nepflow_cli.py --project <name> --memory [--debug]
 """
 
 import csv

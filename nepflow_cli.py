@@ -69,10 +69,10 @@ def create_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python nepflow.py --project myproject
-  python nepflow.py --project myproject --local
-  python nepflow.py --project myproject --memory
-  python nepflow.py --project myproject --debug
+  python nepflow_cli.py --project myproject
+  python nepflow_cli.py --project myproject --local
+  python nepflow_cli.py --project myproject --memory
+  python nepflow_cli.py --project myproject --debug
         """,
     )
 
@@ -401,3 +401,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+

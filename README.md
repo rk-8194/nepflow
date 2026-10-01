@@ -59,7 +59,7 @@ python -m pip install -e .
 4. Verify the installation:
 
 ```bash
-python nepflow.py --help
+python nepflow_cli.py --help
 ```
 
 If you plan to use the Materials Project integration, make sure the `mp-api` dependency is installed and your API key is available in the project config or the `MP_API_KEY` environment variable.
@@ -71,7 +71,7 @@ If you plan to use the Materials Project integration, make sure the `mp-api` dep
 Choose a project name and create its project directory:
 
 ```bash
-python nepflow.py --project myproject --init
+python nepflow_cli.py --project myproject --init
 ```
 
 This creates the project structure under `projects/project_myproject/`.
@@ -82,7 +82,7 @@ On first run, NEPFlow will prompt for any config values it needs, starting with 
 Before sending a project to HPC, run local mode on your local machine:
 
 ```bash
-python nepflow.py --project myproject --local
+python nepflow_cli.py --project myproject --local
 ```
 
 Local mode fetches base structures and stops after seed generation. This step must be done locally before transferring the project to an HPC system.
@@ -92,7 +92,7 @@ Local mode fetches base structures and stops after seed generation. This step mu
 Copy the project directory to the HPC system, then resume with the normal command:
 
 ```bash
-python nepflow.py --project myproject
+python nepflow_cli.py --project myproject
 ```
 
 NEPFlow will continue from the stage stored in the project directory.
@@ -100,14 +100,14 @@ NEPFlow will continue from the stage stored in the project directory.
 ## Common Options
 
 - `--local` runs the local pre-HPC setup step and stops after seed generation.
-- If `config/project.config` contains an `hpc.scp_address`, local mode will offer to upload the project to `<scp_address>/projects/<project>` after seed generation. The address should point to the remote directory where `nepflow.py` lives.
+- If `config/project.config` contains an `hpc.scp_address`, local mode will offer to upload the project to `<scp_address>/projects/<project>` after seed generation. The address should point to the remote directory where `nepflow_cli.py` lives.
 - `--memory` runs VASP memory benchmarks without advancing the workflow.
 - `--config` opens the project config file in Vim and exits.
 - `--debug` enables verbose debug logging.
 - `--stage <name>` forces the workflow to start from a specific stage.
 - `--output-dir <path>` changes the base directory used for projects.
 
-Run `python nepflow.py --help` to see the full CLI help.
+Run `python nepflow_cli.py --help` to see the full CLI help.
 
 ## Project Layout
 

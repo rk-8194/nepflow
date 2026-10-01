@@ -132,7 +132,7 @@ CONFIG_PROMPTS: tuple[ConfigPrompt, ...] = (
     ConfigPrompt(
         key="scp_address",
         label="Remote NEPFlow directory",
-        message="Enter the remote directory where nepflow.py is located (e.g. user@host:/path/to/nepflow)",
+        message="Enter the remote directory where nepflow_cli.py is located (e.g. user@host:/path/to/nepflow)",
     ),
 )
 
@@ -492,7 +492,7 @@ cores_per_node=64
 gpus_per_node=4
 max_nodes=16
 
-# Remote directory where nepflow.py is located (e.g. user@host:/path/to/nepflow)
+# Remote directory where nepflow_cli.py is located (e.g. user@host:/path/to/nepflow)
 scp_address={scp_address}
 
 # VASP execution command template ({{ntasks}} is replaced at runtime)

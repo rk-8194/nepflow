@@ -6,7 +6,7 @@ from pathlib import Path
 import logging
 import time
 
-# Note: src/ is added to sys.path dynamically by nepflow.py
+# Note: src/ is added to sys.path dynamically by nepflow_cli.py
 # pylint: disable=import-error
 from modules import (
     SelfResubmitExit,
@@ -301,7 +301,7 @@ class WorkflowController:
             logger.info("Local mode complete — seeds generated, stage remains at 'generate'")
             print("✓ Base structures generated (seeds only, no perturbations)")
             print("  Transfer the project directory to HPC and resume with:")
-            print("  python nepflow.py --project %s" % self.project_name)
+            print("  python nepflow_cli.py --project %s" % self.project_name)
         else:
             logger.info(
                 "Local mode — nothing to do, current stage is '%s'. "
@@ -309,7 +309,7 @@ class WorkflowController:
             )
             print("✓ Local stages already complete (current stage: '%s')" % stage)
             print("  Resume on HPC with:")
-            print("  python nepflow.py --project %s" % self.project_name)
+            print("  python nepflow_cli.py --project %s" % self.project_name)
 
     def _print_status_summary(self) -> None:
         """Log a summary of the current workflow state."""
@@ -421,13 +421,13 @@ class WorkflowController:
         if not self._check_project_initialized():
             logger.error(
                 "Project '%s' is not initialized. "
-                "Run with --init flag first: python3 nepflow.py --project %s --init",
+                "Run with --init flag first: python3 nepflow_cli.py --project %s --init",
                 self.project_name,
                 self.project_name
             )
             raise ValueError(
                 f"Project '{self.project_name}' is not initialized. "
-                f"Run: python3 nepflow.py --project {self.project_name} --init"
+                f"Run: python3 nepflow_cli.py --project {self.project_name} --init"
             )
         
         if self.stage_override:

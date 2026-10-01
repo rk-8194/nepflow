@@ -15,7 +15,7 @@ for package_name in ("ase", "hiphive", "mp_api", "pymatgen", "icet", "NepTrainKi
 
 def _load_cli_module():
     """Load the root CLI without shadowing the canonical nepflow package."""
-    cli_path = Path(__file__).resolve().parents[1] / "nepflow.py"
+    cli_path = Path(__file__).resolve().parents[1] / "nepflow_cli.py"
     spec = importlib.util.spec_from_file_location("nepflow_cli", cli_path)
     if spec is None or spec.loader is None:
         raise ImportError(f"Could not load CLI module from {cli_path}")
@@ -40,7 +40,7 @@ class ConfigCliTests(unittest.TestCase):
                 nepflow.sys,
                 "argv",
                 [
-                    "nepflow.py",
+                    "nepflow_cli.py",
                     "--project",
                     "w",
                     "--config",
