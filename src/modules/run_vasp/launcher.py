@@ -14,14 +14,18 @@ from nepflow.hpc.slurm import SlurmScheduler
 from nepflow.io.hashing import sha256_file
 from nepflow.io.json import read_json
 
-from .prepare import _read_identity
-from ._common import (
+from nepflow.dft.vasp.failures import has_oom_marker
+from nepflow.dft.vasp.inputs import read_identity as _read_identity
+from nepflow.dft.vasp.outputs import outcar_is_complete, parse_performance_evidence
+from nepflow.dft.vasp.recovery import (
     build_retry_levels_for_gpu,
+    write_incar_resource_parameters,
+)
+from ._common import (
     estimate_kpoints_irr,
     estimate_n_electrons,
     get_nepflow_root,
     logger,
-    outcar_is_complete,
     parse_zval,
     predict_vasp_params,
     read_status,
@@ -196,8 +200,7 @@ def run_launcher(
                         continue
 
                     # Not completed — check for OOM marker from script
-                    oom_marker = struct_dir / ".vasp_oom_detected"
-                    if oom_marker.exists():
+                    if has_oom_marker(struct_dir):
                         # Read retry level from .vasp_status (authoritative),
                         # NOT .vasp_retry_level (legacy, no longer written)
                         retry_count = status_data.get("retry_level", 0)
@@ -456,28 +459,13 @@ def _get_project_job_names(project_name: str) -> tuple[set[str], set[str]]:
 
 
 def _write_incar_params(struct_dir: Path, ncore: int, kpar: int) -> None:
-    """Update NCORE and KPAR in the structure's INCAR file."""
-    incar_path = struct_dir / "INCAR"
-    if not incar_path.exists():
-        logger.warning(f"    INCAR not found: {incar_path}")
-        return
-    try:
-        content = incar_path.read_text(encoding="utf-8")
-        lines = content.splitlines(keepends=True)
-        output = []
-        for line in lines:
-            stripped = line.strip()
-            if not stripped or stripped.startswith("#"):
-                output.append(line)
-            elif re.match(r"^NCORE\s*=", stripped, re.IGNORECASE):
-                output.append(f"NCORE = {ncore}\n")
-            elif re.match(r"^KPAR\s*=", stripped, re.IGNORECASE):
-                output.append(f"KPAR = {kpar}\n")
-            else:
-                output.append(line)
-        incar_path.write_text("".join(output), encoding="utf-8")
-    except OSError as e:
-        logger.warning(f"    Failed to write INCAR: {e}")
+    """Compatibility bridge to canonical resource-only INCAR rewriting."""
+    write_incar_resource_parameters(
+        struct_dir,
+        ncore,
+        kpar,
+        warn=logger.warning,
+    )
 
 
 def _submit_job(
@@ -594,12 +582,9 @@ def _log_oom(
         if outcar.exists():
             try:
                 outcar_text = outcar.read_text(encoding="utf-8", errors="replace")
-                m = re.search(r"Found\s+(\d+)\s+irreducible k-points", outcar_text)
-                if m:
-                    n_kpoints_irr = int(m.group(1))
-                m = re.search(r"NELECT\s*=\s*([\d.]+)", outcar_text)
-                if m:
-                    n_electrons = int(float(m.group(1)))
+                performance = parse_performance_evidence(outcar_text)
+                n_kpoints_irr = performance.irreducible_kpoints
+                n_electrons = int(performance.electrons)
             except OSError:
                 pass
         if n_kpoints_irr == 0:
@@ -722,35 +707,15 @@ def _log_performance(struct_dir: Path, nepflow_root: Path, gpus_per_node: int) -
         # Parse MPI ranks from OUTCAR to determine nodes/gpus
         outcar_text = outcar.read_text(encoding="utf-8", errors="replace")
 
-        total_ranks = 0
-        # GPU VASP: "running N mpi-ranks";  CPU VASP: "running on N total cores"
-        m_ranks = re.search(r"running\s+(\d+)\s+mpi-ranks", outcar_text)
-        if not m_ranks:
-            m_ranks = re.search(r"running on\s+(\d+)\s+total cores", outcar_text)
-        if m_ranks:
-            total_ranks = int(m_ranks.group(1))
+        performance = parse_performance_evidence(outcar_text)
+        # GPU VASP reports mpi-ranks; CPU VASP reports total cores.
+        total_ranks = performance.mpi_ranks or performance.total_ranks
         nodes = max(1, total_ranks // gpus_per_node) if total_ranks > 0 else 1
         gpus = total_ranks if total_ranks > 0 else gpus_per_node
 
-        loop_times = [
-            float(m.group(1))
-            for m in re.finditer(
-                r"LOOP:\s+cpu time\s+[\d.]+:\s+real time\s+([\d.]+)", outcar_text
-            )
-        ]
-        avg_loop = sum(loop_times) / len(loop_times) if loop_times else 0.0
-
-        # Irreducible k-points
-        n_kpoints_irr = 0
-        m = re.search(r"Found\s+(\d+)\s+irreducible k-points", outcar_text)
-        if m:
-            n_kpoints_irr = int(m.group(1))
-
-        # Number of electrons
-        n_electrons = 0
-        m = re.search(r"NELECT\s*=\s*([\d.]+)", outcar_text)
-        if m:
-            n_electrons = int(float(m.group(1)))
+        avg_loop = performance.average_loop_time
+        n_kpoints_irr = performance.irreducible_kpoints
+        n_electrons = int(performance.electrons)
 
         # Write CSV header if file is new
         write_header = not csv_path.exists()

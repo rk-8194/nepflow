@@ -1,6 +1,5 @@
 """Prepare sub-stage: parse OUTCAR files and write XYZ datasets."""
 
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Generator, List
 
@@ -9,105 +8,26 @@ from ase.io import read as ase_read
 
 import numpy as np
 
-from nepflow.config.loader import load_legacy_config
-from nepflow.domain.identities import (
-    DftCalculationIdentity,
-    calculate_structure_id,
-    normalise_dft_calculation_identity,
+from nepflow.dft.vasp.inputs import (
+    build_input_context,
+    identity_for_structure,
+    read_identity,
 )
-from nepflow.domain.units import (
-    ENERGY_UNIT_EV,
-    FORCE_UNIT_EV_PER_ANGSTROM,
-    VIRIAL_CONVENTION_POSITIVE_COMPRESSION,
-    VIRIAL_UNIT_EV,
+from nepflow.dft.vasp.outputs import (
+    ResolvedVaspOutput,
+    VaspParseResult,
+    outcar_is_complete,
+    parse_outcar_result as _canonical_parse_outcar_result,
+    parse_virial_from_outcar,
 )
-from nepflow.errors import StateError
-from nepflow.io.hashing import sha256_file
-from nepflow.io.json import read_json
 
 from ..run_vasp._common import (
     get_nepflow_root,
     get_registry_entry,
-    hash_incar_text,
-    hash_potcar_bytes,
-    outcar_is_complete,
-    parse_virial_from_outcar,
     read_completed_registry,
     read_status,
 )
-from ..run_vasp.prepare import inject_incar_defaults
-
-from ._common import HAS_TQDM, StructureValidationError, logger, tqdm, validate_structure
-
-
-@dataclass(frozen=True)
-class VaspParseResult:
-    """Immutable, authoritative result of parsing one VASP OUTCAR."""
-
-    structure_id: str
-    calculation_identity: tuple[tuple[str, str], ...]
-    source_outcar: str
-    source_outcar_hash: str | None
-    status: str
-    rejection_reason: str | None
-    energy_ev: float | None
-    forces_ev_per_angstrom: np.ndarray | None
-    virial_ev: np.ndarray | None
-    positions_angstrom: np.ndarray | None
-    lattice_angstrom: np.ndarray | None
-    species: tuple[str, ...]
-    pbc: tuple[bool, ...]
-    energy_unit: str = ENERGY_UNIT_EV
-    force_unit: str = FORCE_UNIT_EV_PER_ANGSTROM
-    virial_unit: str = VIRIAL_UNIT_EV
-    virial_convention: str = VIRIAL_CONVENTION_POSITIVE_COMPRESSION
-
-    def __post_init__(self) -> None:
-        for field_name in (
-            "forces_ev_per_angstrom",
-            "virial_ev",
-            "positions_angstrom",
-            "lattice_angstrom",
-        ):
-            value = getattr(self, field_name)
-            if value is not None:
-                immutable = np.array(value, dtype=float, copy=True)
-                immutable.setflags(write=False)
-                object.__setattr__(self, field_name, immutable)
-
-    @property
-    def accepted(self) -> bool:
-        return self.status == "accepted"
-
-    def as_structure_dict(self) -> dict:
-        if not self.accepted:
-            raise ValueError(self.rejection_reason or "rejected_parse_result")
-        return {
-            "energy": self.energy_ev,
-            "forces": self.forces_ev_per_angstrom,
-            "positions": self.positions_angstrom,
-            "lattice": self.lattice_angstrom,
-            "species": list(self.species),
-            "pbc": list(self.pbc),
-            "virial": self.virial_ev,
-            "structure_id": self.structure_id,
-            "calculation_identity": dict(self.calculation_identity),
-            "source_outcar": self.source_outcar,
-            "source_outcar_hash": self.source_outcar_hash,
-            "energy_unit": self.energy_unit,
-            "force_unit": self.force_unit,
-            "virial_unit": self.virial_unit,
-            "virial_convention": self.virial_convention,
-        }
-
-
-@dataclass(frozen=True)
-class ResolvedVaspOutput:
-    """An OUTCAR whose calculation identity was verified during resolution."""
-
-    outcar_path: Path
-    calculation_identity: tuple[tuple[str, str], ...]
-    verification_source: str
+from ._common import HAS_TQDM, logger, tqdm
 
 
 def prepare_dataset(
@@ -291,31 +211,13 @@ def _record_rejection(report: dict | None, reason: str) -> None:
 
 
 def _build_vasp_input_context(project_dir: Path) -> dict | None:
-    """Build reusable hashes for the current project's VASP input files."""
-    vasp_config_dir = project_dir / "config" / "vasp"
-    incar_template = vasp_config_dir / "INCAR"
-    if not incar_template.exists():
+    """Compatibility bridge to the canonical project input context."""
+    context = build_input_context(project_dir)
+    if context is None:
         return None
-
-    config = load_legacy_config(
-        project_dir / "config" / "project.config",
-        project_name=project_dir.name.removeprefix("project_"),
-        require_scientific_fields=False,
-    )
-
-    incar_text = inject_incar_defaults(
-        incar_template.read_text(encoding="utf-8"),
-        config,
-    )
-    potcar_data = {
-        potcar_path.name.split("_", 1)[1]: potcar_path.read_bytes()
-        for potcar_path in vasp_config_dir.glob("POTCAR_*")
-    }
-    return {
-        "incar_hash": hash_incar_text(incar_text),
-        "potcar_data": potcar_data,
-        "registry": read_completed_registry(get_nepflow_root(project_dir)),
-    }
+    result = context.as_legacy_mapping()
+    result["registry"] = read_completed_registry(get_nepflow_root(project_dir))
+    return result
 
 
 def _resolve_outcar_for_structure(
@@ -366,26 +268,8 @@ def _resolve_outcar_for_structure(
 
 
 def _identity_for_structure(atoms: Atoms, input_context: dict) -> dict[str, str]:
-    """Build the exact VASP calculation identity for a selected structure."""
-    structure_id = calculate_structure_id(atoms)
-    potcar_data = input_context["potcar_data"]
-    struct_elements = sorted(set(atoms.get_chemical_symbols()))
-    missing = [elem for elem in struct_elements if elem not in potcar_data]
-    if missing:
-        raise FileNotFoundError(f"missing POTCAR files for: {', '.join(missing)}")
-    potcar_hash = hash_potcar_bytes(
-        b"".join(potcar_data[elem] for elem in struct_elements)
-    )
-    return {
-        "structure_id": structure_id,
-        "incar_hash": input_context["incar_hash"],
-        "potcar_hash": potcar_hash,
-        "calculation_id": DftCalculationIdentity(
-            structure_id=structure_id,
-            incar_hash=input_context["incar_hash"],
-            potcar_hash=potcar_hash,
-        ).calculation_id,
-    }
+    """Compatibility bridge to the typed canonical VASP identity."""
+    return identity_for_structure(atoms, input_context).as_dict()
 
 
 def _outcar_from_local_job(
@@ -420,20 +304,8 @@ def _outcar_from_local_job(
 
 
 def _read_identity(struct_dir: Path) -> dict:
-    identity_path = struct_dir / ".vasp_identity"
-    if not identity_path.exists():
-        return {}
-    data = read_json(identity_path, error_type=StateError, require_object=True)
-
-    data = normalise_dft_calculation_identity(data)
-
-    for key in ("structure_id", "incar_hash", "potcar_hash", "calculation_id"):
-        value = data.get(key)
-        if not isinstance(value, str) or not value.strip():
-            raise StateError(
-                f"VASP identity is missing a valid {key}: {identity_path}"
-            )
-    return data
+    """Compatibility bridge for legacy callers of the canonical reader."""
+    return read_identity(struct_dir)
 
 
 def _parse_outcar(
@@ -462,115 +334,15 @@ def _parse_outcar_result(
     calculation_identity: dict[str, str] | None = None,
     identity_evidence: ResolvedVaspOutput | None = None,
 ) -> VaspParseResult:
-    """Parse one OUTCAR into an immutable accepted/rejected result."""
-    structure_id = calculate_structure_id(ase_atoms)
-    identity_items_source = dict(calculation_identity or {"structure_id": structure_id})
-    comparison_identity = normalise_dft_calculation_identity(identity_items_source)
-    identity_items = tuple(
-        sorted((str(key), str(value)) for key, value in identity_items_source.items())
-    )
-    comparison_items = tuple(
-        sorted((str(key), str(value)) for key, value in comparison_identity.items())
-    )
-    source_outcar = str(outcar_path.resolve())
-    # Parsing can return a rejected record, so preserve the prior optional
-    # source-hash behavior while making the missing-file policy explicit.
-    source_hash = sha256_file(outcar_path, required=False)
-
-    def rejected(reason: str) -> VaspParseResult:
-        return VaspParseResult(
-            structure_id=structure_id,
-            calculation_identity=identity_items,
-            source_outcar=source_outcar,
-            source_outcar_hash=source_hash,
-            status="rejected",
-            rejection_reason=reason,
-            energy_ev=None,
-            forces_ev_per_angstrom=None,
-            virial_ev=None,
-            positions_angstrom=None,
-            lattice_angstrom=None,
-            species=(),
-            pbc=(),
-        )
-
-    if calculation_identity is not None:
-        if identity_evidence is None:
-            source_identity = _read_identity(outcar_path.parent)
-            if not source_identity:
-                return rejected("missing_calculation_identity")
-            if any(
-                source_identity.get(key) != value
-                for key, value in comparison_identity.items()
-            ):
-                return rejected("incompatible_calculation_identity")
-        elif (
-            identity_evidence.outcar_path.resolve() != outcar_path.resolve()
-            or identity_evidence.calculation_identity != comparison_items
-        ):
-            return rejected("incompatible_calculation_identity")
-
-    try:
-        atoms = ase_read(str(outcar_path))
-    except Exception as exc:
-        return rejected(f"outcar_parse_failed:{type(exc).__name__}:{exc}")
-
-    expected_species = tuple(ase_atoms.get_chemical_symbols())
-    actual_species = tuple(atoms.get_chemical_symbols())
-    if len(atoms) != len(ase_atoms):
-        return rejected(f"atom_count_mismatch:expected={len(ase_atoms)}:actual={len(atoms)}")
-    if actual_species != expected_species:
-        return rejected(f"species_mismatch:expected={expected_species}:actual={actual_species}")
-
-    try:
-        energy = float(atoms.get_potential_energy())
-    except Exception as exc:
-        return rejected(f"missing_energy:{type(exc).__name__}")
-    try:
-        forces = np.asarray(atoms.get_forces(), dtype=float)
-    except Exception as exc:
-        return rejected(f"missing_forces:{type(exc).__name__}")
-
-    try:
-        positions = np.asarray(atoms.get_positions(), dtype=float)
-        lattice = np.asarray(atoms.get_cell().array, dtype=float)
-        pbc = atoms.pbc.tolist()
-        volume = float(atoms.get_volume())
-    except Exception as exc:
-        return rejected(f"invalid_structure_geometry:{type(exc).__name__}")
-
-    virial = parse_virial_from_outcar(outcar_path, volume)
-    if require_virial and virial is None:
-        return rejected("missing_required_virial")
-
-    structure = {
-        "energy": energy,
-        "forces": forces,
-        "positions": positions,
-        "lattice": lattice,
-        "species": list(actual_species),
-        "pbc": pbc,
-        "virial": virial,
-    }
-    try:
-        validate_structure(structure)
-    except StructureValidationError as exc:
-        return rejected(f"invalid_dft_labels:{exc}")
-
-    return VaspParseResult(
-        structure_id=structure_id,
-        calculation_identity=identity_items,
-        source_outcar=source_outcar,
-        source_outcar_hash=source_hash,
-        status="accepted",
-        rejection_reason=None,
-        energy_ev=energy,
-        forces_ev_per_angstrom=forces,
-        virial_ev=virial,
-        positions_angstrom=positions,
-        lattice_angstrom=lattice,
-        species=actual_species,
-        pbc=tuple(bool(value) for value in pbc),
+    """Compatibility bridge to the canonical VASP output parser."""
+    return _canonical_parse_outcar_result(
+        outcar_path,
+        ase_atoms,
+        require_virial=require_virial,
+        calculation_identity=calculation_identity,
+        identity_evidence=identity_evidence,
+        reader=ase_read,
+        identity_reader=_read_identity,
     )
 
 

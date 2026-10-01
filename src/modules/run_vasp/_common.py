@@ -9,14 +9,24 @@ from pathlib import Path
 
 import numpy as np
 
-from nepflow.domain.units import stress_kbar_to_ev_per_angstrom3, virial_from_stress
 from nepflow.errors import ArtifactError, StateError
-from nepflow.io.hashing import sha256_bytes
 from nepflow.io.json import read_json_object, write_json
+from nepflow.dft.vasp.inputs import (
+    canonical_poscar_bytes,
+    canonical_poscar_text,
+    hash_incar_text,
+    hash_potcar_bytes,
+    strip_resource_incar_params,
+)
+from nepflow.dft.vasp.outputs import (
+    VASP_COMPLETION_MARKERS,
+    outcar_is_complete,
+    parse_virial_from_outcar,
+)
+from nepflow.dft.vasp.recovery import build_retry_levels_for_gpu
 
 logger = logging.getLogger("nepflow.run_vasp")
 
-VASP_COMPLETION_MARKERS = ["General timing", "Voluntary context switches"]
 VASP_REGISTRY_VERSION = 1
 VALID_VASP_STATUSES = frozenset(
     {"pending", "submitted", "completed", "reused", "failed", "oom"}
@@ -38,65 +48,6 @@ def get_nepflow_root(project_dir: Path) -> Path:
 def completed_jobs_registry_path(nepflow_root: Path) -> Path:
     """Return the shared completed-VASP registry path."""
     return Path(nepflow_root) / ".vasp_completed_jobs.json"
-
-
-def canonical_poscar_text(atoms) -> str:
-    """Return NEPFlow's deterministic VASP5 POSCAR representation."""
-    symbols = np.array(atoms.get_chemical_symbols())
-    unique_elements = sorted(set(symbols))
-
-    sorted_indices = []
-    counts = []
-    for elem in unique_elements:
-        mask = symbols == elem
-        indices = np.where(mask)[0]
-        sorted_indices.extend(indices.tolist())
-        counts.append(int(mask.sum()))
-
-    cell = atoms.get_cell()
-    frac_positions = atoms.get_scaled_positions()
-    info = atoms.info if hasattr(atoms, "info") else {}
-    comment = info.get("config_type", " ".join(unique_elements))
-
-    lines = [str(comment), "1.0"]
-    for row in cell:
-        lines.append(f"  {row[0]:20.14f}  {row[1]:20.14f}  {row[2]:20.14f}")
-    lines.append("  " + "  ".join(unique_elements))
-    lines.append("  " + "  ".join(str(c) for c in counts))
-    lines.append("Direct")
-    for idx in sorted_indices:
-        p = frac_positions[idx]
-        lines.append(f"  {p[0]:20.14f}  {p[1]:20.14f}  {p[2]:20.14f}")
-    return "\n".join(lines) + "\n"
-
-
-def canonical_poscar_bytes(atoms) -> bytes:
-    """Return canonical POSCAR bytes for structure hashing."""
-    return canonical_poscar_text(atoms).encode("utf-8")
-
-
-def strip_resource_incar_params(incar_text: str) -> str:
-    """Remove launcher-controlled resource parameters from INCAR text."""
-    kept = []
-    for line in incar_text.splitlines():
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#"):
-            kept.append(line.rstrip())
-            continue
-        if re.match(r"^(NCORE|KPAR)\s*=", stripped, re.IGNORECASE):
-            continue
-        kept.append(line.rstrip())
-    return "\n".join(kept).rstrip() + "\n"
-
-
-def hash_incar_text(incar_text: str) -> str:
-    """Hash scientific INCAR content, excluding launcher resource params."""
-    return sha256_bytes(strip_resource_incar_params(incar_text).encode("utf-8"))
-
-
-def hash_potcar_bytes(potcar_bytes: bytes) -> str:
-    """Hash concatenated POTCAR bytes for the exact structure element set."""
-    return sha256_bytes(potcar_bytes)
 
 
 def validate_completed_registry(data: dict, path: Path | None = None) -> dict:
@@ -186,126 +137,6 @@ def upsert_registry_entry(
     jobs = registry["jobs"]
     jobs.setdefault(incar_hash, {}).setdefault(potcar_hash, {})[structure_id] = entry
     write_completed_registry(nepflow_root, registry)
-
-
-def outcar_is_complete(outcar_path: Path) -> bool:
-    """Check whether an OUTCAR tail contains a VASP completion marker."""
-    if not outcar_path.exists():
-        return False
-    try:
-        with open(outcar_path, "r", encoding="utf-8", errors="replace") as f:
-            f.seek(0, 2)
-            size = f.tell()
-            f.seek(max(0, size - 50_000))
-            tail = f.read()
-        return any(marker in tail for marker in VASP_COMPLETION_MARKERS)
-    except OSError:
-        return False
-
-
-def parse_virial_from_outcar(outcar_path: Path, volume: float) -> np.ndarray | None:
-    """Parse VASP stress and convert it to the NEPFlow virial convention.
-
-    VASP reports stress in kB.  NEPFlow stores virial in eV with positive
-    compression, hence ``virial = -stress * volume / 1602.17663``.
-    """
-    try:
-        outcar_text = outcar_path.read_text(encoding="utf-8", errors="replace")
-        stress_pattern = (
-            r"STRESS\s+in cartesian coordinates \(kB\)\n"
-            r"\s+([-+.\d]+)\s+([-+.\d]+)\s+([-+.\d]+)\n"
-            r"\s+([-+.\d]+)\s+([-+.\d]+)\s+([-+.\d]+)\n"
-            r"\s+([-+.\d]+)\s+([-+.\d]+)\s+([-+.\d]+)"
-        )
-        matches = list(re.finditer(stress_pattern, outcar_text))
-        if not matches:
-            return None
-        values = [float(matches[-1].group(index)) for index in range(1, 10)]
-        stress = np.asarray(values, dtype=float).reshape(3, 3)
-        return virial_from_stress(
-            stress_kbar_to_ev_per_angstrom3(stress),
-            float(volume),
-        )
-    except (OSError, TypeError, ValueError):
-        return None
-
-
-# ==================================================================
-# HPC-aware retry level generation
-# ==================================================================
-
-def build_retry_levels_for_gpu(
-    starting_gpu: int,
-    initial_ncore: int,
-    initial_kpar: int,
-    config: ConfigParser,
-) -> list:
-    """Build GPU-aware retry escalation from the job's initial parameters.
-
-    Called with the ORIGINAL (first-submission) parameters so that the
-    escalation table is stable across retries.  The launcher indexes
-    into the returned list using the retry count.
-
-    Escalation hierarchy:
-      1. Fix KPAR = GPU count (optimal for GPU VASP), sweep all NCORE
-      2. Try KPAR = 1 as aggressive memory-saving fallback, sweep NCORE
-      3. Jump to next GPU tier (1→2→4) and repeat
-      4. Multi-node escalation (2, 4, … nodes)
-
-    Args:
-      starting_gpu: GPU count from the initial submission
-      initial_ncore: NCORE from the initial submission
-      initial_kpar: KPAR from the initial submission
-    """
-    cores = config.getint("hpc", "cores_per_node", fallback=64)
-    gpus_per_node = config.getint("hpc", "gpus_per_node", fallback=4)
-    max_nodes = config.getint("hpc", "max_nodes", fallback=16)
-
-    valid_ncores = sorted(p for p in (2**i for i in range(1, 12))
-                          if p <= cores and cores % p == 0)
-    if not valid_ncores:
-        valid_ncores = [cores]
-
-    levels: list[tuple[int, int, int, int]] = []
-    seen = set()
-    initial_key = (initial_ncore, initial_kpar, 1, starting_gpu)
-
-    def _add(ncore, kpar, nodes, gpus):
-        key = (ncore, kpar, nodes, gpus)
-        if key not in seen and key != initial_key:
-            seen.add(key)
-            levels.append(key)
-
-    valid_kpars = sorted(
-        k for k in (2**i for i in range(0, 8))
-        if k <= gpus_per_node
-    ) or [1]
-
-    def _sweep_gpu_tier(gpu_count):
-        """Add NCORE/KPAR combinations for a given GPU count."""
-        for kpar in valid_kpars:
-            for nc in valid_ncores:
-                _add(nc, kpar, 1, gpu_count)
-
-    # Phase 1: Current GPU tier — fix KPAR to GPU count, try all NCORE
-    _sweep_gpu_tier(starting_gpu)
-
-    # Phase 2: Higher GPU tiers
-    valid_gpus = sorted(g for g in [1, 2, 4, 8] if g <= gpus_per_node)
-    for gpu in valid_gpus:
-        if gpu > starting_gpu:
-            _sweep_gpu_tier(gpu)
-
-    # Phase 3: Multi-node escalation at highest GPU tier
-    highest_gpu = valid_gpus[-1] if valid_gpus else starting_gpu
-    nodes = 2
-    while nodes <= max_nodes:
-        kpar = nodes * highest_gpu
-        for nc in valid_ncores:
-            _add(nc, kpar, nodes, highest_gpu)
-        nodes *= 2
-
-    return levels
 
 
 # ==================================================================

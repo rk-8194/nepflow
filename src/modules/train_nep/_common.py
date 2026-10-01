@@ -5,10 +5,9 @@ from numbers import Real
 from typing import Mapping
 
 import numpy as np
+from nepflow.dft.vasp.outputs import VASP_COMPLETION_MARKERS, is_completed_text
 
 logger = logging.getLogger("nepflow.train_nep")
-
-VASP_COMPLETION_MARKERS = ["General timing", "Voluntary context switches"]
 
 # Try to import tqdm for progress bars; graceful fallback if not available
 try:
@@ -24,8 +23,7 @@ except ImportError:
 
 def is_completed(outcar_text: str) -> bool:
     """Check if OUTCAR indicates a successfully completed VASP run."""
-    tail = outcar_text[-2000:]
-    return any(marker in tail for marker in VASP_COMPLETION_MARKERS)
+    return is_completed_text(outcar_text)
 
 
 class StructureValidationError(ValueError):

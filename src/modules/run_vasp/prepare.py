@@ -1,6 +1,5 @@
 """Prepare sub-stage: create VASP job folders and shared runner script."""
 
-import re
 import time
 from configparser import ConfigParser
 from pathlib import Path
@@ -8,21 +7,22 @@ from pathlib import Path
 from ase.io import iread
 
 from nepflow.domain.identities import (
-    DftCalculationIdentity,
-    calculate_structure_id,
     normalise_dft_calculation_identity,
 )
-from nepflow.errors import StateError
-from nepflow.io.json import read_json, write_json
+from nepflow.io.json import write_json
+from nepflow.dft.vasp.inputs import (
+    canonical_poscar_text,
+    hash_incar_text,
+    identity_for_structure,
+    inject_incar_defaults as _canonical_inject_incar_defaults,
+    read_identity,
+)
+from nepflow.dft.vasp.outputs import outcar_is_complete
 
 from ._common import (
-    canonical_poscar_text,
     get_nepflow_root,
     get_registry_entry,
-    hash_incar_text,
-    hash_potcar_bytes,
     logger,
-    outcar_is_complete,
     read_completed_registry,
     read_status,
     write_status,
@@ -106,13 +106,13 @@ def prepare_jobs(
 
             struct_elements = sorted(set(atoms.get_chemical_symbols()))
             potcar_bytes = b"".join(potcar_data[elem] for elem in struct_elements)
-            potcar_hash = hash_potcar_bytes(potcar_bytes)
-            structure_id = calculate_structure_id(atoms)
-            calculation = DftCalculationIdentity(
-                structure_id=structure_id,
-                incar_hash=incar_hash,
-                potcar_hash=potcar_hash,
+            input_identity = identity_for_structure(
+                atoms,
+                {"incar_hash": incar_hash, "potcar_data": potcar_data},
             )
+            calculation = input_identity.calculation
+            structure_id = input_identity.structure_id
+            potcar_hash = input_identity.potcar_hash
             identity = {
                 "project_name": project_name,
                 "dataset": ds,
@@ -285,23 +285,8 @@ def write_poscar(atoms, path: Path) -> None:
 
 
 def _read_identity(struct_dir: Path) -> dict:
-    identity_path = struct_dir / ".vasp_identity"
-    if not identity_path.exists():
-        return {}
-    data = read_json(identity_path, error_type=StateError, require_object=True)
-
-    # Read the Phase 2 spelling as a compatibility boundary, but normalize
-    # immediately so all new comparisons use the canonical vocabulary.
-    data = normalise_dft_calculation_identity(data)
-
-    required = ("structure_id", "incar_hash", "potcar_hash", "calculation_id")
-    for key in required:
-        value = data.get(key)
-        if not isinstance(value, str) or not value.strip():
-            raise StateError(
-                f"VASP identity is missing a valid {key}: {identity_path}"
-            )
-    return data
+    """Compatibility bridge for callers that still import this helper."""
+    return read_identity(struct_dir)
 
 
 def _write_identity(struct_dir: Path, identity: dict) -> None:
@@ -351,24 +336,5 @@ def _valid_registry_entry(
 # ==================================================================
 
 def inject_incar_defaults(incar_text: str, config: ConfigParser) -> str:
-    """Append KSPACING and KGAMMA to INCAR text if not already present."""
-    lines = incar_text.rstrip("\n")
-
-    has_kspacing = bool(re.search(r"^\s*KSPACING\s*=", incar_text, re.MULTILINE | re.IGNORECASE))
-    has_kgamma = bool(re.search(r"^\s*KGAMMA\s*=", incar_text, re.MULTILINE | re.IGNORECASE))
-
-    additions = []
-    if not has_kspacing:
-        kspacing = config.get("vasp", "kspacing", fallback="0.30")
-        additions.append(f"KSPACING = {kspacing}")
-    if not has_kgamma:
-        kgamma = config.get("vasp", "kgamma", fallback=".TRUE.")
-        additions.append(f"KGAMMA = {kgamma}")
-
-    if additions:
-        lines += "\n\n# --- Injected by nepflow (not in user template) ---\n"
-        lines += "\n".join(additions) + "\n"
-    else:
-        lines += "\n"
-
-    return lines
+    """Compatibility bridge to canonical INCAR default injection."""
+    return _canonical_inject_incar_defaults(incar_text, config)

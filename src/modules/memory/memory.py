@@ -23,15 +23,17 @@ from ase.io import write as ase_write
 from ..base import Stage
 from nepflow.errors import SchedulerError
 from nepflow.hpc.slurm import SlurmScheduler
+from nepflow.dft.vasp.failures import is_oom_failure
+from nepflow.dft.vasp.inputs import inject_incar_defaults
+from nepflow.dft.vasp.outputs import outcar_is_complete, parse_performance_evidence
 
 from ..run_vasp._common import (
-    VASP_COMPLETION_MARKERS,
     logger,
     parse_zval,
     read_status,
     write_status,
 )
-from ..run_vasp.prepare import inject_incar_defaults, write_poscar
+from ..run_vasp.prepare import write_poscar
 
 CSV_HEADER = [
     "n_atoms", "n_kpoints_irr", "n_electrons",
@@ -558,33 +560,12 @@ fi
     @staticmethod
     def _check_completed(job_dir: Path) -> bool:
         """Check if VASP completed successfully."""
-        outcar = job_dir / "OUTCAR"
-        if not outcar.exists():
-            return False
-        try:
-            with open(outcar, "r", encoding="utf-8", errors="replace") as f:
-                f.seek(0, 2)
-                size = f.tell()
-                f.seek(max(0, size - 50_000))
-                tail = f.read()
-            return any(marker in tail for marker in VASP_COMPLETION_MARKERS)
-        except OSError:
-            return False
+        return outcar_is_complete(job_dir / "OUTCAR")
 
     @staticmethod
     def _check_oom(job_dir: Path) -> bool:
         """Check if job failed due to OOM."""
-        if (job_dir / ".vasp_oom_marker").exists():
-            return True
-        vasp_log = job_dir / "vasp_output.log"
-        if vasp_log.exists():
-            try:
-                text = vasp_log.read_text(encoding="utf-8", errors="replace")
-                if "oom_kill" in text:
-                    return True
-            except OSError:
-                pass
-        return False
+        return is_oom_failure(job_dir)
 
     def _submit_job(
         self,
@@ -737,40 +718,17 @@ fi
                     kpar = int(line.split("=")[1].split("#")[0].strip())
 
             outcar_text = outcar.read_text(encoding="utf-8", errors="replace")
+            performance = parse_performance_evidence(outcar_text)
 
             # MPI ranks → gpus
             gpus = self._parse_gpus(job_dir)
-            total_ranks = 0
-            m_ranks = re.search(
-                r"running on\s+(\d+)\s+total cores", outcar_text,
-            )
-            if m_ranks:
-                total_ranks = int(m_ranks.group(1))
+            total_ranks = performance.total_ranks
             if total_ranks > 0:
                 gpus = total_ranks
 
-            loop_times = [
-                float(m.group(1))
-                for m in re.finditer(
-                    r"LOOP:\s+cpu time\s+[\d.]+:\s+real time\s+([\d.]+)",
-                    outcar_text,
-                )
-            ]
-            avg_loop = (
-                sum(loop_times) / len(loop_times) if loop_times else 0.0
-            )
-
-            n_kpoints_irr = 0
-            m = re.search(
-                r"Found\s+(\d+)\s+irreducible k-points", outcar_text,
-            )
-            if m:
-                n_kpoints_irr = int(m.group(1))
-
-            n_electrons = 0
-            m = re.search(r"NELECT\s*=\s*([\d.]+)", outcar_text)
-            if m:
-                n_electrons = int(float(m.group(1)))
+            avg_loop = performance.average_loop_time
+            n_kpoints_irr = performance.irreducible_kpoints
+            n_electrons = int(performance.electrons)
 
             return {
                 "n_atoms": n_atoms,
@@ -816,14 +774,9 @@ fi
                     outcar_text = outcar.read_text(
                         encoding="utf-8", errors="replace",
                     )
-                    m = re.search(r"NELECT\s*=\s*([\d.]+)", outcar_text)
-                    if m:
-                        n_electrons = int(float(m.group(1)))
-                    m = re.search(
-                        r"Found\s+(\d+)\s+irreducible k-points", outcar_text,
-                    )
-                    if m:
-                        n_kpoints_irr = int(m.group(1))
+                    performance = parse_performance_evidence(outcar_text)
+                    n_electrons = int(performance.electrons)
+                    n_kpoints_irr = performance.irreducible_kpoints
                 except OSError:
                     pass
 
