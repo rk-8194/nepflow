@@ -80,7 +80,14 @@ def test_deterministic_dft_to_validation_identity_trace() -> None:
             json.dumps(calculation_identity), encoding="utf-8"
         )
 
-        with patch.object(train_prepare, "ase_read", return_value=selected.copy()):
+        with patch.object(
+            train_prepare,
+            "ase_read",
+            side_effect=lambda *_args, **_kwargs: ase_read(
+                str(DFT_FIXTURE),
+                format="extxyz",
+            ),
+        ):
             accepted = train_prepare._parse_outcar_result(
                 outcar_path,
                 selected,
@@ -88,7 +95,7 @@ def test_deterministic_dft_to_validation_identity_trace() -> None:
                 calculation_identity=calculation_identity,
             )
 
-        assert accepted.accepted
+        assert accepted.accepted, accepted.rejection_reason
         assert accepted.structure_id == calculation_identity["structure_hash"]
         assert accepted.calculation_identity == tuple(sorted(calculation_identity.items()))
         assert accepted.source_outcar_hash == sha256_file(outcar_path)

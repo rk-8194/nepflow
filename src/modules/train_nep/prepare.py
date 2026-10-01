@@ -504,19 +504,11 @@ def _parse_outcar_result(
         return rejected(f"species_mismatch:expected={expected_species}:actual={actual_species}")
 
     try:
-        if "energy" in atoms.info:
-            energy = float(atoms.info["energy"])
-        else:
-            energy = float(atoms.get_potential_energy())
+        energy = float(atoms.get_potential_energy())
     except Exception as exc:
         return rejected(f"missing_energy:{type(exc).__name__}")
     try:
-        if "forces" in atoms.arrays:
-            forces = np.asarray(atoms.arrays["forces"], dtype=float)
-        elif "force" in atoms.arrays:
-            forces = np.asarray(atoms.arrays["force"], dtype=float)
-        else:
-            forces = np.asarray(atoms.get_forces(), dtype=float)
+        forces = np.asarray(atoms.get_forces(), dtype=float)
     except Exception as exc:
         return rejected(f"missing_forces:{type(exc).__name__}")
 
