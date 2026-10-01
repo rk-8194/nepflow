@@ -9,8 +9,9 @@ from nepflow.config.models import CompositionConfig, NepTrainingConfig
 from nepflow.domain.datasets import DatasetIdentity, TrainingDatasetManifest
 from nepflow.domain.identities import ArtifactIdentity, ModelRunIdentity, StructureIdentity
 from nepflow.domain.models import ModelArtifactMetadata, ModelRunRecord
-from nepflow.errors import ValidationError
+from nepflow.errors import MlipError, ValidationError
 from nepflow.mlip.backend import (
+    CollectedModelArtifacts,
     MlipBackend,
     TrainingCompletion,
     TrainingInput,
@@ -36,12 +37,17 @@ def _dataset() -> TrainingDatasetManifest:
     return TrainingDatasetManifest(identity=identity, records=())
 
 
-def _training_request(tmp_path: Path) -> TrainingInputRequest:
+def _training_request(
+    tmp_path: Path,
+    *,
+    hyperparameters: NepTrainingConfig | None = None,
+) -> TrainingInputRequest:
     return TrainingInputRequest(
         dataset=_dataset(),
-        hyperparameters=NepTrainingConfig(),
+        hyperparameters=hyperparameters or NepTrainingConfig(),
         composition=CompositionConfig(elements=("W",)),
         working_directory=tmp_path / "training",
+        hyperparameters_hash="canonical-nep-hyperparameters",
     )
 
 
@@ -70,9 +76,10 @@ class FakeMlipBackend:
         self,
         run_directory: Path,
         inputs: TrainingInput,
-    ) -> ModelRunRecord:
+    ) -> CollectedModelArtifacts:
         model = ArtifactIdentity.from_bytes("nep-model", b"model")
-        return ModelRunRecord(
+        return CollectedModelArtifacts(
+            inputs,
             inputs.model_run_identity,
             ModelArtifactMetadata(model=model, nep_in=inputs.nep_in, status="completed"),
         )
@@ -108,10 +115,46 @@ def test_fake_mlip_backend_conforms_and_keeps_commands_argument_oriented(
     assert isinstance(backend, MlipBackend)
 
     inputs = backend.render_training_input(_training_request(tmp_path))
-    assert backend.training_command(inputs) == ("nep", "--input", "nep.in")
-    assert ";" not in backend.training_command(inputs)
+    command = backend.training_command(inputs)
+    assert command == ("nep", "--input", "nep.in")
+    assert command and all(isinstance(part, str) and part for part in command)
+    assert ";" not in command
     assert backend.model_run_identity(inputs) == inputs.model_run_identity
-    assert backend.collect_model_artifacts(tmp_path, inputs).artifact is not None
+    collected = backend.collect_model_artifacts(tmp_path, inputs)
+    assert collected.artifact.model.sha256
+
+
+def test_runtime_training_policy_does_not_change_carried_model_identity(
+    tmp_path: Path,
+) -> None:
+    backend = FakeMlipBackend()
+    baseline = backend.render_training_input(_training_request(tmp_path))
+    changed_policy = backend.render_training_input(
+        _training_request(tmp_path, hyperparameters=NepTrainingConfig(max_resubmit=99))
+    )
+
+    assert baseline.hyperparameters_hash == changed_policy.hyperparameters_hash
+    assert baseline.model_run_identity == changed_policy.model_run_identity
+
+
+def test_collected_model_artifacts_reject_missing_or_mismatched_identity() -> None:
+    training_input = FakeMlipBackend().render_training_input(
+        _training_request(Path("training"))
+    )
+    artifact = ModelArtifactMetadata(
+        model=ArtifactIdentity.from_bytes("nep-model", b"model"),
+        status="completed",
+    )
+    with pytest.raises(MlipError, match="require model metadata"):
+        CollectedModelArtifacts(
+            training_input,
+            training_input.model_run_identity,
+            None,  # type: ignore[arg-type]
+        )
+
+    different = ModelRunIdentity("dataset-2", "nep-in", "hyperparameters")
+    with pytest.raises(MlipError, match="different model run"):
+        CollectedModelArtifacts(training_input, different, artifact)
 
 
 def test_static_prediction_keeps_runtime_metadata_separate() -> None:

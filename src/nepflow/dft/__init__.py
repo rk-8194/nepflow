@@ -7,9 +7,8 @@ from .backend import (
     DftFailureEvidence,
     DftInputArtifacts,
     DftInputRequest,
-    DftRecoveryDecision,
-    DftRecoveryRequest,
     DftResult,
+    DftResultRequirements,
 )
 
 __all__ = [
@@ -19,7 +18,6 @@ __all__ = [
     "DftFailureEvidence",
     "DftInputArtifacts",
     "DftInputRequest",
-    "DftRecoveryDecision",
-    "DftRecoveryRequest",
     "DftResult",
+    "DftResultRequirements",
 ]

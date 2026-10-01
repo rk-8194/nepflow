@@ -1,6 +1,7 @@
 """Machine-learning interatomic-potential package for NEPFlow."""
 
 from .backend import (
+    CollectedModelArtifacts,
     MlipBackend,
     TrainingCompletion,
     TrainingInput,
@@ -15,6 +16,7 @@ from .simulation import (
 )
 
 __all__ = [
+    "CollectedModelArtifacts",
     "MlipBackend",
     "PredictionRuntimeMetadata",
     "StaticPrediction",

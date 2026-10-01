@@ -8,31 +8,15 @@ backend boundary.
 from __future__ import annotations
 
 import math
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
 from nepflow.config.models import CompositionConfig, NepTrainingConfig
 from nepflow.domain.datasets import TrainingDatasetManifest
 from nepflow.domain.identities import ArtifactIdentity, ModelRunIdentity
-from nepflow.domain.models import ModelRunRecord
-from nepflow.io.hashing import sha256_canonical_json
-from nepflow.io.json import to_jsonable
+from nepflow.domain.models import ModelArtifactMetadata
 from nepflow.errors import MlipError
-
-
-def _hyperparameters_hash(
-    hyperparameters: NepTrainingConfig,
-    composition: CompositionConfig,
-) -> str:
-    """Hash the typed settings that affect the rendered NEP input."""
-
-    payload = {
-        "schema_version": "nep.hyperparameters.v1",
-        "composition": to_jsonable(asdict(composition)),
-        "training": to_jsonable(asdict(hyperparameters)),
-    }
-    return sha256_canonical_json(payload)
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,13 +27,8 @@ class TrainingInputRequest:
     hyperparameters: NepTrainingConfig
     composition: CompositionConfig
     working_directory: Path
+    hyperparameters_hash: str
     template_path: Path | None = None
-
-    @property
-    def hyperparameters_hash(self) -> str:
-        """Return the canonical hash used by ``ModelRunIdentity``."""
-
-        return _hyperparameters_hash(self.hyperparameters, self.composition)
 
 
 @dataclass(frozen=True, slots=True)
@@ -101,6 +80,23 @@ class TrainingCompletion:
             )
 
 
+@dataclass(frozen=True, slots=True)
+class CollectedModelArtifacts:
+    """Successful model collection with a required, identity-bound artifact."""
+
+    training_input: TrainingInput
+    model_run: ModelRunIdentity
+    artifact: ModelArtifactMetadata
+
+    def __post_init__(self) -> None:
+        if self.artifact is None or self.artifact.model is None:  # type: ignore[comparison-overlap]
+            raise MlipError("collected model artifacts require model metadata")
+        if self.model_run != self.training_input.model_run_identity:
+            raise MlipError(
+                "collected model artifact belongs to a different model run"
+            )
+
+
 @runtime_checkable
 class MlipBackend(Protocol):
     """Stable operations required by current NEP training."""
@@ -121,14 +117,15 @@ class MlipBackend(Protocol):
         self,
         run_directory: Path,
         inputs: TrainingInput,
-    ) -> ModelRunRecord:
-        """Collect required model artifact(s) with explicit content identity."""
+    ) -> CollectedModelArtifacts:
+        """Collect required artifacts bound to the rendered model-run identity."""
 
     def model_run_identity(self, inputs: TrainingInput) -> ModelRunIdentity:
         """Expose the exact dataset/input/settings identity of the run."""
 
 
 __all__ = [
+    "CollectedModelArtifacts",
     "MlipBackend",
     "TrainingCompletion",
     "TrainingInput",

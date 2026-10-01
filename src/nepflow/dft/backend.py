@@ -8,13 +8,12 @@ infrastructure and workflow layers.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
 import numpy as np
 
-from nepflow.config.models import DftRecoveryConfig, HpcConfig, VaspConfig
 from nepflow.domain.calculations import DftResultArtifact
 from nepflow.domain.identities import DftCalculationIdentity, StructureIdentity
 from nepflow.domain.units import (
@@ -24,8 +23,17 @@ from nepflow.domain.units import (
     VIRIAL_TENSOR_CONVENTION_CARTESIAN_3X3,
     VIRIAL_UNIT_EV,
 )
-from nepflow.errors import ValidationError, VaspError
+from nepflow.errors import BackendError, ValidationError
 from nepflow.hpc.process import ProcessResult
+
+
+@dataclass(frozen=True, slots=True)
+class DftResultRequirements:
+    """Explicit required quantities for one parsed DFT result."""
+
+    energy_required: bool = True
+    forces_required: bool = True
+    virial_requested: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -35,9 +43,7 @@ class DftInputRequest:
     structure: StructureIdentity
     source_structure: Path
     working_directory: Path
-    incar_template: Path
-    pseudopotentials: tuple[Path, ...]
-    config: VaspConfig
+    requirements: DftResultRequirements = field(default_factory=DftResultRequirements)
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,6 +53,7 @@ class DftInputArtifacts:
     calculation: DftCalculationIdentity
     working_directory: Path
     files: tuple[Path, ...]
+    requirements: DftResultRequirements = field(default_factory=DftResultRequirements)
 
 
 @dataclass(frozen=True, slots=True)
@@ -64,17 +71,17 @@ class DftResult:
 
     Energy is in eV, forces are Cartesian eV/Angstrom, and virial is an
     optional 3x3 tensor in eV using the positive-compression convention.
-    Missing required energy or force labels are backend errors rather than
-    partial results.  Virial is optional because current training settings
-    explicitly allow it to be requested or omitted.
+    The explicit requirements record determines which quantities may be
+    absent; it is carried from the input request through the prepared inputs.
     """
 
     structure: StructureIdentity
     calculation: DftCalculationIdentity
-    energy_ev: float
-    forces_ev_per_angstrom: np.ndarray
+    energy_ev: float | None
+    forces_ev_per_angstrom: np.ndarray | None
     virial_ev: np.ndarray | None = None
     artifact: DftResultArtifact | None = None
+    requirements: DftResultRequirements = field(default_factory=DftResultRequirements)
     energy_unit: str = ENERGY_UNIT_EV
     force_unit: str = FORCE_UNIT_EV_PER_ANGSTROM
     virial_unit: str = VIRIAL_UNIT_EV
@@ -82,40 +89,51 @@ class DftResult:
     virial_tensor_convention: str = VIRIAL_TENSOR_CONVENTION_CARTESIAN_3X3
 
     def __post_init__(self) -> None:
-        try:
-            energy = float(self.energy_ev)
-        except (TypeError, ValueError) as exc:
-            raise VaspError("DFT result is missing a numeric energy") from exc
-        if not np.isfinite(energy):
-            raise VaspError("DFT result energy is not finite")
-        object.__setattr__(self, "energy_ev", energy)
+        if self.energy_ev is None:
+            if self.requirements.energy_required:
+                raise BackendError("DFT result is missing required energy")
+        else:
+            try:
+                energy = float(self.energy_ev)
+            except (TypeError, ValueError) as exc:
+                raise BackendError("DFT result energy is not numeric") from exc
+            if not np.isfinite(energy):
+                raise BackendError("DFT result energy is not finite")
+            object.__setattr__(self, "energy_ev", energy)
 
         if self.calculation.structure_id != self.structure.structure_id:
             raise ValidationError(
                 "DFT result structure identity does not match calculation identity"
             )
 
-        forces = np.asarray(self.forces_ev_per_angstrom, dtype=float)
-        if forces.ndim != 2 or forces.shape[1] != 3:
-            raise VaspError(
-                "DFT result forces must have shape (n_atoms, 3), "
-                f"got {forces.shape}"
-            )
-        if not np.isfinite(forces).all():
-            raise VaspError("DFT result forces contain non-finite values")
-        forces = np.array(forces, copy=True)
-        forces.setflags(write=False)
-        object.__setattr__(self, "forces_ev_per_angstrom", forces)
+        if self.forces_ev_per_angstrom is None:
+            if self.requirements.forces_required:
+                raise BackendError("DFT result is missing required forces")
+        else:
+            forces = np.asarray(self.forces_ev_per_angstrom, dtype=float)
+            if forces.ndim != 2 or forces.shape[1] != 3:
+                raise BackendError(
+                    "DFT result forces must have shape (n_atoms, 3), "
+                    f"got {forces.shape}"
+                )
+            if not np.isfinite(forces).all():
+                raise BackendError("DFT result forces contain non-finite values")
+            forces = np.array(forces, copy=True)
+            forces.setflags(write=False)
+            object.__setattr__(self, "forces_ev_per_angstrom", forces)
 
-        if self.virial_ev is not None:
+        if self.virial_ev is None:
+            if self.requirements.virial_requested:
+                raise BackendError("DFT result is missing requested virial/stress")
+        else:
             virial = np.asarray(self.virial_ev, dtype=float)
             if virial.shape != (3, 3):
-                raise VaspError(
+                raise BackendError(
                     "DFT result virial must have shape (3, 3), "
                     f"got {virial.shape}"
                 )
             if not np.isfinite(virial).all():
-                raise VaspError("DFT result virial contains non-finite values")
+                raise BackendError("DFT result virial contains non-finite values")
             virial = np.array(virial, copy=True)
             virial.setflags(write=False)
             object.__setattr__(self, "virial_ev", virial)
@@ -148,31 +166,6 @@ class DftFailure:
     reason: str
 
 
-@dataclass(frozen=True, slots=True)
-class DftRecoveryRequest:
-    """Input to the backend-specific VASP recovery decision."""
-
-    failure: DftFailure
-    retry_level: int
-    initial_gpu: int
-    initial_ncore: int
-    initial_kpar: int
-    hpc: HpcConfig
-    policy: DftRecoveryConfig
-
-
-@dataclass(frozen=True, slots=True)
-class DftRecoveryDecision:
-    """One backend recovery choice, without scheduler submission semantics."""
-
-    retry: bool
-    reason: str
-    ncore: int | None = None
-    kpar: int | None = None
-    nodes: int | None = None
-    gpus_per_node: int | None = None
-
-
 @runtime_checkable
 class DftBackend(Protocol):
     """Scientific boundary required by the current VASP workflow."""
@@ -196,9 +189,6 @@ class DftBackend(Protocol):
     def classify_failure(self, evidence: DftFailureEvidence) -> DftFailure:
         """Classify backend output for workflow recovery/quarantine policy."""
 
-    def decide_recovery(self, request: DftRecoveryRequest) -> DftRecoveryDecision:
-        """Choose backend-specific retry settings, if the failure is recoverable."""
-
     def calculation_identity(self, request: DftInputRequest) -> DftCalculationIdentity:
         """Expose the identity of the scientific inputs being prepared."""
 
@@ -217,7 +207,6 @@ __all__ = [
     "DftFailureEvidence",
     "DftInputArtifacts",
     "DftInputRequest",
-    "DftRecoveryDecision",
-    "DftRecoveryRequest",
     "DftResult",
+    "DftResultRequirements",
 ]
