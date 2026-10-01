@@ -20,6 +20,13 @@ dependencies = [
     "matplotlib",
 ]
 
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["nepflow*"]
+
 [tool.pylint.init-hook]
 init-hook = "import sys; sys.path.insert(0, 'src')"
 

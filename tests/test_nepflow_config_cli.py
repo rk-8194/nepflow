@@ -1,3 +1,4 @@
+import importlib.util
 import os
 import tempfile
 import unittest
@@ -10,7 +11,20 @@ import pytest
 for package_name in ("ase", "hiphive", "mp_api", "pymatgen", "icet", "NepTrainKit"):
     pytest.importorskip(package_name)
 
-import nepflow  # noqa: E402
+
+
+def _load_cli_module():
+    """Load the root CLI without shadowing the canonical nepflow package."""
+    cli_path = Path(__file__).resolve().parents[1] / "nepflow.py"
+    spec = importlib.util.spec_from_file_location("nepflow_cli", cli_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Could not load CLI module from {cli_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+nepflow = _load_cli_module()
 
 
 class ConfigCliTests(unittest.TestCase):

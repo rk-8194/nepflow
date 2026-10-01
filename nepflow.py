@@ -40,13 +40,16 @@ if _missing:
     )
     sys.exit(1)
 
-# Add src to path
+# Temporary Phase 4 migration bridge: legacy workflow and stage modules still
+# live directly under src/. The installed nepflow package does not depend on
+# this path mutation; only these legacy imports do.
 sys.path.insert(0, str(Path(__file__).parent / "src"))
 
-# Note: Imports below depend on src/ being in sys.path
+# Note: The legacy imports below depend on src/ being in sys.path. The logging
+# foundation is imported from the canonical installed package.
 # pylint: disable=import-error
 from workflow import WorkflowController
-from logging_config import setup_logging
+from nepflow.logging import configure_logging
 from modules import SelfResubmitExit
 
 logger = logging.getLogger("nepflow")
@@ -313,7 +316,7 @@ def main():
     project_dir = args.output_dir / f"project_{args.project}"
     log_dir = project_dir / "logs"
 
-    setup_logging(
+    configure_logging(
         project_name=args.project,
         log_dir=log_dir,
         debug=args.debug,
