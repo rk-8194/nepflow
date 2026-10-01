@@ -89,6 +89,15 @@ class VaspParseResult:
         }
 
 
+@dataclass(frozen=True)
+class ResolvedVaspOutput:
+    """An OUTCAR whose calculation identity was verified during resolution."""
+
+    outcar_path: Path
+    calculation_identity: tuple[tuple[str, str], ...]
+    verification_source: str
+
+
 def prepare_dataset(
     dataset_path: Path,
     ase_structures: List[Atoms],
@@ -209,7 +218,7 @@ def _parse_structures(
 
     for struct_idx, atoms in enumerate(ase_structures):
         try:
-            outcar_path = _resolve_outcar_for_structure(
+            resolved_output = _resolve_outcar_for_structure(
                 atoms,
                 dataset_type,
                 struct_idx,
@@ -225,7 +234,7 @@ def _parse_structures(
             )
             continue
 
-        if outcar_path is None:
+        if resolved_output is None:
             logger.warning(f"[{dataset_type}] Skipping struct_{struct_idx:04d}: no completed OUTCAR found")
             _record_rejection(extraction_report, "completed_outcar_missing")
             continue
@@ -234,10 +243,11 @@ def _parse_structures(
             logger.debug(f"[{dataset_type}] Parsing struct_{struct_idx:04d}")
             identity = _identity_for_structure(atoms, input_context)
             result = _parse_outcar_result(
-                outcar_path,
+                resolved_output.outcar_path,
                 atoms,
                 require_virial=require_virial,
                 calculation_identity=identity,
+                identity_evidence=resolved_output,
             )
             if result.accepted:
                 _record_acceptance(extraction_report, result)
@@ -306,7 +316,7 @@ def _resolve_outcar_for_structure(
     project_dir: Path,
     vasp_jobs_path: Path,
     input_context: dict,
-) -> Path | None:
+) -> ResolvedVaspOutput | None:
     """Resolve the completed OUTCAR for one selected structure by input hashes."""
     identity = _identity_for_structure(atoms, input_context)
     structure_hash = identity["structure_hash"]
@@ -314,9 +324,9 @@ def _resolve_outcar_for_structure(
     potcar_hash = identity["potcar_hash"]
 
     preferred = vasp_jobs_path / f"struct_{struct_idx:04d}"
-    outcar = _outcar_from_local_job(preferred, identity)
-    if outcar is not None:
-        return outcar
+    resolved_output = _outcar_from_local_job(preferred, identity)
+    if resolved_output is not None:
+        return resolved_output
 
     for struct_dir in sorted(
         [d for d in vasp_jobs_path.iterdir() if d.is_dir() and d.name.startswith("struct_")],
@@ -324,9 +334,9 @@ def _resolve_outcar_for_structure(
     ):
         if struct_dir == preferred:
             continue
-        outcar = _outcar_from_local_job(struct_dir, identity)
-        if outcar is not None:
-            return outcar
+        resolved_output = _outcar_from_local_job(struct_dir, identity)
+        if resolved_output is not None:
+            return resolved_output
 
     entry = get_registry_entry(
         input_context["registry"],
@@ -337,7 +347,11 @@ def _resolve_outcar_for_structure(
     if entry and entry.get("job_path"):
         outcar = Path(entry["job_path"]) / "OUTCAR"
         if outcar_is_complete(outcar):
-            return outcar
+            return ResolvedVaspOutput(
+                outcar_path=outcar,
+                calculation_identity=tuple(sorted(identity.items())),
+                verification_source="completed_registry_key",
+            )
 
     return None
 
@@ -360,7 +374,10 @@ def _identity_for_structure(atoms: Atoms, input_context: dict) -> dict[str, str]
     }
 
 
-def _outcar_from_local_job(struct_dir: Path, identity: dict) -> Path | None:
+def _outcar_from_local_job(
+    struct_dir: Path,
+    identity: dict,
+) -> ResolvedVaspOutput | None:
     """Return a completed OUTCAR from a local identity-matched job folder."""
     if not struct_dir.exists():
         return None
@@ -372,10 +389,20 @@ def _outcar_from_local_job(struct_dir: Path, identity: dict) -> Path | None:
     if status.get("status") == "reused" and status.get("reused_from"):
         reused_outcar = Path(status["reused_from"]) / "OUTCAR"
         if outcar_is_complete(reused_outcar):
-            return reused_outcar
+            return ResolvedVaspOutput(
+                outcar_path=reused_outcar,
+                calculation_identity=tuple(sorted(identity.items())),
+                verification_source="current_job_identity_reuse",
+            )
 
     outcar = struct_dir / "OUTCAR"
-    return outcar if outcar_is_complete(outcar) else None
+    if not outcar_is_complete(outcar):
+        return None
+    return ResolvedVaspOutput(
+        outcar_path=outcar,
+        calculation_identity=tuple(sorted(identity.items())),
+        verification_source="current_job_identity",
+    )
 
 
 def _read_identity(struct_dir: Path) -> dict:
@@ -422,6 +449,7 @@ def _parse_outcar_result(
     ase_atoms: Atoms,
     require_virial: bool = False,
     calculation_identity: dict[str, str] | None = None,
+    identity_evidence: ResolvedVaspOutput | None = None,
 ) -> VaspParseResult:
     """Parse one OUTCAR into an immutable accepted/rejected result."""
     structure_id = hash_structure(ase_atoms)
@@ -448,12 +476,18 @@ def _parse_outcar_result(
         )
 
     if calculation_identity is not None:
-        source_identity = _read_identity(outcar_path.parent)
-        if not source_identity:
-            return rejected("missing_calculation_identity")
-        if any(
-            source_identity.get(key) != value
-            for key, value in calculation_identity.items()
+        if identity_evidence is None:
+            source_identity = _read_identity(outcar_path.parent)
+            if not source_identity:
+                return rejected("missing_calculation_identity")
+            if any(
+                source_identity.get(key) != value
+                for key, value in calculation_identity.items()
+            ):
+                return rejected("incompatible_calculation_identity")
+        elif (
+            identity_evidence.outcar_path.resolve() != outcar_path.resolve()
+            or identity_evidence.calculation_identity != identity_items
         ):
             return rejected("incompatible_calculation_identity")
 

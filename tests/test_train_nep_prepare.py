@@ -286,6 +286,7 @@ class TrainNepPrepareRegistryTests(unittest.TestCase):
                 encoding="utf-8",
             )
             self.write_identity_job(project_dir, "struct_0000", atoms, reused_from=old_job)
+            self.assertFalse((old_job / ".vasp_identity").exists())
 
             with patch.object(train_prepare, "ase_read", return_value=self.fixture_atoms()):
                 parsed = list(train_prepare._parse_structures([atoms], True, project_dir))
@@ -320,6 +321,7 @@ class TrainNepPrepareRegistryTests(unittest.TestCase):
             old_job.mkdir(parents=True)
             old_outcar = old_job / "OUTCAR"
             old_outcar.write_text("General timing\n", encoding="utf-8")
+            self.assertFalse((old_job / ".vasp_identity").exists())
             common.upsert_registry_entry(
                 root,
                 current_incar_hash(),
@@ -333,6 +335,59 @@ class TrainNepPrepareRegistryTests(unittest.TestCase):
 
         self.assertEqual(len(parsed), 1)
         self.assertAlmostEqual(parsed[0]["energy"], -10.5, places=12)
+
+    def test_unverified_historical_outcar_cannot_bypass_identity_validation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            old_job = root / "historical" / "struct_0002"
+            old_job.mkdir(parents=True)
+            outcar = old_job / "OUTCAR"
+            outcar.write_text(
+                (FIXTURES / "outcar" / "valid_outcar").read_text(encoding="utf-8"),
+                encoding="utf-8",
+            )
+            selected = self.fixture_atoms()
+            identity = {
+                "structure_hash": common.hash_structure(selected),
+                "incar_hash": current_incar_hash(),
+                "potcar_hash": common.hash_potcar_bytes(b"Si-potcar-v1"),
+            }
+
+            with patch.object(train_prepare, "ase_read", return_value=self.fixture_atoms()):
+                result = train_prepare._parse_outcar_result(
+                    outcar,
+                    selected,
+                    calculation_identity=identity,
+                )
+
+        self.assertFalse(result.accepted)
+        self.assertEqual(result.rejection_reason, "missing_calculation_identity")
+
+    def test_registry_key_mismatch_does_not_reuse_completed_outcar(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            project_dir = self.make_project(root)
+            selected = make_atoms("Si")
+            registered_for = make_atoms(
+                "Si", positions=np.array([[0.25, 0.0, 0.0]])
+            )
+            old_job = root / "projects" / "project_old" / "vasp" / "jobs" / "train" / "struct_0002"
+            old_job.mkdir(parents=True)
+            (old_job / "OUTCAR").write_text(
+                (FIXTURES / "outcar" / "valid_outcar").read_text(encoding="utf-8"),
+                encoding="utf-8",
+            )
+            common.upsert_registry_entry(
+                root,
+                current_incar_hash(),
+                common.hash_potcar_bytes(b"Si-potcar-v1"),
+                common.hash_structure(registered_for),
+                {"job_path": str(old_job.resolve())},
+            )
+
+            parsed = list(train_prepare._parse_structures([selected], True, project_dir))
+
+        self.assertEqual(parsed, [])
 
     def test_resolves_by_hash_not_selected_index(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

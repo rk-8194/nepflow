@@ -115,9 +115,11 @@ def test_equivalent_effective_inputs_have_stable_identity_across_paths_and_forma
 def test_effective_type_list_change_changes_render_and_identity() -> None:
     baseline_rendered, baseline_identity = render_and_identify(
         composition_elements="Si,Ge",
+        weights="",
     )
     variant_rendered, variant_identity = render_and_identify(
         composition_elements="Si,Ge,O",
+        weights="",
     )
 
     assert baseline_rendered != variant_rendered
