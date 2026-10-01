@@ -7,12 +7,14 @@ from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
+import numpy as np
 import pytest
 
 pytest.importorskip("ase")
 pytest.importorskip("pymatgen")
 
 from ase.io import read as ase_read  # noqa: E402
+from ase.calculators.singlepoint import SinglePointCalculator  # noqa: E402
 
 from common.model_manifest import (  # noqa: E402
     compute_model_run_id,
@@ -39,6 +41,22 @@ ROOT = Path(__file__).resolve().parents[1]
 OUTCAR_FIXTURE = ROOT / "tests" / "fixtures" / "outcar" / "valid_outcar"
 DFT_FIXTURE = ROOT / "tests" / "fixtures" / "structures" / "dft_reference.extxyz.fixture"
 ML_FIXTURE = ROOT / "tests" / "fixtures" / "structures" / "gpumd_static_prediction.extxyz.fixture"
+
+
+def read_dft_fixture_as_vasp_result():
+    """Adapt the NEP-facing fixture to ASE's VASP calculator contract."""
+    atoms = ase_read(str(DFT_FIXTURE), format="extxyz")
+    assert "force" in atoms.arrays
+    assert np.asarray(atoms.arrays["force"]).shape == (len(atoms), 3)
+
+    energy = atoms.get_potential_energy()
+    forces = np.asarray(atoms.arrays["force"], dtype=float).copy()
+    atoms.calc = SinglePointCalculator(
+        atoms,
+        energy=energy,
+        forces=forces,
+    )
+    return atoms
 
 
 def audit_config() -> ConfigParser:
@@ -70,7 +88,7 @@ def test_deterministic_dft_to_validation_identity_trace() -> None:
         vasp_job.mkdir(parents=True)
         outcar_path = vasp_job / "OUTCAR"
         shutil.copy2(OUTCAR_FIXTURE, outcar_path)
-        selected = ase_read(str(DFT_FIXTURE), format="extxyz")
+        selected = read_dft_fixture_as_vasp_result()
         calculation_identity = {
             "structure_hash": hash_structure(selected),
             "incar_hash": "incar-hash-v1",
@@ -83,10 +101,7 @@ def test_deterministic_dft_to_validation_identity_trace() -> None:
         with patch.object(
             train_prepare,
             "ase_read",
-            side_effect=lambda *_args, **_kwargs: ase_read(
-                str(DFT_FIXTURE),
-                format="extxyz",
-            ),
+            side_effect=lambda *_args, **_kwargs: read_dft_fixture_as_vasp_result(),
         ):
             accepted = train_prepare._parse_outcar_result(
                 outcar_path,
