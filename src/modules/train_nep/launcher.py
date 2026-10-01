@@ -11,7 +11,7 @@ from pathlib import Path
 from nepflow.errors import StateError
 from nepflow.io.json import read_json, write_json
 
-from ..base import SelfResubmitExit
+from nepflow.workflow.resubmission import SelfResubmitExit
 from common.model_manifest import ModelManifestError, update_model_run_status
 from ._common import logger
 

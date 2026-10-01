@@ -267,6 +267,28 @@ class StateStore:
         row = self._fetchone("SELECT * FROM stage_runs WHERE stage_run_id = ?", (stage_run_id,))
         return None if row is None else _decode_row(row, ("metadata_json",))
 
+    def list_stage_runs(self, project_id: str) -> list[dict[str, Any]]:
+        """Return stage-run records for a project in most-recent-first order.
+
+        Ordering belongs in the state boundary because ``started_at`` and the
+        stage-run identity are ledger fields.  Workflow policy still decides
+        whether the returned stage is a valid transition.
+        """
+
+        rows = self._fetchall(
+            "SELECT * FROM stage_runs "
+            "WHERE project_id = ? "
+            "ORDER BY COALESCE(started_at, completed_at, '') DESC, stage_run_id DESC",
+            (project_id,),
+        )
+        return [_decode_row(row, ("metadata_json",)) for row in rows]
+
+    def get_latest_stage_run(self, project_id: str) -> dict[str, Any] | None:
+        """Return the current-most stage-run record for a project."""
+
+        rows = self.list_stage_runs(project_id)
+        return rows[0] if rows else None
+
     def record_stage_run(self, stage_run_id: str, project_id: str, stage: str, **kwargs: Any) -> dict[str, Any]:
         """Record one stage run by its stable run ID."""
 

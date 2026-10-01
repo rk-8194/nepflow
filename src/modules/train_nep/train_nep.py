@@ -12,7 +12,8 @@ import numpy as np
 from ase.io import read as ase_read
 from ase.atoms import Atoms
 
-from ..base import Stage, SelfResubmitExit
+from ..base import Stage
+from nepflow.workflow.resubmission import SelfResubmitExit
 from common.model_manifest import (
     MODEL_RUN_MANIFEST_FILENAME,
     ModelManifestError,

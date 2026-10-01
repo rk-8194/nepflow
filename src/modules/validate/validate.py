@@ -4,7 +4,8 @@ import logging
 from configparser import ConfigParser
 from pathlib import Path
 
-from ..base import Stage, SelfResubmitExit
+from ..base import Stage
+from nepflow.workflow.resubmission import SelfResubmitExit
 from ..train_nep.launcher import read_train_status
 from .prepare import (
     finalize_nep_potential,

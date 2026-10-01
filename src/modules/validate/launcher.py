@@ -10,7 +10,7 @@ from pathlib import Path
 from nepflow.errors import StateError
 from nepflow.io.json import read_json_object, write_json
 
-from ..base import SelfResubmitExit
+from nepflow.workflow.resubmission import SelfResubmitExit
 
 logger = logging.getLogger("nepflow.validate")
 

@@ -49,9 +49,10 @@ sys.path.insert(0, str(Path(__file__).parent / "src"))
 # foundation is imported from the canonical installed package.
 # pylint: disable=import-error
 from workflow import WorkflowController
+from nepflow.errors import StateError, ValidationError
 from nepflow.logging import configure_logging
 from nepflow.config.loader import canonical_config_path
-from modules import SelfResubmitExit
+from nepflow.workflow.resubmission import SelfResubmitExit
 
 logger = logging.getLogger("nepflow")
 
@@ -356,7 +357,7 @@ def main():
         slurm_deadline=slurm_deadline,
     )
 
-    # Run workflow: controller determines current stage from .project file
+    # Run workflow: controller reconciles StateStore with the legacy marker
     # If under SLURM and approaching deadline, resubmit before running
     try:
         if slurm_deadline and time.time() >= slurm_deadline:
@@ -375,7 +376,7 @@ def main():
         logger.info("Resubmission initiated, exiting")
         return
 
-    except (ValueError, IOError, RuntimeError) as e:
+    except (ValueError, IOError, RuntimeError, StateError, ValidationError) as e:
         # Log the error (message only, not traceback)
         logger.error("Workflow failed: %s", e)
 

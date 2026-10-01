@@ -3,13 +3,13 @@ Workflow controller and stage orchestration.
 """
 
 from pathlib import Path
+from datetime import datetime, timezone
 import logging
 import time
 
 # Note: src/ is added to sys.path dynamically by nepflow_cli.py
 # pylint: disable=import-error
 from modules import (
-    SelfResubmitExit,
     InitStage,
     GenerateStage,
     SelectStage,
@@ -20,8 +20,26 @@ from modules import (
 )
 from modules.validate.launcher import read_validation_status
 from modules.run_vasp._common import read_status
+from nepflow.errors import StateError
+from nepflow.state import StateStore
+from nepflow.workflow.resubmission import (
+    ReconciliationResult,
+    SelfResubmitExit,
+)
+from nepflow.workflow.stages import (
+    StageRunStatus,
+    StageRunState,
+    WorkflowStage,
+    parse_legacy_stage,
+    stage_to_legacy,
+    validate_transition,
+)
 
 logger = logging.getLogger("nepflow.workflow")
+
+
+class _InvalidWorkflowMarkerError(StateError, ValueError):
+    """Keep the legacy ValueError surface while exposing typed state failure."""
 
 
 class WorkflowController:
@@ -29,7 +47,7 @@ class WorkflowController:
     Main workflow controller for project orchestration.
     
     Handles:
-    - Reading project state from .project file
+    - Reconciling StateStore stage state with the legacy .project marker
     - Automatically determining current workflow stage
     - Stage execution and state progression
     - Slurm job submission and tracking
@@ -78,6 +96,17 @@ class WorkflowController:
         self.project_file = self.project_dir / ".project"
         self.state_file = self.project_dir / "state.db"
         self.log_dir = self.project_dir / "logs"
+
+        # The controller remains in its legacy location until Phase 4, but
+        # stage identity is already ledger-backed.  This bridge does not read
+        # or migrate any legacy state file beyond the .project cache marker.
+        self._state_store = StateStore(self.state_file)
+        if self._state_store.get_project(self.project_name) is None:
+            self._state_store.upsert_project(
+                self.project_name,
+                name=self.project_name,
+                root_path=str(self.project_dir),
+            )
         
         logger.info("Initialized controller for project: %s", project_name)
         if self.debug:
@@ -122,61 +151,194 @@ class WorkflowController:
             remaining = self.slurm_deadline - current_time
             logger.info("Approaching SLURM deadline (%.1fs remaining) — will resubmit after this stage", remaining)
     
-    def _determine_current_stage(self) -> str:
-        """
-        Determine the current workflow stage from .project file.
-        
-        Returns:
-            Current stage name, including the terminal 'completed' state.
-            Defaults to 'init' if .project file doesn't exist.
-        """
+    @staticmethod
+    def _timestamp() -> str:
+        return datetime.now(timezone.utc).isoformat()
+
+    def _read_marker_stage(self) -> WorkflowStage | None:
+        """Read and canonically parse the optional legacy stage marker."""
+
         if not self.project_file.exists():
-            logger.debug("Project file not found: %s, defaulting to 'init'", self.project_file)
-            return "init"
-        
+            return None
         try:
-            with open(self.project_file, "r", encoding="utf-8") as f:
-                stage = f.read().strip()
-            
-            # Validate stage name
-            valid_stages = {
-                "init", "generate", "select", "run_vasp", "train_nep",
-                "validate", "completed",
-            }
-            if stage not in valid_stages:
-                raise ValueError(
-                    f"Invalid workflow stage {stage!r} in {self.project_file}"
+            marker = self.project_file.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise StateError(
+                f"Failed to read workflow marker {self.project_file}"
+            ) from exc
+        try:
+            return parse_legacy_stage(marker)
+        except StateError as exc:
+            raise _InvalidWorkflowMarkerError(
+                f"Invalid workflow stage marker in {self.project_file}: {exc}"
+            ) from exc
+
+    def _read_authoritative_stage(
+        self,
+    ) -> tuple[WorkflowStage | None, WorkflowStage | None, StageRunStatus | None]:
+        """Read the store and marker without allowing either to mask the other."""
+
+        marker_stage = self._read_marker_stage()
+        row = self._state_store.get_latest_stage_run(self.project_name)
+        stored_run = StageRunStatus.from_mapping(row) if row is not None else None
+        stored_stage = stored_run.stage if stored_run is not None else None
+
+        if stored_stage is not None and marker_stage is not None:
+            if stored_stage is not marker_stage:
+                raise StateError(
+                    "Workflow stage marker contradicts authoritative state: "
+                    f"marker={marker_stage.value!r}, store={stored_stage.value!r}"
                 )
-            
-            logger.debug("Read stage from %s: %s", self.project_file, stage)
-            return stage
-            
-        except IOError as exc:
-            raise RuntimeError(f"Failed to read project file {self.project_file}") from exc
-    
-    def _set_current_stage(self, stage: str) -> None:
-        """
-        Update the current workflow stage in .project file.
-        
-        Args:
-            stage: Stage name to set
-        """
-        valid_stages = {
-            "init", "generate", "select", "run_vasp", "train_nep",
-            "validate", "completed",
-        }
-        if stage not in valid_stages:
-            logger.error("Invalid stage '%s' - must be one of %s", stage, valid_stages)
-            raise ValueError("Invalid stage: %s" % stage)
-        
+        return stored_stage or marker_stage, marker_stage, stored_run
+
+    def _stage_run_id(self, stage: WorkflowStage) -> str:
+        """Return the stable ledger identity for this project's stage."""
+
+        return f"{self.project_name}:{stage.value}"
+
+    def _record_stage(
+        self,
+        stage: WorkflowStage,
+        *,
+        status: StageRunState,
+        metadata: dict[str, str] | None = None,
+        started_at: str | None = None,
+        completed_at: str | None = None,
+    ) -> None:
+        """Persist one typed stage record inside the caller's transaction."""
+
+        self._state_store.upsert_stage_run(
+            self._stage_run_id(stage),
+            self.project_name,
+            stage.value,
+            status=status.value,
+            started_at=started_at,
+            completed_at=completed_at,
+            metadata=metadata or {},
+        )
+
+    def _write_stage_marker(self, stage: WorkflowStage) -> None:
+        """Write the compatibility marker from the canonical enum only."""
+
         try:
             self.project_file.parent.mkdir(parents=True, exist_ok=True)
-            with open(self.project_file, "w", encoding="utf-8") as f:
-                f.write(stage)
-            logger.debug("Updated project stage to: %s", stage)
-        except IOError as e:
-            logger.error("Failed to write project file %s: %s", self.project_file, e)
+            self.project_file.write_text(stage_to_legacy(stage), encoding="utf-8")
+        except OSError as exc:
+            logger.error("Failed to write project file %s: %s", self.project_file, exc)
             raise
+
+    def _reconcile_stage(self) -> ReconciliationResult:
+        """Reconcile legacy marker state with the StateStore ledger."""
+
+        stage, marker_stage, stored_run = self._read_authoritative_stage()
+        if stored_run is not None:
+            if marker_stage is None:
+                # The marker is only a compatibility cache; repair a missing
+                # cache from authoritative state, never the reverse.
+                self._write_stage_marker(stored_run.stage)
+            return ReconciliationResult(
+                stage=stored_run.stage,
+                source="state_store",
+                marker_stage=marker_stage,
+                authoritative_stage=stored_run.stage,
+                changed=marker_stage is None,
+            )
+
+        if marker_stage is not None:
+            # Existing projects have no stage-run history yet.  This one-time
+            # import is explicit reconciliation, not folder-based inference.
+            now = self._timestamp()
+            status = (
+                StageRunState.COMPLETED
+                if marker_stage.is_terminal
+                else StageRunState.RUNNING
+            )
+            with self._state_store.transaction():
+                self._record_stage(
+                    marker_stage,
+                    status=status,
+                    started_at=now,
+                    completed_at=now if marker_stage.is_terminal else None,
+                    metadata={"source": "legacy_project_marker"},
+                )
+            return ReconciliationResult(
+                stage=marker_stage,
+                source="legacy_marker",
+                marker_stage=marker_stage,
+                authoritative_stage=marker_stage,
+                changed=True,
+            )
+
+        # A brand-new project has a typed initial state.  There is no
+        # arbitrary-string fallback and no reconstruction from directories.
+        now = self._timestamp()
+        with self._state_store.transaction():
+            self._record_stage(
+                WorkflowStage.INIT,
+                status=StageRunState.RUNNING,
+                started_at=now,
+                metadata={"source": "initial_state"},
+            )
+        return ReconciliationResult(
+            stage=WorkflowStage.INIT,
+            source="initial_state",
+            authoritative_stage=WorkflowStage.INIT,
+            changed=True,
+        )
+
+    def _determine_current_stage(self) -> WorkflowStage:
+        """Return the typed current stage after explicit reconciliation."""
+
+        result = self._reconcile_stage()
+        logger.debug("Current workflow stage: %s (%s)", result.stage.value, result.source)
+        return result.stage
+
+    def _set_current_stage(self, stage: WorkflowStage | str) -> None:
+        """Validate and persist one adjacent stage transition.
+
+        The StateStore transaction is committed before the marker cache is
+        updated.  A failed state write therefore leaves both the previous
+        authoritative record and its marker untouched.
+        """
+
+        target = parse_legacy_stage(stage)
+        current, marker_stage, stored_run = self._read_authoritative_stage()
+        if current is None:
+            # Only INIT is a valid empty-ledger state.  The init-mode bridge
+            # calls _determine_current_stage before advancing to GENERATE.
+            validate_transition(None, target)
+        else:
+            validate_transition(current, target)
+
+        now = self._timestamp()
+        with self._state_store.transaction():
+            if current is not None and current is not target:
+                self._record_stage(
+                    current,
+                    status=StageRunState.COMPLETED,
+                    started_at=(stored_run.started_at if stored_run is not None else now),
+                    completed_at=now,
+                    metadata={"source": "workflow_controller"},
+                )
+                # Make the new stage the most recent row even when both rows
+                # are transitioned within the same microsecond.
+                target_started_at = self._timestamp()
+            else:
+                target_started_at = now
+            self._record_stage(
+                target,
+                status=(
+                    StageRunState.COMPLETED
+                    if target.is_terminal
+                    else StageRunState.RUNNING
+                ),
+                started_at=target_started_at,
+                completed_at=target_started_at if target.is_terminal else None,
+                metadata={"source": "workflow_controller"},
+            )
+
+        self._write_stage_marker(target)
+        logger.debug("Updated project stage to: %s", target.value)
     
     def _initialize(self) -> None:
         """Initialize a new project."""
@@ -288,13 +450,13 @@ class WorkflowController:
         stage = self._determine_current_stage()
         
         # If we haven't initialized yet, do that first
-        if stage == "init":
+        if stage is WorkflowStage.INIT:
             logger.info("Local mode — initializing project")
             self._initialize()
-            self._set_current_stage("generate")
-            stage = "generate"
+            self._set_current_stage(WorkflowStage.GENERATE)
+            stage = WorkflowStage.GENERATE
         
-        if stage == "generate":
+        if stage is WorkflowStage.GENERATE:
             logger.info("Local mode — generating base structures (seeds only)")
             self._generate(seeds_only=True)
             # Stage stays at 'generate' — HPC resumes with perturbations
@@ -305,9 +467,9 @@ class WorkflowController:
         else:
             logger.info(
                 "Local mode — nothing to do, current stage is '%s'. "
-                "Base structures were already generated.", stage
+                "Base structures were already generated.", stage.value
             )
-            print("✓ Local stages already complete (current stage: '%s')" % stage)
+            print("✓ Local stages already complete (current stage: '%s')" % stage.value)
             print("  Resume on HPC with:")
             print("  python nepflow_cli.py --project %s" % self.project_name)
 
@@ -316,21 +478,21 @@ class WorkflowController:
         stage = self._determine_current_stage()
 
         STAGE_LABELS = {
-            "init":      "1/6  init",
-            "generate":  "2/6  generate",
-            "select":    "3/6  select",
-            "run_vasp":  "4/6  run_vasp",
-            "train_nep": "5/6  train_nep",
-            "validate":  "6/6  validate",
-            "completed": "completed",
+            WorkflowStage.INIT: "1/6  init",
+            WorkflowStage.GENERATE: "2/6  generate",
+            WorkflowStage.SELECT: "3/6  select",
+            WorkflowStage.RUN_VASP: "4/6  run_vasp",
+            WorkflowStage.TRAIN_NEP: "5/6  train_nep",
+            WorkflowStage.VALIDATE: "6/6  validate",
+            WorkflowStage.COMPLETED: "completed",
         }
-        label = STAGE_LABELS.get(stage, stage)
+        label = STAGE_LABELS.get(stage, stage.value)
 
         logger.info("═" * 55)
         logger.info("  NEPFlow  ·  project: %s", self.project_name)
         logger.info("  Stage    :  %s", label)
 
-        if stage == "run_vasp":
+        if stage is WorkflowStage.RUN_VASP:
             jobs_dir = self.project_dir / "vasp" / "jobs"
             counts: dict[str, dict[str, int]] = {}
             for ds in ("train", "test"):
@@ -359,22 +521,30 @@ class WorkflowController:
 
     def _run_debug(self) -> None:
         """Run all stages sequentially with simulated external calls."""
-        stages = [
-            ("generate",  self._generate),
-            ("select",    self._select),
-            ("run_vasp",  self._run_vasp),
-            ("train_nep", self._train_nep),
-            ("validate",  self._validate),
+        all_stages = [
+            (WorkflowStage.GENERATE,  self._generate),
+            (WorkflowStage.SELECT,    self._select),
+            (WorkflowStage.RUN_VASP,  self._run_vasp),
+            (WorkflowStage.TRAIN_NEP, self._train_nep),
+            (WorkflowStage.VALIDATE,  self._validate),
         ]
+        current = self._determine_current_stage()
+        if current is WorkflowStage.INIT:
+            start_index = 0
+        else:
+            start_index = next(
+                index for index, (stage, _) in enumerate(all_stages) if stage is current
+            )
+        stages = all_stages[start_index:]
 
         for name, stage_fn in stages:
             logger.info("")
             logger.info("=" * 60)
-            logger.info("[DEBUG] Stage: %s", name)
+            logger.info("[DEBUG] Stage: %s", name.value)
             logger.info("=" * 60)
             self._set_current_stage(name)
 
-            if name == "run_vasp":
+            if name is WorkflowStage.RUN_VASP:
                 # Clean marker so the first launcher invocation exercises
                 # the self-resubmit path.
                 marker = self.project_dir / "vasp" / ".debug_resubmit_done"
@@ -391,7 +561,7 @@ class WorkflowController:
                 stage_fn()
 
         if self._validation_is_complete():
-            self._set_current_stage("completed")
+            self._set_current_stage(WorkflowStage.COMPLETED)
 
         logger.info("")
         logger.info("=" * 60)
@@ -403,16 +573,17 @@ class WorkflowController:
         Run workflow controller.
         
         If --init flag was used, only initializes the project and exits.
-        Otherwise, validates that project is initialized, then reads .project file
-        to determine current stage and executes it.
+        Otherwise, validates that project is initialized, then reconciles the
+        authoritative ledger with the compatibility marker before executing it.
         
         In debug mode, all stages run sequentially in one invocation.
         """
         # If in init mode, only run initialization
         if self.init_mode:
             logger.info("Running in init mode - initializing project only")
+            self._determine_current_stage()
             self._initialize()
-            self._set_current_stage("generate")
+            self._set_current_stage(WorkflowStage.GENERATE)
             logger.info("Project initialization complete. Initialization stage finished.")
             if not self.local_mode and not self.debug:
                 return
@@ -431,13 +602,14 @@ class WorkflowController:
             )
         
         if self.stage_override:
-            self._set_current_stage(self.stage_override)
-            logger.info("Stage overridden to: %s", self.stage_override)
+            override = parse_legacy_stage(self.stage_override)
+            self._set_current_stage(override)
+            logger.info("Stage overridden to: %s", override.value)
 
         self._print_status_summary()
 
         stage = self._determine_current_stage()
-        if stage == "completed":
+        if stage is WorkflowStage.COMPLETED:
             logger.info("Workflow is already complete; no stage will be run")
             print("✓ Workflow already complete")
             return
@@ -459,23 +631,23 @@ class WorkflowController:
             self._run_local()
             return
 
-        logger.info("Executing stage: %s", stage)
+        logger.info("Executing stage: %s", stage.value)
         
-        if stage == "init":
+        if stage is WorkflowStage.INIT:
             logger.debug("Initializing project")
             self._initialize()
-            self._set_current_stage("generate")
-        elif stage == "generate":
+            self._set_current_stage(WorkflowStage.GENERATE)
+        elif stage is WorkflowStage.GENERATE:
             logger.debug("Running structure generation")
             self._check_deadline()
             self._generate()
-            self._set_current_stage("select")
-        elif stage == "select":
+            self._set_current_stage(WorkflowStage.SELECT)
+        elif stage is WorkflowStage.SELECT:
             logger.debug("Running selection algorithm")
             self._check_deadline()
             self._select()
-            self._set_current_stage("run_vasp")
-        elif stage == "run_vasp":
+            self._set_current_stage(WorkflowStage.RUN_VASP)
+        elif stage is WorkflowStage.RUN_VASP:
             logger.debug("Running VASP calculations")
             self._check_deadline()
             try:
@@ -483,8 +655,8 @@ class WorkflowController:
             except SelfResubmitExit:
                 logger.info("VASP launcher deadline reached — resubmitting workflow")
                 raise
-            self._set_current_stage("train_nep")
-        elif stage == "train_nep":
+            self._set_current_stage(WorkflowStage.TRAIN_NEP)
+        elif stage is WorkflowStage.TRAIN_NEP:
             logger.debug("Training NEP models")
             self._check_deadline()
             try:
@@ -492,8 +664,8 @@ class WorkflowController:
             except SelfResubmitExit:
                 logger.info("NEP training deadline reached — resubmitting workflow")
                 raise
-            self._set_current_stage("validate")
-        elif stage == "validate":
+            self._set_current_stage(WorkflowStage.VALIDATE)
+        elif stage is WorkflowStage.VALIDATE:
             logger.debug("Running GPUMD validation")
             self._check_deadline()
             try:
@@ -502,8 +674,8 @@ class WorkflowController:
                 logger.info("GPUMD validation deadline reached — resubmitting workflow")
                 raise
             if self._validation_is_complete():
-                self._set_current_stage("completed")
+                self._set_current_stage(WorkflowStage.COMPLETED)
         else:
-            logger.error("Unknown stage: %s", stage)
-            raise ValueError("Unknown stage: %s" % stage)
+            logger.error("Unknown stage: %s", stage.value)
+            raise StateError(f"Unknown workflow stage: {stage.value}")
 

@@ -11,10 +11,6 @@ from nepflow.config.loader import find_config_path, load_legacy_config
 logger = logging.getLogger(__name__)
 
 
-class SelfResubmitExit(Exception):
-    """Raised when a stage resubmits itself via SLURM and needs to exit without advancing."""
-
-
 class Stage(ABC):
     """Base class for all workflow stages."""
     

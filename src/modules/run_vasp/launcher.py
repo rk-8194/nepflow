@@ -29,7 +29,7 @@ from ._common import (
     write_launcher_state,
     write_status,
 )
-from ..base import SelfResubmitExit
+from nepflow.workflow.resubmission import SelfResubmitExit
 
 
 # ==================================================================

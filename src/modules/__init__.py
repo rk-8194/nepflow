@@ -1,6 +1,5 @@
 """Workflow stage modules."""
 
-from .base import SelfResubmitExit
 from .init.init import InitStage
 from .generate.generate import GenerateStage
 from .select.select import SelectStage
@@ -10,7 +9,6 @@ from .validate.validate import ValidateStage
 from .memory.memory import MemoryStage
 
 __all__ = [
-    "SelfResubmitExit",
     "InitStage",
     "GenerateStage",
     "SelectStage",
