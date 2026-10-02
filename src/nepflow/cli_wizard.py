@@ -13,78 +13,16 @@ import builtins
 from dataclasses import dataclass
 from typing import Callable, Iterable
 
-from ase.data import chemical_symbols
+from nepflow.config.validation import (
+    identity,
+    normalize_crystal_structures,
+    normalize_optional_elements,
+    normalize_required_elements,
+    normalize_target_n_atoms,
+)
 
 
 logger = logging.getLogger(__name__)
-
-KNOWN_ELEMENT_SYMBOLS = {symbol for symbol in chemical_symbols if symbol}
-ALLOWED_CRYSTAL_STRUCTURES = {
-    "bcc",
-    "fcc",
-    "hcp",
-    "diamond",
-    "simple_cubic",
-}
-
-
-def _identity(value: str) -> str:
-    """Return *value* unchanged."""
-    return value
-
-
-def _normalize_element_list(raw: str, *, allow_blank: bool) -> str:
-    """Normalize and validate a comma-separated list of chemical symbols."""
-    items = [item.strip() for item in raw.split(",") if item.strip()]
-    if not items:
-        if allow_blank:
-            return ""
-        raise ValueError("At least one element is required")
-
-    normalized: list[str] = []
-    for item in items:
-        symbol = item.capitalize()
-        if symbol not in KNOWN_ELEMENT_SYMBOLS:
-            raise ValueError(f"Unknown element: {item}")
-        normalized.append(symbol)
-    return ",".join(normalized)
-
-
-def _normalize_required_elements(raw: str) -> str:
-    return _normalize_element_list(raw, allow_blank=False)
-
-
-def _normalize_optional_elements(raw: str) -> str:
-    return _normalize_element_list(raw, allow_blank=True)
-
-
-def _normalize_crystal_structures(raw: str) -> str:
-    """Normalize and validate a comma-separated list of structure names."""
-    items = [item.strip().lower() for item in raw.split(",") if item.strip()]
-    if not items:
-        raise ValueError("At least one crystal structure is required")
-
-    normalized: list[str] = []
-    for item in items:
-        if item not in ALLOWED_CRYSTAL_STRUCTURES:
-            raise ValueError(f"Unknown crystal structure: {item}")
-        normalized.append(item)
-    return ",".join(normalized)
-
-
-def _normalize_target_n_atoms(raw: str) -> str:
-    """Normalize target_n_atoms, defaulting to 128 when left blank."""
-    value = raw.strip()
-    if not value:
-        return "128"
-    try:
-        target = int(value)
-    except ValueError as exc:
-        raise ValueError("target_n_atoms must be a positive integer") from exc
-    if target <= 0:
-        raise ValueError("target_n_atoms must be a positive integer")
-    return str(target)
-
 
 @dataclass(frozen=True)
 class ConfigPrompt:
@@ -95,7 +33,7 @@ class ConfigPrompt:
     message: str
     default: str = ""
     env_var: str | None = None
-    normalize: Callable[[str], str] = _identity
+    normalize: Callable[[str], str] = identity
     required: bool = False
 
 
@@ -111,21 +49,21 @@ CONFIG_PROMPTS: tuple[ConfigPrompt, ...] = (
         key="elements",
         label="Elements",
         message="Enter one or more chemical symbols, comma-separated",
-        normalize=_normalize_required_elements,
+        normalize=normalize_required_elements,
         required=True,
     ),
     ConfigPrompt(
         key="gas_elements",
         label="Gas elements",
         message="Enter gas-phase elements, comma-separated",
-        normalize=_normalize_optional_elements,
+        normalize=normalize_optional_elements,
     ),
     ConfigPrompt(
         key="crystal_structures",
         label="Crystal structures",
         message="Enter crystal structures, comma-separated",
         default="bcc,fcc,hcp",
-        normalize=_normalize_crystal_structures,
+        normalize=normalize_crystal_structures,
         required=True,
     ),
     ConfigPrompt(
@@ -133,7 +71,7 @@ CONFIG_PROMPTS: tuple[ConfigPrompt, ...] = (
         label="Target atoms",
         message="Enter the target number of atoms per supercell",
         default="128",
-        normalize=_normalize_target_n_atoms,
+        normalize=normalize_target_n_atoms,
     ),
     ConfigPrompt(
         key="scp_address",
@@ -226,9 +164,7 @@ class ConfigWizard:
 
 
 __all__ = [
-    "ALLOWED_CRYSTAL_STRUCTURES",
     "CONFIG_PROMPTS",
     "ConfigPrompt",
     "ConfigWizard",
-    "KNOWN_ELEMENT_SYMBOLS",
 ]

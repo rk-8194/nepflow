@@ -8,21 +8,15 @@ import pytest
 pytest.importorskip("ase")
 pytest.importorskip("pymatgen")
 
-from modules.init.init import InitStage  # noqa: E402
+from nepflow.config import render_default_config  # noqa: E402
 from modules.run_vasp import run_vasp as run_vasp_module  # noqa: E402
 from modules.run_vasp.run_vasp import RunVaspStage  # noqa: E402
 
 
 def initialized_default_config(project_dir: Path) -> ConfigParser:
     """Render the real config shape produced by initialization."""
-    stage = InitStage(
-        project_name="demo",
-        config_file=project_dir / "config" / "demo.yaml",
-        state_file=project_dir / "state.db",
-        project_dir=project_dir,
-        debug=False,
-    )
-    rendered = stage._render_default_config(
+    rendered = render_default_config(
+        "demo",
         {
             "materialsproject_api_key": "",
             "elements": "Si",
@@ -30,7 +24,7 @@ def initialized_default_config(project_dir: Path) -> ConfigParser:
             "crystal_structures": "diamond",
             "target_n_atoms": "64",
             "scp_address": "user@host:/srv/nepflow",
-        }
+        },
     )
     config = ConfigParser()
     config.read_string(rendered)

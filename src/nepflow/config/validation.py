@@ -3,6 +3,8 @@
 import math
 import re
 
+from ase.data import chemical_symbols
+
 from nepflow.errors import ConfigurationError
 
 from .models import NepflowConfig
@@ -13,6 +15,67 @@ ALLOWED_CRYSTAL_STRUCTURES = frozenset(
 )
 ALLOWED_DESCRIPTOR_TYPES = frozenset({"structure", "atomic"})
 TIME_PATTERN = re.compile(r"^(?:\d+):[0-5]\d:[0-5]\d$")
+KNOWN_ELEMENT_SYMBOLS = frozenset(symbol for symbol in chemical_symbols if symbol)
+
+
+def identity(value: str) -> str:
+    """Return a prompt value unchanged."""
+    return value
+
+
+def normalize_element_list(raw: str, *, allow_blank: bool) -> str:
+    """Normalize and validate a comma-separated list of element symbols."""
+    items = [item.strip() for item in raw.split(",") if item.strip()]
+    if not items:
+        if allow_blank:
+            return ""
+        raise ValueError("At least one element is required")
+
+    normalized: list[str] = []
+    for item in items:
+        symbol = item.capitalize()
+        if symbol not in KNOWN_ELEMENT_SYMBOLS:
+            raise ValueError(f"Unknown element: {item}")
+        normalized.append(symbol)
+    return ",".join(normalized)
+
+
+def normalize_required_elements(raw: str) -> str:
+    """Normalize a required comma-separated element list."""
+    return normalize_element_list(raw, allow_blank=False)
+
+
+def normalize_optional_elements(raw: str) -> str:
+    """Normalize an optional comma-separated element list."""
+    return normalize_element_list(raw, allow_blank=True)
+
+
+def normalize_crystal_structures(raw: str) -> str:
+    """Normalize and validate a comma-separated structure list."""
+    items = [item.strip().lower() for item in raw.split(",") if item.strip()]
+    if not items:
+        raise ValueError("At least one crystal structure is required")
+
+    normalized: list[str] = []
+    for item in items:
+        if item not in ALLOWED_CRYSTAL_STRUCTURES:
+            raise ValueError(f"Unknown crystal structure: {item}")
+        normalized.append(item)
+    return ",".join(normalized)
+
+
+def normalize_target_n_atoms(raw: str) -> str:
+    """Normalize target_n_atoms, defaulting to 128 when blank."""
+    value = raw.strip()
+    if not value:
+        return "128"
+    try:
+        target = int(value)
+    except ValueError as exc:
+        raise ValueError("target_n_atoms must be a positive integer") from exc
+    if target <= 0:
+        raise ValueError("target_n_atoms must be a positive integer")
+    return str(target)
 
 
 def validate_config(
@@ -217,7 +280,7 @@ def validate_config(
 
 
 def _is_element_symbol(value: str) -> bool:
-    return bool(re.fullmatch(r"[A-Z][a-z]?", value))
+    return value in KNOWN_ELEMENT_SYMBOLS
 
 
 def _require_non_negative(

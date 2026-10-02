@@ -33,7 +33,15 @@ from .models import (
     ValidationConfig,
     VaspConfig,
 )
-from .validation import validate_config
+from .validation import (
+    identity,
+    normalize_crystal_structures,
+    normalize_element_list,
+    normalize_optional_elements,
+    normalize_required_elements,
+    normalize_target_n_atoms,
+    validate_config,
+)
 
 __all__ = [
     "CANONICAL_CONFIG_NAME",
@@ -58,8 +66,14 @@ __all__ = [
     "find_config_path",
     "load_config",
     "load_legacy_config",
+    "normalize_crystal_structures",
+    "normalize_element_list",
+    "normalize_optional_elements",
+    "normalize_required_elements",
+    "normalize_target_n_atoms",
     "render_default_config",
     "to_legacy_config",
+    "identity",
     "validate_config",
     "validate_project_identity",
     "write_validated_config",

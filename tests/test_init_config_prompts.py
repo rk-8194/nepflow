@@ -2,31 +2,34 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 
 pytest.importorskip("ase")
 pytest.importorskip("pymatgen")
 
-from modules.init.init import ConfigPrompt, InitStage
-from nepflow.config import load_config
+from nepflow.cli_wizard import CONFIG_PROMPTS, ConfigPrompt, ConfigWizard
+from nepflow.config import load_config, render_default_config
 from nepflow.errors import ConfigurationError, StateError
 from nepflow.state import CURRENT_SCHEMA_VERSION, StateStore
+from nepflow.workflow import initialization as initialization_module
+from nepflow.workflow.initialization import ProjectCreationService
 from nepflow.workflow.stages import StageRunState, WorkflowStage
 
 
 class InitConfigPromptTests(unittest.TestCase):
-    def _make_stage(self, project_dir: Path) -> InitStage:
-        return InitStage(
+    def _make_service(self, project_dir: Path) -> ProjectCreationService:
+        return ProjectCreationService(
             project_name="demo",
             config_file=project_dir / "config" / "demo.yaml",
             state_file=project_dir / "state.db",
             project_dir=project_dir,
         )
 
-    def _valid_config_text(self, stage: InitStage) -> str:
-        return stage._render_default_config(
+    def _valid_config_text(self, service: ProjectCreationService) -> str:
+        return render_default_config(
+            service.project_name,
             {
                 "materialsproject_api_key": "",
                 "elements": "W",
@@ -34,25 +37,34 @@ class InitConfigPromptTests(unittest.TestCase):
                 "crystal_structures": "bcc",
                 "target_n_atoms": "128",
                 "scp_address": "",
-            }
+            },
         )
 
-    def _install_valid_config(self, stage: InitStage) -> Path:
-        config_path = stage.project_dir / "config" / "project.config"
+    def _install_valid_config(self, service: ProjectCreationService) -> Path:
+        config_path = service.project_dir / "config" / "project.config"
         config_path.parent.mkdir(parents=True, exist_ok=True)
-        config_path.write_text(self._valid_config_text(stage), encoding="utf-8")
+        config_path.write_text(self._valid_config_text(service), encoding="utf-8")
         return config_path
+
+    def _collect_values(
+        self,
+        service: ProjectCreationService,
+        responses: list[str],
+    ) -> tuple[dict[str, str], Mock]:
+        input_mock = Mock(side_effect=responses)
+        wizard = ConfigWizard(service.project_name, input_fn=input_mock)
+        return wizard.collect_prompt_values(CONFIG_PROMPTS), input_mock
 
     def test_setup_config_prompts_for_materials_project_api_key(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_dir = Path(tmp)
             (project_dir / "config").mkdir(parents=True, exist_ok=True)
-            stage = self._make_stage(project_dir)
+            service = self._make_service(project_dir)
 
             with patch.dict(os.environ, {}, clear=True):
-                with patch(
-                    "modules.init.init.input",
-                    side_effect=[
+                values, input_mock = self._collect_values(
+                    service,
+                    [
                         "mp-test-key",
                         "w,cr,y,zr",
                         "",
@@ -60,10 +72,12 @@ class InitConfigPromptTests(unittest.TestCase):
                         "",
                         "user@host:/opt/nepflow",
                     ],
-                ) as input_mock:
-                    stage._setup_config()
+                )
+                service.setup_config(prompt_values=values)
 
-            config_text = (project_dir / "config" / "project.config").read_text(encoding="utf-8")
+            config_text = (project_dir / "config" / "project.config").read_text(
+                encoding="utf-8"
+            )
             self.assertIn("api_key=mp-test-key", config_text)
             self.assertIn("elements=W,Cr,Y,Zr", config_text)
             self.assertIn("gas_elements=", config_text)
@@ -84,20 +98,14 @@ class InitConfigPromptTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             project_dir = Path(tmp)
             (project_dir / "config").mkdir(parents=True, exist_ok=True)
-            stage = self._make_stage(project_dir)
+            service = self._make_service(project_dir)
 
             with patch.dict(os.environ, {"MP_API_KEY": "environment-secret"}, clear=True):
-                with patch(
-                    "modules.init.init.input",
-                    side_effect=[
-                        "W",
-                        "",
-                        "BCC",
-                        "",
-                        "user@host:/opt/nepflow",
-                    ],
-                ):
-                    stage._setup_config()
+                values, _ = self._collect_values(
+                    service,
+                    ["W", "", "BCC", "", "user@host:/opt/nepflow"],
+                )
+                service.setup_config(prompt_values=values)
 
             config_text = (project_dir / "config" / "project.config").read_text(
                 encoding="utf-8"
@@ -107,75 +115,51 @@ class InitConfigPromptTests(unittest.TestCase):
 
     def test_unknown_element_raises_value_error(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            project_dir = Path(tmp)
-            (project_dir / "config").mkdir(parents=True, exist_ok=True)
-            stage = self._make_stage(project_dir)
-
+            service = self._make_service(Path(tmp))
             with patch.dict(os.environ, {}, clear=True):
-                with patch("modules.init.init.input", side_effect=["mp-test-key", "W,Xx"]):
-                    with self.assertRaisesRegex(ValueError, "Unknown element: Xx"):
-                        stage._setup_config()
+                with self.assertRaisesRegex(ValueError, "Unknown element: Xx"):
+                    self._collect_values(service, ["mp-test-key", "W,Xx"])
 
     def test_blank_elements_are_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            project_dir = Path(tmp)
-            (project_dir / "config").mkdir(parents=True, exist_ok=True)
-            stage = self._make_stage(project_dir)
-
+            service = self._make_service(Path(tmp))
             with patch.dict(os.environ, {}, clear=True):
-                with patch("modules.init.init.input", side_effect=["mp-test-key", ""]):
-                    with self.assertRaisesRegex(ValueError, "At least one element is required"):
-                        stage._setup_config()
+                with self.assertRaisesRegex(ValueError, "At least one element is required"):
+                    self._collect_values(service, ["mp-test-key", ""])
 
     def test_prompt_registry_is_generic(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            project_dir = Path(tmp)
-            stage = self._make_stage(project_dir)
+        prompts = (
+            ConfigPrompt(
+                key="first_value",
+                label="First value",
+                message="First value",
+                env_var="FIRST_VALUE",
+            ),
+            ConfigPrompt(
+                key="secret_value",
+                label="Secret value",
+                message="Secret value",
+            ),
+        )
+        input_mock = Mock(return_value="from-prompt")
+        with patch.dict(os.environ, {"FIRST_VALUE": "from-env"}, clear=True):
+            values = ConfigWizard("demo", input_fn=input_mock).collect_prompt_values(prompts)
 
-            prompts = (
-                ConfigPrompt(
-                    key="first_value",
-                    label="First value",
-                    message="First value",
-                    env_var="FIRST_VALUE",
-                ),
-                ConfigPrompt(
-                    key="secret_value",
-                    label="Secret value",
-                    message="Secret value",
-                ),
-            )
-
-            with patch.dict(os.environ, {"FIRST_VALUE": "from-env"}, clear=True):
-                with patch("modules.init.init.input", return_value="from-prompt"):
-                    values = stage._collect_prompt_values(prompts)
-
-            self.assertEqual(
-                values,
-                {
-                    "first_value": "from-env",
-                    "secret_value": "from-prompt",
-                },
-            )
+        self.assertEqual(
+            values,
+            {"first_value": "from-env", "secret_value": "from-prompt"},
+        )
 
     def test_run_initializes_authoritative_state_db(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_dir = Path(tmp)
-            stage = self._make_stage(project_dir)
-
+            service = self._make_service(project_dir)
             with patch.dict(os.environ, {}, clear=True):
-                with patch(
-                    "modules.init.init.input",
-                    side_effect=[
-                        "",
-                        "W",
-                        "",
-                        "BCC",
-                        "",
-                        "user@host:/opt/nepflow",
-                    ],
-                ):
-                    stage.run()
+                values, _ = self._collect_values(
+                    service,
+                    ["", "W", "", "BCC", "", "user@host:/opt/nepflow"],
+                )
+            service.run(prompt_values=values)
 
             config = load_config(project_dir / "config" / "project.config")
             with StateStore(project_dir / "state.db") as store:
@@ -195,12 +179,12 @@ class InitConfigPromptTests(unittest.TestCase):
     def test_repeated_init_is_non_destructive_and_does_not_prompt(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_dir = Path(tmp)
-            stage = self._make_stage(project_dir)
-            prompts = ["", "W", "", "BCC", "", "user@host:/opt/nepflow"]
-            with patch.dict(os.environ, {}, clear=True), patch(
-                "modules.init.init.input", side_effect=prompts
-            ):
-                stage.run()
+            service = self._make_service(project_dir)
+            values, _ = self._collect_values(
+                service,
+                ["", "W", "", "BCC", "", "user@host:/opt/nepflow"],
+            )
+            service.run(prompt_values=values)
 
             config_path = project_dir / "config" / "project.config"
             state_path = project_dir / "state.db"
@@ -209,8 +193,8 @@ class InitConfigPromptTests(unittest.TestCase):
                 first_project = store.get_project("demo")
                 first_stage = store.get_stage_run("demo:init")
 
-            with patch("modules.init.init.input") as input_mock:
-                stage.run()
+            with patch("builtins.input") as input_mock, patch("builtins.print"):
+                service.run()
 
             assert config_path.read_bytes() == first_config
             input_mock.assert_not_called()
@@ -218,49 +202,60 @@ class InitConfigPromptTests(unittest.TestCase):
                 assert store.get_project("demo") == first_project
                 assert store.get_stage_run("demo:init") == first_stage
 
+    def test_creation_service_performs_no_terminal_io(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            service = self._make_service(Path(tmp))
+            values, _ = self._collect_values(
+                service,
+                ["", "W", "", "BCC", "", "user@host:/opt/nepflow"],
+            )
+            with patch("builtins.input") as input_mock, patch("builtins.print") as print_mock:
+                service.run(prompt_values=values)
+            input_mock.assert_not_called()
+            print_mock.assert_not_called()
+
     def test_invalid_rendered_config_does_not_create_authoritative_state(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            project_dir = Path(tmp)
-            stage = self._make_stage(project_dir)
-            invalid_config = self._valid_config_text(stage).replace(
+            service = self._make_service(Path(tmp))
+            invalid_config = self._valid_config_text(service).replace(
                 "schema_version=1", "schema_version=999", 1
             )
+            values, _ = self._collect_values(
+                service,
+                ["", "W", "", "BCC", "", ""],
+            )
 
-            with patch.object(stage, "_render_default_config", return_value=invalid_config):
-                with pytest.raises(ConfigurationError, match="schema_version"):
-                    with patch.dict(os.environ, {}, clear=True), patch(
-                        "modules.init.init.input", side_effect=["", "W", "", "BCC", "", ""]
-                    ):
-                        stage.run()
+            with pytest.raises(ConfigurationError, match="schema_version"):
+                with patch.object(
+                    initialization_module,
+                    "render_default_config",
+                    return_value=invalid_config,
+                ):
+                    service.run(prompt_values=values)
 
-            assert not (project_dir / "config" / "project.config").exists()
-            assert not (project_dir / "state.db").exists()
+            assert not (service.project_dir / "config" / "project.config").exists()
+            assert not (service.project_dir / "state.db").exists()
 
     def test_state_transaction_rolls_back_project_when_stage_record_fails(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            project_dir = Path(tmp)
-            stage = self._make_stage(project_dir)
-
+            service = self._make_service(Path(tmp))
+            values, _ = self._collect_values(
+                service,
+                ["", "W", "", "BCC", "", ""],
+            )
             with patch.object(
                 StateStore,
                 "upsert_stage_run",
                 side_effect=RuntimeError("stage write failed"),
             ):
                 with pytest.raises(RuntimeError, match="stage write failed"):
-                    with patch.dict(os.environ, {}, clear=True), patch(
-                        "modules.init.init.input", side_effect=["", "W", "", "BCC", "", ""]
-                    ):
-                        stage.run()
+                    service.run(prompt_values=values)
 
-            assert not (project_dir / "config" / "project.config").exists()
-            assert not (project_dir / "state.db").exists()
+            assert not (service.project_dir / "config" / "project.config").exists()
+            assert not (service.project_dir / "state.db").exists()
 
-            with patch.dict(os.environ, {}, clear=True), patch(
-                "modules.init.init.input", side_effect=["", "W", "", "BCC", "", ""]
-            ):
-                stage.run()
-
-            with StateStore(project_dir / "state.db") as store:
+            service.run(prompt_values=values)
+            with StateStore(service.state_file) as store:
                 assert store.get_project("demo") is not None
                 assert store.get_stage_run("demo:init") is not None
 
@@ -269,10 +264,10 @@ class InitConfigPromptTests(unittest.TestCase):
             project_dir = Path(tmp)
             state_path = project_dir / "state.db"
             state_path.write_bytes(b"not a sqlite database")
-            stage = self._make_stage(project_dir)
+            service = self._make_service(project_dir)
 
             with pytest.raises(StateError, match="state database"):
-                stage.run()
+                service.run()
 
             assert state_path.read_bytes() == b"not a sqlite database"
 
@@ -283,7 +278,7 @@ class InitConfigPromptTests(unittest.TestCase):
                 pass
 
             with pytest.raises(ConfigurationError, match="canonical config"):
-                self._make_stage(project_dir).run()
+                self._make_service(project_dir).run()
 
     def test_legacy_marker_requires_explicit_migration(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -291,29 +286,29 @@ class InitConfigPromptTests(unittest.TestCase):
             (project_dir / ".project").write_text("generate", encoding="utf-8")
 
             with pytest.raises(StateError, match="explicit migration"):
-                self._make_stage(project_dir).run()
+                self._make_service(project_dir).run()
 
     def test_existing_config_without_state_requires_explicit_repair(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_dir = Path(tmp)
-            stage = self._make_stage(project_dir)
-            self._install_valid_config(stage)
+            service = self._make_service(project_dir)
+            self._install_valid_config(service)
 
             with pytest.raises(StateError, match="state.db is missing"):
-                stage.run()
+                service.run()
 
             assert not (project_dir / "state.db").exists()
 
     def test_existing_state_without_project_requires_explicit_migration(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_dir = Path(tmp)
-            stage = self._make_stage(project_dir)
-            self._install_valid_config(stage)
+            service = self._make_service(project_dir)
+            self._install_valid_config(service)
             with StateStore(project_dir / "state.db"):
                 pass
 
             with pytest.raises(StateError, match="no project record"):
-                stage.run()
+                service.run()
 
             with StateStore(project_dir / "state.db") as store:
                 assert store.get_project("demo") is None
@@ -321,11 +316,12 @@ class InitConfigPromptTests(unittest.TestCase):
     def test_existing_project_without_stage_requires_explicit_migration(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_dir = Path(tmp)
-            stage = self._make_stage(project_dir)
-            with patch.dict(os.environ, {}, clear=True), patch(
-                "modules.init.init.input", side_effect=["", "W", "", "BCC", "", ""]
-            ):
-                stage.run()
+            service = self._make_service(project_dir)
+            values, _ = self._collect_values(
+                service,
+                ["", "W", "", "BCC", "", ""],
+            )
+            service.run(prompt_values=values)
 
             with StateStore(project_dir / "state.db") as store:
                 store.connection.execute(
@@ -333,7 +329,7 @@ class InitConfigPromptTests(unittest.TestCase):
                 )
 
             with pytest.raises(StateError, match="no stage history"):
-                stage.run()
+                service.run()
 
             with StateStore(project_dir / "state.db") as store:
                 assert store.get_stage_run("demo:init") is None

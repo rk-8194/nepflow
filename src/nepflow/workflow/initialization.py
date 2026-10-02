@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Callable, Mapping
+from typing import Mapping
 
 from nepflow.config import NepflowConfig, canonical_config_path, load_config
 from nepflow.config.creation import (
@@ -53,8 +53,6 @@ class ProjectCreationService:
         self,
         *,
         prompt_values: Mapping[str, str] | None = None,
-        render_config: Callable[[Mapping[str, str]], str] | None = None,
-        write_config: Callable[[Path, str], NepflowConfig] | None = None,
     ) -> NepflowConfig:
         """Create or validate project config, layout, and initial state."""
         logger.info("Initializing project")
@@ -74,11 +72,7 @@ class ProjectCreationService:
                 )
 
             self.create_layout()
-            config = self.setup_config(
-                prompt_values=prompt_values,
-                render_config=render_config,
-                write_config=write_config,
-            )
+            config = self.setup_config(prompt_values=prompt_values)
             self.initialize_state(config, state_was_present=state_was_present)
         except BaseException:
             # A newly rendered config or ledger is not useful without the
@@ -146,8 +140,6 @@ class ProjectCreationService:
         self,
         *,
         prompt_values: Mapping[str, str] | None = None,
-        render_config: Callable[[Mapping[str, str]], str] | None = None,
-        write_config: Callable[[Path, str], NepflowConfig] | None = None,
     ) -> NepflowConfig:
         """Load an existing config or create one from supplied values."""
         config_dir = self.project_dir / "config"
@@ -178,18 +170,12 @@ class ProjectCreationService:
                 raise ConfigurationError(
                     "Initial configuration values are required to create project.config"
                 )
-            render = render_config or (
-                lambda values: render_default_config(self.project_name, values)
+            rendered = render_default_config(self.project_name, prompt_values)
+            config = write_validated_config(
+                project_config_file,
+                rendered,
+                project_name=self.project_name,
             )
-            install = write_config or (
-                lambda path, text: write_validated_config(
-                    path,
-                    text,
-                    project_name=self.project_name,
-                )
-            )
-            rendered = render(prompt_values)
-            config = install(project_config_file, rendered)
             logger.info("Created default project config: %s", project_config_file)
 
         logger.info("Project config directory: %s", config_dir)
