@@ -53,27 +53,99 @@ def outcar_is_complete(outcar_path: Path) -> bool:
         return False
 
 
+_STRESS_PATTERN = re.compile(
+    r"STRESS\s+in cartesian coordinates \(kB\)\n"
+    r"\s+([-+\.\dEe]+)\s+([-+\.\dEe]+)\s+([-+\.\dEe]+)\n"
+    r"\s+([-+\.\dEe]+)\s+([-+\.\dEe]+)\s+([-+\.\dEe]+)\n"
+    r"\s+([-+\.\dEe]+)\s+([-+\.\dEe]+)\s+([-+\.\dEe]+)"
+)
+_STRESS_FLOAT_PATTERN = re.compile(r"[-+]?\d*\.?\d+(?:[Ee][-+]?\d+)?")
+
+
+def parse_stress_from_outcar(
+    outcar_path: Path,
+    *,
+    prefer_ase: bool = True,
+) -> np.ndarray | None:
+    """Parse the final VASP stress tensor in eV/Angstrom^3.
+
+    ASE handles common OUTCAR variants.  The explicit text paths retain the
+    verified Phase 2 handling for the kB matrix layouts used by existing
+    utilities and fixtures.  The returned tensor keeps the backend-native
+    stress sign; conversion to NEPFlow's positive-compression virial remains
+    the responsibility of :func:`parse_virial_from_outcar`.
+    """
+    outcar_path = Path(outcar_path)
+    if prefer_ase:
+        try:
+            atoms = ase_read(str(outcar_path), format="vasp-out")
+            stress = np.asarray(atoms.get_stress(voigt=False), dtype=float)
+            if stress.shape == (3, 3) and np.all(np.isfinite(stress)):
+                return stress
+        except Exception:
+            # Continue to the established text parser for unusual layouts
+            # that ASE does not accept.
+            pass
+
+    try:
+        outcar_text = outcar_path.read_text(
+            encoding="utf-8", errors="replace"
+        )
+    except OSError:
+        return None
+
+    matches = list(_STRESS_PATTERN.finditer(outcar_text))
+    if matches:
+        values = [float(matches[-1].group(index)) for index in range(1, 10)]
+        return stress_kbar_to_ev_per_angstrom3(
+            np.asarray(values, dtype=float).reshape(3, 3)
+        )
+
+    # Preserve the two alternate text layouts accepted by the elastic
+    # analysis utility without making that utility another OUTCAR parser.
+    last_matrix: np.ndarray | None = None
+    lines = outcar_text.splitlines()
+    for index, line in enumerate(lines):
+        if "STRESS" not in line.upper() or "KB" not in line.upper():
+            continue
+        rows: list[list[float]] = []
+        for probe in lines[index + 1 : index + 8]:
+            numbers = [float(value) for value in _STRESS_FLOAT_PATTERN.findall(probe)]
+            if len(numbers) >= 3:
+                rows.append(numbers[:3])
+            if len(rows) == 3:
+                break
+        if len(rows) == 3:
+            last_matrix = np.asarray(rows, dtype=float)
+    if last_matrix is not None:
+        return stress_kbar_to_ev_per_angstrom3(last_matrix)
+
+    for line in reversed(lines):
+        upper = line.upper()
+        if "KB" not in upper or "STRESS" not in upper:
+            continue
+        numbers = [float(value) for value in _STRESS_FLOAT_PATTERN.findall(line)]
+        if len(numbers) >= 6:
+            xx, yy, zz, xy, yz, zx = numbers[-6:]
+            return stress_kbar_to_ev_per_angstrom3(
+                np.asarray(
+                    [[xx, xy, zx], [xy, yy, yz], [zx, yz, zz]],
+                    dtype=float,
+                )
+            )
+    return None
+
+
 def parse_virial_from_outcar(outcar_path: Path, volume: float) -> np.ndarray | None:
     """Parse VASP stress and convert it to NEPFlow's virial convention."""
     try:
-        outcar_text = Path(outcar_path).read_text(
-            encoding="utf-8", errors="replace"
-        )
-        stress_pattern = (
-            r"STRESS\s+in cartesian coordinates \(kB\)\n"
-            r"\s+([-+.\d]+)\s+([-+.\d]+)\s+([-+.\d]+)\n"
-            r"\s+([-+.\d]+)\s+([-+.\d]+)\s+([-+.\d]+)\n"
-            r"\s+([-+.\d]+)\s+([-+.\d]+)\s+([-+.\d]+)"
-        )
-        matches = list(re.finditer(stress_pattern, outcar_text))
-        if not matches:
+        # Keep the verified Phase 2 text semantics for the canonical virial
+        # result even when ASE offers a different OUTCAR interpretation.
+        stress = parse_stress_from_outcar(outcar_path, prefer_ase=False)
+        if stress is None:
             return None
-        values = [float(matches[-1].group(index)) for index in range(1, 10)]
-        stress = np.asarray(values, dtype=float).reshape(3, 3)
-        return virial_from_stress(
-            stress_kbar_to_ev_per_angstrom3(stress), float(volume)
-        )
-    except (OSError, TypeError, ValueError):
+        return virial_from_stress(stress, float(volume))
+    except (TypeError, ValueError):
         return None
 
 
@@ -503,6 +575,7 @@ __all__ = [
     "parse_outcar",
     "parse_outcar_result",
     "parse_performance_evidence",
+    "parse_stress_from_outcar",
     "parse_virial_from_outcar",
     "resolve_verified_output",
     "validate_dft_result_labels",

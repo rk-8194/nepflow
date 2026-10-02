@@ -11,7 +11,6 @@ from __future__ import annotations
 import argparse
 import re
 import sys
-from configparser import ConfigParser
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -24,15 +23,24 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from nepflow.domain.identities import calculate_structure_id
+from nepflow.config.loader import load_legacy_config
+from nepflow.domain.identities import DftCalculationIdentity, calculate_structure_id
+from nepflow.dft.vasp.inputs import (
+    hash_incar_text,
+    identity_for_structure,
+    inject_incar_defaults,
+)
+from nepflow.dft.vasp.outputs import (
+    VaspRegistryEvidence,
+    outcar_is_complete,
+    parse_stress_from_outcar,
+    resolve_verified_output,
+)
 from nepflow.errors import StateError
 from nepflow.io.json import write_json
 from nepflow.io.json import read_json_object
 from modules.run_vasp._common import (
     get_nepflow_root,
-    hash_incar_text,
-    hash_potcar_bytes,
-    outcar_is_complete,
     read_completed_registry,
     read_status,
 )
@@ -43,15 +51,6 @@ DEFAULT_DATASETS = ("train", "test")
 PROGRESS_EVERY_FRAMES = 500
 PREVIEW_LIMIT = 8
 MATCHED_PREVIEW_LIMIT = 5
-STRESS_PATTERN = re.compile(
-    r"STRESS\s+in cartesian coordinates \(kB\)\n"
-    r"\s+([-.\d]+)\s+([-.\d]+)\s+([-.\d]+)\n"
-    r"\s+([-.\d]+)\s+([-.\d]+)\s+([-.\d]+)\n"
-    r"\s+([-.\d]+)\s+([-.\d]+)\s+([-.\d]+)"
-)
-FLOAT_PATTERN = re.compile(r"[-+]?\d*\.?\d+(?:[Ee][-+]?\d+)?")
-
-
 @dataclass
 class LocalJobRecord:
     dataset: str
@@ -282,64 +281,12 @@ def conventional_rotation_rows(reference_cell: np.ndarray, structure_name: str |
 
 
 def parse_stress_tensor_gpa(outcar_path: Path) -> np.ndarray | None:
-    # First try ASE's OUTCAR reader, which handles more VASP variants than a
-    # handwritten regex.
-    try:
-        from ase.io import read as ase_read
-
-        atoms = ase_read(str(outcar_path), format="vasp-out")
-        stress = atoms.get_stress(voigt=False)
-        # ASE returns stress in eV/Ang^3. Convert directly to GPa.
-        return np.array(stress, dtype=float) * 160.21766208
-    except Exception:
-        pass
-
-    try:
-        text = outcar_path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
+    stress = parse_stress_from_outcar(outcar_path)
+    if stress is None:
         return None
-
-    matches = list(STRESS_PATTERN.finditer(text))
-    if not matches:
-        # Fallback for alternate VASP formatting: find a STRESS header and read
-        # the next three numeric rows even if spacing differs from the canonical block.
-        lines = text.splitlines()
-        last_matrix: np.ndarray | None = None
-        for idx, line in enumerate(lines):
-            if "STRESS" not in line.upper() or "KB" not in line.upper():
-                continue
-            rows: list[list[float]] = []
-            for probe in lines[idx + 1: idx + 8]:
-                numbers = [float(value) for value in FLOAT_PATTERN.findall(probe)]
-                if len(numbers) >= 3:
-                    rows.append(numbers[:3])
-                if len(rows) == 3:
-                    break
-            if len(rows) == 3:
-                last_matrix = np.array(rows, dtype=float)
-        if last_matrix is not None:
-            return last_matrix * 0.1
-
-        # Another common VASP layout prints six stress components on a single line.
-        for line in reversed(lines):
-            upper = line.upper()
-            if "KB" not in upper or "STRESS" not in upper:
-                continue
-            numbers = [float(value) for value in FLOAT_PATTERN.findall(line)]
-            if len(numbers) >= 6:
-                xx, yy, zz, xy, yz, zx = numbers[-6:]
-                return np.array(
-                    [
-                        [xx, xy, zx],
-                        [xy, yy, yz],
-                        [zx, yz, zz],
-                    ],
-                    dtype=float,
-                ) * 0.1
-        return None
-
-    values = [float(matches[-1].group(i + 1)) for i in range(9)]
-    return np.array(values, dtype=float).reshape(3, 3) * 0.1
+    # The canonical parser returns eV/Angstrom^3; retain this utility's
+    # historical GPa output contract.
+    return np.asarray(stress, dtype=float) * 160.21766208
 
 
 def build_group_key(atoms) -> str:
@@ -364,25 +311,6 @@ def build_source_label(metadata: dict) -> str:
         if value:
             return str(value)
     return "unknown"
-
-
-def inject_incar_defaults(incar_text: str, config: ConfigParser) -> str:
-    lines = incar_text.rstrip("\n")
-    has_kspacing = bool(re.search(r"^\s*KSPACING\s*=", incar_text, re.MULTILINE | re.IGNORECASE))
-    has_kgamma = bool(re.search(r"^\s*KGAMMA\s*=", incar_text, re.MULTILINE | re.IGNORECASE))
-
-    additions = []
-    if not has_kspacing:
-        additions.append(f"KSPACING = {config.get('vasp', 'kspacing', fallback='0.30')}")
-    if not has_kgamma:
-        additions.append(f"KGAMMA = {config.get('vasp', 'kgamma', fallback='.TRUE.')}")
-
-    if additions:
-        lines += "\n\n# --- Injected by nepflow (not in user template) ---\n"
-        lines += "\n".join(additions) + "\n"
-    else:
-        lines += "\n"
-    return lines
 
 
 def parse_incar_settings(incar_text: str) -> dict[str, str]:
@@ -440,14 +368,11 @@ def load_input_context(project_dir: Path) -> dict:
             f"Could not build VASP input context under {project_dir / 'config' / 'vasp'}"
         )
 
-    config = ConfigParser()
-    for candidate in (
+    config = load_legacy_config(
         project_dir / "config" / "project.config",
-        project_dir / "config" / f"{project_dir.name.removeprefix('project_')}.ini",
-    ):
-        if candidate.exists():
-            config.read(candidate)
-            break
+        project_name=project_dir.name.removeprefix("project_"),
+        require_scientific_fields=False,
+    )
 
     incar_text = inject_incar_defaults(incar_template.read_text(encoding="utf-8"), config)
     incar_settings = parse_incar_settings(incar_text)
@@ -465,15 +390,8 @@ def load_input_context(project_dir: Path) -> dict:
 
 
 def structure_identity_tuple(atoms, input_context: dict) -> tuple[str, str, str]:
-    structure_id = calculate_structure_id(atoms)
-    potcar_data = input_context["potcar_data"]
-    struct_elements = sorted(set(atoms.get_chemical_symbols()))
-    missing = [elem for elem in struct_elements if elem not in potcar_data]
-    if missing:
-        raise FileNotFoundError(f"missing POTCAR files for: {', '.join(missing)}")
-
-    potcar_hash = hash_potcar_bytes(b"".join(potcar_data[elem] for elem in struct_elements))
-    return (structure_id, input_context["incar_hash"], potcar_hash)
+    identity = identity_for_structure(atoms, input_context).calculation
+    return (identity.structure_id, identity.incar_hash, identity.potcar_hash)
 
 
 def resolve_registry_outcar(identity: tuple[str, str, str], input_context: dict) -> Path | None:
@@ -490,8 +408,19 @@ def resolve_registry_outcar(identity: tuple[str, str, str], input_context: dict)
     job_path = entry.get("job_path")
     if not job_path:
         return None
-    outcar = Path(job_path) / "OUTCAR"
-    return outcar if outcar_is_complete(outcar) else None
+    calculation_identity = DftCalculationIdentity(
+        structure_id=structure_id,
+        incar_hash=incar_hash,
+        potcar_hash=potcar_hash,
+    ).to_dict()
+    resolved = resolve_verified_output(
+        calculation_identity,
+        registry_evidence=VaspRegistryEvidence(
+            Path(job_path) / "OUTCAR",
+            calculation_identity,
+        ),
+    )
+    return None if resolved is None else resolved.outcar_path
 
 
 def resolve_local_job(project_dir: Path, dataset: str, structure_index: int) -> LocalJobRecord:

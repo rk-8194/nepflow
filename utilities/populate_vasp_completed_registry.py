@@ -33,6 +33,8 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from nepflow.domain.identities import DftCalculationIdentity, calculate_structure_id
+from nepflow.dft.vasp.inputs import strip_resource_incar_params
+from nepflow.dft.vasp.outputs import VASP_COMPLETION_MARKERS, outcar_is_complete
 from nepflow.errors import ArtifactError
 from nepflow.io.hashing import sha256_bytes, sha256_file
 from nepflow.io.json import read_json_object, write_json
@@ -40,36 +42,6 @@ from modules.run_vasp._common import (
     VASP_REGISTRY_VERSION,
     validate_completed_registry,
 )
-
-VASP_COMPLETION_MARKERS = ["General timing", "Voluntary context switches"]
-
-
-def outcar_is_complete(outcar_path: Path) -> bool:
-    if not outcar_path.exists():
-        return False
-    try:
-        with open(outcar_path, "r", encoding="utf-8", errors="replace") as f:
-            f.seek(0, 2)
-            size = f.tell()
-            f.seek(max(0, size - 50_000))
-            tail = f.read()
-        return any(marker in tail for marker in VASP_COMPLETION_MARKERS)
-    except OSError:
-        return False
-
-
-def strip_resource_incar_params(incar_text: str) -> str:
-    kept = []
-    for line in incar_text.splitlines():
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#"):
-            kept.append(line.rstrip())
-            continue
-        if re.match(r"^(NCORE|KPAR)\s*=", stripped, re.IGNORECASE):
-            continue
-        kept.append(line.rstrip())
-    return "\n".join(kept).rstrip() + "\n"
-
 
 def hash_incar_file(incar_path: Path) -> str:
     return sha256_bytes(

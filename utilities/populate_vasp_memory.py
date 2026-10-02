@@ -8,12 +8,15 @@ completed OUTCAR files, writing results to <nepflow_root>/.vasp_memory.
 
 import argparse
 import csv
-import re
 import sys
 from pathlib import Path
 from typing import Optional
 
-VASP_COMPLETION_MARKERS = ["General timing", "Voluntary context switches"]
+from nepflow.dft.vasp.outputs import (
+    VASP_COMPLETION_MARKERS,
+    is_completed_text,
+    parse_performance_evidence,
+)
 
 CSV_HEADER = [
     "n_atoms", "n_kpoints_irr", "n_electrons",
@@ -23,8 +26,7 @@ CSV_HEADER = [
 
 def is_completed(outcar_text: str) -> bool:
     """Check if OUTCAR indicates a successfully completed VASP run."""
-    tail = outcar_text[-2000:]
-    return any(marker in tail for marker in VASP_COMPLETION_MARKERS)
+    return is_completed_text(outcar_text)
 
 
 def parse_outcar(outcar_path: Path, gpus_per_node: int) -> Optional[dict]:
@@ -63,37 +65,19 @@ def parse_outcar(outcar_path: Path, gpus_per_node: int) -> Optional[dict]:
             elif stripped.startswith("KPAR"):
                 kpar = int(line.split("=")[1].split("#")[0].strip())
 
-        # Parse MPI ranks from OUTCAR to determine nodes/gpus
-        total_ranks = 0
-        m_ranks = re.search(r"running on\s+(\d+)\s+total cores", outcar_text)
-        if m_ranks:
-            total_ranks = int(m_ranks.group(1))
+        performance = parse_performance_evidence(outcar_text)
+        total_ranks = performance.total_ranks
         nodes = max(1, total_ranks // gpus_per_node) if total_ranks > 0 else 1
         gpus = total_ranks if total_ranks > 0 else gpus_per_node
 
-        # LOOP times
-        loop_times = [
-            float(m.group(1))
-            for m in re.finditer(
-                r"LOOP:\s+cpu time\s+[\d.]+:\s+real time\s+([\d.]+)", outcar_text
-            )
-        ]
+        loop_times = performance.loop_times
         if not loop_times:
             print(f"  SKIP {outcar_path.parent}: no LOOP times found")
             return None
         avg_loop = sum(loop_times) / len(loop_times)
 
-        # Irreducible k-points
-        n_kpoints_irr = 0
-        m = re.search(r"Found\s+(\d+)\s+irreducible k-points", outcar_text)
-        if m:
-            n_kpoints_irr = int(m.group(1))
-
-        # Number of electrons
-        n_electrons = 0
-        m = re.search(r"NELECT\s*=\s*([\d.]+)", outcar_text)
-        if m:
-            n_electrons = int(float(m.group(1)))
+        n_kpoints_irr = performance.irreducible_kpoints
+        n_electrons = int(performance.electrons)
 
         result = {
             "n_atoms": n_atoms,

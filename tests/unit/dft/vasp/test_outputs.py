@@ -10,6 +10,7 @@ from nepflow.dft.vasp.outputs import (
     VaspRegistryEvidence,
     outcar_is_complete,
     parse_outcar_result,
+    parse_stress_from_outcar,
     parse_virial_from_outcar,
     resolve_verified_output,
 )
@@ -52,6 +53,30 @@ def test_completion_and_virial_fixture_semantics(tmp_path) -> None:
     assert outcar_is_complete(outcar)
     expected = -np.arange(1, 10, dtype=float).reshape(3, 3) * 27 / 1602.17663
     np.testing.assert_allclose(parse_virial_from_outcar(outcar, 27), expected)
+
+
+def test_stress_parser_is_shared_with_elastic_consumers(tmp_path) -> None:
+    outcar = tmp_path / "OUTCAR"
+    outcar.write_text(_stress_text())
+
+    expected = np.arange(1, 10, dtype=float).reshape(3, 3) / 1602.17663
+    np.testing.assert_allclose(parse_stress_from_outcar(outcar), expected)
+
+
+def test_performance_parser_preserves_memory_utility_fields() -> None:
+    from nepflow.dft.vasp.outputs import parse_performance_evidence
+
+    evidence = parse_performance_evidence(
+        "running on 8 total cores\n"
+        "LOOP:  cpu time   1.00: real time   2.00\n"
+        "LOOP:  cpu time   3.00: real time   4.00\n"
+        "Found 3 irreducible k-points\n"
+        "NELECT = 14.0000\n"
+    )
+    assert evidence.total_ranks == 8
+    assert evidence.loop_times == (2.0, 4.0)
+    assert evidence.irreducible_kpoints == 3
+    assert evidence.electrons == 14.0
 
 
 def test_result_preserves_energy_forces_and_requires_verified_identity(tmp_path) -> None:

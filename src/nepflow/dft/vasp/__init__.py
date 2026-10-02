@@ -24,6 +24,7 @@ from .outputs import (
     parse_outcar,
     parse_outcar_result,
     parse_performance_evidence,
+    parse_stress_from_outcar,
     parse_virial_from_outcar,
     resolve_verified_output,
 )
@@ -58,6 +59,7 @@ __all__ = [
     "parse_outcar",
     "parse_outcar_result",
     "parse_performance_evidence",
+    "parse_stress_from_outcar",
     "parse_virial_from_outcar",
     "resolve_verified_output",
     "read_identity",

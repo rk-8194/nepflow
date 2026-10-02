@@ -17,7 +17,12 @@ def build_retry_levels_for_gpu(
     initial_kpar: int,
     config: ConfigParser,
 ) -> list[tuple[int, int, int, int]]:
-    """Build the accepted Phase 2 GPU-aware retry escalation table."""
+    """Build the accepted Phase 2 GPU-aware retry escalation table.
+
+    The parser argument is the temporary typed-config-to-legacy adapter used
+    by the still-unmigrated launcher.  This function does not read files or
+    create a second configuration source.
+    """
     cores = config.getint("hpc", "cores_per_node", fallback=64)
     gpus_per_node = config.getint("hpc", "gpus_per_node", fallback=4)
     max_nodes = config.getint("hpc", "max_nodes", fallback=16)

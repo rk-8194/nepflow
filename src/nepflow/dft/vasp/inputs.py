@@ -16,7 +16,7 @@ from typing import Mapping
 
 import numpy as np
 
-from nepflow.config.loader import load_legacy_config
+from nepflow.config import load_config, to_legacy_config
 from nepflow.domain.identities import (
     DftCalculationIdentity,
     calculate_structure_id,
@@ -89,7 +89,12 @@ def hash_potcar_bytes(potcar_bytes: bytes) -> str:
 
 
 def inject_incar_defaults(incar_text: str, config: ConfigParser) -> str:
-    """Append KSPACING and KGAMMA when the user template omits them."""
+    """Append KSPACING and KGAMMA when the user template omits them.
+
+    ``ConfigParser`` is retained only as the temporary one-way adapter used
+    by unmigrated legacy stages.  Canonical project loading below always
+    validates the typed root before producing that adapter.
+    """
     lines = incar_text.rstrip("\n")
 
     has_kspacing = bool(
@@ -167,11 +172,12 @@ def build_input_context(project_dir: Path) -> VaspInputContext | None:
     incar_template = vasp_config_dir / "INCAR"
     if not incar_template.exists():
         return None
-    config = load_legacy_config(
+    typed_config = load_config(
         project_dir / "config" / "project.config",
         project_name=project_dir.name.removeprefix("project_"),
         require_scientific_fields=False,
     )
+    config = to_legacy_config(typed_config)
     incar_text = inject_incar_defaults(
         incar_template.read_text(encoding="utf-8"), config
     )

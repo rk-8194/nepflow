@@ -4,9 +4,152 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
-from nepflow.domain.identities import ArtifactIdentity, DftCalculationIdentity, StructureIdentity
+from nepflow.domain.datasets import DatasetIdentity, SelectedDatasetMember
+from nepflow.domain.identities import (
+    ArtifactIdentity,
+    DftCalculationIdentity,
+    ModelRunIdentity,
+    StructureIdentity,
+    ValidationRunIdentity,
+)
+from nepflow.domain.models import (
+    ModelArtifactMetadata,
+    ModelRunRecord,
+    ValidationArtifactMetadata,
+    ValidationRunRecord,
+)
+from nepflow.domain.structures import GeneratedStructureRecord, StructureProvenance
 from nepflow.errors import StateError
 from nepflow.state.store import StateStore
+
+
+def test_full_phase3_record_chain_serializes_and_reopens(tmp_path) -> None:
+    """Exercise every Phase 3 ledger boundary in one transaction."""
+    path = tmp_path / "state.db"
+    structure = StructureIdentity("structure-fixture")
+    provenance = StructureProvenance(
+        parent_structure_id=None,
+        generator="fixture",
+        requested_composition={"Si": 1.0},
+        realised_composition={"Si": 1.0},
+        source_database_id="fixture-db",
+        crystal_structure="bcc",
+        perturbation_family=None,
+        perturbation_parameters={},
+        random_seed=42,
+        operation_id="operation-fixture",
+        code_version="test",
+        config_fingerprint="config-fixture",
+    )
+    calculation = DftCalculationIdentity(
+        structure_id=structure.structure_id,
+        incar_hash="incar-fixture",
+        potcar_hash="potcar-fixture",
+    )
+    outcar = ArtifactIdentity.from_bytes("vasp_outcar", b"completed-outcar")
+    dataset = DatasetIdentity.from_identity_payload(
+        {
+            "schema_version": "nepflow.dataset.v1",
+            "records": [{"structure_id": structure.structure_id}],
+        }
+    )
+    member = SelectedDatasetMember(
+        split="train",
+        structure_id=structure.structure_id,
+        calculation_id=calculation.calculation_id,
+        source_outcar_hash=outcar.sha256,
+        ordinal=0,
+        calculation_identity=calculation.to_dict(),
+    )
+    model = ModelRunIdentity.from_inputs(
+        dataset.dataset_id,
+        "nep-in-fixture",
+        "hyperparameters-fixture",
+    )
+    model_artifact = ArtifactIdentity.from_bytes("nep_model", b"nep-model")
+    validation = ValidationRunIdentity(
+        model.model_run_id,
+        dataset.dataset_id,
+        {"temperature_k": 300},
+    )
+    report = ArtifactIdentity.from_bytes("validation_report", b"report")
+
+    with StateStore(path) as store:
+        with store.transaction():
+            store.record_project("project-fixture", name="fixture")
+            store.record_stage_run(
+                "project-fixture:init",
+                "project-fixture",
+                "init",
+                status="running",
+            )
+            store.record_structure(
+                GeneratedStructureRecord(identity=structure, provenance=provenance)
+            )
+            store.record_dft_calculation(calculation, selected=True)
+            store.create_dft_attempt(
+                calculation.calculation_id,
+                "attempt-fixture",
+                attempt_number=1,
+                resources={"nodes": 1, "gpus_per_node": 1},
+            )
+            store.register_completed_result(
+                calculation.calculation_id,
+                "attempt-fixture",
+                [outcar],
+            )
+            store.record_dataset(dataset, project_id="project-fixture")
+            store.record_dataset_member(dataset.dataset_id, member)
+            store.record_model_run(
+                ModelRunRecord(
+                    identity=model,
+                    artifact=ModelArtifactMetadata(model=model_artifact),
+                ),
+                status="completed",
+            )
+            store.record_validation_run(
+                ValidationRunRecord(
+                    identity=validation,
+                    artifact=ValidationArtifactMetadata(
+                        report=report,
+                        passed=True,
+                    ),
+                ),
+                status="completed",
+            )
+            store.record_validation_result(
+                validation.validation_run_id,
+                "result-fixture",
+                structure_id=structure.structure_id,
+                metric_name="mae",
+                observed_value=0.1,
+                threshold=0.2,
+                passed=True,
+            )
+            store.append_event(
+                "event-fixture",
+                "validation_run",
+                validation.validation_run_id,
+                "completed",
+                {"source": "test"},
+            )
+
+        assert store.schema_version == 1
+        assert store.get_project("project-fixture") is not None
+        assert store.get_stage_run("project-fixture:init")["stage"] == "init"
+        assert store.get_structure(structure.structure_id)["provenance"]["operation_id"] == "operation-fixture"
+        assert store.get_dft_calculation(calculation.calculation_id)["status"] == "completed"
+        assert store.list_dft_attempts(calculation.calculation_id)[0]["status"] == "completed"
+        assert store.list_dataset_members(dataset.dataset_id)[0]["source_outcar_hash"] == outcar.sha256
+        assert store.get_model_run(model.model_run_id)["status"] == "completed"
+        assert store.get_validation_run(validation.validation_run_id)["status"] == "completed"
+        assert store.list_validation_results(validation.validation_run_id)[0]["passed"] == 1
+        assert store.list_events(entity_id=validation.validation_run_id, entity_type="validation_run")
+
+    with StateStore(path) as reopened:
+        assert reopened.get_project("project-fixture") is not None
+        assert reopened.get_validation_run(validation.validation_run_id) is not None
+        assert len(reopened.list_artifacts()) == 3
 
 
 def test_transaction_rolls_back_all_ledger_changes(tmp_path) -> None:
