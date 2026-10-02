@@ -78,7 +78,7 @@ def classify_failure(evidence: VaspFailureEvidence) -> DftFailure:
 
 
 def is_oom_failure(job_directory: Path) -> bool:
-    """Compatibility predicate used by launcher and memory stages."""
+    """Compatibility predicate used by legacy artifact readers."""
     return VaspFailureEvidence.from_job_directory(job_directory).oom_marker
 
 

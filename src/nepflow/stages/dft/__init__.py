@@ -16,7 +16,13 @@ from .reconciliation import (
     DftReconciliationOrchestrator,
     DftReconciliationResult,
 )
-from .reports import DftPerformanceRecord, DftPerformanceRecorder
+from .reports import (
+    DftPerformanceRecord,
+    DftPerformanceRecorder,
+    VaspBenchmarkSummary,
+    benchmark_plot_data,
+    summarize_benchmark_results,
+)
 
 __all__ = [
     "DftCalculationSpec",
@@ -30,6 +36,9 @@ __all__ = [
     "DftReconciliationResult",
     "DftPerformanceRecord",
     "DftPerformanceRecorder",
+    "VaspBenchmarkSummary",
+    "benchmark_plot_data",
+    "summarize_benchmark_results",
     "PreparedCalculation",
     "VaspPreparationOrchestrator",
     "calculation_identities_match",

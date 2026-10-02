@@ -90,7 +90,6 @@ def compose_stage_registry() -> StageRegistry:
     # pylint: disable=import-error,import-outside-toplevel
     from modules import (
         GenerateStage,
-        MemoryStage,
         SelectStage,
         TrainNepStage,
         ValidateStage,
@@ -153,10 +152,6 @@ def compose_stage_registry() -> StageRegistry:
         )
 
     registry.register(WorkflowStage.VALIDATE, run_validation)
-    registry.register_auxiliary(
-        "memory",
-        lambda context: MemoryStage(**_legacy_stage_kwargs(context)).run(),
-    )
     return registry
 
 
@@ -183,7 +178,6 @@ def create_parser() -> argparse.ArgumentParser:
 Examples:
   nepflow --project myproject
   nepflow --project myproject --local
-  nepflow --project myproject --memory
   nepflow --project myproject --debug
         """,
     )
@@ -218,13 +212,6 @@ Examples:
         help="Fetch base structures locally (seeds only, no perturbations), "
         "then stop. Use on a machine with web access before transferring "
         "to HPC.",
-    )
-    parser.add_argument(
-        "--memory",
-        action="store_true",
-        help="Run VASP memory/performance benchmarks on BCC W supercells "
-        "to populate .vasp_memory with timing and OOM data. "
-        "Does not advance the workflow stage.",
     )
     parser.add_argument(
         "--debug",
@@ -460,7 +447,6 @@ def main():
         debug=args.debug,
         stage_override=args.stage,
         local_mode=args.local,
-        memory_mode=getattr(args, "memory", False),
         slurm_deadline=slurm_deadline,
         stage_registry=compose_stage_registry(),
     )

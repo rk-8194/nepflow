@@ -169,6 +169,24 @@ def clean_stale_outputs(working_directory: Path) -> None:
         (Path(working_directory) / filename).unlink(missing_ok=True)
 
 
+def _scientific_attempts(
+    state_store: StateStore,
+    calculation_id: str,
+) -> list[dict[str, object]]:
+    """Exclude explicitly namespaced benchmark observations from DFT resume."""
+
+    return [
+        attempt
+        for attempt in state_store.list_dft_attempts(calculation_id)
+        if not _is_benchmark_attempt(attempt)
+    ]
+
+
+def _is_benchmark_attempt(attempt: Mapping[str, object]) -> bool:
+    metadata = attempt.get("metadata")
+    return isinstance(metadata, Mapping) and metadata.get("execution_kind") == "vasp_benchmark"
+
+
 class VaspPreparationOrchestrator:
     """Prepare VASP inputs and record typed calculation/reuse state."""
 
@@ -234,7 +252,7 @@ class VaspPreparationOrchestrator:
                     calculation,
                     existing_identity,
                 )
-                attempts = state_store.list_dft_attempts(calculation.calculation_id)
+                attempts = _scientific_attempts(state_store, calculation.calculation_id)
                 latest_attempt = attempts[-1] if attempts else None
                 persisted_status = (
                     None if latest_attempt is None else str(latest_attempt.get("status"))
@@ -460,7 +478,7 @@ class VaspPreparationOrchestrator:
                         ),
                     },
                 )
-                attempts = state_store.list_dft_attempts(calculation.calculation_id)
+                attempts = _scientific_attempts(state_store, calculation.calculation_id)
                 attempt_id = (
                     str(attempts[0]["attempt_id"])
                     if attempts

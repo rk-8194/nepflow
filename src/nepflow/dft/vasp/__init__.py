@@ -1,6 +1,22 @@
 """Canonical VASP scientific backend primitives."""
 
 from .backend import VaspBackend
+from .benchmarking import (
+    BenchmarkOutcome,
+    VaspBenchmarkCase,
+    VaspBenchmarkExecution,
+    VaspBenchmarkPass,
+    VaspBenchmarkPlan,
+    VaspBenchmarkProvenance,
+    VaspBenchmarkResource,
+    VaspBenchmarkResult,
+    VaspBenchmarkRunner,
+    VaspBenchmarkTarget,
+    build_benchmark_resources,
+    build_vasp_benchmark_plan,
+    build_vasp_benchmark_plan_from_config,
+    compatible_benchmark_observations,
+)
 from .failures import VaspFailureEvidence, classify_failure
 from .inputs import (
     VaspInputContext,
@@ -12,6 +28,7 @@ from .inputs import (
     hash_potcar_bytes,
     inject_incar_defaults,
     read_identity,
+    set_incar_parameters,
     strip_resource_incar_params,
 )
 from .outputs import (
@@ -49,6 +66,16 @@ from .registry import (
 
 __all__ = [
     "ResolvedVaspOutput",
+    "BenchmarkOutcome",
+    "VaspBenchmarkCase",
+    "VaspBenchmarkExecution",
+    "VaspBenchmarkPass",
+    "VaspBenchmarkPlan",
+    "VaspBenchmarkProvenance",
+    "VaspBenchmarkResource",
+    "VaspBenchmarkResult",
+    "VaspBenchmarkRunner",
+    "VaspBenchmarkTarget",
     "VaspBackend",
     "VaspFailureEvidence",
     "VaspInputIdentity",
@@ -61,10 +88,14 @@ __all__ = [
     "VALID_VASP_STATUSES",
     "VASP_REGISTRY_VERSION",
     "build_retry_levels_for_gpu",
+    "build_benchmark_resources",
+    "build_vasp_benchmark_plan",
+    "build_vasp_benchmark_plan_from_config",
     "build_input_context",
     "canonical_poscar_bytes",
     "canonical_poscar_text",
     "classify_failure",
+    "compatible_benchmark_observations",
     "completed_jobs_registry_path",
     "decide_retry",
     "get_nepflow_root",
@@ -80,6 +111,7 @@ __all__ = [
     "parse_virial_from_outcar",
     "resolve_verified_output",
     "read_identity",
+    "set_incar_parameters",
     "read_completed_registry",
     "read_status",
     "strip_resource_incar_params",

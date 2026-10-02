@@ -34,7 +34,6 @@ class StageContext:
     config: Any = None
     debug: bool = False
     local_mode: bool = False
-    memory_mode: bool = False
     seeds_only: bool = False
     slurm_deadline: float | None = None
     options: Mapping[str, Any] = field(default_factory=dict)
@@ -115,7 +114,7 @@ class StageRegistry:
         )
 
     def register_auxiliary(self, name: str, handler: StageHandler) -> None:
-        """Register a non-progressing operation such as memory benchmarking."""
+        """Register a non-progressing application operation."""
 
         key = name.strip()
         if not key:
@@ -191,7 +190,6 @@ class WorkflowController:
         debug: bool = False,
         stage_override: str | None = None,
         local_mode: bool = False,
-        memory_mode: bool = False,
         slurm_deadline: float | None = None,
         *,
         stage_registry: StageRegistry | None = None,
@@ -205,7 +203,6 @@ class WorkflowController:
         self.debug = debug
         self.stage_override = stage_override
         self.local_mode = local_mode
-        self.memory_mode = memory_mode
         self.slurm_deadline = slurm_deadline
         self.stage_registry = stage_registry or registry or StageRegistry()
 
@@ -300,7 +297,6 @@ class WorkflowController:
             config=self.config,
             debug=self.debug,
             local_mode=self.local_mode,
-            memory_mode=self.memory_mode,
             seeds_only=seeds_only,
             slurm_deadline=self.slurm_deadline,
             options={"mode": mode},
@@ -422,10 +418,6 @@ class WorkflowController:
         stage = self.current_stage()
         if stage is WorkflowStage.COMPLETED:
             logger.info("Workflow is already complete; no stage will be run")
-            return
-
-        if self.memory_mode:
-            self.stage_registry.execute_auxiliary("memory", self._context(mode="memory"))
             return
 
         if self.debug:

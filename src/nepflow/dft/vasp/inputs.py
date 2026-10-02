@@ -79,6 +79,43 @@ def strip_resource_incar_params(incar_text: str) -> str:
     return "\n".join(kept).rstrip() + "\n"
 
 
+def set_incar_parameters(
+    incar_text: str,
+    parameters: Mapping[str, object],
+) -> str:
+    """Return INCAR text with explicit execution parameters applied.
+
+    This is an input-rendering primitive, not a benchmark or launcher policy.
+    Callers must decide which parameters are scientific and which belong only
+    to one execution.  Existing assignments are replaced in place and absent
+    assignments are appended in deterministic key order.
+    """
+
+    normalized = {
+        str(key).strip().upper(): value
+        for key, value in parameters.items()
+        if str(key).strip()
+    }
+    if not normalized:
+        return incar_text.rstrip() + "\n"
+
+    lines = incar_text.splitlines()
+    seen: set[str] = set()
+    rendered: list[str] = []
+    for line in lines:
+        match = re.match(r"^(?P<prefix>\s*)(?P<key>[A-Za-z][A-Za-z0-9_]*)\s*=", line)
+        key = None if match is None else match.group("key").upper()
+        if key not in normalized:
+            rendered.append(line.rstrip())
+            continue
+        rendered.append(f"{key} = {normalized[key]}")
+        seen.add(key)
+
+    for key in sorted(set(normalized) - seen):
+        rendered.append(f"{key} = {normalized[key]}")
+    return "\n".join(rendered).rstrip() + "\n"
+
+
 def hash_incar_text(incar_text: str) -> str:
     """Hash scientific INCAR content, excluding launcher resource params."""
     return sha256_bytes(strip_resource_incar_params(incar_text).encode("utf-8"))

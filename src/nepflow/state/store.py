@@ -913,6 +913,8 @@ class StateStore:
             and isinstance(existing_calculation.get("metadata"), Mapping)
             else {}
         )
+        if isinstance(getattr(record, "metadata", None), Mapping):
+            metadata.update(dict(record.metadata))
         metadata["working_directory"] = str(record.inputs.working_directory)
         metadata["execution_status"] = record.status
         if reason is not None:

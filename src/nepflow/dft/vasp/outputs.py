@@ -539,7 +539,7 @@ class VaspPerformanceEvidence:
 
 
 def parse_performance_evidence(outcar_text: str) -> VaspPerformanceEvidence:
-    """Parse the performance evidence used by the memory benchmark."""
+    """Parse canonical performance evidence for DFT reports and benchmarks."""
     ranks_match = re.search(r"running on\s+(\d+)\s+total cores", outcar_text)
     mpi_ranks_match = re.search(r"running\s+(\d+)\s+mpi-ranks", outcar_text)
     loops = tuple(

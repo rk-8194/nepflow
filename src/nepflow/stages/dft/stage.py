@@ -20,6 +20,7 @@ from .orchestrator import (
     DftPreparationResult,
     PreparedCalculation,
     VaspPreparationOrchestrator,
+    _scientific_attempts,
 )
 from .reconciliation import (
     DftExecutionRecord,
@@ -213,7 +214,7 @@ class DftStage:
         state_store,
         resources: JobResources,
     ) -> DftExecutionRecord:
-        attempts = state_store.list_dft_attempts(item.calculation.calculation_id)
+        attempts = _scientific_attempts(state_store, item.calculation.calculation_id)
         latest = attempts[-1] if attempts else None
         status = item.status
         if item.reused:

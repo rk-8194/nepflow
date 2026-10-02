@@ -9,9 +9,9 @@ launcher markers.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Protocol, Sequence
+from typing import Any, Mapping, Protocol, Sequence
 
 from nepflow.dft.backend import (
     DftBackend,
@@ -66,6 +66,7 @@ class DftExecutionRecord:
     job_name: str | None = None
     retry_level: int = 0
     resources: JobResources | None = None
+    metadata: Mapping[str, Any] = field(default_factory=dict)
 
     def with_status(
         self,
@@ -132,6 +133,7 @@ class DftReconciliationOrchestrator:
         recovery_policy: DftRecoveryPolicy | None = None,
         performance_recorder: Any | None = None,
         job_name_prefix: str | None = None,
+        persist_result_artifact: bool = True,
     ) -> None:
         if max_concurrent < 1:
             raise ValueError("max_concurrent must be positive")
@@ -146,6 +148,7 @@ class DftReconciliationOrchestrator:
         self.recovery_policy = recovery_policy
         self.performance_recorder = performance_recorder
         self.job_name_prefix = job_name_prefix
+        self.persist_result_artifact = persist_result_artifact
 
     def reconcile_once(
         self,
@@ -210,7 +213,10 @@ class DftReconciliationOrchestrator:
             if self.performance_recorder is not None:
                 self.performance_recorder.record_completion(record, result)
             completed = record.with_status("completed")
-            return self._save(completed, artifact=artifact)
+            return self._save(
+                completed,
+                artifact=artifact if self.persist_result_artifact else None,
+            )
 
         markers = (job_state.value,) if job_state == SchedulerJobState.OOM else ()
         failure = self.backend.classify_failure(

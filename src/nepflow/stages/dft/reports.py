@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -118,4 +119,75 @@ class DftPerformanceRecorder:
         )
 
 
-__all__ = ["DftPerformanceRecord", "DftPerformanceRecorder", "DftPerformanceSink"]
+@dataclass(frozen=True, slots=True)
+class VaspBenchmarkSummary:
+    """Structured benchmark summary used by DFT reports and plot adapters."""
+
+    total: int
+    completed: int
+    out_of_memory: int
+    failed: int
+    average_loop_time: float | None
+
+
+def summarize_benchmark_results(results: Sequence[Any]) -> VaspBenchmarkSummary:
+    """Summarize typed benchmark results without reading launcher output."""
+
+    completed = [
+        result
+        for result in results
+        if getattr(getattr(result, "outcome", None), "value", None) == "completed"
+        and getattr(result, "performance", None) is not None
+    ]
+    loop_times = [
+        result.performance.average_loop_time
+        for result in completed
+        if result.performance.average_loop_time > 0
+    ]
+    return VaspBenchmarkSummary(
+        total=len(results),
+        completed=len(completed),
+        out_of_memory=sum(
+            getattr(getattr(result, "outcome", None), "value", None)
+            == "out_of_memory"
+            for result in results
+        ),
+        failed=sum(
+            getattr(getattr(result, "outcome", None), "value", None) == "failed"
+            for result in results
+        ),
+        average_loop_time=(sum(loop_times) / len(loop_times) if loop_times else None),
+    )
+
+
+def benchmark_plot_data(results: Sequence[Any]) -> tuple[dict[str, Any], ...]:
+    """Return plot-ready structured rows; plotting libraries stay out of DFT state."""
+
+    return tuple(
+        {
+            "benchmark_id": result.benchmark_id,
+            "outcome": result.outcome.value,
+            "structure_id": result.provenance.structure_id,
+            "compatibility_key": result.provenance.compatibility_key,
+            "nodes": result.provenance.resources.nodes,
+            "gpus_per_node": result.provenance.resources.gpus_per_node,
+            "total_gpus": result.provenance.resources.total_gpus,
+            "mpi_ranks": result.provenance.resources.mpi_ranks,
+            "average_loop_time": (
+                None
+                if result.performance is None
+                else result.performance.average_loop_time
+            ),
+        }
+        for result in results
+    )
+
+
+__all__ = [
+    "DftPerformanceRecord",
+    "DftPerformanceRecorder",
+    "DftPerformanceSink",
+    "VaspBenchmarkSummary",
+    "benchmark_plot_data",
+    "summarize_benchmark_results",
+]
