@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
+from nepflow.config.models import NepflowConfig
 from nepflow.errors import VaspError
 
 
@@ -19,13 +20,46 @@ def build_retry_levels_for_gpu(
 ) -> list[tuple[int, int, int, int]]:
     """Build the accepted Phase 2 GPU-aware retry escalation table.
 
-    The parser argument is the temporary typed-config-to-legacy adapter used
-    by the still-unmigrated launcher.  This function does not read files or
-    create a second configuration source.
+    The parser form remains for compatibility with existing recovery callers.
+    New DFT stage code should use :func:`build_retry_levels_for_config`.
     """
-    cores = config.getint("hpc", "cores_per_node", fallback=64)
-    gpus_per_node = config.getint("hpc", "gpus_per_node", fallback=4)
-    max_nodes = config.getint("hpc", "max_nodes", fallback=16)
+    return _build_retry_levels(
+        starting_gpu,
+        initial_ncore,
+        initial_kpar,
+        cores=config.getint("hpc", "cores_per_node", fallback=64),
+        gpus_per_node=config.getint("hpc", "gpus_per_node", fallback=4),
+        max_nodes=config.getint("hpc", "max_nodes", fallback=16),
+    )
+
+
+def build_retry_levels_for_config(
+    starting_gpu: int,
+    initial_ncore: int,
+    initial_kpar: int,
+    config: NepflowConfig,
+) -> list[tuple[int, int, int, int]]:
+    """Build retry levels from the canonical typed configuration."""
+
+    return _build_retry_levels(
+        starting_gpu,
+        initial_ncore,
+        initial_kpar,
+        cores=config.hpc.cores_per_node,
+        gpus_per_node=config.hpc.gpus_per_node,
+        max_nodes=config.hpc.max_nodes,
+    )
+
+
+def _build_retry_levels(
+    starting_gpu: int,
+    initial_ncore: int,
+    initial_kpar: int,
+    *,
+    cores: int,
+    gpus_per_node: int,
+    max_nodes: int,
+) -> list[tuple[int, int, int, int]]:
 
     valid_ncores = sorted(
         p
@@ -117,6 +151,60 @@ class VaspRecoveryDecision:
     reason: str = ""
 
 
+class VaspRecoveryPolicy:
+    """Typed VASP retry policy used by the canonical DFT reconciler."""
+
+    def __init__(self, config: NepflowConfig) -> None:
+        self.config = config
+
+    def decide(
+        self,
+        *,
+        starting_gpu: int,
+        initial_ncore: int,
+        initial_kpar: int,
+        retry_level: int,
+    ) -> VaspRecoveryDecision:
+        levels = build_retry_levels_for_config(
+            starting_gpu,
+            initial_ncore,
+            initial_kpar,
+            self.config,
+        )
+        return decide_retry(
+            levels,
+            retry_level,
+            max_retry_level=self.config.dft_recovery.max_retry_level,
+        )
+
+    def apply(self, decision: VaspRecoveryDecision, working_directory: Path) -> None:
+        """Apply one recorded resource decision before a retry submission."""
+        if not decision.retry:
+            return
+        if decision.ncore is None or decision.kpar is None:
+            raise VaspError("VASP retry decision is missing INCAR resources")
+        write_incar_resource_parameters(
+            working_directory,
+            decision.ncore,
+            decision.kpar,
+        )
+        for filename in (
+            "CHG",
+            "CHGCAR",
+            "WAVECAR",
+            "CONTCAR",
+            "DOSCAR",
+            "EIGENVAL",
+            "PCDAT",
+            "OUTCAR",
+            "vasprun.xml",
+            "OSZICAR",
+            "vasp_output.log",
+            ".vasp_oom_detected",
+        ):
+            (Path(working_directory) / filename).unlink(missing_ok=True)
+
+
 def decide_retry(
     levels: list[tuple[int, int, int, int]],
     retry_level: int,
@@ -145,7 +233,9 @@ def decide_retry(
 
 __all__ = [
     "VaspRecoveryDecision",
+    "VaspRecoveryPolicy",
     "build_retry_levels_for_gpu",
+    "build_retry_levels_for_config",
     "decide_retry",
     "write_incar_resource_parameters",
 ]

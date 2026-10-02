@@ -1,8 +1,8 @@
-"""Validated VASP job-status and completed-artifact registry records.
+"""Validated legacy VASP status and completed-artifact registry records.
 
-The launcher still consumes these records while DFT preparation moves into
-the canonical stage package.  Keeping the file contract here prevents the
-preparation service from depending on a legacy stage module.
+Preparation may still read these records to verify historical reuse. New
+execution results are authoritative in StateStore and do not write this
+compatibility registry.
 """
 
 from __future__ import annotations

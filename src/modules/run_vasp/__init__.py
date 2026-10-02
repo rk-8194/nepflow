@@ -1,1 +1,1 @@
-"""Legacy VASP launcher package retained until launcher migration."""
+"""Compatibility namespace for legacy VASP input helpers."""

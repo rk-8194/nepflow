@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from contextlib import contextmanager
+from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
 import sqlite3
@@ -547,6 +548,30 @@ class StateStore:
             else _decode_row(row, ("identity_json", "metadata_json"))
         )
 
+    def list_dft_calculations(
+        self,
+        *,
+        statuses: Sequence[str] | None = None,
+        selected_only: bool = False,
+    ) -> list[dict[str, Any]]:
+        """List authoritative DFT calculations for reconciliation loaders."""
+        query = "SELECT * FROM dft_calculations"
+        parameters: list[Any] = []
+        clauses: list[str] = []
+        if statuses:
+            placeholders = ", ".join("?" for _ in statuses)
+            clauses.append(f"status IN ({placeholders})")
+            parameters.extend(statuses)
+        if selected_only:
+            clauses.append("selected = 1")
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY created_at, calculation_id"
+        return [
+            _decode_row(row, ("identity_json", "metadata_json"))
+            for row in self._fetchall(query, parameters)
+        ]
+
     def record_dft_calculation(
         self,
         identity: DftCalculationIdentity | Mapping[str, Any],
@@ -686,6 +711,7 @@ class StateStore:
         attempt_id: str,
         *,
         status: str | None = None,
+        resources: Any = None,
         scheduler: Any = None,
         failure_evidence: Any = None,
         job_id: str | None = None,
@@ -705,6 +731,7 @@ class StateStore:
                 """
                 UPDATE dft_attempts SET
                     status = COALESCE(?, status),
+                    resources_json = COALESCE(?, resources_json),
                     scheduler_json = COALESCE(?, scheduler_json),
                     failure_evidence_json = COALESCE(?, failure_evidence_json),
                     job_id = COALESCE(?, job_id),
@@ -715,6 +742,7 @@ class StateStore:
                 """,
                 (
                     status,
+                    None if resources is None else _json(resources),
                     None if scheduler is None else _json(scheduler),
                     None if failure_evidence is None else _json(failure_evidence),
                     job_id,
@@ -861,6 +889,103 @@ class StateStore:
             return _decode_row(row, ("identity_json", "metadata_json"))
 
         return self._write(write)
+
+    def save_execution(
+        self,
+        record: Any,
+        *,
+        artifact: Any = None,
+        reason: str | None = None,
+    ) -> None:
+        """Persist one canonical DFT execution transition.
+
+        The execution reconciler supplies an immutable record.  This adapter
+        keeps attempt history append-only for retries and uses the existing
+        result-registration transaction when a backend artifact is accepted.
+        It intentionally does not write legacy marker or registry files.
+        """
+        calculation = record.inputs.calculation
+        existing_attempt = self.get_dft_attempt(record.attempt_id)
+        existing_calculation = self.get_dft_calculation(calculation.calculation_id)
+        metadata = (
+            dict(existing_calculation.get("metadata", {}))
+            if existing_calculation is not None
+            and isinstance(existing_calculation.get("metadata"), Mapping)
+            else {}
+        )
+        metadata["working_directory"] = str(record.inputs.working_directory)
+        metadata["execution_status"] = record.status
+        if reason is not None:
+            metadata["last_failure_reason"] = reason
+
+        with self.transaction():
+            self.upsert_dft_calculation(
+                calculation,
+                status=record.status,
+                selected=(
+                    bool(existing_calculation.get("selected", False))
+                    if existing_calculation is not None
+                    else True
+                ),
+                priority=(
+                    int(existing_calculation.get("priority", 0))
+                    if existing_calculation is not None
+                    else 0
+                ),
+                metadata=metadata,
+            )
+            if existing_attempt is None:
+                attempts = self.list_dft_attempts(calculation.calculation_id)
+                attempt_number = (
+                    max((int(item["attempt_number"]) for item in attempts), default=0)
+                    + 1
+                )
+                self.create_dft_attempt(
+                    calculation.calculation_id,
+                    record.attempt_id,
+                    attempt_number=attempt_number,
+                    status=record.status,
+                    resources=(
+                        None
+                        if record.resources is None
+                        else asdict(record.resources)
+                    ),
+                    job_id=record.job_id,
+                    failure_evidence=(
+                        {"reason": reason} if reason is not None else None
+                    ),
+                    metadata=metadata,
+                )
+            else:
+                self.update_dft_attempt(
+                    record.attempt_id,
+                    status=record.status,
+                    resources=(
+                        None
+                        if record.resources is None
+                        else asdict(record.resources)
+                    ),
+                    job_id=record.job_id,
+                    failure_evidence=(
+                        {"reason": reason} if reason is not None else None
+                    ),
+                    completed_at=_now() if record.status in {"completed", "failed"} else None,
+                    metadata=metadata,
+                )
+
+            if artifact is not None:
+                if not hasattr(artifact, "outcar"):
+                    raise StateError("DFT execution artifact has no VASP artifact fields")
+                identities = tuple(
+                    item
+                    for item in (artifact.outcar, artifact.vasprun)
+                    if item is not None
+                )
+                self.register_completed_result(
+                    calculation.calculation_id,
+                    record.attempt_id,
+                    identities,
+                )
 
     def upsert_dataset(
         self,

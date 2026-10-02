@@ -9,12 +9,27 @@ from .orchestrator import (
     prepare_calculations,
 )
 from .stage import DftStage, DftStageResult
+from .reconciliation import (
+    DftExecutionRecord,
+    DftRecoveryDecision,
+    DftRecoveryPolicy,
+    DftReconciliationOrchestrator,
+    DftReconciliationResult,
+)
+from .reports import DftPerformanceRecord, DftPerformanceRecorder
 
 __all__ = [
     "DftCalculationSpec",
     "DftPreparationResult",
     "DftStage",
     "DftStageResult",
+    "DftExecutionRecord",
+    "DftRecoveryDecision",
+    "DftRecoveryPolicy",
+    "DftReconciliationOrchestrator",
+    "DftReconciliationResult",
+    "DftPerformanceRecord",
+    "DftPerformanceRecorder",
     "PreparedCalculation",
     "VaspPreparationOrchestrator",
     "calculation_identities_match",

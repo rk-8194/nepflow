@@ -1,7 +1,8 @@
 """Typed DFT preparation and reuse orchestration.
 
-This module owns preparation policy only.  Scheduler submission and launcher
-reconciliation remain separate dependencies for the following migration.
+Preparation remains separate from the execution reconciler: this module
+creates/verifies backend inputs, while ``reconciliation.py`` advances their
+StateStore-backed attempts through scheduler and backend evidence.
 """
 
 from __future__ import annotations
@@ -233,6 +234,31 @@ class VaspPreparationOrchestrator:
                     calculation,
                     existing_identity,
                 )
+                attempts = state_store.list_dft_attempts(calculation.calculation_id)
+                latest_attempt = attempts[-1] if attempts else None
+                persisted_status = (
+                    None if latest_attempt is None else str(latest_attempt.get("status"))
+                )
+                if current_match and persisted_status in {
+                    "submitted",
+                    "running",
+                    "failed",
+                    "completed",
+                    "reused",
+                }:
+                    persisted_marker_status = (
+                        "submitted"
+                        if persisted_status in {"submitted", "running"}
+                        else persisted_status
+                    )
+                    current_status = {
+                        **current_status,
+                        "status": persisted_marker_status,
+                        "retry_level": max(
+                            int(current_status.get("retry_level", 0)),
+                            max(0, int(latest_attempt.get("attempt_number", 1)) - 1),
+                        ),
+                    }
                 current_evidence = None
                 if current_match and current_status["status"] in {
                     "submitted",
@@ -262,7 +288,11 @@ class VaspPreparationOrchestrator:
                     registry,
                     calculation,
                 )
-                if current_match and current_status["status"] == "submitted" and resolved is None:
+                if current_match and persisted_status == "failed":
+                    status = "failed"
+                elif current_match and persisted_status in {"completed", "reused"} and resolved is None:
+                    status = persisted_status
+                elif current_match and current_status["status"] == "submitted" and resolved is None:
                     status = "submitted"
                 elif resolved is not None:
                     status = "reused" if resolved.verification_source != "current_job_identity" else "completed"

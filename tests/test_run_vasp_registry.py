@@ -12,9 +12,14 @@ pytest.importorskip("pymatgen")
 
 from ase import Atoms
 from ase.io import write as ase_write
-from modules.run_vasp import launcher
 from nepflow.config import load_config, render_default_config
-from nepflow.domain.identities import calculate_structure_id
+from nepflow.domain.calculations import DftResultArtifact
+from nepflow.domain.identities import (
+    ArtifactIdentity,
+    DftCalculationIdentity,
+    calculate_structure_id,
+)
+from nepflow.dft.backend import DftInputArtifacts
 from nepflow.dft.vasp.inputs import (
     hash_incar_text,
     hash_potcar_bytes,
@@ -32,6 +37,7 @@ from nepflow.dft.vasp.registry import (
 )
 from nepflow.errors import ArtifactError, StateError
 from nepflow.stages.dft import calculation_identities_match, prepare_calculations
+from nepflow.stages.dft import DftExecutionRecord
 from nepflow.state import StateStore
 
 
@@ -377,28 +383,45 @@ class RunVaspRegistryTests(unittest.TestCase):
             )
             self.assertEqual(status["status"], "pending")
 
-    def test_register_completed_job_writes_registry_entry(self) -> None:
+    def test_completed_result_is_recorded_in_state_store(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             struct_dir = root / "projects" / "project_demo" / "vasp" / "jobs" / "train" / "struct_0042"
             struct_dir.mkdir(parents=True)
-            identity = {
-                "structure_hash": "structure-hash",
-                "incar_hash": "incar-hash",
-                "potcar_hash": "potcar-hash",
-            }
-            (struct_dir / ".vasp_identity").write_text(json.dumps(identity), encoding="utf-8")
             (struct_dir / "OUTCAR").write_text("General timing\n", encoding="utf-8")
+            calculation = DftCalculationIdentity(
+                structure_id="structure-hash",
+                incar_hash="incar-hash",
+                potcar_hash="potcar-hash",
+            )
+            inputs = DftInputArtifacts(
+                calculation=calculation,
+                working_directory=struct_dir,
+                files=(struct_dir / "OUTCAR",),
+            )
+            artifact = DftResultArtifact(
+                calculation=calculation,
+                outcar=ArtifactIdentity.from_file("vasp_outcar", struct_dir / "OUTCAR"),
+                status="completed",
+            )
 
-            launcher._register_completed_job(struct_dir, root, "demo", "train", 42)
+            with StateStore(root / "state.db") as state_store:
+                state_store.save_execution(
+                    DftExecutionRecord(
+                        inputs=inputs,
+                        attempt_id=f"{calculation.calculation_id}:attempt:1",
+                        status="completed",
+                    ),
+                    artifact=artifact,
+                )
+                calculation_row = state_store.get_dft_calculation(
+                    calculation.calculation_id
+                )
+                artifacts = state_store.list_artifacts()
 
-            registry = read_completed_registry(root)
-            entry = registry["jobs"]["incar-hash"]["potcar-hash"]["structure-hash"]
-            self.assertEqual(Path(entry["job_path"]), struct_dir.resolve())
-            self.assertEqual(entry["project_name"], "demo")
-            self.assertEqual(entry["dataset"], "train")
-            self.assertEqual(entry["selected_index"], 42)
-            self.assertIn("completed_at", entry)
+            self.assertIsNotNone(calculation_row)
+            self.assertEqual(calculation_row["status"], "completed")
+            self.assertEqual(artifacts[0]["artifact_type"], "vasp_outcar")
 
     def test_prepare_fails_on_malformed_status_record(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
