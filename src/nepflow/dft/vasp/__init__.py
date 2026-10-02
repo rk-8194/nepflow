@@ -34,6 +34,18 @@ from .recovery import (
     decide_retry,
     write_incar_resource_parameters,
 )
+from .registry import (
+    VALID_VASP_STATUSES,
+    VASP_REGISTRY_VERSION,
+    completed_jobs_registry_path,
+    get_nepflow_root,
+    get_registry_entry,
+    read_completed_registry,
+    read_status,
+    upsert_registry_entry,
+    write_completed_registry,
+    write_status,
+)
 
 __all__ = [
     "ResolvedVaspOutput",
@@ -46,12 +58,17 @@ __all__ = [
     "VaspPerformanceEvidence",
     "VaspRegistryEvidence",
     "VaspRecoveryDecision",
+    "VALID_VASP_STATUSES",
+    "VASP_REGISTRY_VERSION",
     "build_retry_levels_for_gpu",
     "build_input_context",
     "canonical_poscar_bytes",
     "canonical_poscar_text",
     "classify_failure",
+    "completed_jobs_registry_path",
     "decide_retry",
+    "get_nepflow_root",
+    "get_registry_entry",
     "hash_incar_text",
     "hash_potcar_bytes",
     "inject_incar_defaults",
@@ -63,6 +80,11 @@ __all__ = [
     "parse_virial_from_outcar",
     "resolve_verified_output",
     "read_identity",
+    "read_completed_registry",
+    "read_status",
     "strip_resource_incar_params",
+    "upsert_registry_entry",
+    "write_completed_registry",
     "write_incar_resource_parameters",
+    "write_status",
 ]

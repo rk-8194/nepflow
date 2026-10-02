@@ -35,13 +35,10 @@ if str(SRC) not in sys.path:
 from nepflow.domain.identities import DftCalculationIdentity, calculate_structure_id
 from nepflow.dft.vasp.inputs import strip_resource_incar_params
 from nepflow.dft.vasp.outputs import VASP_COMPLETION_MARKERS, outcar_is_complete
+from nepflow.dft.vasp.registry import VASP_REGISTRY_VERSION, validate_completed_registry
 from nepflow.errors import ArtifactError
 from nepflow.io.hashing import sha256_bytes, sha256_file
 from nepflow.io.json import read_json_object, write_json
-from modules.run_vasp._common import (
-    VASP_REGISTRY_VERSION,
-    validate_completed_registry,
-)
 
 def hash_incar_file(incar_path: Path) -> str:
     return sha256_bytes(

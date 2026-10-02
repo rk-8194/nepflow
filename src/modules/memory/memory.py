@@ -24,16 +24,11 @@ from ..base import Stage
 from nepflow.errors import SchedulerError
 from nepflow.hpc.slurm import SlurmScheduler
 from nepflow.dft.vasp.failures import is_oom_failure
-from nepflow.dft.vasp.inputs import inject_incar_defaults
+from nepflow.dft.vasp.inputs import canonical_poscar_text, inject_incar_defaults
 from nepflow.dft.vasp.outputs import outcar_is_complete, parse_performance_evidence
 
-from ..run_vasp._common import (
-    logger,
-    parse_zval,
-    read_status,
-    write_status,
-)
-from ..run_vasp.prepare import write_poscar
+from nepflow.dft.vasp.registry import read_status, write_status
+from ..run_vasp._common import logger, parse_zval
 
 CSV_HEADER = [
     "n_atoms", "n_kpoints_irr", "n_electrons",
@@ -212,7 +207,10 @@ class MemoryStage(Stage):
                 job_dir = atoms_dir / f"gpu{gpus}_nc{ncore:02d}_kp{kpar}"
                 job_dir.mkdir(parents=True, exist_ok=True)
 
-                write_poscar(atoms, job_dir / "POSCAR")
+                (job_dir / "POSCAR").write_text(
+                    canonical_poscar_text(atoms),
+                    encoding="utf-8",
+                )
                 (job_dir / "POTCAR").write_bytes(potcar_bytes)
 
                 job_incar = self._set_incar_params(incar_text, ncore, kpar)

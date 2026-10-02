@@ -3,7 +3,6 @@ import tempfile
 import unittest
 from configparser import ConfigParser
 from pathlib import Path
-from unittest.mock import patch
 
 import numpy as np
 import pytest
@@ -12,10 +11,28 @@ pytest.importorskip("ase")
 pytest.importorskip("pymatgen")
 
 from ase import Atoms
-from modules.run_vasp import _common as common
-from modules.run_vasp import launcher, prepare
+from ase.io import write as ase_write
+from modules.run_vasp import launcher
+from nepflow.config import load_config, render_default_config
 from nepflow.domain.identities import calculate_structure_id
+from nepflow.dft.vasp.inputs import (
+    hash_incar_text,
+    hash_potcar_bytes,
+    inject_incar_defaults,
+    read_identity,
+)
+from nepflow.dft.vasp.registry import (
+    VASP_REGISTRY_VERSION,
+    completed_jobs_registry_path,
+    get_registry_entry,
+    read_completed_registry,
+    read_status,
+    upsert_registry_entry,
+    write_status,
+)
 from nepflow.errors import ArtifactError, StateError
+from nepflow.stages.dft import calculation_identities_match, prepare_calculations
+from nepflow.state import StateStore
 
 
 class RunVaspRegistryTests(unittest.TestCase):
@@ -28,12 +45,18 @@ class RunVaspRegistryTests(unittest.TestCase):
             encoding="utf-8",
         )
         (project_dir / "config" / "vasp" / "POTCAR_Si").write_bytes(b"Si-potcar-v1")
-        (project_dir / "structures" / "selected" / "train.xyz").write_text(
-            "train",
-            encoding="utf-8",
-        )
-        (project_dir / "structures" / "selected" / "test.xyz").write_text(
-            "test",
+        (project_dir / "config" / "project.config").write_text(
+            render_default_config(
+                "demo",
+                {
+                    "materialsproject_api_key": "",
+                    "elements": "Si",
+                    "gas_elements": "",
+                    "crystal_structures": "bcc",
+                    "target_n_atoms": "1",
+                    "scp_address": "",
+                },
+            ),
             encoding="utf-8",
         )
         return project_dir
@@ -48,18 +71,20 @@ class RunVaspRegistryTests(unittest.TestCase):
         )
 
     def run_prepare_jobs(self, project_dir: Path, atoms: Atoms) -> None:
-        def fake_iread(path, **_kwargs):
-            return iter([atoms] if "train.xyz" in str(path) else [])
-
-        with patch.object(prepare, "iread", side_effect=fake_iread):
-            prepare.prepare_jobs(
-                ConfigParser(),
-                project_dir / "config" / "vasp",
-                project_dir / "structures" / "selected",
-                project_dir / "vasp" / "jobs",
-                ["train", "test"],
+        selected_dir = project_dir / "structures" / "selected"
+        ase_write(selected_dir / "train.xyz", atoms, format="extxyz")
+        ase_write(selected_dir / "test.xyz", atoms, format="extxyz")
+        config = load_config(
+            project_dir / "config" / "project.config",
+            project_name="demo",
+        )
+        with StateStore(project_dir / "state.db") as state_store:
+            prepare_calculations(
+                config=config,
                 project_dir=project_dir,
                 project_name="demo",
+                state_store=state_store,
+                datasets=("train", "test"),
             )
 
     def test_structure_hash_changes_with_structure(self) -> None:
@@ -76,7 +101,7 @@ class RunVaspRegistryTests(unittest.TestCase):
         original = "ENCUT = 520\nNCORE = 16\nKPAR = 1\nISMEAR = 0\n"
         rewritten = "ENCUT = 520\nNCORE = 64\nKPAR = 4\nISMEAR = 0\n"
 
-        self.assertEqual(common.hash_incar_text(original), common.hash_incar_text(rewritten))
+        self.assertEqual(hash_incar_text(original), hash_incar_text(rewritten))
 
     def test_effective_incar_defaults_participate_in_identity(self) -> None:
         template = "ENCUT = 520\n"
@@ -85,29 +110,29 @@ class RunVaspRegistryTests(unittest.TestCase):
         second_config = ConfigParser()
         second_config["vasp"] = {"kspacing": "0.35", "kgamma": ".TRUE."}
 
-        first_effective = prepare.inject_incar_defaults(template, first_config)
-        second_effective = prepare.inject_incar_defaults(template, second_config)
+        first_effective = inject_incar_defaults(template, first_config)
+        second_effective = inject_incar_defaults(template, second_config)
 
         self.assertNotEqual(
-            common.hash_incar_text(first_effective),
-            common.hash_incar_text(second_effective),
+            hash_incar_text(first_effective),
+            hash_incar_text(second_effective),
         )
         self.assertNotEqual(
-            common.hash_incar_text(template),
-            common.hash_incar_text(first_effective),
+            hash_incar_text(template),
+            hash_incar_text(first_effective),
         )
 
     def test_scheduler_and_resource_provenance_do_not_change_identity(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             atoms = self.silicon_atoms()
-            incar = prepare.inject_incar_defaults(
+            incar = inject_incar_defaults(
                 "ENCUT = 520\nNCORE = 16\nKPAR = 1\n",
                 ConfigParser(),
             )
             identity = (
-                common.hash_incar_text(incar),
-                common.hash_potcar_bytes(b"Si-potcar-v1"),
+                hash_incar_text(incar),
+                hash_potcar_bytes(b"Si-potcar-v1"),
                 calculate_structure_id(atoms),
             )
 
@@ -132,7 +157,7 @@ class RunVaspRegistryTests(unittest.TestCase):
                     "General timing\n",
                     encoding="utf-8",
                 )
-                common.upsert_registry_entry(
+                upsert_registry_entry(
                     root,
                     identity[0],
                     identity[1],
@@ -162,7 +187,7 @@ class RunVaspRegistryTests(unittest.TestCase):
         }
 
         self.assertFalse(
-            prepare._identity_matches(
+            calculation_identities_match(
                 {"structure_hash": "structure-hash", "incar_hash": "incar-hash"},
                 expected,
             )
@@ -170,8 +195,8 @@ class RunVaspRegistryTests(unittest.TestCase):
 
     def test_potcar_hash_changes_when_content_changes(self) -> None:
         self.assertNotEqual(
-            common.hash_potcar_bytes(b"Si-potcar-v1"),
-            common.hash_potcar_bytes(b"Si-potcar-v2"),
+            hash_potcar_bytes(b"Si-potcar-v1"),
+            hash_potcar_bytes(b"Si-potcar-v2"),
         )
 
     def test_prepare_marks_registry_match_as_reused(self) -> None:
@@ -183,14 +208,14 @@ class RunVaspRegistryTests(unittest.TestCase):
             completed_job = root / "projects" / "project_old" / "vasp" / "jobs" / "train" / "struct_0007"
             completed_job.mkdir(parents=True)
             (completed_job / "OUTCAR").write_text("General timing\n", encoding="utf-8")
-            incar = prepare.inject_incar_defaults(
+            incar = inject_incar_defaults(
                 "ENCUT = 520\nNCORE = 16\nKPAR = 1\n",
                 ConfigParser(),
             )
-            common.upsert_registry_entry(
+            upsert_registry_entry(
                 root,
-                common.hash_incar_text(incar),
-                common.hash_potcar_bytes(b"Si-potcar-v1"),
+                hash_incar_text(incar),
+                hash_potcar_bytes(b"Si-potcar-v1"),
                 calculate_structure_id(atoms),
                 {
                     "job_path": str(completed_job.resolve()),
@@ -221,14 +246,14 @@ class RunVaspRegistryTests(unittest.TestCase):
             completed_job = root / "projects" / "project_old" / "vasp" / "jobs" / "train" / "struct_0007"
             completed_job.mkdir(parents=True)
             (completed_job / "OUTCAR").write_text("General timing\n", encoding="utf-8")
-            incar = prepare.inject_incar_defaults(
+            incar = inject_incar_defaults(
                 "ENCUT = 520\nNCORE = 16\nKPAR = 1\n",
                 ConfigParser(),
             )
-            common.upsert_registry_entry(
+            upsert_registry_entry(
                 root,
-                common.hash_incar_text(incar),
-                common.hash_potcar_bytes(b"Si-potcar-v1"),
+                hash_incar_text(incar),
+                hash_potcar_bytes(b"Si-potcar-v1"),
                 calculate_structure_id(changed),
                 {"job_path": str(completed_job.resolve())},
             )
@@ -249,14 +274,14 @@ class RunVaspRegistryTests(unittest.TestCase):
             incomplete_job = root / "projects" / "project_old" / "vasp" / "jobs" / "train" / "struct_0007"
             incomplete_job.mkdir(parents=True)
             (incomplete_job / "OUTCAR").write_text("not complete\n", encoding="utf-8")
-            incar = prepare.inject_incar_defaults(
+            incar = inject_incar_defaults(
                 "ENCUT = 520\nNCORE = 16\nKPAR = 1\n",
                 ConfigParser(),
             )
-            common.upsert_registry_entry(
+            upsert_registry_entry(
                 root,
-                common.hash_incar_text(incar),
-                common.hash_potcar_bytes(b"Si-potcar-v1"),
+                hash_incar_text(incar),
+                hash_potcar_bytes(b"Si-potcar-v1"),
                 calculate_structure_id(atoms),
                 {"job_path": str(incomplete_job.resolve())},
             )
@@ -275,14 +300,14 @@ class RunVaspRegistryTests(unittest.TestCase):
             project_dir = self.make_project(root)
             atoms = self.silicon_atoms()
             stale_job = root / "projects" / "project_old" / "vasp" / "jobs" / "train" / "missing"
-            incar = prepare.inject_incar_defaults(
+            incar = inject_incar_defaults(
                 "ENCUT = 520\nNCORE = 16\nKPAR = 1\n",
                 ConfigParser(),
             )
-            common.upsert_registry_entry(
+            upsert_registry_entry(
                 root,
-                common.hash_incar_text(incar),
-                common.hash_potcar_bytes(b"Si-potcar-v1"),
+                hash_incar_text(incar),
+                hash_potcar_bytes(b"Si-potcar-v1"),
                 calculate_structure_id(atoms),
                 {"job_path": str(stale_job.resolve())},
             )
@@ -307,10 +332,10 @@ class RunVaspRegistryTests(unittest.TestCase):
             completed_job = root / "projects" / "project_old" / "vasp" / "jobs" / "train" / "struct_0007"
             completed_job.mkdir(parents=True)
             (completed_job / "OUTCAR").write_text("General timing\n", encoding="utf-8")
-            common.upsert_registry_entry(
+            upsert_registry_entry(
                 root,
-                common.hash_incar_text("ENCUT = 520\n"),
-                common.hash_potcar_bytes(b"Si-potcar-v1"),
+                hash_incar_text("ENCUT = 520\n"),
+                hash_potcar_bytes(b"Si-potcar-v1"),
                 calculate_structure_id(atoms),
                 {"job_path": str(completed_job.resolve())},
             )
@@ -332,14 +357,14 @@ class RunVaspRegistryTests(unittest.TestCase):
             completed_job = root / "projects" / "project_old" / "vasp" / "jobs" / "train" / "struct_0007"
             completed_job.mkdir(parents=True)
             (completed_job / "OUTCAR").write_text("General timing\n", encoding="utf-8")
-            incar = prepare.inject_incar_defaults(
+            incar = inject_incar_defaults(
                 "ENCUT = 520\nNCORE = 16\nKPAR = 1\n",
                 ConfigParser(),
             )
-            common.upsert_registry_entry(
+            upsert_registry_entry(
                 root,
-                common.hash_incar_text(incar),
-                common.hash_potcar_bytes(b"Si-potcar-v1"),
+                hash_incar_text(incar),
+                hash_potcar_bytes(b"Si-potcar-v1"),
                 calculate_structure_id(atoms),
                 {"job_path": str(completed_job.resolve())},
             )
@@ -367,7 +392,7 @@ class RunVaspRegistryTests(unittest.TestCase):
 
             launcher._register_completed_job(struct_dir, root, "demo", "train", 42)
 
-            registry = common.read_completed_registry(root)
+            registry = read_completed_registry(root)
             entry = registry["jobs"]["incar-hash"]["potcar-hash"]["structure-hash"]
             self.assertEqual(Path(entry["job_path"]), struct_dir.resolve())
             self.assertEqual(entry["project_name"], "demo")
@@ -383,23 +408,8 @@ class RunVaspRegistryTests(unittest.TestCase):
             struct_dir.mkdir(parents=True)
             (struct_dir / ".vasp_status").write_text("{malformed", encoding="utf-8")
 
-            with patch.object(
-                prepare,
-                "iread",
-                side_effect=lambda path, **_kwargs: iter(
-                    [self.silicon_atoms()] if "train.xyz" in str(path) else []
-                ),
-            ):
-                with self.assertRaises(StateError):
-                    prepare.prepare_jobs(
-                        ConfigParser(),
-                        project_dir / "config" / "vasp",
-                        project_dir / "structures" / "selected",
-                        project_dir / "vasp" / "jobs",
-                        ["train", "test"],
-                        project_dir=project_dir,
-                        project_name="demo",
-                    )
+            with self.assertRaises(StateError):
+                self.run_prepare_jobs(project_dir, self.silicon_atoms())
 
     def test_prepare_fails_on_malformed_identity_record(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -407,53 +417,23 @@ class RunVaspRegistryTests(unittest.TestCase):
             project_dir = self.make_project(root)
             struct_dir = project_dir / "vasp" / "jobs" / "train" / "struct_0000"
             struct_dir.mkdir(parents=True)
-            common.write_status(struct_dir, "submitted")
+            write_status(struct_dir, "submitted")
             (struct_dir / ".vasp_identity").write_text("{malformed", encoding="utf-8")
 
-            with patch.object(
-                prepare,
-                "iread",
-                side_effect=lambda path, **_kwargs: iter(
-                    [self.silicon_atoms()] if "train.xyz" in str(path) else []
-                ),
-            ):
-                with self.assertRaises(StateError):
-                    prepare.prepare_jobs(
-                        ConfigParser(),
-                        project_dir / "config" / "vasp",
-                        project_dir / "structures" / "selected",
-                        project_dir / "vasp" / "jobs",
-                        ["train", "test"],
-                        project_dir=project_dir,
-                        project_name="demo",
-                    )
+            with self.assertRaises(StateError):
+                self.run_prepare_jobs(project_dir, self.silicon_atoms())
 
     def test_prepare_fails_on_corrupt_registry_data(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             project_dir = self.make_project(root)
-            common.completed_jobs_registry_path(root).write_text(
+            completed_jobs_registry_path(root).write_text(
                 "{malformed",
                 encoding="utf-8",
             )
 
-            with patch.object(
-                prepare,
-                "iread",
-                side_effect=lambda path, **_kwargs: iter(
-                    [self.silicon_atoms()] if "train.xyz" in str(path) else []
-                ),
-            ):
-                with self.assertRaises(ArtifactError):
-                    prepare.prepare_jobs(
-                        ConfigParser(),
-                        project_dir / "config" / "vasp",
-                        project_dir / "structures" / "selected",
-                        project_dir / "vasp" / "jobs",
-                        ["train", "test"],
-                        project_dir=project_dir,
-                        project_name="demo",
-                    )
+            with self.assertRaises(ArtifactError):
+                self.run_prepare_jobs(project_dir, self.silicon_atoms())
 
     def test_status_json_list_is_corrupt(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -461,7 +441,7 @@ class RunVaspRegistryTests(unittest.TestCase):
             (struct_dir / ".vasp_status").write_text("[]", encoding="utf-8")
 
             with self.assertRaises(StateError):
-                common.read_status(struct_dir)
+                read_status(struct_dir)
 
     def test_status_missing_status_field_is_corrupt(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -472,7 +452,7 @@ class RunVaspRegistryTests(unittest.TestCase):
             )
 
             with self.assertRaises(StateError):
-                common.read_status(struct_dir)
+                read_status(struct_dir)
 
     def test_identity_missing_required_hash_is_corrupt(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -488,26 +468,26 @@ class RunVaspRegistryTests(unittest.TestCase):
             )
 
             with self.assertRaises(StateError):
-                prepare._read_identity(struct_dir)
+                read_identity(struct_dir)
 
     def test_registry_missing_jobs_field_is_corrupt(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            registry_path = common.completed_jobs_registry_path(Path(tmp))
+            registry_path = completed_jobs_registry_path(Path(tmp))
             registry_path.write_text(
-                json.dumps({"version": common.VASP_REGISTRY_VERSION}),
+                json.dumps({"version": VASP_REGISTRY_VERSION}),
                 encoding="utf-8",
             )
 
             with self.assertRaises(ArtifactError):
-                common.read_completed_registry(Path(tmp))
+                read_completed_registry(Path(tmp))
 
     def test_registry_unsupported_version_is_corrupt(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            registry_path = common.completed_jobs_registry_path(Path(tmp))
+            registry_path = completed_jobs_registry_path(Path(tmp))
             registry_path.write_text(
                 json.dumps(
                     {
-                        "version": common.VASP_REGISTRY_VERSION + 1,
+                        "version": VASP_REGISTRY_VERSION + 1,
                         "jobs": {},
                     }
                 ),
@@ -515,15 +495,15 @@ class RunVaspRegistryTests(unittest.TestCase):
             )
 
             with self.assertRaises(ArtifactError):
-                common.read_completed_registry(Path(tmp))
+                read_completed_registry(Path(tmp))
 
     def test_registry_jobs_must_be_an_object(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            registry_path = common.completed_jobs_registry_path(Path(tmp))
+            registry_path = completed_jobs_registry_path(Path(tmp))
             registry_path.write_text(
                 json.dumps(
                     {
-                        "version": common.VASP_REGISTRY_VERSION,
+                        "version": VASP_REGISTRY_VERSION,
                         "jobs": [],
                     }
                 ),
@@ -531,13 +511,13 @@ class RunVaspRegistryTests(unittest.TestCase):
             )
 
             with self.assertRaises(ArtifactError):
-                common.read_completed_registry(Path(tmp))
+                read_completed_registry(Path(tmp))
 
     def test_matching_registry_entry_must_have_job_path(self) -> None:
         for malformed_entry in ([], {}):
             with self.subTest(malformed_entry=malformed_entry):
                 registry = {
-                    "version": common.VASP_REGISTRY_VERSION,
+                    "version": VASP_REGISTRY_VERSION,
                     "jobs": {
                         "incar-hash": {
                             "potcar-hash": {
@@ -548,7 +528,7 @@ class RunVaspRegistryTests(unittest.TestCase):
                 }
 
                 with self.assertRaises(ArtifactError):
-                    common.get_registry_entry(
+                    get_registry_entry(
                         registry,
                         "incar-hash",
                         "potcar-hash",
@@ -562,13 +542,13 @@ class RunVaspRegistryTests(unittest.TestCase):
             struct_dir.mkdir()
 
             self.assertEqual(
-                common.read_status(struct_dir),
+                read_status(struct_dir),
                 {"status": "pending", "retry_level": 0},
             )
-            self.assertEqual(prepare._read_identity(struct_dir), {})
+            self.assertEqual(read_identity(struct_dir), {})
             self.assertEqual(
-                common.read_completed_registry(root),
-                {"version": common.VASP_REGISTRY_VERSION, "jobs": {}},
+                read_completed_registry(root),
+                {"version": VASP_REGISTRY_VERSION, "jobs": {}},
             )
 
 

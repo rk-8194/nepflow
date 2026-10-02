@@ -58,3 +58,13 @@ def test_vasp_backend_prepares_canonical_inputs_and_argument_command(tmp_path) -
     (prepared.working_directory / "OUTCAR").write_text("parseable labels but incomplete\n")
     with pytest.raises(BackendError, match="incomplete"):
         backend.parse_result(prepared)
+
+
+def test_vasp_runner_renderer_owns_only_backend_body() -> None:
+    backend = VaspBackend(command=("mpirun", "-np", "{ntasks}", "vasp_std"))
+
+    script = backend.render_runner_script()
+
+    assert "$TOTAL_RANKS" in script
+    assert "mpirun --bind-to none" in script
+    assert "#SBATCH" not in script

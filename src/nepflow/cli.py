@@ -53,6 +53,7 @@ from nepflow.hpc.slurm import SlurmScheduler
 from nepflow.logging import configure_logging
 from nepflow.config.loader import canonical_config_path
 from nepflow.reporting import WorkflowStatusPresenter, summarize_legacy_vasp_jobs
+from nepflow.stages.dft import DftStage
 from nepflow.workflow import (
     StageContext,
     StageRegistry,
@@ -90,7 +91,6 @@ def compose_stage_registry() -> StageRegistry:
     from modules import (
         GenerateStage,
         MemoryStage,
-        RunVaspStage,
         SelectStage,
         TrainNepStage,
         ValidateStage,
@@ -129,10 +129,10 @@ def compose_stage_registry() -> StageRegistry:
         WorkflowStage.SELECT,
         lambda context: SelectStage(**_legacy_stage_kwargs(context)).run(),
     )
-    registry.register(
-        WorkflowStage.RUN_VASP,
-        lambda context: RunVaspStage(**_legacy_stage_kwargs(context)).run(),
-    )
+    def run_dft(context: StageContext) -> StageRunResult:
+        return DftStage().run(context).as_workflow_result()
+
+    registry.register(WorkflowStage.RUN_VASP, run_dft)
     registry.register(
         WorkflowStage.TRAIN_NEP,
         lambda context: TrainNepStage(**_legacy_stage_kwargs(context)).run(),
@@ -163,8 +163,7 @@ def compose_stage_registry() -> StageRegistry:
 def _legacy_status_details(project_dir: Path, stage: WorkflowStage) -> dict:
     """Adapt legacy VASP status reporting to the package CLI presenter."""
 
-    # pylint: disable=import-error,import-outside-toplevel
-    from modules.run_vasp._common import read_status
+    from nepflow.dft.vasp.registry import read_status
 
     return summarize_legacy_vasp_jobs(project_dir, stage, read_status)
 

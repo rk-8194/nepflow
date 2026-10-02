@@ -13,7 +13,6 @@ pytest.importorskip("pymatgen")
 from ase import Atoms  # noqa: E402
 from ase.calculators.singlepoint import SinglePointCalculator  # noqa: E402
 
-from modules.run_vasp import _common as common
 from modules.train_nep import prepare as train_prepare
 from nepflow.errors import StateError
 from modules.train_nep import train_nep as train_stage_module
@@ -30,6 +29,7 @@ from nepflow.dft.vasp.outputs import (
     parse_outcar_result,
     parse_virial_from_outcar,
 )
+from nepflow.dft.vasp.registry import upsert_registry_entry
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -398,7 +398,7 @@ class TrainNepPrepareRegistryTests(unittest.TestCase):
             old_outcar = old_job / "OUTCAR"
             old_outcar.write_text("General timing\n", encoding="utf-8")
             self.assertFalse((old_job / ".vasp_identity").exists())
-            common.upsert_registry_entry(
+            upsert_registry_entry(
                 root,
                 current_incar_hash(),
                 hash_potcar_bytes(b"Si-potcar-v1"),
@@ -454,7 +454,7 @@ class TrainNepPrepareRegistryTests(unittest.TestCase):
                 (FIXTURES / "outcar" / "valid_outcar").read_text(encoding="utf-8"),
                 encoding="utf-8",
             )
-            common.upsert_registry_entry(
+            upsert_registry_entry(
                 root,
                 current_incar_hash(),
                 hash_potcar_bytes(b"Si-potcar-v1"),
@@ -489,7 +489,7 @@ class TrainNepPrepareRegistryTests(unittest.TestCase):
             old_job = root / "projects" / "project_old" / "vasp" / "jobs" / "train" / "struct_0002"
             old_job.mkdir(parents=True)
             (old_job / "OUTCAR").write_text("not complete\n", encoding="utf-8")
-            common.upsert_registry_entry(
+            upsert_registry_entry(
                 root,
                 current_incar_hash(),
                 hash_potcar_bytes(b"Si-potcar-v1"),

@@ -1,107 +1,85 @@
 import tempfile
-from configparser import ConfigParser
+from dataclasses import replace
 from pathlib import Path
-from unittest.mock import patch
 
 import pytest
 
 pytest.importorskip("ase")
 pytest.importorskip("pymatgen")
 
-from nepflow.config import render_default_config  # noqa: E402
-from modules.run_vasp import run_vasp as run_vasp_module  # noqa: E402
-from modules.run_vasp.run_vasp import RunVaspStage  # noqa: E402
+from nepflow.config import load_config, render_default_config  # noqa: E402
+from nepflow.state import StateStore  # noqa: E402
+from nepflow.stages.dft import DftStage  # noqa: E402
+from nepflow.stages.dft.orchestrator import DftPreparationResult  # noqa: E402
+from nepflow.workflow import StageContext  # noqa: E402
 
 
-def initialized_default_config(project_dir: Path) -> ConfigParser:
-    """Render the real config shape produced by initialization."""
+def initialized_config(project_dir: Path):
     rendered = render_default_config(
         "demo",
         {
             "materialsproject_api_key": "",
             "elements": "Si",
-            "gasElements": "",
+            "gas_elements": "",
             "crystal_structures": "diamond",
             "target_n_atoms": "64",
             "scp_address": "user@host:/srv/nepflow",
         },
     )
-    config = ConfigParser()
-    config.read_string(rendered)
-    return config
+    config_path = project_dir / "config" / "project.config"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(rendered, encoding="utf-8")
+    return load_config(config_path, project_name="demo")
 
 
-def make_stage(project_dir: Path) -> RunVaspStage:
-    return RunVaspStage(
+class SpyOrchestrator:
+    def __init__(self) -> None:
+        self.call = None
+
+    def prepare_calculations(self, **kwargs):
+        self.call = kwargs
+        return DftPreparationResult(())
+
+
+def make_context(project_dir: Path, config, state_store: StateStore) -> StageContext:
+    return StageContext(
         project_name="demo",
-        config_file=project_dir / "config" / "demo.ini",
-        state_file=project_dir / "state.db",
         project_dir=project_dir,
-        debug=False,
+        config_file=project_dir / "config" / "project.config",
+        state_file=project_dir / "state.db",
+        state_store=state_store,
+        workflow_state=None,
+        config=config,
     )
 
 
-def write_header(project_dir: Path) -> None:
-    header = project_dir / "config" / "slurm" / "header.slurm"
-    header.parent.mkdir(parents=True, exist_ok=True)
-    header.write_text("#!/bin/bash\n", encoding="utf-8")
-
-
-def test_initialized_hpc_command_is_handed_to_shared_vasp_script() -> None:
+def test_typed_dft_stage_delegates_hpc_command_without_legacy_stage() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         project_dir = Path(tmp) / "project_demo"
-        write_header(project_dir)
-        config = initialized_default_config(project_dir)
-        stage = make_stage(project_dir)
+        config = initialized_config(project_dir)
+        orchestrator = SpyOrchestrator()
 
-        with (
-            patch.object(stage, "_find_config_file", return_value=project_dir / "config" / "project.config"),
-            patch.object(stage, "_load_config", return_value=config),
-            patch.object(run_vasp_module, "prepare_jobs"),
-            patch.object(run_vasp_module, "write_shared_vasp_script") as write_script_mock,
-            patch.object(run_vasp_module, "run_launcher"),
-        ):
-            stage.run()
+        with StateStore(project_dir / "state.db") as state_store:
+            result = DftStage(orchestrator=orchestrator).run(
+                make_context(project_dir, config, state_store)
+            )
 
-        assert write_script_mock.call_args.args[2] == config["hpc"]["vasp_command"]
+        assert result.preparation.prepared_count == 0
+        assert orchestrator.call["config"].hpc.vasp_command == (
+            "mpirun -np {ntasks} vasp_std"
+        )
+        assert orchestrator.call["datasets"] == ("train", "test")
 
 
-def test_slurm_command_cannot_override_hpc_command() -> None:
+def test_blank_hpc_command_is_an_explicit_error() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         project_dir = Path(tmp) / "project_demo"
-        write_header(project_dir)
-        config = initialized_default_config(project_dir)
-        expected_command = config["hpc"]["vasp_command"]
-        config["slurm"]["vasp_command"] = "wrong-command --from-slurm"
-        stage = make_stage(project_dir)
+        config = initialized_config(project_dir)
+        config = replace(config, hpc=replace(config.hpc, vasp_command="   "))
+        orchestrator = SpyOrchestrator()
 
-        with (
-            patch.object(stage, "_find_config_file", return_value=project_dir / "config" / "project.config"),
-            patch.object(stage, "_load_config", return_value=config),
-            patch.object(run_vasp_module, "prepare_jobs"),
-            patch.object(run_vasp_module, "write_shared_vasp_script") as write_script_mock,
-            patch.object(run_vasp_module, "run_launcher"),
-        ):
-            stage.run()
-
-        assert write_script_mock.call_args.args[2] == expected_command
-        assert write_script_mock.call_args.args[2] != config["slurm"]["vasp_command"]
-
-
-@pytest.mark.parametrize("command", [None, "   "], ids=["missing", "blank"])
-def test_missing_or_blank_hpc_command_is_an_explicit_error(command: str | None) -> None:
-    with tempfile.TemporaryDirectory() as tmp:
-        project_dir = Path(tmp) / "project_demo"
-        config = initialized_default_config(project_dir)
-        if command is None:
-            config["hpc"].pop("vasp_command")
-        else:
-            config["hpc"]["vasp_command"] = command
-        stage = make_stage(project_dir)
-
-        with (
-            patch.object(stage, "_find_config_file", return_value=project_dir / "config" / "project.config"),
-            patch.object(stage, "_load_config", return_value=config),
-        ):
+        with StateStore(project_dir / "state.db") as state_store:
             with pytest.raises(ValueError, match="hpc\\.vasp_command"):
-                stage.run()
+                DftStage(orchestrator=orchestrator).run(
+                    make_context(project_dir, config, state_store)
+                )

@@ -39,7 +39,7 @@ from nepflow.dft.vasp.outputs import (
 from nepflow.errors import StateError
 from nepflow.io.json import write_json
 from nepflow.io.json import read_json_object
-from modules.run_vasp._common import (
+from nepflow.dft.vasp.registry import (
     get_nepflow_root,
     read_completed_registry,
     read_status,

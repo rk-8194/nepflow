@@ -44,6 +44,7 @@ class DftInputRequest:
     source_structure: Path
     working_directory: Path
     requirements: DftResultRequirements = field(default_factory=DftResultRequirements)
+    source_structure_index: int = 0
 
 
 @dataclass(frozen=True, slots=True)

@@ -21,7 +21,7 @@ from nepflow.dft.vasp.outputs import (
     resolve_verified_output,
 )
 
-from ..run_vasp._common import (
+from nepflow.dft.vasp.registry import (
     get_nepflow_root,
     get_registry_entry,
     read_completed_registry,
