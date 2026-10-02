@@ -1,8 +1,6 @@
-"""Structure generation stage module."""
+"""Legacy scientific generator implementations used by the CLI composition root."""
 
-from .generate import GenerateStage
 from .generators import (
-    CompositionGrid,
     MaterialsProjectGenerator,
     PerturbationEngine,
     RandomSolidSolutionGenerator,
@@ -11,8 +9,6 @@ from .generators import (
 )
 
 __all__ = [
-    "GenerateStage",
-    "CompositionGrid",
     "MaterialsProjectGenerator",
     "RandomSolidSolutionGenerator",
     "SQSGenerator",

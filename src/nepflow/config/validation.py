@@ -117,6 +117,22 @@ def validate_config(
         )
     if not 0.0 < config.composition.composition_step <= 1.0:
         raise ConfigurationError("composition.composition_step must be in (0, 1]")
+    composition_steps = round(1.0 / config.composition.composition_step)
+    if composition_steps < 1 or not math.isclose(
+        composition_steps * config.composition.composition_step,
+        1.0,
+        rel_tol=1.0e-9,
+        abs_tol=1.0e-9,
+    ):
+        raise ConfigurationError(
+            "composition.composition_step must divide the unit interval exactly"
+        )
+    if len(config.composition.elements) > 3:
+        raise ConfigurationError(
+            "generation supports unary, binary, and ternary compositions only"
+        )
+    if set(config.composition.elements) & set(config.composition.gas_elements):
+        raise ConfigurationError("composition.elements and gas_elements must be disjoint")
 
     unknown_structures = set(config.generation.crystal_structures) - ALLOWED_CRYSTAL_STRUCTURES
     if unknown_structures:

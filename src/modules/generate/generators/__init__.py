@@ -1,6 +1,5 @@
 """Generator implementations for the structure-generation stage."""
 
-from .composition import CompositionGrid
 from .configurational import (
     MaterialsProjectGenerator,
     RandomSolidSolutionGenerator,
@@ -11,7 +10,6 @@ from .materials_project import MaterialsProjectFetcher, get_materials_project_fe
 from .structure_generation import PerturbationEngine
 
 __all__ = [
-    "CompositionGrid",
     "MaterialsProjectFetcher",
     "MaterialsProjectGenerator",
     "PerturbationEngine",

@@ -54,6 +54,8 @@ from nepflow.logging import configure_logging
 from nepflow.config.loader import canonical_config_path
 from nepflow.reporting import WorkflowStatusPresenter, summarize_legacy_vasp_jobs
 from nepflow.stages.dft import DftStage
+from nepflow.stages.generation import GenerationStage
+from nepflow.stages.generation.debug import run_debug
 from nepflow.workflow import (
     StageContext,
     StageRegistry,
@@ -82,14 +84,154 @@ def _legacy_stage_kwargs(context: StageContext) -> dict:
     }
 
 
+def _build_generation_stage(context: StageContext) -> GenerationStage:
+    """Compose legacy scientific generators behind the canonical stage seam."""
+
+    config = context.config
+    if config is None:
+        raise ValidationError("Generation requires the validated typed project config")
+
+    if context.debug:
+        return GenerationStage(
+            generators=(),
+            coordinator=None,
+            state_store=context.state_store,
+            debug_runner=run_debug,
+            logger=logger,
+        )
+
+    # These imports are deliberately limited to the application composition
+    # root.  GenerationStage itself owns only orchestration and provenance.
+    from modules.generate.generators.configurational import (
+        MaterialsProjectGenerator,
+        RandomSolidSolutionGenerator,
+        SQSGenerator,
+        SegregatedGenerator,
+    )
+    from modules.generate.generators.materials_project import (
+        get_materials_project_fetcher,
+    )
+    from modules.generate.generators.structure_generation import PerturbationEngine
+
+    composition = config.composition
+    generation = config.generation
+    configured_generators = []
+    if generation.use_materials_project:
+        try:
+            fetcher = get_materials_project_fetcher(
+                {"materialsproject": {"api_key": config.materials_project.api_key}}
+            )
+            configured_generators.append(
+                (
+                    "MaterialsProject",
+                    MaterialsProjectGenerator(
+                        fetcher,
+                        max_per_composition=5,
+                        gas_elements=list(composition.gas_elements),
+                    ),
+                )
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "Cannot initialise the enabled Materials Project generator"
+            ) from exc
+
+    if generation.use_random_solid_solution:
+        configured_generators.append(
+            (
+                "RandomSolidSolution",
+                RandomSolidSolutionGenerator(
+                    n_structures=generation.n_random_solid_solution,
+                    random_seed=config.project.random_seed,
+                ),
+            )
+        )
+    if generation.use_sqs:
+        configured_generators.append(
+            (
+                "SQS",
+                SQSGenerator(
+                    n_structures=generation.n_sqs,
+                    random_seed=config.project.random_seed,
+                ),
+            )
+        )
+    if generation.use_segregated:
+        configured_generators.append(
+            (
+                "Segregated",
+                SegregatedGenerator(
+                    n_structures=generation.n_segregated,
+                    random_seed=config.project.random_seed,
+                ),
+            )
+        )
+
+    coordinator = None
+    if not context.debug:
+        coordinator = PerturbationEngine(
+            rattle_std=generation.rattle_std,
+            rattle_std_min=generation.rattle_std_min,
+            rattle_std_max=generation.rattle_std_max,
+            rattle_d_min=generation.rattle_d_min,
+            vacancy_range=(generation.vacancy_min, generation.vacancy_max),
+            interstitial_range=(generation.interstitial_min, generation.interstitial_max),
+            interstitial_d_min=generation.interstitial_d_min,
+            volume_scale_range=(generation.volume_scale_min, generation.volume_scale_max),
+            n_volume_points=generation.n_volume_points,
+            target_n_atoms=generation.target_n_atoms,
+            random_seed=config.project.random_seed,
+            gas_elements=list(composition.gas_elements),
+            gas_interstitial_d_min=generation.gas_interstitial_d_min,
+            max_gas_occupancy=generation.max_gas_occupancy,
+            elastic_stress_enabled=generation.elastic_stress_enabled,
+            elastic_strain_amplitudes=list(generation.elastic_strain_amplitudes),
+            liquid_enabled=generation.use_liquid,
+            liquid_temperature_k=generation.liquid_temperature,
+            liquid_timestep_fs=generation.liquid_timestep_fs,
+            liquid_equilibration_steps=generation.liquid_equilibration_steps,
+            liquid_steps_between_snapshots=generation.liquid_steps_between_snapshots,
+            liquid_friction=generation.liquid_friction,
+        )
+
+    return GenerationStage(
+        generators=configured_generators,
+        coordinator=coordinator,
+        state_store=context.state_store,
+        debug_runner=run_debug,
+        logger=logger,
+    )
+
+
+def _offer_project_upload(context: StageContext) -> None:
+    """Offer the local seeds-only result to the configured remote project."""
+
+    config = context.config
+    scp_address = "" if config is None else config.hpc.scp_address
+    if not scp_address:
+        return
+    answer = input("Upload project to remote NEPFlow folder? [y/N]: ").strip().lower()
+    if answer not in {"y", "yes"}:
+        return
+    process_runner.run(
+        [
+            "scp",
+            "-r",
+            str(context.project_dir),
+            f"{scp_address}/projects/{context.project_dir.name}",
+        ],
+        check=True,
+        capture_output=False,
+    )
+
+
 def compose_stage_registry() -> StageRegistry:
     """Compose legacy stage implementations behind the canonical seam."""
 
-    # These imports are intentionally confined to the composition root while
-    # the legacy stage implementations are migrated into the package.
+    # These imports remain confined to the composition root for stages that
+    # have not yet moved into the canonical package.
     # pylint: disable=import-error,import-outside-toplevel
     from modules import (
-        GenerateStage,
         SelectStage,
         TrainNepStage,
         ValidateStage,
@@ -118,12 +260,20 @@ def compose_stage_registry() -> StageRegistry:
         WorkflowStage.INIT,
         run_initialization,
     )
-    registry.register(
-        WorkflowStage.GENERATE,
-        lambda context: GenerateStage(**_legacy_stage_kwargs(context)).run(
-            seeds_only=context.seeds_only
-        ),
-    )
+
+    def run_generation(context: StageContext) -> StageRunResult:
+        result = _build_generation_stage(context).run(context)
+        if context.seeds_only and result.base_structures:
+            _offer_project_upload(context)
+        return StageRunResult(
+            stage=WorkflowStage.GENERATE,
+            status=StageRunState.COMPLETED,
+            advanced_to=WorkflowStage.SELECT,
+            completed=result.completed,
+            message=result.status,
+        )
+
+    registry.register(WorkflowStage.GENERATE, run_generation)
     registry.register(
         WorkflowStage.SELECT,
         lambda context: SelectStage(**_legacy_stage_kwargs(context)).run(),
