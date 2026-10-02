@@ -15,6 +15,7 @@ from nepflow.domain.structures import GeneratedStructureRecord, StructureProvena
 from nepflow.workflow.controller import StageContext
 
 from .generators.composition import CompositionGrid
+from .generators.base import ConfigurationalGenerator
 from .models import GenerationManifest, GenerationRequest, GenerationResult
 from .provenance import (
     annotate_base_structures,
@@ -22,15 +23,6 @@ from .provenance import (
     deduplicate_base_structures,
 )
 from .validation import validate_composition_config, validate_generation_config
-
-
-class ConfigurationalGenerator(Protocol):
-    def generate(
-        self,
-        composition: Mapping[str, float],
-        crystal_structures: Sequence[str],
-        target_n_atoms: int,
-    ) -> list[Any]: ...
 
 
 class PerturbationCoordinator(Protocol):

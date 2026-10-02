@@ -12,7 +12,9 @@ from pathlib import Path
 # Add src to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from modules.generate.generators.materials_project import get_materials_project_fetcher
+from nepflow.stages.generation.generators.materials_project import (
+    build_materials_project_fetcher,
+)
 from nepflow.config.loader import load_config
 
 logging.basicConfig(level=logging.INFO)
@@ -39,8 +41,8 @@ def main():
 
     # Create fetcher
     try:
-        fetcher = get_materials_project_fetcher(
-            {"materialsproject": {"api_key": config.materials_project.api_key}}
+        fetcher = build_materials_project_fetcher(
+            api_key=config.materials_project.api_key,
         )
     except ValueError as e:
         logger.error(f"Failed to initialize fetcher: {e}")

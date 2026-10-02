@@ -1,17 +1,5 @@
-"""Legacy scientific generator implementations used by the CLI composition root."""
+"""Remaining legacy perturbation implementation used by the CLI composition root."""
 
-from .generators import (
-    MaterialsProjectGenerator,
-    PerturbationEngine,
-    RandomSolidSolutionGenerator,
-    SQSGenerator,
-    SegregatedGenerator,
-)
+from .generators import PerturbationEngine
 
-__all__ = [
-    "MaterialsProjectGenerator",
-    "RandomSolidSolutionGenerator",
-    "SQSGenerator",
-    "SegregatedGenerator",
-    "PerturbationEngine",
-]
+__all__ = ["PerturbationEngine"]

@@ -11,7 +11,14 @@ pytest.importorskip("ase")
 pytest.importorskip("pymatgen")
 from ase import Atoms  # noqa: E402
 
-from modules.generate.generators import configurational as configurational_module  # noqa: E402
+from nepflow.stages.generation.generators.composition_primitives import (  # noqa: E402
+    allocate_crystal_quota,
+)
+from nepflow.stages.generation.generators.random_solution import (  # noqa: E402
+    RandomSolidSolutionGenerator,
+)
+from nepflow.stages.generation.generators.segregated import SegregatedGenerator  # noqa: E402
+from nepflow.stages.generation.generators.sqs import SQSGenerator  # noqa: E402
 
 
 def make_atoms(symbols: str = "Si4") -> Atoms:
@@ -42,32 +49,32 @@ class ConfigurationalGeneratorTests(unittest.TestCase):
 
     def test_crystal_quota_allocation_balances_in_configured_order(self) -> None:
         self.assertEqual(
-            configurational_module._allocate_crystal_quota(5, ["bcc", "fcc"]),
+            allocate_crystal_quota(5, ["bcc", "fcc"]),
             [("bcc", 3), ("fcc", 2)],
         )
 
     def test_crystal_quota_allocation_gives_remainder_to_first_crystal(self) -> None:
         self.assertEqual(
-            configurational_module._allocate_crystal_quota(1, ["bcc", "fcc"]),
+            allocate_crystal_quota(1, ["bcc", "fcc"]),
             [("bcc", 1), ("fcc", 0)],
         )
 
     def test_crystal_quota_allocation_zero_has_no_outputs(self) -> None:
         self.assertEqual(
-            configurational_module._allocate_crystal_quota(0, ["bcc", "fcc"]),
+            allocate_crystal_quota(0, ["bcc", "fcc"]),
             [("bcc", 0), ("fcc", 0)],
         )
 
     def test_crystal_quota_allocation_rejects_invalid_crystal_inputs(self) -> None:
         with self.assertRaisesRegex(ValueError, "duplicate"):
-            configurational_module._allocate_crystal_quota(4, ["bcc", "bcc"])
+            allocate_crystal_quota(4, ["bcc", "bcc"])
         with self.assertRaisesRegex(ValueError, "at least one"):
-            configurational_module._allocate_crystal_quota(1, [])
+            allocate_crystal_quota(1, [])
         with self.assertRaisesRegex(ValueError, "non-negative"):
-            configurational_module._allocate_crystal_quota(-1, ["bcc"])
+            allocate_crystal_quota(-1, ["bcc"])
 
     def test_random_solution_reversed_crystal_order_uses_ordered_remainder(self) -> None:
-        results = configurational_module.RandomSolidSolutionGenerator(
+        results = RandomSolidSolutionGenerator(
             n_structures=3,
             random_seed=7,
         ).generate(self.composition, ["fcc", "bcc"], target_n_atoms=8)
@@ -78,11 +85,11 @@ class ConfigurationalGeneratorTests(unittest.TestCase):
         )
 
     def test_random_solution_quota_is_per_composition_and_deterministic(self) -> None:
-        first = configurational_module.RandomSolidSolutionGenerator(
+        first = RandomSolidSolutionGenerator(
             n_structures=4,
             random_seed=7,
         ).generate(self.composition, self.crystal_structures, target_n_atoms=8)
-        second = configurational_module.RandomSolidSolutionGenerator(
+        second = RandomSolidSolutionGenerator(
             n_structures=4,
             random_seed=7,
         ).generate(self.composition, self.crystal_structures, target_n_atoms=8)
@@ -94,11 +101,11 @@ class ConfigurationalGeneratorTests(unittest.TestCase):
         )
 
     def test_random_solution_different_seeds_change_assignment(self) -> None:
-        first = configurational_module.RandomSolidSolutionGenerator(
+        first = RandomSolidSolutionGenerator(
             n_structures=1,
             random_seed=7,
         ).generate(self.composition, ["bcc"], target_n_atoms=16)
-        second = configurational_module.RandomSolidSolutionGenerator(
+        second = RandomSolidSolutionGenerator(
             n_structures=1,
             random_seed=8,
         ).generate(self.composition, ["bcc"], target_n_atoms=16)
@@ -109,11 +116,11 @@ class ConfigurationalGeneratorTests(unittest.TestCase):
         )
 
     def test_random_solution_same_seed_repeats_assignment_independently_of_quota(self) -> None:
-        first = configurational_module.RandomSolidSolutionGenerator(
+        first = RandomSolidSolutionGenerator(
             n_structures=2,
             random_seed=17,
         ).generate(self.composition, ["bcc"], target_n_atoms=16)
-        second = configurational_module.RandomSolidSolutionGenerator(
+        second = RandomSolidSolutionGenerator(
             n_structures=2,
             random_seed=17,
         ).generate(self.composition, ["bcc"], target_n_atoms=16)
@@ -124,11 +131,11 @@ class ConfigurationalGeneratorTests(unittest.TestCase):
         )
 
     def test_segregated_quota_is_per_composition_and_deterministic(self) -> None:
-        first = configurational_module.SegregatedGenerator(
+        first = SegregatedGenerator(
             n_structures=4,
             random_seed=7,
         ).generate(self.composition, self.crystal_structures, target_n_atoms=8)
-        second = configurational_module.SegregatedGenerator(
+        second = SegregatedGenerator(
             n_structures=4,
             random_seed=7,
         ).generate(self.composition, self.crystal_structures, target_n_atoms=8)
@@ -155,11 +162,11 @@ class ConfigurationalGeneratorTests(unittest.TestCase):
                 "icet.tools.structure_generation": fake_structure_generation,
             },
         ):
-            first = configurational_module.SQSGenerator(
+            first = SQSGenerator(
                 n_structures=4,
                 random_seed=7,
             ).generate(self.composition, self.crystal_structures, target_n_atoms=8)
-            second = configurational_module.SQSGenerator(
+            second = SQSGenerator(
                 n_structures=4,
                 random_seed=7,
             ).generate(self.composition, self.crystal_structures, target_n_atoms=8)
@@ -187,7 +194,7 @@ class ConfigurationalGeneratorTests(unittest.TestCase):
                 "icet.tools.structure_generation": fake_structure_generation,
             },
         ):
-            results = configurational_module.SQSGenerator(
+            results = SQSGenerator(
                 n_structures=1,
                 random_seed=7,
             ).generate(self.composition, ["bcc"], target_n_atoms=8)
@@ -225,7 +232,7 @@ class ConfigurationalGeneratorTests(unittest.TestCase):
                 RuntimeError,
                 "composition.*crystal structure.*fcc.*primary SQS generation unavailable",
             ):
-                configurational_module.SQSGenerator(
+                SQSGenerator(
                     n_structures=2,
                     random_seed=7,
                 ).generate(self.composition, self.crystal_structures, target_n_atoms=8)
@@ -233,7 +240,7 @@ class ConfigurationalGeneratorTests(unittest.TestCase):
         self.assertEqual(calls, [7, 8])
 
     def test_unary_sqs_returns_empty_without_importing_icet(self) -> None:
-        generator = configurational_module.SQSGenerator(n_structures=1, random_seed=7)
+        generator = SQSGenerator(n_structures=1, random_seed=7)
 
         with patch.dict(sys.modules, {"icet": None}):
             self.assertEqual(
@@ -263,7 +270,7 @@ class ConfigurationalGeneratorTests(unittest.TestCase):
                 "icet.tools.structure_generation": fake_structure_generation,
             },
         ):
-            generator = configurational_module.SQSGenerator(
+            generator = SQSGenerator(
                 n_structures=1,
                 random_seed=7,
             )
@@ -271,7 +278,7 @@ class ConfigurationalGeneratorTests(unittest.TestCase):
                 generator.generate(self.composition, ["bcc"], target_n_atoms=8)
 
     def test_sqs_generate_fails_fast_when_icet_is_unavailable(self) -> None:
-        generator = configurational_module.SQSGenerator(n_structures=1, random_seed=7)
+        generator = SQSGenerator(n_structures=1, random_seed=7)
 
         with patch.dict(sys.modules, {"icet": None}):
             with self.assertRaises((ImportError, RuntimeError)):

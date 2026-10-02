@@ -39,9 +39,8 @@ if _missing:
     )
     sys.exit(1)
 
-# Temporary Phase 4 composition bridge: legacy stage modules still live
-# directly under src/. Keep this compatibility path at the composition root;
-# the canonical workflow package remains independent of it.
+# The remaining legacy perturbation engine is kept behind this composition
+# root until its dedicated migration; generation ownership is canonical.
 _SOURCE_ROOT = Path(__file__).resolve().parents[1]
 if (_SOURCE_ROOT / "modules").is_dir() and str(_SOURCE_ROOT) not in sys.path:
     sys.path.insert(0, str(_SOURCE_ROOT))
@@ -100,17 +99,16 @@ def _build_generation_stage(context: StageContext) -> GenerationStage:
             logger=logger,
         )
 
-    # These imports are deliberately limited to the application composition
-    # root.  GenerationStage itself owns only orchestration and provenance.
-    from modules.generate.generators.configurational import (
+    # These imports stay at the application composition root.  GenerationStage
+    # itself owns only orchestration and provenance.
+    from nepflow.stages.generation.generators import (
         MaterialsProjectGenerator,
         RandomSolidSolutionGenerator,
         SQSGenerator,
         SegregatedGenerator,
+        build_materials_project_fetcher,
     )
-    from modules.generate.generators.materials_project import (
-        get_materials_project_fetcher,
-    )
+    # Perturbation migration is intentionally deferred to its own issue.
     from modules.generate.generators.structure_generation import PerturbationEngine
 
     composition = config.composition
@@ -118,8 +116,8 @@ def _build_generation_stage(context: StageContext) -> GenerationStage:
     configured_generators = []
     if generation.use_materials_project:
         try:
-            fetcher = get_materials_project_fetcher(
-                {"materialsproject": {"api_key": config.materials_project.api_key}}
+            fetcher = build_materials_project_fetcher(
+                api_key=config.materials_project.api_key,
             )
             configured_generators.append(
                 (
