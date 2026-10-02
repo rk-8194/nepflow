@@ -1,11 +1,16 @@
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 
 from nepflow.errors import StateError
 from nepflow.state import StateStore
-from nepflow.workflow import WorkflowController, WorkflowStage
+from nepflow.workflow import (
+    StageRunResult,
+    StageRunState,
+    WorkflowController,
+    WorkflowStage,
+)
 
 
 VALID_PROJECT_CONFIG = """
@@ -164,9 +169,23 @@ def test_completion_persists_terminal_status_and_skips_validation(
     assert latest is not None and latest["stage"] == "completed"
     assert controller.project_file.read_text(encoding="utf-8") == "completed"
 
-    with patch.object(controller, "_validate") as validate_mock:
+    validation_handler = Mock(
+        return_value=StageRunResult(
+            stage=WorkflowStage.VALIDATE,
+            status=StageRunState.COMPLETED,
+            advanced_to=WorkflowStage.COMPLETED,
+            completed=True,
+        )
+    )
+    controller.stage_registry.register(WorkflowStage.VALIDATE, validation_handler)
+    with patch.object(
+        controller.stage_registry,
+        "execute",
+        wraps=controller.stage_registry.execute,
+    ) as execute_mock:
         controller.run()
-    validate_mock.assert_not_called()
+    execute_mock.assert_not_called()
+    validation_handler.assert_not_called()
 
 
 def test_completed_controller_rerun_stays_terminal(tmp_path: Path) -> None:
