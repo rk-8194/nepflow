@@ -21,8 +21,8 @@ from modules import (
 from modules.validate.launcher import read_validation_status
 from modules.run_vasp._common import read_status
 from nepflow.io.atomic import atomic_write_text
-from nepflow.config import canonical_config_path
-from nepflow.errors import StateError
+from nepflow.config import canonical_config_path, load_config
+from nepflow.errors import ConfigurationError, StateError
 from nepflow.state import StateStore
 from nepflow.workflow.resubmission import (
     ReconciliationResult,
@@ -100,14 +100,9 @@ class WorkflowController:
         # the first authoritative write, so do not create/populate state.db
         # before InitStage has validated and installed the canonical config.
         self._state_store = None
+        self._startup_validated = False
         if not self.init_mode:
-            self._state_store = StateStore(self.state_file)
-            if self._state_store.get_project(self.project_name) is None:
-                self._state_store.upsert_project(
-                    self.project_name,
-                    name=self.project_name,
-                    root_path=str(self.project_dir),
-                )
+            self._validate_project_foundations()
         
         logger.info("Initialized controller for project: %s", project_name)
         if self.debug:
@@ -126,6 +121,52 @@ class WorkflowController:
         if self.debug and self.slurm_deadline:
             logger.info("[DEBUG] Triggering deadline immediately to test self-resubmit path")
             self.slurm_deadline = time.time() - 1  # Already past deadline
+
+    def _validate_project_foundations(self) -> None:
+        """Validate initialized project foundations without manufacturing state."""
+        config_path = canonical_config_path(self.project_dir)
+        if not config_path.is_file():
+            raise ConfigurationError(
+                f"Canonical project configuration is missing: {config_path}; "
+                f"run --init for a new project or perform an explicit migration"
+            )
+
+        config = load_config(config_path, project_name=self.project_name)
+        if config.project.name != self.project_name:
+            raise ConfigurationError(
+                "Project config name does not match the requested project: "
+                f"{config.project.name!r} != {self.project_name!r}"
+            )
+
+        if not self.state_file.exists():
+            raise StateError(
+                f"Authoritative state database is missing: {self.state_file}; "
+                "run --init only for a new project or restore state.db through an "
+                "explicit migration"
+            )
+
+        store = StateStore(self.state_file)
+        try:
+            if store.get_project(self.project_name) is None:
+                raise StateError(
+                    f"Authoritative state.db has no project record for "
+                    f"{self.project_name!r}; perform an explicit state migration"
+                )
+
+            latest = store.get_latest_stage_run(self.project_name)
+            if latest is not None:
+                StageRunStatus.from_mapping(latest)
+            elif not self.project_file.exists():
+                raise StateError(
+                    "Authoritative state.db has no stage history and no legacy "
+                    ".project marker; perform an explicit state migration"
+                )
+        except BaseException:
+            store.close()
+            raise
+
+        self._state_store = store
+        self._startup_validated = True
     
     def _check_deadline(self) -> None:
         """
@@ -296,21 +337,12 @@ class WorkflowController:
                 changed=True,
             )
 
-        # A brand-new project has a typed initial state.  There is no
-        # arbitrary-string fallback and no reconstruction from directories.
-        now = self._timestamp()
-        with self._state_store.transaction():
-            self._record_stage(
-                WorkflowStage.INIT,
-                status=StageRunState.RUNNING,
-                started_at=now,
-                metadata={"source": "initial_state"},
-            )
-        return ReconciliationResult(
-            stage=WorkflowStage.INIT,
-            source="initial_state",
-            authoritative_stage=WorkflowStage.INIT,
-            changed=True,
+        # A missing ledger stage is only recoverable through the explicit
+        # legacy-marker import above. Never fabricate INIT during normal
+        # workflow startup.
+        raise StateError(
+            "Authoritative workflow state is missing; restore the stage ledger "
+            "or perform an explicit migration"
         )
 
     def _determine_current_stage(self) -> WorkflowStage:
@@ -464,8 +496,9 @@ class WorkflowController:
         Returns:
             True if project is initialized, False otherwise
         """
-        # Project is considered initialized if config directory exists
-        return self.config_dir.exists()
+        # Constructor/startup validation is the single owner of foundation
+        # checks; this remains a thin guard for the init-mode bridge.
+        return self._startup_validated
     
     def _run_local(self) -> None:
         """
@@ -612,7 +645,7 @@ class WorkflowController:
         if self.init_mode:
             logger.info("Running in init mode - initializing project only")
             self._initialize()
-            self._state_store = StateStore(self.state_file)
+            self._validate_project_foundations()
             current = self._determine_current_stage()
             if current is WorkflowStage.INIT:
                 self._set_current_stage(WorkflowStage.GENERATE)

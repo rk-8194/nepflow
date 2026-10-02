@@ -152,28 +152,37 @@ class InitStage(Stage):
         """Execute initialization."""
         logger.info("Initializing project")
 
-        # Validate an existing ledger before creating or interpreting any
-        # project files.  StateStore owns schema creation and corruption
-        # detection; InitStage only supplies the initialization record.
-        if self.state_file.exists():
-            self._validate_existing_state()
-
-        self._create_directories()
-
         config_path = canonical_config_path(self.project_dir)
+        state_was_present = self.state_file.exists()
         config_was_present = config_path.is_file()
-        config = self._setup_config()
         try:
-            self._initialize_state(config)
+            # Validate an existing ledger before creating or interpreting any
+            # project files.  StateStore owns schema creation and corruption
+            # detection; InitStage only supplies the initialization record.
+            if state_was_present:
+                self._validate_existing_state()
+
+            if config_was_present and not state_was_present:
+                raise StateError(
+                    "Canonical project config exists but authoritative state.db is missing; "
+                    "refusing to fabricate workflow state. Restore state.db or perform an "
+                    "explicit migration"
+                )
+
+            self._create_directories()
+            config = self._setup_config()
+            self._initialize_state(config, state_was_present=state_was_present)
         except BaseException:
-            # A newly rendered config is not useful without its authoritative
-            # ledger.  Remove only the file created by this invocation; an
-            # existing config is never destroyed during failed initialization.
+            # A newly rendered config or ledger is not useful without the
+            # other authoritative foundation. Remove only artifacts created
+            # by this invocation; existing project state is never destroyed.
             if not config_was_present:
                 try:
                     config_path.unlink(missing_ok=True)
                 except OSError:
                     logger.warning("Could not remove failed initialization config: %s", config_path)
+            if not state_was_present:
+                self._remove_new_state_database()
             raise
 
         logger.info("Project initialization complete")
@@ -186,6 +195,18 @@ class InitStage(Stage):
                     "Existing project state uses an unsupported schema version: "
                     f"{store.schema_version}"
                 )
+
+    def _remove_new_state_database(self) -> None:
+        """Remove a ledger and SQLite sidecars created by this attempt."""
+        for path in (
+            self.state_file,
+            Path(f"{self.state_file}-wal"),
+            Path(f"{self.state_file}-shm"),
+        ):
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                logger.warning("Could not remove failed initialization state: %s", path)
     
     def _create_directories(self) -> None:
         """Create project directory structure."""
@@ -290,7 +311,12 @@ class InitStage(Stage):
                 f"{config.project.name!r} != {self.project_name!r}"
             )
 
-    def _initialize_state(self, config: NepflowConfig) -> None:
+    def _initialize_state(
+        self,
+        config: NepflowConfig,
+        *,
+        state_was_present: bool,
+    ) -> None:
         """Record project and initial workflow state through StateStore APIs."""
         config_fingerprint = sha256_canonical_json(
             config.effective_mapping(redact_secrets=True)
@@ -335,15 +361,31 @@ class InitStage(Stage):
                     StageRunStatus.from_mapping(latest)
                     return
 
+                if (self.project_dir / ".project").is_file():
+                    # The controller owns the supported #43 one-time import
+                    # from a legacy marker. Do not synthesize INIT here and
+                    # allow it to overwrite that evidence.
+                    return
+
+                raise StateError(
+                    "Existing state.db has project metadata but no stage history; "
+                    "restore the stage ledger or perform an explicit migration"
+                )
+
+            if state_was_present:
+                raise StateError(
+                    "Existing state.db has no project record for "
+                    f"{self.project_name!r}; perform an explicit state migration"
+                )
+
             with store.transaction():
-                if existing is None:
-                    store.upsert_project(
-                        self.project_name,
-                        name=config.project.name,
-                        root_path=project_root,
-                        config_fingerprint=config_fingerprint,
-                        metadata=metadata,
-                    )
+                store.upsert_project(
+                    self.project_name,
+                    name=config.project.name,
+                    root_path=project_root,
+                    config_fingerprint=config_fingerprint,
+                    metadata=metadata,
+                )
                 store.upsert_stage_run(
                     f"{self.project_name}:{WorkflowStage.INIT.value}",
                     self.project_name,

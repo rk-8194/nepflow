@@ -9,12 +9,84 @@ from nepflow.workflow.stages import WorkflowStage
 from workflow import WorkflowController
 
 
+VALID_PROJECT_CONFIG = """
+[project]
+name=demo
+schema_version=1
+
+[composition]
+elements=W
+composition_step=0.125
+
+[generation]
+crystal_structures=bcc
+target_n_atoms=64
+
+[hpc]
+vasp_command=vasp_std
+""".strip() + "\n"
+
+
+def write_valid_config(project_dir: Path) -> None:
+    config_path = project_dir / "config" / "project.config"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(VALID_PROJECT_CONFIG, encoding="utf-8")
+
+
 def make_controller(tmp_path: Path, marker: str | None = None) -> WorkflowController:
     project_dir = tmp_path / "outputs" / "project_demo"
-    (project_dir / "config").mkdir(parents=True)
+    write_valid_config(project_dir)
     if marker is not None:
         (project_dir / ".project").write_text(marker, encoding="utf-8")
+    with StateStore(project_dir / "state.db") as store:
+        store.upsert_project(
+            "demo",
+            name="demo",
+            root_path=str(project_dir),
+        )
     return WorkflowController("demo", tmp_path / "outputs")
+
+
+def test_normal_startup_with_config_but_no_state_fails_without_creating_state(
+    tmp_path: Path,
+) -> None:
+    project_dir = tmp_path / "outputs" / "project_demo"
+    write_valid_config(project_dir)
+
+    with pytest.raises(StateError, match="state database is missing"):
+        WorkflowController("demo", tmp_path / "outputs")
+
+    assert not (project_dir / "state.db").exists()
+
+
+def test_normal_startup_with_state_but_no_project_fails_without_inserting_one(
+    tmp_path: Path,
+) -> None:
+    project_dir = tmp_path / "outputs" / "project_demo"
+    write_valid_config(project_dir)
+    state_path = project_dir / "state.db"
+    with StateStore(state_path):
+        pass
+
+    with pytest.raises(StateError, match="no project record"):
+        WorkflowController("demo", tmp_path / "outputs")
+
+    with StateStore(state_path) as store:
+        assert store.get_project("demo") is None
+
+
+def test_normal_startup_with_corrupt_state_fails_without_replacing_it(
+    tmp_path: Path,
+) -> None:
+    project_dir = tmp_path / "outputs" / "project_demo"
+    write_valid_config(project_dir)
+    state_path = project_dir / "state.db"
+    state_path.write_bytes(b"not a sqlite database")
+
+    with pytest.raises(StateError, match="state database"):
+        WorkflowController("demo", tmp_path / "outputs")
+
+    assert state_path.read_bytes() == b"not a sqlite database"
 
 
 def test_controller_persists_reconciled_stage_run(tmp_path: Path) -> None:

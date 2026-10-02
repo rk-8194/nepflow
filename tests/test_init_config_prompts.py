@@ -25,6 +25,24 @@ class InitConfigPromptTests(unittest.TestCase):
             project_dir=project_dir,
         )
 
+    def _valid_config_text(self, stage: InitStage) -> str:
+        return stage._render_default_config(
+            {
+                "materialsproject_api_key": "",
+                "elements": "W",
+                "gas_elements": "",
+                "crystal_structures": "bcc",
+                "target_n_atoms": "128",
+                "scp_address": "",
+            }
+        )
+
+    def _install_valid_config(self, stage: InitStage) -> Path:
+        config_path = stage.project_dir / "config" / "project.config"
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(self._valid_config_text(stage), encoding="utf-8")
+        return config_path
+
     def test_setup_config_prompts_for_materials_project_api_key(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_dir = Path(tmp)
@@ -204,7 +222,9 @@ class InitConfigPromptTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             project_dir = Path(tmp)
             stage = self._make_stage(project_dir)
-            invalid_config = "[project]\nname=demo\nschema_version=999\n"
+            invalid_config = self._valid_config_text(stage).replace(
+                "schema_version=1", "schema_version=999", 1
+            )
 
             with patch.object(stage, "_render_default_config", return_value=invalid_config):
                 with pytest.raises(ConfigurationError, match="schema_version"):
@@ -232,15 +252,22 @@ class InitConfigPromptTests(unittest.TestCase):
                     ):
                         stage.run()
 
+            assert not (project_dir / "config" / "project.config").exists()
+            assert not (project_dir / "state.db").exists()
+
+            with patch.dict(os.environ, {}, clear=True), patch(
+                "modules.init.init.input", side_effect=["", "W", "", "BCC", "", ""]
+            ):
+                stage.run()
+
             with StateStore(project_dir / "state.db") as store:
-                assert store.get_project("demo") is None
-                assert store.get_stage_run("demo:init") is None
+                assert store.get_project("demo") is not None
+                assert store.get_stage_run("demo:init") is not None
 
     def test_corrupt_existing_state_fails_without_replacing_it(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_dir = Path(tmp)
             state_path = project_dir / "state.db"
-            state_path.parent.mkdir(parents=True)
             state_path.write_bytes(b"not a sqlite database")
             stage = self._make_stage(project_dir)
 
@@ -252,7 +279,6 @@ class InitConfigPromptTests(unittest.TestCase):
     def test_existing_state_without_config_requires_explicit_repair(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_dir = Path(tmp)
-            project_dir.mkdir(parents=True, exist_ok=True)
             with StateStore(project_dir / "state.db"):
                 pass
 
@@ -262,11 +288,55 @@ class InitConfigPromptTests(unittest.TestCase):
     def test_legacy_marker_requires_explicit_migration(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_dir = Path(tmp)
-            project_dir.mkdir(parents=True, exist_ok=True)
             (project_dir / ".project").write_text("generate", encoding="utf-8")
 
             with pytest.raises(StateError, match="explicit migration"):
                 self._make_stage(project_dir).run()
+
+    def test_existing_config_without_state_requires_explicit_repair(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_dir = Path(tmp)
+            stage = self._make_stage(project_dir)
+            self._install_valid_config(stage)
+
+            with pytest.raises(StateError, match="state.db is missing"):
+                stage.run()
+
+            assert not (project_dir / "state.db").exists()
+
+    def test_existing_state_without_project_requires_explicit_migration(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_dir = Path(tmp)
+            stage = self._make_stage(project_dir)
+            self._install_valid_config(stage)
+            with StateStore(project_dir / "state.db"):
+                pass
+
+            with pytest.raises(StateError, match="no project record"):
+                stage.run()
+
+            with StateStore(project_dir / "state.db") as store:
+                assert store.get_project("demo") is None
+
+    def test_existing_project_without_stage_requires_explicit_migration(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_dir = Path(tmp)
+            stage = self._make_stage(project_dir)
+            with patch.dict(os.environ, {}, clear=True), patch(
+                "modules.init.init.input", side_effect=["", "W", "", "BCC", "", ""]
+            ):
+                stage.run()
+
+            with StateStore(project_dir / "state.db") as store:
+                store.connection.execute(
+                    "DELETE FROM stage_runs WHERE project_id = ?", ("demo",)
+                )
+
+            with pytest.raises(StateError, match="no stage history"):
+                stage.run()
+
+            with StateStore(project_dir / "state.db") as store:
+                assert store.get_stage_run("demo:init") is None
 
 
 if __name__ == "__main__":

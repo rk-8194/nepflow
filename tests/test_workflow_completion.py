@@ -5,14 +5,41 @@ import pytest
 
 from modules.validate.launcher import write_validation_status
 from nepflow.errors import StateError
+from nepflow.state import StateStore
 from workflow import WorkflowController
+
+
+VALID_PROJECT_CONFIG = """
+[project]
+name=demo
+schema_version=1
+
+[composition]
+elements=W
+composition_step=0.125
+
+[generation]
+crystal_structures=bcc
+target_n_atoms=64
+
+[hpc]
+vasp_command=vasp_std
+""".strip() + "\n"
 
 
 def make_controller(tmp_path: Path, stage: str = "validate", *, debug: bool = False) -> WorkflowController:
     output_dir = tmp_path / "outputs"
     project_dir = output_dir / "project_demo"
-    (project_dir / "config").mkdir(parents=True)
+    config_path = project_dir / "config" / "project.config"
+    config_path.parent.mkdir(parents=True)
+    config_path.write_text(VALID_PROJECT_CONFIG, encoding="utf-8")
     (project_dir / ".project").write_text(stage, encoding="utf-8")
+    with StateStore(project_dir / "state.db") as store:
+        store.upsert_project(
+            "demo",
+            name="demo",
+            root_path=str(project_dir),
+        )
     return WorkflowController(
         project_name="demo",
         output_dir=output_dir,
