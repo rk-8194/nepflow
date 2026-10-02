@@ -59,7 +59,7 @@ python -m pip install -e .
 4. Verify the installation:
 
 ```bash
-python nepflow_cli.py --help
+nepflow --help
 ```
 
 If you plan to use the Materials Project integration, make sure the `mp-api` dependency is installed and your API key is available in the project config or the `MP_API_KEY` environment variable.
@@ -71,7 +71,7 @@ If you plan to use the Materials Project integration, make sure the `mp-api` dep
 Choose a project name and create its project directory:
 
 ```bash
-python nepflow_cli.py --project myproject --init
+nepflow --project myproject --init
 ```
 
 This creates the project structure under `projects/project_myproject/`.
@@ -82,7 +82,7 @@ On first run, NEPFlow will prompt for any config values it needs, starting with 
 Before sending a project to HPC, run local mode on your local machine:
 
 ```bash
-python nepflow_cli.py --project myproject --local
+nepflow --project myproject --local
 ```
 
 Local mode fetches base structures and stops after seed generation. This step must be done locally before transferring the project to an HPC system.
@@ -92,7 +92,7 @@ Local mode fetches base structures and stops after seed generation. This step mu
 Copy the project directory to the HPC system, then resume with the normal command:
 
 ```bash
-python nepflow_cli.py --project myproject
+nepflow --project myproject
 ```
 
 NEPFlow will continue from the stage stored in the project directory.
@@ -107,7 +107,7 @@ NEPFlow will continue from the stage stored in the project directory.
 - `--stage <name>` forces the workflow to start from a specific stage.
 - `--output-dir <path>` changes the base directory used for projects.
 
-Run `python nepflow_cli.py --help` to see the full CLI help.
+Run `nepflow --help` to see the full CLI help.
 
 ## Project Layout
 
