@@ -13,10 +13,6 @@ def validate_composition_config(config: CompositionConfig) -> CompositionConfig:
 
     if not config.elements:
         raise ConfigurationError("generation requires at least one composition element")
-    if len(config.elements) > 3:
-        raise ConfigurationError(
-            "generation supports unary, binary, and ternary compositions only"
-        )
     if not math.isfinite(config.composition_step) or not 0.0 < config.composition_step <= 1.0:
         raise ConfigurationError("composition.composition_step must be in (0, 1]")
     steps = round(1.0 / config.composition_step)

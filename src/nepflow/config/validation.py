@@ -127,10 +127,6 @@ def validate_config(
         raise ConfigurationError(
             "composition.composition_step must divide the unit interval exactly"
         )
-    if len(config.composition.elements) > 3:
-        raise ConfigurationError(
-            "generation supports unary, binary, and ternary compositions only"
-        )
     if set(config.composition.elements) & set(config.composition.gas_elements):
         raise ConfigurationError("composition.elements and gas_elements must be disjoint")
 

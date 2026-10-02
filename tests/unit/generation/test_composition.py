@@ -1,5 +1,7 @@
 """Canonical composition-grid behavior and validation."""
 
+from itertools import combinations
+
 import pytest
 
 from nepflow.config.models import CompositionConfig
@@ -22,13 +24,25 @@ def test_phase2_composition_grid_preserves_unary_binary_and_ternary_order() -> N
     ]
 
 
-@pytest.mark.parametrize(
-    "config",
-    [
-        CompositionConfig(elements=("A", "B", "C", "D")),
-        CompositionConfig(elements=("A", "B"), composition_step=0.3),
-    ],
-)
-def test_unsupported_composition_spaces_fail_fast(config: CompositionConfig) -> None:
+def test_four_element_pool_generates_only_supported_subsets() -> None:
+    elements = ("W", "Cr", "Y", "Zr")
+    grid = CompositionGrid.from_config(
+        CompositionConfig(elements=elements, composition_step=0.25)
+    )
+
+    compositions = grid.generate()
+    unary = {frozenset(composition) for composition in compositions if len(composition) == 1}
+    binary = {frozenset(composition) for composition in compositions if len(composition) == 2}
+    ternary = {frozenset(composition) for composition in compositions if len(composition) == 3}
+
+    assert unary == {frozenset(subset) for subset in combinations(elements, 1)}
+    assert binary == {frozenset(subset) for subset in combinations(elements, 2)}
+    assert ternary == {frozenset(subset) for subset in combinations(elements, 3)}
+    assert set().union(*(set(composition) for composition in compositions)) == set(elements)
+    assert all(1 <= len(composition) <= 3 for composition in compositions)
+
+
+def test_invalid_composition_step_fails_fast() -> None:
+    config = CompositionConfig(elements=("W", "Cr"), composition_step=0.3)
     with pytest.raises(ConfigurationError):
         CompositionGrid.from_config(config)
