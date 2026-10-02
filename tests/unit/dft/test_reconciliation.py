@@ -33,7 +33,11 @@ from nepflow.stages.dft.reconciliation import (
     DftExecutionRecord,
     DftRecoveryDecision,
     DftReconciliationOrchestrator,
+    DftReconciliationResult,
 )
+from nepflow.stages.dft.orchestrator import DftPreparationResult
+from nepflow.stages.dft.stage import DftStageResult
+from nepflow.workflow.stages import StageRunState, WorkflowStage
 
 
 @dataclass
@@ -335,3 +339,20 @@ def test_restart_does_not_duplicate_submission(inputs: DftInputArtifacts) -> Non
 
     assert result.records == (submitted,)
     assert scheduler.submissions == []
+
+
+def test_failed_dft_stage_does_not_advance_to_training(
+    record: DftExecutionRecord,
+) -> None:
+    failed = record.with_status("failed")
+    stage_result = DftStageResult(
+        preparation=DftPreparationResult(()),
+        execution=DftReconciliationResult((failed,)),
+    )
+
+    workflow_result = stage_result.as_workflow_result()
+
+    assert workflow_result.stage is WorkflowStage.RUN_VASP
+    assert workflow_result.status is StageRunState.FAILED
+    assert workflow_result.completed is False
+    assert workflow_result.advanced_to is None

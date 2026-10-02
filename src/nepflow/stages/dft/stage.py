@@ -41,19 +41,30 @@ class DftStageResult:
 
     def as_workflow_result(self) -> StageRunResult:
         execution = self.execution
-        complete = execution is not None and all(
-            record.status in {"completed", "reused", "failed"}
-            for record in execution.records
+        failed = execution is not None and execution.any_failed
+        complete = execution is not None and execution.all_successful
+        status = (
+            StageRunState.FAILED
+            if failed
+            else StageRunState.COMPLETED
+            if complete
+            else self.status
         )
         return StageRunResult(
             stage=self.stage,
-            status=StageRunState.COMPLETED if complete else self.status,
+            status=status,
             advanced_to=WorkflowStage.TRAIN_NEP if complete else None,
             completed=complete,
             message=(
                 f"Prepared {self.preparation.prepared_count} calculations; "
                 f"{self.preparation.reused_count} reused"
-                + ("; reconciliation complete" if complete else "; reconciliation pending")
+                + (
+                    "; reconciliation failed"
+                    if failed
+                    else "; reconciliation complete"
+                    if complete
+                    else "; reconciliation pending"
+                )
             ),
         )
 

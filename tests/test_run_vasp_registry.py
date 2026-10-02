@@ -17,6 +17,7 @@ from nepflow.domain.calculations import DftResultArtifact
 from nepflow.domain.identities import (
     ArtifactIdentity,
     DftCalculationIdentity,
+    StructureIdentity,
     calculate_structure_id,
 )
 from nepflow.dft.backend import DftInputArtifacts
@@ -406,6 +407,7 @@ class RunVaspRegistryTests(unittest.TestCase):
             )
 
             with StateStore(root / "state.db") as state_store:
+                state_store.upsert_structure(StructureIdentity("structure-hash"))
                 state_store.save_execution(
                     DftExecutionRecord(
                         inputs=inputs,

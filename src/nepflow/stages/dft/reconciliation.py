@@ -98,6 +98,16 @@ class DftReconciliationResult:
         )
 
     @property
+    def all_successful(self) -> bool:
+        """Return whether every calculation completed successfully or reused."""
+        return all(record.status in {"completed", "reused"} for record in self.records)
+
+    @property
+    def any_failed(self) -> bool:
+        """Return whether at least one calculation reached irrecoverable failure."""
+        return any(record.status == "failed" for record in self.records)
+
+    @property
     def counts(self) -> dict[str, int]:
         result: dict[str, int] = {}
         for record in self.records:
