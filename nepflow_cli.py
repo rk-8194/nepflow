@@ -39,25 +39,107 @@ if _missing:
     )
     sys.exit(1)
 
-# Temporary Phase 4 migration bridge: legacy workflow and stage modules still
-# live directly under src/. The installed nepflow package does not depend on
-# this path mutation; only these legacy imports do.
+# Temporary Phase 4 migration bridge: legacy stage modules still live directly
+# under src/. The installed nepflow package does not depend on this path
+# mutation; only the CLI's composition root uses these legacy imports.
 sys.path.insert(0, str(Path(__file__).parent / "src"))
 
-# Note: The legacy imports below depend on src/ being in sys.path. The logging
-# foundation is imported from the canonical installed package.
+# Note: the legacy stage imports below depend on src/ being in sys.path. The
+# controller and workflow state are imported from the canonical package.
 # pylint: disable=import-error
-from workflow import WorkflowController
+from modules import (
+    GenerateStage,
+    InitStage,
+    MemoryStage,
+    RunVaspStage,
+    SelectStage,
+    TrainNepStage,
+    ValidateStage,
+)
+from modules.run_vasp._common import read_status
+from modules.validate.launcher import read_validation_status
 from nepflow.errors import SchedulerError, StateError, ValidationError
 from nepflow.hpc.process import ProcessError, ProcessRunner
 from nepflow.hpc.slurm import SlurmScheduler
 from nepflow.logging import configure_logging
 from nepflow.config.loader import canonical_config_path
-from nepflow.workflow.resubmission import SelfResubmitExit
+from nepflow.reporting import WorkflowStatusPresenter, summarize_legacy_vasp_jobs
+from nepflow.workflow import (
+    StageContext,
+    StageRegistry,
+    StageRunResult,
+    StageRunState,
+    SelfResubmitExit,
+    WorkflowController,
+    WorkflowStage,
+)
 
 logger = logging.getLogger("nepflow")
 process_runner = ProcessRunner(logger=logger)
 scheduler = SlurmScheduler(process_runner=process_runner)
+
+
+def _legacy_stage_kwargs(context: StageContext) -> dict:
+    """Adapt the canonical stage context to the remaining legacy stages."""
+
+    return {
+        "project_name": context.project_name,
+        "config_file": context.config_file,
+        "state_file": context.state_file,
+        "project_dir": context.project_dir,
+        "debug": context.debug,
+        "slurm_deadline": context.slurm_deadline,
+    }
+
+
+def compose_stage_registry() -> StageRegistry:
+    """Compose legacy stage implementations behind the canonical seam."""
+
+    registry = StageRegistry()
+
+    registry.register(
+        WorkflowStage.INIT,
+        lambda context: InitStage(**_legacy_stage_kwargs(context)).run(),
+    )
+    registry.register(
+        WorkflowStage.GENERATE,
+        lambda context: GenerateStage(**_legacy_stage_kwargs(context)).run(
+            seeds_only=context.seeds_only
+        ),
+    )
+    registry.register(
+        WorkflowStage.SELECT,
+        lambda context: SelectStage(**_legacy_stage_kwargs(context)).run(),
+    )
+    registry.register(
+        WorkflowStage.RUN_VASP,
+        lambda context: RunVaspStage(**_legacy_stage_kwargs(context)).run(),
+    )
+    registry.register(
+        WorkflowStage.TRAIN_NEP,
+        lambda context: TrainNepStage(**_legacy_stage_kwargs(context)).run(),
+    )
+
+    def run_validation(context: StageContext) -> StageRunResult:
+        ValidateStage(**_legacy_stage_kwargs(context)).run()
+        status = read_validation_status(context.project_dir)
+        complete = (
+            status.get("validation_complete") is True
+            and status.get("analysis_complete") is True
+        )
+        return StageRunResult(
+            stage=WorkflowStage.VALIDATE,
+            status=StageRunState.COMPLETED if complete else StageRunState.RUNNING,
+            advanced_to=WorkflowStage.COMPLETED if complete else None,
+            completed=complete,
+        )
+
+    registry.register(WorkflowStage.VALIDATE, run_validation)
+    registry.register_auxiliary(
+        "memory",
+        lambda context: MemoryStage(**_legacy_stage_kwargs(context)).run(),
+    )
+    return registry
 
 
 def _resolve_project_config_path(project_name: str, output_dir: Path) -> Path:
@@ -354,11 +436,21 @@ def main():
         local_mode=args.local,
         memory_mode=getattr(args, "memory", False),
         slurm_deadline=slurm_deadline,
+        stage_registry=compose_stage_registry(),
     )
 
     # Run workflow: controller reconciles StateStore with the legacy marker
     # If under SLURM and approaching deadline, resubmit before running
     try:
+        if not args.init:
+            WorkflowStatusPresenter(
+                logger,
+                details_provider=lambda project_dir, stage: summarize_legacy_vasp_jobs(
+                    project_dir,
+                    stage,
+                    read_status,
+                ),
+            ).log(controller.workflow_state)
         if slurm_deadline and time.time() >= slurm_deadline:
             logger.warning("Already past SLURM deadline - resubmitting immediately")
             _resubmit_slurm_job(debug=args.debug)
