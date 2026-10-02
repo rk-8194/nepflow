@@ -2,6 +2,11 @@
 
 from nepflow.errors import ConfigurationError
 
+from .creation import (
+    render_default_config,
+    validate_project_identity,
+    write_validated_config,
+)
 from .loader import (
     CANONICAL_CONFIG_NAME,
     canonical_config_path,
@@ -53,6 +58,9 @@ __all__ = [
     "find_config_path",
     "load_config",
     "load_legacy_config",
+    "render_default_config",
     "to_legacy_config",
     "validate_config",
+    "validate_project_identity",
+    "write_validated_config",
 ]

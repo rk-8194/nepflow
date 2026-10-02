@@ -6,6 +6,7 @@ from .controller import (
     StageRegistry,
     WorkflowController,
 )
+from .initialization import ProjectCreationService
 from .resubmission import (
     ReconciliationResult,
     ReconciliationSource,
@@ -33,6 +34,7 @@ __all__ = [
     "SelfResubmitExit",
     "StageBinding",
     "StageContext",
+    "ProjectCreationService",
     "StageRegistry",
     "StageResult",
     "StageRun",

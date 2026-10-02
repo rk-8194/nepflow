@@ -47,6 +47,7 @@ if (_SOURCE_ROOT / "modules").is_dir() and str(_SOURCE_ROOT) not in sys.path:
     sys.path.insert(0, str(_SOURCE_ROOT))
 
 from nepflow.errors import SchedulerError, StateError, ValidationError
+from nepflow.cli_wizard import CONFIG_PROMPTS, ConfigWizard
 from nepflow.hpc.process import ProcessError, ProcessRunner
 from nepflow.hpc.slurm import SlurmScheduler
 from nepflow.logging import configure_logging
@@ -88,7 +89,6 @@ def compose_stage_registry() -> StageRegistry:
     # pylint: disable=import-error,import-outside-toplevel
     from modules import (
         GenerateStage,
-        InitStage,
         MemoryStage,
         RunVaspStage,
         SelectStage,
@@ -99,9 +99,25 @@ def compose_stage_registry() -> StageRegistry:
 
     registry = StageRegistry()
 
+    def run_initialization(context: StageContext) -> None:
+        from nepflow.workflow.initialization import ProjectCreationService
+
+        service = ProjectCreationService(
+            context.project_name,
+            context.config_file,
+            context.state_file,
+            context.project_dir,
+        )
+        prompt_values = None
+        if service.requires_prompt_values():
+            wizard = ConfigWizard(context.project_name)
+            wizard.present_header()
+            prompt_values = wizard.collect_prompt_values(CONFIG_PROMPTS)
+        service.run(prompt_values=prompt_values)
+
     registry.register(
         WorkflowStage.INIT,
-        lambda context: InitStage(**_legacy_stage_kwargs(context)).run(),
+        run_initialization,
     )
     registry.register(
         WorkflowStage.GENERATE,
