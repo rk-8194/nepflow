@@ -568,6 +568,23 @@ class TrainingCampaign:
     def _submit(self, candidate: TrainingCandidate) -> TrainingCandidate:
         attempts = self.attempts(candidate.model_run_id)
         current = attempts[-1] if attempts else None
+        # A crash can happen after the scheduler accepts a job and the
+        # attempt transition is persisted, but before the candidate snapshot
+        # is updated.  Treat that durable attempt as authoritative so a
+        # restart repairs the candidate instead of submitting a duplicate.
+        if (
+            current is not None
+            and current.status in {"submitted", "running"}
+            and current.job_id
+        ):
+            return self._save_candidate(
+                candidate,
+                status=current.status,
+                attempt_number=current.attempt_number,
+                job_id=current.job_id,
+                progress=current.progress,
+                failure_reason=None,
+            )
         if current is not None and current.status == "submitting":
             attempt = current
         else:
@@ -597,6 +614,8 @@ class TrainingCampaign:
                     failure_reason=f"submission:{type(exc).__name__}:{exc}",
                 )
                 next_status = "pending" if attempt.attempt_number < self.max_attempts else "failed"
+                if next_status == "failed":
+                    self._persist_failed_model(candidate, str(exc))
                 return self._save_candidate(
                     candidate,
                     status=next_status,
@@ -716,10 +735,11 @@ class TrainingCampaign:
             scheduler_state=scheduler_state.value,
             failure_reason=reason,
         )
-        self._persist_failed_model(candidate, reason)
         next_status = (
             "pending" if attempt.attempt_number < self.max_attempts else "failed"
         )
+        if next_status == "failed":
+            self._persist_failed_model(candidate, reason)
         return self._save_candidate(
             candidate,
             status=next_status,

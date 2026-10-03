@@ -16,7 +16,7 @@ from nepflow.mlip.backend import (
     TrainingProgress,
 )
 from nepflow.state.store import StateStore
-from nepflow.stages.training.campaign import TrainingCampaign
+from nepflow.stages.training.campaign import TrainingAttempt, TrainingCampaign
 from nepflow.stages.training.optimisation import ControlledSweep
 
 
@@ -188,6 +188,31 @@ def test_concurrency_and_restart_do_not_duplicate_submission(tmp_path: Path) -> 
         assert len(scheduler.submissions) == 1
 
 
+def test_restart_repairs_candidate_after_persisted_submission(tmp_path: Path) -> None:
+    scheduler = FakeScheduler()
+    backend = FakeBackend()
+    with StateStore(tmp_path / "state.db") as store:
+        campaign = _campaign(tmp_path, store, scheduler, backend)
+        candidate = campaign.create_run(_input(tmp_path, "candidate"), ordinal=0)
+        scheduler.states["job-recovered"] = SchedulerJobState.PENDING
+        campaign._save_attempt(
+            TrainingAttempt(
+                attempt_id=f"{candidate.model_run_id}:attempt:1",
+                model_run_id=candidate.model_run_id,
+                attempt_number=1,
+                status="submitted",
+                job_id="job-recovered",
+                job_name="nepflow-campaign-1-recovered",
+            )
+        )
+
+        result = campaign.reconcile()
+
+        assert result.candidates[0].status == "submitted"
+        assert result.candidates[0].job_id == "job-recovered"
+        assert len(scheduler.submissions) == 0
+
+
 def test_scheduler_query_failure_does_not_advance_pending_candidate(tmp_path: Path) -> None:
     scheduler = FakeScheduler()
     backend = FakeBackend()
@@ -219,6 +244,22 @@ def test_failed_candidate_history_is_retained_and_not_promoted(tmp_path: Path) -
         assert result.promotion_decision is None
         assert campaign.attempts(candidate.model_run_id)[0].failure_reason == "backend_failed"
         assert store.get_model_run(candidate.model_run_id)["status"] == "failed"
+
+
+def test_retry_keeps_model_run_nonterminal_until_attempts_are_exhausted(tmp_path: Path) -> None:
+    scheduler = FakeScheduler()
+    backend = FakeBackend()
+    with StateStore(tmp_path / "state.db") as store:
+        campaign = _campaign(tmp_path, store, scheduler, backend, max_attempts=2)
+        candidate = campaign.create_run(_input(tmp_path, "retry"), ordinal=0)
+        campaign.reconcile()
+        scheduler.states[candidate.job_id or "job-1"] = SchedulerJobState.FAILED
+
+        result = campaign.reconcile()
+
+        assert result.candidates[0].status == "submitted"
+        assert len(scheduler.submissions) == 2
+        assert store.get_model_run(candidate.model_run_id)["status"] == "prepared"
 
 
 def test_scheduler_disappearance_is_not_completion_evidence(tmp_path: Path) -> None:
