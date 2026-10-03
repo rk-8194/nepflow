@@ -39,8 +39,8 @@ if _missing:
     )
     sys.exit(1)
 
-# The remaining legacy perturbation engine is kept behind this composition
-# root until its dedicated migration; generation ownership is canonical.
+# Remaining legacy workflow modules are kept behind this composition root;
+# generation ownership is canonical.
 _SOURCE_ROOT = Path(__file__).resolve().parents[1]
 if (_SOURCE_ROOT / "modules").is_dir() and str(_SOURCE_ROOT) not in sys.path:
     sys.path.insert(0, str(_SOURCE_ROOT))
@@ -108,8 +108,7 @@ def _build_generation_stage(context: StageContext) -> GenerationStage:
         SegregatedGenerator,
         build_materials_project_fetcher,
     )
-    # Perturbation migration is intentionally deferred to its own issue.
-    from modules.generate.generators.structure_generation import PerturbationEngine
+    from nepflow.stages.generation.perturbations import PerturbationCoordinator
 
     composition = config.composition
     generation = config.generation
@@ -167,7 +166,7 @@ def _build_generation_stage(context: StageContext) -> GenerationStage:
 
     coordinator = None
     if not context.debug:
-        coordinator = PerturbationEngine(
+        coordinator = PerturbationCoordinator(
             rattle_std=generation.rattle_std,
             rattle_std_min=generation.rattle_std_min,
             rattle_std_max=generation.rattle_std_max,

@@ -9,8 +9,20 @@ pytest.importorskip("pymatgen")
 pytest.importorskip("hiphive")
 from ase import Atoms  # noqa: E402
 
-from modules.generate.generators import structure_generation as structure_generation_module  # noqa: E402
-from modules.generate.generators.structure_generation import PerturbationEngine  # noqa: E402
+from nepflow.domain.identities import calculate_structure_id  # noqa: E402
+from nepflow.stages.generation.perturbations.defects import vacancies  # noqa: E402
+from nepflow.stages.generation.perturbations.displacements import rattled  # noqa: E402
+from nepflow.stages.generation.perturbations.models import (  # noqa: E402
+    PerturbationCounts,
+    PerturbationSettings,
+    PerturbationTask,
+)
+from nepflow.stages.generation.perturbations.provenance import (  # noqa: E402
+    annotate_generation_provenance,
+)
+from nepflow.stages.generation.perturbations.coordinator import (  # noqa: E402
+    execute_perturbation_task,
+)
 
 
 class GenerationReproducibilityTests(unittest.TestCase):
@@ -45,6 +57,12 @@ class GenerationReproducibilityTests(unittest.TestCase):
             if self_info != other_info:
                 raise AssertionError(f"different structure metadata: {self_info} != {other_info}")
 
+    @staticmethod
+    def settings(**kwargs) -> PerturbationSettings:
+        values = {"target_n_atoms": 16}
+        values.update(kwargs)
+        return PerturbationSettings(**values)
+
     def test_rattling_failure_is_not_replaced_by_gaussian_output(self) -> None:
         base = self.make_base()
         kwargs = {
@@ -58,7 +76,14 @@ class GenerationReproducibilityTests(unittest.TestCase):
             side_effect=RuntimeError("primary rattling unavailable"),
         ):
             with self.assertRaisesRegex(RuntimeError, "Gaussian substitution is disabled"):
-                PerturbationEngine(**kwargs)._rattled(base, base, n=3)
+                rattled(
+                    base,
+                    base,
+                    3,
+                    GenerationReproducibilityTests.settings(**kwargs),
+                    21,
+                    annotate_generation_provenance,
+                )
 
     def test_primary_rattling_path_repeats_with_same_seed(self) -> None:
         base = self.make_base()
@@ -95,14 +120,22 @@ class GenerationReproducibilityTests(unittest.TestCase):
             "hiphive.structure_generation.generate_mc_rattled_structures",
             side_effect=fake_primary_rattling,
         ):
-            first = PerturbationEngine(
-                target_n_atoms=len(base),
-                random_seed=21,
-            )._rattled(base, base, n=1)
-            second = PerturbationEngine(
-                target_n_atoms=len(base),
-                random_seed=21,
-            )._rattled(base, base, n=1)
+            first = rattled(
+                base,
+                base,
+                1,
+                self.settings(random_seed=21),
+                21,
+                annotate_generation_provenance,
+            )
+            second = rattled(
+                base,
+                base,
+                1,
+                self.settings(random_seed=21),
+                21,
+                annotate_generation_provenance,
+            )
 
         self.assert_structures_equal(first, second)
 
@@ -119,14 +152,8 @@ class GenerationReproducibilityTests(unittest.TestCase):
             "hiphive.structure_generation.generate_mc_rattled_structures",
             side_effect=fake_primary_rattling,
         ):
-            PerturbationEngine(
-                target_n_atoms=len(base),
-                random_seed=21,
-            )._rattled(base, base, n=1)
-            PerturbationEngine(
-                target_n_atoms=len(base),
-                random_seed=22,
-            )._rattled(base, base, n=1)
+            rattled(base, base, 1, self.settings(random_seed=21), 21, annotate_generation_provenance)
+            rattled(base, base, 1, self.settings(random_seed=22), 22, annotate_generation_provenance)
 
         self.assertEqual(received_seeds, [21, 22])
 
@@ -138,23 +165,47 @@ class GenerationReproducibilityTests(unittest.TestCase):
             "vacancy_range": (0.25, 0.25),
         }
 
-        first = PerturbationEngine(**kwargs)._vacancies(base, base, n=3)
-        second = PerturbationEngine(**kwargs)._vacancies(base, base, n=3)
+        first = vacancies(
+            base,
+            base,
+            3,
+            self.settings(**kwargs),
+            np.random.RandomState(31),
+            annotate_generation_provenance,
+            seed=31,
+        )
+        second = vacancies(
+            base,
+            base,
+            3,
+            self.settings(**kwargs),
+            np.random.RandomState(31),
+            annotate_generation_provenance,
+            seed=31,
+        )
 
         self.assert_structures_equal(first, second)
 
     def test_different_seeds_can_change_stochastic_vacancy_choices(self) -> None:
         base = self.make_base()
-        first = PerturbationEngine(
-            target_n_atoms=len(base),
-            random_seed=31,
-            vacancy_range=(0.25, 0.25),
-        )._vacancies(base, base, n=1)
-        second = PerturbationEngine(
-            target_n_atoms=len(base),
-            random_seed=32,
-            vacancy_range=(0.25, 0.25),
-        )._vacancies(base, base, n=1)
+        first = vacancies(
+            base,
+            base,
+            1,
+            self.settings(random_seed=31, vacancy_range=(0.25, 0.25)),
+            np.random.RandomState(31),
+            annotate_generation_provenance,
+            seed=31,
+        )
+        second = vacancies(
+            base,
+            base,
+            1,
+            self.settings(random_seed=32, vacancy_range=(0.25, 0.25)),
+            np.random.RandomState(32),
+            annotate_generation_provenance,
+            seed=32,
+        )
 
         self.assertFalse(
             np.array_equal(first[0].numbers, second[0].numbers)
@@ -162,18 +213,12 @@ class GenerationReproducibilityTests(unittest.TestCase):
         )
 
     def test_worker_engine_parameters_record_random_seed(self) -> None:
-        engine = PerturbationEngine(target_n_atoms=16, random_seed=1234)
+        settings = self.settings(random_seed=1234)
 
-        self.assertEqual(engine._engine_params()["random_seed"], 1234)
+        self.assertEqual(settings.random_seed, 1234)
 
     def test_worker_derived_seed_is_recorded_on_stochastic_candidate(self) -> None:
         base = self.make_base()
-        parent_engine = PerturbationEngine(
-            target_n_atoms=len(base),
-            random_seed=1234,
-            n_volume_points=0,
-            elastic_stress_enabled=False,
-        )
         child_seed = 9876
 
         def fake_primary_rattling(atoms, n_structures, rattle_std, d_min, **kwargs):
@@ -184,36 +229,43 @@ class GenerationReproducibilityTests(unittest.TestCase):
             "hiphive.structure_generation.generate_mc_rattled_structures",
             side_effect=fake_primary_rattling,
         ):
-            results = structure_generation_module._process_one_base(
-                (
-                    base,
-                    parent_engine._engine_params(),
-                    1,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    child_seed,
+            result = execute_perturbation_task(
+                PerturbationTask(
+                    base=base,
+                    base_structure_id=calculate_structure_id(base),
+                    settings=self.settings(
+                        random_seed=1234,
+                        n_volume_points=0,
+                        elastic_stress_enabled=False,
+                    ),
+                    counts=PerturbationCounts(
+                        n_rattled=1,
+                        n_vacancies=0,
+                        n_interstitials=0,
+                    ),
+                    seed=child_seed,
                 )
             )
+            results = list(result.candidates)
 
         rattled = [
             atoms for atoms in results if atoms.info["perturbation_type"] == "rattled"
         ]
         self.assertEqual(len(rattled), 1)
         self.assertEqual(rattled[0].info["random_seed"], child_seed)
-        self.assertNotEqual(rattled[0].info["random_seed"], parent_engine._random_seed)
+        self.assertNotEqual(rattled[0].info["random_seed"], 1234)
 
     def test_stochastic_candidate_records_parent_and_seed_provenance(self) -> None:
         base = self.make_base()
-        candidate = PerturbationEngine(
-            target_n_atoms=len(base),
-            random_seed=1234,
-            vacancy_range=(0.25, 0.25),
-        )._vacancies(base, base, n=1)[0]
+        candidate = vacancies(
+            base,
+            base,
+            1,
+            self.settings(random_seed=1234, vacancy_range=(0.25, 0.25)),
+            np.random.RandomState(1234),
+            annotate_generation_provenance,
+            seed=1234,
+        )[0]
 
         self.assertEqual(candidate.info["seed_id"], base.info["seed_id"])
         self.assertEqual(candidate.info["source"], base.info["source"])

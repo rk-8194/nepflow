@@ -8,7 +8,60 @@ pytest.importorskip("ase")
 pytest.importorskip("pymatgen")
 
 from ase import Atoms
-from modules.generate.generators.structure_generation import PerturbationEngine
+from nepflow.stages.generation.perturbations.coordinator import PerturbationCoordinator
+from nepflow.stages.generation.perturbations.elastic import (
+    coupled_strain_matrix,
+    elastic_stress_set,
+    normal_strain_matrix,
+    shear_strain_matrix,
+)
+from nepflow.stages.generation.perturbations.liquid import liquid_snapshots
+from nepflow.stages.generation.perturbations.displacements import sample_rattle_stds
+from nepflow.stages.generation.perturbations.models import PerturbationSettings
+from nepflow.stages.generation.perturbations.provenance import (
+    annotate_generation_provenance,
+)
+
+
+def elastic_outputs(engine: PerturbationCoordinator, base: Atoms) -> list[Atoms]:
+    settings = PerturbationSettings(
+        target_n_atoms=engine.settings.target_n_atoms,
+        elastic_stress_enabled=engine.settings.elastic_stress_enabled,
+        elastic_strain_amplitudes=tuple(engine.settings.elastic_strain_amplitudes),
+    )
+    return elastic_stress_set(
+        base,
+        base,
+        settings,
+        annotate_generation_provenance,
+    )
+
+
+def liquid_outputs(
+    engine: PerturbationCoordinator,
+    base: Atoms,
+    n_configurations: int,
+    n_snapshots: int,
+) -> list[Atoms]:
+    settings = PerturbationSettings(
+        target_n_atoms=engine.settings.target_n_atoms,
+        random_seed=engine.settings.random_seed,
+        liquid_enabled=engine.settings.liquid_enabled,
+        liquid_temperature_k=engine.settings.liquid_temperature_k,
+        liquid_timestep_fs=engine.settings.liquid_timestep_fs,
+        liquid_equilibration_steps=engine.settings.liquid_equilibration_steps,
+        liquid_steps_between_snapshots=engine.settings.liquid_steps_between_snapshots,
+        liquid_friction=engine.settings.liquid_friction,
+    )
+    return liquid_snapshots(
+        base,
+        base,
+        n_configurations,
+        n_snapshots,
+        settings,
+        engine.settings.random_seed,
+        annotate_generation_provenance,
+    )
 
 
 class _FakeDynamics:
@@ -65,12 +118,12 @@ class ElasticStressGenerationTests(unittest.TestCase):
 
     def test_elastic_stress_set_creates_all_modes_for_each_amplitude(self) -> None:
         base = self.make_base()
-        engine = PerturbationEngine(
+        engine = PerturbationCoordinator(
             target_n_atoms=2,
             elastic_strain_amplitudes=[-0.01, 0.01],
         )
 
-        structures = engine._elastic_stress_set(base, base)
+        structures = elastic_outputs(engine, base)
 
         self.assertEqual(len(structures), 18)
         modes = {atoms.info["elastic_mode"] for atoms in structures}
@@ -96,9 +149,9 @@ class ElasticStressGenerationTests(unittest.TestCase):
 
     def test_elastic_stress_metadata_is_inherited(self) -> None:
         base = self.make_base()
-        engine = PerturbationEngine(target_n_atoms=2, elastic_strain_amplitudes=[0.01])
+        engine = PerturbationCoordinator(target_n_atoms=2, elastic_strain_amplitudes=[0.01])
 
-        structure = engine._elastic_stress_set(base, base)[0]
+        structure = elastic_outputs(engine, base)[0]
 
         self.assertEqual(structure.info["perturbation_type"], "elastic_stress")
         self.assertEqual(structure.info["seed_id"], "seed_000001")
@@ -108,20 +161,20 @@ class ElasticStressGenerationTests(unittest.TestCase):
 
     def test_elastic_stress_disabled_returns_no_structures(self) -> None:
         base = self.make_base()
-        engine = PerturbationEngine(
+        engine = PerturbationCoordinator(
             target_n_atoms=2,
             elastic_stress_enabled=False,
             elastic_strain_amplitudes=[0.01],
         )
 
-        self.assertEqual(engine._elastic_stress_set(base, base), [])
+        self.assertEqual(elastic_outputs(engine, base), [])
 
     def test_mode_cells_are_modified_as_expected(self) -> None:
         base = self.make_base()
-        engine = PerturbationEngine(target_n_atoms=2, elastic_strain_amplitudes=[0.01])
+        engine = PerturbationCoordinator(target_n_atoms=2, elastic_strain_amplitudes=[0.01])
         structures = {
             atoms.info["elastic_mode"]: atoms
-            for atoms in engine._elastic_stress_set(base, base)
+            for atoms in elastic_outputs(engine, base)
         }
 
         normal = structures["normal_xx"]
@@ -143,7 +196,7 @@ class ElasticStressGenerationTests(unittest.TestCase):
         expected[0, 0] = 1.0 + amplitude
 
         np.testing.assert_allclose(
-            PerturbationEngine._normal_strain_matrix(amplitude, 0),
+            normal_strain_matrix(amplitude, 0),
             expected,
             atol=1e-12,
         )
@@ -156,7 +209,7 @@ class ElasticStressGenerationTests(unittest.TestCase):
         )
 
         np.testing.assert_allclose(
-            PerturbationEngine._coupled_strain_matrix(amplitude, 0, 1),
+            coupled_strain_matrix(amplitude, 0, 1),
             expected,
             atol=1e-12,
         )
@@ -164,7 +217,7 @@ class ElasticStressGenerationTests(unittest.TestCase):
 
     def test_shear_amplitude_is_tensor_shear_not_engineering_shear(self) -> None:
         amplitude = 0.03
-        matrix = PerturbationEngine._shear_strain_matrix(amplitude, 0, 1)
+        matrix = shear_strain_matrix(amplitude, 0, 1)
 
         # Tensor-shear convention: epsilon_xy = epsilon_yx = amplitude.
         self.assertAlmostEqual(matrix[0, 1], amplitude, places=12)
@@ -175,10 +228,10 @@ class ElasticStressGenerationTests(unittest.TestCase):
         amplitude = 0.025
         identity = np.eye(3)
 
-        normal_positive = PerturbationEngine._normal_strain_matrix(amplitude, 2)
-        normal_negative = PerturbationEngine._normal_strain_matrix(-amplitude, 2)
-        shear_positive = PerturbationEngine._shear_strain_matrix(amplitude, 1, 2)
-        shear_negative = PerturbationEngine._shear_strain_matrix(-amplitude, 1, 2)
+        normal_positive = normal_strain_matrix(amplitude, 2)
+        normal_negative = normal_strain_matrix(-amplitude, 2)
+        shear_positive = shear_strain_matrix(amplitude, 1, 2)
+        shear_negative = shear_strain_matrix(-amplitude, 1, 2)
 
         np.testing.assert_allclose(
             normal_positive - identity,
@@ -193,16 +246,19 @@ class ElasticStressGenerationTests(unittest.TestCase):
 
     def test_elastic_generation_is_independent_of_random_state(self) -> None:
         base = self.make_base()
-        first = PerturbationEngine(
+        first = PerturbationCoordinator(
             target_n_atoms=2,
             random_seed=7,
             elastic_strain_amplitudes=[-0.01, 0.01],
-        )._elastic_stress_set(base, base)
-        second = PerturbationEngine(
+        )
+        second = PerturbationCoordinator(
             target_n_atoms=2,
             random_seed=991,
             elastic_strain_amplitudes=[-0.01, 0.01],
-        )._elastic_stress_set(base, base)
+        )
+
+        first = elastic_outputs(first, base)
+        second = elastic_outputs(second, base)
 
         self.assertEqual(len(first), len(second))
         for first_atoms, second_atoms in zip(first, second):
@@ -210,24 +266,24 @@ class ElasticStressGenerationTests(unittest.TestCase):
             self.assertEqual(first_atoms.info, second_atoms.info)
 
     def test_rattle_std_defaults_expand_sampling_range(self) -> None:
-        engine = PerturbationEngine(target_n_atoms=2)
+        engine = PerturbationCoordinator(target_n_atoms=2)
 
-        self.assertAlmostEqual(engine.rattle_std_min, 0.03, places=12)
-        self.assertAlmostEqual(engine.rattle_std_max, 0.03, places=12)
-        np.testing.assert_allclose(engine._sample_rattle_stds(3), [0.03, 0.03, 0.03], atol=1e-12)
-
-    def test_rattle_std_sampling_uses_configured_range(self) -> None:
-        engine = PerturbationEngine(
-            target_n_atoms=2,
-            rattle_std=0.03,
-            rattle_std_min=0.01,
-            rattle_std_max=0.07,
+        self.assertAlmostEqual(engine.settings.rattle_std_min, 0.03, places=12)
+        self.assertAlmostEqual(engine.settings.rattle_std_max, 0.03, places=12)
+        np.testing.assert_allclose(
+            sample_rattle_stds(
+                PerturbationSettings(
+                    target_n_atoms=2,
+                    rattle_std=engine.settings.rattle_std,
+                ),
+                3,
+            ),
+            [0.03, 0.03, 0.03],
+            atol=1e-12,
         )
 
-        np.testing.assert_allclose(engine._sample_rattle_stds(2), [0.01, 0.07], atol=1e-12)
-
-    def test_rattle_std_sampling_steps_across_range(self) -> None:
-        engine = PerturbationEngine(
+    def test_rattle_std_sampling_uses_configured_range(self) -> None:
+        engine = PerturbationCoordinator(
             target_n_atoms=2,
             rattle_std=0.03,
             rattle_std_min=0.01,
@@ -235,14 +291,44 @@ class ElasticStressGenerationTests(unittest.TestCase):
         )
 
         np.testing.assert_allclose(
-            engine._sample_rattle_stds(4),
+            sample_rattle_stds(
+                PerturbationSettings(
+                    target_n_atoms=2,
+                    rattle_std=0.03,
+                    rattle_std_min=0.01,
+                    rattle_std_max=0.07,
+                ),
+                2,
+            ),
+            [0.01, 0.07],
+            atol=1e-12,
+        )
+
+    def test_rattle_std_sampling_steps_across_range(self) -> None:
+        engine = PerturbationCoordinator(
+            target_n_atoms=2,
+            rattle_std=0.03,
+            rattle_std_min=0.01,
+            rattle_std_max=0.07,
+        )
+
+        np.testing.assert_allclose(
+            sample_rattle_stds(
+                PerturbationSettings(
+                    target_n_atoms=2,
+                    rattle_std=0.03,
+                    rattle_std_min=0.01,
+                    rattle_std_max=0.07,
+                ),
+                4,
+            ),
             [0.01, 0.03, 0.05, 0.07],
             atol=1e-12,
         )
 
     def test_liquid_snapshots_are_tagged_as_perturbations(self) -> None:
         base = self.make_base()
-        engine = PerturbationEngine(
+        engine = PerturbationCoordinator(
             target_n_atoms=2,
             liquid_enabled=True,
             liquid_temperature_k=2500.0,
@@ -259,7 +345,7 @@ class ElasticStressGenerationTests(unittest.TestCase):
             patch("ase.md.velocitydistribution.Stationary"),
             patch("ase.md.velocitydistribution.ZeroRotation"),
         ):
-            structures = engine._liquid_snapshots(base, base, n_configurations=2, n_snapshots=2)
+            structures = liquid_outputs(engine, base, n_configurations=2, n_snapshots=2)
 
         self.assertEqual(len(structures), 4)
         self.assertEqual(
@@ -293,18 +379,10 @@ class ElasticStressGenerationTests(unittest.TestCase):
             patch("ase.md.velocitydistribution.Stationary"),
             patch("ase.md.velocitydistribution.ZeroRotation"),
         ):
-            first = PerturbationEngine(**kwargs)._liquid_snapshots(
-                base,
-                base,
-                n_configurations=1,
-                n_snapshots=1,
-            )
-            second = PerturbationEngine(**kwargs)._liquid_snapshots(
-                base,
-                base,
-                n_configurations=1,
-                n_snapshots=1,
-            )
+            first_engine = PerturbationCoordinator(**kwargs)
+            second_engine = PerturbationCoordinator(**kwargs)
+            first = liquid_outputs(first_engine, base, n_configurations=1, n_snapshots=1)
+            second = liquid_outputs(second_engine, base, n_configurations=1, n_snapshots=1)
 
         np.testing.assert_allclose(first[0].positions, second[0].positions)
         self.assertEqual(first[0].info["random_seed"], 17)
@@ -334,8 +412,8 @@ class ElasticStressGenerationTests(unittest.TestCase):
             patch("ase.md.velocitydistribution.Stationary"),
             patch("ase.md.velocitydistribution.ZeroRotation"),
         ):
-            structures = PerturbationEngine(**kwargs)._liquid_snapshots(
-                base,
+            structures = liquid_outputs(
+                PerturbationCoordinator(**kwargs),
                 base,
                 n_configurations=2,
                 n_snapshots=1,

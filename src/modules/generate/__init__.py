@@ -1,5 +1,3 @@
-"""Remaining legacy perturbation implementation used by the CLI composition root."""
+"""Compatibility package retained for non-perturbation legacy modules."""
 
-from .generators import PerturbationEngine
-
-__all__ = ["PerturbationEngine"]
+__all__ = []

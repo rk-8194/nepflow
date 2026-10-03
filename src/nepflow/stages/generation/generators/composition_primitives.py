@@ -2,16 +2,13 @@
 
 from __future__ import annotations
 
-from collections import Counter
 from collections.abc import Mapping, Sequence
-import logging
+from collections import Counter
 
 import numpy as np
 from ase import Atoms
-from ase.build import bulk
 
-
-logger = logging.getLogger("nepflow.generation.composition_primitives")
+from ..supercell import build_target_supercell
 
 
 def allocate_crystal_quota(
@@ -34,33 +31,6 @@ def allocate_crystal_quota(
         (crystal, base + (1 if index < remainder else 0))
         for index, crystal in enumerate(crystal_structures)
     ]
-
-
-def build_target_supercell(
-    element: str,
-    crystal_structure: str,
-    target_n_atoms: int,
-    *,
-    raise_on_error: bool = False,
-) -> Atoms | None:
-    """Build the accepted Phase 2 isotropic target supercell."""
-
-    try:
-        if crystal_structure == "hcp":
-            base = bulk(element, "hcp", a=3.0, c=3.0 * 1.633)
-        else:
-            base = bulk(element, crystal_structure, a=3.0)
-    except Exception:
-        if raise_on_error:
-            raise
-        logger.debug("Cannot build %s-%s", element, crystal_structure, exc_info=True)
-        return None
-
-    n_base = len(base)
-    if n_base == 0:
-        return None
-    rep = max(1, round((target_n_atoms / n_base) ** (1.0 / 3.0)))
-    return base.repeat(rep)
 
 
 def assign_composition(

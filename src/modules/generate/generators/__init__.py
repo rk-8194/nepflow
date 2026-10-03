@@ -1,5 +1,3 @@
-"""Remaining legacy perturbation implementation."""
+"""Legacy generator namespace; canonical perturbations live under nepflow."""
 
-from .structure_generation import PerturbationEngine
-
-__all__ = ["PerturbationEngine"]
+__all__ = []
