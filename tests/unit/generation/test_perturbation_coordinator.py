@@ -1,5 +1,8 @@
 """Coordinator execution, defect placement, and worker failure contracts."""
 
+import pickle
+from types import MappingProxyType
+
 import numpy as np
 import pytest
 
@@ -119,6 +122,47 @@ def test_serial_and_parallel_candidates_are_ordered_and_scientifically_equal() -
     task = PerturbationCoordinator(settings=settings)._tasks([base], counts)[0]
     result = execute_perturbation_task(task)
     assert len(result.provenance_records) == len(result.candidates)
+
+
+def test_worker_result_is_pickleable_with_canonical_provenance() -> None:
+    base = base_atoms()
+    settings = PerturbationSettings(
+        target_n_atoms=4,
+        random_seed=21,
+        n_volume_points=0,
+        elastic_stress_enabled=False,
+    )
+    counts = PerturbationCounts(
+        n_rattled=0,
+        n_vacancies=1,
+        n_interstitials=0,
+    )
+    task = PerturbationCoordinator(settings=settings)._tasks([base], counts)[0]
+
+    result = execute_perturbation_task(task)
+    restored = pickle.loads(pickle.dumps(result))
+
+    assert restored.task.base_structure_id == result.task.base_structure_id
+    assert calculate_structure_id(restored.task.base) == calculate_structure_id(result.task.base)
+    assert restored.task.settings == result.task.settings
+    assert restored.task.counts == result.task.counts
+    assert restored.task.seed == result.task.seed
+    assert [calculate_structure_id(item) for item in restored.candidates] == [
+        calculate_structure_id(item) for item in result.candidates
+    ]
+    assert [item.info.get("random_seed") for item in restored.candidates] == [
+        item.info.get("random_seed") for item in result.candidates
+    ]
+    assert [record.to_dict() for record in restored.provenance_records] == [
+        record.to_dict() for record in result.provenance_records
+    ]
+    assert [record.structure_id for record in restored.provenance_records] == [
+        record.structure_id for record in result.provenance_records
+    ]
+    assert all(
+        isinstance(record.provenance.realised_composition, MappingProxyType)
+        for record in restored.provenance_records
+    )
 
 
 def test_failed_task_identifies_base_and_effective_seed() -> None:

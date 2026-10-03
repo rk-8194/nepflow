@@ -7,7 +7,7 @@ from typing import Any
 
 from nepflow.io.json import to_jsonable
 
-from .identities import StructureIdentity, _freeze
+from .identities import STRUCTURE_IDENTITY_SCHEMA, StructureIdentity, _freeze
 
 
 @dataclass(frozen=True)
@@ -32,6 +32,18 @@ class StructureProvenance:
             "perturbation_parameters",
         ):
             object.__setattr__(self, name, _freeze(getattr(self, name)))
+
+    def __reduce__(self) -> tuple[Any, tuple[dict[str, Any]]]:
+        """Serialize through public values so process workers can return records.
+
+        ``_freeze`` intentionally uses ``MappingProxyType`` for immutable
+        provenance mappings, but the standard multiprocessing pickler cannot
+        serialize mapping proxies.  The public JSON-shaped representation is
+        the explicit transport boundary; reconstruction calls the normal
+        constructor and therefore reapplies ``_freeze``.
+        """
+
+        return (_restore_structure_provenance, (self.to_dict(),))
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -70,4 +82,45 @@ class GeneratedStructureRecord:
         if self.metadata is not None:
             result["metadata"] = to_jsonable(self.metadata)
         return result
+
+    def __reduce__(self) -> tuple[Any, tuple[dict[str, Any]]]:
+        """Serialize the canonical record through its public representation."""
+
+        return (_restore_generated_structure_record, (self.to_dict(),))
+
+
+def _restore_structure_provenance(payload: dict[str, Any]) -> StructureProvenance:
+    """Rebuild an immutable provenance record from its JSON-shaped values."""
+
+    return StructureProvenance(
+        parent_structure_id=payload["parent_structure_id"],
+        generator=payload["generator"],
+        requested_composition=payload["requested_composition"],
+        realised_composition=payload["realised_composition"],
+        source_database_id=payload["source_database_id"],
+        crystal_structure=payload["crystal_structure"],
+        perturbation_family=payload["perturbation_family"],
+        perturbation_parameters=payload["perturbation_parameters"],
+        random_seed=payload["random_seed"],
+        operation_id=payload["operation_id"],
+        code_version=payload["code_version"],
+        config_fingerprint=payload["config_fingerprint"],
+    )
+
+
+def _restore_generated_structure_record(
+    payload: dict[str, Any],
+) -> GeneratedStructureRecord:
+    """Rebuild a canonical generated record through its normal constructors."""
+
+    identity = StructureIdentity(
+        structure_id=payload["structure_id"],
+        schema_version=payload.get("structure_id_version", STRUCTURE_IDENTITY_SCHEMA),
+    )
+    provenance = _restore_structure_provenance(payload["provenance"])
+    return GeneratedStructureRecord(
+        identity=identity,
+        provenance=provenance,
+        metadata=payload.get("metadata"),
+    )
 
