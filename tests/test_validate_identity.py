@@ -10,7 +10,6 @@ import pytest
 pytest.importorskip("ase")
 pytest.importorskip("pymatgen")
 
-from modules.train_nep.train_nep import TrainNepStage  # noqa: E402
 from nepflow.mlip.nep.artifacts import (  # noqa: E402
     NepArtifactError,
     create_model_run_manifest,
@@ -101,16 +100,6 @@ def materialize_layout(
     return project_dir, models, datasets
 
 
-def train_stage_for(project_dir: Path) -> TrainNepStage:
-    return TrainNepStage(
-        project_name="demo",
-        config_file=project_dir / "config" / "demo.yaml",
-        state_file=project_dir / "state.db",
-        project_dir=project_dir,
-        debug=False,
-    )
-
-
 def validate_stage_for(project_dir: Path) -> ValidateStage:
     return ValidateStage(
         project_name="demo",
@@ -127,52 +116,6 @@ def model_run_id_for(model_path: Path) -> str:
     )["model_run_id"]
 
 
-def test_one_explicit_model_dataset_pair_resolves_exactly() -> None:
-    layout = load_layout("lexical_order_conflicts_with_explicit_association")
-    single_pair = {"datasets": [layout["datasets"][0]], "models": [layout["models"][0]]}
-
-    with tempfile.TemporaryDirectory() as tmp:
-        project_dir, models, datasets = materialize_layout(Path(tmp), single_pair)
-        with StateStore(project_dir / "state.db") as state_store:
-            resolved = train_stage_for(project_dir)._find_dataset_for_potential(
-                models["model_old"],
-                state_store=state_store,
-                model_run_id=model_run_id_for(models["model_old"]),
-            )
-
-    assert resolved == datasets["dataset_old"]
-
-
-@pytest.mark.parametrize(
-    "layout_name",
-    [
-        "lexical_order_conflicts_with_explicit_association",
-        "latest_model_directory_points_to_older_dataset",
-    ],
-)
-def test_model_specific_resolution_ignores_directory_and_mtime_order(layout_name: str) -> None:
-    layout = load_layout(layout_name)
-
-    with tempfile.TemporaryDirectory() as tmp:
-        project_dir, models, datasets = materialize_layout(Path(tmp), layout)
-        stage = train_stage_for(project_dir)
-        with StateStore(project_dir / "state.db") as state_store:
-            resolved = {
-                model_id: stage._find_dataset_for_potential(
-                    model_path,
-                    state_store=state_store,
-                    model_run_id=model_run_id_for(model_path),
-                )
-                for model_id, model_path in models.items()
-            }
-
-    expected = {
-        model["model_id"]: datasets[model["dataset_id"]]
-        for model in layout["models"]
-    }
-    assert resolved == expected
-
-
 @pytest.mark.parametrize(
     "layout_name",
     [
@@ -187,36 +130,6 @@ def test_validation_discovery_rejects_ambiguous_latest_pair(layout_name: str) ->
         project_dir, _, _ = materialize_layout(Path(tmp), layout)
         with pytest.raises((FileNotFoundError, ValueError, RuntimeError)):
             find_latest_potential_and_dataset(project_dir)
-
-
-def test_missing_model_dataset_association_is_an_error() -> None:
-    layout = load_layout("lexical_order_conflicts_with_explicit_association")
-    single_pair = {"datasets": [layout["datasets"][0]], "models": [layout["models"][0]]}
-
-    with tempfile.TemporaryDirectory() as tmp:
-        project_dir, models, _ = materialize_layout(Path(tmp), single_pair, write_manifests=False)
-        with StateStore(project_dir / "state.db") as state_store:
-            with pytest.raises(RuntimeError, match="Unknown authoritative model run"):
-                train_stage_for(project_dir)._find_dataset_for_potential(
-                    models["model_old"],
-                    state_store=state_store,
-                    model_run_id="model_run_without_manifest",
-                )
-
-
-def test_missing_requested_model_is_an_error() -> None:
-    layout = load_layout("lexical_order_conflicts_with_explicit_association")
-
-    with tempfile.TemporaryDirectory() as tmp:
-        project_dir, _, _ = materialize_layout(Path(tmp), layout)
-        missing_model = project_dir / "nep" / "potentials" / "potential_missing"
-        with StateStore(project_dir / "state.db") as state_store:
-            with pytest.raises(RuntimeError, match="Unknown authoritative model run"):
-                train_stage_for(project_dir)._find_dataset_for_potential(
-                    missing_model,
-                    state_store=state_store,
-                    model_run_id="model_run_missing",
-                )
 
 
 def test_storage_path_is_not_the_scientific_model_identity() -> None:
@@ -373,14 +286,9 @@ def test_finalization_uses_manifest_artifact_after_later_nep_file_appears() -> N
         assert (finalized_path / "nep.txt").read_text(encoding="utf-8") == "manifest-bound\n"
 
 
-def test_requested_validation_model_id_wins_over_training_status() -> None:
+def test_explicit_validation_model_id_is_used() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         project_dir = Path(tmp)
-        (project_dir / "nep").mkdir(parents=True, exist_ok=True)
-        (project_dir / "nep" / ".train_nep_status").write_text(
-            json.dumps({"status": "completed", "model_run_id": "model_run_from_training"}),
-            encoding="utf-8",
-        )
         config = ConfigParser()
         config["gpumd"] = {"model_run_id": "model_run_requested"}
 

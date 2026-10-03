@@ -26,8 +26,6 @@ from nepflow.domain.identities import calculate_structure_id  # noqa: E402
 from nepflow.dft.vasp.inputs import read_identity  # noqa: E402
 from nepflow.dft.vasp.outputs import parse_outcar_result  # noqa: E402
 from nepflow.io.hashing import sha256_file  # noqa: E402
-from modules.train_nep import prepare as train_prepare  # noqa: E402
-from modules.train_nep.train_nep import TrainNepStage  # noqa: E402
 from modules.validate.analyze import generate_comparison_csv  # noqa: E402
 from modules.validate.launcher import (  # noqa: E402
     read_validation_status,
@@ -37,6 +35,9 @@ from modules.validate.prepare import (  # noqa: E402
     find_latest_potential_and_dataset,
     find_model_run_and_dataset,
 )
+from nepflow.mlip.nep.inputs import NepHyperparameters, NepInputRenderer  # noqa: E402
+from nepflow.stages.training.dataset import build_dataset_metadata  # noqa: E402
+from nepflow.io.json import write_json  # noqa: E402
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -123,21 +124,15 @@ def test_deterministic_dft_to_validation_identity_trace() -> None:
             "accepted_results": [accepted],
         }
         test_report = empty_report(1, [accepted])
-        stage = TrainNepStage(
-            project_name="demo",
-            config_file=project_dir / "config" / "demo.ini",
-            state_file=project_dir / "state.db",
-            project_dir=project_dir,
-            debug=False,
-        )
-        metadata = stage._build_dataset_metadata(
+        metadata = build_dataset_metadata(
             dataset_path,
             train_report,
             test_report,
             train_virial=True,
             allow_partial=True,
         )
-        stage._write_dataset_metadata(dataset_path, metadata)
+        dataset_path.mkdir(parents=True, exist_ok=True)
+        write_json(dataset_path / ".dataset", metadata)
         shutil.copy2(DFT_FIXTURE, dataset_path / "train.xyz")
         shutil.copy2(DFT_FIXTURE, dataset_path / "test.xyz")
 
@@ -155,15 +150,17 @@ def test_deterministic_dft_to_validation_identity_trace() -> None:
 
         # Rendered NEP input -> immutable hyperparameter identity.
         config = audit_config()
-        hyperparameters = stage._get_nep_hyperparameters(config)
-        stage._generate_nep_config(config, dataset_path, hyperparameters)
+        hyperparameters = NepHyperparameters.from_legacy_config(config)
+        (dataset_path / "nep.in").write_text(
+            NepInputRenderer().render_content(hyperparameters), encoding="utf-8"
+        )
         nep_in = dataset_path / "nep.in"
         nep_in_hash = sha256_file(nep_in)
         hyperparameters_hash = hyperparameters.identity_hash()
         variant_config = audit_config()
         variant_config["train_nep"]["charge_mode"] = "1"
         assert (
-            stage._get_nep_hyperparameters(variant_config).identity_hash()
+            NepHyperparameters.from_legacy_config(variant_config).identity_hash()
             != hyperparameters_hash
         )
 
@@ -202,7 +199,7 @@ def test_deterministic_dft_to_validation_identity_trace() -> None:
 
         # Storage relocation does not change the scientific dataset/model identities.
         relocated_result = replace(accepted, source_outcar=str(project_dir / "moved" / "OUTCAR"))
-        relocated_metadata = stage._build_dataset_metadata(
+        relocated_metadata = build_dataset_metadata(
             project_dir / "moved" / "dataset_0001",
             {**train_report, "accepted_results": [relocated_result]},
             {**test_report, "accepted_results": [relocated_result]},

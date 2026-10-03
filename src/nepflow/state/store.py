@@ -10,6 +10,7 @@ from pathlib import Path
 import sqlite3
 import threading
 from typing import Any, TypeVar
+from uuid import uuid4
 
 from nepflow.domain.datasets import DatasetIdentity, SelectedDatasetMember, TrainingDatasetManifest
 from nepflow.domain.identities import (
@@ -1411,9 +1412,61 @@ class StateStore:
                 "ORDER BY occurred_at, event_id",
                 (entity_type, entity_id),
             )
+        elif entity_type is not None:
+            rows = self._fetchall(
+                "SELECT * FROM events WHERE entity_type = ? "
+                "ORDER BY occurred_at, event_id",
+                (entity_type,),
+            )
+        elif entity_id is not None:
+            rows = self._fetchall(
+                "SELECT * FROM events WHERE entity_id = ? "
+                "ORDER BY occurred_at, event_id",
+                (entity_id,),
+            )
         else:
-            raise ValueError("entity_type and entity_id must be provided together")
+            raise ValueError("event filter must contain an entity_type or entity_id")
         return [_decode_row(row, ("payload_json",)) for row in rows]
+
+    def record_training_event(
+        self,
+        entity_type: str,
+        entity_id: str,
+        event_type: str,
+        payload: Any = None,
+        *,
+        event_id: str | None = None,
+        occurred_at: str | None = None,
+    ) -> dict[str, Any]:
+        """Append one training-campaign transition to the ledger.
+
+        Campaign snapshots are deliberately event-sourced here so attempt
+        history remains append-only without changing the Phase 3 schema
+        version.  ``event_id`` is optional for callers that do not need a
+        deterministic retry token.
+        """
+
+        if not entity_type.startswith("training_"):
+            raise ValueError("training events must use a training_ entity type")
+        return self.append_event(
+            event_id or f"training:{entity_type}:{entity_id}:{uuid4().hex}",
+            entity_type,
+            entity_id,
+            event_type,
+            payload,
+            occurred_at=occurred_at,
+        )
+
+    def list_training_events(
+        self,
+        entity_type: str,
+        entity_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return append-only training transitions in ledger order."""
+
+        if not entity_type.startswith("training_"):
+            raise ValueError("training events must use a training_ entity type")
+        return self.list_events(entity_type=entity_type, entity_id=entity_id)
 
 
 __all__ = ["StateStore", "CURRENT_SCHEMA_VERSION"]

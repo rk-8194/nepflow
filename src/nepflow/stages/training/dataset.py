@@ -25,7 +25,12 @@ import numpy as np
 # not import or call an ASE reader.
 ase_read = None
 
-from nepflow.dft.vasp.outputs import VaspParseResult, validate_dft_result_labels
+from nepflow.dft.vasp.outputs import (
+    ResolvedVaspOutput,
+    VaspParseResult,
+    parse_outcar_result,
+    validate_dft_result_labels,
+)
 from nepflow.domain.datasets import (
     DatasetIdentity,
     SelectedDatasetMember,
@@ -39,7 +44,9 @@ from nepflow.domain.units import (
     VIRIAL_UNIT_EV,
     VIRIAL_TENSOR_CONVENTION_CARTESIAN_3X3,
 )
-from nepflow.io.json import to_jsonable, write_json
+from nepflow.errors import StateError
+from nepflow.io.json import read_json_object, to_jsonable, write_json
+from nepflow.io.hashing import sha256_file
 
 
 logger = logging.getLogger("nepflow.training.dataset")
@@ -742,6 +749,155 @@ def build_training_dataset(
     return DatasetBuildResult(dataset_path, manifest, metadata, reports)
 
 
+def resolve_selected_dft_results(
+    project_dir: Path,
+    state_store: Any,
+    *,
+    reader: Any | None = None,
+) -> dict[DatasetSplit, tuple[VaspParseResult, ...]]:
+    """Load selected structures and resolve their exact accepted DFT results.
+
+    This is the canonical input adapter for ``TrainingStage``.  It never
+    chooses a latest folder, creates synthetic labels, or falls back to a
+    filesystem-only OUTCAR.
+    """
+
+    if reader is None:
+        from ase.io import read as reader  # type: ignore[no-redef]
+    calculations = state_store.list_dft_calculations(
+        statuses=("completed",),
+        selected_only=True,
+    )
+    by_structure: dict[str, list[Mapping[str, Any]]] = {}
+    for calculation in calculations:
+        identity = calculation.get("identity", {})
+        structure_id = identity.get("structure_id", calculation.get("structure_id"))
+        if structure_id:
+            by_structure.setdefault(str(structure_id), []).append(calculation)
+
+    resolved: dict[DatasetSplit, tuple[VaspParseResult, ...]] = {}
+    for split in (DatasetSplit.TRAIN, DatasetSplit.TEST):
+        source = Path(project_dir) / "structures" / "selected" / f"{split.value}.xyz"
+        if not source.is_file():
+            raise FileNotFoundError(
+                f"Selected {split.value} structures not found at {source}; "
+                "run the select stage first"
+            )
+        structures = reader(str(source), index=":", format="extxyz")
+        if not isinstance(structures, list):
+            structures = [structures]
+        split_results: list[VaspParseResult] = []
+        for atoms in structures:
+            structure_id = str(
+                atoms.info.get("structure_id", StructureIdentity.from_atoms(atoms).structure_id)
+            )
+            requested_calculation_id = atoms.info.get("calculation_id")
+            candidates = by_structure.get(structure_id, [])
+            if requested_calculation_id:
+                candidates = [
+                    calculation
+                    for calculation in candidates
+                    if calculation.get("calculation_id") == requested_calculation_id
+                    or calculation.get("identity", {}).get("calculation_id")
+                    == requested_calculation_id
+                ]
+            if len(candidates) != 1:
+                raise RuntimeError(
+                    f"StateStore must resolve exactly one completed {split.value} DFT "
+                    f"calculation for structure_id={structure_id}; found {len(candidates)}"
+                )
+            calculation = candidates[0]
+            identity = dict(calculation.get("identity", {}))
+            calculation_id = str(calculation["calculation_id"])
+            attempt_id = calculation.get("accepted_attempt_id")
+            if not isinstance(attempt_id, str) or not attempt_id.strip():
+                raise RuntimeError(
+                    f"StateStore has no accepted attempt for {calculation_id}"
+                )
+            artifacts = state_store.list_artifacts(
+                originating_attempt_id=attempt_id,
+            )
+            outcars = [
+                artifact
+                for artifact in artifacts
+                if artifact.get("artifact_type") == "vasp_outcar"
+            ]
+            if len(outcars) != 1:
+                raise RuntimeError(
+                    f"StateStore has no unique accepted OUTCAR for {calculation_id}"
+                )
+            outcar_path = Path(str(outcars[0].get("path", "")))
+            if (
+                not outcar_path.is_file()
+                or sha256_file(outcar_path) != outcars[0].get("sha256")
+            ):
+                raise RuntimeError(
+                    f"Accepted OUTCAR artifact is missing or changed for {calculation_id}"
+                )
+            evidence = ResolvedVaspOutput(
+                outcar_path=outcar_path,
+                calculation_identity=tuple(
+                    sorted((str(key), str(value)) for key, value in identity.items())
+                ),
+                verification_source="state_store_artifact",
+            )
+            result = parse_outcar_result(
+                outcar_path,
+                atoms,
+                require_virial=False,
+                calculation_identity=identity,
+                identity_evidence=evidence,
+            )
+            if not result.accepted or result.structure_id != structure_id:
+                raise RuntimeError(
+                    f"StateStore OUTCAR could not be accepted for {calculation_id}: "
+                    f"{result.rejection_reason or 'structure_identity_changed'}"
+                )
+            split_results.append(result)
+        resolved[split] = tuple(split_results)
+    return resolved
+
+
+def load_materialized_dataset(
+    dataset_path: Path,
+    state_store: Any,
+) -> tuple[TrainingDatasetManifest, Mapping[str, Any]]:
+    """Load a dataset only when both its artifact and ledger identity exist."""
+
+    dataset_path = Path(dataset_path)
+    metadata_path = dataset_path / ".dataset"
+    if not dataset_path.is_dir() or not metadata_path.is_file():
+        raise FileNotFoundError(f"Materialized training dataset is missing: {dataset_path}")
+    metadata = read_json_object(metadata_path)
+    dataset_id = metadata.get("dataset_id")
+    if not isinstance(dataset_id, str) or not dataset_id:
+        raise ValueError(f"Materialized dataset has no dataset_id: {metadata_path}")
+    row = state_store.get_dataset(dataset_id)
+    if row is None:
+        raise StateError(f"Materialized dataset is not registered: {dataset_id}")
+    stored = row.get("manifest", {})
+    stored_identity = stored.get("identity", {}) if isinstance(stored, Mapping) else {}
+    if not isinstance(stored_identity, Mapping):
+        raise StateError(f"Dataset identity is malformed in StateStore: {dataset_id}")
+    identity_payload = dict(stored_identity)
+    identity_payload.pop("dataset_id", None)
+    identity = DatasetIdentity(dataset_id, identity_payload)
+    if identity.to_dict() != stored_identity:
+        raise StateError(f"Dataset identity is inconsistent in StateStore: {dataset_id}")
+    if metadata.get("dataset_id") != identity.dataset_id:
+        raise StateError(f"Materialized dataset identity changed: {dataset_id}")
+    manifest = TrainingDatasetManifest(
+        identity=identity,
+        records=tuple(stored.get("records", ())),
+        selection_method=stored.get("selection_method"),
+        selection_parameters=stored.get("selection_parameters"),
+        descriptor_model_fingerprint=stored.get("descriptor_model_fingerprint"),
+        created_at=stored.get("created_at"),
+        code_version=stored.get("code_version"),
+    )
+    return manifest, metadata
+
+
 def build_dataset_metadata(
     dataset_path: Path,
     train_report: Mapping[str, Any],
@@ -851,6 +1007,8 @@ __all__ = [
     "build_dataset_metadata",
     "build_training_dataset",
     "iter_labeled_structures",
+    "load_materialized_dataset",
+    "resolve_selected_dft_results",
     "write_nep_dataset",
 ]
 # End of canonical dataset module.

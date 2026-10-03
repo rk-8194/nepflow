@@ -6,7 +6,6 @@ from pathlib import Path
 
 from ..base import Stage
 from nepflow.workflow.resubmission import SelfResubmitExit
-from ..train_nep.launcher import read_train_status
 from .prepare import (
     finalize_nep_potential,
     prepare_validation_structures,
@@ -79,9 +78,6 @@ class ValidateStage(Stage):
             value = config.get(section, "model_run_id", fallback="").strip()
             if value:
                 return value
-        training_status = read_train_status(self.project_dir)
-        if training_status.get("status") == "completed" and training_status.get("model_run_id"):
-            return str(training_status["model_run_id"])
         raise ValueError(
             "Validation requires an explicit model_run_id in [validate] or [gpumd]"
         )

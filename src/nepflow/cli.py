@@ -56,6 +56,7 @@ from nepflow.stages.dft import DftStage
 from nepflow.stages.generation import GenerationStage
 from nepflow.stages.generation.debug import run_debug
 from nepflow.stages.selection import SelectionStage
+from nepflow.stages.training import TrainingStage
 from nepflow.workflow import (
     StageContext,
     StageRegistry,
@@ -229,10 +230,7 @@ def compose_stage_registry() -> StageRegistry:
     # These imports remain confined to the composition root for stages that
     # have not yet moved into the canonical package.
     # pylint: disable=import-error,import-outside-toplevel
-    from modules import (
-        TrainNepStage,
-        ValidateStage,
-    )
+    from modules import ValidateStage
     from modules.validate.launcher import read_validation_status
 
     registry = StageRegistry()
@@ -287,7 +285,7 @@ def compose_stage_registry() -> StageRegistry:
     registry.register(WorkflowStage.RUN_VASP, run_dft)
     registry.register(
         WorkflowStage.TRAIN_NEP,
-        lambda context: TrainNepStage(**_legacy_stage_kwargs(context)).run(),
+        lambda context: TrainingStage().run(context),
     )
 
     def run_validation(context: StageContext) -> StageRunResult:
