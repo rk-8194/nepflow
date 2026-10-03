@@ -23,9 +23,9 @@ class StructureStub:
 
 pytest.importorskip("NepTrainKit")
 
-from common import descriptors as DESCRIPTORS  # noqa: E402
 from modules.select import select as select_module  # noqa: E402
 from nepflow.errors import ConfigurationError
+from nepflow.stages.selection import representations as DESCRIPTORS  # noqa: E402
 
 SelectStage = select_module.SelectStage
 
@@ -186,6 +186,12 @@ class SelectStageTests(unittest.TestCase):
             with self.assertRaisesRegex(ConfigurationError, "frontier_fraction"):
                 stage.load_config()
 
+    def test_sampling_ownership_is_not_shadowed_by_stage_aliases(self) -> None:
+        stage = self.create_stage(Path("unused"))
+
+        self.assertFalse(hasattr(stage, "_fps_target_count"))
+        self.assertFalse(hasattr(stage, "_cross_distance_stats"))
+
     def test_descriptor_loader_rejects_shape_only_cache_without_identity(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_dir = Path(tmp)
@@ -207,7 +213,7 @@ class SelectStageTests(unittest.TestCase):
                     "compute_descriptors_batched",
                     return_value=np.full((3, 4), 2.0),
                 ) as compute:
-                    result = DESCRIPTORS.load_or_compute_descriptors(
+                    result = DESCRIPTORS.load_or_calculate_representations(
                         project_dir,
                         structures,
                         mean_descriptor=True,
@@ -236,7 +242,7 @@ class SelectStageTests(unittest.TestCase):
                 "min_train_test_dist": 0.3,
                 "mean_train_test_dist": 0.4,
             }
-            with patch.object(select_module, "load_or_compute_descriptors", return_value=descriptors) as loader:
+            with patch.object(select_module, "load_or_calculate_representations", return_value=descriptors) as loader:
                 with patch.object(stage, "_select_training_set", return_value=([0], 0.1)):
                     with patch.object(stage, "_select_test_set", return_value=test_result):
                         result = stage.execute(config, settings, prepared)
@@ -261,7 +267,7 @@ class SelectStageTests(unittest.TestCase):
                 "structures": [StructureStub() for _ in range(3)],
                 "ase_structures": [make_atoms() for _ in range(3)],
             }
-            with patch.object(select_module, "load_or_compute_descriptors", return_value=np.ones((3, 2))):
+            with patch.object(select_module, "load_or_calculate_representations", return_value=np.ones((3, 2))):
                 with patch.object(stage, "_load_seed_indices", return_value=[0]) as seed:
                     with patch.object(stage, "_load_single_element_elastic_stress_indices", return_value=[1]) as single:
                         with patch.object(stage, "_load_elastic_stress_indices", return_value=[1, 2]) as elastic:
@@ -287,7 +293,7 @@ class SelectStageTests(unittest.TestCase):
             settings = {"target_train": 3, "composition_aware_fps": False, "mean_descriptor": True,
                         "tolerance": 1, "max_iterations": 4}
             descriptors = np.arange(8, dtype=float).reshape(4, 2)
-            with patch.object(stage, "_fps_target_count", return_value=([0], 0.5)):
+            with patch.object(select_module, "select_farthest_points_for_target", return_value=([0], 0.5)):
                 indices, minimum = stage._select_training_set(
                     descriptors,
                     [StructureStub() for _ in range(4)],
@@ -378,7 +384,7 @@ class SelectStageTests(unittest.TestCase):
             structures = [StructureStub() for _ in candidates]
             seed_indices = stage._load_seed_indices(candidates)
 
-            with patch.object(stage, "_fps_target_count", return_value=([1], 0.25)):
+            with patch.object(select_module, "select_farthest_points_for_target", return_value=([1], 0.25)):
                 train_indices, _ = stage._select_training_set(
                     descriptors,
                     structures,
@@ -405,7 +411,7 @@ class SelectStageTests(unittest.TestCase):
             structures = [StructureStub() for _ in candidates]
             seed_indices = stage._load_seed_indices(candidates)
 
-            with patch.object(stage, "_fps_target_count", return_value=([1], 0.25)):
+            with patch.object(select_module, "select_farthest_points_for_target", return_value=([1], 0.25)):
                 train_indices, _ = stage._select_training_set(
                     descriptors,
                     structures,
@@ -500,7 +506,7 @@ class SelectStageTests(unittest.TestCase):
                 "tolerance": 1,
                 "max_iterations": 4,
             }
-            with patch.object(stage, "_fps_target_count", return_value=([0], 0.25)):
+            with patch.object(select_module, "select_farthest_points_for_target", return_value=([0], 0.25)):
                 indices, minimum = stage._select_training_set(
                     np.array([[0.0], [1.0], [2.0]]),
                     [StructureStub() for _ in range(3)],

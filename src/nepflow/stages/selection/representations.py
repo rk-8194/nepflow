@@ -1,28 +1,28 @@
-"""Shared NEP descriptor loading and computation helpers."""
+"""Identity-safe representation calculation and cache ownership."""
 
 from __future__ import annotations
 
+from io import BytesIO
 import logging
-import os
-import tempfile
 import time
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 from NepTrainKit.core.calculator import NepCalculator
 
-from nepflow.errors import StateError
 from nepflow.domain.identities import (
     DESCRIPTOR_CACHE_SCHEMA,
     DescriptorCacheIdentity,
     calculate_structure_id,
 )
+from nepflow.errors import StateError
+from nepflow.io.atomic import atomic_write_bytes, atomic_write_text
 from nepflow.io.hashing import sha256_file
 from nepflow.io.json import dumps, read_json
 
-logger = logging.getLogger("nepflow.common.descriptors")
 
-
+logger = logging.getLogger("nepflow.selection.representations")
 DESCRIPTOR_CACHE_SCHEMA_VERSION = DESCRIPTOR_CACHE_SCHEMA
 
 
@@ -32,7 +32,8 @@ def compute_structure_descriptors(
     *,
     mean_descriptor: bool,
 ) -> np.ndarray:
-    """Compute descriptors across NepTrainKit 2.x and 3.x calculator APIs."""
+    """Compute structure representations through supported NepTrainKit APIs."""
+
     if hasattr(calc, "descriptors"):
         return calc.descriptors(structures, mean=mean_descriptor)
     if hasattr(calc, "get_structures_descriptor"):
@@ -48,16 +49,19 @@ def compute_structure_descriptors(
 
 def descriptor_cache_path(project_dir: Path) -> Path:
     """Return the descriptor cache path for a project."""
+
     return project_dir / "nep" / "datasets" / "descriptors.npy"
 
 
 def descriptor_manifest_path(project_dir: Path) -> Path:
     """Return the descriptor-cache manifest path for a project."""
+
     return project_dir / "nep" / "datasets" / "descriptors.manifest.json"
 
 
 def _structure_identity(structure: object) -> str:
     """Return the stable physical/input identity for one structure."""
+
     structure_id = getattr(structure, "structure_id", None)
     if structure_id is not None:
         structure_id = str(structure_id)
@@ -78,17 +82,18 @@ def _structure_identity(structure: object) -> str:
     except (AttributeError, TypeError, ValueError) as exc:
         raise ValueError(
             "Structure has no stable identity; provide structure_id, "
-            "structure_id, structure_hash, or a real ASE structure"
+            "structure_hash, or a real ASE structure"
         ) from exc
 
 
 def _model_identity(model_path: Path, model_filename: str) -> dict[str, str]:
     """Return the configured model filename and content hash."""
+
     if not model_path.exists():
         raise FileNotFoundError(
             f"NEP model not found at {model_path}\n"
-            f"Download NEP89 from:\n"
-            f"  https://github.com/brucefan1983/GPUMD/tree/master/potentials/nep/nep89_20250409\n"
+            "Download NEP89 from:\n"
+            "  https://github.com/brucefan1983/GPUMD/tree/master/potentials/nep/nep89_20250409\n"
             f"Place the model file as: {model_path}"
         )
     return {
@@ -102,8 +107,9 @@ def _descriptor_manifest(
     model: dict[str, str],
     mean_descriptor: bool,
     descriptors: np.ndarray,
-) -> dict:
-    """Build the deterministic manifest for one descriptor array."""
+) -> dict[str, Any]:
+    """Build the unchanged Phase 2 manifest representation."""
+
     return DescriptorCacheIdentity(
         structure_ids=tuple(structure_ids),
         model_filename=model["filename"],
@@ -120,7 +126,8 @@ def _load_valid_cached_descriptors(
     model: dict[str, str],
     mean_descriptor: bool,
 ) -> np.ndarray | None:
-    """Load a cache only when its complete manifest matches current inputs."""
+    """Load a cache only when its complete identity matches current inputs."""
+
     if not descriptor_cache.exists() or not manifest_path.exists():
         return None
 
@@ -162,7 +169,8 @@ def _load_valid_cached_descriptors(
 
 
 def _validate_descriptors(descriptors: np.ndarray, structure_count: int) -> np.ndarray:
-    """Validate the descriptor array before it becomes reusable cache state."""
+    """Validate representations before they become reusable cache state."""
+
     descriptors = np.asarray(descriptors)
     if descriptors.ndim != 2 or descriptors.shape[0] != structure_count:
         raise ValueError(
@@ -181,52 +189,17 @@ def _write_descriptor_cache(
     descriptor_cache: Path,
     manifest_path: Path,
     descriptors: np.ndarray,
-    manifest: dict,
+    manifest: dict[str, Any],
 ) -> None:
-    """Atomically write descriptors, then commit their manifest last."""
-    descriptor_cache.parent.mkdir(parents=True, exist_ok=True)
-    temporary_paths: list[Path] = []
-    try:
-        with tempfile.NamedTemporaryFile(
-            mode="wb",
-            dir=descriptor_cache.parent,
-            prefix=f"{descriptor_cache.name}.",
-            suffix=".tmp",
-            delete=False,
-        ) as descriptor_file:
-            descriptor_temp = Path(descriptor_file.name)
-            temporary_paths.append(descriptor_temp)
-            np.save(descriptor_file, descriptors, allow_pickle=False)
-            descriptor_file.flush()
-            os.fsync(descriptor_file.fileno())
+    """Atomically write the array, then commit the unchanged manifest last."""
 
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            dir=manifest_path.parent,
-            prefix=f"{manifest_path.name}.",
-            suffix=".tmp",
-            encoding="utf-8",
-            delete=False,
-        ) as manifest_file:
-            manifest_temp = Path(manifest_file.name)
-            temporary_paths.append(manifest_temp)
-            manifest_file.write(dumps(manifest, indent=None))
-            manifest_file.flush()
-            os.fsync(manifest_file.fileno())
-
-        os.replace(descriptor_temp, descriptor_cache)
-        temporary_paths.remove(descriptor_temp)
-        os.replace(manifest_temp, manifest_path)
-        temporary_paths.remove(manifest_temp)
-    finally:
-        for temporary_path in temporary_paths:
-            try:
-                temporary_path.unlink()
-            except FileNotFoundError:
-                pass
+    array_buffer = BytesIO()
+    np.save(array_buffer, descriptors, allow_pickle=False)
+    atomic_write_bytes(descriptor_cache, array_buffer.getvalue())
+    atomic_write_text(manifest_path, dumps(manifest, indent=None), encoding="utf-8")
 
 
-def load_or_compute_descriptors(
+def load_or_calculate_representations(
     project_dir: Path,
     structures: list,
     *,
@@ -234,7 +207,8 @@ def load_or_compute_descriptors(
     batch_size: int,
     nep_model_file: str,
 ) -> np.ndarray:
-    """Load cached descriptors or compute them from the configured NEP model."""
+    """Load an exact-identity cache or calculate representations from NEP."""
+
     descriptor_cache = descriptor_cache_path(project_dir)
     nep_model_path = project_dir / "config" / "nep" / nep_model_file
     model = _model_identity(nep_model_path, nep_model_file)
@@ -249,11 +223,11 @@ def load_or_compute_descriptors(
         mean_descriptor,
     )
     if descriptors is not None:
-        logger.info(f"  Loaded cached descriptors from {descriptor_cache}")
+        logger.info("  Loaded cached descriptors from %s", descriptor_cache)
         return descriptors
 
     calc = NepCalculator(str(nep_model_path))
-    logger.info(f"  Loaded NEP model: {nep_model_file}")
+    logger.info("  Loaded NEP model: %s", nep_model_file)
     descriptors = _validate_descriptors(
         compute_descriptors_batched(
             calc,
@@ -270,7 +244,7 @@ def load_or_compute_descriptors(
         descriptors,
     )
     _write_descriptor_cache(descriptor_cache, manifest_path, descriptors, manifest)
-    logger.info(f"  Saved descriptors to {descriptor_cache}")
+    logger.info("  Saved descriptors to %s", descriptor_cache)
     return descriptors
 
 
@@ -281,7 +255,8 @@ def compute_descriptors_batched(
     mean_descriptor: bool,
     batch_size: int,
 ) -> np.ndarray:
-    """Compute descriptors in batches to avoid OOM."""
+    """Compute representations in batches to avoid OOM."""
+
     all_descriptors = []
     n = len(structures)
     t0 = time.perf_counter()
@@ -298,7 +273,21 @@ def compute_descriptors_batched(
         rate = end / elapsed if elapsed > 0 else 0
         eta = (n - end) / rate if rate > 0 else 0
         logger.info(
-            f"  Batch {end}/{n} ({100 * end / n:.0f}%) - "
-            f"{elapsed:.1f}s elapsed, ~{eta:.0f}s remaining"
+            "  Batch %s/%s (%.0f%%) - %.1fs elapsed, ~%.0fs remaining",
+            end,
+            n,
+            100 * end / n,
+            elapsed,
+            eta,
         )
     return np.concatenate(all_descriptors, axis=0)
+
+
+__all__ = [
+    "DESCRIPTOR_CACHE_SCHEMA_VERSION",
+    "compute_descriptors_batched",
+    "compute_structure_descriptors",
+    "descriptor_cache_path",
+    "descriptor_manifest_path",
+    "load_or_calculate_representations",
+]

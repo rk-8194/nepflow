@@ -13,7 +13,10 @@ from .models import NepflowConfig
 ALLOWED_CRYSTAL_STRUCTURES = frozenset(
     {"bcc", "fcc", "hcp", "diamond", "simple_cubic"}
 )
-ALLOWED_DESCRIPTOR_TYPES = frozenset({"structure", "atomic"})
+# Atomic representations do not yet have a structure-level selection result
+# contract.  Reject the nominal mode instead of allowing it to fail later in
+# descriptor caching or FPS row-to-structure mapping.
+ALLOWED_DESCRIPTOR_TYPES = frozenset({"structure"})
 TIME_PATTERN = re.compile(r"^(?:\d+):[0-5]\d:[0-5]\d$")
 KNOWN_ELEMENT_SYMBOLS = frozenset(symbol for symbol in chemical_symbols if symbol)
 

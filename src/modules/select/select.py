@@ -24,9 +24,16 @@ import numpy as np
 from ase.io import read as ase_read, write as ase_write
 from NepTrainKit.core.structure import Structure
 
-from common.FPS import cross_distance_stats, fps_target_count
-from common.descriptors import descriptor_cache_path, load_or_compute_descriptors
 from nepflow.domain.identities import calculate_structure_id
+from nepflow.stages.selection.representations import (
+    descriptor_cache_path,
+    load_or_calculate_representations,
+)
+from nepflow.stages.selection.sampling import (
+    calculate_cross_distance_stats,
+    select_farthest_points_for_target,
+)
+from nepflow.errors import ConfigurationError
 from ..base import Stage
 
 logger = logging.getLogger("nepflow.select")
@@ -63,10 +70,16 @@ class SelectStage(Stage):
         config_path = self._find_config_file()
         config = self._load_config()
         logger.debug(f"Loaded config from {config_path}")
+        descriptor_type = config.get(
+            "selection", "descriptor_type", fallback="structure"
+        ).strip().lower()
+        if descriptor_type != "structure":
+            raise ConfigurationError(
+                f"selection.descriptor_type={descriptor_type!r} is not supported "
+                "by structure-level selection; use 'structure'"
+            )
         settings = {
-            "descriptor_type": config.get(
-                "selection", "descriptor_type", fallback="structure"
-            ),
+            "descriptor_type": descriptor_type,
             "batch_size": config.getint("selection", "batch_size", fallback=500),
             "target_train": config.getint(
                 "selection", "target_train_count", fallback=1000
@@ -81,10 +94,7 @@ class SelectStage(Stage):
             "test_pool_factor": config.getfloat(
                 "selection", "test_pool_factor", fallback=0.5
             ),
-            "mean_descriptor": config.get(
-                "selection", "descriptor_type", fallback="structure"
-            )
-            == "structure",
+            "mean_descriptor": True,
             "include_seed_structures": config.getboolean(
                 "selection", "include_seed_structures", fallback=False
             ),
@@ -161,7 +171,7 @@ class SelectStage(Stage):
         """Compute descriptors and select train/test indices."""
         logger.info("")
         logger.info("Step 2: Computing NEP descriptors")
-        descriptors = load_or_compute_descriptors(
+        descriptors = load_or_calculate_representations(
             self.project_dir,
             prepared["structures"],
             mean_descriptor=settings["mean_descriptor"],
@@ -356,11 +366,13 @@ class SelectStage(Stage):
             else:
                 remaining_descriptors = descriptors[remaining_indices]
                 remaining_structures = [structures[i] for i in remaining_indices]
-                fps_indices, train_min_dist = self._fps_target_count(
+                fps_indices, train_min_dist = select_farthest_points_for_target(
                     remaining_descriptors,
                     remaining_structures,
-                    settings,
+                    settings["mean_descriptor"],
                     remaining_target,
+                    settings["tolerance"],
+                    settings["max_iterations"],
                     label="train",
                 )
                 fps_indices = [int(remaining_indices[i]) for i in fps_indices]
@@ -514,11 +526,13 @@ class SelectStage(Stage):
     ) -> tuple[list[int], float]:
         remaining_descriptors = descriptors[remaining_indices]
         remaining_structures = [structures[i] for i in remaining_indices]
-        fps_indices, train_min_dist = self._fps_target_count(
+        fps_indices, train_min_dist = select_farthest_points_for_target(
             remaining_descriptors,
             remaining_structures,
-            settings,
+            settings["mean_descriptor"],
             remaining_target,
+            settings["tolerance"],
+            settings["max_iterations"],
             label="train",
         )
         fps_indices = [int(remaining_indices[i]) for i in fps_indices]
@@ -1141,7 +1155,7 @@ class SelectStage(Stage):
                 len(remaining_indices),
             )
             test_indices = remaining_indices.tolist()
-            min_dist, mean_dist = self._cross_distance_stats(
+            min_dist, mean_dist = calculate_cross_distance_stats(
                 descriptors, train_indices, test_indices
             )
             return {
@@ -1172,15 +1186,17 @@ class SelectStage(Stage):
         )
 
         pool_descriptors = descriptors[pool_indices]
-        test_local, test_min_dist = self._fps_target_count(
+        test_local, test_min_dist = select_farthest_points_for_target(
             pool_descriptors,
             [structures[i] for i in pool_indices],
-            settings,
+            settings["mean_descriptor"],
             target_test,
+            settings["tolerance"],
+            settings["max_iterations"],
             label="test",
         )
         test_indices = [int(pool_indices[i]) for i in test_local]
-        min_dist, mean_dist = self._cross_distance_stats(
+        min_dist, mean_dist = calculate_cross_distance_stats(
             descriptors,
             train_indices,
             test_indices,
@@ -1278,32 +1294,6 @@ class SelectStage(Stage):
 
         self._save_selected_structures(ase_structures, train_indices, test_indices)
         logger.info("[DEBUG] Structure selection complete")
-
-    def _fps_target_count(
-        self,
-        descriptors: np.ndarray,
-        structures: list[Structure],
-        settings: dict,
-        target: int,
-        label: str = "",
-    ) -> tuple[list[int], float]:
-        return fps_target_count(
-            descriptors,
-            structures,
-            settings["mean_descriptor"],
-            target,
-            settings["tolerance"],
-            settings["max_iterations"],
-            label=label,
-        )
-
-    @staticmethod
-    def _cross_distance_stats(
-        descriptors: np.ndarray,
-        indices_a: list[int],
-        indices_b: list[int],
-    ) -> tuple[float, float]:
-        return cross_distance_stats(descriptors, indices_a, indices_b)
 
     @staticmethod
     def _seed_id(atoms) -> str | None:

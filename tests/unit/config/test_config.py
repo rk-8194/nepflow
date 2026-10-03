@@ -94,6 +94,13 @@ def test_loader_rejects_bad_enum(tmp_path: Path) -> None:
         load_config(write_config(tmp_path, text))
 
 
+def test_loader_rejects_unsupported_atomic_descriptor_mode(tmp_path: Path) -> None:
+    text = BASE_CONFIG + "\n[selection]\ndescriptor_type = atomic\n"
+
+    with pytest.raises(ConfigurationError, match="descriptor_type"):
+        load_config(write_config(tmp_path, text))
+
+
 @pytest.mark.parametrize(
     "text, message",
     [

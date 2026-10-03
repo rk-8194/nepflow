@@ -173,9 +173,8 @@ target_train_count=1000
 target_test_count=200
 target_tolerance=50
 
-# Descriptor aggregation type
+# Descriptor aggregation type (the current selector consumes one vector per structure)
 # structure: mean of per-atom descriptors â†’ one vector per structure (recommended)
-# atomic: per-atom descriptors with frame deduplication
 descriptor_type=structure
 
 [vasp]

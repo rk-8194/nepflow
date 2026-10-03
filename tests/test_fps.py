@@ -6,7 +6,7 @@ import pytest
 
 pytest.importorskip("NepTrainKit")
 
-from common import FPS  # noqa: E402
+from nepflow.stages.selection import sampling as SAMPLING  # noqa: E402
 
 
 class StructureStub:
@@ -15,41 +15,41 @@ class StructureStub:
 
 
 class FPSTests(unittest.TestCase):
-    def test_fps_run_returns_sorted_frame_indices_for_mean_descriptors(self) -> None:
+    def test_select_farthest_points_returns_sorted_frame_indices_for_mean_descriptors(self) -> None:
         descriptors = np.ones((3, 2))
         structures = [StructureStub(), StructureStub(), StructureStub()]
 
-        with patch.object(FPS, "farthest_point_sampling", return_value=[2, 0, 1]) as sampler:
-            result = FPS.fps_run(descriptors, structures, True, 0.1)
+        with patch.object(SAMPLING, "farthest_point_sampling", return_value=[2, 0, 1]) as sampler:
+            result = SAMPLING.select_farthest_points(descriptors, structures, True, 0.1)
 
         sampler.assert_called_once_with(descriptors, n_samples=3, min_dist=0.1)
         self.assertEqual(result, [0, 1, 2])
 
-    def test_fps_run_maps_atomic_descriptor_indices_back_to_frames(self) -> None:
+    def test_select_farthest_points_maps_atomic_rows_back_to_frames(self) -> None:
         descriptors = np.ones((5, 2))
         structures = [StructureStub(2), StructureStub(3)]
 
-        with patch.object(FPS, "farthest_point_sampling", return_value=[0, 1, 2, 4]):
-            result = FPS.fps_run(descriptors, structures, False, 0.2)
+        with patch.object(SAMPLING, "farthest_point_sampling", return_value=[0, 1, 2, 4]):
+            result = SAMPLING.select_farthest_points(descriptors, structures, False, 0.2)
 
         self.assertEqual(result, [0, 1])
 
-    def test_fps_count_uses_fps_run_length(self) -> None:
+    def test_selected_count_uses_selected_frame_length(self) -> None:
         descriptors = np.ones((4, 2))
         structures = [StructureStub(), StructureStub()]
 
-        with patch.object(FPS, "fps_run", return_value=[0, 2, 3]):
-            count = FPS.fps_count(descriptors, structures, True, 0.1)
+        with patch.object(SAMPLING, "select_farthest_points", return_value=[0, 2, 3]):
+            count = SAMPLING._selected_count(descriptors, structures, True, 0.1)
 
         self.assertEqual(count, 3)
 
-    def test_fps_target_count_converges_on_first_iteration_when_already_within_tolerance(self) -> None:
+    def test_target_count_converges_on_first_iteration_when_already_within_tolerance(self) -> None:
         descriptors = np.ones((2, 2))
         structures = [StructureStub(), StructureStub()]
 
-        with patch.object(FPS, "fps_count", return_value=2):
-            with patch.object(FPS, "fps_run", return_value=[0, 1]) as fps_run:
-                indices, best_dist = FPS.fps_target_count(
+        with patch.object(SAMPLING, "_selected_count", return_value=2):
+            with patch.object(SAMPLING, "select_farthest_points", return_value=[0, 1]) as select_points:
+                indices, best_dist = SAMPLING.select_farthest_points_for_target(
                     descriptors,
                     structures,
                     True,
@@ -62,18 +62,18 @@ class FPSTests(unittest.TestCase):
         self.assertEqual(indices, [0, 1])
         self.assertAlmostEqual(best_dist, 0.005, places=12)
         self.assertEqual(
-            fps_run.call_args_list[-1].args,
+            select_points.call_args_list[-1].args,
             (descriptors, structures, True, 0.005),
         )
 
-    def test_fps_target_count_runs_binary_search_until_within_tolerance(self) -> None:
+    def test_target_count_runs_binary_search_until_within_tolerance(self) -> None:
         descriptors = np.ones((5, 2))
         structures = [StructureStub() for _ in range(5)]
         count_values = [5, 4, 3, 3]
 
-        with patch.object(FPS, "fps_count", side_effect=count_values):
-            with patch.object(FPS, "fps_run", return_value=[0, 1, 2]) as fps_run:
-                indices, best_dist = FPS.fps_target_count(
+        with patch.object(SAMPLING, "_selected_count", side_effect=count_values):
+            with patch.object(SAMPLING, "select_farthest_points", return_value=[0, 1, 2]) as select_points:
+                indices, best_dist = SAMPLING.select_farthest_points_for_target(
                     descriptors,
                     structures,
                     True,
@@ -85,23 +85,23 @@ class FPSTests(unittest.TestCase):
 
         self.assertEqual(indices, [0, 1, 2])
         self.assertAlmostEqual(best_dist, 0.02, places=12)
-        self.assertGreaterEqual(fps_run.call_count, 2)
+        self.assertGreaterEqual(select_points.call_count, 2)
 
-    def test_cross_distance_stats_handles_empty_inputs(self) -> None:
+    def test_cross_distance_handles_empty_inputs(self) -> None:
         descriptors = np.ones((2, 2))
 
-        result = FPS.cross_distance_stats(descriptors, [], [0])
+        result = SAMPLING.calculate_cross_distance_stats(descriptors, [], [0])
 
         self.assertEqual(result, (float("inf"), float("inf")))
 
-    def test_cross_distance_stats_returns_min_and_mean(self) -> None:
+    def test_cross_distance_returns_min_and_mean(self) -> None:
         descriptors = np.array([
             [0.0, 0.0],
             [2.0, 0.0],
             [3.0, 0.0],
         ])
 
-        min_dist, mean_dist = FPS.cross_distance_stats(descriptors, [0], [1, 2])
+        min_dist, mean_dist = SAMPLING.calculate_cross_distance_stats(descriptors, [0], [1, 2])
 
         self.assertAlmostEqual(min_dist, 2.0, places=12)
         self.assertAlmostEqual(mean_dist, 2.5, places=12)

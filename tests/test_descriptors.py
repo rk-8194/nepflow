@@ -11,7 +11,7 @@ import pytest
 
 pytest.importorskip("NepTrainKit")
 
-from common import descriptors as DESCRIPTORS  # noqa: E402
+from nepflow.stages.selection import representations as DESCRIPTORS  # noqa: E402
 
 
 CACHE_SCHEMA_VERSION = "descriptor-cache-v1"
@@ -111,7 +111,7 @@ class DescriptorTests(unittest.TestCase):
                 "compute_descriptors_batched",
                 return_value=recomputed,
             ) as compute:
-                descriptors = DESCRIPTORS.load_or_compute_descriptors(
+                descriptors = DESCRIPTORS.load_or_calculate_representations(
                     project_dir,
                     structures,
                     mean_descriptor=mean_descriptor,
@@ -232,7 +232,7 @@ class DescriptorTests(unittest.TestCase):
             expected = np.load(project_dir / "nep" / "datasets" / "descriptors.npy")
 
             with patch.object(DESCRIPTORS, "compute_descriptors_batched") as compute:
-                descriptors = DESCRIPTORS.load_or_compute_descriptors(
+                descriptors = DESCRIPTORS.load_or_calculate_representations(
                     project_dir,
                     structures,
                     mean_descriptor=True,
@@ -250,7 +250,7 @@ class DescriptorTests(unittest.TestCase):
             self.write_cache_fixture(project_dir, structures)
 
             with patch.object(DESCRIPTORS, "compute_descriptors_batched") as compute:
-                descriptors = DESCRIPTORS.load_or_compute_descriptors(
+                descriptors = DESCRIPTORS.load_or_calculate_representations(
                     project_dir,
                     structures,
                     mean_descriptor=True,
@@ -290,7 +290,7 @@ class DescriptorTests(unittest.TestCase):
 
             self.assert_cache_recomputed(project_dir, structures)
 
-    def test_load_or_compute_descriptors_computes_and_saves_when_missing(self) -> None:
+    def test_load_or_calculate_representations_computes_and_saves_when_missing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_dir = Path(tmp)
             model_dir = project_dir / "config" / "nep"
@@ -299,7 +299,7 @@ class DescriptorTests(unittest.TestCase):
             model_path.write_text("stub", encoding="utf-8")
 
             with patch.object(DESCRIPTORS, "NepCalculator", CalculatorBoundary):
-                descriptors = DESCRIPTORS.load_or_compute_descriptors(
+                descriptors = DESCRIPTORS.load_or_calculate_representations(
                     project_dir,
                     [CacheStructure(f"structure-{i}") for i in range(3)],
                     mean_descriptor=False,
@@ -312,7 +312,7 @@ class DescriptorTests(unittest.TestCase):
                 (project_dir / "nep" / "datasets" / "descriptors.npy").exists()
             )
 
-    def test_load_or_compute_descriptors_recomputes_when_cache_shape_mismatches(self) -> None:
+    def test_load_or_calculate_representations_recomputes_when_cache_shape_mismatches(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_dir = Path(tmp)
             cache_path = project_dir / "nep" / "datasets"
@@ -325,7 +325,7 @@ class DescriptorTests(unittest.TestCase):
             with patch.object(DESCRIPTORS, "NepCalculator", CalculatorBoundary):
                 with patch.object(DESCRIPTORS, "compute_descriptors_batched") as compute:
                     compute.return_value = np.ones((3, 2))
-                    descriptors = DESCRIPTORS.load_or_compute_descriptors(
+                    descriptors = DESCRIPTORS.load_or_calculate_representations(
                         project_dir,
                         [CacheStructure(f"structure-{i}") for i in range(3)],
                         mean_descriptor=False,
@@ -345,7 +345,7 @@ class DescriptorTests(unittest.TestCase):
             structures = [CacheStructure(f"structure-{i}") for i in range(3)]
 
             with patch.object(DESCRIPTORS, "NepCalculator", CalculatorBoundary):
-                descriptors = DESCRIPTORS.load_or_compute_descriptors(
+                descriptors = DESCRIPTORS.load_or_calculate_representations(
                     project_dir,
                     structures,
                     mean_descriptor=False,
@@ -362,12 +362,12 @@ class DescriptorTests(unittest.TestCase):
             np.testing.assert_array_equal(saved, descriptors)
             self.assertEqual(manifest["descriptor_shape"], list(saved.shape))
 
-    def test_load_or_compute_descriptors_raises_when_model_file_missing(self) -> None:
+    def test_load_or_calculate_representations_raises_when_model_file_missing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_dir = Path(tmp)
 
             with self.assertRaisesRegex(FileNotFoundError, "NEP model not found"):
-                DESCRIPTORS.load_or_compute_descriptors(
+                DESCRIPTORS.load_or_calculate_representations(
                     project_dir,
                     [CacheStructure("structure-0")],
                     mean_descriptor=True,
@@ -383,7 +383,7 @@ class DescriptorTests(unittest.TestCase):
             model_path.unlink()
 
             with self.assertRaisesRegex(FileNotFoundError, "NEP model not found"):
-                DESCRIPTORS.load_or_compute_descriptors(
+                DESCRIPTORS.load_or_calculate_representations(
                     project_dir,
                     structures,
                     mean_descriptor=True,
