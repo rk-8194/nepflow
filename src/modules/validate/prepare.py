@@ -16,6 +16,8 @@ from nepflow.mlip.nep.artifacts import (
 )
 from nepflow.io.hashing import sha256_file
 from nepflow.state.store import StateStore
+from nepflow.stages.validation.resolution import resolve_model_dataset
+from nepflow.mlip.gpumd import GpumdBackend
 
 logger = logging.getLogger("nepflow.validate")
 
@@ -73,26 +75,15 @@ def _validated_model_run(project_dir: Path, model_run_id: str) -> dict:
 
 
 def find_model_run_and_dataset(project_dir: Path, model_run_id: str) -> Tuple[Path, Path]:
-    """Resolve one completed model run through its persisted manifest."""
-    manifest = _validated_model_run(project_dir, model_run_id)
-
-    potential_artifact = Path(str(manifest["potential_artifact_path"])).resolve()
-    potential_path = potential_artifact.parent
-    canonical_dir = (project_dir / "nep" / "potentials").resolve()
-    try:
-        if potential_path.parent != canonical_dir:
-            raise NepArtifactError(
-                f"Model artifact is outside canonical NEP storage: {potential_artifact}"
-            )
-    except OSError as exc:
-        raise RuntimeError(f"Could not resolve model artifact path: {potential_artifact}") from exc
-
-    dataset_path = Path(str(manifest["dataset_path"])).resolve()
+    """Resolve one completed model run through authoritative identities."""
+    resolved = resolve_model_dataset(project_dir, model_run_id)
+    potential_path = resolved.model_path.parent
+    dataset_path = resolved.dataset_path
     logger.info(
         "Resolved model_run_id=%s to potential=%s and dataset_id=%s",
         model_run_id,
         potential_path,
-        manifest["dataset_id"],
+        resolved.dataset_id,
     )
     return potential_path, dataset_path
 
@@ -367,7 +358,7 @@ def parse_test_xyz(test_xyz_path: Path) -> List[Dict]:
     try:
         # Read all structures from XYZ file
         structures = []
-        atoms_list = ase_read(str(test_xyz_path), index=":")
+        atoms_list = ase_read(str(test_xyz_path), index=":", format="extxyz")
         
         # Handle single structure vs multiple
         if isinstance(atoms_list, Atoms):
@@ -484,26 +475,17 @@ def prepare_validation_structures(
         # Create model.xyz
         model_xyz_path = struct_dir / "model.xyz"
         model_xyz_content = create_model_xyz_from_structure(atoms)
-        model_xyz_path.write_text(model_xyz_content)
+        model_xyz_path.write_text(model_xyz_content, encoding="utf-8", newline="\n")
         logger.debug(f"  Created model.xyz ({len(atoms)} atoms)")
         
         # Calculate required replicates. Geometry failures must stop
         # preparation rather than producing an unsafe default protocol.
         nx, ny, nz = calculate_required_replicates(model_xyz_path, nep_path)
         
-        # Generate the authoritative static NEP protocol.  The template is
-        # intentionally not inherited: arbitrary GPUMD commands could alter
-        # the physical configuration or select a different model artifact.
-        dump_command = "dump_xyz 1 out.xyz precision double force potential virial"
-        setup_lines = [
-            f"replicate {nx} {ny} {nz}",
-            "potential nep.txt",
-            "ensemble nve",
-            "time_step 0",
-            dump_command,
-            "run 1",
-        ]
-        run_in_content = "\n".join(setup_lines) + "\n"
+        # Generate the authoritative static NEP protocol through the GPUMD
+        # backend.  Arbitrary template commands cannot alter the physical
+        # configuration or select a different model artifact.
+        run_in_content = GpumdBackend.render_input(replicates=(nx, ny, nz))
         
         run_in_path = struct_dir / "run.in"
         run_in_path.write_text(run_in_content)

@@ -35,6 +35,10 @@ class StaticPredictionRequest:
     working_directory: Path
     atom_count: int
     virial_requested: bool = False
+    species: tuple[str, ...] | None = None
+    positions_angstrom: np.ndarray | None = None
+    cell_angstrom: np.ndarray | None = None
+    pbc: tuple[bool, bool, bool] | None = None
 
     def __post_init__(self) -> None:
         if self.atom_count < 1:
@@ -43,6 +47,44 @@ class StaticPredictionRequest:
             raise ValidationError(
                 "static prediction requires a model run with a model artifact"
             )
+        if self.species is not None:
+            species = tuple(str(value) for value in self.species)
+            if not species:
+                raise ValidationError("static prediction species must not be empty")
+            object.__setattr__(self, "species", species)
+        if self.positions_angstrom is not None:
+            positions = np.asarray(self.positions_angstrom, dtype=float)
+            if positions.ndim != 2 or positions.shape[1] != 3:
+                raise ValidationError(
+                    "static prediction reference positions must have shape (n_atoms, 3)"
+                )
+            if not np.isfinite(positions).all():
+                raise ValidationError("static prediction reference positions are not finite")
+            object.__setattr__(self, "positions_angstrom", np.array(positions, copy=True))
+        if self.cell_angstrom is not None:
+            cell = np.asarray(self.cell_angstrom, dtype=float)
+            if cell.shape != (3, 3) or not np.isfinite(cell).all():
+                raise ValidationError(
+                    "static prediction reference cell must be a finite 3x3 matrix"
+                )
+            object.__setattr__(self, "cell_angstrom", np.array(cell, copy=True))
+        if self.pbc is not None:
+            values = tuple(bool(value) for value in self.pbc)
+            if len(values) != 3:
+                raise ValidationError("static prediction reference pbc must have three flags")
+            object.__setattr__(self, "pbc", values)  # type: ignore[assignment]
+
+    @property
+    def cell(self) -> np.ndarray | None:
+        """Compatibility spelling for the reference cell metadata."""
+
+        return self.cell_angstrom
+
+    @property
+    def positions(self) -> np.ndarray | None:
+        """Compatibility spelling for reference Cartesian positions."""
+
+        return self.positions_angstrom
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,6 +113,10 @@ class StaticPrediction:
     virial_unit: str = VIRIAL_UNIT_EV
     virial_convention: str = VIRIAL_CONVENTION_POSITIVE_COMPRESSION
     virial_tensor_convention: str = VIRIAL_TENSOR_CONVENTION_CARTESIAN_3X3
+    species: tuple[str, ...] | None = None
+    positions_angstrom: np.ndarray | None = None
+    cell_angstrom: np.ndarray | None = None
+    pbc: tuple[bool, bool, bool] | None = None
 
     def __post_init__(self) -> None:
         if self.atom_count < 1:
@@ -112,6 +158,52 @@ class StaticPrediction:
             virial = np.array(virial, copy=True)
             virial.setflags(write=False)
             object.__setattr__(self, "virial_ev", virial)
+
+        if self.species is not None:
+            species = tuple(str(value) for value in self.species)
+            if len(species) != self.atom_count:
+                raise ValidationError(
+                    "static prediction species count does not match atom_count"
+                )
+            object.__setattr__(self, "species", species)
+        if self.positions_angstrom is not None:
+            positions = np.asarray(self.positions_angstrom, dtype=float)
+            if positions.shape != (self.atom_count, 3):
+                raise ValidationError(
+                    "static prediction positions must have shape "
+                    f"({self.atom_count}, 3), got {positions.shape}"
+                )
+            if not np.isfinite(positions).all():
+                raise ValidationError("static prediction positions contain non-finite values")
+            positions = np.array(positions, copy=True)
+            positions.setflags(write=False)
+            object.__setattr__(self, "positions_angstrom", positions)
+        if self.cell_angstrom is not None:
+            cell = np.asarray(self.cell_angstrom, dtype=float)
+            if cell.shape != (3, 3) or not np.isfinite(cell).all():
+                raise ValidationError(
+                    "static prediction cell must be a finite 3x3 matrix"
+                )
+            cell = np.array(cell, copy=True)
+            cell.setflags(write=False)
+            object.__setattr__(self, "cell_angstrom", cell)
+        if self.pbc is not None:
+            values = tuple(bool(value) for value in self.pbc)
+            if len(values) != 3:
+                raise ValidationError("static prediction pbc must have three flags")
+            object.__setattr__(self, "pbc", values)  # type: ignore[assignment]
+
+    @property
+    def cell(self) -> np.ndarray | None:
+        """Compatibility spelling for the output cell metadata."""
+
+        return self.cell_angstrom
+
+    @property
+    def positions(self) -> np.ndarray | None:
+        """Compatibility spelling for output Cartesian positions."""
+
+        return self.positions_angstrom
 
 
 @runtime_checkable

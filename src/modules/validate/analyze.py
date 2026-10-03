@@ -3,11 +3,15 @@
 import csv
 import logging
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 from ase.atoms import Atoms
 from ase.io import read as ase_read
+
+from nepflow.domain.models import ModelRunRecord
+from nepflow.mlip.gpumd import GpumdBackend
+from nepflow.stages.validation.protocols import ValidationCaseSpec
 
 logger = logging.getLogger("nepflow.validate")
 
@@ -160,6 +164,8 @@ def parse_dft_properties(test_xyz_path: Path) -> Dict[int, Dict]:
 def parse_gpumd_output(
     out_xyz_path: Path,
     require_virial: bool = True,
+    *,
+    request=None,
 ) -> Tuple[int, np.ndarray, Dict[str, object]]:
     """Parse genuine model predictions from GPUMD's ``dump_xyz`` output.
 
@@ -169,6 +175,21 @@ def parse_gpumd_output(
     energy or forces always fails; virial is required when the validation
     contract requests it.
     """
+    if request is not None:
+        prediction = GpumdBackend().parse_prediction(request, out_xyz_path)
+        return (
+            prediction.atom_count,
+            np.asarray(prediction.positions_angstrom, dtype=float),
+            {
+                "energy": prediction.energy_ev,
+                "forces": prediction.forces_ev_per_angstrom,
+                "virial": prediction.virial_ev,
+                "species": list(prediction.species or ()),
+                "cell": np.asarray(prediction.cell_angstrom, dtype=float),
+                "pbc": np.asarray(prediction.pbc, dtype=bool),
+            },
+        )
+
     atoms = _read_last_frame(out_xyz_path, "GPUMD out.xyz")
     predictions: Dict[str, object] = {
         "energy": _extract_energy(atoms, "GPUMD output"),
@@ -343,11 +364,51 @@ def _pair_model_configuration(
 
 def generate_comparison_csv(
     validation_root: Path,
-    test_xyz_path: Path,
+    test_xyz_path: Path | None,
     output_csv_path: Path,
+    *,
+    cases: Sequence[ValidationCaseSpec] | None = None,
+    model: ModelRunRecord | None = None,
 ) -> None:
-    """Generate a complete DFT-vs-model report from paired predictions."""
-    dft_data = parse_dft_properties(test_xyz_path)
+    """Generate a complete DFT-vs-model report from paired predictions.
+
+    The compatibility call accepts ``test_xyz_path``.  The canonical call
+    supplies identity-bound ``cases`` and the resolved ``model``; in that
+    path DFT labels come from the authoritative dataset records and the ML
+    values are parsed through :class:`GpumdBackend` and the static-prediction
+    protocol.
+    """
+    case_by_index = {case.ordinal: case for case in cases or ()}
+    if cases is not None:
+        if model is None:
+            raise ValueError("Canonical validation analysis requires the resolved model record")
+        dft_data = {
+            case.ordinal: {
+                "atoms_count": case.reference.atom_count,
+                "energy": case.reference.energy_ev,
+                "forces": np.asarray(case.reference.forces_ev_per_angstrom, dtype=float),
+                "virial": (
+                    None
+                    if case.reference.virial_ev is None
+                    else np.asarray(case.reference.virial_ev, dtype=float)
+                ),
+                "species": list(case.reference.species),
+                "positions": np.asarray(case.reference.positions_angstrom, dtype=float),
+                "cell": np.asarray(case.reference.cell_angstrom, dtype=float),
+                "pbc": np.asarray(case.reference.pbc, dtype=bool),
+                "composition": case.reference.metadata.get("composition", "")
+                if case.reference.metadata
+                else "",
+                "perturbation_family": case.reference.metadata.get("perturbation_family", "")
+                if case.reference.metadata
+                else "",
+            }
+            for case in cases
+        }
+    else:
+        if test_xyz_path is None:
+            raise ValueError("Validation analysis requires test_xyz_path or typed cases")
+        dft_data = parse_dft_properties(test_xyz_path)
     if not dft_data:
         raise ValueError("No DFT structures are available for validation")
 
@@ -358,10 +419,22 @@ def generate_comparison_csv(
     paired = []
     for struct_idx in sorted(dft_data):
         dft = dft_data[struct_idx]
-        struct_dir = validation_root / f"struct_{struct_idx:04d}"
+        case = case_by_index.get(struct_idx)
+        struct_dir = (
+            case.working_directory
+            if case is not None
+            else validation_root / f"struct_{struct_idx:04d}"
+        )
         out_xyz_path = struct_dir / "out.xyz"
+        request = (
+            case.static_prediction_request(model)
+            if case is not None and model is not None
+            else None
+        )
         ml_count, ml_positions, ml = parse_gpumd_output(
-            out_xyz_path, require_virial=virial_required
+            out_xyz_path,
+            require_virial=virial_required,
+            request=request,
         )
         factors = _read_replication_factors(struct_dir)
         reference_indices = _pair_model_configuration(
