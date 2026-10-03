@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 
 from nepflow.dft.vasp.outputs import VaspParseResult
+from nepflow.stages.training import dataset as dataset_module
 from nepflow.stages.training.dataset import (
     DatasetSplit,
     build_training_dataset,
@@ -113,6 +114,79 @@ def test_build_training_dataset_preserves_authoritative_members_and_splits(tmp_p
         "train-1",
         "test-1",
     ]
+    assert len(state_store.datasets) == 1
+    assert state_store.datasets[0].identity.dataset_id == manifest["dataset_id"]
+    assert [
+        {
+            "split": member.split,
+            "structure_id": member.structure_id,
+            "calculation_id": member.calculation_id,
+            "source_outcar_hash": member.source_outcar_hash,
+            "ordinal": member.ordinal,
+        }
+        for _, member in state_store.members
+    ] == [
+        {
+            "split": item["split"],
+            "structure_id": item["structure_id"],
+            "calculation_id": item["calculation_identity"]["calculation_id"],
+            "source_outcar_hash": item["source_outcar_hash"],
+            "ordinal": ordinal,
+        }
+        for ordinal, item in enumerate(manifest["accepted_members"])
+    ]
+
+
+def test_writer_failure_does_not_prepare_dataset_in_state_store(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    accepted = _result("writer-failure")
+    state_store = FakeStateStore([accepted])
+
+    def fail_writer(*_args, **_kwargs):
+        raise OSError("simulated dataset writer failure")
+
+    monkeypatch.setattr(dataset_module, "write_nep_dataset", fail_writer)
+    with pytest.raises(OSError, match="simulated dataset writer failure"):
+        build_training_dataset(
+            tmp_path / "dataset_0001",
+            {
+                DatasetSplit.TRAIN: (accepted,),
+                DatasetSplit.TEST: (accepted,),
+            },
+            tmp_path,
+            state_store=state_store,
+        )
+
+    assert state_store.datasets == []
+    assert state_store.members == []
+    assert not (tmp_path / "dataset_0001").exists()
+
+
+def test_manifest_write_failure_does_not_prepare_dataset_in_state_store(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    accepted = _result("manifest-failure")
+    state_store = FakeStateStore([accepted])
+
+    def fail_manifest(*_args, **_kwargs):
+        raise OSError("simulated manifest write failure")
+
+    monkeypatch.setattr(dataset_module, "write_json", fail_manifest)
+    with pytest.raises(OSError, match="simulated manifest write failure"):
+        build_training_dataset(
+            tmp_path / "dataset_0001",
+            {
+                DatasetSplit.TRAIN: (accepted,),
+                DatasetSplit.TEST: (accepted,),
+            },
+            tmp_path,
+            state_store=state_store,
+        )
+
+    assert state_store.datasets == []
+    assert state_store.members == []
+    assert not (tmp_path / "dataset_0001").exists()
 
 
 def test_rejected_exact_count_does_not_publish_dataset_files(tmp_path: Path) -> None:

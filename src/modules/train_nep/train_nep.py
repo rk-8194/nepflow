@@ -561,7 +561,7 @@ class TrainNepStage(Stage):
         return default_nep_template()
 
     def _get_or_create_dataset_folder(self) -> Path:
-        """Find next available dataset_XXXX folder and create it."""
+        """Find the next dataset publication target without creating it."""
         datasets_dir = self.project_dir / "nep" / "datasets"
         datasets_dir.mkdir(parents=True, exist_ok=True)
 
@@ -574,8 +574,7 @@ class TrainNepStage(Stage):
 
         next_id = max(existing, default=0) + 1
         dataset_path = datasets_dir / f"dataset_{next_id:04d}"
-        dataset_path.mkdir(parents=True, exist_ok=True)
-        logger.debug(f"Created dataset folder: dataset_{next_id:04d}")
+        logger.debug(f"Reserved dataset publication target: dataset_{next_id:04d}")
 
         return dataset_path
 

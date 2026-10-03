@@ -118,16 +118,13 @@ def _mark_model_run(
 
     if state_store is None or not model_run_id:
         return
-    try:
-        update_model_run_status(
-            potential_path,
-            status,
-            error=error,
-            state_store=state_store,
-            model_run_id=model_run_id,
-        )
-    except NepArtifactError as exc:
-        logger.error("Could not update authoritative model-run state: %s", exc)
+    update_model_run_status(
+        potential_path,
+        status,
+        error=error,
+        state_store=state_store,
+        model_run_id=model_run_id,
+    )
 
 
 def run_launcher(
@@ -363,23 +360,9 @@ def run_launcher(
                                 state_store=state_store,
                                 model_run_id=model_run_id,
                             )
-                        except NepArtifactError as exc:
-                            logger.error("Training artifact could not be finalized: %s", exc)
-                            _mark_model_run(
-                                potential_path,
-                                "failed",
-                                error=str(exc),
-                                state_store=state_store,
-                                model_run_id=model_run_id,
-                            )
-                            write_train_status(
-                                project_dir,
-                                potential_path=str(potential_path),
-                                job_id=job_id,
-                                status="failed",
-                                attempt=attempt,
-                                error=str(exc),
-                            )
+                        except NepArtifactError:
+                            logger.exception("Training artifact could not be finalized")
+                            raise
                         else:
                             logger.info(f"  ✓ NEP training completed successfully")
                             write_train_status(
@@ -398,15 +381,6 @@ def run_launcher(
                         error_msg = f"Training did not produce output (state: {job_state.value})"
                     
                     logger.warning(f"  ✗ Training failed: {error_msg}")
-                    # Clear job_id so resubmission knows to increment attempt
-                    write_train_status(
-                        project_dir,
-                        potential_path=str(potential_path),
-                        job_id=None,
-                        status="failed",
-                        attempt=attempt,
-                        error=error_msg,
-                    )
                     try:
                         update_model_run_status(
                             potential_path,
@@ -415,8 +389,21 @@ def run_launcher(
                             state_store=state_store,
                             model_run_id=model_run_id,
                         )
-                    except NepArtifactError as exc:
-                        logger.error("Could not update model-run manifest: %s", exc)
+                    except NepArtifactError:
+                        logger.exception("Could not update model-run manifest")
+                        raise
+
+                    # Clear job_id so resubmission knows to increment attempt.
+                    # The legacy projection is written only after the
+                    # authoritative StateStore transition succeeds.
+                    write_train_status(
+                        project_dir,
+                        potential_path=str(potential_path),
+                        job_id=None,
+                        status="failed",
+                        attempt=attempt,
+                        error=error_msg,
+                    )
                     
                     # Check if we should retry
                     if attempt < max_attempts:

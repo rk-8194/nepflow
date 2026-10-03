@@ -127,6 +127,15 @@ def update_model_run_status(
 ) -> dict[str, Any]:
     manifest_path = potential_path / MODEL_RUN_MANIFEST_FILENAME
     manifest = read_model_run_manifest(manifest_path)
+    if manifest.get("schema_version") != MODEL_RUN_MANIFEST_SCHEMA:
+        raise NepArtifactError(
+            f"Unsupported model-run manifest schema: {manifest.get('schema_version')}"
+        )
+    if manifest.get("identity_schema_version") != MODEL_RUN_IDENTITY_SCHEMA:
+        raise NepArtifactError(
+            "Unsupported model-run identity schema: "
+            f"{manifest.get('identity_schema_version')}"
+        )
     authoritative_identity: ModelRunIdentity | None = None
     execution_metadata: dict[str, Any] = {}
     if state_store is not None:
@@ -146,11 +155,26 @@ def update_model_run_status(
             nep_in_sha256=str(identity_payload["nep_in_sha256"]),
             hyperparameters_hash=str(identity_payload["hyperparameters_hash"]),
         )
-        for key, expected in authoritative_identity.to_dict().items():
+        for key in (
+            "model_run_id",
+            "dataset_id",
+            "nep_in_sha256",
+            "hyperparameters_hash",
+        ):
+            expected = authoritative_identity.to_dict()[key]
             if manifest.get(key) != expected:
                 raise NepArtifactError(
                     f"Filesystem model-run manifest conflicts with StateStore for {key}"
                 )
+        if manifest.get("identity_schema_version") != authoritative_identity.schema_version:
+            raise NepArtifactError(
+                "Filesystem model-run manifest conflicts with StateStore for "
+                "identity_schema_version"
+            )
+        if manifest.get("schema_version") != MODEL_RUN_MANIFEST_SCHEMA:
+            raise NepArtifactError(
+                f"Unsupported model-run manifest schema: {manifest.get('schema_version')}"
+            )
         stored_dataset_path = execution_metadata.get("dataset_path")
         if stored_dataset_path and Path(str(manifest.get("dataset_path", ""))).resolve() != Path(
             str(stored_dataset_path)
@@ -252,6 +276,10 @@ def validate_model_run_manifest(
         raise NepArtifactError(
             f"Model-run manifest {manifest_path} is missing: {', '.join(missing)}"
         )
+    if manifest.get("schema_version") != MODEL_RUN_MANIFEST_SCHEMA:
+        raise NepArtifactError(
+            f"Unsupported model-run manifest schema: {manifest.get('schema_version')}"
+        )
     if expected_model_run_id and manifest["model_run_id"] != expected_model_run_id:
         raise NepArtifactError(
             f"Manifest identity mismatch: expected {expected_model_run_id}, "
@@ -276,6 +304,12 @@ def validate_model_run_manifest(
                 raise NepArtifactError(
                     f"Filesystem model-run manifest conflicts with StateStore for {key}"
                 )
+        identity_schema = identity_payload.get("schema_version")
+        if manifest.get("identity_schema_version") != identity_schema:
+            raise NepArtifactError(
+                "Filesystem model-run manifest conflicts with StateStore for "
+                "identity_schema_version"
+            )
         if row.get("status") != manifest.get("status"):
             raise NepArtifactError(
                 f"Model-run status conflicts with StateStore: {row.get('status')!r}"

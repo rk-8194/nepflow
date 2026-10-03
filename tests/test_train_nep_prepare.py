@@ -613,6 +613,13 @@ class TrainNepMetadataTests(unittest.TestCase):
         )
 
         def fake_build_training_dataset(_dataset_path, _split_records, *_args, **_kwargs):
+            if not _kwargs.get("allow_partial", False) and (
+                selected_train != accepted_train or selected_test != accepted_test
+            ):
+                raise RuntimeError(
+                    "Dataset creation rejected selected structures; "
+                    "set train_nep.allow_partial_dataset=true to allow explicit partial data"
+                )
             train_results = [
                 self.accepted_result("train-%d" % index, -1.0 - index, f"train-hash-{index}")
                 for index in range(accepted_train)

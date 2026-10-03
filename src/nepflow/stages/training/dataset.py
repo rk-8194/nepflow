@@ -13,7 +13,10 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 import logging
+import os
 from pathlib import Path
+import shutil
+import tempfile
 from typing import Any, Iterable, Iterator, Mapping, Sequence
 
 import numpy as np
@@ -470,6 +473,84 @@ def _record_state_members(
             ordinal += 1
 
 
+def _publish_dataset_artifacts(
+    dataset_path: Path,
+    rendered: Mapping[DatasetSplit, Sequence[Mapping[str, Any]]],
+    metadata: Mapping[str, Any],
+    *,
+    train_virial: bool,
+    expected_counts: Mapping[DatasetSplit, int],
+) -> bool:
+    """Materialize a complete dataset and atomically promote it.
+
+    Returns whether an empty pre-existing target directory was replaced.  The
+    caller uses that information to restore the target if StateStore
+    finalization fails after publication.
+    """
+
+    dataset_path = Path(dataset_path)
+    dataset_path.parent.mkdir(parents=True, exist_ok=True)
+    target_was_empty = dataset_path.exists()
+    if target_was_empty and (
+        not dataset_path.is_dir() or any(dataset_path.iterdir())
+    ):
+        raise FileExistsError(
+            f"Dataset publication target is not an empty directory: {dataset_path}"
+        )
+
+    staging_path = Path(
+        tempfile.mkdtemp(
+            prefix=f".{dataset_path.name}.staging-",
+            dir=str(dataset_path.parent),
+        )
+    )
+    published = False
+    try:
+        train_count = write_nep_dataset(
+            staging_path / "train.xyz",
+            rendered[DatasetSplit.TRAIN],
+            include_virial=train_virial,
+        )
+        test_count = write_nep_dataset(
+            staging_path / "test.xyz",
+            rendered[DatasetSplit.TEST],
+            include_virial=train_virial,
+        )
+        if train_count != expected_counts[DatasetSplit.TRAIN]:
+            raise RuntimeError("Staged train dataset count does not match its report")
+        if test_count != expected_counts[DatasetSplit.TEST]:
+            raise RuntimeError("Staged test dataset count does not match its report")
+        write_json(staging_path / ".dataset", dict(metadata))
+
+        for filename in ("train.xyz", "test.xyz", ".dataset"):
+            artifact = staging_path / filename
+            if not artifact.is_file():
+                raise RuntimeError(f"Staged dataset artifact is missing: {artifact}")
+
+        if target_was_empty:
+            dataset_path.rmdir()
+        os.replace(staging_path, dataset_path)
+        published = True
+        return target_was_empty
+    except BaseException:
+        if published and dataset_path.exists():
+            shutil.rmtree(dataset_path)
+        if target_was_empty and not dataset_path.exists():
+            dataset_path.mkdir(parents=True, exist_ok=True)
+        if staging_path.exists():
+            shutil.rmtree(staging_path)
+        raise
+
+
+def _rollback_published_dataset(dataset_path: Path, *, restore_empty_target: bool) -> None:
+    """Remove only the dataset artifact published by this build."""
+
+    if dataset_path.exists():
+        shutil.rmtree(dataset_path)
+    if restore_empty_target:
+        dataset_path.mkdir(parents=True, exist_ok=True)
+
+
 def _require_state_authority(state_store: Any, result: VaspParseResult) -> None:
     """Require the parsed result and OUTCAR hash to exist in the ledger."""
 
@@ -625,24 +706,39 @@ def build_training_dataset(
     elif selection_parameters is not None:
         metadata["selection_parameters"] = to_jsonable(selection_parameters)
 
-    _record_state_members(
-        state_store,
-        manifest,
-        reports,
-        project_id=project_id,
+    restore_empty_target = _publish_dataset_artifacts(
+        dataset_path,
+        rendered,
+        metadata,
+        train_virial=train_virial,
+        expected_counts={
+            DatasetSplit.TRAIN: reports[DatasetSplit.TRAIN].accepted_count,
+            DatasetSplit.TEST: reports[DatasetSplit.TEST].accepted_count,
+        },
     )
-    dataset_path.mkdir(parents=True, exist_ok=True)
-    write_nep_dataset(
-        dataset_path / "train.xyz",
-        rendered[DatasetSplit.TRAIN],
-        include_virial=train_virial,
-    )
-    write_nep_dataset(
-        dataset_path / "test.xyz",
-        rendered[DatasetSplit.TEST],
-        include_virial=train_virial,
-    )
-    write_json(dataset_path / ".dataset", metadata)
+    try:
+        transaction = getattr(state_store, "transaction", None)
+        if callable(transaction):
+            with transaction():
+                _record_state_members(
+                    state_store,
+                    manifest,
+                    reports,
+                    project_id=project_id,
+                )
+        else:
+            _record_state_members(
+                state_store,
+                manifest,
+                reports,
+                project_id=project_id,
+            )
+    except BaseException:
+        _rollback_published_dataset(
+            dataset_path,
+            restore_empty_target=restore_empty_target,
+        )
+        raise
     return DatasetBuildResult(dataset_path, manifest, metadata, reports)
 
 

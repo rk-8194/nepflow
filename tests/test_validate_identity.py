@@ -21,10 +21,11 @@ from nepflow.mlip.nep.artifacts import (  # noqa: E402
 from modules.validate import validate as validate_stage_module  # noqa: E402
 from modules.validate.prepare import (  # noqa: E402
     finalize_nep_potential,
-    find_model_run_and_dataset,
     find_latest_potential_and_dataset,
 )
 from modules.validate.validate import ValidateStage  # noqa: E402
+from nepflow.domain.datasets import DatasetIdentity  # noqa: E402
+from nepflow.state.store import StateStore  # noqa: E402
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -47,33 +48,46 @@ def materialize_layout(
     models: dict[str, Path] = {}
     datasets: dict[str, Path] = {}
 
-    for dataset in layout["datasets"]:
-        dataset_path = project_dir / "nep" / dataset["directory"]
-        dataset_path.mkdir(parents=True, exist_ok=True)
-        (dataset_path / ".dataset").write_text(
-            json.dumps({"dataset_id": dataset["dataset_id"]}),
-            encoding="utf-8",
-        )
-        datasets[dataset["dataset_id"]] = dataset_path
-
-    for model in layout["models"]:
-        model_path = project_dir / "nep" / model["directory"]
-        model_path.mkdir(parents=True, exist_ok=True)
-        (model_path / "nep.txt").write_text(f"model={model['model_id']}\n", encoding="utf-8")
-        (model_path / "nep.in").write_text(
-            f"type 1 {model['model_id']}\n",
-            encoding="utf-8",
-        )
-        if write_manifests:
-            create_model_run_manifest(
-                potential_path=model_path,
-                dataset_path=datasets[model["dataset_id"]],
-                dataset_id=model["dataset_id"],
-                nep_in_path=model_path / "nep.in",
-                hyperparameters_hash=f"fixture-{model['model_id']}",
+    with StateStore(project_dir / "state.db") as state_store:
+        for dataset in layout["datasets"]:
+            dataset_path = project_dir / "nep" / dataset["directory"]
+            dataset_path.mkdir(parents=True, exist_ok=True)
+            (dataset_path / ".dataset").write_text(
+                json.dumps({"dataset_id": dataset["dataset_id"]}),
+                encoding="utf-8",
             )
-            update_model_run_status(model_path, "completed")
-        models[model["model_id"]] = model_path
+            datasets[dataset["dataset_id"]] = dataset_path
+            state_store.upsert_dataset(
+                DatasetIdentity(
+                    dataset["dataset_id"],
+                    {"schema_version": "nepflow.dataset.v1", "records": []},
+                )
+            )
+
+        for model in layout["models"]:
+            model_path = project_dir / "nep" / model["directory"]
+            model_path.mkdir(parents=True, exist_ok=True)
+            (model_path / "nep.txt").write_text(f"model={model['model_id']}\n", encoding="utf-8")
+            (model_path / "nep.in").write_text(
+                f"type 1 {model['model_id']}\n",
+                encoding="utf-8",
+            )
+            if write_manifests:
+                manifest = create_model_run_manifest(
+                    potential_path=model_path,
+                    dataset_path=datasets[model["dataset_id"]],
+                    dataset_id=model["dataset_id"],
+                    nep_in_path=model_path / "nep.in",
+                    hyperparameters_hash=f"fixture-{model['model_id']}",
+                    state_store=state_store,
+                )
+                update_model_run_status(
+                    model_path,
+                    "completed",
+                    state_store=state_store,
+                    model_run_id=manifest["model_run_id"],
+                )
+            models[model["model_id"]] = model_path
 
     # Deliberately make lower lexical indices newer on disk. Correct resolution
     # must use the explicit association, not either directory or mtime ordering.
@@ -119,7 +133,12 @@ def test_one_explicit_model_dataset_pair_resolves_exactly() -> None:
 
     with tempfile.TemporaryDirectory() as tmp:
         project_dir, models, datasets = materialize_layout(Path(tmp), single_pair)
-        resolved = train_stage_for(project_dir)._find_dataset_for_potential(models["model_old"])
+        with StateStore(project_dir / "state.db") as state_store:
+            resolved = train_stage_for(project_dir)._find_dataset_for_potential(
+                models["model_old"],
+                state_store=state_store,
+                model_run_id=model_run_id_for(models["model_old"]),
+            )
 
     assert resolved == datasets["dataset_old"]
 
@@ -137,10 +156,15 @@ def test_model_specific_resolution_ignores_directory_and_mtime_order(layout_name
     with tempfile.TemporaryDirectory() as tmp:
         project_dir, models, datasets = materialize_layout(Path(tmp), layout)
         stage = train_stage_for(project_dir)
-        resolved = {
-            model_id: stage._find_dataset_for_potential(model_path)
-            for model_id, model_path in models.items()
-        }
+        with StateStore(project_dir / "state.db") as state_store:
+            resolved = {
+                model_id: stage._find_dataset_for_potential(
+                    model_path,
+                    state_store=state_store,
+                    model_run_id=model_run_id_for(model_path),
+                )
+                for model_id, model_path in models.items()
+            }
 
     expected = {
         model["model_id"]: datasets[model["dataset_id"]]
@@ -171,8 +195,13 @@ def test_missing_model_dataset_association_is_an_error() -> None:
 
     with tempfile.TemporaryDirectory() as tmp:
         project_dir, models, _ = materialize_layout(Path(tmp), single_pair, write_manifests=False)
-        with pytest.raises((FileNotFoundError, ValueError, RuntimeError)):
-            train_stage_for(project_dir)._find_dataset_for_potential(models["model_old"])
+        with StateStore(project_dir / "state.db") as state_store:
+            with pytest.raises(RuntimeError, match="Unknown authoritative model run"):
+                train_stage_for(project_dir)._find_dataset_for_potential(
+                    models["model_old"],
+                    state_store=state_store,
+                    model_run_id="model_run_without_manifest",
+                )
 
 
 def test_missing_requested_model_is_an_error() -> None:
@@ -181,10 +210,13 @@ def test_missing_requested_model_is_an_error() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         project_dir, _, _ = materialize_layout(Path(tmp), layout)
         missing_model = project_dir / "nep" / "potentials" / "potential_missing"
-        with pytest.raises(FileNotFoundError):
-            train_stage_for(project_dir)._find_dataset_for_potential(missing_model)
-        with pytest.raises(FileNotFoundError):
-            find_model_run_and_dataset(project_dir, "model_missing")
+        with StateStore(project_dir / "state.db") as state_store:
+            with pytest.raises(RuntimeError, match="Unknown authoritative model run"):
+                train_stage_for(project_dir)._find_dataset_for_potential(
+                    missing_model,
+                    state_store=state_store,
+                    model_run_id="model_run_missing",
+                )
 
 
 def test_storage_path_is_not_the_scientific_model_identity() -> None:
