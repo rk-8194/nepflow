@@ -204,3 +204,14 @@ def test_model_run_id_remains_in_its_declared_legacy_section(tmp_path: Path) -> 
 
     assert adapted.get("gpumd", "model_run_id") == "run-1"
     assert not adapted.has_section("validate")
+
+
+def test_loader_exposes_deterministic_typed_training_sweep(tmp_path: Path) -> None:
+    text = BASE_CONFIG + "\n[training_sweep]\nlambda_f = 1.0|2.0\ncutoff = 6 5|7 5\n"
+
+    config = load_config(write_config(tmp_path, text))
+
+    assert config.train_nep.sweep_mapping() == {
+        "cutoff": (("6", "5"), ("7", "5")),
+        "lambda_f": (1.0, 2.0),
+    }

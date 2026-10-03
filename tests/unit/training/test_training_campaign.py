@@ -8,6 +8,7 @@ from nepflow.config.models import NepTrainingConfig
 from nepflow.domain.datasets import DatasetIdentity, TrainingDatasetManifest
 from nepflow.domain.identities import ArtifactIdentity
 from nepflow.domain.models import ModelArtifactMetadata
+from nepflow.errors import StateError
 from nepflow.hpc.jobs import ReconciledJobResult, SchedulerJobState, SlurmJobRecord, SubmissionResult
 from nepflow.mlip.backend import (
     CollectedModelArtifacts,
@@ -88,6 +89,17 @@ class FakeBackend:
         return "backend_failed"
 
 
+class AttemptDirectoryBackend(FakeBackend):
+    """Completion evidence is present only when the active attempt has output."""
+
+    def parse_completion(self, run_directory):
+        artifact = Path(run_directory) / "nep.txt"
+        return TrainingCompletion(
+            artifact.is_file(),
+            (artifact,) if artifact.is_file() else (),
+        )
+
+
 def _dataset() -> TrainingDatasetManifest:
     return TrainingDatasetManifest(
         identity=DatasetIdentity(
@@ -102,7 +114,8 @@ def _input(tmp_path: Path, name: str) -> TrainingInput:
     run_directory = tmp_path / name
     run_directory.mkdir(parents=True, exist_ok=True)
     content = f"input={name}\n"
-    (run_directory / "nep.in").write_text(content, encoding="utf-8")
+    with (run_directory / "nep.in").open("w", encoding="utf-8", newline="") as handle:
+        handle.write(content)
     return TrainingInput(
         dataset=_dataset(),
         working_directory=run_directory,
@@ -260,6 +273,80 @@ def test_retry_keeps_model_run_nonterminal_until_attempts_are_exhausted(tmp_path
         assert result.candidates[0].status == "submitted"
         assert len(scheduler.submissions) == 2
         assert store.get_model_run(candidate.model_run_id)["status"] == "prepared"
+
+
+def test_retry_restart_uses_a_distinct_discoverable_scheduler_name(tmp_path: Path) -> None:
+    scheduler = FakeScheduler()
+    backend = FakeBackend()
+    with StateStore(tmp_path / "state.db") as store:
+        campaign = _campaign(tmp_path, store, scheduler, backend, max_attempts=2)
+        candidate = campaign.create_run(_input(tmp_path, "restart-retry"), ordinal=0)
+        campaign.reconcile()
+        first_job = campaign.candidates()[0].job_id or "job-1"
+        scheduler.states[first_job] = SchedulerJobState.FAILED
+
+        campaign.reconcile()
+        attempts = campaign.attempts(candidate.model_run_id)
+        assert len(attempts) == 2
+        assert attempts[0].job_name != attempts[1].job_name
+        assert attempts[0].job_name.endswith("-a0001")
+        assert attempts[1].job_name.endswith("-a0002")
+
+        restarted = _campaign(tmp_path, store, scheduler, backend, max_attempts=2)
+        restarted.reconcile()
+        assert len(scheduler.submissions) == 2
+
+
+def test_stale_output_from_failed_attempt_cannot_complete_retry(tmp_path: Path) -> None:
+    scheduler = FakeScheduler()
+    backend = AttemptDirectoryBackend()
+    with StateStore(tmp_path / "state.db") as store:
+        campaign = _campaign(tmp_path, store, scheduler, backend, max_attempts=2)
+        candidate = campaign.create_run(_input(tmp_path, "stale-output"), ordinal=0)
+        campaign.reconcile()
+        first_job = campaign.candidates()[0].job_id or "job-1"
+        (candidate.run_directory / "nep.txt").write_text("stale", encoding="utf-8")
+        scheduler.states[first_job] = SchedulerJobState.FAILED
+        campaign.reconcile()
+        second_job = campaign.candidates()[0].job_id or "job-2"
+        scheduler.states[second_job] = SchedulerJobState.FAILED
+
+        result = campaign.reconcile()
+        assert result.candidates[0].status == "failed"
+        assert campaign.attempts(candidate.model_run_id)[1].status == "failed"
+
+
+def test_campaign_persists_execution_policy_and_rejects_matrix_changes(
+    tmp_path: Path,
+) -> None:
+    scheduler = FakeScheduler()
+    backend = FakeBackend()
+    specification = {
+        "candidate_keys": ["candidate-a"],
+        "candidate_matrix": [{"ordinal": 0, "candidate_key": "candidate-a"}],
+        "max_attempts": 2,
+        "max_concurrent": 1,
+        "backend": {"kind": "fake", "command_fingerprint": "command-a"},
+        "resource_policy": {"walltime": "01:00:00"},
+    }
+    with StateStore(tmp_path / "state.db") as store:
+        campaign = _campaign(tmp_path, store, scheduler, backend)
+        campaign.ensure(specification)
+        campaign.ensure({**specification, "max_concurrent": 2})
+
+        events = store.list_training_events("training_campaign", "campaign-1")
+        assert any(event["event_type"] == "policy_updated" for event in events)
+
+        with pytest.raises(StateError, match="conflicting immutable"):
+            campaign.ensure(
+                {
+                    **specification,
+                    "candidate_keys": ["candidate-b"],
+                    "candidate_matrix": [
+                        {"ordinal": 0, "candidate_key": "candidate-b"}
+                    ],
+                }
+            )
 
 
 def test_scheduler_disappearance_is_not_completion_evidence(tmp_path: Path) -> None:

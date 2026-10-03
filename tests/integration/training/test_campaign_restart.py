@@ -63,9 +63,10 @@ def test_campaign_reopens_persisted_submission_without_resubmitting(tmp_path: Pa
         hyperparameters_hash="hyper-restart",
     )
     training_input.working_directory.mkdir(parents=True, exist_ok=True)
-    (training_input.working_directory / "nep.in").write_text(
-        training_input.content, encoding="utf-8"
-    )
+    with (training_input.working_directory / "nep.in").open(
+        "w", encoding="utf-8", newline=""
+    ) as handle:
+        handle.write(training_input.content)
     scheduler = RestartScheduler()
     backend = RestartBackend()
     state_path = tmp_path / "state.db"

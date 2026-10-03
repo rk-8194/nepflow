@@ -1,8 +1,9 @@
 """Canonical project-config loading and the temporary legacy adapter."""
 
 from configparser import ConfigParser
+import json
 from pathlib import Path
-from typing import Mapping
+from typing import Any, Mapping
 
 from nepflow.errors import ConfigurationError
 
@@ -123,6 +124,39 @@ _ALLOWED_KEYS: dict[str, frozenset[str]] = {
         "train_virial",
         "allow_partial_dataset",
         "max_resubmit",
+        "sweep",
+        "sweep_population",
+        "sweep_batch",
+        "sweep_generations",
+        "sweep_charge_mode",
+        "sweep_weights",
+        "sweep_outer_zbl",
+        "sweep_cutoff",
+        "sweep_n_max",
+        "sweep_basis_size",
+        "sweep_l_max",
+        "sweep_neuron",
+        "sweep_lambda_e",
+        "sweep_lambda_f",
+        "sweep_lambda_v",
+        "sweep_lambda_shear",
+    }),
+    "training_sweep": frozenset({
+        "population",
+        "batch",
+        "generations",
+        "charge_mode",
+        "weights",
+        "outer_zbl",
+        "cutoff",
+        "n_max",
+        "basis_size",
+        "l_max",
+        "neuron",
+        "lambda_e",
+        "lambda_f",
+        "lambda_v",
+        "lambda_shear",
     }),
     "gpumd": frozenset({"enabled", "model_run_id"}),
     "validate": frozenset({"model_run_id"}),
@@ -365,6 +399,7 @@ def load_config(
         train_virial=_parse_bool(train_section.get("train_virial", "false"), "train_nep.train_virial"),
         allow_partial_dataset=_parse_bool(train_section.get("allow_partial_dataset", "false"), "train_nep.allow_partial_dataset"),
         max_resubmit=_parse_int(train_section.get("max_resubmit", "3"), "train_nep.max_resubmit"),
+        sweep=_parse_training_sweep(parser, train_section),
     )
 
     slurm_section = _section(parser, "slurm")
@@ -581,6 +616,14 @@ def to_legacy_config(config: NepflowConfig) -> ConfigParser:
         "allow_partial_dataset": _bool_text(config.train_nep.allow_partial_dataset),
         "max_resubmit": str(config.train_nep.max_resubmit),
     })
+    if config.train_nep.sweep:
+        add_section(
+            "training_sweep",
+            {
+                name: "|".join(_format_sweep_value(value) for value in values)
+                for name, values in config.train_nep.sweep
+            },
+        )
     gpumd_values = {"enabled": _bool_text(config.validation.enabled)}
     if "gpumd" in present_sections and config.validation.model_run_id:
         gpumd_values["model_run_id"] = config.validation.model_run_id
@@ -611,6 +654,145 @@ def to_legacy_config(config: NepflowConfig) -> ConfigParser:
         "gpumd_command": config.hpc.gpumd_command,
     })
     return parser
+
+
+_SWEEP_FIELDS = (
+    "population",
+    "batch",
+    "generations",
+    "charge_mode",
+    "weights",
+    "outer_zbl",
+    "cutoff",
+    "n_max",
+    "basis_size",
+    "l_max",
+    "neuron",
+    "lambda_e",
+    "lambda_f",
+    "lambda_v",
+    "lambda_shear",
+)
+_SWEEP_TUPLE_FIELDS = frozenset(
+    {"weights", "cutoff", "n_max", "basis_size", "l_max", "neuron"}
+)
+
+
+def _parse_training_sweep(
+    parser: ConfigParser,
+    train_section: Mapping[str, str],
+) -> tuple[tuple[str, tuple[Any, ...]], ...]:
+    """Parse the canonical, typed sweep declaration.
+
+    The preferred form is a ``[training_sweep]`` section whose values use
+    ``|`` between ordered candidates, for example ``lambda_f = 1.0|2.0`` or
+    ``cutoff = 6 5|7 5``.  A JSON object in ``train_nep.sweep`` is accepted as
+    a compact equivalent for programmatic/project generators.
+    """
+
+    section_values = _section(parser, "training_sweep")
+    declarations: dict[str, Any] = {}
+    for name, raw in section_values.items():
+        declarations[name] = _parse_sweep_options(name, raw)
+
+    compact = train_section.get("sweep")
+    if compact:
+        try:
+            decoded = json.loads(compact)
+        except json.JSONDecodeError as exc:
+            raise ConfigurationError(
+                "train_nep.sweep must be a JSON object of scientific field candidates"
+            ) from exc
+        if not isinstance(decoded, dict):
+            raise ConfigurationError("train_nep.sweep must be a JSON object")
+        for name, values in decoded.items():
+            if name in declarations:
+                raise ConfigurationError(
+                    f"Training sweep field is declared twice: {name}"
+                )
+            declarations[str(name)] = values
+
+    for key, raw in train_section.items():
+        if not key.startswith("sweep_") or key == "sweep":
+            continue
+        name = key.removeprefix("sweep_")
+        if name in declarations:
+            raise ConfigurationError(f"Training sweep field is declared twice: {name}")
+        declarations[name] = _parse_sweep_options(name, raw)
+
+    unknown = sorted(set(declarations) - set(_SWEEP_FIELDS))
+    if unknown:
+        raise ConfigurationError(
+            "Training sweeps may vary only scientific NEP settings: "
+            + ", ".join(unknown)
+        )
+
+    base = NepTrainingConfig()
+    normalized: list[tuple[str, tuple[Any, ...]]] = []
+    for name in _SWEEP_FIELDS:
+        if name not in declarations:
+            continue
+        raw_values = declarations[name]
+        if not isinstance(raw_values, (list, tuple)) or not raw_values:
+            raise ConfigurationError(f"training sweep {name} must contain candidates")
+        values: list[Any] = []
+        for value in raw_values:
+            values.append(_parse_sweep_value(name, value, getattr(base, name)))
+        normalized.append((name, tuple(values)))
+    return tuple(normalized)
+
+
+def _parse_sweep_options(name: str, raw: str) -> list[Any]:
+    text = raw.strip()
+    if not text:
+        raise ConfigurationError(f"training sweep {name} must not be blank")
+    try:
+        decoded = json.loads(text)
+    except json.JSONDecodeError:
+        decoded = None
+    if isinstance(decoded, list):
+        return list(decoded)
+    if "|" in text:
+        return [item.strip() for item in text.split("|") if item.strip()]
+    # Tuple-valued fields need an explicit candidate separator.  For scalar
+    # fields a comma-separated declaration is the convenient INI form.
+    if name in _SWEEP_TUPLE_FIELDS:
+        return [text]
+    return [item.strip() for item in text.split(",") if item.strip()]
+
+
+def _parse_sweep_value(name: str, value: Any, current: Any) -> Any:
+    if name in _SWEEP_TUPLE_FIELDS:
+        if isinstance(value, (list, tuple)):
+            items = tuple(value)
+        elif isinstance(value, str):
+            items = tuple(item for item in value.replace(",", " ").split() if item)
+        else:
+            raise ConfigurationError(f"training sweep {name} contains an invalid candidate")
+        if name == "weights":
+            try:
+                return tuple(float(item) for item in items)
+            except (TypeError, ValueError) as exc:
+                raise ConfigurationError(f"training sweep {name} must contain numbers") from exc
+        return tuple(str(item) for item in items)
+    try:
+        if isinstance(current, bool):
+            if not isinstance(value, bool):
+                raise ValueError
+            return value
+        if isinstance(current, int):
+            return int(value)
+        if isinstance(current, float):
+            return float(value)
+    except (TypeError, ValueError) as exc:
+        raise ConfigurationError(f"training sweep {name} has an invalid candidate") from exc
+    return value
+
+
+def _format_sweep_value(value: Any) -> str:
+    if isinstance(value, (tuple, list)):
+        return " ".join(str(item) for item in value)
+    return str(value)
 
 
 def _read_parser(path: Path) -> ConfigParser:

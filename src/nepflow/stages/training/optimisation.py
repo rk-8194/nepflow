@@ -77,6 +77,7 @@ class CandidateConfiguration:
             "hyperparameters": {
                 field.name: getattr(self.hyperparameters, field.name)
                 for field in fields(self.hyperparameters)
+                if field.name != "sweep"
             },
         }
         return "candidate_" + sha256_bytes(canonical_json_bytes(payload))[:16]

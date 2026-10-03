@@ -85,7 +85,9 @@ def test_equivalent_effective_inputs_have_stable_identity() -> None:
 
 def test_effective_type_list_and_order_changes_identity() -> None:
     baseline_rendered, baseline_identity = render_and_identify()
-    extra_rendered, extra_identity = render_and_identify(composition_elements="Si,Ge,O")
+    extra_rendered, extra_identity = render_and_identify(
+        composition_elements="Si,Ge,O", weights="1,1,1"
+    )
     reordered_rendered, reordered_identity = render_and_identify(composition_elements="Ge,Si")
 
     assert baseline_rendered != extra_rendered

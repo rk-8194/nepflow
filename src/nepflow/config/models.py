@@ -2,6 +2,8 @@
 
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from collections.abc import Mapping
+from typing import Any
 
 
 CONFIG_SCHEMA_VERSION = 1
@@ -169,6 +171,25 @@ class NepTrainingConfig:
     train_virial: bool = False
     allow_partial_dataset: bool = False
     max_resubmit: int = 3
+    # A deterministic, typed candidate sweep.  Each item is a field name and
+    # its ordered candidate values; the optimisation layer validates that the
+    # names are scientific NEP fields before constructing candidates.
+    sweep: tuple[tuple[str, tuple[Any, ...]], ...] = ()
+
+    def __post_init__(self) -> None:
+        source = self.sweep.items() if isinstance(self.sweep, Mapping) else self.sweep
+        normalized = tuple(
+            (str(name), tuple(values))
+            for name, values in sorted(source, key=lambda item: str(item[0]))
+        )
+        if len({name for name, _values in normalized}) != len(normalized):
+            raise ValueError("NEP training sweep fields must be unique")
+        object.__setattr__(self, "sweep", normalized)
+
+    def sweep_mapping(self) -> dict[str, tuple[Any, ...]]:
+        """Return the configured sweep in the mapping form used by ``ControlledSweep``."""
+
+        return {str(name): tuple(values) for name, values in self.sweep}
 
 
 @dataclass(frozen=True, slots=True)

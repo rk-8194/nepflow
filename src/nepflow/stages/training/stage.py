@@ -7,7 +7,6 @@ from pathlib import Path
 import shutil
 from typing import Any, Callable
 
-from nepflow.config.loader import load_config
 from nepflow.errors import StateError
 from nepflow.hpc.resources import JobResources
 from nepflow.hpc.slurm import SlurmScheduler
@@ -24,6 +23,7 @@ from .dataset import (
     DatasetBuildResult,
     build_training_dataset,
     load_materialized_dataset,
+    prepare_training_dataset,
     resolve_selected_dft_results,
 )
 from .optimisation import ControlledSweep
@@ -49,14 +49,23 @@ class TrainingStage:
 
     @staticmethod
     def _dataset_path(project_dir: Path) -> Path:
+        """Validate explicit selection inputs for compatibility callers.
+
+        The canonical stage no longer derives dataset identity or storage from
+        these files; it resolves authoritative DFT records first.
+        """
+
         selected_dir = Path(project_dir) / "structures" / "selected"
-        train_hash = sha256_file(selected_dir / "train.xyz")
-        test_hash = sha256_file(selected_dir / "test.xyz")
-        return (
-            Path(project_dir)
-            / "nep"
-            / "datasets"
-            / f"dataset_{train_hash[:16]}_{test_hash[:16]}"
+        for split in ("train", "test"):
+            source = selected_dir / f"{split}.xyz"
+            if not source.is_file():
+                raise FileNotFoundError(
+                    f"Selected {split} structures not found at {source}; "
+                    "run the select stage first"
+                )
+        raise StateError(
+            "Dataset storage is keyed by the resolved authoritative dataset identity; "
+            "call _assemble_dataset instead of deriving a path from selection files"
         )
 
     @staticmethod
@@ -64,7 +73,14 @@ class TrainingStage:
         payload = {
             "schema_version": "nepflow.training_campaign.v1",
             "dataset_id": dataset_id,
-            "candidates": [asdict(candidate.hyperparameters) for candidate in candidates],
+            "candidates": [
+                {
+                    "ordinal": candidate.ordinal,
+                    "candidate_key": candidate.candidate_key,
+                    "overrides": dict(candidate.overrides),
+                }
+                for candidate in candidates
+            ],
         }
         return "campaign_" + sha256_bytes(canonical_json_bytes(payload))[:24]
 
@@ -92,9 +108,24 @@ class TrainingStage:
             shutil.copy2(source, destination)
 
     def _config(self, context: StageContext) -> Any:
-        if context.config is not None:
-            return context.config
-        return load_config(context.config_file, project_name=context.project_name)
+        if context.config is None:
+            raise StateError(
+                "TrainingStage requires the injected typed project configuration"
+            )
+        return context.config
+
+    @staticmethod
+    def _assert_authoritative_dataset(dataset_manifest: Any, state_store: Any) -> None:
+        get_dataset = getattr(state_store, "get_dataset", None)
+        if not callable(get_dataset):
+            raise StateError("TrainingStage requires StateStore dataset identity APIs")
+        dataset_id = dataset_manifest.identity.dataset_id
+        row = get_dataset(dataset_id)
+        persisted = None if row is None else row.get("identity_json", row.get("identity"))
+        if not isinstance(persisted, dict) or persisted != dataset_manifest.identity.to_dict():
+            raise StateError(
+                "Training dataset is not registered in authoritative StateStore"
+            )
 
     def _assemble_dataset(
         self,
@@ -102,9 +133,31 @@ class TrainingStage:
         config: Any,
         state_store: Any,
     ) -> tuple[Any, Path]:
-        dataset_path = self._dataset_path(context.project_dir)
+        # Resolve exact selected DFT identities and accepted OUTCAR hashes
+        # before consulting any materialized directory.  Selection files are
+        # inputs to resolution, not the dataset identity.
+        split_records = resolve_selected_dft_results(
+            context.project_dir,
+            state_store,
+            reader=self.reader,
+        )
+        preview_path = context.project_dir / "nep" / "datasets" / ".identity-preview"
+        preparation = prepare_training_dataset(
+            split_records,
+            preview_path,
+            train_virial=config.train_nep.train_virial,
+            allow_partial=config.train_nep.allow_partial_dataset,
+            state_store=state_store,
+            project_id=context.project_name,
+        )
+        dataset_id = preparation.manifest.identity.dataset_id
+        dataset_path = context.project_dir / "nep" / "datasets" / dataset_id
         if (dataset_path / ".dataset").is_file():
             manifest, metadata = load_materialized_dataset(dataset_path, state_store)
+            if manifest.identity.to_dict() != preparation.manifest.identity.to_dict():
+                raise StateError(
+                    "Materialized training dataset conflicts with the resolved DFT identity"
+                )
             if bool(metadata.get("virial_required", False)) != bool(
                 config.train_nep.train_virial
             ):
@@ -119,11 +172,6 @@ class TrainingStage:
                 )
             return manifest, dataset_path
 
-        split_records = resolve_selected_dft_results(
-            context.project_dir,
-            state_store,
-            reader=self.reader,
-        )
         result = self.dataset_builder(
             dataset_path,
             split_records,
@@ -144,13 +192,9 @@ class TrainingStage:
         dataset_path: Path,
         backend: Any,
     ) -> None:
-        sweep_values = context.options.get(
-            "training_sweep",
-            context.options.get("candidate_sweep", {}),
-        )
         candidates = ControlledSweep.from_mapping(
             config.train_nep,
-            sweep_values if isinstance(sweep_values, dict) else {},
+            config.train_nep.sweep_mapping(),
         ).configurations()
         template = context.project_dir / "config" / "nep" / "nep.in"
         template_path = template if template.is_file() else None
@@ -256,18 +300,15 @@ class TrainingStage:
             config,
             state_store,
         )
+        self._assert_authoritative_dataset(dataset_manifest, state_store)
         backend = self.backend or NepBackend(config.hpc.nep_command)
         scheduler = self.scheduler or SlurmScheduler()
         # The campaign identity includes the effective candidate matrix, so a
         # restart reopens the same event stream rather than proposing trials
         # from mutable folder order.
-        sweep_values = context.options.get(
-            "training_sweep",
-            context.options.get("candidate_sweep", {}),
-        )
         candidates = ControlledSweep.from_mapping(
             config.train_nep,
-            sweep_values if isinstance(sweep_values, dict) else {},
+            config.train_nep.sweep_mapping(),
         ).configurations()
         campaign_id = self._campaign_id(dataset_manifest.identity.dataset_id, candidates)
         campaign = self.campaign_factory(
@@ -284,9 +325,32 @@ class TrainingStage:
         )
         campaign.ensure(
             {
-                "backend": "nep",
-                "candidate_count": len(candidates),
+                "schema_version": "nepflow.training_campaign_spec.v2",
+                "candidate_keys": [candidate.candidate_key for candidate in candidates],
+                "candidate_matrix": [
+                    {
+                        "ordinal": candidate.ordinal,
+                        "candidate_key": candidate.candidate_key,
+                        "overrides": dict(candidate.overrides),
+                        "hyperparameters": {
+                            key: value
+                            for key, value in asdict(candidate.hyperparameters).items()
+                            if key != "sweep"
+                        },
+                    }
+                    for candidate in candidates
+                ],
+                "max_attempts": config.train_nep.max_resubmit + 1,
                 "max_concurrent": config.slurm.max_concurrent,
+                "backend": {
+                    "kind": f"{type(backend).__module__}.{type(backend).__qualname__}",
+                    "command": list(getattr(backend, "command", ())),
+                    "configured_command": config.hpc.nep_command,
+                    "command_fingerprint": sha256_bytes(
+                        canonical_json_bytes(config.hpc.nep_command)
+                    ),
+                },
+                "resource_policy": asdict(self._resources(config)),
             }
         )
         self._prepare_candidates(

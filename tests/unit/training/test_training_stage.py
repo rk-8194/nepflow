@@ -20,7 +20,10 @@ class RecordingBackend:
         self.requests.append(request)
         request.working_directory.mkdir(parents=True, exist_ok=True)
         content = "type 1 Si\n"
-        (request.working_directory / "nep.in").write_text(content, encoding="utf-8")
+        with (request.working_directory / "nep.in").open(
+            "w", encoding="utf-8", newline=""
+        ) as handle:
+            handle.write(content)
         return TrainingInput(
             dataset=request.dataset,
             working_directory=request.working_directory,
@@ -108,6 +111,9 @@ def test_training_stage_delegates_preparation_to_backend_and_campaign(tmp_path: 
 
     stage._assemble_dataset = assemble
     with StateStore(tmp_path / "state.db") as state_store:
+        # The stage consumes the authoritative dataset FK; an injected
+        # assembler must register the exact identity it returns.
+        state_store.upsert_dataset(dataset)
         result = stage.run(
             StageContext(
                 project_name="demo",

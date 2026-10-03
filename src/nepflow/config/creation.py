@@ -219,6 +219,13 @@ allow_partial_dataset=false
 # Maximum number of resubmission attempts if training job fails
 max_resubmit=3
 
+# Optional deterministic Cartesian sweep over scientific NEP fields.
+# Separate ordered candidates with |, e.g. lambda_f=1.0|2.0 or
+# cutoff=6 5|7 5.  Runtime-only scheduler/resource settings are not allowed.
+[training_sweep]
+# lambda_f=1.0|2.0
+# cutoff=6 5|7 5
+
 [gpumd]
 enabled=true
 # Explicit model_run_id to validate; generated after NEP training completes.

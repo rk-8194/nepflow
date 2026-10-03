@@ -185,6 +185,16 @@ class DatasetBuildResult:
         return self.reports[DatasetSplit.TEST].accepted_count
 
 
+@dataclass(frozen=True)
+class DatasetBuildPreparation:
+    """Validated, content-derived dataset inputs before publication."""
+
+    manifest: TrainingDatasetManifest
+    metadata: Mapping[str, Any]
+    reports: Mapping[DatasetSplit, DatasetBuildReport]
+    rendered: Mapping[DatasetSplit, Sequence[Mapping[str, Any]]]
+
+
 def _reset_or_create_report(
     split: DatasetSplit,
     requested_count: int,
@@ -617,6 +627,74 @@ def build_training_dataset(
     compatibility adapter before this boundary.
     """
 
+    dataset_path = Path(dataset_path)
+    preparation = prepare_training_dataset(
+        split_records,
+        dataset_path,
+        train_virial=train_virial,
+        allow_partial=allow_partial,
+        state_store=state_store,
+        selection_method=selection_method,
+        selection_parameters=selection_parameters,
+    )
+
+    restore_empty_target = _publish_dataset_artifacts(
+        dataset_path,
+        preparation.rendered,
+        preparation.metadata,
+        train_virial=train_virial,
+        expected_counts={
+            DatasetSplit.TRAIN: preparation.reports[DatasetSplit.TRAIN].accepted_count,
+            DatasetSplit.TEST: preparation.reports[DatasetSplit.TEST].accepted_count,
+        },
+    )
+    try:
+        transaction = getattr(state_store, "transaction", None)
+        if callable(transaction):
+            with transaction():
+                _record_state_members(
+                    state_store,
+                    preparation.manifest,
+                    preparation.reports,
+                    project_id=project_id,
+                )
+        else:
+            _record_state_members(
+                state_store,
+                    preparation.manifest,
+                    preparation.reports,
+                project_id=project_id,
+            )
+    except BaseException:
+        _rollback_published_dataset(
+            dataset_path,
+            restore_empty_target=restore_empty_target,
+        )
+        raise
+    return DatasetBuildResult(
+        dataset_path,
+        preparation.manifest,
+        preparation.metadata,
+        preparation.reports,
+    )
+
+
+def prepare_training_dataset(
+    split_records: Mapping[DatasetSplit | str, Sequence[Any]],
+    dataset_path: Path,
+    *,
+    train_virial: bool = False,
+    allow_partial: bool = False,
+    state_store: Any | None = None,
+    selection_method: str | None = None,
+    selection_parameters: Mapping[str, Any] | None = None,
+) -> DatasetBuildPreparation:
+    """Resolve and validate exact labels without publishing a dataset.
+
+    Training-stage orchestration uses this preview to derive the immutable
+    dataset ID before deciding whether a materialization can be reused.
+    """
+
     if state_store is None:
         raise ValueError(
             "state_store is required for the authoritative training dataset path"
@@ -691,12 +769,8 @@ def build_training_dataset(
     if not reports[DatasetSplit.TRAIN].accepted_count or not reports[DatasetSplit.TEST].accepted_count:
         raise RuntimeError("No valid structures found; cannot create a training dataset")
 
-    # All acceptance and exact-count policy checks happen before any apparent
-    # dataset artifact is published.  A rejected exact-count build therefore
-    # cannot leave train.xyz/test.xyz behind without a completed manifest.
-    dataset_path = Path(dataset_path)
     metadata, manifest = _build_report_metadata(
-        dataset_path,
+        Path(dataset_path),
         reports,
         train_virial=train_virial,
         allow_partial=allow_partial,
@@ -712,41 +786,7 @@ def build_training_dataset(
         )
     elif selection_parameters is not None:
         metadata["selection_parameters"] = to_jsonable(selection_parameters)
-
-    restore_empty_target = _publish_dataset_artifacts(
-        dataset_path,
-        rendered,
-        metadata,
-        train_virial=train_virial,
-        expected_counts={
-            DatasetSplit.TRAIN: reports[DatasetSplit.TRAIN].accepted_count,
-            DatasetSplit.TEST: reports[DatasetSplit.TEST].accepted_count,
-        },
-    )
-    try:
-        transaction = getattr(state_store, "transaction", None)
-        if callable(transaction):
-            with transaction():
-                _record_state_members(
-                    state_store,
-                    manifest,
-                    reports,
-                    project_id=project_id,
-                )
-        else:
-            _record_state_members(
-                state_store,
-                manifest,
-                reports,
-                project_id=project_id,
-            )
-    except BaseException:
-        _rollback_published_dataset(
-            dataset_path,
-            restore_empty_target=restore_empty_target,
-        )
-        raise
-    return DatasetBuildResult(dataset_path, manifest, metadata, reports)
+    return DatasetBuildPreparation(manifest, metadata, reports, rendered)
 
 
 def resolve_selected_dft_results(
@@ -1002,12 +1042,14 @@ def write_nep_dataset(
 
 __all__ = [
     "DatasetBuildReport",
+    "DatasetBuildPreparation",
     "DatasetBuildResult",
     "DatasetSplit",
     "build_dataset_metadata",
     "build_training_dataset",
     "iter_labeled_structures",
     "load_materialized_dataset",
+    "prepare_training_dataset",
     "resolve_selected_dft_results",
     "write_nep_dataset",
 ]

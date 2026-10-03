@@ -270,6 +270,30 @@ def test_member_identity_does_not_depend_on_legacy_folder_or_selection_position(
     assert result.metadata["accepted_members"][0]["source_outcar"] == "/legacy/struct_0000/OUTCAR"
 
 
+def test_changed_authoritative_dft_content_gets_a_new_immutable_dataset(
+    tmp_path: Path,
+) -> None:
+    first = _result("stable")
+    changed = replace(first, source_outcar_hash="hash-stable-recomputed", energy_ev=-2.0)
+
+    first_result = build_training_dataset(
+        tmp_path / "datasets" / "first",
+        {DatasetSplit.TRAIN: (first,), DatasetSplit.TEST: (first,)},
+        tmp_path,
+        state_store=FakeStateStore([first]),
+    )
+    changed_result = build_training_dataset(
+        tmp_path / "datasets" / "changed",
+        {DatasetSplit.TRAIN: (changed,), DatasetSplit.TEST: (changed,)},
+        tmp_path,
+        state_store=FakeStateStore([changed]),
+    )
+
+    assert changed_result.dataset_id != first_result.dataset_id
+    assert first_result.dataset_path.is_dir()
+    assert changed_result.dataset_path.is_dir()
+
+
 def test_writer_rejects_missing_required_virial(tmp_path: Path) -> None:
     structure = _result("missing-virial").as_structure_dict()
     structure["virial"] = None
