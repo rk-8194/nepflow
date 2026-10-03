@@ -30,9 +30,6 @@ package-dir = {"" = "src"}
 where = ["src"]
 include = ["nepflow*"]
 
-[tool.pylint.init-hook]
-init-hook = "import sys; sys.path.insert(0, 'src')"
-
 [tool.pylint.messages_control]
 disable = [
     "missing-docstring",
@@ -45,6 +42,3 @@ disable = [
 [tool.pyright]
 include = ["src"]
 pythonVersion = "3.11"
-
-[tool.pytest.ini_options]
-pythonpath = ["src"]

@@ -19,11 +19,10 @@ def test_select_farthest_points_maps_atomic_rows_to_sorted_frames() -> None:
     representations = np.ones((5, 2))
     structures = [_Structure(2), _Structure(3)]
 
-    with patch.object(
-        sampling,
-        "farthest_point_sampling",
+    with patch(
+        "NepTrainKit.core.io.farthest_point_sampling",
         return_value=[0, 1, 2, 4],
-    ):
+    ) as sampler:
         result = sampling.select_farthest_points(
             representations,
             structures,
@@ -31,6 +30,7 @@ def test_select_farthest_points_maps_atomic_rows_to_sorted_frames() -> None:
             0.2,
         )
 
+    sampler.assert_called_once_with(representations, n_samples=2, min_dist=0.2)
     assert result == [0, 1]
 
 

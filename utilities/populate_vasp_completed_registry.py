@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""
+"""Migration-only backfill of the legacy completed VASP job registry.
+
+This operator utility is for explicitly requested historical migration only.
+It writes the legacy ``.vasp_completed_jobs.json`` registry and must not be
+used as current workflow state or as a fallback when StateStore data is
+missing.  Runtime code does not import or invoke this module.
+
 Backfill nepflow's completed VASP job registry from existing project jobs.
 
 Scans <nepflow_root>/projects for completed VASP job folders that have not yet

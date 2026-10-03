@@ -1,1 +1,1 @@
-"""Shared test configuration is declared in pyproject pytest settings."""
+"""Tests intentionally rely on the installed/editable package environment."""

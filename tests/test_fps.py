@@ -19,7 +19,10 @@ class FPSTests(unittest.TestCase):
         descriptors = np.ones((3, 2))
         structures = [StructureStub(), StructureStub(), StructureStub()]
 
-        with patch.object(SAMPLING, "farthest_point_sampling", return_value=[2, 0, 1]) as sampler:
+        with patch(
+            "NepTrainKit.core.io.farthest_point_sampling",
+            return_value=[2, 0, 1],
+        ) as sampler:
             result = SAMPLING.select_farthest_points(descriptors, structures, True, 0.1)
 
         sampler.assert_called_once_with(descriptors, n_samples=3, min_dist=0.1)
@@ -29,9 +32,13 @@ class FPSTests(unittest.TestCase):
         descriptors = np.ones((5, 2))
         structures = [StructureStub(2), StructureStub(3)]
 
-        with patch.object(SAMPLING, "farthest_point_sampling", return_value=[0, 1, 2, 4]):
+        with patch(
+            "NepTrainKit.core.io.farthest_point_sampling",
+            return_value=[0, 1, 2, 4],
+        ) as sampler:
             result = SAMPLING.select_farthest_points(descriptors, structures, False, 0.2)
 
+        sampler.assert_called_once_with(descriptors, n_samples=2, min_dist=0.2)
         self.assertEqual(result, [0, 1])
 
     def test_selected_count_uses_selected_frame_length(self) -> None:

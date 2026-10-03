@@ -1,10 +1,13 @@
-import os
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import Mock
 
+import pytest
+
+from nepflow.errors import SchedulerError
 from nepflow.mlip.gpumd import resubmission as module
 from nepflow.workflow.resubmission import resolve_resubmit_command
 
@@ -73,13 +76,48 @@ class GpumdSelfResubmitTests(unittest.TestCase):
                 capture_output=True,
                 text=True,
                 check=False,
-                env={
-                    **os.environ,
-                    "PYTHONPATH": str(Path("src").resolve()),
-                },
             )
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn("Would stop after the next segment", result.stdout)
+
+    def test_scheduler_query_failure_does_not_fall_back_to_filesystem_script(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workdir = Path(tmp)
+            submit_script = workdir / "submit.slurm"
+            submit_script.write_text("#!/bin/bash\n", encoding="utf-8")
+            scheduler = Mock()
+            scheduler.show_job.side_effect = RuntimeError("scheduler unavailable")
+
+            with pytest.raises(SchedulerError, match="scheduler unavailable") as error:
+                resolve_resubmit_command(
+                    workdir=workdir,
+                    submit_script=None,
+                    scheduler=scheduler,
+                    environment={"SLURM_JOB_ID": "123"},
+                )
+
+            self.assertEqual(error.value.kind, "query_failed")
+            scheduler.show_job.assert_called_once_with("123")
+
+    def test_scheduler_lookup_reuses_original_submission_command(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workdir = Path(tmp)
+            submit_script = workdir / "original.slurm"
+            submit_script.write_text("#!/bin/bash\n", encoding="utf-8")
+            scheduler = Mock()
+            scheduler.show_job.return_value = (
+                f"JobId=123 Command={submit_script} WorkDir={workdir}"
+            )
+
+            command, cwd, source = resolve_resubmit_command(
+                workdir=workdir,
+                scheduler=scheduler,
+                environment={"SLURM_JOB_ID": "123"},
+            )
+
+            self.assertEqual(command, ["sbatch", str(submit_script)])
+            self.assertEqual(cwd, workdir)
+            self.assertEqual(source, "scontrol job 123")
 
 
 if __name__ == "__main__":

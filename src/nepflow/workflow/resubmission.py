@@ -10,7 +10,7 @@ import re
 import subprocess
 from typing import Any
 
-from nepflow.errors import StateError
+from nepflow.errors import SchedulerError, StateError
 
 from .stages import WorkflowStage
 
@@ -109,20 +109,37 @@ def resolve_resubmit_command(
 
     env = os.environ if environment is None else environment
     job_id = env.get("SLURM_JOB_ID")
-    if job_id and scheduler is not None and hasattr(scheduler, "show_job"):
+    if job_id:
+        if scheduler is None or not hasattr(scheduler, "show_job"):
+            raise SchedulerError(
+                f"Cannot inspect SLURM job {job_id}: scheduler query is unavailable",
+                kind="query_unavailable",
+            )
         try:
             output = scheduler.show_job(job_id)
-        except Exception:
-            output = ""
+        except Exception as exc:
+            if isinstance(exc, SchedulerError):
+                raise
+            raise SchedulerError(
+                f"Could not inspect SLURM job {job_id}: {exc}",
+                kind="query_failed",
+            ) from exc
         command_match = re.search(r"\bCommand=(\S+)", output)
-        if command_match:
-            command_path = Path(command_match.group(1)).expanduser()
-            if not command_path.is_absolute():
-                workdir_match = re.search(r"\bWorkDir=(\S+)", output)
-                if workdir_match:
-                    command_path = Path(workdir_match.group(1)) / command_path
-            if command_path.exists():
-                return ["sbatch", str(command_path)], command_path.parent, f"scontrol job {job_id}"
+        if not command_match:
+            raise SchedulerError(
+                f"SLURM job {job_id} did not expose its submission command",
+                kind="command_missing",
+            )
+        command_path = Path(command_match.group(1)).expanduser()
+        if not command_path.is_absolute():
+            workdir_match = re.search(r"\bWorkDir=(\S+)", output)
+            if workdir_match:
+                command_path = Path(workdir_match.group(1)) / command_path
+        if not command_path.exists():
+            raise FileNotFoundError(
+                f"SLURM job {job_id} submission command does not exist: {command_path}"
+            )
+        return ["sbatch", str(command_path)], command_path.parent, f"scontrol job {job_id}"
 
     candidate_dirs: list[Path] = []
     for directory in (env.get("SLURM_SUBMIT_DIR"), str(workdir), os.getcwd()):

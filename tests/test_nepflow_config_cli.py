@@ -71,7 +71,7 @@ class ConfigCliTests(unittest.TestCase):
             self.assertEqual(source, "scontrol job 123")
             run_mock.assert_called_once_with("123")
 
-    def test_resolve_resubmit_command_falls_back_to_submit_dir_script(self) -> None:
+    def test_resolve_resubmit_command_fails_on_scheduler_query_error(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             submit_dir = Path(tmp)
             script_path = submit_dir / "submit.slurm"
@@ -86,12 +86,11 @@ class ConfigCliTests(unittest.TestCase):
                     nepflow.scheduler,
                     "show_job",
                     side_effect=nepflow.SchedulerError("scontrol not found"),
-                ):
-                    command, cwd, source = nepflow._resolve_resubmit_command()
+                ) as show_job:
+                    with self.assertRaises(nepflow.SchedulerError):
+                        nepflow._resolve_resubmit_command()
 
-            self.assertEqual(command, ["sbatch", str(script_path)])
-            self.assertEqual(cwd, submit_dir)
-            self.assertEqual(source, f"submit.slurm in {submit_dir}")
+            show_job.assert_called_once_with("123")
 
 
 if __name__ == "__main__":

@@ -562,8 +562,19 @@ def parse_performance_evidence(outcar_text: str) -> VaspPerformanceEvidence:
     )
 
 
+class VaspMemoryParseError(ValueError):
+    """Raised when a completed VASP memory record is malformed or unreadable."""
+
+
 def parse_memory_record(outcar_path: Path, gpus_per_node: int) -> dict[str, object] | None:
-    """Parse one historical ``.vasp_memory`` row through VASP-owned logic."""
+    """Parse one eligible historical ``.vasp_memory`` row.
+
+    Missing artifacts or an unfinished OUTCAR describe an absent historical
+    record and return ``None``.  Once the OUTCAR is complete and the required
+    inputs are present, malformed or unreadable evidence raises
+    :class:`VaspMemoryParseError` so migration diagnostics cannot silently
+    discard a completed run.
+    """
 
     if gpus_per_node < 1:
         raise ValueError("gpus_per_node must be positive")
@@ -571,43 +582,87 @@ def parse_memory_record(outcar_path: Path, gpus_per_node: int) -> dict[str, obje
     struct_dir = outcar_path.parent
     poscar = struct_dir / "POSCAR"
     incar = struct_dir / "INCAR"
-    if not poscar.exists() or not incar.exists() or not outcar_is_complete(outcar_path):
+    if not outcar_path.exists() or not poscar.exists() or not incar.exists():
         return None
-    try:
-        poscar_lines = poscar.read_text(encoding="utf-8", errors="replace").splitlines()
-        n_atoms = sum(int(value) for value in poscar_lines[6].split())
-        ncore = 0
-        kpar = 0
-        for line in incar.read_text(encoding="utf-8", errors="replace").splitlines():
-            match = re.match(r"\s*(NCORE|KPAR)\s*=\s*([^#!]+)", line, re.IGNORECASE)
-            if not match:
-                continue
-            value = int(float(match.group(2).strip()))
-            if match.group(1).upper() == "NCORE":
-                ncore = value
-            else:
-                kpar = value
-        performance = parse_performance_evidence(
-            outcar_path.read_text(encoding="utf-8", errors="replace")
+
+    def read_required_text(path: Path, artifact: str) -> str:
+        try:
+            return path.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            raise VaspMemoryParseError(
+                f"Could not read required {artifact} artifact: {path}"
+            ) from exc
+
+    outcar_text = read_required_text(outcar_path, "OUTCAR")
+    if not is_completed_text(outcar_text):
+        return None
+
+    poscar_lines = read_required_text(poscar, "POSCAR").splitlines()
+    if len(poscar_lines) <= 6:
+        raise VaspMemoryParseError(
+            f"POSCAR is missing its atom-count row: {poscar}"
         )
-        if not performance.loop_times:
-            return None
-        total_ranks = performance.total_ranks
-        nodes = max(1, total_ranks // gpus_per_node) if total_ranks > 0 else 1
-        gpus = total_ranks if total_ranks > 0 else gpus_per_node
-        return {
-            "n_atoms": n_atoms,
-            "n_kpoints_irr": performance.irreducible_kpoints,
-            "n_electrons": int(performance.electrons),
-            "nodes": nodes,
-            "gpus": gpus,
-            "ncore": ncore,
-            "kpar": kpar,
-            "avg_loop_time": f"{performance.average_loop_time:.4f}",
-            "oom": 0,
-        }
-    except (OSError, IndexError, TypeError, ValueError):
-        return None
+    try:
+        atom_counts = [int(value) for value in poscar_lines[6].split()]
+    except (TypeError, ValueError) as exc:
+        raise VaspMemoryParseError(
+            f"POSCAR atom-count row is malformed: {poscar}"
+        ) from exc
+    if not atom_counts or any(value < 0 for value in atom_counts):
+        raise VaspMemoryParseError(
+            f"POSCAR atom-count row is malformed: {poscar}"
+        )
+    n_atoms = sum(atom_counts)
+
+    ncore = 0
+    kpar = 0
+    for line in read_required_text(incar, "INCAR").splitlines():
+        key_match = re.match(r"\s*(NCORE|KPAR)\b", line, re.IGNORECASE)
+        if not key_match:
+            continue
+        match = re.match(
+            r"\s*(NCORE|KPAR)\s*=\s*([^#!]+)", line, re.IGNORECASE
+        )
+        if not match:
+            raise VaspMemoryParseError(
+                f"{key_match.group(1).upper()} assignment is malformed: {incar}"
+            )
+        raw_value = match.group(2).strip()
+        try:
+            numeric_value = float(raw_value)
+        except ValueError as exc:
+            raise VaspMemoryParseError(
+                f"{key_match.group(1).upper()} value is malformed: {incar}"
+            ) from exc
+        if not np.isfinite(numeric_value) or not numeric_value.is_integer():
+            raise VaspMemoryParseError(
+                f"{key_match.group(1).upper()} value is malformed: {incar}"
+            )
+        value = int(numeric_value)
+        if key_match.group(1).upper() == "NCORE":
+            ncore = value
+        else:
+            kpar = value
+
+    performance = parse_performance_evidence(outcar_text)
+    if not performance.loop_times:
+        raise VaspMemoryParseError(
+            f"Completed OUTCAR has no valid electronic loop evidence: {outcar_path}"
+        )
+    total_ranks = performance.total_ranks
+    nodes = max(1, total_ranks // gpus_per_node) if total_ranks > 0 else 1
+    gpus = total_ranks if total_ranks > 0 else gpus_per_node
+    return {
+        "n_atoms": n_atoms,
+        "n_kpoints_irr": performance.irreducible_kpoints,
+        "n_electrons": int(performance.electrons),
+        "nodes": nodes,
+        "gpus": gpus,
+        "ncore": ncore,
+        "kpar": kpar,
+        "avg_loop_time": f"{performance.average_loop_time:.4f}",
+        "oom": 0,
+    }
 
 
 __all__ = [
@@ -618,6 +673,7 @@ __all__ = [
     "VASP_COMPLETION_MARKERS",
     "VaspParseResult",
     "VaspPerformanceEvidence",
+    "VaspMemoryParseError",
     "outcar_is_complete",
     "is_completed_text",
     "parse_outcar",

@@ -9,7 +9,6 @@ import sys
 import argparse
 import logging
 import os
-import re
 import time
 from pathlib import Path
 
@@ -63,6 +62,7 @@ from nepflow.workflow import (
     SelfResubmitExit,
     WorkflowController,
     WorkflowStage,
+    resolve_resubmit_command as canonical_resolve_resubmit_command,
 )
 
 logger = logging.getLogger("nepflow")
@@ -394,65 +394,11 @@ def _get_slurm_walltime_info() -> tuple[int | None, str]:
     return None, "slurm_vars_unavailable"
 
 
-def _resolve_resubmit_from_scontrol(slurm_job_id: str) -> tuple[list[str], Path, str] | None:
-    """Try to recover the original batch script path from `scontrol show job`."""
-    try:
-        output = scheduler.show_job(slurm_job_id)
-    except SchedulerError as e:
-        logger.debug("Could not inspect SLURM job %s via scontrol: %s", slurm_job_id, e)
-        return None
-
-    command_match = re.search(r"\bCommand=(\S+)", output)
-    if not command_match:
-        logger.debug("scontrol output for job %s did not include Command=", slurm_job_id)
-        return None
-
-    command_path = Path(command_match.group(1)).expanduser()
-    if not command_path.is_absolute():
-        workdir_match = re.search(r"\bWorkDir=(\S+)", output)
-        if workdir_match:
-            command_path = Path(workdir_match.group(1)) / command_path
-
-    if not command_path.exists():
-        logger.debug("Recovered SLURM command does not exist: %s", command_path)
-        return None
-
-    submit_cwd = command_path.parent
-    return ["sbatch", str(command_path)], submit_cwd, f"scontrol job {slurm_job_id}"
-
-
 def _resolve_resubmit_command() -> tuple[list[str], Path, str]:
-    """Resolve the best available `sbatch` command for self-resubmission."""
-    slurm_job_id = os.environ.get("SLURM_JOB_ID")
-    if slurm_job_id:
-        resolved = _resolve_resubmit_from_scontrol(slurm_job_id)
-        if resolved is not None:
-            return resolved
-
-    nepflow_root = Path(__file__).parent.resolve()
-    candidate_dirs = []
-    for directory in (
-        os.environ.get("SLURM_SUBMIT_DIR"),
-        os.getcwd(),
-        str(nepflow_root),
-    ):
-        if not directory:
-            continue
-        path = Path(directory).resolve()
-        if path not in candidate_dirs:
-            candidate_dirs.append(path)
-
-    tried = []
-    for directory in candidate_dirs:
-        submit_script = directory / "submit.slurm"
-        tried.append(str(submit_script))
-        if submit_script.exists():
-            return ["sbatch", str(submit_script)], directory, f"submit.slurm in {directory}"
-
-    tried_text = "\n".join(f"  - {candidate}" for candidate in tried)
-    raise FileNotFoundError(
-        "Could not find a resubmission script for nepflow. Tried:\n"
-        f"{tried_text}"
+    """Resolve self-resubmission through the canonical workflow boundary."""
+    return canonical_resolve_resubmit_command(
+        workdir=Path.cwd(),
+        scheduler=scheduler,
     )
 
 

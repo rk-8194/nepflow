@@ -24,19 +24,15 @@ CSV_HEADER = [
 
 def parse_outcar(outcar_path: Path, gpus_per_node: int) -> Optional[dict]:
     """Extract a legacy benchmark row using the canonical VASP parser."""
-    try:
-        result = parse_memory_record(outcar_path, gpus_per_node)
-        if result is None:
-            print(f"  SKIP {outcar_path.parent}: incomplete or unparseable OUTCAR")
-            return None
-        print(f"    OK {outcar_path.parent.name}: "
-              f"atoms={result['n_atoms']} kpts={result['n_kpoints_irr']} "
-              f"nel={result['n_electrons']} ncore={result['ncore']} "
-              f"kpar={result['kpar']} avg_loop={result['avg_loop_time']}s")
-        return result
-    except (ValueError, IndexError, OSError) as e:
-        print(f"  Warning: could not parse {struct_dir.name}: {e}", file=sys.stderr)
+    result = parse_memory_record(outcar_path, gpus_per_node)
+    if result is None:
+        print(f"  SKIP {outcar_path.parent}: incomplete or absent OUTCAR")
         return None
+    print(f"    OK {outcar_path.parent.name}: "
+          f"atoms={result['n_atoms']} kpts={result['n_kpoints_irr']} "
+          f"nel={result['n_electrons']} ncore={result['ncore']} "
+          f"kpar={result['kpar']} avg_loop={result['avg_loop_time']}s")
+    return result
 
 
 def main() -> None:
