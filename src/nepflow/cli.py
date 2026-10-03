@@ -55,6 +55,7 @@ from nepflow.reporting import WorkflowStatusPresenter, summarize_legacy_vasp_job
 from nepflow.stages.dft import DftStage
 from nepflow.stages.generation import GenerationStage
 from nepflow.stages.generation.debug import run_debug
+from nepflow.stages.selection import SelectionStage
 from nepflow.workflow import (
     StageContext,
     StageRegistry,
@@ -229,7 +230,6 @@ def compose_stage_registry() -> StageRegistry:
     # have not yet moved into the canonical package.
     # pylint: disable=import-error,import-outside-toplevel
     from modules import (
-        SelectStage,
         TrainNepStage,
         ValidateStage,
     )
@@ -273,7 +273,7 @@ def compose_stage_registry() -> StageRegistry:
     registry.register(WorkflowStage.GENERATE, run_generation)
     registry.register(
         WorkflowStage.SELECT,
-        lambda context: SelectStage(**_legacy_stage_kwargs(context)).run(),
+        lambda context: SelectionStage(**_legacy_stage_kwargs(context)).run(),
     )
     def run_dft(context: StageContext) -> StageRunResult:
         return DftStage().run(context).as_workflow_result()

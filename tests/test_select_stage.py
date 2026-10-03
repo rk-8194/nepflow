@@ -23,11 +23,12 @@ class StructureStub:
 
 pytest.importorskip("NepTrainKit")
 
-from modules.select import select as select_module  # noqa: E402
 from nepflow.errors import ConfigurationError
+from nepflow.config.loader import load_config
+from nepflow.stages.selection import artifacts, sampling, strategy
+from nepflow.stages.selection import stage as select_module  # noqa: E402
 from nepflow.stages.selection import representations as DESCRIPTORS  # noqa: E402
-
-SelectStage = select_module.SelectStage
+from nepflow.stages.selection.stage import SelectionStage  # noqa: E402
 
 SEED_LINEAGE_FIXTURE = (
     Path(__file__).parent / "fixtures" / "structures" / "seed_lineage.extxyz.fixture"
@@ -93,9 +94,9 @@ def write_project_config(
     )
 
 
-class SelectStageTests(unittest.TestCase):
-    def create_stage(self, project_dir: Path) -> SelectStage:
-        return SelectStage(
+class SelectionStageTests(unittest.TestCase):
+    def create_stage(self, project_dir: Path) -> SelectionStage:
+        return SelectionStage(
             project_name="demo",
             config_file=project_dir / "config" / "demo.yaml",
             state_file=project_dir / "state.db",
@@ -115,7 +116,7 @@ class SelectStageTests(unittest.TestCase):
 
     def load_seed_lineage(
         self, project_dir: Path
-    ) -> tuple[SelectStage, list[Atoms], Atoms]:
+    ) -> tuple[SelectionStage, list[Atoms], Atoms]:
         """Prepare the base seed file and return its generated lineage."""
         stage = self.create_stage(project_dir)
         lineage = select_module.ase_read(
@@ -159,7 +160,7 @@ class SelectStageTests(unittest.TestCase):
             stage = self.create_stage(Path(tmp))
             prepared = {"structures": [StructureStub()], "ase_structures": [make_atoms()]}
             result = {"train_indices": [0], "test_indices": []}
-            with patch.object(stage, "load_config", return_value=(Mock(), {})):
+            with patch.object(select_module, "load_config", return_value=Mock(selection=Mock())):
                 with patch.object(stage, "prepare", return_value=prepared):
                     with patch.object(stage, "execute", return_value=result) as execute:
                         with patch.object(stage, "finalize") as finalize:
@@ -172,11 +173,15 @@ class SelectStageTests(unittest.TestCase):
             project_dir = Path(tmp)
             write_project_config(project_dir)
             stage = self.create_stage(project_dir)
-            _, settings = stage.load_config()
-            self.assertFalse(settings["include_seed_structures"])
-            self.assertFalse(settings["include_single_element_elastic_stress_structures"])
-            self.assertFalse(settings["composition_aware_fps"])
-            self.assertEqual(settings["composition_aware_fps_adaptive_retries"], 4)
+            settings = load_config(
+                stage._find_config_file(),
+                project_name="demo",
+                require_scientific_fields=False,
+            ).selection
+            self.assertFalse(settings.include_seed_structures)
+            self.assertFalse(settings.include_single_element_elastic_stress_structures)
+            self.assertFalse(settings.composition_aware_fps)
+            self.assertEqual(settings.composition_aware_fps_adaptive_retries, 4)
 
     def test_load_config_rejects_invalid_composition_aware_settings(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -184,7 +189,11 @@ class SelectStageTests(unittest.TestCase):
             write_project_config(project_dir, frontier_fraction=0.0)
             stage = self.create_stage(project_dir)
             with self.assertRaisesRegex(ConfigurationError, "frontier_fraction"):
-                stage.load_config()
+                load_config(
+                    stage._find_config_file(),
+                    project_name="demo",
+                    require_scientific_fields=False,
+                )
 
     def test_sampling_ownership_is_not_shadowed_by_stage_aliases(self) -> None:
         stage = self.create_stage(Path("unused"))
@@ -230,7 +239,11 @@ class SelectStageTests(unittest.TestCase):
             project_dir = Path(tmp)
             write_project_config(project_dir)
             stage = self.create_stage(project_dir)
-            config, settings = stage.load_config()
+            settings = load_config(
+                stage._find_config_file(),
+                project_name="demo",
+                require_scientific_fields=False,
+            ).selection
             prepared = {
                 "structures": [StructureStub(), StructureStub()],
                 "ase_structures": [make_atoms(), make_atoms("Ge")],
@@ -243,14 +256,14 @@ class SelectStageTests(unittest.TestCase):
                 "mean_train_test_dist": 0.4,
             }
             with patch.object(select_module, "load_or_calculate_representations", return_value=descriptors) as loader:
-                with patch.object(stage, "_select_training_set", return_value=([0], 0.1)):
-                    with patch.object(stage, "_select_test_set", return_value=test_result):
-                        result = stage.execute(config, settings, prepared)
+                with patch.object(select_module, "select_training_set", return_value=([0], 0.1)):
+                    with patch.object(select_module, "select_test_set", return_value=test_result):
+                        result = stage.execute(settings, prepared)
 
             loader.assert_called_once()
-            np.testing.assert_array_equal(result["descriptors"], descriptors)
-            self.assertEqual(result["train_indices"], [0])
-            self.assertEqual(result["test_indices"], [1])
+            np.testing.assert_array_equal(result.descriptors, descriptors)
+            self.assertEqual(result.train_indices, [0])
+            self.assertEqual(result.test_indices, [1])
 
     def test_execute_includes_seed_and_elastic_anchor_indices(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -262,21 +275,25 @@ class SelectStageTests(unittest.TestCase):
                 include_elastic_stress_structures=True,
             )
             stage = self.create_stage(project_dir)
-            config, settings = stage.load_config()
+            settings = load_config(
+                stage._find_config_file(),
+                project_name="demo",
+                require_scientific_fields=False,
+            ).selection
             prepared = {
                 "structures": [StructureStub() for _ in range(3)],
                 "ase_structures": [make_atoms() for _ in range(3)],
             }
             with patch.object(select_module, "load_or_calculate_representations", return_value=np.ones((3, 2))):
-                with patch.object(stage, "_load_seed_indices", return_value=[0]) as seed:
-                    with patch.object(stage, "_load_single_element_elastic_stress_indices", return_value=[1]) as single:
-                        with patch.object(stage, "_load_elastic_stress_indices", return_value=[1, 2]) as elastic:
-                            with patch.object(stage, "_select_training_set", return_value=([0, 1], 0.1)) as train:
-                                with patch.object(stage, "_select_test_set", return_value={
+                with patch.object(select_module, "resolve_seed_indices", return_value=[0]) as seed:
+                    with patch.object(select_module, "find_single_element_elastic_stress_indices", return_value=[1]) as single:
+                        with patch.object(select_module, "find_elastic_stress_indices", return_value=[1, 2]) as elastic:
+                            with patch.object(select_module, "select_training_set", return_value=([0, 1], 0.1)) as train:
+                                with patch.object(select_module, "select_test_set", return_value={
                                     "test_indices": [], "test_min_dist": 0.0,
                                     "min_train_test_dist": float("inf"), "mean_train_test_dist": float("inf"),
                                 }):
-                                    result = stage.execute(config, settings, prepared)
+                                    result = stage.execute(settings, prepared)
 
             seed.assert_called_once()
             single.assert_called_once()
@@ -285,7 +302,7 @@ class SelectStageTests(unittest.TestCase):
             self.assertEqual(call_kwargs["seed_indices"], [0])
             self.assertEqual(call_kwargs["single_element_elastic_indices"], [1])
             self.assertEqual(call_kwargs["elastic_indices"], [1, 2])
-            self.assertEqual(result["train_anchor_count"], 3)
+            self.assertEqual(result.train_anchor_count, 3)
 
     def test_training_selection_preserves_and_deduplicates_anchors(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -293,8 +310,8 @@ class SelectStageTests(unittest.TestCase):
             settings = {"target_train": 3, "composition_aware_fps": False, "mean_descriptor": True,
                         "tolerance": 1, "max_iterations": 4}
             descriptors = np.arange(8, dtype=float).reshape(4, 2)
-            with patch.object(select_module, "select_farthest_points_for_target", return_value=([0], 0.5)):
-                indices, minimum = stage._select_training_set(
+            with patch.object(strategy, "select_farthest_points_for_target", return_value=([0], 0.5)):
+                indices, minimum = strategy.select_training_set(
                     descriptors,
                     [StructureStub() for _ in range(4)],
                     settings,
@@ -309,7 +326,7 @@ class SelectStageTests(unittest.TestCase):
             stage = self.create_stage(Path(tmp))
             settings = {"target_train": 2}
             with self.assertRaisesRegex(ValueError, "unique anchors=3"):
-                stage._select_training_set(
+                strategy.select_training_set(
                     np.ones((4, 2)),
                     [StructureStub() for _ in range(4)],
                     settings,
@@ -324,7 +341,7 @@ class SelectStageTests(unittest.TestCase):
 
             for ordered_lineage in permutations(lineage):
                 candidates = list(ordered_lineage)
-                seed_indices = stage._load_seed_indices(candidates)
+                seed_indices = strategy.resolve_seed_indices(stage.project_dir, candidates)
 
                 self.assertEqual(len(seed_indices), 1)
                 self.assertEqual(
@@ -355,9 +372,9 @@ class SelectStageTests(unittest.TestCase):
             }
             descriptors = np.array([[0.0], [1.0], [0.01], [5.0], [6.0]])
             structures = [StructureStub() for _ in candidates]
-            seed_indices = stage._load_seed_indices(candidates)
+            seed_indices = strategy.resolve_seed_indices(stage.project_dir, candidates)
 
-            train_indices, _ = stage._select_training_set(
+            train_indices, _ = strategy.select_training_set(
                 descriptors,
                 structures,
                 settings,
@@ -382,10 +399,10 @@ class SelectStageTests(unittest.TestCase):
             }
             descriptors = np.array([[0.0], [1.0], [2.0]])
             structures = [StructureStub() for _ in candidates]
-            seed_indices = stage._load_seed_indices(candidates)
+            seed_indices = strategy.resolve_seed_indices(stage.project_dir, candidates)
 
-            with patch.object(select_module, "select_farthest_points_for_target", return_value=([1], 0.25)):
-                train_indices, _ = stage._select_training_set(
+            with patch.object(strategy, "select_farthest_points_for_target", return_value=([1], 0.25)):
+                train_indices, _ = strategy.select_training_set(
                     descriptors,
                     structures,
                     settings,
@@ -409,10 +426,10 @@ class SelectStageTests(unittest.TestCase):
             }
             descriptors = np.array([[0.0], [1.0], [2.0]])
             structures = [StructureStub() for _ in candidates]
-            seed_indices = stage._load_seed_indices(candidates)
+            seed_indices = strategy.resolve_seed_indices(stage.project_dir, candidates)
 
-            with patch.object(select_module, "select_farthest_points_for_target", return_value=([1], 0.25)):
-                train_indices, _ = stage._select_training_set(
+            with patch.object(strategy, "select_farthest_points_for_target", return_value=([1], 0.25)):
+                train_indices, _ = strategy.select_training_set(
                     descriptors,
                     structures,
                     settings,
@@ -437,7 +454,7 @@ class SelectStageTests(unittest.TestCase):
             descendants = lineage[1:]
 
             with self.assertRaises(ValueError):
-                stage._load_seed_indices(descendants)
+                strategy.resolve_seed_indices(stage.project_dir, descendants)
 
     def test_seed_loader_deduplicates_identical_candidates_deterministically(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -446,21 +463,24 @@ class SelectStageTests(unittest.TestCase):
             duplicate.info["seed_id"] = "different_lineage"
             candidates = [lineage[1], duplicate, base.copy()]
 
-            self.assertEqual(stage._load_seed_indices(candidates), [1])
+            self.assertEqual(
+                strategy.resolve_seed_indices(stage.project_dir, candidates),
+                [1],
+            )
 
     def test_selection_helpers_use_real_numpy_distances(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             stage = self.create_stage(Path(tmp))
             descriptors = np.array([[0.0], [1.0], [3.0]])
-            self.assertAlmostEqual(stage._selected_mean_nearest_distance(descriptors, [0, 1, 2]), 4.0 / 3.0)
-            self.assertAlmostEqual(stage._selected_positive_min_distance(np.array([[0.0], [0.0], [2.0]]), [0, 1, 2]), 2.0)
-            np.testing.assert_allclose(stage._flatten_single_column_distances(np.array([[1.5], [2.5]])), [1.5, 2.5])
+            self.assertAlmostEqual(sampling.calculate_mean_nearest_distance(descriptors, [0, 1, 2]), 4.0 / 3.0)
+            self.assertAlmostEqual(sampling.calculate_positive_min_distance(np.array([[0.0], [0.0], [2.0]]), [0, 1, 2]), 2.0)
+            np.testing.assert_allclose(sampling.flatten_single_column_distances(np.array([[1.5], [2.5]])), [1.5, 2.5])
 
     def test_composition_projection_includes_binary_and_ternary_subsets(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             stage = self.create_stage(Path(tmp))
-            binary = stage._composition_projection_bins(make_atoms("SiGe"))
-            quaternary = stage._composition_projection_bins(make_atoms("SiGeAlCu"))
+            binary = sampling.composition_projection_bins(make_atoms("SiGe"))
+            quaternary = sampling.composition_projection_bins(make_atoms("SiGeAlCu"))
             self.assertEqual(len(binary["binary"]), 1)
             self.assertEqual(len(binary["ternary"]), 0)
             self.assertEqual(len(quaternary["binary"]), 6)
@@ -482,7 +502,7 @@ class SelectStageTests(unittest.TestCase):
             }
             ase_structures = [make_atoms("SiGe"), make_atoms("SiGe", x=1), make_atoms("SiAl", x=2)]
             descriptors = np.array([[0.0, 0.0], [2.0, 0.0], [0.0, 2.0]])
-            indices, _ = stage._select_training_set(
+            indices, _ = strategy.select_training_set(
                 descriptors,
                 [StructureStub() for _ in range(3)],
                 settings,
@@ -506,8 +526,8 @@ class SelectStageTests(unittest.TestCase):
                 "tolerance": 1,
                 "max_iterations": 4,
             }
-            with patch.object(select_module, "select_farthest_points_for_target", return_value=([0], 0.25)):
-                indices, minimum = stage._select_training_set(
+            with patch.object(strategy, "select_farthest_points_for_target", return_value=([0], 0.25)):
+                indices, minimum = strategy.select_training_set(
                     np.array([[0.0], [1.0], [2.0]]),
                     [StructureStub() for _ in range(3)],
                     settings,
@@ -518,7 +538,7 @@ class SelectStageTests(unittest.TestCase):
 
     def test_composition_aware_attempt_schedule_matches_retry_budget(self) -> None:
         self.assertEqual(
-            select_module.SelectStage._composition_aware_attempt_schedule(0.1, 1.0, 3),
+            sampling.composition_aware_attempt_schedule(0.1, 1.0, 3),
             [(0.1, 1.0), (0.05, 1.0), (0.2, 1.0)],
         )
 
@@ -527,10 +547,10 @@ class SelectStageTests(unittest.TestCase):
             stage = self.create_stage(Path(tmp))
             ase_structures = [make_atoms("SiGe"), make_atoms("SiGe"), make_atoms("SiAl")]
             candidate_bins = {
-                index: stage._composition_projection_bins(atoms)
+                index: sampling.composition_projection_bins(atoms)
                 for index, atoms in enumerate(ase_structures)
             }
-            metrics = stage._composition_coverage_metrics([0, 2], candidate_bins)
+            metrics = sampling.calculate_composition_coverage_metrics([0, 2], candidate_bins)
             self.assertGreaterEqual(metrics["binary_occupied_bin_fraction"], 0.0)
             self.assertLessEqual(metrics["binary_occupied_bin_fraction"], 1.0)
             self.assertGreaterEqual(metrics["binary_normalized_entropy"], 0.0)
@@ -550,7 +570,7 @@ class SelectStageTests(unittest.TestCase):
             accepted = {**base, "attempt_number": 3, "train_positive_min_dist": 1.1,
                         "train_min_dist": 1.1, "train_mean_nn_dist": 1.1,
                         "binary_occupied_bin_fraction": 0.8}
-            result = stage._pick_best_composition_aware_attempt([base, rejected, accepted], 0.9)
+            result = sampling.select_best_sampling_attempt([base, rejected, accepted], 0.9)
             self.assertEqual(result["attempt_number"], 3)
 
     def test_seed_loader_matches_real_ase_metadata(self) -> None:
@@ -565,8 +585,11 @@ class SelectStageTests(unittest.TestCase):
             generated[1].info["seed_id"] = "seed_000001"
             seed = make_atoms()
             seed.info["seed_id"] = "seed_000001"
-            with patch.object(select_module, "ase_read", return_value=[seed]):
-                self.assertEqual(stage._load_seed_indices(generated), [1])
+            with patch.object(strategy, "ase_read", return_value=[seed]):
+                self.assertEqual(
+                    strategy.resolve_seed_indices(stage.project_dir, generated),
+                    [1],
+                )
 
     def test_elastic_helpers_detect_single_element_structures(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -575,17 +598,18 @@ class SelectStageTests(unittest.TestCase):
             unary.info["perturbation_type"] = "elastic_stress"
             binary = make_atoms("SiGe")
             binary.info["perturbation_type"] = "elastic_stress"
-            self.assertTrue(stage._is_single_element_elastic_stress(unary))
-            self.assertFalse(stage._is_single_element_elastic_stress(binary))
-            self.assertEqual(stage._load_elastic_stress_indices([unary, binary]), [0, 1])
-            self.assertEqual(stage._load_single_element_elastic_stress_indices([unary, binary]), [0])
+            self.assertTrue(strategy.is_elastic_stress(unary))
+            self.assertTrue(strategy.is_single_element_structure(unary))
+            self.assertFalse(strategy.is_single_element_structure(binary))
+            self.assertEqual(strategy.find_elastic_stress_indices([unary, binary]), [0, 1])
+            self.assertEqual(strategy.find_single_element_elastic_stress_indices([unary, binary]), [0])
 
-    def test_save_selected_structures_writes_extxyz_outputs(self) -> None:
+    def test_artifact_writer_writes_extxyz_outputs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_dir = Path(tmp)
             stage = self.create_stage(project_dir)
             atoms = [make_atoms(), make_atoms("Ge")]
-            stage._save_selected_structures(atoms, [0], [1])
+            artifacts.write_selected_structures(stage.project_dir, atoms, [0], [1])
             self.assertTrue((project_dir / "structures" / "selected" / "train.xyz").exists())
             self.assertTrue((project_dir / "structures" / "selected" / "test.xyz").exists())
 
