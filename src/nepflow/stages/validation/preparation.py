@@ -61,8 +61,14 @@ def calculate_cell_replicates_for_cutoff(
     return result  # type: ignore[return-value]
 
 
-def _legacy_state(preparation: ValidationPreparation) -> dict[str, Any]:
-    """Serialize the typed preparation for the still-legacy launcher."""
+def validation_preparation_to_launcher_state(
+    preparation: ValidationPreparation,
+) -> dict[str, Any]:
+    """Serialize canonical cases into the launcher's existing status shape.
+
+    This adapter contains no dataset parsing, geometry calculation, or identity
+    construction.  Those responsibilities remain in ``prepare_validation_cases``.
+    """
 
     return {
         "schema_version": preparation.schema_version,
@@ -155,4 +161,5 @@ __all__ = [
     "calculate_cell_replicates_for_cutoff",
     "cell_perpendicular_heights_angstrom",
     "prepare_validation_cases",
+    "validation_preparation_to_launcher_state",
 ]

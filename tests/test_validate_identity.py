@@ -25,6 +25,7 @@ from modules.validate.validate import ValidateStage  # noqa: E402
 from nepflow.domain.datasets import DatasetIdentity  # noqa: E402
 from nepflow.state.store import StateStore  # noqa: E402
 from nepflow.stages.validation.resolution import resolve_model_dataset  # noqa: E402
+from nepflow.stages.validation.protocols import ValidationPreparation  # noqa: E402
 from nepflow.errors import StateError  # noqa: E402
 
 
@@ -337,7 +338,13 @@ def test_validation_entry_point_preserves_model_dataset_association_through_prep
         config = ConfigParser()
         config["slurm"] = {"enabled": "false"}
         config["gpumd"] = {"model_run_id": "model_old"}
-        preparation_state = {"struct_count": 1, "validation_root": str(project_dir / "validation")}
+        preparation = ValidationPreparation(
+            model_run_id="model_old",
+            dataset_id="dataset_old",
+            model_path=model_path / "nep.txt",
+            dataset_path=dataset_path,
+            cases=(),
+        )
 
         with (
             patch.object(stage, "_find_config_file", return_value=project_dir / "config" / "demo.yaml"),
@@ -349,8 +356,8 @@ def test_validation_entry_point_preserves_model_dataset_association_through_prep
             ),
             patch.object(
                 validate_stage_module,
-                "prepare_validation_structures",
-                return_value=preparation_state,
+                "prepare_validation_cases",
+                return_value=preparation,
             ) as prepare_mock,
             patch.object(validate_stage_module, "run_validation_launcher"),
             patch.object(stage, "_run_analysis"),
@@ -358,8 +365,7 @@ def test_validation_entry_point_preserves_model_dataset_association_through_prep
             stage.run()
 
     prepare_mock.assert_called_once_with(
-        dataset_path=dataset_path,
+        project_dir,
+        "model_old",
         gpumd_potential_dir=model_path,
-        project_dir=project_dir,
-        config_gpumd_dir=project_dir / "config" / "gpumd",
     )

@@ -6,9 +6,14 @@ from pathlib import Path
 
 from ..base import Stage
 from nepflow.workflow.resubmission import SelfResubmitExit
+from nepflow.stages.validation.preparation import (
+    prepare_validation_cases,
+    validation_preparation_to_launcher_state,
+)
+from nepflow.stages.validation.protocols import ValidationCaseSpec
+from nepflow.stages.validation.resolution import resolve_model_dataset
 from .prepare import (
     finalize_nep_potential,
-    prepare_validation_structures,
 )
 from .launcher import (
     run_validation_launcher,
@@ -54,7 +59,7 @@ class ValidateStage(Stage):
         if not isinstance(status["preparation_state"], dict):
             raise ValueError("Validation status preparation_state must be an object")
         preparation_state = status["preparation_state"]
-        for field in ("validation_root", "struct_count", "struct_folders"):
+        for field in ("validation_root", "struct_count", "struct_folders", "cases"):
             if field not in preparation_state:
                 raise ValueError(
                     f"Validation preparation_state is missing required field {field!r}"
@@ -68,6 +73,12 @@ class ValidateStage(Stage):
             raise ValueError("Validation preparation_state struct_count must be an integer")
         if not isinstance(preparation_state["struct_folders"], list):
             raise ValueError("Validation preparation_state struct_folders must be a list")
+        if not isinstance(preparation_state["cases"], list):
+            raise ValueError("Validation preparation_state cases must be a list")
+        if preparation_state["struct_count"] != len(preparation_state["cases"]):
+            raise ValueError(
+                "Validation preparation_state struct_count does not match cases"
+            )
 
     def _model_run_id(self, config: ConfigParser, status: dict) -> str:
         """Return the explicitly requested model-run identity."""
@@ -87,7 +98,7 @@ class ValidateStage(Stage):
         
         Stages:
         1. Finalize NEP potential (move nep.txt to gpumd structure)
-        2. Prepare validation structures (create struct folders, set replicates)
+        2. Prepare canonical identity-bound validation cases
         3. Submit and monitor GPUMD jobs
         4. Analyze results and generate plots
         """
@@ -164,25 +175,22 @@ class ValidateStage(Stage):
             logger.error(f"Failed to finalize potential: {e}")
             raise
         
-        # Phase 2: Prepare structures
-        logger.info("\n--- Phase 2: Preparing validation structures ---")
-        config_gpumd_dir = self.project_dir / "config" / "gpumd"
-        if not config_gpumd_dir.exists():
-            logger.error(f"config/gpumd not found: {config_gpumd_dir}")
-            raise FileNotFoundError(f"Missing config/gpumd directory")
-        
-        dataset_path = self.project_dir / "nep" / "datasets" / dataset_name
-        
+        # Phase 2: Prepare canonical cases.  This legacy stage only adapts the
+        # typed result to the launcher's historical status shape.
+        logger.info("\n--- Phase 2: Preparing identity-bound validation cases ---")
         try:
-            preparation_state = prepare_validation_structures(
-                dataset_path=dataset_path,
+            preparation = prepare_validation_cases(
+                self.project_dir,
+                model_run_id,
                 gpumd_potential_dir=gpumd_potential_dir,
-                project_dir=self.project_dir,
-                config_gpumd_dir=config_gpumd_dir,
             )
-            logger.info(f"Prepared {preparation_state['struct_count']} structures for validation")
+            preparation_state = validation_preparation_to_launcher_state(preparation)
+            logger.info(
+                "Prepared %d identity-bound cases for validation",
+                len(preparation.cases),
+            )
         except Exception as e:
-            logger.error(f"Failed to prepare structures: {e}")
+            logger.error(f"Failed to prepare validation cases: {e}")
             raise
         
         # Save initial status
@@ -190,7 +198,7 @@ class ValidateStage(Stage):
             "status": "running",
             "model_run_id": model_run_id,
             "potential_path": str(gpumd_potential_dir),
-            "dataset_path": str(dataset_path),
+            "dataset_path": str(preparation.dataset_path),
             "dataset_name": dataset_name,
             "preparation_state": preparation_state,
             "validation_complete": False,
@@ -238,7 +246,8 @@ class ValidateStage(Stage):
         try:
             preparation_state = status.get("preparation_state")
             dataset_name = status.get("dataset_name")
-            if not isinstance(preparation_state, dict) or not dataset_name:
+            model_run_id = status.get("model_run_id")
+            if not isinstance(preparation_state, dict) or not dataset_name or not model_run_id:
                 raise ValueError("Validation analysis state is incomplete")
             gpumd_potential_dir = Path(status["potential_path"])
             
@@ -246,10 +255,21 @@ class ValidateStage(Stage):
                 logger.warning("No preparation state available for analysis")
                 return
             
+            raw_cases = preparation_state.get("cases")
+            if not isinstance(raw_cases, list) or not raw_cases:
+                raise ValueError(
+                    "Validation analysis requires persisted identity-bound cases"
+                )
+            cases = tuple(ValidationCaseSpec.from_mapping(item) for item in raw_cases)
+            dataset_id = preparation_state.get("dataset_id")
+            resolved = resolve_model_dataset(
+                self.project_dir,
+                str(model_run_id),
+                dataset_id=str(dataset_id) if dataset_id else None,
+            )
+
             # Paths
             validation_root = Path(preparation_state["validation_root"])
-            dataset_path = self.project_dir / "nep" / "datasets" / dataset_name
-            test_xyz_path = dataset_path / "test.xyz"
             
             # Get potential folder name
             potential_name = gpumd_potential_dir.name
@@ -263,8 +283,10 @@ class ValidateStage(Stage):
             
             generate_comparison_csv(
                 validation_root=validation_root,
-                test_xyz_path=test_xyz_path,
+                test_xyz_path=None,
                 output_csv_path=csv_path,
+                cases=cases,
+                model=resolved.model_run,
             )
             if not csv_path.exists() or csv_path.stat().st_size == 0:
                 raise RuntimeError(f"Comparison CSV was not produced: {csv_path}")

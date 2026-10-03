@@ -4,14 +4,13 @@ from configparser import ConfigParser
 from pathlib import Path
 from unittest.mock import patch
 
+import numpy as np
 import pytest
 
 pytest.importorskip("ase")
 pytest.importorskip("pymatgen")
-from ase import Atoms  # noqa: E402
 
 from modules.validate import launcher as launcher_module  # noqa: E402
-from modules.validate import prepare as prepare_module  # noqa: E402
 from modules.validate import validate as validate_stage_module  # noqa: E402
 from modules.validate.launcher import (  # noqa: E402
     read_validation_status,
@@ -19,6 +18,15 @@ from modules.validate.launcher import (  # noqa: E402
 )
 from modules.validate.validate import ValidateStage  # noqa: E402
 from nepflow.errors import SchedulerError, StateError  # noqa: E402
+from nepflow.domain.identities import StructureIdentity  # noqa: E402
+from nepflow.stages.validation.preparation import (  # noqa: E402
+    validation_preparation_to_launcher_state,
+)
+from nepflow.stages.validation.protocols import (  # noqa: E402
+    ValidationCaseSpec,
+    ValidationPreparation,
+    ValidationReference,
+)
 
 
 def make_validate_stage(project_dir: Path) -> ValidateStage:
@@ -44,34 +52,36 @@ def make_config() -> ConfigParser:
 def prepare_state_fixture(root: Path) -> tuple[dict, Path]:
     dataset_path = root / "nep" / "datasets" / "dataset_0001"
     potential_path = root / "gpumd" / "dataset_0001" / "potential_0001"
-    config_gpumd_dir = root / "config" / "gpumd"
     dataset_path.mkdir(parents=True, exist_ok=True)
     potential_path.mkdir(parents=True, exist_ok=True)
-    config_gpumd_dir.mkdir(parents=True, exist_ok=True)
-    (potential_path / "nep.txt").write_text(
-        "version 4\ntype 1 Si\ncutoff 6 5 112 60\n",
-        encoding="utf-8",
+    case_path = potential_path / "validation" / "case_0000"
+    reference = ValidationReference(
+        structure=StructureIdentity("resume-fixture"),
+        species=("Si",),
+        positions_angstrom=np.zeros((1, 3)),
+        cell_angstrom=np.eye(3) * 3.0,
+        pbc=(True, True, True),
+        energy_ev=-1.0,
+        forces_ev_per_angstrom=np.zeros((1, 3)),
     )
-    (config_gpumd_dir / "run.in_validate").write_text("replicate 2 2 2\n", encoding="utf-8")
-
-    atoms = Atoms(
-        "Si",
-        positions=[[0.0, 0.0, 0.0]],
-        cell=[[3.0, 0.0, 0.0], [0.0, 3.0, 0.0], [0.0, 0.0, 3.0]],
-        pbc=True,
+    case = ValidationCaseSpec.create(
+        ordinal=0,
+        model_run_id="model_run_fixture",
+        dataset_id="dataset_0001",
+        reference=reference,
+        input_path=case_path / "model.xyz",
+        working_directory=case_path,
+        output_path=case_path / "out.xyz",
     )
-    with (
-        patch.object(prepare_module, "parse_test_xyz", return_value=[{"atoms": atoms}]),
-        patch.object(prepare_module, "calculate_required_replicates", return_value=(2, 2, 2)),
-    ):
-        state = prepare_module.prepare_validation_structures(
-            dataset_path=dataset_path,
-            gpumd_potential_dir=potential_path,
-            project_dir=root,
-            config_gpumd_dir=config_gpumd_dir,
-        )
-
-    return state, Path(state["struct_folders"][0]["path"])
+    preparation = ValidationPreparation(
+        model_run_id="model_run_fixture",
+        dataset_id="dataset_0001",
+        model_path=potential_path / "nep.txt",
+        dataset_path=dataset_path,
+        cases=(case,),
+    )
+    state = validation_preparation_to_launcher_state(preparation)
+    return state, case_path
 
 
 def test_preparation_state_serializes_without_raw_paths() -> None:
@@ -98,6 +108,7 @@ def resume_state(root: Path) -> tuple[ValidateStage, dict, Path]:
     preparation_state = {
         "validation_root": str(potential_path / "validation"),
         "struct_count": 0,
+        "cases": [],
         "struct_folders": [],
     }
     status = {

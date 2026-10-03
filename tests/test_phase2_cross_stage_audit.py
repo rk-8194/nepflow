@@ -23,7 +23,7 @@ from nepflow.mlip.nep.artifacts import (  # noqa: E402
     validate_model_run_manifest,
 )
 from nepflow.domain.identities import calculate_structure_id  # noqa: E402
-from nepflow.domain.datasets import DatasetIdentity  # noqa: E402
+from nepflow.domain.datasets import DatasetIdentity, TrainingDatasetManifest  # noqa: E402
 from nepflow.dft.vasp.inputs import read_identity  # noqa: E402
 from nepflow.dft.vasp.outputs import parse_outcar_result  # noqa: E402
 from nepflow.io.hashing import sha256_file  # noqa: E402
@@ -36,6 +36,7 @@ from nepflow.mlip.nep.inputs import NepHyperparameters, NepInputRenderer  # noqa
 from nepflow.stages.training.dataset import build_dataset_metadata  # noqa: E402
 from nepflow.io.json import write_json  # noqa: E402
 from nepflow.stages.validation.resolution import resolve_model_dataset  # noqa: E402
+from nepflow.stages.validation.protocols import ValidationCaseSpec  # noqa: E402
 from nepflow.errors import StateError  # noqa: E402
 from nepflow.state.store import StateStore  # noqa: E402
 
@@ -172,10 +173,20 @@ def test_deterministic_dft_to_validation_identity_trace() -> None:
             "version 4\ntype 1 Si\ncutoff 6 5 112 60\n", encoding="utf-8"
         )
         with StateStore(project_dir / "state.db") as state_store:
+            dataset_identity = DatasetIdentity.from_identity_payload(
+                {
+                    "schema_version": "nepflow.dataset.v1",
+                    "label_schema": metadata["label_schema"],
+                    "units": metadata["units"],
+                    "virial_convention": metadata["virial_convention"],
+                    "virial_tensor_convention": metadata["virial_tensor_convention"],
+                    "records": metadata["records"],
+                }
+            )
             state_store.upsert_dataset(
-                DatasetIdentity(
-                    metadata["dataset_id"],
-                    {"schema_version": "nepflow.dataset.v1", "records": []},
+                TrainingDatasetManifest(
+                    identity=dataset_identity,
+                    records=tuple(metadata["records"]),
                 )
             )
             model_manifest = create_model_run_manifest(
@@ -253,7 +264,23 @@ def test_deterministic_dft_to_validation_identity_trace() -> None:
 
         # Actual serialized DFT/ML output produces deliberately non-zero metrics.
         report_path = project_dir / "reports" / "comparison.csv"
-        generate_comparison_csv(validation_root, dataset_path / "test.xyz", report_path)
+        case = ValidationCaseSpec.create(
+            ordinal=0,
+            model_run_id=resolved.model_run_id,
+            dataset_id=resolved.dataset_id,
+            reference=resolved.test_references()[0],
+            input_path=struct_dir / "model.xyz",
+            working_directory=struct_dir,
+            output_path=struct_dir / "out.xyz",
+            virial_requested=True,
+        )
+        generate_comparison_csv(
+            validation_root,
+            None,
+            report_path,
+            cases=(case,),
+            model=resolved.model_run,
+        )
         rows = list(csv.DictReader(report_path.open(newline="", encoding="utf-8")))
         assert rows
         assert float(rows[0]["energy_error_per_atom"]) == pytest.approx(0.125)

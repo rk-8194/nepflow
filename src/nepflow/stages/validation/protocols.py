@@ -194,6 +194,11 @@ class ValidationCaseSpec:
     atom_mapping: AtomMapping = ()
 
     def __post_init__(self) -> None:
+        if self.schema_version != VALIDATION_CASE_SCHEMA:
+            raise ValidationError(
+                f"unsupported validation case schema {self.schema_version!r}; "
+                f"expected {VALIDATION_CASE_SCHEMA!r}"
+            )
         for name in ("case_id", "model_run_id", "dataset_id"):
             value = str(getattr(self, name)).strip()
             if not value:
@@ -405,7 +410,7 @@ class ValidationCaseSpec:
                 output_path=Path(str(value["output_path"])),
                 replicates=tuple(int(item) for item in value.get("replicates", (1, 1, 1))),
                 virial_requested=bool(value.get("virial_requested", False)),
-                schema_version=str(value.get("schema_version", VALIDATION_CASE_SCHEMA)),
+                schema_version=str(value["schema_version"]),
                 atom_mapping=mapping,
             )
         except (KeyError, TypeError, ValueError, IndexError) as exc:
@@ -424,6 +429,11 @@ class ValidationPreparation:
     schema_version: str = VALIDATION_PREPARATION_SCHEMA
 
     def __post_init__(self) -> None:
+        if self.schema_version != VALIDATION_PREPARATION_SCHEMA:
+            raise ValidationError(
+                f"unsupported validation preparation schema {self.schema_version!r}; "
+                f"expected {VALIDATION_PREPARATION_SCHEMA!r}"
+            )
         if not str(self.model_run_id).strip() or not str(self.dataset_id).strip():
             raise ValidationError("validation preparation requires model and dataset IDs")
         object.__setattr__(self, "model_path", Path(self.model_path))
@@ -459,9 +469,7 @@ class ValidationPreparation:
                 model_path=Path(str(value["model_path"])),
                 dataset_path=Path(str(value["dataset_path"])),
                 cases=cases,
-                schema_version=str(
-                    value.get("schema_version", VALIDATION_PREPARATION_SCHEMA)
-                ),
+                schema_version=str(value["schema_version"]),
             )
         except KeyError as exc:
             raise ValidationError(

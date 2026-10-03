@@ -179,7 +179,7 @@ def run_validation_launcher(
     
     Args:
         config: ConfigParser with SLURM settings
-        preparation_state: Dict from prepare_validation_structures()
+        preparation_state: Dict serialized from canonical validation cases
         project_dir: Project root directory
         debug: If True, simulate job submission
         slurm_deadline: Unix timestamp of SLURM walltime deadline

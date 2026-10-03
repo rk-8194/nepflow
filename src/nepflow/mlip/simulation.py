@@ -52,6 +52,22 @@ class StaticPredictionRequest:
             raise ValidationError(
                 "static prediction requires a model run with a model artifact"
             )
+        expected_fields = (
+            self.expected_species,
+            self.expected_positions_angstrom,
+            self.expected_cell_angstrom,
+            self.expected_pbc,
+        )
+        expected_present = tuple(value is not None for value in expected_fields)
+        if any(expected_present) and not all(expected_present):
+            raise ValidationError(
+                "static prediction expected configuration must provide species, "
+                "positions, cell, and pbc together"
+            )
+        if self.atom_mapping is not None and not all(expected_present):
+            raise ValidationError(
+                "static prediction atom_mapping requires complete expected configuration"
+            )
         if self.species is not None:
             species = tuple(str(value) for value in self.species)
             if not species:

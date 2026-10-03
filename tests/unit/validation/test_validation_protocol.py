@@ -22,7 +22,12 @@ from nepflow.stages.validation import (
     prepare_validation_cases,
     resolve_model_dataset,
 )
-from nepflow.stages.validation.protocols import ValidationCaseSpec
+from nepflow.stages.validation.protocols import (
+    VALIDATION_CASE_SCHEMA,
+    VALIDATION_PREPARATION_SCHEMA,
+    ValidationCaseSpec,
+    ValidationPreparation,
+)
 from modules.validate.analyze import generate_comparison_csv
 from nepflow.state.store import StateStore
 
@@ -123,6 +128,60 @@ def test_resolution_and_case_schema_keep_exact_model_dataset_association(tmp_pat
     duplicate["atom_mapping"][-1] = duplicate["atom_mapping"][0]
     with pytest.raises(ValidationError, match="duplicate|cover"):
         ValidationCaseSpec.from_mapping(duplicate)
+    missing_mapping = case.to_dict()
+    del missing_mapping["atom_mapping"]
+    with pytest.raises(ValidationError, match="atom_mapping"):
+        ValidationCaseSpec.from_mapping(missing_mapping)
+
+    unknown_case_schema = case.to_dict()
+    unknown_case_schema["schema_version"] = "nepflow.validation_case.v999"
+    with pytest.raises(ValidationError, match="schema"):
+        ValidationCaseSpec.from_mapping(unknown_case_schema)
+
+    preparation = ValidationPreparation(
+        model_run_id=model_run_id,
+        dataset_id=resolved.dataset_id,
+        model_path=resolved.model_path,
+        dataset_path=resolved.dataset_path,
+        cases=(case,),
+    )
+    unknown_preparation_schema = preparation.to_dict()
+    unknown_preparation_schema["schema_version"] = "nepflow.validation_preparation.v999"
+    with pytest.raises(ValidationError, match="schema"):
+        ValidationPreparation.from_mapping(unknown_preparation_schema)
+    assert preparation.schema_version == VALIDATION_PREPARATION_SCHEMA
+    assert case.schema_version == VALIDATION_CASE_SCHEMA
+
+
+def test_static_prediction_request_rejects_partial_expected_configuration(
+    tmp_path: Path,
+) -> None:
+    model = ModelRunRecord(
+        ModelRunIdentity("dataset-fixture", "nep-input", "hyperparameters"),
+        ModelArtifactMetadata(
+            model=ArtifactIdentity.from_bytes("nep_model", b"model"),
+            status="completed",
+        ),
+    )
+    common = dict(
+        structure=StructureIdentity("fixture-structure-0001"),
+        model=model,
+        input_path=tmp_path / "model.xyz",
+        working_directory=tmp_path,
+        atom_count=2,
+        expected_positions_angstrom=np.zeros((2, 3)),
+        expected_cell_angstrom=np.eye(3),
+        expected_pbc=(True, True, True),
+    )
+    with pytest.raises(ValidationError, match="expected configuration"):
+        StaticPredictionRequest(**common)
+
+    with pytest.raises(ValidationError, match="atom_mapping"):
+        StaticPredictionRequest(atom_mapping=(0, 1), **{
+            key: value
+            for key, value in common.items()
+            if not key.startswith("expected_")
+        })
 
 
 def test_triclinic_replicates_use_perpendicular_heights() -> None:

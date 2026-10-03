@@ -9,10 +9,8 @@ import numpy as np
 from ase.atoms import Atoms
 from ase.io import read as ase_read
 
-from nepflow.domain.identities import ArtifactIdentity, ModelRunIdentity, StructureIdentity
-from nepflow.domain.models import ModelArtifactMetadata, ModelRunRecord
+from nepflow.domain.models import ModelRunRecord
 from nepflow.mlip.gpumd import GpumdBackend
-from nepflow.mlip.simulation import StaticPredictionRequest
 from nepflow.stages.validation.protocols import ValidationCaseSpec
 
 logger = logging.getLogger("nepflow.validate")
@@ -156,173 +154,6 @@ def _metrics(errors: np.ndarray) -> Tuple[float, float]:
     return float(np.mean(np.abs(values))), float(np.sqrt(np.mean(values**2)))
 
 
-def _report_model(struct_idx: int) -> ModelRunRecord:
-    """Provide identity metadata for the pre-typed report compatibility path."""
-
-    artifact = ArtifactIdentity.from_bytes("report-input", b"legacy-validation-report")
-    identity = ModelRunIdentity(
-        "legacy-validation-report",
-        artifact.sha256,
-        f"structure-{struct_idx}",
-    )
-    return ModelRunRecord(
-        identity=identity,
-        artifact=ModelArtifactMetadata(model=artifact, status="completed"),
-    )
-
-
-def _read_replication_factors(struct_dir: Path) -> Tuple[int, int, int]:
-    """Read the explicit GPUMD supercell factors used for one structure."""
-    run_in_path = struct_dir / "run.in"
-    if not run_in_path.exists():
-        raise FileNotFoundError(
-            f"Validation replication provenance is missing: {run_in_path}"
-        )
-    commands = []
-    for line in run_in_path.read_text(encoding="utf-8").splitlines():
-        parts = line.split("#", 1)[0].split()
-        if parts and parts[0] == "replicate":
-            if len(parts) != 4:
-                raise ValueError(f"Malformed replicate command in {run_in_path}")
-            try:
-                factors = tuple(int(value) for value in parts[1:])
-            except ValueError as exc:
-                raise ValueError(f"Invalid replicate command in {run_in_path}") from exc
-            if any(value < 1 for value in factors):
-                raise ValueError(f"Replicate factors must be positive in {run_in_path}")
-            commands.append(factors)
-    if len(commands) != 1:
-        raise ValueError(
-            f"Validation run.in must contain exactly one replicate command: {run_in_path}"
-        )
-    return commands[0]
-
-
-def _periodic_distance(first: np.ndarray, second: np.ndarray) -> float:
-    delta = np.asarray(first, dtype=float) - np.asarray(second, dtype=float)
-    delta -= np.rint(delta)
-    return float(np.linalg.norm(delta))
-
-
-def _map_model_atoms_to_reference(
-    dft: dict,
-    ml_positions: np.ndarray,
-    ml_species: Optional[List[str]],
-    ml_cell: Optional[np.ndarray],
-    ml_pbc: Optional[np.ndarray],
-    factors: Tuple[int, int, int],
-) -> np.ndarray:
-    """Map each model supercell atom to an equivalent reference atom."""
-    reference_positions = np.asarray(dft["positions"], dtype=float)
-    reference_cell = np.asarray(dft["cell"], dtype=float)
-    output_positions = np.asarray(ml_positions, dtype=float)
-    if ml_cell is None or ml_pbc is None:
-        raise ValueError("GPUMD output is missing cell/PBC metadata for configuration pairing")
-    output_cell = np.asarray(ml_cell, dtype=float)
-    if not np.allclose(output_cell, reference_cell * np.asarray(factors)[:, None], atol=1e-7):
-        raise ValueError("GPUMD output cell does not match the requested replicated reference cell")
-    if not np.array_equal(np.asarray(ml_pbc, dtype=bool), np.asarray(dft["pbc"], dtype=bool)):
-        raise ValueError("GPUMD output PBC flags do not match the DFT reference")
-
-    try:
-        reference_fractional = reference_positions @ np.linalg.inv(reference_cell)
-        output_fractional = output_positions @ np.linalg.inv(output_cell)
-    except np.linalg.LinAlgError as exc:
-        raise ValueError("Configuration pairing requires non-singular reference/output cells") from exc
-
-    scaled_output_fractional = output_fractional * np.asarray(factors, dtype=float)
-    reference_species = list(dft["species"])
-    if ml_species is not None and len(ml_species) != len(output_positions):
-        raise ValueError("GPUMD output species count does not match its positions")
-    used = np.zeros(len(reference_positions), dtype=int)
-    maximum_uses = int(np.prod(factors))
-    mapping = []
-    for output_index, fractional in enumerate(scaled_output_fractional):
-        candidates = []
-        for reference_index, reference_fractional_value in enumerate(reference_fractional):
-            if used[reference_index] >= maximum_uses:
-                continue
-            if ml_species is not None and ml_species[output_index] != reference_species[reference_index]:
-                continue
-            candidates.append(
-                (
-                    _periodic_distance(fractional, reference_fractional_value),
-                    reference_index,
-                )
-            )
-        if not candidates:
-            raise ValueError(
-                "GPUMD output contains an atom that cannot be mapped to the DFT reference"
-            )
-        distance, reference_index = min(candidates)
-        if distance > 1e-6:
-            raise ValueError(
-                "GPUMD output positions do not match the DFT reference configuration"
-            )
-        used[reference_index] += 1
-        mapping.append(reference_index)
-
-    if not np.all(used == maximum_uses):
-        raise ValueError("GPUMD output does not contain every replicated DFT atom")
-    return np.asarray(mapping, dtype=int)
-
-
-def _pair_model_configuration(
-    dft: dict,
-    ml_positions: np.ndarray,
-    ml_predictions: dict,
-    factors: Tuple[int, int, int],
-) -> np.ndarray:
-    """Validate physical identity and return reference indices for model atoms."""
-    reference_count = int(dft["atoms_count"])
-    model_count = len(ml_positions)
-    repeat_count = int(np.prod(factors))
-    if model_count != reference_count * repeat_count:
-        raise ValueError(
-            "GPUMD output atom count does not match the reference count and "
-            f"replication factors {factors}: DFT={reference_count}, GPUMD={model_count}"
-        )
-
-    reference_positions = dft.get("positions")
-    if reference_positions is None:
-        if factors != (1, 1, 1):
-            raise ValueError("Replicated comparison requires DFT positions and cell metadata")
-        return np.arange(reference_count, dtype=int)
-
-    if factors == (1, 1, 1):
-        if not np.allclose(np.asarray(ml_positions), np.asarray(reference_positions), atol=1e-6):
-            raise ValueError("GPUMD output positions do not match the DFT reference configuration")
-        if (
-            ml_predictions.get("species") is not None
-            and list(ml_predictions["species"]) != list(dft["species"])
-        ):
-            raise ValueError("GPUMD output species do not match the DFT reference")
-        if dft.get("cell") is not None and ml_predictions.get("cell") is not None:
-            if not np.allclose(ml_predictions["cell"], dft["cell"], atol=1e-7):
-                raise ValueError("GPUMD output cell does not match the DFT reference cell")
-        if dft.get("pbc") is not None and ml_predictions.get("pbc") is not None:
-            if not np.array_equal(ml_predictions["pbc"], dft["pbc"]):
-                raise ValueError("GPUMD output PBC flags do not match the DFT reference")
-        return np.arange(reference_count, dtype=int)
-
-    required_geometry = (
-        dft.get("cell"),
-        dft.get("pbc"),
-        ml_predictions.get("cell"),
-        ml_predictions.get("pbc"),
-    )
-    if any(value is None for value in required_geometry):
-        raise ValueError("Replicated comparison requires complete DFT and GPUMD cell/PBC metadata")
-    return _map_model_atoms_to_reference(
-        dft,
-        ml_positions,
-        ml_predictions.get("species"),
-        ml_predictions.get("cell"),
-        ml_predictions.get("pbc"),
-        factors,
-    )
-
-
 def generate_comparison_csv(
     validation_root: Path,
     test_xyz_path: Path | None,
@@ -333,43 +164,38 @@ def generate_comparison_csv(
 ) -> None:
     """Generate a complete DFT-vs-model report from paired predictions.
 
-    The compatibility call accepts ``test_xyz_path``.  The canonical call
-    supplies identity-bound ``cases`` and the resolved ``model``; in that
-    path DFT labels come from the authoritative dataset records and the ML
-    values are parsed through :class:`GpumdBackend` and the static-prediction
-    protocol.
+    ``cases`` and ``model`` are required so the report cannot invent model
+    identities or reconstruct geometry from a legacy ``test.xyz`` path.
     """
-    case_by_index = {case.ordinal: case for case in cases or ()}
-    if cases is not None:
-        if model is None:
-            raise ValueError("Canonical validation analysis requires the resolved model record")
-        dft_data = {
-            case.ordinal: {
-                "atoms_count": case.reference.atom_count,
-                "energy": case.reference.energy_ev,
-                "forces": np.asarray(case.reference.forces_ev_per_angstrom, dtype=float),
-                "virial": (
-                    None
-                    if case.reference.virial_ev is None
-                    else np.asarray(case.reference.virial_ev, dtype=float)
-                ),
-                "species": list(case.reference.species),
-                "positions": np.asarray(case.reference.positions_angstrom, dtype=float),
-                "cell": np.asarray(case.reference.cell_angstrom, dtype=float),
-                "pbc": np.asarray(case.reference.pbc, dtype=bool),
-                "composition": case.reference.metadata.get("composition", "")
-                if case.reference.metadata
-                else "",
-                "perturbation_family": case.reference.metadata.get("perturbation_family", "")
-                if case.reference.metadata
-                else "",
-            }
-            for case in cases
+    if cases is None or model is None:
+        raise ValueError(
+            "Validation analysis requires authoritative typed cases and model record"
+        )
+    typed_cases = tuple(cases)
+    case_by_index = {case.ordinal: case for case in typed_cases}
+    dft_data = {
+        case.ordinal: {
+            "atoms_count": case.reference.atom_count,
+            "energy": case.reference.energy_ev,
+            "forces": np.asarray(case.reference.forces_ev_per_angstrom, dtype=float),
+            "virial": (
+                None
+                if case.reference.virial_ev is None
+                else np.asarray(case.reference.virial_ev, dtype=float)
+            ),
+            "species": list(case.reference.species),
+            "positions": np.asarray(case.reference.positions_angstrom, dtype=float),
+            "cell": np.asarray(case.reference.cell_angstrom, dtype=float),
+            "pbc": np.asarray(case.reference.pbc, dtype=bool),
+            "composition": case.reference.metadata.get("composition", "")
+            if case.reference.metadata
+            else "",
+            "perturbation_family": case.reference.metadata.get("perturbation_family", "")
+            if case.reference.metadata
+            else "",
         }
-    else:
-        if test_xyz_path is None:
-            raise ValueError("Validation analysis requires test_xyz_path or typed cases")
-        dft_data = parse_dft_properties(test_xyz_path)
+        for case in typed_cases
+    }
     if not dft_data:
         raise ValueError("No DFT structures are available for validation")
 
@@ -381,26 +207,12 @@ def generate_comparison_csv(
     for struct_idx in sorted(dft_data):
         dft = dft_data[struct_idx]
         case = case_by_index.get(struct_idx)
-        struct_dir = (
-            case.working_directory
-            if case is not None
-            else validation_root / f"struct_{struct_idx:04d}"
-        )
+        if case is None:
+            raise ValueError(f"Validation case ordinal {struct_idx} is missing")
+        struct_dir = case.working_directory
         out_xyz_path = struct_dir / "out.xyz"
-        factors = case.replicates if case is not None else _read_replication_factors(struct_dir)
-        if case is not None:
-            if model is None:
-                raise ValueError("Canonical validation analysis requires the resolved model record")
-            request = case.static_prediction_request(model)
-        else:
-            request = StaticPredictionRequest(
-                structure=StructureIdentity(f"validation-report-{struct_idx}"),
-                model=_report_model(struct_idx),
-                input_path=struct_dir / "model.xyz",
-                working_directory=struct_dir,
-                atom_count=int(dft["atoms_count"]) * int(np.prod(factors)),
-                virial_requested=virial_required,
-            )
+        factors = case.replicates
+        request = case.static_prediction_request(model)
         prediction = GpumdBackend().parse_prediction(request, out_xyz_path)
         ml_count = prediction.atom_count
         ml_positions = np.asarray(prediction.positions_angstrom, dtype=float)
@@ -412,12 +224,9 @@ def generate_comparison_csv(
             "cell": np.asarray(prediction.cell_angstrom, dtype=float),
             "pbc": np.asarray(prediction.pbc, dtype=bool),
         }
-        if case is not None:
-            if prediction.atom_mapping is None:
-                raise ValueError("Canonical GPUMD prediction is missing atom provenance mapping")
-            reference_indices = np.asarray(prediction.atom_mapping, dtype=int)
-        else:
-            reference_indices = _pair_model_configuration(dft, ml_positions, ml, factors)
+        if prediction.atom_mapping is None:
+            raise ValueError("Canonical GPUMD prediction is missing atom provenance mapping")
+        reference_indices = np.asarray(prediction.atom_mapping, dtype=int)
         repeat_count = int(np.prod(factors))
 
         ml_forces = _finite_force_array(

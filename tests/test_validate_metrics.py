@@ -12,7 +12,6 @@ pytest.importorskip("ase")
 pytest.importorskip("pymatgen")
 
 from modules.validate import analyze as analyze_module  # noqa: E402
-from modules.validate import prepare as prepare_module  # noqa: E402
 from modules.validate import validate as validate_stage_module  # noqa: E402
 from modules.validate.validate import ValidateStage  # noqa: E402
 from ase.io import read as ase_read, write as ase_write  # noqa: E402
@@ -20,6 +19,11 @@ from nepflow.domain.identities import ArtifactIdentity, ModelRunIdentity, Struct
 from nepflow.domain.models import ModelArtifactMetadata, ModelRunRecord  # noqa: E402
 from nepflow.mlip.gpumd import GpumdBackend  # noqa: E402
 from nepflow.mlip.simulation import StaticPrediction, StaticPredictionRequest  # noqa: E402
+from nepflow.errors import MlipError, ValidationError  # noqa: E402
+from nepflow.stages.validation.protocols import (  # noqa: E402
+    ValidationCaseSpec,
+    ValidationReference,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -70,9 +74,54 @@ def backend_prediction_side_effect(predictions: list[dict]):
             positions_angstrom=prediction["positions"],
             cell_angstrom=prediction["cell"],
             pbc=tuple(prediction["pbc"]),
+            atom_mapping=tuple(range(prediction["atoms_count"])),
         )
 
     return parse
+
+
+def report_model() -> ModelRunRecord:
+    artifact = ArtifactIdentity.from_bytes("nep-model", b"fixture-report-model")
+    return ModelRunRecord(
+        ModelRunIdentity("fixture-dataset", "fixture-nep-input", "fixture-hyperparameters"),
+        ModelArtifactMetadata(model=artifact, status="completed"),
+    )
+
+
+def report_cases(
+    root: Path,
+    dft_data: dict,
+    *,
+    factors: tuple[int, int, int] = (1, 1, 1),
+) -> tuple[ModelRunRecord, tuple[ValidationCaseSpec, ...]]:
+    model = report_model()
+    cases = []
+    for ordinal, dft in sorted(dft_data.items()):
+        case_dir = root / "validation" / f"struct_{ordinal:04d}"
+        reference = ValidationReference(
+            structure=StructureIdentity(f"fixture-structure-{ordinal}"),
+            species=tuple(dft["species"]),
+            positions_angstrom=dft["positions"],
+            cell_angstrom=dft["cell"],
+            pbc=tuple(dft["pbc"]),
+            energy_ev=dft["energy"],
+            forces_ev_per_angstrom=dft["forces"],
+            virial_ev=dft["virial"],
+        )
+        cases.append(
+            ValidationCaseSpec.create(
+                ordinal=ordinal,
+                model_run_id=model.model_run_id,
+                dataset_id=model.identity.dataset_id,
+                reference=reference,
+                input_path=case_dir / "model.xyz",
+                working_directory=case_dir,
+                output_path=case_dir / "out.xyz",
+                replicates=factors,
+                virial_requested=dft["virial"] is not None,
+            )
+        )
+    return model, tuple(cases)
 
 
 def write_model_output(root: Path, frame_count: int = 2) -> Path:
@@ -94,6 +143,7 @@ def generate_report(root: Path) -> Path:
     dft_data, ml_predictions = comparison_inputs()
     output_path = root / "comparison.csv"
     validation_root = write_model_output(root, frame_count=len(dft_data))
+    model, cases = report_cases(root, dft_data)
 
     with (
         patch.object(analyze_module, "parse_dft_properties", return_value=dft_data),
@@ -105,8 +155,10 @@ def generate_report(root: Path) -> Path:
     ):
         analyze_module.generate_comparison_csv(
             validation_root=validation_root,
-            test_xyz_path=DFT_FIXTURE,
+            test_xyz_path=None,
             output_csv_path=output_path,
+            cases=cases,
+            model=model,
         )
 
     return output_path
@@ -157,12 +209,16 @@ def test_model_parser_exposes_fixture_predictions() -> None:
 def test_unmocked_extxyz_parser_to_csv_path_preserves_real_predictions() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
+        dft_data, _ = comparison_inputs()
         validation_root = write_model_output(root, frame_count=1)
+        model, cases = report_cases(root, {0: dft_data[0]})
         report_path = root / "comparison.csv"
         analyze_module.generate_comparison_csv(
             validation_root=validation_root,
-            test_xyz_path=DFT_FIXTURE,
+            test_xyz_path=None,
             output_csv_path=report_path,
+            cases=cases,
+            model=model,
         )
         rows = list(csv.DictReader(report_path.open(newline="", encoding="utf-8")))
 
@@ -173,110 +229,10 @@ def test_unmocked_extxyz_parser_to_csv_path_preserves_real_predictions() -> None
     assert float(rows[0]["virial_mae"]) == pytest.approx(5.18426037271)
 
 
-def test_prepared_model_xyz_preserves_periodic_reference_without_labels() -> None:
-    with tempfile.TemporaryDirectory() as tmp:
-        root = Path(tmp)
-        dataset_path = root / "nep" / "datasets" / "dataset_0001"
-        potential_path = root / "gpumd" / "dataset_0001" / "potential_0001"
-        config_gpumd_dir = root / "config" / "gpumd"
-        dataset_path.mkdir(parents=True)
-        potential_path.mkdir(parents=True)
-        config_gpumd_dir.mkdir(parents=True)
-        shutil.copy2(DFT_FIXTURE, dataset_path / "test.xyz")
-        (potential_path / "nep.txt").write_text(
-            "version 4\ntype 1 Si\ncutoff 6 5 112 60\n", encoding="utf-8"
-        )
-        (config_gpumd_dir / "run.in_validate").write_text(
-            "ensemble nvt 300 300 100\ntime_step 2\nvelocity 300\n"
-            "replicate 1 1 1\nrun 100\n",
-            encoding="utf-8",
-        )
-
-        source = ase_read(str(DFT_FIXTURE), index=0, format="extxyz")
-        state = prepare_module.prepare_validation_structures(
-            dataset_path=dataset_path,
-            gpumd_potential_dir=potential_path,
-            project_dir=root,
-            config_gpumd_dir=config_gpumd_dir,
-        )
-        model_path = Path(state["struct_folders"][0]["path"]) / "model.xyz"
-        model = ase_read(str(model_path), index=0, format="extxyz")
-        run_text = (Path(state["struct_folders"][0]["path"]) / "run.in").read_text(
-            encoding="utf-8"
-        )
-
-    assert model.get_chemical_symbols() == source.get_chemical_symbols()
-    np.testing.assert_allclose(model.positions, source.positions)
-    np.testing.assert_allclose(model.cell.array, source.cell.array)
-    np.testing.assert_array_equal(model.pbc, source.pbc)
-    assert "energy" not in model.info
-    assert "force" not in model.arrays
-    assert "ensemble nve" in run_text
-    assert "time_step 0" in run_text
-    assert run_text.count("potential nep.txt") == 1
-    assert run_text.index("replicate ") < run_text.index("potential nep.txt")
-    assert "dump_xyz 1 out.xyz precision double force potential virial" in run_text
-    assert run_text.count("dump_xyz 1 out.xyz precision double force potential virial") == 1
-    assert [line for line in run_text.splitlines() if line.startswith("run ")] == ["run 1"]
-    assert "ensemble nvt" not in run_text
-    assert "velocity 300" not in run_text
-
-
-def test_template_potential_and_geometry_commands_cannot_override_model_protocol() -> None:
-    with tempfile.TemporaryDirectory() as tmp:
-        root = Path(tmp)
-        dataset_path = root / "nep" / "datasets" / "dataset_0001"
-        potential_path = root / "gpumd" / "dataset_0001" / "potential_0001"
-        config_gpumd_dir = root / "config" / "gpumd"
-        dataset_path.mkdir(parents=True)
-        potential_path.mkdir(parents=True)
-        config_gpumd_dir.mkdir(parents=True)
-        shutil.copy2(DFT_FIXTURE, dataset_path / "test.xyz")
-        (potential_path / "nep.txt").write_text(
-            "version 4\ntype 1 Si\ncutoff 6 5 112 60\n", encoding="utf-8"
-        )
-        (config_gpumd_dir / "run.in_validate").write_text(
-            "potential wrong_model.txt\nchange_box x final 0 10\n"
-            "add_force 0 1 0 0\ndftd3 on\nreplicate 1 1 1\nrun 20\n",
-            encoding="utf-8",
-        )
-
-        state = prepare_module.prepare_validation_structures(
-            dataset_path=dataset_path,
-            gpumd_potential_dir=potential_path,
-            project_dir=root,
-            config_gpumd_dir=config_gpumd_dir,
-        )
-        run_text = (Path(state["struct_folders"][0]["path"]) / "run.in").read_text(
-            encoding="utf-8"
-        )
-        nx, ny, nz = state["struct_folders"][0]["replicates"]
-
-    lines = [line.strip() for line in run_text.splitlines()]
-    expected_replicate = f"replicate {nx} {ny} {nz}"
-    executable_lines = [line for line in lines if line and not line.startswith("#")]
-    assert executable_lines == [
-        expected_replicate,
-        "potential nep.txt",
-        "ensemble nve",
-        "time_step 0",
-        "dump_xyz 1 out.xyz precision double force potential virial",
-        "run 1",
-    ]
-    assert lines.count("potential nep.txt") == 1
-    assert not any("wrong_model.txt" in line for line in lines)
-    assert not any(line.startswith("change_box ") for line in lines)
-    assert not any(line.startswith("add_force ") for line in lines)
-    assert not any(line.startswith("dftd3 ") for line in lines)
-    assert lines.count("run 1") == 1
-    assert lines.count("dump_xyz 1 out.xyz precision double force potential virial") == 1
-    assert lines.count(expected_replicate) == 1
-    assert lines.index(expected_replicate) < lines.index("potential nep.txt")
-
-
 def test_replicated_model_output_normalizes_to_reference_metrics() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
+        dft_data, _ = comparison_inputs()
         reference_root = root / "reference"
         reference_struct_dir = reference_root / "validation" / "struct_0000"
         reference_struct_dir.mkdir(parents=True)
@@ -285,10 +241,15 @@ def test_replicated_model_output_normalizes_to_reference_metrics() -> None:
         )
         shutil.copy2(ML_FIXTURE, reference_struct_dir / "out.xyz")
         reference_report = reference_root / "comparison.csv"
+        reference_model, reference_cases = report_cases(
+            reference_root, {0: dft_data[0]}
+        )
         analyze_module.generate_comparison_csv(
             validation_root=reference_root / "validation",
-            test_xyz_path=DFT_FIXTURE,
+            test_xyz_path=None,
             output_csv_path=reference_report,
+            cases=reference_cases,
+            model=reference_model,
         )
         reference_rows = list(
             csv.DictReader(reference_report.open(newline="", encoding="utf-8"))
@@ -305,11 +266,16 @@ def test_replicated_model_output_normalizes_to_reference_metrics() -> None:
         repeated.info["virial"] = np.asarray(model.info["virial"], dtype=float) * 2
         ase_write(struct_dir / "out.xyz", repeated, format="extxyz")
         report_path = root / "comparison.csv"
+        model_record, cases = report_cases(
+            root, {0: dft_data[0]}, factors=(2, 1, 1)
+        )
 
         analyze_module.generate_comparison_csv(
             validation_root=validation_root,
-            test_xyz_path=DFT_FIXTURE,
+            test_xyz_path=None,
             output_csv_path=report_path,
+            cases=cases,
+            model=model_record,
         )
         rows = list(csv.DictReader(report_path.open(newline="", encoding="utf-8")))
 
@@ -323,56 +289,22 @@ def test_replicated_model_output_normalizes_to_reference_metrics() -> None:
 
 
 def test_displaced_model_frame_cannot_be_paired_with_dft_reference() -> None:
-    dft_data, ml_predictions = comparison_inputs()
-    ml_predictions[0]["positions"] = ml_predictions[0]["positions"].copy()
-    ml_predictions[0]["positions"][0, 0] += 0.25
-
-    with tempfile.TemporaryDirectory() as tmp:
-        root = Path(tmp)
-        validation_root = write_model_output(root, frame_count=2)
-        with (
-            patch.object(analyze_module, "parse_dft_properties", return_value=dft_data),
-            patch.object(
-                GpumdBackend,
-                "parse_prediction",
-                side_effect=backend_prediction_side_effect(ml_predictions),
-            ),
-        ):
-            with pytest.raises(ValueError, match="positions|configuration"):
-                analyze_module.generate_comparison_csv(
-                    validation_root=validation_root,
-                    test_xyz_path=DFT_FIXTURE,
-                    output_csv_path=root / "comparison.csv",
-                )
-
-
-def test_missing_replication_provenance_fails_explicitly() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
         validation_root = write_model_output(root, frame_count=1)
-        (validation_root / "struct_0000" / "run.in").unlink()
+        dft_data, _ = comparison_inputs()
+        model_record, cases = report_cases(root, {0: dft_data[0]})
+        output = ase_read(str(validation_root / "struct_0000" / "out.xyz"), format="extxyz")
+        output.positions[0, 0] += 0.25
+        ase_write(validation_root / "struct_0000" / "out.xyz", output, format="extxyz")
 
-        with pytest.raises(FileNotFoundError, match="replication provenance"):
+        with pytest.raises(MlipError, match="positions|configuration"):
             analyze_module.generate_comparison_csv(
                 validation_root=validation_root,
-                test_xyz_path=DFT_FIXTURE,
+                test_xyz_path=None,
                 output_csv_path=root / "comparison.csv",
-            )
-
-
-def test_malformed_replication_provenance_fails_explicitly() -> None:
-    with tempfile.TemporaryDirectory() as tmp:
-        root = Path(tmp)
-        validation_root = write_model_output(root, frame_count=1)
-        (validation_root / "struct_0000" / "run.in").write_text(
-            "replicate 2 1\nrun 1\n", encoding="utf-8"
-        )
-
-        with pytest.raises(ValueError, match="replicate"):
-            analyze_module.generate_comparison_csv(
-                validation_root=validation_root,
-                test_xyz_path=DFT_FIXTURE,
-                output_csv_path=root / "comparison.csv",
+                cases=cases,
+                model=model_record,
             )
 
 
@@ -431,21 +363,24 @@ def test_missing_required_prediction_is_an_error(missing_key: str) -> None:
     ml_predictions[0][missing_key] = None
 
     with tempfile.TemporaryDirectory() as tmp:
-        validation_root = write_model_output(Path(tmp))
+        root = Path(tmp)
+        validation_root = write_model_output(root)
+        model, cases = report_cases(root, dft_data)
         output_path = Path(tmp) / "comparison.csv"
         with (
-            patch.object(analyze_module, "parse_dft_properties", return_value=dft_data),
             patch.object(
                 GpumdBackend,
                 "parse_prediction",
                 side_effect=backend_prediction_side_effect(ml_predictions),
             ),
         ):
-            with pytest.raises((ValueError, RuntimeError)):
+            with pytest.raises(ValidationError):
                 analyze_module.generate_comparison_csv(
                     validation_root=validation_root,
-                    test_xyz_path=DFT_FIXTURE,
+                    test_xyz_path=None,
                     output_csv_path=output_path,
+                    cases=cases,
+                    model=model,
                 )
 
 
