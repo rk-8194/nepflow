@@ -1,5 +1,3 @@
-"""Remaining legacy validation stage module."""
+"""Compatibility namespace for legacy stages not yet migrated."""
 
-from .validate.validate import ValidateStage
-
-__all__ = ["ValidateStage"]
+__all__: list[str] = []

@@ -39,11 +39,8 @@ if _missing:
     )
     sys.exit(1)
 
-# Remaining legacy workflow modules are kept behind this composition root;
-# generation ownership is canonical.
+# Package root used for the project-output default below.
 _SOURCE_ROOT = Path(__file__).resolve().parents[1]
-if (_SOURCE_ROOT / "modules").is_dir() and str(_SOURCE_ROOT) not in sys.path:
-    sys.path.insert(0, str(_SOURCE_ROOT))
 
 from nepflow.errors import SchedulerError, StateError, ValidationError
 from nepflow.cli_wizard import CONFIG_PROMPTS, ConfigWizard
@@ -57,6 +54,7 @@ from nepflow.stages.generation import GenerationStage
 from nepflow.stages.generation.debug import run_debug
 from nepflow.stages.selection import SelectionStage
 from nepflow.stages.training import TrainingStage
+from nepflow.stages.validation import ValidationStage
 from nepflow.workflow import (
     StageContext,
     StageRegistry,
@@ -70,19 +68,6 @@ from nepflow.workflow import (
 logger = logging.getLogger("nepflow")
 process_runner = ProcessRunner(logger=logger)
 scheduler = SlurmScheduler(process_runner=process_runner)
-
-
-def _legacy_stage_kwargs(context: StageContext) -> dict:
-    """Adapt the canonical stage context to the remaining legacy stages."""
-
-    return {
-        "project_name": context.project_name,
-        "config_file": context.config_file,
-        "state_file": context.state_file,
-        "project_dir": context.project_dir,
-        "debug": context.debug,
-        "slurm_deadline": context.slurm_deadline,
-    }
 
 
 def _build_generation_stage(context: StageContext) -> GenerationStage:
@@ -225,13 +210,7 @@ def _offer_project_upload(context: StageContext) -> None:
 
 
 def compose_stage_registry() -> StageRegistry:
-    """Compose legacy stage implementations behind the canonical seam."""
-
-    # These imports remain confined to the composition root for stages that
-    # have not yet moved into the canonical package.
-    # pylint: disable=import-error,import-outside-toplevel
-    from modules import ValidateStage
-    from modules.validate.launcher import read_validation_status
+    """Compose canonical workflow stages behind the application seam."""
 
     registry = StageRegistry()
 
@@ -289,18 +268,7 @@ def compose_stage_registry() -> StageRegistry:
     )
 
     def run_validation(context: StageContext) -> StageRunResult:
-        ValidateStage(**_legacy_stage_kwargs(context)).run()
-        status = read_validation_status(context.project_dir)
-        complete = (
-            status.get("validation_complete") is True
-            and status.get("analysis_complete") is True
-        )
-        return StageRunResult(
-            stage=WorkflowStage.VALIDATE,
-            status=StageRunState.COMPLETED if complete else StageRunState.RUNNING,
-            advanced_to=WorkflowStage.COMPLETED if complete else None,
-            completed=complete,
-        )
+        return ValidationStage(context=context, scheduler=scheduler).run().as_workflow_result()
 
     registry.register(WorkflowStage.VALIDATE, run_validation)
     return registry

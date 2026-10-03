@@ -18,6 +18,7 @@ from .validation import (
     ValidationPreparation,
     ValidationReference,
     ValidationStage,
+    ValidationStageResult,
     prepare_validation_cases,
     resolve_model_dataset,
 )
@@ -33,6 +34,7 @@ __all__ = [
     "ValidationPreparation",
     "ValidationReference",
     "ValidationStage",
+    "ValidationStageResult",
     "prepare_validation_cases",
     "resolve_model_dataset",
 ]

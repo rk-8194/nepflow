@@ -1,4 +1,3 @@
-import csv
 import json
 import shutil
 import tempfile
@@ -27,16 +26,10 @@ from nepflow.domain.datasets import DatasetIdentity, TrainingDatasetManifest  # 
 from nepflow.dft.vasp.inputs import read_identity  # noqa: E402
 from nepflow.dft.vasp.outputs import parse_outcar_result  # noqa: E402
 from nepflow.io.hashing import sha256_file  # noqa: E402
-from modules.validate.analyze import generate_comparison_csv  # noqa: E402
-from modules.validate.launcher import (  # noqa: E402
-    read_validation_status,
-    write_validation_status,
-)
 from nepflow.mlip.nep.inputs import NepHyperparameters, NepInputRenderer  # noqa: E402
 from nepflow.stages.training.dataset import build_dataset_metadata  # noqa: E402
 from nepflow.io.json import write_json  # noqa: E402
 from nepflow.stages.validation.resolution import resolve_model_dataset  # noqa: E402
-from nepflow.stages.validation.protocols import ValidationCaseSpec  # noqa: E402
 from nepflow.errors import StateError  # noqa: E402
 from nepflow.state.store import StateStore  # noqa: E402
 
@@ -44,7 +37,6 @@ from nepflow.state.store import StateStore  # noqa: E402
 ROOT = Path(__file__).resolve().parents[1]
 OUTCAR_FIXTURE = ROOT / "tests" / "fixtures" / "outcar" / "valid_outcar"
 DFT_FIXTURE = ROOT / "tests" / "fixtures" / "structures" / "dft_reference.extxyz.fixture"
-ML_FIXTURE = ROOT / "tests" / "fixtures" / "structures" / "gpumd_static_prediction.extxyz.fixture"
 
 
 def read_dft_fixture_as_vasp_result():
@@ -237,52 +229,3 @@ def test_deterministic_dft_to_validation_identity_trace() -> None:
             nep_in_sha256=sha256_file(relocated_nep),
             hyperparameters_hash=hyperparameters_hash,
         ) == validated_manifest["model_run_id"]
-
-        # Exact model/dataset association is persisted in validation status.
-        validation_root = potential_path / "validation"
-        struct_dir = validation_root / "struct_0000"
-        struct_dir.mkdir(parents=True)
-        (struct_dir / "run.in").write_text("replicate 1 1 1\nrun 1\n", encoding="utf-8")
-        shutil.copy2(ML_FIXTURE, struct_dir / "out.xyz")
-        write_validation_status(
-            project_dir,
-            model_run_id=validated_manifest["model_run_id"],
-            potential_path=str(potential_path),
-            dataset_path=str(dataset_path),
-            dataset_name=dataset_path.name,
-            preparation_state={
-                "validation_root": str(validation_root),
-                "struct_count": 1,
-                "struct_folders": [{"name": "struct_0000", "path": str(struct_dir)}],
-            },
-            validation_complete=True,
-            analysis_complete=True,
-        )
-        validation_status = read_validation_status(project_dir)
-        assert validation_status["model_run_id"] == validated_manifest["model_run_id"]
-        assert Path(validation_status["dataset_path"]).resolve() == dataset_path.resolve()
-
-        # Actual serialized DFT/ML output produces deliberately non-zero metrics.
-        report_path = project_dir / "reports" / "comparison.csv"
-        case = ValidationCaseSpec.create(
-            ordinal=0,
-            model_run_id=resolved.model_run_id,
-            dataset_id=resolved.dataset_id,
-            reference=resolved.test_references()[0],
-            input_path=struct_dir / "model.xyz",
-            working_directory=struct_dir,
-            output_path=struct_dir / "out.xyz",
-            virial_requested=True,
-        )
-        generate_comparison_csv(
-            validation_root,
-            None,
-            report_path,
-            cases=(case,),
-            model=resolved.model_run,
-        )
-        rows = list(csv.DictReader(report_path.open(newline="", encoding="utf-8")))
-        assert rows
-        assert float(rows[0]["energy_error_per_atom"]) == pytest.approx(0.125)
-        assert float(rows[0]["force_component_mae"]) > 0.0
-        assert "virial_mae" in rows[0]

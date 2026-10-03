@@ -61,38 +61,6 @@ def calculate_cell_replicates_for_cutoff(
     return result  # type: ignore[return-value]
 
 
-def validation_preparation_to_launcher_state(
-    preparation: ValidationPreparation,
-) -> dict[str, Any]:
-    """Serialize canonical cases into the launcher's existing status shape.
-
-    This adapter contains no dataset parsing, geometry calculation, or identity
-    construction.  Those responsibilities remain in ``prepare_validation_cases``.
-    """
-
-    return {
-        "schema_version": preparation.schema_version,
-        "model_run_id": preparation.model_run_id,
-        "dataset_id": preparation.dataset_id,
-        "validation_root": str(preparation.cases[0].working_directory.parent)
-        if preparation.cases
-        else str(preparation.model_path.parent / "validation"),
-        "dataset_path": str(preparation.dataset_path),
-        "potential_path": str(preparation.model_path.parent),
-        "struct_count": len(preparation.cases),
-        "cases": [case.to_dict() for case in preparation.cases],
-        "struct_folders": [
-            {
-                "name": case.working_directory.name,
-                "path": str(case.working_directory),
-                "atoms_count": case.atom_count,
-                "replicates": list(case.replicates),
-            }
-            for case in preparation.cases
-        ],
-    }
-
-
 def prepare_validation_cases(
     project_dir: Path,
     model_run_id: str,
@@ -161,5 +129,4 @@ __all__ = [
     "calculate_cell_replicates_for_cutoff",
     "cell_perpendicular_heights_angstrom",
     "prepare_validation_cases",
-    "validation_preparation_to_launcher_state",
 ]

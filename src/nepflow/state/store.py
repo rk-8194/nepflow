@@ -1468,5 +1468,39 @@ class StateStore:
             raise ValueError("training events must use a training_ entity type")
         return self.list_events(entity_type=entity_type, entity_id=entity_id)
 
+    def record_validation_event(
+        self,
+        entity_type: str,
+        entity_id: str,
+        event_type: str,
+        payload: Any = None,
+        *,
+        event_id: str | None = None,
+        occurred_at: str | None = None,
+    ) -> dict[str, Any]:
+        """Append one validation reconciliation transition to the ledger."""
+
+        if not entity_type.startswith("validation_"):
+            raise ValueError("validation events must use a validation_ entity type")
+        return self.append_event(
+            event_id or f"validation:{entity_type}:{entity_id}:{uuid4().hex}",
+            entity_type,
+            entity_id,
+            event_type,
+            payload,
+            occurred_at=occurred_at,
+        )
+
+    def list_validation_events(
+        self,
+        entity_type: str,
+        entity_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return append-only validation transitions in ledger order."""
+
+        if not entity_type.startswith("validation_"):
+            raise ValueError("validation events must use a validation_ entity type")
+        return self.list_events(entity_type=entity_type, entity_id=entity_id)
+
 
 __all__ = ["StateStore", "CURRENT_SCHEMA_VERSION"]

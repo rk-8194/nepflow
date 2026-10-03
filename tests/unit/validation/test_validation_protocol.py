@@ -1,8 +1,6 @@
 """Identity, geometry, and real GPUMD static-output regressions."""
 
-import csv
 import json
-import shutil
 from pathlib import Path
 
 import numpy as np
@@ -28,7 +26,6 @@ from nepflow.stages.validation.protocols import (
     ValidationCaseSpec,
     ValidationPreparation,
 )
-from modules.validate.analyze import generate_comparison_csv
 from nepflow.state.store import StateStore
 
 
@@ -384,38 +381,6 @@ def test_gpumd_backend_materializes_exact_potential_filename_and_checks_artifact
     )
     with pytest.raises(MlipError, match="source path"):
         GpumdBackend().prepare_inputs(missing_path_request)
-
-
-def test_canonical_case_analysis_uses_backend_ml_values(tmp_path: Path) -> None:
-    model_run_id, _ = _materialize_authoritative_project(tmp_path)
-    resolved = resolve_model_dataset(tmp_path, model_run_id)
-    reference = resolved.test_references()[0]
-    case_dir = tmp_path / "case"
-    case_dir.mkdir()
-    (case_dir / "run.in").write_text("replicate 1 1 1\nrun 1\n", encoding="utf-8")
-    shutil.copy2(ML_FIXTURE, case_dir / "out.xyz")
-    case = ValidationCaseSpec.create(
-        ordinal=0,
-        model_run_id=model_run_id,
-        dataset_id=resolved.dataset_id,
-        reference=reference,
-        input_path=case_dir / "model.xyz",
-        working_directory=case_dir,
-        output_path=case_dir / "out.xyz",
-        replicates=(1, 1, 1),
-        virial_requested=True,
-    )
-    report_path = tmp_path / "comparison.csv"
-    generate_comparison_csv(
-        case_dir.parent,
-        None,
-        report_path,
-        cases=(case,),
-        model=resolved.model_run,
-    )
-    row = next(csv.DictReader(report_path.open(newline="", encoding="utf-8")))
-    assert float(row["energy_error_per_atom"]) == 0.125
-    assert float(row["force_component_mae"]) > 0.0
 
 
 def test_replicated_case_prediction_returns_reference_atom_mapping(tmp_path: Path) -> None:
