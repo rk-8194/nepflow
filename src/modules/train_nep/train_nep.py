@@ -6,7 +6,7 @@ import shutil
 from configparser import ConfigParser
 from datetime import datetime
 from pathlib import Path
-from typing import List, Tuple
+from typing import Any, List, Sequence, Tuple
 
 import numpy as np
 from ase.io import read as ase_read
@@ -14,11 +14,14 @@ from ase.atoms import Atoms
 
 from ..base import Stage
 from nepflow.workflow.resubmission import SelfResubmitExit
+from nepflow.state.store import StateStore
+from nepflow.domain.datasets import DatasetIdentity
+from nepflow.domain.identities import calculate_structure_id
+from nepflow.dft.vasp.outputs import ResolvedVaspOutput, parse_outcar_result
+from nepflow.io.hashing import sha256_file
 from nepflow.mlip.nep.artifacts import (
-    MODEL_RUN_MANIFEST_FILENAME,
     NepArtifactError,
     create_model_run_manifest,
-    read_model_run_manifest,
     update_model_run_status,
 )
 from nepflow.io.atomic import atomic_write_text
@@ -44,6 +47,12 @@ class TrainNepStage(Stage):
     """Prepare NEP training datasets from VASP results and submit training job."""
 
     def run(self) -> None:
+        """Execute the stage with one authoritative ledger connection."""
+
+        with StateStore(self.state_file) as state_store:
+            return self._run_with_state_store(state_store)
+
+    def _run_with_state_store(self, state_store: StateStore) -> None:
         """Execute NEP dataset preparation and training job submission/monitoring."""
         logger.info("NEP Training Stage")
         
@@ -69,7 +78,11 @@ class TrainNepStage(Stage):
         if status.get("status") in ["running", "failed"] and status.get("potential_path"):
             logger.info("Resubmitting from previous run")
             potential_path = Path(status["potential_path"])
-            dataset_path = self._find_dataset_for_potential(potential_path)
+            dataset_path = self._find_dataset_for_potential(
+                potential_path,
+                state_store=state_store,
+                model_run_id=status.get("model_run_id"),
+            )
             if status.get("dataset_path"):
                 persisted_path = Path(status["dataset_path"]).resolve()
                 if persisted_path != dataset_path.resolve():
@@ -93,6 +106,8 @@ class TrainNepStage(Stage):
                             project_dir=self.project_dir,
                             debug=self.debug,
                             slurm_deadline=self.slurm_deadline,
+                            state_store=state_store,
+                            model_run_id=status.get("model_run_id"),
                         )
                     except SelfResubmitExit as e:
                         logger.warning(f"Resubmit needed: {e}")
@@ -138,6 +153,23 @@ class TrainNepStage(Stage):
         logger.info(
             f"Found {len(train_structures)} train structures and {len(test_structures)} test structures"
         )
+        if all(isinstance(item, Atoms) for item in (*train_structures, *test_structures)):
+            split_records = {
+                DatasetSplit.TRAIN: self._resolve_state_results(
+                    state_store, train_structures, DatasetSplit.TRAIN
+                ),
+                DatasetSplit.TEST: self._resolve_state_results(
+                    state_store, test_structures, DatasetSplit.TEST
+                ),
+            }
+        else:
+            # Test/integration doubles may supply already-authoritative records
+            # directly.  The production path above is the only path that
+            # converts selected structures into dataset members.
+            split_records = {
+                DatasetSplit.TRAIN: train_structures,
+                DatasetSplit.TEST: test_structures,
+            }
 
         # Step 2: Create or find dataset folder
         logger.info("Step 2: Creating NEP dataset folder")
@@ -158,14 +190,13 @@ class TrainNepStage(Stage):
         )
         dataset_result = build_training_dataset(
             dataset_path,
-            {
-                DatasetSplit.TRAIN: train_structures,
-                DatasetSplit.TEST: test_structures,
-            },
+            split_records,
             self.project_dir,
             train_virial=train_virial,
             debug=self.debug,
             allow_partial=allow_partial,
+            state_store=state_store,
+            project_id=self.project_name,
         )
         train_count = dataset_result.train_count
         test_count = dataset_result.test_count
@@ -202,14 +233,31 @@ class TrainNepStage(Stage):
         dataset_id = metadata.get("dataset_id")
         if not dataset_id:
             raise RuntimeError(f"Dataset manifest has no dataset_id: {dataset_path / '.dataset'}")
+        if state_store.get_dataset(str(dataset_id)) is None:
+            # Compatibility doubles may return a prebuilt result without
+            # having called the canonical builder's StateStore hook.
+            state_store.upsert_dataset(
+                DatasetIdentity(str(dataset_id), metadata),
+                project_id=None,
+                status="prepared",
+            )
         model_manifest = create_model_run_manifest(
             potential_path=potential_path,
             dataset_path=dataset_path,
             dataset_id=dataset_id,
             nep_in_path=potential_path / "nep.in",
             hyperparameters_hash=hyperparameters.identity_hash(),
+            state_store=state_store,
         )
         logger.info("Created model-run manifest for %s", model_manifest["model_run_id"])
+        write_train_status(
+            self.project_dir,
+            potential_path=str(potential_path),
+            dataset_path=str(dataset_path),
+            model_run_id=model_manifest["model_run_id"],
+            status="prepared",
+            attempt=0,
+        )
 
         # Step 6: Prepare the backend command and let the common launcher/
         # Scheduler boundary submit it.  The NEP backend never submits jobs.
@@ -223,6 +271,8 @@ class TrainNepStage(Stage):
                     potential_path,
                     "failed",
                     error=str(e),
+                    state_store=state_store,
+                    model_run_id=model_manifest["model_run_id"],
                 )
                 write_train_status(
                     self.project_dir,
@@ -245,6 +295,8 @@ class TrainNepStage(Stage):
                     project_dir=self.project_dir,
                     debug=self.debug,
                     slurm_deadline=self.slurm_deadline,
+                    state_store=state_store,
+                    model_run_id=model_manifest["model_run_id"],
                 )
             except SelfResubmitExit as e:
                 logger.warning(f"Resubmit needed: {e}")
@@ -295,38 +347,133 @@ class TrainNepStage(Stage):
         script_path.chmod(0o755)
         return script_path
 
-    def _find_dataset_for_potential(self, potential_path: Path) -> Path:
-        """Resolve the dataset from the potential's explicit run manifest."""
-        manifest_path = potential_path / MODEL_RUN_MANIFEST_FILENAME
-        try:
-            manifest = read_model_run_manifest(manifest_path)
-        except FileNotFoundError:
-            raise
-        except NepArtifactError as exc:
-            raise RuntimeError(
-                f"Cannot resolve dataset for {potential_path} without a valid model-run manifest"
-            ) from exc
-        dataset_path = Path(str(manifest.get("dataset_path", "")))
-        dataset_id = manifest.get("dataset_id")
-        if not dataset_id or not dataset_path.is_dir():
-            raise RuntimeError(
-                f"Model-run manifest has no valid dataset association: {manifest_path}"
+    def _resolve_state_results(
+        self,
+        state_store: StateStore,
+        structures: Sequence[Atoms],
+        split: DatasetSplit,
+    ) -> list[Any]:
+        """Parse only OUTCAR artifacts accepted for exact StateStore rows."""
+
+        calculations = state_store.list_dft_calculations(
+            statuses=("completed",),
+            selected_only=True,
+        )
+        by_structure: dict[str, list[dict[str, Any]]] = {}
+        for calculation in calculations:
+            identity = calculation.get("identity", {})
+            structure_id = identity.get("structure_id", calculation.get("structure_id"))
+            if structure_id:
+                by_structure.setdefault(str(structure_id), []).append(calculation)
+
+        resolved: list[Any] = []
+        for atoms in structures:
+            structure_id = str(atoms.info.get("structure_id", calculate_structure_id(atoms)))
+            requested_calculation_id = atoms.info.get("calculation_id")
+            candidates = by_structure.get(structure_id, [])
+            if requested_calculation_id:
+                candidates = [
+                    row
+                    for row in candidates
+                    if row.get("calculation_id") == requested_calculation_id
+                    or row.get("identity", {}).get("calculation_id") == requested_calculation_id
+                ]
+            if len(candidates) != 1:
+                raise RuntimeError(
+                    f"StateStore must resolve exactly one completed {split.value} DFT calculation "
+                    f"for structure_id={structure_id}; found {len(candidates)}"
+                )
+            calculation = candidates[0]
+            identity = dict(calculation.get("identity", {}))
+            calculation_id = str(calculation["calculation_id"])
+            attempt_id = calculation.get("accepted_attempt_id")
+            artifacts = state_store.list_artifacts(originating_attempt_id=attempt_id)
+            outcars = [
+                artifact
+                for artifact in artifacts
+                if artifact.get("artifact_type") == "vasp_outcar"
+            ]
+            if len(outcars) != 1:
+                raise RuntimeError(
+                    f"StateStore has no unique accepted OUTCAR for {calculation_id}"
+                )
+            artifact = outcars[0]
+            outcar_path = Path(str(artifact.get("path", "")))
+            if not outcar_path.is_file() or sha256_file(outcar_path) != artifact.get("sha256"):
+                raise RuntimeError(
+                    f"Accepted OUTCAR artifact is missing or changed for {calculation_id}"
+                )
+            evidence = ResolvedVaspOutput(
+                outcar_path=outcar_path,
+                calculation_identity=tuple(sorted((str(k), str(v)) for k, v in identity.items())),
+                verification_source="state_store_artifact",
             )
-        try:
-            dataset_metadata = read_json(
+            result = parse_outcar_result(
+                outcar_path,
+                atoms,
+                require_virial=False,
+                calculation_identity=identity,
+                identity_evidence=evidence,
+            )
+            if not result.accepted:
+                raise RuntimeError(
+                    f"StateStore OUTCAR could not be parsed for {calculation_id}: "
+                    f"{result.rejection_reason}"
+                )
+            if result.structure_id != structure_id:
+                raise RuntimeError(
+                    f"StateStore OUTCAR structure identity changed for {calculation_id}"
+                )
+            resolved.append(result)
+        return resolved
+
+    def _find_dataset_for_potential(
+        self,
+        potential_path: Path,
+        *,
+        state_store: StateStore | None = None,
+        model_run_id: str | None = None,
+    ) -> Path:
+        """Resolve a dataset through the authoritative model and dataset rows."""
+        if state_store is not None:
+            if not model_run_id:
+                raise RuntimeError("Training restart requires an explicit model_run_id")
+            model_run = state_store.get_model_run(model_run_id)
+            if model_run is None:
+                raise RuntimeError(f"Unknown authoritative model run: {model_run_id}")
+            identity = model_run.get("identity", {})
+            dataset_id = identity.get("dataset_id")
+            dataset = state_store.get_dataset(str(dataset_id)) if dataset_id else None
+            if dataset is None:
+                raise RuntimeError(
+                    f"Model run {model_run_id} has no authoritative dataset association"
+                )
+            run_metadata = model_run.get("execution_metadata", {})
+            stored_potential = run_metadata.get("potential_path")
+            if stored_potential and Path(str(stored_potential)).resolve() != potential_path.resolve():
+                raise RuntimeError(
+                    "Training restart potential_path conflicts with StateStore model identity"
+                )
+            dataset_manifest = dataset.get("manifest", {})
+            dataset_path = Path(
+                str(run_metadata.get("dataset_path", dataset_manifest.get("dataset_path", "")))
+            )
+            if not dataset_path.is_dir():
+                raise RuntimeError(
+                    f"Authoritative dataset {dataset_id} is missing its materialized path"
+                )
+            metadata = read_json(
                 dataset_path / ".dataset",
                 error_type=NepArtifactError,
                 missing_error_type=NepArtifactError,
                 require_object=True,
             )
-        except NepArtifactError as exc:
-            raise RuntimeError(f"Cannot read dataset manifest: {dataset_path / '.dataset'}") from exc
-        if dataset_metadata.get("dataset_id") != dataset_id:
-            raise RuntimeError(
-                f"Dataset identity mismatch for model run {manifest.get('model_run_id')}"
-            )
-        logger.debug("Resolved model run %s to dataset %s", manifest.get("model_run_id"), dataset_path)
-        return dataset_path
+            if metadata.get("dataset_id") != dataset_id:
+                raise RuntimeError("Materialized dataset conflicts with StateStore identity")
+            logger.debug("Resolved model run %s to dataset %s", model_run_id, dataset_path)
+            return dataset_path
+
+        raise RuntimeError("StateStore is required to resolve a training restart")
 
     def _get_nep_hyperparameters(self, config: ConfigParser) -> NepHyperparameters:
         """Resolve all exposed NEP settings through the canonical value object."""

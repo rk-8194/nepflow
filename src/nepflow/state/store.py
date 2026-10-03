@@ -1191,6 +1191,21 @@ class StateStore:
             else _decode_row(row, ("identity_json", "execution_metadata_json"))
         )
 
+    def list_model_artifacts(self, model_run_id: str) -> list[dict[str, Any]]:
+        """Return artifacts linked to one authoritative model run."""
+
+        rows = self._fetchall(
+            "SELECT a.*, ma.role, ma.metadata_json AS link_metadata_json "
+            "FROM model_artifacts AS ma "
+            "JOIN artifacts AS a ON a.artifact_id = ma.artifact_id "
+            "WHERE ma.model_run_id = ? ORDER BY ma.role, a.artifact_id",
+            (model_run_id,),
+        )
+        return [
+            _decode_row(row, ("metadata_json", "link_metadata_json"))
+            for row in rows
+        ]
+
     def record_model_run(self, record: ModelRunRecord, **kwargs: Any) -> dict[str, Any]:
         """Record one model-run identity and its artifact links."""
 

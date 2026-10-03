@@ -17,34 +17,18 @@ from pathlib import Path
 from typing import Any, Iterable, Iterator, Mapping, Sequence
 
 import numpy as np
-from ase.atoms import Atoms
-from ase.io import read as ase_read
 
-from nepflow.dft.vasp.inputs import (
-    build_input_context,
-    identity_for_structure,
-    read_identity,
-)
-from nepflow.dft.vasp.outputs import (
-    VaspJobEvidence,
-    VaspParseResult,
-    VaspRegistryEvidence,
-    parse_outcar_result,
-    resolve_verified_output,
-    validate_dft_result_labels,
-)
-from nepflow.dft.vasp.registry import (
-    get_nepflow_root,
-    get_registry_entry,
-    read_completed_registry,
-    read_status,
-)
+# Only used by the compatibility bridge below; the authoritative builder does
+# not import or call an ASE reader.
+ase_read = None
+
+from nepflow.dft.vasp.outputs import VaspParseResult, validate_dft_result_labels
 from nepflow.domain.datasets import (
     DatasetIdentity,
     SelectedDatasetMember,
     TrainingDatasetManifest,
 )
-from nepflow.domain.identities import StructureIdentity, calculate_structure_id
+from nepflow.domain.identities import StructureIdentity
 from nepflow.domain.units import (
     ENERGY_UNIT_EV,
     FORCE_UNIT_EV_PER_ANGSTROM,
@@ -211,8 +195,6 @@ def _reset_or_create_report(
 def _record_structure_id(value: Any) -> str | None:
     if isinstance(value, VaspParseResult):
         return value.structure_id
-    if isinstance(value, Atoms):
-        return calculate_structure_id(value)
     if isinstance(value, Mapping):
         structure_id = value.get("structure_id")
         if structure_id is not None:
@@ -238,210 +220,19 @@ def _rejection(
     report.record_rejection(reason, member_index=member_index)
 
 
-def iter_labeled_structures(
-    ase_structures: Sequence[Atoms],
-    split: DatasetSplit | str,
-    project_dir: Path,
-    *,
-    require_virial: bool = False,
-    debug: bool = False,
-    report: DatasetBuildReport | None = None,
-) -> Iterator[dict[str, Any]]:
-    """Yield verified DFT labels for one explicit split.
+def iter_labeled_structures(*args: Any, **kwargs: Any) -> Iterator[dict[str, Any]]:
+    """Compatibility bridge to the legacy Atoms-to-VASP resolver.
 
-    Missing or unverified VASP output is always rejected.  ``debug=True`` is
-    the only mode in which labels already attached to an ``Atoms`` object may
-    be used, and those records are marked as synthetic content in the report.
+    The authoritative dataset builder below does not call this function. It
+    remains importable for pre-Phase 4 callers while the resolver itself lives
+    in the explicitly named compatibility adapter.
     """
 
-    selected_split = DatasetSplit.coerce(split)
-    report = _reset_or_create_report(selected_split, len(ase_structures), report)
-    jobs_path = Path(project_dir) / "vasp" / "jobs" / selected_split.value
-    input_context_record = build_input_context(Path(project_dir))
+    from modules.train_nep.prepare import resolve_legacy_labeled_structures
 
-    if not jobs_path.exists():
-        if not debug:
-            for ordinal, atoms in enumerate(ase_structures):
-                member_index = report.record_requested(
-                    calculate_structure_id(atoms), ordinal
-                )
-                _rejection(
-                    report,
-                    "vasp_jobs_path_missing",
-                    member_index=member_index,
-                )
-            return
-        for ordinal, atoms in enumerate(ase_structures):
-            member_index = report.record_requested(
-                calculate_structure_id(atoms), ordinal
-            )
-            try:
-                synthetic = _extract_debug_labels(atoms)
-                if require_virial and synthetic.get("virial") is None:
-                    raise ValueError("missing_required_virial")
-            except Exception:
-                # Debug mode retains the explicit failure semantics of the
-                # accepted Phase 2 helper; it never turns missing labels into
-                # a silently rejected synthetic record.
-                raise
-            synthetic["record_type"] = "debug_synthetic"
-            synthetic["split"] = selected_split.value
-            synthetic["ordinal"] = ordinal
-            synthetic["structure_id"] = calculate_structure_id(atoms)
-            report.record_acceptance(
-                content_record=synthetic,
-                member_index=member_index,
-            )
-            yield synthetic
-        return
-
-    if input_context_record is None:
-        for ordinal, atoms in enumerate(ase_structures):
-            member_index = report.record_requested(
-                calculate_structure_id(atoms), ordinal
-            )
-            _rejection(
-                report,
-                "vasp_input_context_missing",
-                member_index=member_index,
-            )
-        return
-
-    input_context = input_context_record.as_legacy_mapping()
-    input_context["registry"] = read_completed_registry(get_nepflow_root(project_dir))
-
-    for ordinal, atoms in enumerate(ase_structures):
-        member_index = report.record_requested(
-            calculate_structure_id(atoms), ordinal
-        )
-        try:
-            identity = identity_for_structure(atoms, input_context).as_dict()
-            preferred = jobs_path / f"struct_{ordinal:04d}"
-            candidate_dirs = [preferred]
-            candidate_dirs.extend(
-                directory
-                for directory in sorted(
-                    (
-                        directory
-                        for directory in jobs_path.iterdir()
-                        if directory.is_dir() and directory.name.startswith("struct_")
-                    ),
-                    key=lambda directory: directory.name,
-                )
-                if directory != preferred
-            )
-            current_jobs = []
-            for directory in candidate_dirs:
-                if not directory.exists():
-                    continue
-                current_jobs.append(
-                    VaspJobEvidence(
-                        job_directory=directory,
-                        identity=read_identity(directory) or None,
-                        status=read_status(directory),
-                    )
-                )
-            registry_entry = get_registry_entry(
-                input_context["registry"],
-                identity["incar_hash"],
-                identity["potcar_hash"],
-                identity["structure_id"],
-            )
-            registry_evidence = None
-            if registry_entry is not None:
-                registry_evidence = VaspRegistryEvidence(
-                    outcar_path=Path(registry_entry["job_path"]) / "OUTCAR",
-                    calculation_identity=identity,
-                )
-            resolved_output = resolve_verified_output(
-                identity,
-                current_jobs=current_jobs,
-                registry_evidence=registry_evidence,
-            )
-        except Exception as exc:
-            _rejection(
-                report,
-                f"identity_resolution_failed:{type(exc).__name__}",
-                member_index=member_index,
-            )
-            continue
-
-        if resolved_output is None:
-            _rejection(report, "completed_outcar_missing", member_index=member_index)
-            continue
-
-        try:
-            result = parse_outcar_result(
-                resolved_output.outcar_path,
-                atoms,
-                require_virial=require_virial,
-                calculation_identity=identity,
-                identity_evidence=resolved_output,
-                reader=ase_read,
-                identity_reader=read_identity,
-            )
-        except Exception as exc:
-            _rejection(
-                report,
-                f"extraction_failed:{type(exc).__name__}",
-                member_index=member_index,
-            )
-            continue
-
-        if not result.accepted:
-            _rejection(
-                report,
-                result.rejection_reason or "record_rejected",
-                member_index=member_index,
-            )
-            continue
-        if not result.source_outcar_hash:
-            _rejection(
-                report,
-                "missing_source_outcar_hash",
-                member_index=member_index,
-            )
-            continue
-        report.record_acceptance(result, member_index=member_index)
-        yield result.as_structure_dict()
-
-
-def _extract_debug_labels(atoms: Atoms) -> dict[str, Any]:
-    """Read labels already attached to a debug-only ``Atoms`` object."""
-
-    if "energy" in atoms.info:
-        energy = float(atoms.info["energy"])
-    elif atoms.calc is not None:
-        energy = float(atoms.get_potential_energy())
-    else:
-        raise ValueError("Debug structure is missing an energy label")
-
-    if "forces" in atoms.arrays:
-        forces = np.asarray(atoms.arrays["forces"], dtype=float)
-    elif "force" in atoms.arrays:
-        forces = np.asarray(atoms.arrays["force"], dtype=float)
-    elif atoms.calc is not None:
-        forces = np.asarray(atoms.get_forces(), dtype=float)
-    else:
-        raise ValueError("Debug structure is missing force labels")
-
-    if forces.shape != (len(atoms), 3) or not np.isfinite(forces).all():
-        raise ValueError("Debug structure force labels are invalid")
-    if not np.isfinite(energy):
-        raise ValueError("Debug structure energy label is not finite")
-    return {
-        "energy": energy,
-        "forces": forces,
-        "positions": atoms.get_positions(),
-        "lattice": atoms.get_cell().array,
-        "species": atoms.get_chemical_symbols(),
-        "pbc": atoms.pbc.tolist(),
-        "virial": atoms.info.get("virial"),
-        "energy_unit": ENERGY_UNIT_EV,
-        "force_unit": FORCE_UNIT_EV_PER_ANGSTROM,
-        "virial_unit": VIRIAL_UNIT_EV,
-        "virial_convention": VIRIAL_CONVENTION_POSITIVE_COMPRESSION,
-    }
+    if "reader" not in kwargs:
+        kwargs["reader"] = ase_read
+    return resolve_legacy_labeled_structures(*args, **kwargs)
 
 
 def _result_from_mapping(value: Mapping[str, Any]) -> VaspParseResult:
@@ -518,11 +309,12 @@ def _canonical_record(
     return record
 
 
-def _normalise_explicit_item(value: Any) -> VaspParseResult | Atoms | Mapping[str, Any]:
-    if isinstance(value, (Atoms, VaspParseResult, Mapping)):
+def _normalise_explicit_item(value: Any) -> VaspParseResult | Mapping[str, Any]:
+    if isinstance(value, (VaspParseResult, Mapping)):
         return value
     raise TypeError(
-        "dataset split members must be ASE Atoms, VaspParseResult, or a result mapping"
+        "authoritative dataset members must be VaspParseResult records or result mappings; "
+        "resolve ASE structures through the compatibility adapter first"
     )
 
 
@@ -678,6 +470,43 @@ def _record_state_members(
             ordinal += 1
 
 
+def _require_state_authority(state_store: Any, result: VaspParseResult) -> None:
+    """Require the parsed result and OUTCAR hash to exist in the ledger."""
+
+    identity = dict(result.calculation_identity)
+    calculation_id = identity.get("calculation_id")
+    if not isinstance(calculation_id, str) or not calculation_id:
+        raise ValueError("state_dft_calculation_id_missing")
+    get_calculation = getattr(state_store, "get_dft_calculation", None)
+    list_artifacts = getattr(state_store, "list_artifacts", None)
+    if not callable(get_calculation) or not callable(list_artifacts):
+        raise TypeError(
+            "authoritative dataset building requires StateStore DFT result APIs"
+        )
+    calculation = get_calculation(calculation_id)
+    if not isinstance(calculation, Mapping):
+        raise ValueError("state_dft_calculation_missing")
+    if calculation.get("status") != "completed":
+        raise ValueError("state_dft_calculation_not_completed")
+    if not calculation.get("accepted_attempt_id"):
+        raise ValueError("state_dft_attempt_not_accepted")
+    persisted_identity = calculation.get("identity", calculation.get("identity_json", {}))
+    if isinstance(persisted_identity, Mapping):
+        if dict(persisted_identity) != identity:
+            raise ValueError("state_dft_identity_mismatch")
+        if persisted_identity.get("structure_id") != result.structure_id:
+            raise ValueError("state_dft_structure_identity_mismatch")
+    artifacts = list_artifacts(
+        originating_attempt_id=str(calculation["accepted_attempt_id"])
+    )
+    if not any(
+        artifact.get("artifact_type") == "vasp_outcar"
+        and artifact.get("sha256") == result.source_outcar_hash
+        for artifact in artifacts
+    ):
+        raise ValueError("state_dft_outcar_hash_not_authoritative")
+
+
 def build_training_dataset(
     dataset_path: Path,
     split_records: Mapping[DatasetSplit | str, Sequence[Any]],
@@ -695,10 +524,15 @@ def build_training_dataset(
 
     ``split_records`` is deliberately explicit: callers cannot accidentally
     turn a boolean into a different split while moving data through the
-    pipeline.  Existing verified :class:`VaspParseResult` records are consumed
-    directly; selected ``Atoms`` are resolved only through the canonical VASP
-    resolver above.
+    pipeline.  It accepts only verified :class:`VaspParseResult` records (or
+    mappings containing one).  ASE structures must be resolved by the named
+    compatibility adapter before this boundary.
     """
+
+    if state_store is None:
+        raise ValueError(
+            "state_store is required for the authoritative training dataset path"
+        )
 
     normalized: dict[DatasetSplit, Sequence[Any]] = {}
     for key, records in split_records.items():
@@ -722,41 +556,6 @@ def build_training_dataset(
         report = reports[split]
         for ordinal, item in enumerate(normalized[split]):
             member_index = report.record_requested(_record_structure_id(item), ordinal)
-            if isinstance(item, Atoms):
-                # The canonical resolver expects a sequence and accounts for
-                # all errors without ever inventing labels.
-                local_report = DatasetBuildReport(split, requested_count=1)
-                for structure in iter_labeled_structures(
-                    [item],
-                    split,
-                    project_dir,
-                    require_virial=train_virial,
-                    debug=debug,
-                    report=local_report,
-                ):
-                    rendered[split].append(structure)
-                if local_report.accepted_results:
-                    report.accepted_results.extend(local_report.accepted_results)
-                    local_member = dict(local_report.requested_members[0])
-                    local_member.pop("ordinal", None)
-                    report.requested_members[member_index].update(local_member)
-                elif local_report.accepted_content_records:
-                    report.accepted_content_records.extend(
-                        local_report.accepted_content_records
-                    )
-                    local_member = dict(local_report.requested_members[0])
-                    local_member.pop("ordinal", None)
-                    report.requested_members[member_index].update(local_member)
-                else:
-                    for reason, count in local_report.rejected_reason_counts.items():
-                        report.rejected_reason_counts[reason] = (
-                            report.rejected_reason_counts.get(reason, 0) + count
-                        )
-                    local_member = dict(local_report.requested_members[0])
-                    local_member.pop("ordinal", None)
-                    report.requested_members[member_index].update(local_member)
-                continue
-
             try:
                 result = item if isinstance(item, VaspParseResult) else _result_from_mapping(item)
                 if not result.accepted:
@@ -766,6 +565,7 @@ def build_training_dataset(
                         member_index=member_index,
                     )
                     continue
+                _require_state_authority(state_store, result)
                 validate_dft_result_labels(result.as_structure_dict())
                 if not result.source_outcar_hash:
                     _rejection(
@@ -794,19 +594,6 @@ def build_training_dataset(
         if reports[split].rejected_count < 0:
             raise RuntimeError(f"Dataset report over-accepted {split.value} records")
 
-    dataset_path = Path(dataset_path)
-    dataset_path.mkdir(parents=True, exist_ok=True)
-    write_nep_dataset(
-        dataset_path / "train.xyz",
-        rendered[DatasetSplit.TRAIN],
-        include_virial=train_virial,
-    )
-    write_nep_dataset(
-        dataset_path / "test.xyz",
-        rendered[DatasetSplit.TEST],
-        include_virial=train_virial,
-    )
-
     total_rejected = sum(report.rejected_count for report in reports.values())
     if total_rejected and not allow_partial:
         raise RuntimeError(
@@ -816,6 +603,10 @@ def build_training_dataset(
     if not reports[DatasetSplit.TRAIN].accepted_count or not reports[DatasetSplit.TEST].accepted_count:
         raise RuntimeError("No valid structures found; cannot create a training dataset")
 
+    # All acceptance and exact-count policy checks happen before any apparent
+    # dataset artifact is published.  A rejected exact-count build therefore
+    # cannot leave train.xyz/test.xyz behind without a completed manifest.
+    dataset_path = Path(dataset_path)
     metadata, manifest = _build_report_metadata(
         dataset_path,
         reports,
@@ -834,14 +625,24 @@ def build_training_dataset(
     elif selection_parameters is not None:
         metadata["selection_parameters"] = to_jsonable(selection_parameters)
 
+    _record_state_members(
+        state_store,
+        manifest,
+        reports,
+        project_id=project_id,
+    )
+    dataset_path.mkdir(parents=True, exist_ok=True)
+    write_nep_dataset(
+        dataset_path / "train.xyz",
+        rendered[DatasetSplit.TRAIN],
+        include_virial=train_virial,
+    )
+    write_nep_dataset(
+        dataset_path / "test.xyz",
+        rendered[DatasetSplit.TEST],
+        include_virial=train_virial,
+    )
     write_json(dataset_path / ".dataset", metadata)
-    if state_store is not None:
-        _record_state_members(
-            state_store,
-            manifest,
-            reports,
-            project_id=project_id,
-        )
     return DatasetBuildResult(dataset_path, manifest, metadata, reports)
 
 
@@ -956,3 +757,4 @@ __all__ = [
     "iter_labeled_structures",
     "write_nep_dataset",
 ]
+# End of canonical dataset module.

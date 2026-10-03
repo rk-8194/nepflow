@@ -15,19 +15,53 @@ from nepflow.mlip.nep.artifacts import (
     validate_model_run_manifest,
 )
 from nepflow.io.hashing import sha256_file
+from nepflow.state.store import StateStore
 
 logger = logging.getLogger("nepflow.validate")
 
 
 def _validated_model_run(project_dir: Path, model_run_id: str) -> dict:
-    """Load and validate the manifest for one explicitly requested run."""
+    """Load one explicit StateStore run and validate its derived manifest."""
+    state_path = project_dir / "state.db"
     manifest_path = find_model_run_manifest(project_dir, model_run_id)
+    if not state_path.is_file():
+        # Pre-StateStore Phase 2 projects remain readable for migration and
+        # audit.  Initialized production projects always take the branch
+        # below, where the filesystem file is only a validated projection.
+        try:
+            return validate_model_run_manifest(
+                manifest_path,
+                expected_model_run_id=model_run_id,
+            )
+        except (FileNotFoundError, NepArtifactError) as exc:
+            raise RuntimeError(f"Invalid model-run manifest for {model_run_id}") from exc
     try:
-        manifest = validate_model_run_manifest(
-            manifest_path,
-            expected_model_run_id=model_run_id,
-        )
-    except (FileNotFoundError, NepArtifactError) as exc:
+        with StateStore(state_path) as state_store:
+            model_run = state_store.get_model_run(model_run_id)
+            if model_run is None:
+                raise RuntimeError(f"Unknown authoritative model run: {model_run_id}")
+            manifest = validate_model_run_manifest(
+                manifest_path,
+                expected_model_run_id=model_run_id,
+                state_store=state_store,
+            )
+            linked_model_artifacts = [
+                artifact
+                for artifact in state_store.list_model_artifacts(model_run_id)
+                if artifact.get("role") == "model"
+            ]
+            if len(linked_model_artifacts) != 1:
+                raise NepArtifactError(
+                    f"StateStore has no unique model artifact for {model_run_id}"
+                )
+            linked = linked_model_artifacts[0]
+            if linked.get("sha256") != manifest.get("potential_artifact_sha256"):
+                raise NepArtifactError(
+                    "Filesystem model artifact hash is not the persisted StateStore artifact"
+                )
+    except (FileNotFoundError, NepArtifactError, RuntimeError) as exc:
+        if isinstance(exc, RuntimeError) and str(exc).startswith("Unknown authoritative"):
+            raise
         raise RuntimeError(f"Invalid model-run manifest for {model_run_id}") from exc
     artifact_path = Path(str(manifest["potential_artifact_path"])).resolve()
     canonical_dir = (project_dir / "nep" / "potentials").resolve()

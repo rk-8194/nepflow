@@ -106,6 +106,30 @@ def _get_slurm_job_id(job_name: str) -> str | None:
     return job.job_id if job is not None else None
 
 
+def _mark_model_run(
+    potential_path: Path,
+    status: str,
+    *,
+    error: str | None,
+    state_store: object | None,
+    model_run_id: str | None,
+) -> None:
+    """Persist model status before the legacy status-file projection."""
+
+    if state_store is None or not model_run_id:
+        return
+    try:
+        update_model_run_status(
+            potential_path,
+            status,
+            error=error,
+            state_store=state_store,
+            model_run_id=model_run_id,
+        )
+    except NepArtifactError as exc:
+        logger.error("Could not update authoritative model-run state: %s", exc)
+
+
 def run_launcher(
     config: ConfigParser,
     dataset_path: Path,
@@ -114,6 +138,8 @@ def run_launcher(
     project_dir: Path,
     debug: bool = False,
     slurm_deadline: float | None = None,
+    state_store: object | None = None,
+    model_run_id: str | None = None,
 ) -> None:
     """Monitor and manage NEP training job submission.
     
@@ -160,6 +186,13 @@ def run_launcher(
     
     if max_attempts_exceeded:
         logger.error(f"Training failed after {max_attempts} attempts")
+        _mark_model_run(
+            potential_path,
+            "failed",
+            error="Max resubmit attempts exceeded",
+            state_store=state_store,
+            model_run_id=model_run_id,
+        )
         write_train_status(
             project_dir,
             potential_path=str(potential_path),
@@ -175,6 +208,13 @@ def run_launcher(
     train_script = potential_path / "train_nep.sh"
     if not train_script.exists():
         logger.error(f"Training script not found: {train_script}")
+        _mark_model_run(
+            potential_path,
+            "failed",
+            error="Training script not found",
+            state_store=state_store,
+            model_run_id=model_run_id,
+        )
         write_train_status(
             project_dir,
             potential_path=str(potential_path),
@@ -201,6 +241,13 @@ def run_launcher(
             logger.error("Failed to submit training job: %s", exc)
             if exc.kind == "command_failed":
                 error_msg = exc.stderr.strip() if exc.stderr else str(exc)
+                _mark_model_run(
+                    potential_path,
+                    "failed",
+                    error=f"sbatch failed: {error_msg}",
+                    state_store=state_store,
+                    model_run_id=model_run_id,
+                )
                 write_train_status(
                     project_dir,
                     potential_path=str(potential_path),
@@ -212,6 +259,13 @@ def run_launcher(
     
     if not job_id:
         logger.error("No job ID available for monitoring")
+        _mark_model_run(
+            potential_path,
+            "failed",
+            error="No job ID available for monitoring",
+            state_store=state_store,
+            model_run_id=model_run_id,
+        )
         return
     
     # Update status: job submitted
@@ -303,9 +357,21 @@ def run_launcher(
                     # Job finished — check for success
                     if _check_nep_complete(potential_path):
                         try:
-                            manifest = update_model_run_status(potential_path, "completed")
+                            manifest = update_model_run_status(
+                                potential_path,
+                                "completed",
+                                state_store=state_store,
+                                model_run_id=model_run_id,
+                            )
                         except NepArtifactError as exc:
                             logger.error("Training artifact could not be finalized: %s", exc)
+                            _mark_model_run(
+                                potential_path,
+                                "failed",
+                                error=str(exc),
+                                state_store=state_store,
+                                model_run_id=model_run_id,
+                            )
                             write_train_status(
                                 project_dir,
                                 potential_path=str(potential_path),
@@ -346,6 +412,8 @@ def run_launcher(
                             potential_path,
                             "failed",
                             error=error_msg,
+                            state_store=state_store,
+                            model_run_id=model_run_id,
                         )
                     except NepArtifactError as exc:
                         logger.error("Could not update model-run manifest: %s", exc)
@@ -362,6 +430,8 @@ def run_launcher(
                             project_dir,
                             debug=debug,
                             slurm_deadline=slurm_deadline,
+                            state_store=state_store,
+                            model_run_id=model_run_id,
                         )
                     else:
                         logger.error(f"Training failed after {max_attempts} attempts")

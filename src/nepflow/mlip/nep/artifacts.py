@@ -6,7 +6,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from nepflow.domain.identities import ModelRunIdentity
+from nepflow.domain.identities import ArtifactIdentity, ModelRunIdentity
+from nepflow.domain.models import ModelArtifactMetadata, ModelRunRecord
 from nepflow.errors import ArtifactError
 from nepflow.io.hashing import sha256_file
 from nepflow.io.json import read_json_object, write_json
@@ -59,6 +60,7 @@ def create_model_run_manifest(
     dataset_id: str,
     nep_in_path: Path,
     hyperparameters_hash: str,
+    state_store: Any | None = None,
 ) -> dict[str, Any]:
     nep_in_path = nep_in_path.resolve()
     potential_path = potential_path.resolve()
@@ -72,6 +74,25 @@ def create_model_run_manifest(
         nep_in_sha256=nep_in_hash,
         hyperparameters_hash=hyperparameters_hash,
     )
+    identity = ModelRunIdentity.from_inputs(
+        dataset_id=dataset_id,
+        nep_in_sha256=nep_in_hash,
+        hyperparameters_hash=hyperparameters_hash,
+    )
+    if identity.model_run_id != model_run_id:
+        raise NepArtifactError("Model-run identity construction is inconsistent")
+    if state_store is not None:
+        state_store.upsert_model_run(
+            ModelRunRecord(
+                identity=identity,
+                execution_metadata={
+                    "dataset_path": str(dataset_path.resolve()),
+                    "potential_path": str(potential_path),
+                },
+            ),
+            status="prepared",
+            started_at=_now(),
+        )
     manifest = {
         "schema_version": MODEL_RUN_MANIFEST_SCHEMA,
         "model_run_id": model_run_id,
@@ -101,10 +122,47 @@ def update_model_run_status(
     status: str,
     *,
     error: str | None = None,
+    state_store: Any | None = None,
+    model_run_id: str | None = None,
 ) -> dict[str, Any]:
     manifest_path = potential_path / MODEL_RUN_MANIFEST_FILENAME
     manifest = read_model_run_manifest(manifest_path)
+    authoritative_identity: ModelRunIdentity | None = None
+    execution_metadata: dict[str, Any] = {}
+    if state_store is not None:
+        requested_id = model_run_id or str(manifest.get("model_run_id", ""))
+        if not requested_id:
+            raise NepArtifactError("StateStore model-run update requires model_run_id")
+        row = state_store.get_model_run(requested_id)
+        if row is None:
+            raise NepArtifactError(f"Unknown authoritative model run: {requested_id}")
+        identity_payload = row.get("identity_json", row.get("identity", {}))
+        if isinstance(row.get("execution_metadata"), dict):
+            execution_metadata.update(row["execution_metadata"])
+        if not isinstance(identity_payload, dict):
+            raise NepArtifactError("StateStore model-run identity is malformed")
+        authoritative_identity = ModelRunIdentity.from_inputs(
+            dataset_id=str(identity_payload["dataset_id"]),
+            nep_in_sha256=str(identity_payload["nep_in_sha256"]),
+            hyperparameters_hash=str(identity_payload["hyperparameters_hash"]),
+        )
+        for key, expected in authoritative_identity.to_dict().items():
+            if manifest.get(key) != expected:
+                raise NepArtifactError(
+                    f"Filesystem model-run manifest conflicts with StateStore for {key}"
+                )
+        stored_dataset_path = execution_metadata.get("dataset_path")
+        if stored_dataset_path and Path(str(manifest.get("dataset_path", ""))).resolve() != Path(
+            str(stored_dataset_path)
+        ).resolve():
+            raise NepArtifactError(
+                "Filesystem model-run manifest dataset path conflicts with StateStore"
+            )
+        if requested_id != authoritative_identity.model_run_id:
+            raise NepArtifactError("Requested model-run ID does not match StateStore identity")
+
     artifact_path = Path(str(manifest.get("potential_artifact_path", "")))
+    completed_at = _now() if status == "completed" else None
     if status == "completed":
         if not artifact_path.is_file():
             alternate = sorted(
@@ -143,6 +201,32 @@ def update_model_run_status(
         }
         if error:
             evidence["error"] = error
+    if state_store is not None and authoritative_identity is not None:
+        nep_artifact = ArtifactIdentity.from_file(
+            "nep_input",
+            Path(str(manifest["nep_in_path"])),
+        )
+        if status == "completed":
+            model_artifact = ArtifactIdentity.from_file("nep_model", artifact_path)
+            artifact = ModelArtifactMetadata(
+                model=model_artifact,
+                nep_in=nep_artifact,
+                status="completed",
+                completed_at=completed_at,
+            )
+        else:
+            artifact = None
+        if error:
+            execution_metadata["error"] = error
+        state_store.upsert_model_run(
+            ModelRunRecord(
+                identity=authoritative_identity,
+                artifact=artifact,
+                execution_metadata=execution_metadata or None,
+            ),
+            status=status,
+            completed_at=completed_at,
+        )
     manifest["status"] = status
     manifest["completion_evidence"] = evidence
     manifest["updated_at"] = _now()
@@ -154,6 +238,7 @@ def validate_model_run_manifest(
     manifest_path: Path,
     *,
     expected_model_run_id: str | None = None,
+    state_store: Any | None = None,
 ) -> dict[str, Any]:
     manifest = read_model_run_manifest(manifest_path)
     required = (
@@ -172,6 +257,52 @@ def validate_model_run_manifest(
             f"Manifest identity mismatch: expected {expected_model_run_id}, "
             f"found {manifest['model_run_id']}"
         )
+    if state_store is not None:
+        row = state_store.get_model_run(str(manifest["model_run_id"]))
+        if row is None:
+            raise NepArtifactError(
+                f"Model run {manifest['model_run_id']} is absent from StateStore"
+            )
+        identity_payload = row.get("identity_json", row.get("identity", {}))
+        if not isinstance(identity_payload, dict):
+            raise NepArtifactError("StateStore model-run identity is malformed")
+        for key in (
+            "model_run_id",
+            "dataset_id",
+            "nep_in_sha256",
+            "hyperparameters_hash",
+        ):
+            if identity_payload.get(key) != manifest.get(key):
+                raise NepArtifactError(
+                    f"Filesystem model-run manifest conflicts with StateStore for {key}"
+                )
+        if row.get("status") != manifest.get("status"):
+            raise NepArtifactError(
+                f"Model-run status conflicts with StateStore: {row.get('status')!r}"
+            )
+        execution_metadata = row.get("execution_metadata", {})
+        stored_dataset_path = (
+            execution_metadata.get("dataset_path")
+            if isinstance(execution_metadata, dict)
+            else None
+        )
+        if stored_dataset_path and Path(str(manifest["dataset_path"])).resolve() != Path(
+            str(stored_dataset_path)
+        ).resolve():
+            raise NepArtifactError(
+                "Filesystem model-run manifest dataset path conflicts with StateStore"
+            )
+        list_model_artifacts = getattr(state_store, "list_model_artifacts", None)
+        if callable(list_model_artifacts):
+            linked = list_model_artifacts(str(manifest["model_run_id"]))
+            if manifest["status"] == "completed":
+                model_artifacts = [item for item in linked if item.get("role") == "model"]
+                if len(model_artifacts) != 1 or model_artifacts[0].get("sha256") != manifest.get(
+                    "potential_artifact_sha256"
+                ):
+                    raise NepArtifactError(
+                        "Filesystem model artifact hash is not the persisted StateStore artifact"
+                    )
     if manifest["status"] != "completed":
         raise NepArtifactError(
             f"Model run {manifest['model_run_id']} is not completed "

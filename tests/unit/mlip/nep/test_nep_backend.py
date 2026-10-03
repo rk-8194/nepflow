@@ -60,3 +60,5 @@ def test_backend_progress_completion_and_exact_artifact_collection(tmp_path: Pat
     assert completion.completed is True
     collected = backend.collect_model_artifacts(tmp_path / "run", inputs)
     assert collected.artifact.model.sha256
+
+
