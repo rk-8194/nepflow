@@ -9,13 +9,17 @@ import numpy as np
 from ase.io import read as ase_read
 
 from .artifacts import write_selected_structures
+from .models import SelectionResult
 from .representations import descriptor_cache_path
 
 
 logger = logging.getLogger("nepflow.selection.debug")
 
 
-def run_debug_selection(project_dir: Path) -> None:
+def run_debug_selection(
+    project_dir: Path,
+    ase_structures: list | None = None,
+) -> SelectionResult:
     """Create the established deterministic random debug split."""
 
     generated_path = (
@@ -27,7 +31,10 @@ def run_debug_selection(project_dir: Path) -> None:
             "Run the 'generate' stage first."
         )
 
-    ase_structures = ase_read(str(generated_path), index=":", format="extxyz")
+    if ase_structures is None:
+        ase_structures = ase_read(str(generated_path), index=":", format="extxyz")
+    if not isinstance(ase_structures, list):
+        ase_structures = [ase_structures]
     n = len(ase_structures)
     logger.info("[DEBUG] Loaded %d structures from %s", n, generated_path)
 
@@ -54,6 +61,23 @@ def run_debug_selection(project_dir: Path) -> None:
         test_indices,
     )
     logger.info("[DEBUG] Structure selection complete")
+    return SelectionResult(
+        descriptors=representations,
+        train_indices=train_indices,
+        train_min_dist=0.0,
+        train_seed_count=0,
+        train_single_element_elastic_count=0,
+        train_elastic_count=0,
+        train_anchor_count=0,
+        train_fps_count=len(train_indices),
+        test_indices=test_indices,
+        test_min_dist=0.0,
+        min_train_test_dist=0.0,
+        mean_train_test_dist=0.0,
+        seed_indices=[],
+        single_element_elastic_indices=[],
+        elastic_indices=[],
+    )
 
 
 __all__ = ["run_debug_selection"]

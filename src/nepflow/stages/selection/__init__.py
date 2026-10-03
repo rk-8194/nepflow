@@ -23,6 +23,13 @@ from .sampling import (
     select_farthest_points_for_target,
 )
 from .models import SelectionResult
+from .persistence import (
+    candidate_set_fingerprint,
+    persist_selection_result,
+    restore_selection_result,
+    selection_run_id,
+    structure_ids,
+)
 from .stage import SelectionStage
 from .strategy import (
     select_composition_aware_training_set,
@@ -54,4 +61,9 @@ __all__ = [
     "select_training_set",
     "SelectionResult",
     "SelectionStage",
+    "candidate_set_fingerprint",
+    "persist_selection_result",
+    "restore_selection_result",
+    "selection_run_id",
+    "structure_ids",
 ]

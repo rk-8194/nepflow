@@ -271,10 +271,16 @@ def compose_stage_registry() -> StageRegistry:
         )
 
     registry.register(WorkflowStage.GENERATE, run_generation)
-    registry.register(
-        WorkflowStage.SELECT,
-        lambda context: SelectionStage(**_legacy_stage_kwargs(context)).run(),
-    )
+    def run_selection(context: StageContext) -> StageRunResult:
+        SelectionStage(context=context).run()
+        return StageRunResult(
+            stage=WorkflowStage.SELECT,
+            status=StageRunState.COMPLETED,
+            advanced_to=WorkflowStage.RUN_VASP,
+            completed=True,
+        )
+
+    registry.register(WorkflowStage.SELECT, run_selection)
     def run_dft(context: StageContext) -> StageRunResult:
         return DftStage().run(context).as_workflow_result()
 

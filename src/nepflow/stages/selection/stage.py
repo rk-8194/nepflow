@@ -1,22 +1,33 @@
-"""Thin orchestration boundary for structure selection."""
+"""Thin orchestration boundary for canonical structure selection."""
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import logging
-import time
 from pathlib import Path
+import time
+from typing import Any
 
 from ase.io import read as ase_read
 from NepTrainKit.core.structure import Structure
 
-from nepflow.config.loader import find_config_path, load_config
-from nepflow.config.models import SelectionConfig
+from nepflow.config.models import NepflowConfig, SelectionConfig
+from nepflow.errors import StateError
+from nepflow.workflow.controller import StageContext
 
 from .artifacts import write_selected_structures
 from .debug import run_debug_selection
 from .models import SelectionResult
+from .persistence import (
+    persist_selection_result,
+    restore_selection_result,
+    selection_policy,
+    selection_run_id,
+    structure_ids,
+)
 from .reports import plot_descriptor_space
 from .representations import load_or_calculate_representations
+from .sampling import calculate_composition_coverage_metrics, composition_projection_bins
 from .strategy import (
     find_elastic_stress_indices,
     find_single_element_elastic_stress_indices,
@@ -30,53 +41,93 @@ logger = logging.getLogger("nepflow.selection.stage")
 
 
 class SelectionStage:
-    """Load candidates, compose selection services, and persist artifacts."""
+    """Compose selection services from an already validated stage context."""
 
     def __init__(
         self,
-        project_name: str,
-        config_file: Path,
-        state_file: Path,
-        project_dir: Path,
-        debug: bool = False,
-        slurm_deadline: float | None = None,
+        context: StageContext | None = None,
+        *,
+        selection_config: SelectionConfig | None = None,
     ) -> None:
-        self.project_name = project_name
-        self.config_file = Path(config_file)
-        self.state_file = Path(state_file)
-        self.project_dir = Path(project_dir)
-        self.debug = debug
-        self.slurm_deadline = slurm_deadline
+        self.context = context
+        self.selection_config = selection_config
 
-    def _find_config_file(self) -> Path:
-        """Resolve the canonical project configuration path."""
+    def _active_context(self, context: StageContext | None) -> StageContext:
+        active = context or self.context
+        if active is None:
+            raise TypeError("SelectionStage requires an injected StageContext")
+        return active
 
-        return find_config_path(self.project_dir, explicit_path=self.config_file)
+    def _settings(self, context: StageContext) -> SelectionConfig:
+        settings = self.selection_config
+        if settings is None:
+            root_config = context.config
+            if isinstance(root_config, SelectionConfig):
+                settings = root_config
+            elif isinstance(root_config, NepflowConfig):
+                settings = root_config.selection
+        if not isinstance(settings, SelectionConfig):
+            raise TypeError(
+                "SelectionStage requires the validated SelectionConfig on StageContext"
+            )
+        return settings
 
-    def run(self) -> None:
+    def run(self, context: StageContext | None = None) -> SelectionResult:
+        """Run selection and return its scientific result, not its side effects."""
+
+        active = self._active_context(context)
+        settings = self._settings(active)
+        state_store = active.state_store
+        if state_store is None:
+            raise StateError("SelectionStage requires the authoritative StateStore")
+
         logger.info("Running structure selection")
-        if self.debug:
-            run_debug_selection(self.project_dir)
-            return
-
-        config = load_config(
-            self._find_config_file(),
-            project_name=self.project_name,
-            require_scientific_fields=False,
-        )
-        prepared = self.prepare()
+        prepared = self.prepare(active.project_dir)
         if prepared is None:
-            return
-        result = self.execute(config.selection, prepared)
-        self.finalize(prepared, result)
+            raise ValueError("No generated structures are available for selection")
 
-    def prepare(self) -> dict | None:
+        started_at = datetime.now(timezone.utc).isoformat()
+        if active.debug:
+            result = run_debug_selection(
+                active.project_dir,
+                prepared["ase_structures"],
+            )
+        else:
+            result = self.execute(settings, prepared, context=active)
+
+        candidate_ids = structure_ids(prepared["ase_structures"])
+        coverage_metrics = {}
+        if settings.composition_aware_fps:
+            candidate_bins = {
+                index: composition_projection_bins(atoms)
+                for index, atoms in enumerate(prepared["ase_structures"])
+            }
+            coverage_metrics = calculate_composition_coverage_metrics(
+                result.train_indices,
+                candidate_bins,
+            )
+        persist_selection_result(
+            state_store,
+            active.project_name,
+            active.project_name,
+            str(active.project_dir),
+            settings,
+            candidate_ids,
+            result,
+            coverage_metrics=coverage_metrics,
+            started_at=started_at,
+        )
+        self.finalize(prepared, result, context=active)
+        return result
+
+    def prepare(self, project_dir: Path | None = None) -> dict[str, Any] | None:
         """Load the generated candidate structures needed for selection."""
 
+        active_project_dir = Path(project_dir or self._active_context(None).project_dir)
         logger.info("")
         logger.info("Step 1: Loading generated structures")
         generated_path = (
-            self.project_dir / "structures" / "generated" / "generated_structures.xyz"
+            active_project_dir / "structures" / "generated" / "generated_structures.xyz"
         )
         if not generated_path.exists():
             raise FileNotFoundError(
@@ -108,14 +159,22 @@ class SelectionStage:
     def execute(
         self,
         settings: SelectionConfig,
-        prepared: dict,
+        prepared: dict[str, Any],
+        *,
+        context: StageContext | None = None,
     ) -> SelectionResult:
-        """Compose representation, strategy, and result services."""
+        """Compose representation, strategy, and identity-safe result services."""
 
+        active = context or self.context
         logger.info("")
         logger.info("Step 2: Computing NEP descriptors")
+        project_dir = (
+            active.project_dir
+            if active is not None
+            else Path(prepared["generated_path"]).parents[2]
+        )
         representations = load_or_calculate_representations(
-            self.project_dir,
+            project_dir,
             prepared["structures"],
             mean_descriptor=settings.descriptor_type == "structure",
             batch_size=settings.batch_size,
@@ -124,10 +183,34 @@ class SelectionStage:
         logger.info("  Descriptor shape: %s", representations.shape)
         logger.info("  Descriptor type: %s", settings.descriptor_type)
 
+        candidate_ids = structure_ids(prepared["ase_structures"])
+        if active is not None and active.state_store is not None:
+            existing = active.state_store.get_selection_run(
+                selection_run_id(active.project_name, candidate_ids, settings)
+            )
+            if existing is not None:
+                if existing.get("status") != "completed":
+                    raise StateError(
+                        "Selection run exists but is not complete; explicit reconciliation "
+                        "is required before selecting again"
+                    )
+                persisted_parameters = existing.get("parameters")
+                if (
+                    not isinstance(persisted_parameters, dict)
+                    or persisted_parameters.get("policy") != selection_policy(settings)
+                ):
+                    raise StateError("Persisted selection policy does not match current input")
+                logger.info("  Reconciled completed selection by structure identity")
+                return restore_selection_result(
+                    existing,
+                    representations,
+                    candidate_ids,
+                )
+
         seed_indices: list[int] = []
         if settings.include_seed_structures:
             seed_indices = resolve_seed_indices(
-                self.project_dir,
+                project_dir,
                 prepared["ase_structures"],
             )
             logger.info("  Seed anchors enabled: %d structures", len(seed_indices))
@@ -179,22 +262,29 @@ class SelectionStage:
             elastic_indices=elastic_indices,
         )
 
-    def finalize(self, prepared: dict, result: SelectionResult) -> None:
-        """Write reports/artifacts and emit the established summary."""
+    def finalize(
+        self,
+        prepared: dict[str, Any],
+        result: SelectionResult,
+        *,
+        context: StageContext | None = None,
+    ) -> SelectionResult:
+        """Write presentation artifacts without changing the scientific result."""
 
+        active = context or self._active_context(None)
         logger.info("")
         logger.info("Step 5: Plotting descriptor space")
         plot_descriptor_space(
             result.descriptors,
             result.train_indices,
             result.test_indices,
-            self.project_dir / "reports" / "descriptor_space.png",
+            active.project_dir / "reports" / "descriptor_space.png",
         )
 
         logger.info("")
         logger.info("Step 6: Saving selected structures")
         write_selected_structures(
-            self.project_dir,
+            active.project_dir,
             prepared["ase_structures"],
             result.train_indices,
             result.test_indices,
@@ -225,6 +315,7 @@ class SelectionStage:
             result.min_train_test_dist,
             result.mean_train_test_dist,
         )
+        return result
 
 
 __all__ = ["SelectionStage"]
