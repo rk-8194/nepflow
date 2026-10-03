@@ -2,6 +2,7 @@ import json
 import tempfile
 import unittest
 from configparser import ConfigParser
+from types import SimpleNamespace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -30,6 +31,12 @@ from nepflow.dft.vasp.outputs import (
     parse_virial_from_outcar,
 )
 from nepflow.dft.vasp.registry import upsert_registry_entry
+from nepflow.stages.training.dataset import (
+    DatasetSplit,
+    iter_labeled_structures,
+    write_nep_dataset,
+)
+from nepflow.stages.training import dataset as training_dataset_module
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -215,7 +222,7 @@ class TrainNepPrepareRegistryTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            parsed = list(train_prepare._parse_structures([atoms], True, project_dir))
+            parsed = list(iter_labeled_structures([atoms], DatasetSplit.TRAIN, project_dir))
 
             self.assertEqual(parsed, [])
 
@@ -299,7 +306,7 @@ class TrainNepPrepareRegistryTests(unittest.TestCase):
                 (FIXTURES / "outcar" / "completed_without_stress").read_text(encoding="utf-8"),
                 encoding="utf-8",
             )
-            with patch.object(train_prepare, "ase_read", return_value=self.fixture_atoms()):
+            with patch.object(training_dataset_module, "ase_read", return_value=self.fixture_atoms()):
                 count = train_prepare.prepare_dataset(
                     dataset_path=root / "train.xyz",
                     ase_structures=[atoms],
@@ -324,7 +331,7 @@ class TrainNepPrepareRegistryTests(unittest.TestCase):
             )
             dataset_path = root / "train.xyz"
 
-            with patch.object(train_prepare, "ase_read", side_effect=RuntimeError("bad OUTCAR")):
+            with patch.object(training_dataset_module, "ase_read", side_effect=RuntimeError("bad OUTCAR")):
                 count = train_prepare.prepare_dataset(
                     dataset_path=dataset_path,
                     ase_structures=[atoms],
@@ -364,8 +371,8 @@ class TrainNepPrepareRegistryTests(unittest.TestCase):
             self.write_identity_job(project_dir, "struct_0000", atoms, reused_from=old_job)
             self.assertFalse((old_job / ".vasp_identity").exists())
 
-            with patch.object(train_prepare, "ase_read", return_value=self.fixture_atoms()):
-                parsed = list(train_prepare._parse_structures([atoms], True, project_dir))
+            with patch.object(training_dataset_module, "ase_read", return_value=self.fixture_atoms()):
+                parsed = list(iter_labeled_structures([atoms], DatasetSplit.TRAIN, project_dir))
 
         self.assertEqual(len(parsed), 1)
         self.assertAlmostEqual(parsed[0]["energy"], -10.5, places=12)
@@ -384,7 +391,7 @@ class TrainNepPrepareRegistryTests(unittest.TestCase):
             )
             self.write_identity_job(project_dir, "struct_0000", different_atoms, reused_from=old_job)
 
-            parsed = list(train_prepare._parse_structures([selected_atoms], True, project_dir))
+            parsed = list(iter_labeled_structures([selected_atoms], DatasetSplit.TRAIN, project_dir))
 
         self.assertEqual(parsed, [])
 
@@ -406,8 +413,8 @@ class TrainNepPrepareRegistryTests(unittest.TestCase):
                 {"job_path": str(old_job.resolve())},
             )
 
-            with patch.object(train_prepare, "ase_read", return_value=make_atoms("Si")):
-                parsed = list(train_prepare._parse_structures([atoms], True, project_dir))
+            with patch.object(training_dataset_module, "ase_read", return_value=make_atoms("Si")):
+                parsed = list(iter_labeled_structures([atoms], DatasetSplit.TRAIN, project_dir))
 
         self.assertEqual(len(parsed), 1)
         self.assertAlmostEqual(parsed[0]["energy"], -10.5, places=12)
@@ -462,7 +469,7 @@ class TrainNepPrepareRegistryTests(unittest.TestCase):
                 {"job_path": str(old_job.resolve())},
             )
 
-            parsed = list(train_prepare._parse_structures([selected], True, project_dir))
+            parsed = list(iter_labeled_structures([selected], DatasetSplit.TRAIN, project_dir))
 
         self.assertEqual(parsed, [])
 
@@ -475,8 +482,8 @@ class TrainNepPrepareRegistryTests(unittest.TestCase):
             struct_dir = self.write_identity_job(project_dir, "struct_0009", second)
             (struct_dir / "OUTCAR").write_text("General timing\n", encoding="utf-8")
 
-            with patch.object(train_prepare, "ase_read", return_value=make_atoms("Si")):
-                parsed = list(train_prepare._parse_structures([first, second], True, project_dir))
+            with patch.object(training_dataset_module, "ase_read", return_value=make_atoms("Si")):
+                parsed = list(iter_labeled_structures([first, second], DatasetSplit.TRAIN, project_dir))
 
         self.assertEqual(len(parsed), 1)
         self.assertAlmostEqual(parsed[0]["energy"], -10.5, places=12)
@@ -497,7 +504,7 @@ class TrainNepPrepareRegistryTests(unittest.TestCase):
                 {"job_path": str(old_job.resolve())},
             )
 
-            parsed = list(train_prepare._parse_structures([atoms], True, project_dir))
+            parsed = list(iter_labeled_structures([atoms], DatasetSplit.TRAIN, project_dir))
 
         self.assertEqual(parsed, [])
 
@@ -518,7 +525,7 @@ class TrainNepPrepareRegistryTests(unittest.TestCase):
                 ]
             )
 
-            count = train_prepare._write_xyz_file(output_path, structures, include_virial=True)
+            count = write_nep_dataset(output_path, structures, include_virial=True)
             lines = output_path.read_text(encoding="utf-8").splitlines()
 
             self.assertEqual(count, 1)
@@ -537,7 +544,7 @@ class TrainNepPrepareRegistryTests(unittest.TestCase):
                 ["Si", "0.1000000000", "0.2000000000", "0.3000000000", "0.4000000000", "0.5000000000", "0.6000000000"],
             )
 
-    def test_write_xyz_file_omits_missing_virial_when_requested(self) -> None:
+    def test_write_xyz_file_rejects_missing_virial_when_requested(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             output_path = Path(tmp) / "test.xyz"
             structures = iter(
@@ -554,11 +561,8 @@ class TrainNepPrepareRegistryTests(unittest.TestCase):
                 ]
             )
 
-            train_prepare._write_xyz_file(output_path, structures, include_virial=True)
-            lines = output_path.read_text(encoding="utf-8").splitlines()
-
-            self.assertNotIn("virial=", lines[1])
-            self.assertIn("Properties=species:S:1:pos:R:3:force:R:3", lines[1])
+            with self.assertRaisesRegex(ValueError, "missing_required_virial"):
+                write_nep_dataset(output_path, structures, include_virial=True)
 
 
 class TrainNepMetadataTests(unittest.TestCase):
@@ -608,23 +612,50 @@ class TrainNepMetadataTests(unittest.TestCase):
             debug=False,
         )
 
-        def fake_prepare_dataset(*, is_train, extraction_report, **_kwargs):
-            accepted_count = accepted_train if is_train else accepted_test
-            split = "train" if is_train else "test"
-            extraction_report["accepted_results"] = [
-                self.accepted_result(
-                    f"{split}-{index}",
-                    -1.0 - index,
-                    f"{split}-hash-{index}",
-                )
-                for index in range(accepted_count)
+        def fake_build_training_dataset(_dataset_path, _split_records, *_args, **_kwargs):
+            train_results = [
+                self.accepted_result("train-%d" % index, -1.0 - index, f"train-hash-{index}")
+                for index in range(accepted_train)
             ]
-            return accepted_count
-
-        def fake_generate_nep_config(*_args, **_kwargs):
-            (dataset_path / "nep.in").write_text(
-                "type 1 Si\ncutoff 6 5\n",
-                encoding="utf-8",
+            test_results = [
+                self.accepted_result("test-%d" % index, -1.0 - index, f"test-hash-{index}")
+                for index in range(accepted_test)
+            ]
+            train_report = {
+                "requested_count": selected_train,
+                "accepted_results": train_results,
+                "accepted_content_records": [],
+                "rejected_reason_counts": {"record_rejected": selected_train - accepted_train},
+                "accepted_count": accepted_train,
+                "rejected_count": selected_train - accepted_train,
+            }
+            test_report = {
+                "requested_count": selected_test,
+                "accepted_results": test_results,
+                "accepted_content_records": [],
+                "rejected_reason_counts": {"record_rejected": selected_test - accepted_test},
+                "accepted_count": accepted_test,
+                "rejected_count": selected_test - accepted_test,
+            }
+            metadata = stage._build_dataset_metadata(
+                dataset_path,
+                train_report,
+                test_report,
+                train_virial=False,
+                allow_partial=True,
+            )
+            stage._write_dataset_metadata(dataset_path, metadata)
+            (dataset_path / "train.xyz").write_text("1\n", encoding="utf-8")
+            (dataset_path / "test.xyz").write_text("1\n", encoding="utf-8")
+            return SimpleNamespace(
+                train_count=accepted_train,
+                test_count=accepted_test,
+                metadata=metadata,
+                manifest=object(),
+                reports={
+                    DatasetSplit.TRAIN: SimpleNamespace(to_dict=lambda: train_report),
+                    DatasetSplit.TEST: SimpleNamespace(to_dict=lambda: test_report),
+                },
             )
 
         with (
@@ -638,8 +669,7 @@ class TrainNepMetadataTests(unittest.TestCase):
                 ),
             ),
             patch.object(stage, "_get_or_create_dataset_folder", return_value=dataset_path),
-            patch.object(train_stage_module, "prepare_dataset", side_effect=fake_prepare_dataset),
-            patch.object(stage, "_generate_nep_config", side_effect=fake_generate_nep_config),
+            patch.object(train_stage_module, "build_training_dataset", side_effect=fake_build_training_dataset),
             patch.object(stage, "_create_potential_folder", return_value=dataset_path),
         ):
             stage.run()

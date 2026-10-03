@@ -1,12 +1,12 @@
 """NEP model training stage — prepare datasets and submit training jobs."""
 
 import logging
+import shlex
 import shutil
 from configparser import ConfigParser
 from datetime import datetime
-from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Tuple
 
 import numpy as np
 from ase.io import read as ase_read
@@ -14,90 +14,30 @@ from ase.atoms import Atoms
 
 from ..base import Stage
 from nepflow.workflow.resubmission import SelfResubmitExit
-from common.model_manifest import (
+from nepflow.mlip.nep.artifacts import (
     MODEL_RUN_MANIFEST_FILENAME,
-    ModelManifestError,
+    NepArtifactError,
     create_model_run_manifest,
     read_model_run_manifest,
     update_model_run_status,
 )
-from nepflow.domain.datasets import DatasetIdentity
 from nepflow.io.atomic import atomic_write_text
-from nepflow.io.hashing import sha256_bytes
-from nepflow.io.json import canonical_json_bytes, read_json, write_json
-from .prepare import prepare_dataset
-from .submit import submit_training_job
+from nepflow.io.json import read_json, write_json
 from .launcher import run_launcher, read_train_status, write_train_status
+from nepflow.stages.training.dataset import (
+    DatasetSplit,
+    build_dataset_metadata,
+    build_training_dataset,
+)
+from nepflow.mlip.nep.inputs import (
+    NepHyperparameters,
+    NepInputRenderer,
+    default_nep_template,
+)
+from nepflow.mlip.nep.backend import NepBackend
+from nepflow.hpc.resources import JobResources, render_slurm_header
 
 logger = logging.getLogger("nepflow.train_nep")
-
-
-def _canonical_tokens(value: str) -> tuple[str, ...]:
-    """Normalize a space/comma-separated numeric NEP setting."""
-    tokens = value.replace(",", " ").split()
-    normalized = []
-    for token in tokens:
-        try:
-            normalized.append(format(float(token), ".15g"))
-        except ValueError:
-            normalized.append(token)
-    return tuple(normalized)
-
-
-@dataclass(frozen=True)
-class NepHyperparameters:
-    """Canonical NEP settings shared by rendering and run identity."""
-
-    elements: tuple[str, ...]
-    gas_elements: tuple[str, ...]
-    cutoff: tuple[str, ...]
-    n_max: tuple[str, ...]
-    basis_size: tuple[str, ...]
-    l_max: tuple[str, ...]
-    neuron: tuple[str, ...]
-    population: int
-    batch: int
-    generations: int
-    outer_zbl: float
-    charge_mode: int
-    weights: tuple[float, ...]
-    lambda_e: float
-    lambda_f: float
-    lambda_v: float
-    lambda_shear: float
-
-    @property
-    def all_elements(self) -> tuple[str, ...]:
-        return self.elements + self.gas_elements
-
-    @staticmethod
-    def _float(value: float) -> str:
-        return format(value, ".15g")
-
-    def canonical_dict(self) -> dict:
-        """Return deterministic, JSON-serializable scientific settings."""
-        return {
-            "schema_version": "nep.hyperparameters.v1",
-            "types": list(self.all_elements),
-            "cutoff": list(self.cutoff),
-            "n_max": list(self.n_max),
-            "basis_size": list(self.basis_size),
-            "l_max": list(self.l_max),
-            "neuron": list(self.neuron),
-            "population": self.population,
-            "batch": self.batch,
-            "generations": self.generations,
-            "outer_zbl": self._float(self.outer_zbl),
-            "charge_mode": self.charge_mode,
-            "weights": [self._float(value) for value in self.weights],
-            "lambda_e": self._float(self.lambda_e),
-            "lambda_f": self._float(self.lambda_f),
-            "lambda_v": self._float(self.lambda_v),
-            "lambda_shear": self._float(self.lambda_shear),
-        }
-
-    def identity_hash(self) -> str:
-        return sha256_bytes(canonical_json_bytes(self.canonical_dict()))
 
 
 class TrainNepStage(Stage):
@@ -209,56 +149,41 @@ class TrainNepStage(Stage):
         allow_partial = config.getboolean(
             "train_nep", "allow_partial_dataset", fallback=False
         )
-        train_report: dict = {}
-        test_report: dict = {}
-
-        # Step 3: Prepare datasets (parse OUTCAR and write XYZ files)
-        logger.info("Step 3: Parsing OUTCAR files and writing XYZ datasets. Training virials: %s", train_virial)
-        train_count = prepare_dataset(
-            dataset_path=dataset_path / "train.xyz",
-            ase_structures=train_structures,
-            is_train=True,
-            project_dir=self.project_dir,
-            train_virial=train_virial,
-            debug=self.debug,
-            extraction_report=train_report,
+        # Step 3: Assemble both explicit splits through the canonical dataset
+        # boundary.  The stage still owns orchestration for now, but it no
+        # longer owns DFT resolution, label validation, or manifest assembly.
+        logger.info(
+            "Step 3: Parsing OUTCAR files and writing XYZ datasets. Training virials: %s",
+            train_virial,
         )
-        test_count = prepare_dataset(
-            dataset_path=dataset_path / "test.xyz",
-            ase_structures=test_structures,
-            is_train=False,
-            project_dir=self.project_dir,
-            train_virial=train_virial,
-            debug=self.debug,
-            extraction_report=test_report,
-        )
-
-        self._complete_extraction_report(train_report, len(train_structures), train_count)
-        self._complete_extraction_report(test_report, len(test_structures), test_count)
-        rejected_total = train_report["rejected_count"] + test_report["rejected_count"]
-        if rejected_total and not allow_partial:
-            raise RuntimeError(
-                "Dataset creation rejected selected structures; "
-                "set train_nep.allow_partial_dataset=true to allow explicit partial data"
-            )
-
-        if train_count == 0 or test_count == 0:
-            raise RuntimeError("No valid structures found; cannot create a training dataset")
-
-        metadata = self._build_dataset_metadata(
+        dataset_result = build_training_dataset(
             dataset_path,
-            train_report,
-            test_report,
+            {
+                DatasetSplit.TRAIN: train_structures,
+                DatasetSplit.TEST: test_structures,
+            },
+            self.project_dir,
             train_virial=train_virial,
+            debug=self.debug,
             allow_partial=allow_partial,
         )
-        self._write_dataset_metadata(dataset_path, metadata)
+        train_count = dataset_result.train_count
+        test_count = dataset_result.test_count
+        train_report = dataset_result.reports[DatasetSplit.TRAIN].to_dict()
+        test_report = dataset_result.reports[DatasetSplit.TEST].to_dict()
+        metadata = dict(dataset_result.metadata)
 
         logger.info(f"Successfully processed {train_count} train and {test_count} test structures")
 
         # Step 4: Generate customized nep.in
         logger.info("Step 4: Generating customized nep.in")
-        self._generate_nep_config(config, dataset_path, hyperparameters)
+        template_path = self.project_dir / "config" / "nep" / "nep.in"
+        NepInputRenderer().render_hyperparameters(
+            dataset=dataset_result.manifest,
+            hyperparameters=hyperparameters,
+            working_directory=dataset_path,
+            template_path=template_path if template_path.exists() else None,
+        )
         logger.info(f"nep.in written to {dataset_path / 'nep.in'}")
 
         # Step 5: Create training run folder
@@ -286,29 +211,12 @@ class TrainNepStage(Stage):
         )
         logger.info("Created model-run manifest for %s", model_manifest["model_run_id"])
 
-        # Step 6: Submit job and enter monitoring loop
+        # Step 6: Prepare the backend command and let the common launcher/
+        # Scheduler boundary submit it.  The NEP backend never submits jobs.
         if config.getboolean("slurm", "enabled", fallback=False):
-            logger.info("Step 6: Submitting SLURM training job")
+            logger.info("Step 6: Preparing SLURM training job")
             try:
-                job_id = submit_training_job(
-                    config=config,
-                    dataset_path=dataset_path,
-                    potential_path=potential_path,
-                    project_dir=self.project_dir,
-                    project_name=self.project_name,
-                )
-                logger.info(f"NEP training submitted as SLURM job {job_id}")
-                # Save job_id and dataset_path to status file to track this submission
-                # The launcher will monitor this job and only resubmit if it fails
-                write_train_status(
-                    self.project_dir,
-                    potential_path=str(potential_path),
-                    dataset_path=str(dataset_path),
-                    model_run_id=model_manifest["model_run_id"],
-                    job_id=job_id,
-                    status="running",
-                    attempt=1,
-                )
+                self._write_training_script(config, potential_path)
             except Exception as e:
                 logger.error(f"Could not submit SLURM job: {e}")
                 update_model_run_status(
@@ -344,6 +252,49 @@ class TrainNepStage(Stage):
         else:
             logger.info("SLURM not enabled. To run training, use the dataset and nep.in files manually:")
 
+    def _write_training_script(self, config: ConfigParser, potential_path: Path) -> Path:
+        """Render a scheduler script from a backend command, without submitting it."""
+
+        header_path = self.project_dir / "config" / "slurm" / "header.slurm"
+        if not header_path.is_file():
+            raise FileNotFoundError(f"SLURM header not found at {header_path}")
+        command_text = config.get("hpc", "nep_command", fallback="").strip()
+        if not command_text:
+            raise ValueError("Required configuration hpc.nep_command is missing or blank")
+        backend = NepBackend(command_text)
+        walltime = config.get(
+            "slurm", "train_nep_walltime",
+            fallback=config.get("slurm", "walltime", fallback="24:00:00"),
+        )
+        rendered_header = render_slurm_header(
+            JobResources(nodes=1, gpus_per_node=1, mpi_ranks=1, walltime=walltime),
+            base_header=header_path.read_text(encoding="utf-8"),
+            job_name=f"nep_train_{self.project_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+            stdout_path="train_nep_%j.log",
+            stderr_path="train_nep_%j.err",
+        )
+        script_path = potential_path / "train_nep.sh"
+        command_line = " ".join(
+            part
+            if not any(character in part for character in "'\";|&><`")
+            else shlex.quote(part)
+            for part in backend.command
+        )
+        script_path.write_text(
+            "\n".join(
+                (
+                    rendered_header.rstrip(),
+                    "",
+                    f"cd {shlex.quote(str(potential_path))}",
+                    command_line,
+                )
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        script_path.chmod(0o755)
+        return script_path
+
     def _find_dataset_for_potential(self, potential_path: Path) -> Path:
         """Resolve the dataset from the potential's explicit run manifest."""
         manifest_path = potential_path / MODEL_RUN_MANIFEST_FILENAME
@@ -351,7 +302,7 @@ class TrainNepStage(Stage):
             manifest = read_model_run_manifest(manifest_path)
         except FileNotFoundError:
             raise
-        except ModelManifestError as exc:
+        except NepArtifactError as exc:
             raise RuntimeError(
                 f"Cannot resolve dataset for {potential_path} without a valid model-run manifest"
             ) from exc
@@ -364,11 +315,11 @@ class TrainNepStage(Stage):
         try:
             dataset_metadata = read_json(
                 dataset_path / ".dataset",
-                error_type=ModelManifestError,
-                missing_error_type=ModelManifestError,
+                error_type=NepArtifactError,
+                missing_error_type=NepArtifactError,
                 require_object=True,
             )
-        except ModelManifestError as exc:
+        except NepArtifactError as exc:
             raise RuntimeError(f"Cannot read dataset manifest: {dataset_path / '.dataset'}") from exc
         if dataset_metadata.get("dataset_id") != dataset_id:
             raise RuntimeError(
@@ -377,75 +328,9 @@ class TrainNepStage(Stage):
         logger.debug("Resolved model run %s to dataset %s", manifest.get("model_run_id"), dataset_path)
         return dataset_path
 
-    @staticmethod
-    def _parse_list(config: ConfigParser, section: str, option: str) -> List[str]:
-        """Parse comma-separated list from config."""
-        value = config.get(section, option)
-        return [item.strip() for item in value.split(",") if item.strip()]
-
     def _get_nep_hyperparameters(self, config: ConfigParser) -> NepHyperparameters:
-        """Resolve all exposed NEP settings into one immutable value object."""
-        try:
-            elements = tuple(self._parse_list(config, "composition", "elements"))
-        except Exception as exc:
-            raise ValueError(
-                "Required configuration composition.elements is missing or invalid"
-            ) from exc
-        if not elements:
-            raise ValueError("Required configuration composition.elements must not be empty")
-
-        try:
-            gas_elements = tuple(self._parse_list(config, "composition", "gasElements"))
-        except Exception:
-            gas_elements = ()
-
-        all_elements = elements + gas_elements
-        weights_str = config.get("train_nep", "weights", fallback="")
-        if not weights_str.strip():
-            weights = tuple(1.0 for _ in all_elements)
-        else:
-            try:
-                weights = tuple(
-                    float(weight)
-                    for weight in weights_str.replace(",", " ").split()
-                )
-            except ValueError as exc:
-                raise ValueError("train_nep.weights must contain only numbers") from exc
-            if len(weights) != len(all_elements):
-                raise ValueError(
-                    "train_nep.weights count must match the configured element count"
-                )
-            if not all(np.isfinite(weight) and weight >= 0.0 for weight in weights):
-                raise ValueError("train_nep.weights must be finite and non-negative")
-
-        charge_mode = config.getint("train_nep", "charge_mode", fallback=0)
-        if charge_mode not in (0, 1):
-            raise ValueError(
-                "Unsupported train_nep.charge_mode=%s; expected 0 (NEP) or 1 (qNEP)"
-                % charge_mode
-            )
-
-        return NepHyperparameters(
-            elements=elements,
-            gas_elements=gas_elements,
-            cutoff=_canonical_tokens(config.get("train_nep", "cutoff", fallback="6 5")),
-            n_max=_canonical_tokens(config.get("train_nep", "n_max", fallback="4 4")),
-            basis_size=_canonical_tokens(
-                config.get("train_nep", "basis_size", fallback="8 8")
-            ),
-            l_max=_canonical_tokens(config.get("train_nep", "l_max", fallback="4 2 1")),
-            neuron=_canonical_tokens(config.get("train_nep", "neuron", fallback="80")),
-            population=config.getint("train_nep", "population", fallback=50),
-            batch=config.getint("train_nep", "batch", fallback=3000),
-            generations=config.getint("train_nep", "generation", fallback=250000),
-            outer_zbl=config.getfloat("train_nep", "outerZBL", fallback=2.0),
-            charge_mode=charge_mode,
-            weights=weights,
-            lambda_e=config.getfloat("train_nep", "lambda_e", fallback=1.0),
-            lambda_f=config.getfloat("train_nep", "lambda_f", fallback=1.0),
-            lambda_v=config.getfloat("train_nep", "lambda_v", fallback=1.0),
-            lambda_shear=config.getfloat("train_nep", "lambda_shear", fallback=1.0),
-        )
+        """Resolve all exposed NEP settings through the canonical value object."""
+        return NepHyperparameters.from_legacy_config(config)
 
     def _read_train_test_split(self) -> Tuple[List[Atoms], List[Atoms]]:
         """Read train and test structures from existing XYZ files."""
@@ -511,148 +396,22 @@ class TrainNepStage(Stage):
         dataset_path: Path,
         hyperparameters: NepHyperparameters | None = None,
     ) -> None:
-        """Generate customized nep.in based on project config."""
-        # Read template
-        template_path = self.project_dir / "config" / "nep" / "nep.in"
-        if template_path.exists():
-            template_lines = template_path.read_text().splitlines()
-            logger.info(f"Using nep.in template from {template_path}")
-        else:
-            logger.warning(f"nep.in template not found at {template_path}. Using defaults.")
-            template_lines = self._get_default_nep_template().splitlines()
-
-        if not template_lines:
-            logger.error("Template is empty! Cannot generate nep.in")
-            return
-
+        """Compatibility adapter around the canonical NEP input renderer."""
         hyperparameters = hyperparameters or self._get_nep_hyperparameters(config)
-        all_elements = hyperparameters.all_elements
-        logger.info("NEP will train on %s element types: %s", len(all_elements), all_elements)
-
-        population = hyperparameters.population
-        batch = hyperparameters.batch
-        generation = hyperparameters.generations
-        charge_mode = hyperparameters.charge_mode
-        outer_zbl = hyperparameters.outer_zbl
-        weights = hyperparameters.weights
-        cutoff = " ".join(hyperparameters.cutoff)
-        n_max = " ".join(hyperparameters.n_max)
-        basis_size = " ".join(hyperparameters.basis_size)
-        l_max = " ".join(hyperparameters.l_max)
-        neuron = " ".join(hyperparameters.neuron)
-        lambda_e = hyperparameters.lambda_e
-        lambda_f = hyperparameters.lambda_f
-        lambda_v = hyperparameters.lambda_v
-        lambda_shear = hyperparameters.lambda_shear
-
-        # Build output
-        output_lines = []
-        for line in template_lines:
-            stripped = line.strip()
-
-            if stripped.startswith("type ") and "# type" not in line:
-                output_lines.append(f"type {len(all_elements)} {' '.join(all_elements)}")
-            elif stripped.startswith("type_weight ") and "# type" not in line:
-                output_lines.append(f"type_weight {' '.join(str(w) for w in weights)}")
-            elif stripped.startswith("cutoff ") and "# cutoff" not in line:
-                output_lines.append(f"cutoff {cutoff}")
-            elif stripped.startswith("n_max ") and "# n_max" not in line:
-                output_lines.append(f"n_max {n_max}")
-            elif stripped.startswith("basis_size ") and "# basis_size" not in line:
-                output_lines.append(f"basis_size {basis_size}")
-            elif stripped.startswith("l_max ") and "# l_max" not in line:
-                output_lines.append(f"l_max {l_max}")
-            elif stripped.startswith("neuron ") and "# neuron" not in line:
-                output_lines.append(f"neuron {neuron}")
-            elif stripped.startswith("population ") and "# population" not in line:
-                output_lines.append(f"population {population}")
-            elif stripped.startswith("batch ") and "# batch" not in line:
-                output_lines.append(f"batch {batch}")
-            elif stripped.startswith("generation ") and "# generation" not in line:
-                output_lines.append(f"generation {generation}")
-            elif stripped.startswith("charge_mode ") and "# charge_mode" not in line:
-                output_lines.append(f"charge_mode {charge_mode}")
-            elif stripped.startswith("zbl ") and "# zbl" not in line:
-                output_lines.append(f"zbl {outer_zbl}")
-            elif stripped.startswith("lambda_e ") and "# lambda" not in line:
-                output_lines.append(f"lambda_e {lambda_e}")
-            elif stripped.startswith("lambda_f ") and "# lambda" not in line:
-                output_lines.append(f"lambda_f {lambda_f}")
-            elif stripped.startswith("lambda_v ") and "# lambda" not in line:
-                output_lines.append(f"lambda_v {lambda_v}")
-            elif stripped.startswith("lambda_shear ") and "# lambda" not in line:
-                output_lines.append(f"lambda_shear {lambda_shear}")
-            else:
-                output_lines.append(line)
-
-        required_lines = [
-            ("type", f"type {len(all_elements)} {' '.join(all_elements)}"),
-            ("type_weight", f"type_weight {' '.join(str(w) for w in weights)}"),
-            ("cutoff", f"cutoff {cutoff}"),
-            ("n_max", f"n_max {n_max}"),
-            ("basis_size", f"basis_size {basis_size}"),
-            ("l_max", f"l_max {l_max}"),
-            ("neuron", f"neuron {neuron}"),
-            ("population", f"population {population}"),
-            ("batch", f"batch {batch}"),
-            ("generation", f"generation {generation}"),
-            ("charge_mode", f"charge_mode {charge_mode}"),
-            ("zbl", f"zbl {outer_zbl}"),
-            ("lambda_e", f"lambda_e {lambda_e}"),
-            ("lambda_f", f"lambda_f {lambda_f}"),
-            ("lambda_v", f"lambda_v {lambda_v}"),
-            ("lambda_shear", f"lambda_shear {lambda_shear}"),
-        ]
-        for key, rendered_line in required_lines:
-            if not any(
-                line.strip().startswith(f"{key} ") and f"# {key}" not in line
-                for line in output_lines
-            ):
-                output_lines.append(rendered_line)
-
-        # Write customized config
-        output_path = dataset_path / "nep.in"
-        content = "\n".join(output_lines)
-        
-        if not content.strip():
-            logger.error(f"Generated nep.in is empty! Template had {len(template_lines)} lines, output has {len(output_lines)} lines.")
-            return
-        
-        atomic_write_text(output_path, content)
-        logger.info(f"Wrote {len(output_lines)} lines to {output_path}")
+        template_path = self.project_dir / "config" / "nep" / "nep.in"
+        if not template_path.exists():
+            template_path = None
+        content = NepInputRenderer().render_content(
+            hyperparameters,
+            template_path=template_path,
+        )
+        atomic_write_text(dataset_path / "nep.in", content)
+        return
 
     @staticmethod
     def _get_default_nep_template() -> str:
-        """Get default nep.in template if file not found."""
-        return """# Do not change this value
-version    4
-
-# Training population and generation settings
-population 50
-batch 3000
-generation 250000
-charge_mode 0
-
-# Element types and weights
-type 2 W O
-type_weight 1 1
-
-# Zbl configuration - value is outer cuttoff of ZBL.
-zbl        2
-
-# Parameters to be ML optimised
-cutoff     6 5
-n_max      4 4
-basis_size 8 8
-l_max      4 2 1
-neuron     80
-
-# Loss function parameters
-lambda_e   1
-lambda_f   1
-lambda_v   1
-lambda_shear 1
-"""
+        """Compatibility adapter for the canonical default template."""
+        return default_nep_template()
 
     def _get_or_create_dataset_folder(self) -> Path:
         """Find next available dataset_XXXX folder and create it."""
@@ -673,24 +432,6 @@ lambda_shear 1
 
         return dataset_path
 
-    @staticmethod
-    def _complete_extraction_report(report: dict, requested_count: int, accepted_count: int) -> None:
-        """Normalize reports from the parser, including test doubles."""
-        report.setdefault("requested_count", requested_count)
-        report.setdefault("accepted_results", [])
-        report.setdefault("accepted_content_records", [])
-        report.setdefault("rejected_reason_counts", {})
-        report["requested_count"] = requested_count
-        report["accepted_count"] = accepted_count
-        report["rejected_count"] = requested_count - accepted_count
-        accounted_for = sum(report["rejected_reason_counts"].values())
-        missing_rejections = report["rejected_count"] - accounted_for
-        if missing_rejections > 0:
-            report["rejected_reason_counts"]["record_rejected"] = (
-                report["rejected_reason_counts"].get("record_rejected", 0)
-                + missing_rejections
-            )
-
     def _build_dataset_metadata(
         self,
         dataset_path: Path,
@@ -700,114 +441,15 @@ lambda_shear 1
         train_virial: bool,
         allow_partial: bool,
     ) -> dict:
-        """Build manifest data from accepted parse results and extraction outcomes."""
-        canonical_records = []
-        accepted_identities = []
-        source_output_hashes = []
-        for split, report in (("train", train_report), ("test", test_report)):
-            for result in report.get("accepted_results", []):
-                canonical_record = {
-                    "split": split,
-                    "structure_id": result.structure_id,
-                    "calculation_identity": dict(result.calculation_identity),
-                    "source_outcar_hash": result.source_outcar_hash,
-                    "energy": result.energy_ev,
-                    "forces": result.forces_ev_per_angstrom.tolist(),
-                    "positions": result.positions_angstrom.tolist(),
-                    "lattice": result.lattice_angstrom.tolist(),
-                    "species": list(result.species),
-                    "pbc": list(result.pbc),
-                    "label_units": {
-                        "energy": result.energy_unit,
-                        "forces": result.force_unit,
-                    },
-                }
-                if train_virial:
-                    canonical_record["virial"] = (
-                        result.virial_ev.tolist() if result.virial_ev is not None else None
-                    )
-                    canonical_record["label_units"]["virial"] = result.virial_unit
-                    canonical_record["virial_convention"] = result.virial_convention
-                canonical_records.append(canonical_record)
-                accepted_identities.append(
-                    {
-                        "split": split,
-                        "structure_id": result.structure_id,
-                        "calculation_identity": dict(result.calculation_identity),
-                        "source_outcar": result.source_outcar,
-                        "source_outcar_hash": result.source_outcar_hash,
-                    }
-                )
-                if result.source_outcar_hash:
-                    source_output_hashes.append(result.source_outcar_hash)
+        """Compatibility adapter for the canonical manifest builder."""
 
-        canonical_records.extend(train_report.get("accepted_content_records", []))
-        canonical_records.extend(test_report.get("accepted_content_records", []))
-        accepted_count = train_report["accepted_count"] + test_report["accepted_count"]
-        if accepted_count and len(canonical_records) != accepted_count:
-            raise RuntimeError(
-                "Accepted dataset records are missing immutable content provenance"
-            )
-
-        label_schema = {
-            "version": "nepflow.extxyz.labels.v1",
-            "geometry": ["positions", "lattice", "species", "pbc"],
-            "energy": True,
-            "forces": True,
-            "virial": train_virial,
-        }
-        units = {
-            "energy": "eV",
-            "forces": "eV/Angstrom",
-            "virial": "eV",
-        }
-        identity_payload = {
-            "schema_version": "nepflow.dataset.v1",
-            "label_schema": label_schema,
-            "units": units,
-            "virial_convention": "positive_compression" if train_virial else None,
-            "virial_tensor_convention": "cartesian_3x3" if train_virial else None,
-            "records": canonical_records,
-        }
-
-        dataset_id = DatasetIdentity.from_identity_payload(identity_payload).dataset_id
-
-        train_reasons = dict(train_report["rejected_reason_counts"])
-        test_reasons = dict(test_report["rejected_reason_counts"])
-        rejection_reasons = {}
-        for reason, count in (*train_reasons.items(), *test_reasons.items()):
-            rejection_reasons[reason] = rejection_reasons.get(reason, 0) + count
-
-        created = datetime.now().isoformat()
-        return {
-            "dataset_id": dataset_id,
-            "dataset_schema_version": "nepflow.dataset.v1",
-            "label_schema": label_schema,
-            "created": created,
-            "creation_timestamp": created,
-            "dataset_folder": dataset_path.name,
-            "requested_train_structures": train_report["requested_count"],
-            "requested_test_structures": test_report["requested_count"],
-            "accepted_train_structures": train_report["accepted_count"],
-            "accepted_test_structures": test_report["accepted_count"],
-            "rejected_train_structures": train_report["rejected_count"],
-            "rejected_test_structures": test_report["rejected_count"],
-            "train_structures": train_report["accepted_count"],
-            "test_structures": test_report["accepted_count"],
-            "total_structures": train_report["accepted_count"] + test_report["accepted_count"],
-            "rejection_reason_counts": rejection_reasons,
-            "exclusion_reasons": rejection_reasons,
-            "train_rejection_reason_counts": train_reasons,
-            "test_rejection_reason_counts": test_reasons,
-            "accepted_calculation_identities": accepted_identities,
-            "source_output_hashes": source_output_hashes,
-            "virial_required": train_virial,
-            "virial_included": train_virial,
-            "units": units,
-            "virial_convention": "positive_compression",
-            "virial_tensor_convention": "cartesian_3x3",
-            "partial_dataset_allowed": allow_partial,
-        }
+        return build_dataset_metadata(
+            dataset_path,
+            train_report,
+            test_report,
+            train_virial=train_virial,
+            allow_partial=allow_partial,
+        )
 
     @staticmethod
     def _write_dataset_metadata(dataset_path: Path, metadata: dict) -> None:

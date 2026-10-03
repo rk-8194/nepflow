@@ -16,7 +16,7 @@ pytest.importorskip("pymatgen")
 from ase.io import read as ase_read  # noqa: E402
 from ase.calculators.singlepoint import SinglePointCalculator  # noqa: E402
 
-from common.model_manifest import (  # noqa: E402
+from nepflow.mlip.nep.artifacts import (  # noqa: E402
     compute_model_run_id,
     create_model_run_manifest,
     update_model_run_status,

@@ -11,8 +11,8 @@ pytest.importorskip("ase")
 pytest.importorskip("pymatgen")
 
 from modules.train_nep.train_nep import TrainNepStage  # noqa: E402
-from common.model_manifest import (  # noqa: E402
-    ModelManifestError,
+from nepflow.mlip.nep.artifacts import (  # noqa: E402
+    NepArtifactError,
     create_model_run_manifest,
     read_model_run_manifest,
     update_model_run_status,
@@ -309,7 +309,7 @@ def test_multiple_alternate_model_artifacts_are_rejected() -> None:
         (potential_path / "nep_first.txt").write_text("first\n", encoding="utf-8")
         (potential_path / "nep_second.txt").write_text("second\n", encoding="utf-8")
 
-        with pytest.raises(ModelManifestError):
+        with pytest.raises(NepArtifactError):
             update_model_run_status(potential_path, "completed")
 
 

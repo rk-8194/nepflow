@@ -9,8 +9,8 @@ import numpy as np
 from ase.io import read as ase_read
 from ase.atoms import Atoms
 
-from common.model_manifest import (
-    ModelManifestError,
+from nepflow.mlip.nep.artifacts import (
+    NepArtifactError,
     find_model_run_manifest,
     validate_model_run_manifest,
 )
@@ -27,7 +27,7 @@ def _validated_model_run(project_dir: Path, model_run_id: str) -> dict:
             manifest_path,
             expected_model_run_id=model_run_id,
         )
-    except (FileNotFoundError, ModelManifestError) as exc:
+    except (FileNotFoundError, NepArtifactError) as exc:
         raise RuntimeError(f"Invalid model-run manifest for {model_run_id}") from exc
     artifact_path = Path(str(manifest["potential_artifact_path"])).resolve()
     canonical_dir = (project_dir / "nep" / "potentials").resolve()
@@ -47,7 +47,7 @@ def find_model_run_and_dataset(project_dir: Path, model_run_id: str) -> Tuple[Pa
     canonical_dir = (project_dir / "nep" / "potentials").resolve()
     try:
         if potential_path.parent != canonical_dir:
-            raise ModelManifestError(
+            raise NepArtifactError(
                 f"Model artifact is outside canonical NEP storage: {potential_artifact}"
             )
     except OSError as exc:
@@ -119,9 +119,9 @@ def finalize_nep_potential(
     if src_nep.exists() and sha256_file(
         src_nep,
         required=True,
-        error_type=ModelManifestError,
+        error_type=NepArtifactError,
     ) != manifest["potential_artifact_sha256"]:
-        raise ModelManifestError(
+        raise NepArtifactError(
             f"Manifest-bound artifact changed after validation: {src_nep}"
         )
     if src_nep.exists() and not dst_nep.exists():
@@ -132,9 +132,9 @@ def finalize_nep_potential(
         if sha256_file(
             dst_nep,
             required=True,
-            error_type=ModelManifestError,
+            error_type=NepArtifactError,
         ) != manifest["potential_artifact_sha256"]:
-            raise ModelManifestError(
+            raise NepArtifactError(
                 f"Existing finalized artifact does not match manifest: {dst_nep}"
             )
         logger.info(f"nep.txt already exists at {dst_nep}")

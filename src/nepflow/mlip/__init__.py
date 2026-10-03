@@ -14,6 +14,7 @@ from .simulation import (
     StaticPredictionBackend,
     StaticPredictionRequest,
 )
+from .nep import NepBackend, NepHyperparameters, NepInputRenderer
 
 __all__ = [
     "CollectedModelArtifacts",
@@ -26,4 +27,7 @@ __all__ = [
     "TrainingInput",
     "TrainingInputRequest",
     "TrainingProgress",
+    "NepBackend",
+    "NepHyperparameters",
+    "NepInputRenderer",
 ]

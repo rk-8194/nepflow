@@ -11,7 +11,9 @@ from nepflow.hpc.slurm import SlurmScheduler
 from nepflow.io.json import read_json, write_json
 
 from nepflow.workflow.resubmission import SelfResubmitExit
-from common.model_manifest import ModelManifestError, update_model_run_status
+from nepflow.mlip.nep.artifacts import NepArtifactError, update_model_run_status
+from nepflow.mlip.nep.metrics import classify_training_error, parse_progress
+from nepflow.mlip.nep.outputs import parse_completion
 from ._common import logger
 
 scheduler = SlurmScheduler()
@@ -45,52 +47,14 @@ def _get_job_name_from_potential(potential_path: Path) -> str:
 
 
 def _check_nep_complete(potential_path: Path) -> bool:
-    """Check if NEP training completed successfully by looking for output files."""
-    # NEP generates a nep.txt file when training completes
-    nep_output = potential_path / "nep.txt"
-    if nep_output.exists() and nep_output.stat().st_size > 0:
-        logger.info(f"  Found NEP output: {nep_output.name}")
-        return True
-    
-    # Check for nep_*.txt outputs (different NEP versions)
-    nep_outputs = list(potential_path.glob("nep*.txt"))
-    if nep_outputs:
-        for f in nep_outputs:
-            if f.stat().st_size > 0:
-                logger.info(f"  Found NEP output: {f.name}")
-                return True
-    
-    return False
+    """Compatibility predicate backed by the canonical NEP output parser."""
+    return parse_completion(potential_path).completed
 
 
 def _get_training_generation(potential_path: Path) -> tuple[int, float] | None:
-    """Read generation number and total loss from loss.out file.
-    
-    Extracts the first value (generation) and second value (total loss) from the last line.
-    Returns tuple (generation, loss) or None if file doesn't exist or cannot be read.
-    """
-    loss_file = potential_path / "loss.out"
-    if not loss_file.exists():
-        return None
-    
-    try:
-        lines = loss_file.read_text(encoding="utf-8", errors="ignore").strip().split("\n")
-        if lines:
-            last_line = lines[-1].strip()
-            if last_line:
-                parts = last_line.split()
-                # First value is generation, second is total loss
-                if len(parts) >= 2:
-                    try:
-                        generation = int(parts[0])
-                        loss = float(parts[1])
-                        return (generation, loss)
-                    except (ValueError, IndexError):
-                        pass
-    except OSError:
-        pass
-    
-    return None
+    """Compatibility tuple backed by the canonical NEP progress parser."""
+    progress = parse_progress(potential_path)
+    return None if progress is None else (progress.generation, progress.loss)
 
 
 def _get_target_generations(dataset_path: Path) -> int | None:
@@ -132,35 +96,8 @@ def _format_time_remaining(seconds: float) -> str:
 
 
 def _check_training_error(potential_path: Path) -> str | None:
-    """Check for training errors in log files."""
-    log_file = potential_path / "train_nep_*.log"
-    log_files = list(potential_path.glob("train_nep_*.log"))
-    
-    if not log_files:
-        return None
-    
-    log_file = log_files[0]  # Get the SLURM log
-    try:
-        content = log_file.read_text(encoding="utf-8", errors="ignore")
-        
-        # Check for common error patterns
-        if "CUDA Error" in content:
-            return "CUDA error (GPU not available)"
-        if "out of memory" in content.lower() or "oom" in content.lower():
-            return "Out of memory"
-        if "segmentation fault" in content.lower():
-            return "Segmentation fault"
-        if "Killed" in content or "terminated" in content.lower():
-            return "Job terminated/killed"
-        
-        # Check last line for any error indication
-        lines = content.strip().split("\n")
-        if lines and ("error" in lines[-1].lower() or "failed" in lines[-1].lower()):
-            return lines[-1][:100]
-    except OSError as e:
-        logger.debug(f"Could not read log file: {e}")
-    
-    return None
+    """Compatibility error lookup backed by the canonical NEP classifier."""
+    return classify_training_error(potential_path)
 
 
 def _get_slurm_job_id(job_name: str) -> str | None:
@@ -367,7 +304,7 @@ def run_launcher(
                     if _check_nep_complete(potential_path):
                         try:
                             manifest = update_model_run_status(potential_path, "completed")
-                        except ModelManifestError as exc:
+                        except NepArtifactError as exc:
                             logger.error("Training artifact could not be finalized: %s", exc)
                             write_train_status(
                                 project_dir,
@@ -410,7 +347,7 @@ def run_launcher(
                             "failed",
                             error=error_msg,
                         )
-                    except ModelManifestError as exc:
+                    except NepArtifactError as exc:
                         logger.error("Could not update model-run manifest: %s", exc)
                     
                     # Check if we should retry
