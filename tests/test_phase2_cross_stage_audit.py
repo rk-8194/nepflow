@@ -23,6 +23,7 @@ from nepflow.mlip.nep.artifacts import (  # noqa: E402
     validate_model_run_manifest,
 )
 from nepflow.domain.identities import calculate_structure_id  # noqa: E402
+from nepflow.domain.datasets import DatasetIdentity  # noqa: E402
 from nepflow.dft.vasp.inputs import read_identity  # noqa: E402
 from nepflow.dft.vasp.outputs import parse_outcar_result  # noqa: E402
 from nepflow.io.hashing import sha256_file  # noqa: E402
@@ -31,13 +32,12 @@ from modules.validate.launcher import (  # noqa: E402
     read_validation_status,
     write_validation_status,
 )
-from modules.validate.prepare import (  # noqa: E402
-    find_latest_potential_and_dataset,
-    find_model_run_and_dataset,
-)
 from nepflow.mlip.nep.inputs import NepHyperparameters, NepInputRenderer  # noqa: E402
 from nepflow.stages.training.dataset import build_dataset_metadata  # noqa: E402
 from nepflow.io.json import write_json  # noqa: E402
+from nepflow.stages.validation.resolution import resolve_model_dataset  # noqa: E402
+from nepflow.errors import StateError  # noqa: E402
+from nepflow.state.store import StateStore  # noqa: E402
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -171,14 +171,27 @@ def test_deterministic_dft_to_validation_identity_trace() -> None:
         (potential_path / "nep.txt").write_text(
             "version 4\ntype 1 Si\ncutoff 6 5 112 60\n", encoding="utf-8"
         )
-        model_manifest = create_model_run_manifest(
-            potential_path=potential_path,
-            dataset_path=dataset_path,
-            dataset_id=metadata["dataset_id"],
-            nep_in_path=potential_path / "nep.in",
-            hyperparameters_hash=hyperparameters_hash,
-        )
-        completed_manifest = update_model_run_status(potential_path, "completed")
+        with StateStore(project_dir / "state.db") as state_store:
+            state_store.upsert_dataset(
+                DatasetIdentity(
+                    metadata["dataset_id"],
+                    {"schema_version": "nepflow.dataset.v1", "records": []},
+                )
+            )
+            model_manifest = create_model_run_manifest(
+                potential_path=potential_path,
+                dataset_path=dataset_path,
+                dataset_id=metadata["dataset_id"],
+                nep_in_path=potential_path / "nep.in",
+                hyperparameters_hash=hyperparameters_hash,
+                state_store=state_store,
+            )
+            completed_manifest = update_model_run_status(
+                potential_path,
+                "completed",
+                state_store=state_store,
+                model_run_id=model_manifest["model_run_id"],
+            )
         validated_manifest = validate_model_run_manifest(
             potential_path / "model_run_manifest.json",
             expected_model_run_id=model_manifest["model_run_id"],
@@ -189,13 +202,11 @@ def test_deterministic_dft_to_validation_identity_trace() -> None:
         assert validated_manifest["potential_artifact_sha256"] == sha256_file(potential_path / "nep.txt")
         assert validated_manifest["nep_in_sha256"] == nep_in_hash
 
-        resolved_potential, resolved_dataset = find_model_run_and_dataset(
-            project_dir, validated_manifest["model_run_id"]
-        )
-        assert resolved_potential == potential_path.resolve()
-        assert resolved_dataset == dataset_path.resolve()
-        with pytest.raises(ValueError, match="model_run_id"):
-            find_latest_potential_and_dataset(project_dir)
+        resolved = resolve_model_dataset(project_dir, validated_manifest["model_run_id"])
+        assert resolved.model_path.parent == potential_path.resolve()
+        assert resolved.dataset_path == dataset_path.resolve()
+        with pytest.raises(StateError, match="explicit model_run_id"):
+            resolve_model_dataset(project_dir, "")
 
         # Storage relocation does not change the scientific dataset/model identities.
         relocated_result = replace(accepted, source_outcar=str(project_dir / "moved" / "OUTCAR"))

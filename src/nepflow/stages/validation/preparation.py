@@ -3,34 +3,16 @@
 from __future__ import annotations
 
 from pathlib import Path
-import shutil
 from typing import Any
 
 import numpy as np
-from ase import Atoms
-from ase.io import write as ase_write
 
 from nepflow.errors import ValidationError
-from nepflow.errors import StateError
-from nepflow.io.hashing import sha256_file
 from nepflow.mlip.gpumd import GpumdBackend
+from nepflow.mlip.nep.artifacts import parse_nep_cutoff_angstrom
 
 from .protocols import ValidationCaseSpec, ValidationPreparation
 from .resolution import ResolvedModelDataset, resolve_model_dataset
-
-
-def _cutoff_angstrom(nep_path: Path) -> float:
-    for line in nep_path.read_text(encoding="utf-8").splitlines():
-        values = line.split("#", 1)[0].split()
-        if values and values[0].lower() == "cutoff" and len(values) >= 2:
-            try:
-                cutoff = float(values[1])
-            except ValueError as exc:
-                raise ValidationError(f"Invalid NEP cutoff in {nep_path}") from exc
-            if np.isfinite(cutoff) and cutoff > 0:
-                return cutoff
-            break
-    raise ValidationError(f"Could not find a positive NEP cutoff in {nep_path}")
 
 
 def cell_perpendicular_heights_angstrom(cell: Any) -> np.ndarray:
@@ -77,24 +59,6 @@ def calculate_cell_replicates_for_cutoff(
     if any(repeat * height <= required for repeat, height in zip(result, heights)):
         raise ValidationError("validation replication does not satisfy cutoff thickness")
     return result  # type: ignore[return-value]
-
-
-def _write_model_xyz(case_dir: Path, reference) -> Path:
-    atoms = Atoms(
-        symbols=list(reference.species),
-        positions=np.asarray(reference.positions_angstrom, dtype=float),
-        cell=np.asarray(reference.cell_angstrom, dtype=float),
-        pbc=reference.pbc,
-    )
-    path = case_dir / "model.xyz"
-    ase_write(
-        str(path),
-        atoms,
-        format="extxyz",
-        write_info=False,
-        write_results=False,
-    )
-    return path
 
 
 def _legacy_state(preparation: ValidationPreparation) -> dict[str, Any]:
@@ -151,46 +115,30 @@ def prepare_validation_cases(
         / f"{resolved.dataset_id[-16:]}-{resolved.model_run_id[-16:]}"
     )
     potential_dir = Path(gpumd_potential_dir or default_potential_dir)
-    potential_dir.mkdir(parents=True, exist_ok=True)
-    nep_path = potential_dir / "nep.txt"
-    if not nep_path.exists():
-        shutil.copy2(resolved.model_path, nep_path)
-    elif sha256_file(nep_path) != sha256_file(resolved.model_path):
-        raise StateError(
-            "Existing validation potential does not match the explicitly resolved model artifact"
-        )
-    cutoff = _cutoff_angstrom(nep_path)
+    cutoff = parse_nep_cutoff_angstrom(resolved.model_path)
 
     cases: list[ValidationCaseSpec] = []
     references = resolved.test_references()
     for ordinal, reference in enumerate(references):
         case_dir = potential_dir / "validation" / f"case_{ordinal:04d}"
-        case_dir.mkdir(parents=True, exist_ok=True)
-        model_xyz_path = _write_model_xyz(case_dir, reference)
-        case_nep_path = case_dir / "nep.txt"
-        if not case_nep_path.exists():
-            shutil.copy2(nep_path, case_nep_path)
-        elif sha256_file(case_nep_path) != sha256_file(nep_path):
-            raise StateError(
-                "Existing validation case potential does not match the resolved model artifact"
-            )
         replicates = calculate_cell_replicates_for_cutoff(
             reference.cell_angstrom,
             cutoff,
         )
-        run_content = backend.render_input(replicates=replicates)
-        run_path = case_dir / "run.in"
-        run_path.write_text(run_content, encoding="utf-8", newline="\n")
         case = ValidationCaseSpec.create(
             ordinal=ordinal,
             model_run_id=resolved.model_run_id,
             dataset_id=resolved.dataset_id,
             reference=reference,
-            input_path=model_xyz_path,
+            input_path=case_dir / "model.xyz",
             working_directory=case_dir,
             output_path=case_dir / "out.xyz",
             replicates=replicates,
             virial_requested=reference.virial_ev is not None,
+        )
+        backend.prepare_inputs(
+            case.static_prediction_request(resolved.model_run),
+            replicates=replicates,
         )
         cases.append(case)
 

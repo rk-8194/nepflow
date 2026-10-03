@@ -37,8 +37,20 @@ class ResolvedModelDataset:
         return self.model_run.model_run_id
 
     @property
+    def model(self) -> ModelRunRecord:
+        """Canonical model record spelling for typed validation callers."""
+
+        return self.model_run
+
+    @property
     def dataset_id(self) -> str:
         return self.dataset.identity.dataset_id
+
+    @property
+    def model_artifact(self) -> ArtifactIdentity:
+        if self.model_run.artifact is None:
+            raise StateError("Resolved model run has no model artifact")
+        return self.model_run.artifact.model
 
     def test_references(self) -> tuple[ValidationReference, ...]:
         """Return ordered test labels from the persisted dataset manifest."""
@@ -223,58 +235,6 @@ def _resolve_with_store(
     return ResolvedModelDataset(record, dataset, model_path, dataset_path, model_manifest)
 
 
-def _resolve_without_store(
-    project_dir: Path,
-    model_run_id: str,
-    *,
-    dataset_id: str | None,
-) -> ResolvedModelDataset:
-    """Read the pre-ledger manifest only for migration-era projects."""
-
-    manifest_path = find_model_run_manifest(project_dir, model_run_id)
-    try:
-        manifest = validate_model_run_manifest(
-            manifest_path,
-            expected_model_run_id=model_run_id,
-        )
-    except (FileNotFoundError, NepArtifactError) as exc:
-        raise StateError(f"Invalid model-run manifest: {model_run_id}") from exc
-    resolved_dataset_id = str(manifest.get("dataset_id", ""))
-    if dataset_id is not None and dataset_id != resolved_dataset_id:
-        raise StateError("Requested dataset_id conflicts with model manifest")
-    identity = ModelRunIdentity.from_inputs(
-        dataset_id=resolved_dataset_id,
-        nep_in_sha256=str(manifest["nep_in_sha256"]),
-        hyperparameters_hash=str(manifest["hyperparameters_hash"]),
-    )
-    if identity.model_run_id != model_run_id or manifest.get("status") != "completed":
-        raise StateError("Model manifest is not a completed authoritative model run")
-    dataset_path = Path(str(manifest["dataset_path"])).resolve()
-    if dataset_path.parent != (project_dir / "nep" / "datasets").resolve():
-        raise StateError(f"Dataset is outside canonical storage: {dataset_path}")
-    metadata = read_json_object(dataset_path / ".dataset")
-    if metadata.get("dataset_id") != resolved_dataset_id:
-        raise StateError("Materialized dataset conflicts with model manifest")
-    identity_payload = dict(metadata)
-    identity_payload.pop("dataset_id", None)
-    dataset = TrainingDatasetManifest(
-        identity=DatasetIdentity(resolved_dataset_id, identity_payload),
-        records=tuple(metadata.get("records", ())),
-    )
-    model_path = Path(str(manifest["potential_artifact_path"])).resolve()
-    canonical_model_dir = (project_dir / "nep" / "potentials").resolve()
-    if model_path.parent.parent != canonical_model_dir:
-        raise StateError(
-            f"Model artifact is outside canonical storage: {model_path}"
-        )
-    artifact = ArtifactIdentity.from_file("nep_model", model_path)
-    record = ModelRunRecord(
-        identity=identity,
-        artifact=ModelArtifactMetadata(model=artifact, status="completed"),
-    )
-    return ResolvedModelDataset(record, dataset, model_path, dataset_path, manifest)
-
-
 def resolve_model_dataset(
     project_dir: Path,
     model_run_id: str,
@@ -296,10 +256,12 @@ def resolve_model_dataset(
     if state_store is not None:
         return _resolve_with_store(project_dir, model_run_id, state_store, dataset_id=dataset_id)
     state_path = project_dir / "state.db"
-    if state_path.is_file():
-        with StateStore(state_path) as store:
-            return _resolve_with_store(project_dir, model_run_id, store, dataset_id=dataset_id)
-    return _resolve_without_store(project_dir, model_run_id, dataset_id=dataset_id)
+    if not state_path.is_file():
+        raise StateError(
+            f"Authoritative StateStore is required for validation: {state_path}"
+        )
+    with StateStore(state_path) as store:
+        return _resolve_with_store(project_dir, model_run_id, store, dataset_id=dataset_id)
 
 
 __all__ = ["ResolvedModelDataset", "resolve_model_dataset"]

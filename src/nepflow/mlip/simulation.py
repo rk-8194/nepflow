@@ -39,6 +39,11 @@ class StaticPredictionRequest:
     positions_angstrom: np.ndarray | None = None
     cell_angstrom: np.ndarray | None = None
     pbc: tuple[bool, bool, bool] | None = None
+    expected_species: tuple[str, ...] | None = None
+    expected_positions_angstrom: np.ndarray | None = None
+    expected_cell_angstrom: np.ndarray | None = None
+    expected_pbc: tuple[bool, bool, bool] | None = None
+    atom_mapping: tuple[int, ...] | None = None
 
     def __post_init__(self) -> None:
         if self.atom_count < 1:
@@ -73,6 +78,50 @@ class StaticPredictionRequest:
             if len(values) != 3:
                 raise ValidationError("static prediction reference pbc must have three flags")
             object.__setattr__(self, "pbc", values)  # type: ignore[assignment]
+        if self.expected_species is not None:
+            expected_species = tuple(str(value) for value in self.expected_species)
+            if len(expected_species) != self.atom_count:
+                raise ValidationError(
+                    "static prediction expected species count does not match atom_count"
+                )
+            object.__setattr__(self, "expected_species", expected_species)
+        if self.expected_positions_angstrom is not None:
+            expected_positions = np.asarray(self.expected_positions_angstrom, dtype=float)
+            if expected_positions.shape != (self.atom_count, 3):
+                raise ValidationError(
+                    "static prediction expected positions must have shape "
+                    f"({self.atom_count}, 3)"
+                )
+            if not np.isfinite(expected_positions).all():
+                raise ValidationError(
+                    "static prediction expected positions are not finite"
+                )
+            object.__setattr__(
+                self, "expected_positions_angstrom", np.array(expected_positions, copy=True)
+            )
+        if self.expected_cell_angstrom is not None:
+            expected_cell = np.asarray(self.expected_cell_angstrom, dtype=float)
+            if expected_cell.shape != (3, 3) or not np.isfinite(expected_cell).all():
+                raise ValidationError(
+                    "static prediction expected cell must be a finite 3x3 matrix"
+                )
+            object.__setattr__(
+                self, "expected_cell_angstrom", np.array(expected_cell, copy=True)
+            )
+        if self.expected_pbc is not None:
+            expected_pbc = tuple(bool(value) for value in self.expected_pbc)
+            if len(expected_pbc) != 3:
+                raise ValidationError(
+                    "static prediction expected pbc must have three flags"
+                )
+            object.__setattr__(self, "expected_pbc", expected_pbc)  # type: ignore[assignment]
+        if self.atom_mapping is not None:
+            mapping = tuple(int(value) for value in self.atom_mapping)
+            if len(mapping) != self.atom_count or any(value < 0 for value in mapping):
+                raise ValidationError(
+                    "static prediction atom_mapping must match atom_count and use non-negative indices"
+                )
+            object.__setattr__(self, "atom_mapping", mapping)
 
     @property
     def cell(self) -> np.ndarray | None:
@@ -117,6 +166,7 @@ class StaticPrediction:
     positions_angstrom: np.ndarray | None = None
     cell_angstrom: np.ndarray | None = None
     pbc: tuple[bool, bool, bool] | None = None
+    atom_mapping: tuple[int, ...] | None = None
 
     def __post_init__(self) -> None:
         if self.atom_count < 1:
@@ -192,6 +242,13 @@ class StaticPrediction:
             if len(values) != 3:
                 raise ValidationError("static prediction pbc must have three flags")
             object.__setattr__(self, "pbc", values)  # type: ignore[assignment]
+        if self.atom_mapping is not None:
+            mapping = tuple(int(value) for value in self.atom_mapping)
+            if len(mapping) != self.atom_count or any(value < 0 for value in mapping):
+                raise ValidationError(
+                    "static prediction atom_mapping must match atom_count and use non-negative indices"
+                )
+            object.__setattr__(self, "atom_mapping", mapping)
 
     @property
     def cell(self) -> np.ndarray | None:

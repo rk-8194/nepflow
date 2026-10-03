@@ -6,13 +6,16 @@ import shutil
 from pathlib import Path
 
 import numpy as np
+import pytest
 from ase.io import read as ase_read
+from ase.io import write as ase_write
 
 from nepflow.domain.datasets import DatasetIdentity, TrainingDatasetManifest
 from nepflow.domain.identities import ArtifactIdentity, ModelRunIdentity, StructureIdentity
 from nepflow.domain.models import ModelArtifactMetadata, ModelRunRecord
 from nepflow.mlip.gpumd import GpumdBackend
 from nepflow.mlip.simulation import StaticPredictionRequest
+from nepflow.errors import MlipError, ValidationError
 from nepflow.mlip.nep.artifacts import create_model_run_manifest, update_model_run_status
 from nepflow.stages.validation import (
     calculate_cell_replicates_for_cutoff,
@@ -108,6 +111,18 @@ def test_resolution_and_case_schema_keep_exact_model_dataset_association(tmp_pat
     assert case.reference.energy_ev == -10.5
     assert "Properties=" in case.input_path.read_text(encoding="utf-8").splitlines()[1]
     np.testing.assert_allclose(case.reference.cell_angstrom, np.eye(3) * 3.0)
+    assert len(case.atom_mapping) == case.reference.atom_count * int(np.prod(case.replicates))
+    assert [item[0] for item in case.atom_mapping].count(0) == int(np.prod(case.replicates))
+    restored = ValidationCaseSpec.from_mapping(case.to_dict())
+    assert restored.atom_mapping == case.atom_mapping
+    malformed = case.to_dict()
+    malformed["atom_mapping"] = malformed["atom_mapping"][:-1]
+    with pytest.raises(ValidationError, match="atom_mapping"):
+        ValidationCaseSpec.from_mapping(malformed)
+    duplicate = case.to_dict()
+    duplicate["atom_mapping"][-1] = duplicate["atom_mapping"][0]
+    with pytest.raises(ValidationError, match="duplicate|cover"):
+        ValidationCaseSpec.from_mapping(duplicate)
 
 
 def test_triclinic_replicates_use_perpendicular_heights() -> None:
@@ -124,6 +139,7 @@ def test_triclinic_replicates_use_perpendicular_heights() -> None:
             volume / np.linalg.norm(np.cross(cell[0], cell[1])),
         ]
     )
+    assert repeats == (2, 2, 1)
     assert all(repeat * height > 4.0 for repeat, height in zip(repeats, heights))
 
 
@@ -149,6 +165,166 @@ def test_gpumd_backend_parses_actual_ml_values_and_metadata(tmp_path: Path) -> N
     np.testing.assert_allclose(prediction.forces_ev_per_angstrom, [[0.12, 0.01, 0.0], [-0.08, -0.01, 0.0]])
     assert prediction.cell_angstrom is not None
     np.testing.assert_allclose(prediction.cell_angstrom, np.eye(3) * 3.0)
+    assert prediction.runtime.command == ("gpumd",)
+
+
+def test_gpumd_backend_rejects_same_count_wrong_physical_configuration(tmp_path: Path) -> None:
+    model = ModelRunRecord(
+        ModelRunIdentity("dataset-fixture", "nep-input", "hyperparameters"),
+        ModelArtifactMetadata(
+            model=ArtifactIdentity.from_bytes("nep_model", b"model"),
+            status="completed",
+        ),
+    )
+    request = StaticPredictionRequest(
+        structure=StructureIdentity("fixture-structure-0001"),
+        model=model,
+        input_path=ML_FIXTURE,
+        working_directory=tmp_path,
+        atom_count=2,
+        virial_requested=True,
+        expected_species=("Si", "Si"),
+        expected_positions_angstrom=np.array([[0.0, 0.0, 0.0], [1.25, 1.5, 1.5]]),
+        expected_cell_angstrom=np.eye(3) * 3.0,
+        expected_pbc=(True, True, True),
+        atom_mapping=(0, 1),
+    )
+    with pytest.raises(MlipError, match="positions|configuration"):
+        GpumdBackend().parse_prediction(request, ML_FIXTURE)
+
+
+def test_gpumd_backend_rejects_missing_energy_forces_and_requested_virial(tmp_path: Path) -> None:
+    model = ModelRunRecord(
+        ModelRunIdentity("dataset-fixture", "nep-input", "hyperparameters"),
+        ModelArtifactMetadata(
+            model=ArtifactIdentity.from_bytes("nep_model", b"model"),
+            status="completed",
+        ),
+    )
+
+    def request() -> StaticPredictionRequest:
+        return StaticPredictionRequest(
+            structure=StructureIdentity("fixture-structure-0001"),
+            model=model,
+            input_path=ML_FIXTURE,
+            working_directory=tmp_path,
+            atom_count=2,
+            virial_requested=True,
+        )
+
+    missing_energy = tmp_path / "missing-energy.xyz"
+    missing_energy.write_text(
+        ML_FIXTURE.read_text(encoding="utf-8").replace("energy=-10.2500000000 ", "", 1),
+        encoding="utf-8",
+    )
+    with pytest.raises(MlipError, match="energy"):
+        GpumdBackend().parse_prediction(request(), missing_energy)
+
+    missing_virial = tmp_path / "missing-virial.xyz"
+    missing_virial.write_text(
+        ML_FIXTURE.read_text(encoding="utf-8").replace(
+            ' virial="1.1000000000 2.1000000000 3.1000000000 4.1000000000 '
+            '5.1000000000 6.1000000000 7.1000000000 8.1000000000 9.1000000000"',
+            "",
+            1,
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(MlipError, match="virial|stress"):
+        GpumdBackend().parse_prediction(request(), missing_virial)
+
+    missing_forces = ase_read(str(ML_FIXTURE), format="extxyz")
+    del missing_forces.arrays["force"]
+    missing_forces.info["energy"] = -10.25
+    missing_forces.calc = None
+    missing_forces_path = tmp_path / "missing-forces.xyz"
+    ase_write(str(missing_forces_path), missing_forces, format="extxyz")
+    with pytest.raises(MlipError, match="forces"):
+        GpumdBackend().parse_prediction(request(), missing_forces_path)
+
+
+def test_gpumd_backend_materializes_exact_potential_filename_and_checks_artifact_hash(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "authoritative-nep.txt"
+    source.write_text("version 4\ntype 1 Si\ncutoff 2\n", encoding="utf-8")
+    artifact = ArtifactIdentity.from_file("nep_model", source)
+    model = ModelRunRecord(
+        ModelRunIdentity("dataset-fixture", "nep-input", "hyperparameters"),
+        ModelArtifactMetadata(model=artifact, status="completed"),
+    )
+    request = StaticPredictionRequest(
+        structure=StructureIdentity("fixture-structure-0001"),
+        model=model,
+        input_path=tmp_path / "not-yet-materialized.xyz",
+        working_directory=tmp_path / "case",
+        atom_count=1,
+        species=("Si",),
+        positions_angstrom=np.array([[0.0, 0.0, 0.0]]),
+        cell_angstrom=np.eye(3) * 3.0,
+        pbc=(True, True, True),
+    )
+    prepared = GpumdBackend(command=("gpumd", "--version")).prepare_inputs(
+        request,
+        potential_filename="custom-nep.txt",
+    )
+    assert prepared.input_path.is_file()
+    assert (tmp_path / "case" / "custom-nep.txt").read_bytes() == source.read_bytes()
+    assert "potential custom-nep.txt" in prepared.content
+
+    source.write_text("tampered\n", encoding="utf-8")
+    with pytest.raises(MlipError, match="SHA-256"):
+        GpumdBackend().prepare_inputs(request, potential_filename="custom-nep.txt")
+
+    missing_file_artifact = ArtifactIdentity(
+        artifact.artifact_id,
+        artifact.artifact_type,
+        artifact.sha256,
+        path=str(tmp_path / "missing-nep.txt"),
+    )
+    missing_file_model = ModelRunRecord(
+        model.identity,
+        ModelArtifactMetadata(model=missing_file_artifact, status="completed"),
+    )
+    missing_file_request = StaticPredictionRequest(
+        request.structure,
+        missing_file_model,
+        request.input_path,
+        tmp_path / "missing-file-case",
+        atom_count=1,
+        species=("Si",),
+        positions_angstrom=np.array([[0.0, 0.0, 0.0]]),
+        cell_angstrom=np.eye(3) * 3.0,
+        pbc=(True, True, True),
+    )
+    with pytest.raises(MlipError, match="does not exist"):
+        GpumdBackend().prepare_inputs(missing_file_request)
+
+    missing_path_model = ModelRunRecord(
+        model.identity,
+        ModelArtifactMetadata(
+            model=ArtifactIdentity(
+                artifact.artifact_id,
+                artifact.artifact_type,
+                artifact.sha256,
+                path=None,
+            ),
+            status="completed",
+        ),
+    )
+    missing_path_request = StaticPredictionRequest(
+        request.structure,
+        missing_path_model,
+        request.input_path,
+        tmp_path / "missing-path-case",
+        atom_count=1,
+        species=("Si",),
+        positions_angstrom=np.array([[0.0, 0.0, 0.0]]),
+        cell_angstrom=np.eye(3) * 3.0,
+        pbc=(True, True, True),
+    )
+    with pytest.raises(MlipError, match="source path"):
+        GpumdBackend().prepare_inputs(missing_path_request)
 
 
 def test_canonical_case_analysis_uses_backend_ml_values(tmp_path: Path) -> None:
@@ -181,3 +357,34 @@ def test_canonical_case_analysis_uses_backend_ml_values(tmp_path: Path) -> None:
     row = next(csv.DictReader(report_path.open(newline="", encoding="utf-8")))
     assert float(row["energy_error_per_atom"]) == 0.125
     assert float(row["force_component_mae"]) > 0.0
+
+
+def test_replicated_case_prediction_returns_reference_atom_mapping(tmp_path: Path) -> None:
+    model_run_id, _ = _materialize_authoritative_project(tmp_path)
+    resolved = resolve_model_dataset(tmp_path, model_run_id)
+    case_dir = tmp_path / "replicated-case"
+    case_dir.mkdir()
+    case = ValidationCaseSpec.create(
+        ordinal=0,
+        model_run_id=model_run_id,
+        dataset_id=resolved.dataset_id,
+        reference=resolved.test_references()[0],
+        input_path=case_dir / "model.xyz",
+        working_directory=case_dir,
+        output_path=case_dir / "out.xyz",
+        replicates=(2, 1, 1),
+        virial_requested=True,
+    )
+    output = ase_read(str(ML_FIXTURE), format="extxyz").repeat((2, 1, 1))
+    output.info["energy"] = -20.5
+    output.info["virial"] = np.asarray(output.info["virial"], dtype=float) * 2.0
+    output_path = case_dir / "out.xyz"
+    ase_write(str(output_path), output, format="extxyz")
+
+    prediction = GpumdBackend().parse_prediction(
+        case.static_prediction_request(resolved.model_run),
+        output_path,
+    )
+    assert prediction.atom_mapping is not None
+    assert prediction.atom_mapping.count(0) == 2
+    assert prediction.atom_mapping.count(1) == 2

@@ -5,25 +5,12 @@ expressed in Angstroms.  The safety condition is strict: each replicated
 perpendicular height must be greater than twice the cutoff radius.
 """
 
-from pathlib import Path
-from unittest.mock import patch
-
 import numpy as np
 import pytest
-
-pytest.importorskip("ase")
-
-from ase import Atoms  # noqa: E402
-
-from modules.validate import prepare as prepare_module  # noqa: E402
-
-
-class _CellFixture:
-    def __init__(self, cell: np.ndarray) -> None:
-        self.cell = np.asarray(cell, dtype=float)
-
-    def get_cell(self) -> np.ndarray:
-        return self.cell
+from nepflow.stages.validation.preparation import (  # noqa: E402
+    calculate_cell_replicates_for_cutoff,
+)
+from nepflow.errors import ValidationError  # noqa: E402
 
 
 def perpendicular_heights(cell: np.ndarray) -> np.ndarray:
@@ -54,23 +41,8 @@ def strict_required_replicates(
 
 
 def calculate_replicates(cell: np.ndarray, cutoff_angstrom: float) -> tuple[int, int, int]:
-    """Call production replication logic without filesystem or GPUMD dependencies."""
-    with (
-        patch.object(
-            prepare_module,
-            "parse_cutoff_from_nep",
-            return_value=cutoff_angstrom,
-        ),
-        patch.object(
-            prepare_module,
-            "ase_read",
-            return_value=_CellFixture(cell),
-        ),
-    ):
-        return prepare_module.calculate_required_replicates(
-            Path("model.xyz"),
-            Path("nep.txt"),
-        )
+    """Call the canonical triclinic-safe replication calculation."""
+    return calculate_cell_replicates_for_cutoff(cell, cutoff_angstrom)
 
 
 def assert_strict_threshold(
@@ -136,6 +108,12 @@ def test_skewed_triclinic_cell_uses_perpendicular_plane_heights() -> None:
     assert_strict_threshold(cell, cutoff_angstrom, actual)
 
 
+def test_canonical_triclinic_regression_is_exact() -> None:
+    cell = np.array([[3.0, 0.0, 0.0], [1.0, 2.5, 0.0], [0.3, 0.4, 7.0]])
+
+    assert calculate_replicates(cell, 2.0) == (2, 2, 1)
+
+
 def test_strongly_anisotropic_triclinic_cell_uses_perpendicular_heights() -> None:
     cell = np.array(
         [
@@ -189,42 +167,5 @@ def test_no_unnecessary_repeat_when_height_exceeds_twice_cutoff() -> None:
 def test_degenerate_cell_raises_clear_value_error() -> None:
     cell = np.zeros((3, 3))
 
-    with pytest.raises(ValueError, match="cell|volume|height"):
+    with pytest.raises(ValidationError, match="cell|volume|height"):
         calculate_replicates(cell, cutoff_angstrom=2.0)
-
-
-def test_prepare_validation_structures_propagates_invalid_cell_failure(
-    tmp_path: Path,
-) -> None:
-    invalid_atoms = Atoms(
-        "Si",
-        positions=[[0.0, 0.0, 0.0]],
-        cell=np.zeros((3, 3)),
-        pbc=True,
-    )
-    dataset_path = tmp_path / "nep" / "datasets" / "dataset_0001"
-    potential_path = tmp_path / "gpumd" / "dataset_0001" / "potential_0001"
-    config_gpumd_dir = tmp_path / "config" / "gpumd"
-    dataset_path.mkdir(parents=True)
-    potential_path.mkdir(parents=True)
-    config_gpumd_dir.mkdir(parents=True)
-    (potential_path / "nep.txt").write_text(
-        "version 4\ntype 1 Si\ncutoff 2 5 112 60\n", encoding="utf-8"
-    )
-    (config_gpumd_dir / "run.in_validate").write_text(
-        "replicate 1 1 1\n", encoding="utf-8"
-    )
-
-    with patch.object(
-        prepare_module, "parse_test_xyz", return_value=[{"atoms": invalid_atoms}]
-    ):
-        with pytest.raises(ValueError, match="cell|volume|height"):
-            prepare_module.prepare_validation_structures(
-                dataset_path=dataset_path,
-                gpumd_potential_dir=potential_path,
-                project_dir=tmp_path,
-                config_gpumd_dir=config_gpumd_dir,
-            )
-
-    run_in_path = potential_path / "validation" / "struct_0000" / "run.in"
-    assert not run_in_path.exists()

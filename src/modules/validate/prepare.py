@@ -9,97 +9,22 @@ import numpy as np
 from ase.io import read as ase_read
 from ase.atoms import Atoms
 
+from nepflow.domain.identities import ArtifactIdentity, ModelRunIdentity, StructureIdentity
+from nepflow.domain.models import ModelArtifactMetadata, ModelRunRecord
 from nepflow.mlip.nep.artifacts import (
     NepArtifactError,
-    find_model_run_manifest,
-    validate_model_run_manifest,
+    parse_nep_cutoff_angstrom,
 )
 from nepflow.io.hashing import sha256_file
-from nepflow.state.store import StateStore
 from nepflow.stages.validation.resolution import resolve_model_dataset
+from nepflow.stages.validation.preparation import (
+    calculate_cell_replicates_for_cutoff,
+    cell_perpendicular_heights_angstrom,
+)
 from nepflow.mlip.gpumd import GpumdBackend
+from nepflow.mlip.simulation import StaticPredictionRequest
 
 logger = logging.getLogger("nepflow.validate")
-
-
-def _validated_model_run(project_dir: Path, model_run_id: str) -> dict:
-    """Load one explicit StateStore run and validate its derived manifest."""
-    state_path = project_dir / "state.db"
-    manifest_path = find_model_run_manifest(project_dir, model_run_id)
-    if not state_path.is_file():
-        # Pre-StateStore Phase 2 projects remain readable for migration and
-        # audit.  Initialized production projects always take the branch
-        # below, where the filesystem file is only a validated projection.
-        try:
-            return validate_model_run_manifest(
-                manifest_path,
-                expected_model_run_id=model_run_id,
-            )
-        except (FileNotFoundError, NepArtifactError) as exc:
-            raise RuntimeError(f"Invalid model-run manifest for {model_run_id}") from exc
-    try:
-        with StateStore(state_path) as state_store:
-            model_run = state_store.get_model_run(model_run_id)
-            if model_run is None:
-                raise RuntimeError(f"Unknown authoritative model run: {model_run_id}")
-            manifest = validate_model_run_manifest(
-                manifest_path,
-                expected_model_run_id=model_run_id,
-                state_store=state_store,
-            )
-            linked_model_artifacts = [
-                artifact
-                for artifact in state_store.list_model_artifacts(model_run_id)
-                if artifact.get("role") == "model"
-            ]
-            if len(linked_model_artifacts) != 1:
-                raise NepArtifactError(
-                    f"StateStore has no unique model artifact for {model_run_id}"
-                )
-            linked = linked_model_artifacts[0]
-            if linked.get("sha256") != manifest.get("potential_artifact_sha256"):
-                raise NepArtifactError(
-                    "Filesystem model artifact hash is not the persisted StateStore artifact"
-                )
-    except (FileNotFoundError, NepArtifactError, RuntimeError) as exc:
-        if isinstance(exc, RuntimeError) and str(exc).startswith("Unknown authoritative"):
-            raise
-        raise RuntimeError(f"Invalid model-run manifest for {model_run_id}") from exc
-    artifact_path = Path(str(manifest["potential_artifact_path"])).resolve()
-    canonical_dir = (project_dir / "nep" / "potentials").resolve()
-    if artifact_path.parent.parent != canonical_dir:
-        raise RuntimeError(
-            f"Model artifact is outside canonical NEP storage: {artifact_path}"
-        )
-    return manifest
-
-
-def find_model_run_and_dataset(project_dir: Path, model_run_id: str) -> Tuple[Path, Path]:
-    """Resolve one completed model run through authoritative identities."""
-    resolved = resolve_model_dataset(project_dir, model_run_id)
-    potential_path = resolved.model_path.parent
-    dataset_path = resolved.dataset_path
-    logger.info(
-        "Resolved model_run_id=%s to potential=%s and dataset_id=%s",
-        model_run_id,
-        potential_path,
-        resolved.dataset_id,
-    )
-    return potential_path, dataset_path
-
-
-def find_latest_potential_and_dataset(
-    project_dir: Path,
-    model_run_id: str | None = None,
-) -> Tuple[Path, Path]:
-    """Compatibility wrapper requiring an explicit model-run identity.
-
-    The historical name is retained for callers during the Phase 2 migration;
-    it never performs latest-directory discovery.
-    """
-    if not model_run_id:
-        raise ValueError("model_run_id is required; latest model discovery is disabled")
-    return find_model_run_and_dataset(project_dir, model_run_id)
 
 
 def finalize_nep_potential(
@@ -123,10 +48,10 @@ def finalize_nep_potential(
     
     if not model_run_id:
         raise ValueError("model_run_id is required to finalize a potential")
-    manifest = _validated_model_run(project_dir, model_run_id)
-    source_artifact = Path(str(manifest["potential_artifact_path"])).resolve()
+    resolved = resolve_model_dataset(project_dir, model_run_id)
+    source_artifact = resolved.model_path.resolve()
     potential_src = source_artifact.parent
-    dataset_path = Path(str(manifest["dataset_path"])).resolve()
+    dataset_path = resolved.dataset_path.resolve()
     
     # Extract folder names
     potential_name = potential_src.name  # potential_XXXX
@@ -145,7 +70,7 @@ def finalize_nep_potential(
         src_nep,
         required=True,
         error_type=NepArtifactError,
-    ) != manifest["potential_artifact_sha256"]:
+    ) != resolved.model_artifact.sha256:
         raise NepArtifactError(
             f"Manifest-bound artifact changed after validation: {src_nep}"
         )
@@ -158,7 +83,7 @@ def finalize_nep_potential(
             dst_nep,
             required=True,
             error_type=NepArtifactError,
-        ) != manifest["potential_artifact_sha256"]:
+        ) != resolved.model_artifact.sha256:
             raise NepArtifactError(
                 f"Existing finalized artifact does not match manifest: {dst_nep}"
             )
@@ -169,41 +94,6 @@ def finalize_nep_potential(
     logger.info(f"NEP potential finalized at: {gpumd_potential_dir}")
     
     return gpumd_potential_dir, dataset_name
-
-
-def parse_cutoff_from_nep(nep_path: Path) -> float:
-    """Extract potential cutoff radius from nep.txt file.
-    
-    The cutoff is on line 3 (index 2), space-separated format:
-    cutoff 6 5 112 60
-    
-    Args:
-        nep_path: Path to nep.txt file
-        
-    Returns:
-        Cutoff radius in Angstroms
-        
-    Raises:
-        ValueError: If cutoff cannot be parsed
-    """
-    try:
-        lines = nep_path.read_text().strip().split("\n")
-        if len(lines) < 3:
-            raise ValueError("nep.txt too short")
-        
-        cutoff_line = lines[2]  # Line 3 (0-indexed)
-        
-        # Parse: "cutoff 6 5 112 60"
-        parts = cutoff_line.split()
-        if len(parts) < 2 or parts[0] != "cutoff":
-            raise ValueError(f"Unexpected cutoff line format: {cutoff_line}")
-        
-        cutoff = float(parts[1])
-        logger.debug(f"Parsed cutoff from nep.txt: {cutoff} Å")
-        return cutoff
-    except (OSError, IndexError, ValueError) as e:
-        logger.error(f"Failed to parse cutoff from {nep_path}: {e}")
-        raise ValueError(f"Could not parse cutoff from nep.txt: {e}") from e
 
 
 def parse_lattice_from_xyz(atoms: Atoms) -> np.ndarray:
@@ -217,51 +107,6 @@ def parse_lattice_from_xyz(atoms: Atoms) -> np.ndarray:
     """
     lattice = atoms.get_cell()
     return np.array(lattice)
-
-
-def _cell_perpendicular_heights_angstrom(cell: np.ndarray) -> np.ndarray:
-    """Return perpendicular lattice-plane heights for row-wise cell vectors.
-
-    For cell rows ``a``, ``b``, and ``c``, the heights are ``V / |b x c|``,
-    ``V / |c x a|``, and ``V / |a x b|``, respectively, where ``V`` is the
-    absolute cell volume.
-
-    Raises:
-        ValueError: If the cell is not a finite, non-degenerate 3x3 matrix.
-    """
-    try:
-        vectors = np.asarray(cell, dtype=float)
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise ValueError(f"Invalid cell: could not convert cell to floats: {exc}") from exc
-
-    if vectors.shape != (3, 3):
-        raise ValueError(
-            f"Invalid cell shape {vectors.shape}; expected a 3x3 cell matrix"
-        )
-    if not np.all(np.isfinite(vectors)):
-        raise ValueError("Invalid cell: all cell entries must be finite")
-
-    with np.errstate(over="ignore", invalid="ignore"):
-        volume = abs(float(np.linalg.det(vectors)))
-        face_areas = np.array(
-            [
-                np.linalg.norm(np.cross(vectors[1], vectors[2])),
-                np.linalg.norm(np.cross(vectors[2], vectors[0])),
-                np.linalg.norm(np.cross(vectors[0], vectors[1])),
-            ],
-            dtype=float,
-        )
-
-    if not np.isfinite(volume) or volume <= 0.0:
-        raise ValueError(f"Invalid cell volume: {volume!r}")
-    if not np.all(np.isfinite(face_areas)) or np.any(face_areas <= 0.0):
-        raise ValueError(f"Invalid cell opposite-face area: {face_areas!r}")
-
-    with np.errstate(over="ignore", divide="ignore", invalid="ignore"):
-        heights = volume / face_areas
-    if not np.all(np.isfinite(heights)) or np.any(heights <= 0.0):
-        raise ValueError(f"Invalid cell height: {heights!r}")
-    return heights
 
 
 def calculate_required_replicates(
@@ -281,7 +126,7 @@ def calculate_required_replicates(
     Raises:
         ValueError: If parsing fails or constraint cannot be satisfied
     """
-    cutoff = parse_cutoff_from_nep(nep_path)
+    cutoff = parse_nep_cutoff_angstrom(nep_path)
     if not np.isfinite(cutoff) or cutoff <= 0.0:
         raise ValueError(
             f"Invalid cutoff {cutoff!r}: cutoff must be finite and strictly positive"
@@ -299,7 +144,7 @@ def calculate_required_replicates(
         logger.error(f"Failed to read model.xyz: {e}")
         raise ValueError(f"Could not read model.xyz: {e}") from e
     
-    thicknesses = _cell_perpendicular_heights_angstrom(atoms.get_cell())
+    thicknesses = cell_perpendicular_heights_angstrom(atoms.get_cell())
     
     logger.debug(f"Cutoff: {cutoff} Å, min required thickness: {min_required_thickness} Å")
     logger.debug(f"Model thicknesses: {thicknesses}")
@@ -389,32 +234,6 @@ def parse_test_xyz(test_xyz_path: Path) -> List[Dict]:
         raise ValueError(f"Could not parse test.xyz: {e}") from e
 
 
-def create_model_xyz_from_structure(atoms: Atoms) -> str:
-    """Create model.xyz content from ASE Atoms object (without energy/forces).
-    
-    Args:
-        atoms: ASE Atoms object
-        
-    Returns:
-        XYZ file content as string
-    """
-    from ase.io import write
-    from io import StringIO
-    
-    # GPUMD consumes extended XYZ so the reference cell and PBC survive into
-    # its model evaluation.  Build a label-free copy: DFT energy/force/virial
-    # fields must never be copied into the model input as predictions.
-    model_atoms = Atoms(
-        symbols=atoms.get_chemical_symbols(),
-        positions=np.asarray(atoms.positions, dtype=float),
-        cell=np.asarray(atoms.cell, dtype=float),
-        pbc=np.asarray(atoms.pbc, dtype=bool),
-    )
-    output = StringIO()
-    write(output, model_atoms, format="extxyz", write_info=False, write_results=False)
-    return output.getvalue()
-
-
 def prepare_validation_structures(
     dataset_path: Path,
     gpumd_potential_dir: Path,
@@ -453,7 +272,7 @@ def prepare_validation_structures(
     
     # Get cutoff and base replicate values for later
     nep_path = gpumd_potential_dir / "nep.txt"
-    cutoff = parse_cutoff_from_nep(nep_path)
+    cutoff = parse_nep_cutoff_angstrom(nep_path)
     
     # Read template run.in_validate
     template_run_in = config_gpumd_dir / "run.in_validate"
@@ -472,29 +291,31 @@ def prepare_validation_structures(
         # Extract atoms
         atoms = struct_data["atoms"]
         
-        # Create model.xyz
         model_xyz_path = struct_dir / "model.xyz"
-        model_xyz_content = create_model_xyz_from_structure(atoms)
-        model_xyz_path.write_text(model_xyz_content, encoding="utf-8", newline="\n")
-        logger.debug(f"  Created model.xyz ({len(atoms)} atoms)")
-        
         # Calculate required replicates. Geometry failures must stop
         # preparation rather than producing an unsafe default protocol.
-        nx, ny, nz = calculate_required_replicates(model_xyz_path, nep_path)
-        
-        # Generate the authoritative static NEP protocol through the GPUMD
-        # backend.  Arbitrary template commands cannot alter the physical
-        # configuration or select a different model artifact.
-        run_in_content = GpumdBackend.render_input(replicates=(nx, ny, nz))
-        
-        run_in_path = struct_dir / "run.in"
-        run_in_path.write_text(run_in_content)
-        logger.debug(f"  Created run.in (replicate {nx} {ny} {nz})")
-        
-        # Copy nep.txt
-        dst_nep = struct_dir / "nep.txt"
-        shutil.copy2(nep_path, dst_nep)
-        logger.debug(f"  Copied nep.txt")
+        nx, ny, nz = calculate_cell_replicates_for_cutoff(
+            atoms.get_cell(),
+            cutoff,
+        )
+        artifact = ArtifactIdentity.from_file("nep_model", nep_path)
+        model = ModelRunRecord(
+            ModelRunIdentity("legacy-validation", artifact.sha256, "legacy-validation"),
+            ModelArtifactMetadata(model=artifact, status="completed"),
+        )
+        request = StaticPredictionRequest(
+            structure=StructureIdentity(f"legacy-validation-{struct_idx}"),
+            model=model,
+            input_path=model_xyz_path,
+            working_directory=struct_dir,
+            atom_count=len(atoms),
+            species=tuple(atoms.get_chemical_symbols()),
+            positions_angstrom=np.asarray(atoms.positions, dtype=float),
+            cell_angstrom=np.asarray(atoms.cell, dtype=float),
+            pbc=tuple(bool(value) for value in atoms.pbc),
+        )
+        GpumdBackend().prepare_inputs(request, replicates=(nx, ny, nz))
+        logger.debug(f"  Materialized model.xyz, nep.txt, and run.in")
         
         struct_folders.append({
             "name": struct_name,

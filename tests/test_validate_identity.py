@@ -20,11 +20,12 @@ from nepflow.mlip.nep.artifacts import (  # noqa: E402
 from modules.validate import validate as validate_stage_module  # noqa: E402
 from modules.validate.prepare import (  # noqa: E402
     finalize_nep_potential,
-    find_latest_potential_and_dataset,
 )
 from modules.validate.validate import ValidateStage  # noqa: E402
 from nepflow.domain.datasets import DatasetIdentity  # noqa: E402
 from nepflow.state.store import StateStore  # noqa: E402
+from nepflow.stages.validation.resolution import resolve_model_dataset  # noqa: E402
+from nepflow.errors import StateError  # noqa: E402
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -123,13 +124,13 @@ def model_run_id_for(model_path: Path) -> str:
         "latest_model_directory_points_to_older_dataset",
     ],
 )
-def test_validation_discovery_rejects_ambiguous_latest_pair(layout_name: str) -> None:
+def test_validation_requires_an_explicit_model_identity(layout_name: str) -> None:
     layout = load_layout(layout_name)
 
     with tempfile.TemporaryDirectory() as tmp:
         project_dir, _, _ = materialize_layout(Path(tmp), layout)
-        with pytest.raises((FileNotFoundError, ValueError, RuntimeError)):
-            find_latest_potential_and_dataset(project_dir)
+        with pytest.raises(StateError, match="explicit model_run_id"):
+            resolve_model_dataset(project_dir, "")
 
 
 def test_storage_path_is_not_the_scientific_model_identity() -> None:
@@ -141,10 +142,9 @@ def test_storage_path_is_not_the_scientific_model_identity() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         project_dir, _, _ = materialize_layout(Path(tmp), layout)
         model_path = project_dir / "nep" / "potentials" / "arbitrary_model_storage"
-        potential, dataset = find_latest_potential_and_dataset(
-            project_dir,
-            model_run_id_for(model_path),
-        )
+        resolved = resolve_model_dataset(project_dir, model_run_id_for(model_path))
+        potential = resolved.model_path.parent
+        dataset = resolved.dataset_path
 
     assert potential.name == "arbitrary_model_storage"
     assert dataset.name == "data_a"
@@ -157,8 +157,8 @@ def test_manifest_artifact_hash_mismatch_is_rejected() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         project_dir, models, _ = materialize_layout(Path(tmp), single_pair)
         (models["model_old"] / "nep.txt").write_text("tampered\n", encoding="utf-8")
-        with pytest.raises(RuntimeError):
-            find_latest_potential_and_dataset(
+        with pytest.raises(StateError):
+            resolve_model_dataset(
                 project_dir,
                 model_run_id_for(models["model_old"]),
             )
@@ -228,8 +228,8 @@ def test_tampered_model_run_id_is_rejected() -> None:
         manifest = read_model_run_manifest(manifest_path)
         manifest["model_run_id"] = "model_run_tampered"
         write_model_run_manifest(manifest_path, manifest)
-        with pytest.raises(RuntimeError):
-            find_latest_potential_and_dataset(project_dir, "model_run_tampered")
+        with pytest.raises(StateError):
+            resolve_model_dataset(project_dir, "model_run_tampered")
 
 
 def test_multiple_alternate_model_artifacts_are_rejected() -> None:
@@ -271,14 +271,27 @@ def test_finalization_uses_manifest_artifact_after_later_nep_file_appears() -> N
         )
         (potential_path / "nep.in").write_text("type 1 Si\n", encoding="utf-8")
         (potential_path / "nep_model.txt").write_text("manifest-bound\n", encoding="utf-8")
-        create_model_run_manifest(
-            potential_path=potential_path,
-            dataset_path=dataset_path,
-            dataset_id="dataset_a",
-            nep_in_path=potential_path / "nep.in",
-            hyperparameters_hash="hyperparameters_a",
-        )
-        manifest = update_model_run_status(potential_path, "completed")
+        with StateStore(root / "state.db") as state_store:
+            state_store.upsert_dataset(
+                DatasetIdentity(
+                    "dataset_a",
+                    {"schema_version": "nepflow.dataset.v1", "records": []},
+                )
+            )
+            manifest = create_model_run_manifest(
+                potential_path=potential_path,
+                dataset_path=dataset_path,
+                dataset_id="dataset_a",
+                nep_in_path=potential_path / "nep.in",
+                hyperparameters_hash="hyperparameters_a",
+                state_store=state_store,
+            )
+            update_model_run_status(
+                potential_path,
+                "completed",
+                state_store=state_store,
+                model_run_id=manifest["model_run_id"],
+            )
         (potential_path / "nep.txt").write_text("later-unrelated\n", encoding="utf-8")
 
         finalized_path, _ = finalize_nep_potential(root, manifest["model_run_id"])

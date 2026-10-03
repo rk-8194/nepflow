@@ -24,6 +24,22 @@ from nepflow.errors import ValidationError
 
 VALIDATION_CASE_SCHEMA = "nepflow.validation_case.v1"
 VALIDATION_PREPARATION_SCHEMA = "nepflow.validation_preparation.v1"
+AtomMapping = tuple[tuple[int, int, int, int], ...]
+
+
+def _replication_mapping(
+    atom_count: int,
+    replicates: tuple[int, int, int],
+) -> AtomMapping:
+    """Return the deterministic reference-atom/replica provenance mapping."""
+
+    return tuple(
+        (reference_index, tx, ty, tz)
+        for tx in range(replicates[0])
+        for ty in range(replicates[1])
+        for tz in range(replicates[2])
+        for reference_index in range(atom_count)
+    )
 
 
 def _immutable_array(value: Any, shape: tuple[int, ...], label: str) -> np.ndarray:
@@ -175,6 +191,7 @@ class ValidationCaseSpec:
     replicates: tuple[int, int, int] = (1, 1, 1)
     virial_requested: bool = False
     schema_version: str = VALIDATION_CASE_SCHEMA
+    atom_mapping: AtomMapping = ()
 
     def __post_init__(self) -> None:
         for name in ("case_id", "model_run_id", "dataset_id"):
@@ -188,6 +205,43 @@ class ValidationCaseSpec:
         if len(replicates) != 3 or any(value < 1 for value in replicates):
             raise ValidationError("validation case replicates must be three positive integers")
         object.__setattr__(self, "replicates", replicates)
+        mapping = tuple(
+            tuple(int(component) for component in item)
+            for item in self.atom_mapping
+        )
+        expected_count = self.reference.atom_count * int(np.prod(replicates))
+        if not mapping:
+            mapping = _replication_mapping(self.reference.atom_count, replicates)
+        if len(mapping) != expected_count or any(len(item) != 4 for item in mapping):
+            raise ValidationError(
+                "validation case atom_mapping must contain exactly reference_atoms * replication_product entries"
+            )
+        counts = [0] * self.reference.atom_count
+        seen: set[tuple[int, int, int, int]] = set()
+        for reference_index, tx, ty, tz in mapping:
+            if not 0 <= reference_index < self.reference.atom_count:
+                raise ValidationError("validation case atom_mapping contains an invalid reference index")
+            if not (
+                0 <= tx < replicates[0]
+                and 0 <= ty < replicates[1]
+                and 0 <= tz < replicates[2]
+            ):
+                raise ValidationError("validation case atom_mapping contains an invalid replica")
+            key = (reference_index, tx, ty, tz)
+            if key in seen:
+                raise ValidationError("validation case atom_mapping contains a duplicate replica")
+            seen.add(key)
+            counts[reference_index] += 1
+        expected_per_atom = int(np.prod(replicates))
+        if counts != [expected_per_atom] * self.reference.atom_count:
+            raise ValidationError(
+                "validation case atom_mapping must include every reference atom once per replica"
+            )
+        if seen != set(_replication_mapping(self.reference.atom_count, replicates)):
+            raise ValidationError(
+                "validation case atom_mapping does not cover the declared replication factors"
+            )
+        object.__setattr__(self, "atom_mapping", mapping)
         object.__setattr__(self, "input_path", Path(self.input_path))
         object.__setattr__(self, "working_directory", Path(self.working_directory))
         object.__setattr__(self, "output_path", Path(self.output_path))
@@ -212,6 +266,7 @@ class ValidationCaseSpec:
             "model_run_id": str(model_run_id),
             "dataset_id": str(dataset_id),
             "structure_id": reference.structure_id,
+            "replicates": [int(value) for value in replicates],
         }
         case_id = "validation_case_" + sha256_canonical_json(payload)
         return cls(
@@ -243,6 +298,32 @@ class ValidationCaseSpec:
     def pbc(self) -> tuple[bool, bool, bool]:
         return self.reference.pbc
 
+    @property
+    def replication_mapping(self) -> AtomMapping:
+        """Compatibility spelling for explicit replica provenance."""
+
+        return self.atom_mapping
+
+    @property
+    def expected_species(self) -> tuple[str, ...]:
+        return tuple(self.reference.species[item[0]] for item in self.atom_mapping)
+
+    @property
+    def expected_positions_angstrom(self) -> np.ndarray:
+        positions = np.asarray(self.reference.positions_angstrom, dtype=float)
+        cell = np.asarray(self.reference.cell_angstrom, dtype=float)
+        return np.asarray(
+            [positions[index] + tx * cell[0] + ty * cell[1] + tz * cell[2]
+             for index, tx, ty, tz in self.atom_mapping],
+            dtype=float,
+        )
+
+    @property
+    def expected_cell_angstrom(self) -> np.ndarray:
+        return np.asarray(self.reference.cell_angstrom, dtype=float) * np.asarray(
+            self.replicates, dtype=float
+        )[:, None]
+
     def static_prediction_request(self, model: ModelRunRecord) -> StaticPredictionRequest:
         """Create the existing MLIP static-prediction request for this case."""
 
@@ -265,6 +346,11 @@ class ValidationCaseSpec:
             positions_angstrom=self.reference.positions_angstrom,
             cell_angstrom=self.reference.cell_angstrom,
             pbc=self.reference.pbc,
+            expected_species=self.expected_species,
+            expected_positions_angstrom=self.expected_positions_angstrom,
+            expected_cell_angstrom=self.expected_cell_angstrom,
+            expected_pbc=self.reference.pbc,
+            atom_mapping=tuple(item[0] for item in self.atom_mapping),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -281,12 +367,33 @@ class ValidationCaseSpec:
             "replicates": list(self.replicates),
             "virial_requested": self.virial_requested,
             "reference": self.reference.to_dict(),
+            "atom_mapping": [
+                {
+                    "reference_index": reference_index,
+                    "replica": [tx, ty, tz],
+                }
+                for reference_index, tx, ty, tz in self.atom_mapping
+            ],
         }
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> "ValidationCaseSpec":
         try:
             reference = ValidationReference.from_mapping(value["reference"])
+            if "atom_mapping" not in value:
+                raise ValidationError("persisted validation case is missing 'atom_mapping'")
+            raw_mapping = value["atom_mapping"]
+            if not isinstance(raw_mapping, (list, tuple)):
+                raise ValidationError("persisted validation case atom_mapping must be a list")
+            mapping = tuple(
+                (
+                    int(item["reference_index"]),
+                    int(item["replica"][0]),
+                    int(item["replica"][1]),
+                    int(item["replica"][2]),
+                )
+                for item in raw_mapping
+            )
             return cls(
                 case_id=str(value["case_id"]),
                 ordinal=int(value["ordinal"]),
@@ -299,8 +406,9 @@ class ValidationCaseSpec:
                 replicates=tuple(int(item) for item in value.get("replicates", (1, 1, 1))),
                 virial_requested=bool(value.get("virial_requested", False)),
                 schema_version=str(value.get("schema_version", VALIDATION_CASE_SCHEMA)),
+                atom_mapping=mapping,
             )
-        except KeyError as exc:
+        except (KeyError, TypeError, ValueError, IndexError) as exc:
             raise ValidationError(f"persisted validation case is missing {exc.args[0]!r}") from exc
 
 
@@ -373,4 +481,5 @@ __all__ = [
     "ValidationCase",
     "ValidationPreparation",
     "ValidationReference",
+    "AtomMapping",
 ]

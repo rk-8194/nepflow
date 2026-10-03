@@ -16,6 +16,10 @@ from modules.validate import prepare as prepare_module  # noqa: E402
 from modules.validate import validate as validate_stage_module  # noqa: E402
 from modules.validate.validate import ValidateStage  # noqa: E402
 from ase.io import read as ase_read, write as ase_write  # noqa: E402
+from nepflow.domain.identities import ArtifactIdentity, ModelRunIdentity, StructureIdentity  # noqa: E402
+from nepflow.domain.models import ModelArtifactMetadata, ModelRunRecord  # noqa: E402
+from nepflow.mlip.gpumd import GpumdBackend  # noqa: E402
+from nepflow.mlip.simulation import StaticPrediction, StaticPredictionRequest  # noqa: E402
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -33,6 +37,8 @@ def fixture_properties(path: Path) -> dict:
         "virial": np.asarray(atoms.info["virial"], dtype=float),
         "positions": np.asarray(atoms.positions, dtype=float),
         "species": list(atoms.get_chemical_symbols()),
+        "cell": np.asarray(atoms.cell, dtype=float),
+        "pbc": np.asarray(atoms.pbc, dtype=bool),
     }
 
 
@@ -45,6 +51,28 @@ def comparison_inputs() -> tuple[dict, dict]:
     dft_second["energy"] = -10.5
     ml_second["energy"] = -10.0
     return {0: dft, 1: dft_second}, [ml, ml_second]
+
+
+def backend_prediction_side_effect(predictions: list[dict]):
+    iterator = iter(predictions)
+
+    def parse(_request, _output_path):
+        prediction = next(iterator)
+        return StaticPrediction(
+            StructureIdentity("fixture-output"),
+            ModelRunIdentity("report", "nep-in", "hyperparameters"),
+            prediction["atoms_count"],
+            prediction["energy"],
+            prediction["forces"],
+            prediction["virial"],
+            True,
+            species=tuple(prediction["species"]),
+            positions_angstrom=prediction["positions"],
+            cell_angstrom=prediction["cell"],
+            pbc=tuple(prediction["pbc"]),
+        )
+
+    return parse
 
 
 def write_model_output(root: Path, frame_count: int = 2) -> Path:
@@ -70,12 +98,9 @@ def generate_report(root: Path) -> Path:
     with (
         patch.object(analyze_module, "parse_dft_properties", return_value=dft_data),
         patch.object(
-            analyze_module,
-            "parse_gpumd_output",
-            side_effect=[
-                (prediction["atoms_count"], prediction["positions"], prediction)
-                for prediction in ml_predictions
-            ],
+            GpumdBackend,
+            "parse_prediction",
+            side_effect=backend_prediction_side_effect(ml_predictions),
         ),
     ):
         analyze_module.generate_comparison_csv(
@@ -107,13 +132,26 @@ def test_dft_parser_consumes_fixture_energy_forces_and_virial() -> None:
 
 
 def test_model_parser_exposes_fixture_predictions() -> None:
-    atoms_count, _, predictions = analyze_module.parse_gpumd_output(ML_FIXTURE)
+    artifact = ArtifactIdentity.from_bytes("nep-model", b"fixture-model")
+    model = ModelRunRecord(
+        ModelRunIdentity("dataset", "nep-input", "hyperparameters"),
+        ModelArtifactMetadata(model=artifact, status="completed"),
+    )
+    request = StaticPredictionRequest(
+        StructureIdentity("fixture-structure"),
+        model,
+        ML_FIXTURE,
+        ML_FIXTURE.parent,
+        atom_count=2,
+        virial_requested=True,
+    )
+    prediction = GpumdBackend().parse_prediction(request, ML_FIXTURE)
     expected = fixture_properties(ML_FIXTURE)
 
-    assert atoms_count == expected["atoms_count"]
-    assert predictions["energy"] == -10.25
-    np.testing.assert_allclose(predictions["forces"], expected["forces"])
-    np.testing.assert_allclose(predictions["virial"], expected["virial"])
+    assert prediction.atom_count == expected["atoms_count"]
+    assert prediction.energy_ev == -10.25
+    np.testing.assert_allclose(prediction.forces_ev_per_angstrom, expected["forces"])
+    np.testing.assert_allclose(prediction.virial_ev, expected["virial"])
 
 
 def test_unmocked_extxyz_parser_to_csv_path_preserves_real_predictions() -> None:
@@ -295,12 +333,9 @@ def test_displaced_model_frame_cannot_be_paired_with_dft_reference() -> None:
         with (
             patch.object(analyze_module, "parse_dft_properties", return_value=dft_data),
             patch.object(
-                analyze_module,
-                "parse_gpumd_output",
-                side_effect=[
-                    (prediction["atoms_count"], prediction["positions"], prediction)
-                    for prediction in ml_predictions
-                ],
+                GpumdBackend,
+                "parse_prediction",
+                side_effect=backend_prediction_side_effect(ml_predictions),
             ),
         ):
             with pytest.raises(ValueError, match="positions|configuration"):
@@ -401,12 +436,9 @@ def test_missing_required_prediction_is_an_error(missing_key: str) -> None:
         with (
             patch.object(analyze_module, "parse_dft_properties", return_value=dft_data),
             patch.object(
-                analyze_module,
-                "parse_gpumd_output",
-                side_effect=[
-                    (prediction["atoms_count"], prediction["positions"], prediction)
-                    for prediction in ml_predictions
-                ],
+                GpumdBackend,
+                "parse_prediction",
+                side_effect=backend_prediction_side_effect(ml_predictions),
             ),
         ):
             with pytest.raises((ValueError, RuntimeError)):

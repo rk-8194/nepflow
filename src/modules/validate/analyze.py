@@ -9,8 +9,10 @@ import numpy as np
 from ase.atoms import Atoms
 from ase.io import read as ase_read
 
-from nepflow.domain.models import ModelRunRecord
+from nepflow.domain.identities import ArtifactIdentity, ModelRunIdentity, StructureIdentity
+from nepflow.domain.models import ModelArtifactMetadata, ModelRunRecord
 from nepflow.mlip.gpumd import GpumdBackend
+from nepflow.mlip.simulation import StaticPredictionRequest
 from nepflow.stages.validation.protocols import ValidationCaseSpec
 
 logger = logging.getLogger("nepflow.validate")
@@ -100,21 +102,6 @@ def _extract_virial(atoms: Atoms, label: str, required: bool) -> Optional[np.nda
     return None
 
 
-def _read_last_frame(path: Path, label: str) -> Atoms:
-    """Read the final extended-XYZ frame from one validation artifact."""
-    if not path.exists():
-        raise FileNotFoundError(f"{label} not found: {path}")
-    try:
-        frames = ase_read(str(path), index=":", format="extxyz")
-    except Exception as exc:
-        raise ValueError(f"Could not parse {label}: {exc}") from exc
-    if isinstance(frames, Atoms):
-        return frames
-    if not frames:
-        raise ValueError(f"{label} contains no XYZ frames: {path}")
-    return frames[-1]
-
-
 def _composition(atoms: Atoms) -> str:
     counts: Dict[str, int] = {}
     for symbol in atoms.get_chemical_symbols():
@@ -161,53 +148,27 @@ def parse_dft_properties(test_xyz_path: Path) -> Dict[int, Dict]:
     return dft_data
 
 
-def parse_gpumd_output(
-    out_xyz_path: Path,
-    require_virial: bool = True,
-    *,
-    request=None,
-) -> Tuple[int, np.ndarray, Dict[str, object]]:
-    """Parse genuine model predictions from GPUMD's ``dump_xyz`` output.
-
-    GPUMD writes total energy and total virial/stress in the extended-XYZ
-    frame metadata and per-atom forces in the ``force:R:3`` array.  The final
-    frame is used because the launcher may append on resumed runs.  Missing
-    energy or forces always fails; virial is required when the validation
-    contract requests it.
-    """
-    if request is not None:
-        prediction = GpumdBackend().parse_prediction(request, out_xyz_path)
-        return (
-            prediction.atom_count,
-            np.asarray(prediction.positions_angstrom, dtype=float),
-            {
-                "energy": prediction.energy_ev,
-                "forces": prediction.forces_ev_per_angstrom,
-                "virial": prediction.virial_ev,
-                "species": list(prediction.species or ()),
-                "cell": np.asarray(prediction.cell_angstrom, dtype=float),
-                "pbc": np.asarray(prediction.pbc, dtype=bool),
-            },
-        )
-
-    atoms = _read_last_frame(out_xyz_path, "GPUMD out.xyz")
-    predictions: Dict[str, object] = {
-        "energy": _extract_energy(atoms, "GPUMD output"),
-        "forces": _extract_forces(atoms, "GPUMD output"),
-        "virial": _extract_virial(atoms, "GPUMD output", required=require_virial),
-        "species": list(atoms.get_chemical_symbols()),
-        "cell": np.asarray(atoms.cell, dtype=float),
-        "pbc": np.asarray(atoms.pbc, dtype=bool),
-    }
-    return len(atoms), np.asarray(atoms.positions, dtype=float), predictions
-
-
 def _metrics(errors: np.ndarray) -> Tuple[float, float]:
     """Return MAE and RMSE for a non-empty finite error array."""
     values = np.asarray(errors, dtype=float)
     if values.size == 0 or not np.isfinite(values).all():
         raise ValueError("Cannot calculate metrics from empty or non-finite errors")
     return float(np.mean(np.abs(values))), float(np.sqrt(np.mean(values**2)))
+
+
+def _report_model(struct_idx: int) -> ModelRunRecord:
+    """Provide identity metadata for the pre-typed report compatibility path."""
+
+    artifact = ArtifactIdentity.from_bytes("report-input", b"legacy-validation-report")
+    identity = ModelRunIdentity(
+        "legacy-validation-report",
+        artifact.sha256,
+        f"structure-{struct_idx}",
+    )
+    return ModelRunRecord(
+        identity=identity,
+        artifact=ModelArtifactMetadata(model=artifact, status="completed"),
+    )
 
 
 def _read_replication_factors(struct_dir: Path) -> Tuple[int, int, int]:
@@ -426,20 +387,37 @@ def generate_comparison_csv(
             else validation_root / f"struct_{struct_idx:04d}"
         )
         out_xyz_path = struct_dir / "out.xyz"
-        request = (
-            case.static_prediction_request(model)
-            if case is not None and model is not None
-            else None
-        )
-        ml_count, ml_positions, ml = parse_gpumd_output(
-            out_xyz_path,
-            require_virial=virial_required,
-            request=request,
-        )
-        factors = _read_replication_factors(struct_dir)
-        reference_indices = _pair_model_configuration(
-            dft, ml_positions, ml, factors
-        )
+        factors = case.replicates if case is not None else _read_replication_factors(struct_dir)
+        if case is not None:
+            if model is None:
+                raise ValueError("Canonical validation analysis requires the resolved model record")
+            request = case.static_prediction_request(model)
+        else:
+            request = StaticPredictionRequest(
+                structure=StructureIdentity(f"validation-report-{struct_idx}"),
+                model=_report_model(struct_idx),
+                input_path=struct_dir / "model.xyz",
+                working_directory=struct_dir,
+                atom_count=int(dft["atoms_count"]) * int(np.prod(factors)),
+                virial_requested=virial_required,
+            )
+        prediction = GpumdBackend().parse_prediction(request, out_xyz_path)
+        ml_count = prediction.atom_count
+        ml_positions = np.asarray(prediction.positions_angstrom, dtype=float)
+        ml = {
+            "energy": prediction.energy_ev,
+            "forces": prediction.forces_ev_per_angstrom,
+            "virial": prediction.virial_ev,
+            "species": list(prediction.species or ()),
+            "cell": np.asarray(prediction.cell_angstrom, dtype=float),
+            "pbc": np.asarray(prediction.pbc, dtype=bool),
+        }
+        if case is not None:
+            if prediction.atom_mapping is None:
+                raise ValueError("Canonical GPUMD prediction is missing atom provenance mapping")
+            reference_indices = np.asarray(prediction.atom_mapping, dtype=int)
+        else:
+            reference_indices = _pair_model_configuration(dft, ml_positions, ml, factors)
         repeat_count = int(np.prod(factors))
 
         ml_forces = _finite_force_array(

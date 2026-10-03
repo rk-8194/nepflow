@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import math
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +21,22 @@ MODEL_RUN_IDENTITY_SCHEMA = "nepflow.model_run_identity.v1"
 
 class NepArtifactError(ArtifactError):
     """Raised when a NEP model-run manifest or artifact is inconsistent."""
+
+
+def parse_nep_cutoff_angstrom(nep_path: Path) -> float:
+    """Read the positive cutoff from an authoritative NEP artifact."""
+
+    for line in Path(nep_path).read_text(encoding="utf-8").splitlines():
+        values = line.split("#", 1)[0].split()
+        if values and values[0].lower() == "cutoff" and len(values) >= 2:
+            try:
+                cutoff = float(values[1])
+            except ValueError as exc:
+                raise NepArtifactError(f"Invalid NEP cutoff in {nep_path}") from exc
+            if math.isfinite(cutoff) and cutoff > 0:
+                return cutoff
+            break
+    raise NepArtifactError(f"Could not find a positive NEP cutoff in {nep_path}")
 
 
 def _now() -> str:
@@ -416,6 +433,7 @@ __all__ = [
     "MODEL_RUN_MANIFEST_FILENAME",
     "MODEL_RUN_MANIFEST_SCHEMA",
     "NepArtifactError",
+    "parse_nep_cutoff_angstrom",
     "compute_model_run_id",
     "create_model_run_manifest",
     "find_model_run_manifest",
