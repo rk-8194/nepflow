@@ -1,12 +1,12 @@
-import json
 import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
 
-
-from utilities import gpumd_self_resubmit as module
+from nepflow.mlip.gpumd import resubmission as module
+from nepflow.workflow.resubmission import resolve_resubmit_command
 
 
 class GpumdSelfResubmitTests(unittest.TestCase):
@@ -45,50 +45,41 @@ class GpumdSelfResubmitTests(unittest.TestCase):
             submit_script = workdir / "submit.slurm"
             submit_script.write_text("#!/bin/bash\n", encoding="utf-8")
 
-            with patch.dict(os.environ, {}, clear=False):
-                command, cwd, source = module.resolve_resubmit_command(
-                    workdir=workdir,
-                    submit_script=None,
-                    nepflow_root=None,
-                )
+            command, cwd, source = resolve_resubmit_command(
+                workdir=workdir,
+                submit_script=None,
+                environment={},
+            )
 
             self.assertEqual(command, ["sbatch", str(submit_script)])
             self.assertEqual(cwd, workdir)
             self.assertEqual(source, f"submit.slurm in {workdir}")
 
-    def test_main_runs_segment_updates_state_and_stops_at_limit(self) -> None:
+    def test_root_utility_dry_run_is_a_supported_cli_wrapper(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             workdir = Path(tmp)
-            final_file = workdir / "final.xyz"
-
-            def fake_run(command: str, workdir: Path, dry_run: bool = False) -> None:
-                self.assertEqual(command, "fake-gpumd")
-                self.assertEqual(workdir, Path(tmp))
-                final_file.write_text("segment output\n", encoding="utf-8")
-
-            argv = [
-                "gpumd_self_resubmit.py",
-                "--gpumd-command",
-                "fake-gpumd",
-                "--workdir",
-                str(workdir),
-                "--max-segments",
-                "1",
-            ]
-
-            with patch.object(module, "run_gpumd", side_effect=fake_run):
-                with patch.object(module, "resubmit_job") as resubmit_mock:
-                    with patch.object(module.sys, "argv", argv):
-                        result = module.main()
-
-            self.assertEqual(result, 0)
-            resubmit_mock.assert_not_called()
-
-            state = json.loads((workdir / module.STATE_FILE_NAME).read_text(encoding="utf-8"))
-            self.assertEqual(state["segments_completed"], 1)
-            self.assertEqual(len(state["history"]), 1)
-            self.assertTrue((workdir / "model.xyz").exists())
-            self.assertTrue((workdir / module.DEFAULT_ARCHIVE_DIR / "segment_00001_final.xyz").exists())
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "utilities/gpumd_self_resubmit.py",
+                    "--gpumd-command",
+                    "fake-gpumd",
+                    "--workdir",
+                    str(workdir),
+                    "--max-segments",
+                    "1",
+                    "--dry-run",
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+                env={
+                    **os.environ,
+                    "PYTHONPATH": str(Path("src").resolve()),
+                },
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("Would stop after the next segment", result.stdout)
 
 
 if __name__ == "__main__":

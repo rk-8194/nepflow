@@ -1,6 +1,6 @@
 import unittest
 
-from utilities import plot_composition_coverage as module
+from nepflow.stages.selection import sampling as module
 
 
 class CompositionCoverageTests(unittest.TestCase):
@@ -21,7 +21,7 @@ class CompositionCoverageTests(unittest.TestCase):
             self.composition(2, {"W": 1.0}),
         ]
 
-        projections = module._collect_binary_projections(compositions)
+        projections = module.collect_binary_projections(compositions)
         w_y = projections[("W", "Y")]
         fractions = sorted(point.normalized_fraction_b for point in w_y)
 
@@ -35,7 +35,7 @@ class CompositionCoverageTests(unittest.TestCase):
             self.composition(1, {"Cr": 0.20, "W": 0.40, "Y": 0.20, "Zr": 0.20}),
         ]
 
-        projections = module._collect_ternary_projections(compositions)
+        projections = module.collect_ternary_projections(compositions)
 
         self.assertIn(("Cr", "W", "Y"), projections)
         self.assertIn(("Cr", "W", "Zr"), projections)
@@ -59,8 +59,8 @@ class CompositionCoverageTests(unittest.TestCase):
             for idx, value in enumerate([0.49, 0.50, 0.50, 0.51, 0.50])
         ]
 
-        uniform_summary, _ = module._summarize_binary_subset(("W", "Y"), uniform, bins=5)
-        clustered_summary, _ = module._summarize_binary_subset(("W", "Y"), clustered, bins=5)
+        uniform_summary, _ = module.summarize_binary_subset(("W", "Y"), uniform, bins=5)
+        clustered_summary, _ = module.summarize_binary_subset(("W", "Y"), clustered, bins=5)
 
         self.assertGreater(uniform_summary.occupied_bin_fraction, clustered_summary.occupied_bin_fraction)
         self.assertGreater(uniform_summary.normalized_entropy, clustered_summary.normalized_entropy)
@@ -74,7 +74,7 @@ class CompositionCoverageTests(unittest.TestCase):
             module.BinaryProjection(("W", "Y"), 2, 0.75),
         ]
 
-        summary, counts = module._summarize_binary_subset(("W", "Y"), projections, bins=4)
+        summary, counts = module.summarize_binary_subset(("W", "Y"), projections, bins=4)
 
         self.assertEqual(summary.structure_count, 3)
         self.assertEqual(max(counts), 2)
@@ -87,7 +87,7 @@ class CompositionCoverageTests(unittest.TestCase):
             module.TernaryProjection(("Cr", "W", "Y"), 2, (0.50, 0.25, 0.25)),
         ]
 
-        summary, counts = module._summarize_ternary_subset(("Cr", "W", "Y"), projections, resolution=8)
+        summary, counts = module.summarize_ternary_subset(("Cr", "W", "Y"), projections, resolution=8)
 
         self.assertEqual(summary.structure_count, 3)
         self.assertGreaterEqual(summary.occupied_bins, 2)

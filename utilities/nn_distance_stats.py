@@ -24,7 +24,6 @@ Arguments:
 from __future__ import annotations
 
 import argparse
-import hashlib
 import logging
 import sys
 import time
@@ -34,7 +33,9 @@ import numpy as np
 from ase.io import read as ase_read
 from NepTrainKit.core.calculator import NepCalculator
 from NepTrainKit.core.structure import Structure
-from scipy.spatial.distance import cdist
+
+from nepflow.stages.selection.representations import compute_descriptors_batched
+from nepflow.stages.selection.sampling import nearest_representation_distances
 
 logging.basicConfig(
     level=logging.INFO,
@@ -42,25 +43,6 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 logger = logging.getLogger("nn_distance_stats")
-
-
-def _compute_structure_descriptors(
-    calc: NepCalculator,
-    structures: list,
-    *,
-    mean_descriptor: bool,
-) -> np.ndarray:
-    if hasattr(calc, "descriptors"):
-        return calc.descriptors(structures, mean=mean_descriptor)
-    if hasattr(calc, "get_structures_descriptor"):
-        return calc.get_structures_descriptor(
-            structures,
-            mean_descriptor=mean_descriptor,
-        )
-    raise AttributeError(
-        "NepCalculator does not provide a supported descriptor API. "
-        "Expected descriptors() or get_structures_descriptor()."
-    )
 
 
 def _latest_potential(potentials_dir: Path) -> Path:
@@ -80,38 +62,6 @@ def _resolve_potential(potentials_dir: Path, potential_name: str) -> Path:
     if not potential_path.exists():
         raise FileNotFoundError(f"Potential folder not found: {potential_path}")
     return potential_path
-
-
-def _structure_key(atoms) -> str:
-    pos_bytes = atoms.get_positions().round(6).tobytes()
-    return hashlib.md5(atoms.get_chemical_formula().encode() + pos_bytes).hexdigest()
-
-
-def _compute_descriptors_batched(
-    calc: NepCalculator,
-    structures: list,
-    mean_descriptor: bool,
-    batch_size: int,
-) -> np.ndarray:
-    all_descriptors = []
-    n = len(structures)
-    t0 = time.perf_counter()
-    for start in range(0, n, batch_size):
-        end = min(start + batch_size, n)
-        desc = _compute_structure_descriptors(
-            calc,
-            structures[start:end],
-            mean_descriptor=mean_descriptor,
-        )
-        all_descriptors.append(desc)
-        elapsed = time.perf_counter() - t0
-        rate = end / elapsed if elapsed > 0 else 0
-        eta = (n - end) / rate if rate > 0 else 0
-        logger.info(
-            f"  Batch {end}/{n} ({100 * end / n:.0f}%) - "
-            f"{elapsed:.1f}s elapsed, ~{eta:.0f}s remaining"
-        )
-    return np.concatenate(all_descriptors, axis=0)
 
 
 def _load_or_compute_descriptors(
@@ -138,7 +88,7 @@ def _load_or_compute_descriptors(
     if descriptors is None:
         calc = NepCalculator(str(nep_txt))
         logger.info(f"  Loaded NepCalculator with {nep_txt.name}")
-        descriptors = _compute_descriptors_batched(
+        descriptors = compute_descriptors_batched(
             calc,
             structures,
             mean_descriptor,
@@ -148,14 +98,6 @@ def _load_or_compute_descriptors(
         logger.info(f"  Saved descriptor cache to {cache_path}")
 
     return descriptors
-
-
-def _nearest_neighbor_distances(descriptors: np.ndarray) -> np.ndarray:
-    if len(descriptors) < 2:
-        return np.array([], dtype=float)
-    dists = cdist(descriptors, descriptors)
-    np.fill_diagonal(dists, np.inf)
-    return dists.min(axis=1)
 
 
 def main() -> None:
@@ -227,7 +169,7 @@ def main() -> None:
 
     logger.info("")
     logger.info("Step 3: Computing nearest-neighbor distances")
-    nn_dists = _nearest_neighbor_distances(descriptors)
+    nn_dists = nearest_representation_distances(descriptors)
     if len(nn_dists) == 0:
         logger.error("Need at least two structures to compute nearest-neighbor distances")
         sys.exit(1)

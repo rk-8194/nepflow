@@ -7,6 +7,11 @@ from .models import (
     PerturbationTask,
     PerturbationTaskResult,
 )
+from .elasticity import (
+    ElasticRecord,
+    fit_elastic_tensor,
+    strain_matrix_to_voigt,
+)
 
 __all__ = [
     "PerturbationCoordinator",
@@ -15,4 +20,7 @@ __all__ = [
     "PerturbationTask",
     "PerturbationTaskError",
     "PerturbationTaskResult",
+    "ElasticRecord",
+    "fit_elastic_tensor",
+    "strain_matrix_to_voigt",
 ]

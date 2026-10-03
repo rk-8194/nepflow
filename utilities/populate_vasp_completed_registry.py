@@ -27,18 +27,17 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
-ROOT = Path(__file__).resolve().parents[1]
-SRC = ROOT / "src"
-if str(SRC) not in sys.path:
-    sys.path.insert(0, str(SRC))
-
 from nepflow.domain.identities import DftCalculationIdentity, calculate_structure_id
 from nepflow.dft.vasp.inputs import strip_resource_incar_params
-from nepflow.dft.vasp.outputs import VASP_COMPLETION_MARKERS, outcar_is_complete
-from nepflow.dft.vasp.registry import VASP_REGISTRY_VERSION, validate_completed_registry
+from nepflow.dft.vasp.outputs import outcar_is_complete
+from nepflow.dft.vasp.registry import (
+    VASP_REGISTRY_VERSION,
+    read_completed_registry,
+    write_completed_registry,
+)
 from nepflow.errors import ArtifactError
 from nepflow.io.hashing import sha256_bytes, sha256_file
-from nepflow.io.json import read_json_object, write_json
+from nepflow.io.json import write_json
 
 def hash_incar_file(incar_path: Path) -> str:
     return sha256_bytes(
@@ -156,16 +155,19 @@ def _invert_3x3(matrix: list[list[float]]) -> list[list[float]]:
 
 
 def read_registry(registry_path: Path) -> dict:
-    data = read_json_object(
-        registry_path,
-        default={"version": VASP_REGISTRY_VERSION, "jobs": {}},
-        error_type=ArtifactError,
-    )
-    return validate_completed_registry(data, registry_path)
+    """Read the canonical registry; this wrapper exists only for migration CLI wiring."""
+
+    registry_path = Path(registry_path)
+    if registry_path.name != ".vasp_completed_jobs.json":
+        raise ArtifactError(f"Unexpected VASP registry path: {registry_path}")
+    return read_completed_registry(registry_path.parent)
 
 
 def write_registry(registry_path: Path, registry: dict) -> None:
-    write_json(registry_path, registry)
+    registry_path = Path(registry_path)
+    if registry_path.name != ".vasp_completed_jobs.json":
+        raise ArtifactError(f"Unexpected VASP registry path: {registry_path}")
+    write_completed_registry(registry_path.parent, registry)
 
 
 def registry_contains(registry: dict, incar_hash: str, potcar_hash: str, structure_id: str) -> bool:

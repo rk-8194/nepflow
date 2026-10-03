@@ -36,7 +36,6 @@ Arguments:
 from __future__ import annotations
 
 import argparse
-import hashlib
 import logging
 import sys
 import time
@@ -46,6 +45,11 @@ import numpy as np
 from ase.io import read as ase_read
 from NepTrainKit.core.calculator import NepCalculator
 from NepTrainKit.core.structure import Structure
+
+from nepflow.stages.selection.representations import (
+    compute_descriptors_batched,
+    structure_identity,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -59,25 +63,6 @@ logger = logging.getLogger("plot_descriptors")
 # helpers - copied / adapted from select.py
 # ---------------------------------------------------------------------------
 
-def _compute_structure_descriptors(
-    calc: NepCalculator,
-    structures: list,
-    *,
-    mean_descriptor: bool,
-) -> np.ndarray:
-    if hasattr(calc, "descriptors"):
-        return calc.descriptors(structures, mean=mean_descriptor)
-    if hasattr(calc, "get_structures_descriptor"):
-        return calc.get_structures_descriptor(
-            structures,
-            mean_descriptor=mean_descriptor,
-        )
-    raise AttributeError(
-        "NepCalculator does not provide a supported descriptor API. "
-        "Expected descriptors() or get_structures_descriptor()."
-    )
-
-
 def _latest_potential(potentials_dir: Path) -> Path:
     candidates = [
         d for d in potentials_dir.iterdir()
@@ -88,12 +73,6 @@ def _latest_potential(potentials_dir: Path) -> Path:
     return max(candidates, key=lambda d: d.stat().st_mtime)
 
 
-def _structure_key(atoms) -> str:
-    """Stable hash: formula + rounded positions."""
-    pos_bytes = atoms.get_positions().round(6).tobytes()
-    return hashlib.md5(atoms.get_chemical_formula().encode() + pos_bytes).hexdigest()
-
-
 def _match_indices(ref_ase: list, target_xyz: Path) -> list[int]:
     """Return indices into ref_ase for structures in target_xyz."""
     if not target_xyz.exists():
@@ -102,41 +81,17 @@ def _match_indices(ref_ase: list, target_xyz: Path) -> list[int]:
     target = ase_read(str(target_xyz), index=":", format="extxyz")
     if not isinstance(target, list):
         target = [target]
-    ref_index = {_structure_key(a): i for i, a in enumerate(ref_ase)}
-    indices = [ref_index[_structure_key(a)] for a in target if _structure_key(a) in ref_index]
+    ref_index = {structure_identity(a): i for i, a in enumerate(ref_ase)}
+    indices = [
+        ref_index[structure_identity(a)]
+        for a in target
+        if structure_identity(a) in ref_index
+    ]
     if not indices:
         logger.warning(f"  No structures from {target_xyz.name} matched")
     else:
         logger.info(f"  Matched {len(indices)}/{len(target)} from {target_xyz.name}")
     return indices
-
-
-def _compute_descriptors_batched(
-    calc: NepCalculator,
-    structures: list,
-    mean_descriptor: bool,
-    batch_size: int,
-) -> np.ndarray:
-    """Compute descriptors in batches to avoid OOM. (Same as select.py.)"""
-    all_descriptors = []
-    n = len(structures)
-    t0 = time.perf_counter()
-    for start in range(0, n, batch_size):
-        end = min(start + batch_size, n)
-        desc = _compute_structure_descriptors(
-            calc,
-            structures[start:end],
-            mean_descriptor=mean_descriptor,
-        )
-        all_descriptors.append(desc)
-        elapsed = time.perf_counter() - t0
-        rate = end / elapsed if elapsed > 0 else 0
-        eta = (n - end) / rate if rate > 0 else 0
-        logger.info(
-            f"  Batch {end}/{n} ({100 * end / n:.0f}%) - "
-            f"{elapsed:.1f}s elapsed, ~{eta:.0f}s remaining"
-        )
-    return np.concatenate(all_descriptors, axis=0)
 
 
 def _resolve_potential(potentials_dir: Path, potential_name: str) -> Path:
@@ -205,7 +160,7 @@ def _load_or_compute_descriptors(
     if descriptors is None:
         calc = NepCalculator(str(nep_txt))
         logger.info(f"  Loaded NepCalculator with {nep_txt.name}")
-        descriptors = _compute_descriptors_batched(
+        descriptors = compute_descriptors_batched(
             calc,
             structures,
             mean_descriptor,

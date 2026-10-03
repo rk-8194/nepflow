@@ -12,6 +12,8 @@ from .resubmission import (
     ReconciliationSource,
     ResubmissionResult,
     SelfResubmitExit,
+    resolve_resubmit_command,
+    submit_resubmission,
 )
 from .state import WorkflowState
 from .stages import (
@@ -32,6 +34,8 @@ __all__ = [
     "ReconciliationSource",
     "ResubmissionResult",
     "SelfResubmitExit",
+    "resolve_resubmit_command",
+    "submit_resubmission",
     "StageBinding",
     "StageContext",
     "ProjectCreationService",

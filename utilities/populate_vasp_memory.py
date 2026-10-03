@@ -13,9 +13,7 @@ from pathlib import Path
 from typing import Optional
 
 from nepflow.dft.vasp.outputs import (
-    VASP_COMPLETION_MARKERS,
-    is_completed_text,
-    parse_performance_evidence,
+    parse_memory_record,
 )
 
 CSV_HEADER = [
@@ -24,77 +22,18 @@ CSV_HEADER = [
 ]
 
 
-def is_completed(outcar_text: str) -> bool:
-    """Check if OUTCAR indicates a successfully completed VASP run."""
-    return is_completed_text(outcar_text)
-
-
 def parse_outcar(outcar_path: Path, gpus_per_node: int) -> Optional[dict]:
-    """Extract performance data from an OUTCAR and its sibling POSCAR/INCAR."""
-    struct_dir = outcar_path.parent
-    poscar = struct_dir / "POSCAR"
-    incar = struct_dir / "INCAR"
-
-    if not poscar.exists() or not incar.exists():
-        missing = [f for f, p in (("POSCAR", poscar), ("INCAR", incar)) if not p.exists()]
-        print(f"  SKIP {outcar_path.parent}: missing {', '.join(missing)}")
-        return None
-
+    """Extract a legacy benchmark row using the canonical VASP parser."""
     try:
-        outcar_text = outcar_path.read_text(encoding="utf-8", errors="replace")
-    except OSError as e:
-        print(f"  SKIP {outcar_path.parent}: cannot read OUTCAR: {e}")
-        return None
-
-    if not is_completed(outcar_text):
-        print(f"  SKIP {outcar_path.parent}: OUTCAR not completed")
-        return None
-
-    try:
-        # n_atoms from POSCAR line 7
-        poscar_lines = poscar.read_text(encoding="utf-8").splitlines()
-        n_atoms = sum(int(x) for x in poscar_lines[6].split())
-
-        # NCORE / KPAR from INCAR
-        incar_text = incar.read_text(encoding="utf-8")
-        ncore = kpar = 0
-        for line in incar_text.splitlines():
-            stripped = line.strip().upper()
-            if stripped.startswith("NCORE"):
-                ncore = int(line.split("=")[1].split("#")[0].strip())
-            elif stripped.startswith("KPAR"):
-                kpar = int(line.split("=")[1].split("#")[0].strip())
-
-        performance = parse_performance_evidence(outcar_text)
-        total_ranks = performance.total_ranks
-        nodes = max(1, total_ranks // gpus_per_node) if total_ranks > 0 else 1
-        gpus = total_ranks if total_ranks > 0 else gpus_per_node
-
-        loop_times = performance.loop_times
-        if not loop_times:
-            print(f"  SKIP {outcar_path.parent}: no LOOP times found")
+        result = parse_memory_record(outcar_path, gpus_per_node)
+        if result is None:
+            print(f"  SKIP {outcar_path.parent}: incomplete or unparseable OUTCAR")
             return None
-        avg_loop = sum(loop_times) / len(loop_times)
-
-        n_kpoints_irr = performance.irreducible_kpoints
-        n_electrons = int(performance.electrons)
-
-        result = {
-            "n_atoms": n_atoms,
-            "n_kpoints_irr": n_kpoints_irr,
-            "n_electrons": n_electrons,
-            "nodes": nodes,
-            "gpus": gpus,
-            "ncore": ncore,
-            "kpar": kpar,
-            "avg_loop_time": f"{avg_loop:.4f}",
-            "oom": 0,
-        }
         print(f"    OK {outcar_path.parent.name}: "
-              f"atoms={n_atoms} kpts={n_kpoints_irr} nel={n_electrons} "
-              f"ncore={ncore} kpar={kpar} avg_loop={avg_loop:.4f}s")
+              f"atoms={result['n_atoms']} kpts={result['n_kpoints_irr']} "
+              f"nel={result['n_electrons']} ncore={result['ncore']} "
+              f"kpar={result['kpar']} avg_loop={result['avg_loop_time']}s")
         return result
-
     except (ValueError, IndexError, OSError) as e:
         print(f"  Warning: could not parse {struct_dir.name}: {e}", file=sys.stderr)
         return None

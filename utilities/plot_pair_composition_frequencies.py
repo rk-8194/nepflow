@@ -23,14 +23,18 @@ from __future__ import annotations
 import argparse
 import csv
 import logging
-import math
 import sys
-from collections import Counter, defaultdict
-from dataclasses import dataclass
-from fractions import Fraction
 from pathlib import Path
 
 from ase.io import read as ase_read
+
+from nepflow.stages.selection.sampling import (
+    PairFrequencyPoint,
+    StructureComposition,
+    collect_pair_frequency_points,
+    composition_from_atoms,
+    fraction_label,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -38,93 +42,6 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 logger = logging.getLogger("plot_pair_composition_frequencies")
-
-
-@dataclass(frozen=True)
-class StructureComposition:
-    structure_index: int
-    formula: str
-    total_atoms: int
-    unique_elements: tuple[str, ...]
-    element_counts: dict[str, int]
-    element_fractions: dict[str, float]
-
-
-@dataclass(frozen=True)
-class PairFrequencyPoint:
-    pair: tuple[str, str]
-    b_fraction: float
-    frequency: int
-    distinct_elements: int
-
-
-def _load_structures(train_xyz: Path) -> list:
-    structures = ase_read(str(train_xyz), index=":", format="extxyz")
-    if isinstance(structures, list):
-        return structures
-    return [structures]
-
-
-def _composition_from_atoms(atoms, structure_index: int) -> StructureComposition:
-    counts = Counter(atoms.get_chemical_symbols())
-    total_atoms = sum(counts.values())
-    if total_atoms == 0:
-        raise ValueError(f"Structure {structure_index} contains no atoms")
-
-    ordered_elements = tuple(sorted(counts))
-    fractions = {
-        element: counts[element] / total_atoms
-        for element in ordered_elements
-    }
-    return StructureComposition(
-        structure_index=structure_index,
-        formula=atoms.get_chemical_formula(),
-        total_atoms=total_atoms,
-        unique_elements=ordered_elements,
-        element_counts=dict(counts),
-        element_fractions=fractions,
-    )
-
-
-def _fraction_label(value: float) -> str:
-    fraction = Fraction(value).limit_denominator()
-    if math.isclose(float(fraction), value, rel_tol=0.0, abs_tol=1e-12):
-        return f"{fraction.numerator}/{fraction.denominator}"
-    return f"{value:.6f}"
-
-
-def _collect_pair_points(
-    compositions: list[StructureComposition],
-) -> dict[tuple[str, str], list[PairFrequencyPoint]]:
-    pair_fraction_counts: dict[tuple[str, str], Counter[float]] = defaultdict(Counter)
-    pair_fraction_distinct: dict[tuple[str, str], dict[float, set[int]]] = defaultdict(
-        lambda: defaultdict(set)
-    )
-
-    for composition in compositions:
-        distinct_count = len(composition.unique_elements)
-        for i, element_a in enumerate(composition.unique_elements):
-            for element_b in composition.unique_elements[i + 1:]:
-                pair = (element_a, element_b)
-                b_fraction = composition.element_fractions[element_b]
-                pair_fraction_counts[pair][b_fraction] += 1
-                pair_fraction_distinct[pair][b_fraction].add(distinct_count)
-
-    pair_points: dict[tuple[str, str], list[PairFrequencyPoint]] = {}
-    for pair, counts in pair_fraction_counts.items():
-        points: list[PairFrequencyPoint] = []
-        for b_fraction, frequency in sorted(counts.items(), key=lambda item: item[0]):
-            for distinct_elements in sorted(pair_fraction_distinct[pair][b_fraction]):
-                points.append(
-                    PairFrequencyPoint(
-                        pair=pair,
-                        b_fraction=b_fraction,
-                        frequency=frequency,
-                        distinct_elements=distinct_elements,
-                    )
-                )
-        pair_points[pair] = points
-    return pair_points
 
 
 def _write_composition_summary(
@@ -194,7 +111,7 @@ def _write_pair_summary(
                         "element_a": pair[0],
                         "element_b": pair[1],
                         "b_fraction": f"{point.b_fraction:.12f}",
-                        "b_fraction_label": _fraction_label(point.b_fraction),
+                        "b_fraction_label": fraction_label(point.b_fraction),
                         "frequency": point.frequency,
                         "distinct_elements": point.distinct_elements,
                     }
@@ -310,12 +227,12 @@ def main() -> None:
         sys.exit(1)
 
     compositions = [
-        _composition_from_atoms(atoms, structure_index=index)
+        composition_from_atoms(atoms, structure_index=index)
         for index, atoms in enumerate(structures)
     ]
     logger.info(f"Loaded {len(compositions)} structures")
 
-    pair_points = _collect_pair_points(compositions)
+    pair_points = collect_pair_frequency_points(compositions)
     if not pair_points:
         logger.error("No structures containing at least one unordered element pair were found")
         sys.exit(1)

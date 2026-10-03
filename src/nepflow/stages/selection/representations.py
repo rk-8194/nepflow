@@ -86,6 +86,12 @@ def _structure_identity(structure: object) -> str:
         ) from exc
 
 
+def structure_identity(structure: object) -> str:
+    """Return the canonical identity used to match descriptor structures."""
+
+    return _structure_identity(structure)
+
+
 def _model_identity(model_path: Path, model_filename: str) -> dict[str, str]:
     """Return the configured model filename and content hash."""
 
@@ -290,4 +296,5 @@ __all__ = [
     "descriptor_cache_path",
     "descriptor_manifest_path",
     "load_or_calculate_representations",
+    "structure_identity",
 ]

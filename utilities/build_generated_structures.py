@@ -36,19 +36,14 @@ from __future__ import annotations
 
 import argparse
 import json
-import sys
 from pathlib import Path
 from typing import Iterable
 
 from ase import Atoms
 from ase.io import read as ase_read, write as ase_write
 
-ROOT = Path(__file__).resolve().parents[1]
-SRC = ROOT / "src"
-if str(SRC) not in sys.path:
-    sys.path.insert(0, str(SRC))
-
 from nepflow.domain.identities import annotate_structure_id, calculate_structure_id
+from nepflow.stages.selection.sampling import extract_composition_fractions
 
 
 DEFAULT_PATTERNS = [
@@ -243,16 +238,9 @@ def coerce_scalar(value: str) -> object:
 
 
 def normalized_composition_from_atoms(atoms: Atoms) -> dict[str, float]:
-    counts: dict[str, int] = {}
-    for symbol in atoms.get_chemical_symbols():
-        counts[symbol] = counts.get(symbol, 0) + 1
-    total = sum(counts.values())
-    if total <= 0:
-        return {}
-    return {
-        element: count / total
-        for element, count in sorted(counts.items())
-    }
+    """Use the canonical composition representation for generated structures."""
+
+    return extract_composition_fractions(atoms)
 
 
 def normalize_composition_map(raw: dict[str, object]) -> dict[str, float]:

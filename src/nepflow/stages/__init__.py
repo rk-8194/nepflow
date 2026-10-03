@@ -1,40 +1,30 @@
-"""Canonical workflow stages."""
+"""Canonical workflow stage classes.
 
-from .dft import DftStage, DftStageResult
-try:
-    from .generation import GenerationStage, GenerationResult
-except ModuleNotFoundError as exc:
-    # Validation and MLIP subpackages are useful in lightweight environments
-    # that do not install the optional Materials Project stack.  Keep those
-    # canonical boundaries importable without hiding unrelated import errors.
-    if exc.name != "pymatgen":
-        raise
-    GenerationStage = None  # type: ignore[assignment,misc]
-    GenerationResult = None  # type: ignore[assignment,misc]
-from .training import TrainingStage
-from .validation import (
-    ValidationCaseSpec,
-    ValidationCase,
-    ValidationPreparation,
-    ValidationReference,
-    ValidationStage,
-    ValidationStageResult,
-    prepare_validation_cases,
-    resolve_model_dataset,
-)
+Stage implementation details and backend-specific types belong to their
+owning packages; this root intentionally exposes only the five stage names.
+"""
+
+from __future__ import annotations
 
 __all__ = [
     "DftStage",
-    "DftStageResult",
     "GenerationStage",
-    "GenerationResult",
+    "SelectionStage",
     "TrainingStage",
-    "ValidationCaseSpec",
-    "ValidationCase",
-    "ValidationPreparation",
-    "ValidationReference",
     "ValidationStage",
-    "ValidationStageResult",
-    "prepare_validation_cases",
-    "resolve_model_dataset",
 ]
+
+
+def __getattr__(name: str):
+    modules = {
+        "DftStage": ".dft",
+        "GenerationStage": ".generation",
+        "SelectionStage": ".selection",
+        "TrainingStage": ".training",
+        "ValidationStage": ".validation",
+    }
+    module_name = modules.get(name)
+    if module_name is None:
+        raise AttributeError(name)
+    module = __import__(f"{__name__}{module_name}", fromlist=[name])
+    return getattr(module, name)

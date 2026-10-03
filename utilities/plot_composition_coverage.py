@@ -23,14 +23,25 @@ import argparse
 import csv
 import json
 import logging
-import math
-import statistics
 import sys
-from collections import Counter, defaultdict
-from dataclasses import asdict, dataclass
-from itertools import combinations
+from dataclasses import asdict
 from pathlib import Path
 from typing import Iterable
+
+from nepflow.stages.selection.sampling import (
+    SQRT3_OVER_2,
+    BinaryProjection,
+    CoverageSummary,
+    StructureComposition,
+    TernaryProjection,
+    barycentric_to_cartesian,
+    collect_binary_projections,
+    collect_ternary_projections,
+    composition_from_atoms,
+    summarize_binary_subset,
+    summarize_ternary_subset,
+    ternary_bin_center,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -40,303 +51,11 @@ logging.basicConfig(
 logger = logging.getLogger("plot_composition_coverage")
 
 
-SQRT3_OVER_2 = math.sqrt(3.0) / 2.0
-
-
-@dataclass(frozen=True)
-class StructureComposition:
-    structure_index: int
-    formula: str
-    total_atoms: int
-    unique_elements: tuple[str, ...]
-    element_counts: dict[str, int]
-    element_fractions: dict[str, float]
-
-
-@dataclass(frozen=True)
-class BinaryProjection:
-    subset: tuple[str, str]
-    structure_index: int
-    normalized_fraction_b: float
-
-
-@dataclass(frozen=True)
-class TernaryProjection:
-    subset: tuple[str, str, str]
-    structure_index: int
-    barycentric: tuple[float, float, float]
-
-
-@dataclass(frozen=True)
-class CoverageSummary:
-    subset_label: str
-    subset_size: int
-    dimensions: int
-    structure_count: int
-    total_bins: int
-    occupied_bins: int
-    occupied_bin_fraction: float
-    normalized_entropy: float
-    max_bin_fraction: float
-    gini: float
-    nn_distance_mean: float | None
-    nn_distance_p95: float | None
-
-
 def _load_structures(train_xyz: Path) -> list:
-    try:
-        from ase.io import read as ase_read
-    except ImportError as exc:
-        raise ImportError(
-            "ASE is required to read extxyz files. Install it in the active environment "
-            "before running plot_composition_coverage.py."
-        ) from exc
+    from ase.io import read as ase_read
 
     structures = ase_read(str(train_xyz), index=":", format="extxyz")
-    if isinstance(structures, list):
-        return structures
-    return [structures]
-
-
-def _composition_from_atoms(atoms, structure_index: int) -> StructureComposition:
-    counts = Counter(atoms.get_chemical_symbols())
-    total_atoms = sum(counts.values())
-    if total_atoms == 0:
-        raise ValueError(f"Structure {structure_index} contains no atoms")
-
-    ordered_elements = tuple(sorted(counts))
-    fractions = {
-        element: counts[element] / total_atoms
-        for element in ordered_elements
-    }
-    return StructureComposition(
-        structure_index=structure_index,
-        formula=atoms.get_chemical_formula(),
-        total_atoms=total_atoms,
-        unique_elements=ordered_elements,
-        element_counts=dict(counts),
-        element_fractions=fractions,
-    )
-
-
-def _normalize_subset_fractions(
-    composition: StructureComposition,
-    subset: tuple[str, ...],
-) -> tuple[float, ...]:
-    subset_total = sum(composition.element_fractions[element] for element in subset)
-    if subset_total <= 0:
-        raise ValueError(f"Subset {subset} has zero total mass in structure {composition.structure_index}")
-    return tuple(composition.element_fractions[element] / subset_total for element in subset)
-
-
-def _collect_binary_projections(
-    compositions: list[StructureComposition],
-) -> dict[tuple[str, str], list[BinaryProjection]]:
-    projections: dict[tuple[str, str], list[BinaryProjection]] = defaultdict(list)
-    for composition in compositions:
-        for subset in combinations(composition.unique_elements, 2):
-            normalized = _normalize_subset_fractions(composition, subset)
-            projections[subset].append(
-                BinaryProjection(
-                    subset=subset,
-                    structure_index=composition.structure_index,
-                    normalized_fraction_b=normalized[1],
-                )
-            )
-    return dict(projections)
-
-
-def _collect_ternary_projections(
-    compositions: list[StructureComposition],
-) -> dict[tuple[str, str, str], list[TernaryProjection]]:
-    projections: dict[tuple[str, str, str], list[TernaryProjection]] = defaultdict(list)
-    for composition in compositions:
-        for subset in combinations(composition.unique_elements, 3):
-            projections[subset].append(
-                TernaryProjection(
-                    subset=subset,
-                    structure_index=composition.structure_index,
-                    barycentric=_normalize_subset_fractions(composition, subset),
-                )
-            )
-    return dict(projections)
-
-
-def _binary_bin_index(value: float, bins: int) -> int:
-    clamped = min(max(value, 0.0), 1.0)
-    if math.isclose(clamped, 1.0, rel_tol=0.0, abs_tol=1e-12):
-        return bins - 1
-    return min(int(clamped * bins), bins - 1)
-
-
-def _largest_remainder_integer_partition(values: tuple[float, ...], total: int) -> tuple[int, ...]:
-    scaled = [value * total for value in values]
-    floors = [math.floor(value) for value in scaled]
-    remainder = total - sum(floors)
-    if remainder > 0:
-        ranked = sorted(
-            enumerate(scaled),
-            key=lambda item: (item[1] - floors[item[0]], -item[0]),
-            reverse=True,
-        )
-        for idx, _ in ranked[:remainder]:
-            floors[idx] += 1
-    return tuple(int(value) for value in floors)
-
-
-def _ternary_bin_index(
-    barycentric: tuple[float, float, float],
-    resolution: int,
-) -> tuple[int, int, int]:
-    counts = _largest_remainder_integer_partition(barycentric, resolution)
-    return counts
-
-
-def _ternary_bin_center(
-    index: tuple[int, int, int],
-    resolution: int,
-) -> tuple[float, float, float]:
-    return tuple(value / resolution for value in index)
-
-
-def _barycentric_to_cartesian(barycentric: tuple[float, float, float]) -> tuple[float, float]:
-    a, b, c = barycentric
-    _ = a
-    x = b + 0.5 * c
-    y = c * SQRT3_OVER_2
-    return x, y
-
-
-def _occupied_bin_fraction(counts: list[int], total_bins: int) -> tuple[int, float]:
-    occupied = sum(1 for count in counts if count > 0)
-    fraction = occupied / total_bins if total_bins > 0 else 0.0
-    return occupied, fraction
-
-
-def _normalized_entropy(counts: list[int], total_bins: int) -> float:
-    total = sum(counts)
-    if total <= 0 or total_bins <= 1:
-        return 0.0
-    entropy = 0.0
-    for count in counts:
-        if count <= 0:
-            continue
-        probability = count / total
-        entropy -= probability * math.log(probability)
-    return entropy / math.log(total_bins)
-
-
-def _max_bin_fraction(counts: list[int]) -> float:
-    total = sum(counts)
-    if total <= 0:
-        return 0.0
-    return max(counts) / total
-
-
-def _gini(values: list[int]) -> float:
-    if not values:
-        return 0.0
-    total = sum(values)
-    if total <= 0:
-        return 0.0
-    sorted_values = sorted(values)
-    n = len(sorted_values)
-    weighted_sum = sum((2 * idx - n - 1) * value for idx, value in enumerate(sorted_values, start=1))
-    return weighted_sum / (n * total)
-
-
-def _nearest_neighbor_distances(points: list[tuple[float, ...]]) -> list[float]:
-    if len(points) < 2:
-        return []
-    distances: list[float] = []
-    for idx, point in enumerate(points):
-        best = math.inf
-        for other_idx, other in enumerate(points):
-            if idx == other_idx:
-                continue
-            squared = sum((a - b) ** 2 for a, b in zip(point, other))
-            best = min(best, math.sqrt(squared))
-        distances.append(best)
-    return distances
-
-
-def _p95(values: list[float]) -> float | None:
-    if not values:
-        return None
-    if len(values) == 1:
-        return values[0]
-    ordered = sorted(values)
-    position = 0.95 * (len(ordered) - 1)
-    lower = math.floor(position)
-    upper = math.ceil(position)
-    if lower == upper:
-        return ordered[lower]
-    weight = position - lower
-    return ordered[lower] * (1.0 - weight) + ordered[upper] * weight
-
-
-def _summarize_binary_subset(
-    subset: tuple[str, str],
-    projections: list[BinaryProjection],
-    bins: int,
-) -> tuple[CoverageSummary, list[int]]:
-    bin_counts = [0] * bins
-    coordinates: list[tuple[float]] = []
-    for projection in projections:
-        bin_idx = _binary_bin_index(projection.normalized_fraction_b, bins)
-        bin_counts[bin_idx] += 1
-        coordinates.append((projection.normalized_fraction_b,))
-
-    occupied_bins, occupied_fraction = _occupied_bin_fraction(bin_counts, bins)
-    nn_distances = _nearest_neighbor_distances(coordinates)
-    summary = CoverageSummary(
-        subset_label="-".join(subset),
-        subset_size=2,
-        dimensions=1,
-        structure_count=len(projections),
-        total_bins=bins,
-        occupied_bins=occupied_bins,
-        occupied_bin_fraction=occupied_fraction,
-        normalized_entropy=_normalized_entropy(bin_counts, bins),
-        max_bin_fraction=_max_bin_fraction(bin_counts),
-        gini=_gini(bin_counts),
-        nn_distance_mean=statistics.fmean(nn_distances) if nn_distances else None,
-        nn_distance_p95=_p95(nn_distances),
-    )
-    return summary, bin_counts
-
-
-def _summarize_ternary_subset(
-    subset: tuple[str, str, str],
-    projections: list[TernaryProjection],
-    resolution: int,
-) -> tuple[CoverageSummary, dict[tuple[int, int, int], int]]:
-    bin_counts: dict[tuple[int, int, int], int] = {}
-    coordinates: list[tuple[float, float]] = []
-    for projection in projections:
-        bin_idx = _ternary_bin_index(projection.barycentric, resolution)
-        bin_counts[bin_idx] = bin_counts.get(bin_idx, 0) + 1
-        coordinates.append(_barycentric_to_cartesian(projection.barycentric))
-
-    total_bins = (resolution + 1) * (resolution + 2) // 2
-    dense_counts = list(bin_counts.values()) + [0] * (total_bins - len(bin_counts))
-    occupied_bins, occupied_fraction = _occupied_bin_fraction(dense_counts, total_bins)
-    nn_distances = _nearest_neighbor_distances(coordinates)
-    summary = CoverageSummary(
-        subset_label="-".join(subset),
-        subset_size=3,
-        dimensions=2,
-        structure_count=len(projections),
-        total_bins=total_bins,
-        occupied_bins=occupied_bins,
-        occupied_bin_fraction=occupied_fraction,
-        normalized_entropy=_normalized_entropy(dense_counts, total_bins),
-        max_bin_fraction=_max_bin_fraction(dense_counts),
-        gini=_gini(dense_counts),
-        nn_distance_mean=statistics.fmean(nn_distances) if nn_distances else None,
-        nn_distance_p95=_p95(nn_distances),
-    )
-    return summary, bin_counts
+    return structures if isinstance(structures, list) else [structures]
 
 
 def _write_composition_summary(
@@ -494,8 +213,8 @@ def _plot_ternary_subset(
     if not bin_counts:
         return
 
-    centers = [_ternary_bin_center(index, resolution) for index in bin_counts]
-    xs, ys = zip(*[_barycentric_to_cartesian(center) for center in centers])
+    centers = [ternary_bin_center(index, resolution) for index in bin_counts]
+    xs, ys = zip(*[barycentric_to_cartesian(center) for center in centers])
     counts = [bin_counts[index] for index in bin_counts]
 
     max_count = max(counts)
@@ -625,7 +344,7 @@ def main() -> None:
         sys.exit(1)
 
     compositions = [
-        _composition_from_atoms(atoms, structure_index=index)
+        composition_from_atoms(atoms, structure_index=index)
         for index, atoms in enumerate(structures)
     ]
     logger.info(f"Loaded {len(compositions)} structures")
@@ -635,9 +354,9 @@ def main() -> None:
     summaries: list[CoverageSummary] = []
 
     if args.include_subsets in {"binary", "both"}:
-        binary_projections = _collect_binary_projections(compositions)
+        binary_projections = collect_binary_projections(compositions)
         for subset, projections in sorted(binary_projections.items()):
-            summary, bin_counts = _summarize_binary_subset(
+            summary, bin_counts = summarize_binary_subset(
                 subset,
                 projections,
                 args.binary_bins,
@@ -651,9 +370,9 @@ def main() -> None:
             )
 
     if args.include_subsets in {"ternary", "both"}:
-        ternary_projections = _collect_ternary_projections(compositions)
+        ternary_projections = collect_ternary_projections(compositions)
         for subset, projections in sorted(ternary_projections.items()):
-            summary, bin_counts = _summarize_ternary_subset(
+            summary, bin_counts = summarize_ternary_subset(
                 subset,
                 projections,
                 args.ternary_resolution,

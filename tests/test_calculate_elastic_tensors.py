@@ -3,7 +3,7 @@ from pathlib import Path
 
 import numpy as np
 
-from utilities import calculate_elastic_tensors as module
+from nepflow.stages.generation.perturbations import elasticity as module
 
 
 class CalculateElasticTensorsTests(unittest.TestCase):

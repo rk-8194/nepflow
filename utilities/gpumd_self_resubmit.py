@@ -1,46 +1,46 @@
 #!/usr/bin/env python3
-"""Run a GPUMD segment, archive ``final.xyz``, promote it to ``model.xyz``, and self-resubmit.
-
-This utility is intentionally standalone so it can be copied into an MD working
-directory and launched directly from a SLURM batch script. When NEPFlow is
-available, it reuses NEPFlow's SLURM resubmission resolver. If not, it falls
-back to the same resolution strategy locally.
-"""
+"""Thin operator CLI for canonical GPUMD segment/resubmission services."""
 
 from __future__ import annotations
 
 import argparse
-import importlib.util
-import json
 import os
-import re
-import shutil
-import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Any
 
-try:
-    from nepflow.errors import SchedulerError
-    from nepflow.hpc.slurm import SlurmScheduler
-except ModuleNotFoundError:
-    source_root = Path(__file__).resolve().parent.parent / "src"
-    if source_root.exists() and str(source_root) not in sys.path:
-        sys.path.insert(0, str(source_root))
-    # A copied utility may not have NEPFlow installed.  Keep this narrow
-    # scheduler fallback until the standalone distribution can bundle the
-    # shared scheduler boundary (Phase 4); parsing remains identical here.
-    try:
-        from nepflow.errors import SchedulerError
-        from nepflow.hpc.slurm import SlurmScheduler
-    except ModuleNotFoundError:  # standalone copied utility without NEPFlow
-        SchedulerError = None  # type: ignore[assignment,misc]
-        SlurmScheduler = None  # type: ignore[assignment,misc]
+from nepflow.hpc.slurm import SlurmScheduler
+from nepflow.mlip.gpumd.resubmission import (
+    DEFAULT_ARCHIVE_DIR,
+    STATE_FILE_NAME,
+    archive_and_promote_final,
+    load_segment_state,
+    run_gpumd_segment,
+    should_stop,
+    write_segment_state,
+)
+from nepflow.workflow.resubmission import (
+    resolve_resubmit_command as canonical_resolve_resubmit_command,
+    submit_resubmission,
+)
 
-STATE_FILE_NAME = ".gpumd_self_resubmit_state.json"
-DEFAULT_ARCHIVE_DIR = "final_xyz_history"
-scheduler = SlurmScheduler() if SlurmScheduler is not None else None
+load_state = load_segment_state
+write_state = write_segment_state
+
+
+def resolve_resubmit_command(
+    workdir: Path,
+    submit_script: Path | None,
+    nepflow_root: Path | None = None,
+) -> tuple[list[str], Path, str]:
+    """Compatibility-shaped thin wrapper over the workflow resolver."""
+
+    _ = nepflow_root
+    return canonical_resolve_resubmit_command(
+        workdir,
+        submit_script,
+        scheduler=SlurmScheduler(),
+    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -125,188 +125,11 @@ def ensure_stop_rule(args: argparse.Namespace) -> None:
         raise ValueError("--max-segments must be at least 1.")
 
 
-def load_state(state_path: Path) -> dict[str, Any]:
-    if not state_path.exists():
-        return {
-            "segments_completed": 0,
-            "history": [],
-            "created": time.time(),
-        }
-    try:
-        return json.loads(state_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise RuntimeError(f"Could not read state file: {state_path}") from exc
-
-
-def write_state(state_path: Path, state: dict[str, Any]) -> None:
-    state["updated"] = time.time()
-    state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
-
-
 def run_gpumd(command: str, workdir: Path, dry_run: bool = False) -> None:
+    """Thin CLI adapter over the canonical GPUMD segment runner."""
+
     print(f"[gpumd-self-resubmit] Running GPUMD command in {workdir}: {command}")
-    if dry_run:
-        return
-
-    # This utility is copied and run standalone, so it deliberately retains
-    # its explicit shell command boundary.  The command supports redirection
-    # and variable expansion; ProcessRunner's argument-list API is not a drop-
-    # in replacement for that standalone contract.  Phase 4 owns revisiting
-    # this standalone boundary once the utility can share the runner without
-    # making a package import a runtime requirement.
-    result = subprocess.run(command, shell=True, cwd=str(workdir), check=False)
-    if result.returncode != 0:
-        raise RuntimeError(f"GPUMD command failed with exit code {result.returncode}.")
-
-
-def archive_and_promote_final(
-    workdir: Path,
-    archive_dir_name: str,
-    final_name: str,
-    model_name: str,
-    segment_index: int,
-) -> dict[str, str]:
-    final_path = workdir / final_name
-    if not final_path.exists():
-        raise FileNotFoundError(f"GPUMD did not produce {final_path}.")
-    if final_path.stat().st_size == 0:
-        raise RuntimeError(f"GPUMD produced an empty restart file: {final_path}.")
-
-    archive_dir = workdir / archive_dir_name
-    archive_dir.mkdir(parents=True, exist_ok=True)
-
-    archived_name = f"segment_{segment_index:05d}_{final_name}"
-    archived_path = archive_dir / archived_name
-    shutil.copy2(final_path, archived_path)
-
-    model_path = workdir / model_name
-    final_path.replace(model_path)
-
-    return {
-        "archived_final": str(archived_path),
-        "model_file": str(model_path),
-    }
-
-
-def _load_nepflow_module(nepflow_root: Path):
-    nepflow_py = nepflow_root / "nepflow_cli.py"
-    if not nepflow_py.exists():
-        raise FileNotFoundError(f"nepflow_cli.py not found under {nepflow_root}")
-
-    spec = importlib.util.spec_from_file_location("nepflow_cli_for_md_utility", nepflow_py)
-    if spec is None or spec.loader is None:
-        raise RuntimeError(f"Could not load nepflow module from {nepflow_py}")
-
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-def _resolve_resubmit_from_scontrol(slurm_job_id: str) -> tuple[list[str], Path, str] | None:
-    if scheduler is not None:
-        try:
-            output = scheduler.show_job(slurm_job_id)
-        except SchedulerError:
-            return None
-
-        command_match = re.search(r"\bCommand=(\S+)", output)
-        if not command_match:
-            return None
-        command_path = Path(command_match.group(1)).expanduser()
-        if not command_path.is_absolute():
-            workdir_match = re.search(r"\bWorkDir=(\S+)", output)
-            if workdir_match:
-                command_path = Path(workdir_match.group(1)) / command_path
-        if not command_path.exists():
-            return None
-        return ["sbatch", str(command_path)], command_path.parent, f"scontrol job {slurm_job_id}"
-
-    # A copied utility without NEPFlow retains this narrow legacy fallback;
-    # repository executions use the canonical scheduler above.
-    try:
-        result = subprocess.run(
-            ["scontrol", "show", "job", slurm_job_id],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-    except (FileNotFoundError, subprocess.CalledProcessError):
-        return None
-
-    command_match = re.search(r"\bCommand=(\S+)", result.stdout)
-    if not command_match:
-        return None
-
-    command_path = Path(command_match.group(1)).expanduser()
-    if not command_path.is_absolute():
-        workdir_match = re.search(r"\bWorkDir=(\S+)", result.stdout)
-        if workdir_match:
-            command_path = Path(workdir_match.group(1)) / command_path
-
-    if not command_path.exists():
-        return None
-
-    return ["sbatch", str(command_path)], command_path.parent, f"scontrol job {slurm_job_id}"
-
-
-def _fallback_resubmit_command(workdir: Path, submit_script: Path | None) -> tuple[list[str], Path, str]:
-    if submit_script is not None:
-        resolved = submit_script if submit_script.is_absolute() else (workdir / submit_script)
-        resolved = resolved.resolve()
-        if not resolved.exists():
-            raise FileNotFoundError(f"Submit script not found: {resolved}")
-        return ["sbatch", str(resolved)], resolved.parent, f"explicit submit script {resolved}"
-
-    slurm_job_id = os.environ.get("SLURM_JOB_ID")
-    if slurm_job_id:
-        resolved = _resolve_resubmit_from_scontrol(slurm_job_id)
-        if resolved is not None:
-            return resolved
-
-    candidate_dirs: list[Path] = []
-    for directory in (
-        os.environ.get("SLURM_SUBMIT_DIR"),
-        str(workdir),
-        os.getcwd(),
-    ):
-        if not directory:
-            continue
-        path = Path(directory).resolve()
-        if path not in candidate_dirs:
-            candidate_dirs.append(path)
-
-    tried: list[str] = []
-    for directory in candidate_dirs:
-        candidate = directory / "submit.slurm"
-        tried.append(str(candidate))
-        if candidate.exists():
-            return ["sbatch", str(candidate)], directory, f"submit.slurm in {directory}"
-
-    tried_text = "\n".join(f"  - {candidate}" for candidate in tried)
-    raise FileNotFoundError(f"Could not find a submit script to resubmit. Tried:\n{tried_text}")
-
-
-def resolve_resubmit_command(
-    workdir: Path,
-    submit_script: Path | None,
-    nepflow_root: Path | None,
-) -> tuple[list[str], Path, str]:
-    if nepflow_root is not None and submit_script is None:
-        module = _load_nepflow_module(nepflow_root.resolve())
-        return module._resolve_resubmit_command()
-    return _fallback_resubmit_command(workdir=workdir, submit_script=submit_script)
-
-
-def should_stop(
-    state: dict[str, Any],
-    max_segments: int | None,
-    stop_file: Path | None,
-) -> tuple[bool, str]:
-    if max_segments is not None and int(state.get("segments_completed", 0)) >= max_segments:
-        return True, f"reached max segments ({max_segments})"
-    if stop_file is not None and stop_file.exists():
-        return True, f"stop file present ({stop_file})"
-    return False, ""
+    run_gpumd_segment(command, workdir, dry_run=dry_run)
 
 
 def resubmit_job(
@@ -315,31 +138,25 @@ def resubmit_job(
     nepflow_root: Path | None,
     dry_run: bool = False,
 ) -> None:
-    command, submit_cwd, submit_source = resolve_resubmit_command(
-        workdir=workdir,
-        submit_script=submit_script,
-        nepflow_root=nepflow_root,
+    """Thin CLI adapter over canonical workflow resubmission services."""
+
+    _ = nepflow_root  # retained only for command-line compatibility
+    scheduler = SlurmScheduler()
+    command, submit_cwd, submit_source = canonical_resolve_resubmit_command(
+        workdir,
+        submit_script,
+        scheduler=scheduler,
     )
     print(
         "[gpumd-self-resubmit] Resubmitting via "
         f"{submit_source}: {' '.join(command)} (cwd={submit_cwd})"
     )
-    if dry_run:
-        return
-
-    if scheduler is not None:
-        result = scheduler.submit(command, cwd=submit_cwd)
-        stdout = result.stdout.strip()
-    else:
-        # Standalone-copy fallback; repository executions use SlurmScheduler.
-        result = subprocess.run(
-            command,
-            capture_output=True,
-            text=True,
-            check=True,
-            cwd=str(submit_cwd),
-        )
-        stdout = result.stdout.strip()
+    stdout = submit_resubmission(
+        command,
+        submit_cwd,
+        scheduler=scheduler,
+        dry_run=dry_run,
+    )
     if stdout:
         print(f"[gpumd-self-resubmit] sbatch output: {stdout}")
 

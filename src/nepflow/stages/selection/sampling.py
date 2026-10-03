@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import logging
 import math
+import statistics
 from collections import Counter
+from dataclasses import dataclass
+from fractions import Fraction
 from itertools import combinations
 from typing import Any
 
 import numpy as np
-from NepTrainKit.core.io import farthest_point_sampling
 
 
 logger = logging.getLogger("nepflow.selection.sampling")
@@ -17,6 +19,57 @@ logger = logging.getLogger("nepflow.selection.sampling")
 COMPOSITION_AWARE_BINARY_BINS = 20
 COMPOSITION_AWARE_TERNARY_RESOLUTION = 18
 COMPOSITION_AWARE_NOVELTY_FLOOR_FRACTION = 0.90
+SQRT3_OVER_2 = math.sqrt(3.0) / 2.0
+
+
+@dataclass(frozen=True)
+class StructureComposition:
+    """Composition data shared by selection diagnostics."""
+
+    structure_index: int
+    formula: str
+    total_atoms: int
+    unique_elements: tuple[str, ...]
+    element_counts: dict[str, int]
+    element_fractions: dict[str, float]
+
+
+@dataclass(frozen=True)
+class BinaryProjection:
+    subset: tuple[str, str]
+    structure_index: int
+    normalized_fraction_b: float
+
+
+@dataclass(frozen=True)
+class TernaryProjection:
+    subset: tuple[str, str, str]
+    structure_index: int
+    barycentric: tuple[float, float, float]
+
+
+@dataclass(frozen=True)
+class CoverageSummary:
+    subset_label: str
+    subset_size: int
+    dimensions: int
+    structure_count: int
+    total_bins: int
+    occupied_bins: int
+    occupied_bin_fraction: float
+    normalized_entropy: float
+    max_bin_fraction: float
+    gini: float
+    nn_distance_mean: float | None
+    nn_distance_p95: float | None
+
+
+@dataclass(frozen=True)
+class PairFrequencyPoint:
+    pair: tuple[str, str]
+    b_fraction: float
+    frequency: int
+    distinct_elements: int
 
 
 def select_farthest_points(
@@ -26,6 +79,8 @@ def select_farthest_points(
     min_dist: float,
 ) -> list[int]:
     """Return sorted frame indices selected by the accepted FPS policy."""
+
+    from NepTrainKit.core.io import farthest_point_sampling
 
     selected_indices = farthest_point_sampling(
         representations,
@@ -209,6 +264,26 @@ def extract_composition_fractions(atoms: Any) -> dict[str, float]:
     }
 
 
+def composition_from_atoms(atoms: Any, structure_index: int) -> StructureComposition:
+    """Create a stable composition record from an ASE-like structure."""
+
+    counts = Counter(atoms.get_chemical_symbols())
+    total_atoms = sum(counts.values())
+    if total_atoms == 0:
+        raise ValueError(f"Structure {structure_index} contains no atoms")
+    unique_elements = tuple(sorted(counts))
+    return StructureComposition(
+        structure_index=structure_index,
+        formula=atoms.get_chemical_formula(),
+        total_atoms=total_atoms,
+        unique_elements=unique_elements,
+        element_counts=dict(counts),
+        element_fractions={
+            element: counts[element] / total_atoms for element in unique_elements
+        },
+    )
+
+
 def normalize_subset_fractions(
     fractions: dict[str, float],
     subset: tuple[str, ...],
@@ -219,6 +294,48 @@ def normalize_subset_fractions(
     if subset_total <= 0.0:
         return tuple(0.0 for _ in subset)
     return tuple(fractions[element] / subset_total for element in subset)
+
+
+def normalize_composition_subset(
+    composition: StructureComposition,
+    subset: tuple[str, ...],
+) -> tuple[float, ...]:
+    """Normalize a composition onto a binary or ternary projection."""
+
+    return normalize_subset_fractions(composition.element_fractions, subset)
+
+
+def collect_binary_projections(
+    compositions: list[StructureComposition],
+) -> dict[tuple[str, str], list[BinaryProjection]]:
+    """Collect every binary projection, including projections of higher-order structures."""
+
+    projections: dict[tuple[str, str], list[BinaryProjection]] = {}
+    for composition in compositions:
+        for subset in combinations(composition.unique_elements, 2):
+            normalized = normalize_composition_subset(composition, subset)
+            projections.setdefault(subset, []).append(
+                BinaryProjection(subset, composition.structure_index, normalized[1])
+            )
+    return projections
+
+
+def collect_ternary_projections(
+    compositions: list[StructureComposition],
+) -> dict[tuple[str, str, str], list[TernaryProjection]]:
+    """Collect every ternary projection, including quaternary structures."""
+
+    projections: dict[tuple[str, str, str], list[TernaryProjection]] = {}
+    for composition in compositions:
+        for subset in combinations(composition.unique_elements, 3):
+            projections.setdefault(subset, []).append(
+                TernaryProjection(
+                    subset,
+                    composition.structure_index,
+                    normalize_composition_subset(composition, subset),
+                )
+            )
+    return projections
 
 
 def binary_bin_index(value: float, bins: int) -> int:
@@ -257,6 +374,170 @@ def ternary_bin_index(
     """Map ternary barycentric fractions to integer simplex coordinates."""
 
     return largest_remainder_integer_partition(barycentric, resolution)
+
+
+def ternary_bin_center(
+    index: tuple[int, int, int],
+    resolution: int,
+) -> tuple[float, float, float]:
+    return tuple(value / resolution for value in index)
+
+
+def barycentric_to_cartesian(
+    barycentric: tuple[float, float, float],
+) -> tuple[float, float]:
+    _a, b, c = barycentric
+    return b + 0.5 * c, c * SQRT3_OVER_2
+
+
+def occupied_bin_fraction(counts: list[int], total_bins: int) -> tuple[int, float]:
+    occupied = sum(1 for count in counts if count > 0)
+    return occupied, occupied / total_bins if total_bins > 0 else 0.0
+
+
+def max_bin_fraction(counts: list[int]) -> float:
+    total = sum(counts)
+    return max(counts) / total if total > 0 else 0.0
+
+
+def gini(values: list[int]) -> float:
+    if not values:
+        return 0.0
+    total = sum(values)
+    if total <= 0:
+        return 0.0
+    sorted_values = sorted(values)
+    n = len(sorted_values)
+    weighted_sum = sum(
+        (2 * idx - n - 1) * value
+        for idx, value in enumerate(sorted_values, start=1)
+    )
+    return weighted_sum / (n * total)
+
+
+def nearest_neighbor_distances(points: list[tuple[float, ...]]) -> list[float]:
+    if len(points) < 2:
+        return []
+    distances: list[float] = []
+    for index, point in enumerate(points):
+        best = math.inf
+        for other_index, other in enumerate(points):
+            if index == other_index:
+                continue
+            best = min(
+                best,
+                math.sqrt(sum((a - b) ** 2 for a, b in zip(point, other))),
+            )
+        distances.append(best)
+    return distances
+
+
+def nearest_representation_distances(representations: np.ndarray) -> np.ndarray:
+    """Return each representation row's nearest other-row distance."""
+
+    if len(representations) < 2:
+        return np.array([], dtype=float)
+    from scipy.spatial.distance import cdist
+
+    distances = cdist(representations, representations)
+    np.fill_diagonal(distances, np.inf)
+    return distances.min(axis=1)
+
+
+def percentile95(values: list[float]) -> float | None:
+    if not values:
+        return None
+    if len(values) == 1:
+        return values[0]
+    ordered = sorted(values)
+    position = 0.95 * (len(ordered) - 1)
+    lower = math.floor(position)
+    upper = math.ceil(position)
+    if lower == upper:
+        return ordered[lower]
+    weight = position - lower
+    return ordered[lower] * (1.0 - weight) + ordered[upper] * weight
+
+
+def summarize_binary_subset(
+    subset: tuple[str, str],
+    projections: list[BinaryProjection],
+    bins: int,
+) -> tuple[CoverageSummary, list[int]]:
+    bin_counts = [0] * bins
+    coordinates: list[tuple[float]] = []
+    for projection in projections:
+        bin_counts[binary_bin_index(projection.normalized_fraction_b, bins)] += 1
+        coordinates.append((projection.normalized_fraction_b,))
+    occupied, occupied_fraction = occupied_bin_fraction(bin_counts, bins)
+    nn_distances = nearest_neighbor_distances(coordinates)
+    return CoverageSummary(
+        subset_label="-".join(subset), subset_size=2, dimensions=1,
+        structure_count=len(projections), total_bins=bins,
+        occupied_bins=occupied, occupied_bin_fraction=occupied_fraction,
+        normalized_entropy=normalized_entropy(bin_counts, bins),
+        max_bin_fraction=max_bin_fraction(bin_counts), gini=gini(bin_counts),
+        nn_distance_mean=statistics.fmean(nn_distances) if nn_distances else None,
+        nn_distance_p95=percentile95(nn_distances),
+    ), bin_counts
+
+
+def summarize_ternary_subset(
+    subset: tuple[str, str, str],
+    projections: list[TernaryProjection],
+    resolution: int,
+) -> tuple[CoverageSummary, dict[tuple[int, int, int], int]]:
+    bin_counts: dict[tuple[int, int, int], int] = {}
+    coordinates: list[tuple[float, float]] = []
+    for projection in projections:
+        bin_index = ternary_bin_index(projection.barycentric, resolution)
+        bin_counts[bin_index] = bin_counts.get(bin_index, 0) + 1
+        coordinates.append(barycentric_to_cartesian(projection.barycentric))
+    total_bins = ternary_bin_count(resolution)
+    dense_counts = list(bin_counts.values()) + [0] * (total_bins - len(bin_counts))
+    occupied, occupied_fraction = occupied_bin_fraction(dense_counts, total_bins)
+    nn_distances = nearest_neighbor_distances(coordinates)
+    return CoverageSummary(
+        subset_label="-".join(subset), subset_size=3, dimensions=2,
+        structure_count=len(projections), total_bins=total_bins,
+        occupied_bins=occupied, occupied_bin_fraction=occupied_fraction,
+        normalized_entropy=normalized_entropy(dense_counts, total_bins),
+        max_bin_fraction=max_bin_fraction(dense_counts), gini=gini(dense_counts),
+        nn_distance_mean=statistics.fmean(nn_distances) if nn_distances else None,
+        nn_distance_p95=percentile95(nn_distances),
+    ), bin_counts
+
+
+def collect_pair_frequency_points(
+    compositions: list[StructureComposition],
+) -> dict[tuple[str, str], list[PairFrequencyPoint]]:
+    """Build pair-frequency report points from canonical composition records."""
+
+    pair_fraction_counts: dict[tuple[str, str], Counter[float]] = {}
+    pair_fraction_distinct: dict[tuple[str, str], dict[float, set[int]]] = {}
+    for composition in compositions:
+        distinct_count = len(composition.unique_elements)
+        for index, element_a in enumerate(composition.unique_elements):
+            for element_b in composition.unique_elements[index + 1:]:
+                pair = (element_a, element_b)
+                fraction = composition.element_fractions[element_b]
+                pair_fraction_counts.setdefault(pair, Counter())[fraction] += 1
+                pair_fraction_distinct.setdefault(pair, {}).setdefault(fraction, set()).add(distinct_count)
+    points: dict[tuple[str, str], list[PairFrequencyPoint]] = {}
+    for pair, counts in pair_fraction_counts.items():
+        points[pair] = [
+            PairFrequencyPoint(pair, fraction, frequency, distinct)
+            for fraction, frequency in sorted(counts.items())
+            for distinct in sorted(pair_fraction_distinct[pair][fraction])
+        ]
+    return points
+
+
+def fraction_label(value: float) -> str:
+    fraction = Fraction(value).limit_denominator()
+    if math.isclose(float(fraction), value, rel_tol=0.0, abs_tol=1e-12):
+        return f"{fraction.numerator}/{fraction.denominator}"
+    return f"{value:.6f}"
 
 
 def composition_projection_bins(atoms: Any) -> dict[str, list[tuple]]:
@@ -823,9 +1104,15 @@ def build_composition_aware_candidate_set(
 
 
 __all__ = [
+    "BinaryProjection",
     "COMPOSITION_AWARE_BINARY_BINS",
     "COMPOSITION_AWARE_NOVELTY_FLOOR_FRACTION",
     "COMPOSITION_AWARE_TERNARY_RESOLUTION",
+    "CoverageSummary",
+    "PairFrequencyPoint",
+    "SQRT3_OVER_2",
+    "StructureComposition",
+    "TernaryProjection",
     "_selected_count",
     "binary_bin_index",
     "build_composition_aware_candidate_set",
@@ -836,22 +1123,38 @@ __all__ = [
     "calculate_mean_nearest_distance",
     "calculate_min_distance",
     "calculate_positive_min_distance",
+    "barycentric_to_cartesian",
+    "collect_binary_projections",
+    "collect_pair_frequency_points",
+    "collect_ternary_projections",
+    "composition_from_atoms",
     "composition_projection_bins",
     "composition_sparsity_reward",
     "descriptor_distance",
     "extract_composition_fractions",
+    "fraction_label",
     "flatten_single_column_distances",
     "initialize_nearest_distances",
     "largest_remainder_integer_partition",
     "mean",
     "min_max_normalize",
     "nearest_descriptor_distance",
+    "nearest_neighbor_distances",
+    "nearest_representation_distances",
     "normalize_subset_fractions",
+    "normalize_composition_subset",
     "normalized_entropy",
+    "occupied_bin_fraction",
+    "percentile95",
     "select_best_sampling_attempt",
     "select_farthest_points",
     "select_farthest_points_for_target",
     "ternary_bin_count",
+    "ternary_bin_center",
     "ternary_bin_index",
+    "summarize_binary_subset",
+    "summarize_ternary_subset",
+    "gini",
+    "max_bin_fraction",
     "update_nearest_distances",
 ]

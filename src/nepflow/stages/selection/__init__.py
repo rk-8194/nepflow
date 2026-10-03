@@ -1,69 +1,19 @@
-"""Canonical selection stage and supporting services."""
+"""Canonical selection stage boundary.
 
-from .representations import (
-    compute_descriptors_batched,
-    compute_structure_descriptors,
-    descriptor_cache_path,
-    descriptor_manifest_path,
-    load_or_calculate_representations,
-)
-from .sampling import (
-    binary_bin_index,
-    build_composition_aware_candidate_set,
-    calculate_composition_coverage_metrics,
-    calculate_cross_distance_stats,
-    calculate_mean_nearest_distance,
-    calculate_min_distance,
-    calculate_positive_min_distance,
-    composition_aware_attempt_schedule,
-    composition_aware_attempt_score,
-    composition_projection_bins,
-    descriptor_distance,
-    select_farthest_points,
-    select_farthest_points_for_target,
-)
-from .models import SelectionResult
-from .persistence import (
-    candidate_set_fingerprint,
-    persist_selection_result,
-    restore_selection_result,
-    selection_run_id,
-    structure_ids,
-)
-from .stage import SelectionStage
-from .strategy import (
-    select_composition_aware_training_set,
-    select_test_set,
-    select_training_set,
-)
+Scientific services are imported from their owning modules (for example
+``selection.sampling`` and ``selection.representations``). Keeping this
+package root narrow avoids making optional descriptor dependencies a package
+import requirement.
+"""
 
-__all__ = [
-    "calculate_cross_distance_stats",
-    "binary_bin_index",
-    "build_composition_aware_candidate_set",
-    "calculate_composition_coverage_metrics",
-    "composition_aware_attempt_schedule",
-    "composition_aware_attempt_score",
-    "composition_projection_bins",
-    "compute_descriptors_batched",
-    "compute_structure_descriptors",
-    "descriptor_distance",
-    "descriptor_cache_path",
-    "descriptor_manifest_path",
-    "load_or_calculate_representations",
-    "calculate_mean_nearest_distance",
-    "calculate_min_distance",
-    "calculate_positive_min_distance",
-    "select_composition_aware_training_set",
-    "select_farthest_points",
-    "select_farthest_points_for_target",
-    "select_test_set",
-    "select_training_set",
-    "SelectionResult",
-    "SelectionStage",
-    "candidate_set_fingerprint",
-    "persist_selection_result",
-    "restore_selection_result",
-    "selection_run_id",
-    "structure_ids",
-]
+from __future__ import annotations
+
+__all__ = ["SelectionStage"]
+
+
+def __getattr__(name: str):
+    if name == "SelectionStage":
+        from .stage import SelectionStage
+
+        return SelectionStage
+    raise AttributeError(name)

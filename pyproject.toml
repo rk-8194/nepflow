@@ -45,3 +45,6 @@ disable = [
 [tool.pyright]
 include = ["src"]
 pythonVersion = "3.11"
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]

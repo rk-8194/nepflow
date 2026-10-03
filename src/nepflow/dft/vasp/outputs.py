@@ -562,6 +562,54 @@ def parse_performance_evidence(outcar_text: str) -> VaspPerformanceEvidence:
     )
 
 
+def parse_memory_record(outcar_path: Path, gpus_per_node: int) -> dict[str, object] | None:
+    """Parse one historical ``.vasp_memory`` row through VASP-owned logic."""
+
+    if gpus_per_node < 1:
+        raise ValueError("gpus_per_node must be positive")
+    outcar_path = Path(outcar_path)
+    struct_dir = outcar_path.parent
+    poscar = struct_dir / "POSCAR"
+    incar = struct_dir / "INCAR"
+    if not poscar.exists() or not incar.exists() or not outcar_is_complete(outcar_path):
+        return None
+    try:
+        poscar_lines = poscar.read_text(encoding="utf-8", errors="replace").splitlines()
+        n_atoms = sum(int(value) for value in poscar_lines[6].split())
+        ncore = 0
+        kpar = 0
+        for line in incar.read_text(encoding="utf-8", errors="replace").splitlines():
+            match = re.match(r"\s*(NCORE|KPAR)\s*=\s*([^#!]+)", line, re.IGNORECASE)
+            if not match:
+                continue
+            value = int(float(match.group(2).strip()))
+            if match.group(1).upper() == "NCORE":
+                ncore = value
+            else:
+                kpar = value
+        performance = parse_performance_evidence(
+            outcar_path.read_text(encoding="utf-8", errors="replace")
+        )
+        if not performance.loop_times:
+            return None
+        total_ranks = performance.total_ranks
+        nodes = max(1, total_ranks // gpus_per_node) if total_ranks > 0 else 1
+        gpus = total_ranks if total_ranks > 0 else gpus_per_node
+        return {
+            "n_atoms": n_atoms,
+            "n_kpoints_irr": performance.irreducible_kpoints,
+            "n_electrons": int(performance.electrons),
+            "nodes": nodes,
+            "gpus": gpus,
+            "ncore": ncore,
+            "kpar": kpar,
+            "avg_loop_time": f"{performance.average_loop_time:.4f}",
+            "oom": 0,
+        }
+    except (OSError, IndexError, TypeError, ValueError):
+        return None
+
+
 __all__ = [
     "DftOutputValidationError",
     "ResolvedVaspOutput",
@@ -575,6 +623,7 @@ __all__ = [
     "parse_outcar",
     "parse_outcar_result",
     "parse_performance_evidence",
+    "parse_memory_record",
     "parse_stress_from_outcar",
     "parse_virial_from_outcar",
     "resolve_verified_output",
