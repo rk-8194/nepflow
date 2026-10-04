@@ -37,7 +37,25 @@ jobs:
           python -m pip install pytest
 
       - name: Check unique test basenames
-        run: python -c "from collections import Counter; from pathlib import Path; names = [path.name for path in Path('tests').rglob('test*.py')]; duplicates = sorted(name for name, count in Counter(names).items() if count > 1); assert not duplicates, f'Duplicate test basenames: {duplicates}'"
+        run: |
+          python - <<'PY'
+          from collections import defaultdict
+          from pathlib import Path
+
+          names = defaultdict(list)
+          for path in Path("tests").rglob("test*.py"):
+              names[path.name].append(str(path))
+
+          duplicates = {
+              name: paths
+              for name, paths in names.items()
+              if len(paths) > 1
+          }
+          if duplicates:
+              raise SystemExit(
+                  f"Duplicate pytest module basenames: {duplicates}"
+              )
+          PY
 
       - name: Compile package and tests
         run: python -m compileall -q src tests
