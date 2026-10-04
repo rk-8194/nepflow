@@ -1,8 +1,5 @@
 {
+  "include": ["src/nepflow"],
   "pythonVersion": "3.11",
-  "pythonPath": "./src",
-  "venvPath": ".",
-  "typeCheckingMode": "basic",
-  "reportMissingImports": false,
-  "reportMissingTypeStubs": false
+  "typeCheckingMode": "standard"
 }

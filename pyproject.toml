@@ -30,15 +30,21 @@ package-dir = {"" = "src"}
 where = ["src"]
 include = ["nepflow*"]
 
-[tool.pylint.messages_control]
-disable = [
-    "missing-docstring",
-    "trailing-whitespace",
-    "wrong-import-position",
-    "import-outside-toplevel",
-    "trailing-newlines",
-]
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+extend-exclude = ["archive", "projects", "reports"]
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["nepflow"]
+
+[tool.ruff.format]
+line-ending = "lf"
 
 [tool.pyright]
-include = ["src"]
+include = ["src/nepflow"]
 pythonVersion = "3.11"
+typeCheckingMode = "standard"

@@ -34,7 +34,39 @@ jobs:
       - name: Install NEPFlow and test runner
         run: |
           python -m pip install -e .
-          python -m pip install pytest
+          python -m pip install pytest ruff
+
+      - name: Check Ruff formatting
+        run: ruff format --check .
+
+      - name: Run Ruff lint checks
+        run: ruff check .
+
+      - name: Check tracked repository hygiene
+        run: |
+          python - <<'PY'
+          import subprocess
+          from pathlib import PurePosixPath
+
+          tracked = subprocess.check_output(
+              ["git", "ls-files", "-z"], text=False
+          ).decode().split("\0")
+          tracked = [path for path in tracked if path]
+
+          prohibited = []
+          for path in tracked:
+              parts = PurePosixPath(path).parts
+              if "__pycache__" in parts or path.endswith((".pyc", ".pyo")):
+                  prohibited.append(path)
+              if path.startswith("projects/project_"):
+                  prohibited.append(path)
+
+          if prohibited:
+              raise SystemExit(
+                  "Tracked generated/local artifacts found:\n"
+                  + "\n".join(sorted(set(prohibited)))
+              )
+          PY
 
       - name: Check unique test basenames
         run: |
@@ -58,7 +90,7 @@ jobs:
           PY
 
       - name: Compile package and tests
-        run: python -m compileall -q src tests
+        run: python -m compileall -q src tests utilities examples
 
       - name: Collect tests
         run: python -m pytest --collect-only -q
