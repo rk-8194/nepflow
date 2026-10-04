@@ -43,8 +43,3 @@ known-first-party = ["nepflow"]
 
 [tool.ruff.format]
 line-ending = "lf"
-
-[tool.pyright]
-include = ["src/nepflow"]
-pythonVersion = "3.11"
-typeCheckingMode = "standard"

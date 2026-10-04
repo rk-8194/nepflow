@@ -25,3 +25,5 @@ __pycache__/
 *.npy
 *.png
 *.xyz
+!tests/fixtures/
+!tests/fixtures/**

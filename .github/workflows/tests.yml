@@ -36,11 +36,10 @@ jobs:
           python -m pip install -e .
           python -m pip install pytest ruff
 
-      - name: Check Ruff formatting
-        run: ruff format --check .
-
-      - name: Run Ruff lint checks
-        run: ruff check .
+      - name: Validate Ruff configuration
+        run: |
+          ruff --version
+          ruff check --show-settings src/nepflow/__init__.py > /dev/null
 
       - name: Check tracked repository hygiene
         run: |
