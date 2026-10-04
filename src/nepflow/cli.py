@@ -5,10 +5,10 @@ NEPFlow: HPC workflow system for atomistic datasets.
 Entry point for the workflow controller.
 """
 
-import sys
 import argparse
 import logging
 import os
+import sys
 import time
 from pathlib import Path
 
@@ -41,237 +41,60 @@ if _missing:
 # Package root used for the project-output default below.
 _SOURCE_ROOT = Path(__file__).resolve().parents[1]
 
-from nepflow.errors import SchedulerError, StateError, ValidationError
-from nepflow.cli_wizard import CONFIG_PROMPTS, ConfigWizard
-from nepflow.hpc.process import ProcessError, ProcessRunner
-from nepflow.hpc.slurm import SlurmScheduler
-from nepflow.logging import configure_logging
-from nepflow.config.loader import canonical_config_path
-from nepflow.reporting import WorkflowStatusPresenter
-from nepflow.stages.dft import DftStage
-from nepflow.stages.generation import GenerationStage
-from nepflow.stages.generation.debug import run_debug
-from nepflow.stages.selection import SelectionStage
-from nepflow.stages.training import TrainingStage
-from nepflow.stages.validation import ValidationStage
-from nepflow.workflow import (
+from nepflow.application.composition import (  # noqa: E402
+    build_generation_stage as _compose_generation_stage,
+    compose_stage_registry as _compose_stage_registry,
+    offer_project_upload as _offer_project_upload_impl,
+)
+from nepflow.application.runtime import (  # noqa: E402
+    create_process_runner,
+    create_scheduler,
+    resolve_resubmit_command as _resolve_runtime_resubmit_command,
+    resubmit_slurm_job as _resubmit_runtime_job,
+)
+from nepflow.config.loader import canonical_config_path  # noqa: E402
+from nepflow.errors import (  # noqa: E402
+    ProcessError,
+    SchedulerError as _SchedulerError,
+    StateError,
+    ValidationError,
+)
+from nepflow.logging import configure_logging  # noqa: E402
+from nepflow.reporting import WorkflowStatusPresenter  # noqa: E402
+from nepflow.stages.generation import GenerationStage  # noqa: E402
+from nepflow.workflow import (  # noqa: E402
+    SelfResubmitExit,
     StageContext,
     StageRegistry,
-    StageRunResult,
-    StageRunState,
-    SelfResubmitExit,
     WorkflowController,
-    WorkflowStage,
-    resolve_resubmit_command as canonical_resolve_resubmit_command,
 )
 
 logger = logging.getLogger("nepflow")
-process_runner = ProcessRunner(logger=logger)
-scheduler = SlurmScheduler(process_runner=process_runner)
+SchedulerError = _SchedulerError
+process_runner = create_process_runner(logger)
+scheduler = create_scheduler(process_runner)
 
 
 def _build_generation_stage(context: StageContext) -> GenerationStage:
-    """Compose legacy scientific generators behind the canonical stage seam."""
+    """Preserve the historical CLI composition seam."""
 
-    config = context.config
-    if config is None:
-        raise ValidationError("Generation requires the validated typed project config")
-
-    if context.debug:
-        return GenerationStage(
-            generators=(),
-            coordinator=None,
-            state_store=context.state_store,
-            debug_runner=run_debug,
-            logger=logger,
-        )
-
-    # These imports stay at the application composition root.  GenerationStage
-    # itself owns only orchestration and provenance.
-    from nepflow.stages.generation.generators import (
-        MaterialsProjectGenerator,
-        RandomSolidSolutionGenerator,
-        SQSGenerator,
-        SegregatedGenerator,
-        build_materials_project_fetcher,
-    )
-    from nepflow.stages.generation.perturbations import PerturbationCoordinator
-
-    composition = config.composition
-    generation = config.generation
-    configured_generators = []
-    if generation.use_materials_project:
-        try:
-            fetcher = build_materials_project_fetcher(
-                api_key=config.materials_project.api_key,
-            )
-            configured_generators.append(
-                (
-                    "MaterialsProject",
-                    MaterialsProjectGenerator(
-                        fetcher,
-                        max_per_composition=5,
-                        gas_elements=list(composition.gas_elements),
-                    ),
-                )
-            )
-        except Exception as exc:
-            raise RuntimeError(
-                "Cannot initialise the enabled Materials Project generator"
-            ) from exc
-
-    if generation.use_random_solid_solution:
-        configured_generators.append(
-            (
-                "RandomSolidSolution",
-                RandomSolidSolutionGenerator(
-                    n_structures=generation.n_random_solid_solution,
-                    random_seed=config.project.random_seed,
-                ),
-            )
-        )
-    if generation.use_sqs:
-        configured_generators.append(
-            (
-                "SQS",
-                SQSGenerator(
-                    n_structures=generation.n_sqs,
-                    random_seed=config.project.random_seed,
-                ),
-            )
-        )
-    if generation.use_segregated:
-        configured_generators.append(
-            (
-                "Segregated",
-                SegregatedGenerator(
-                    n_structures=generation.n_segregated,
-                    random_seed=config.project.random_seed,
-                ),
-            )
-        )
-
-    coordinator = None
-    if not context.debug:
-        coordinator = PerturbationCoordinator(
-            rattle_std=generation.rattle_std,
-            rattle_std_min=generation.rattle_std_min,
-            rattle_std_max=generation.rattle_std_max,
-            rattle_d_min=generation.rattle_d_min,
-            vacancy_range=(generation.vacancy_min, generation.vacancy_max),
-            interstitial_range=(generation.interstitial_min, generation.interstitial_max),
-            interstitial_d_min=generation.interstitial_d_min,
-            volume_scale_range=(generation.volume_scale_min, generation.volume_scale_max),
-            n_volume_points=generation.n_volume_points,
-            target_n_atoms=generation.target_n_atoms,
-            random_seed=config.project.random_seed,
-            gas_elements=list(composition.gas_elements),
-            gas_interstitial_d_min=generation.gas_interstitial_d_min,
-            max_gas_occupancy=generation.max_gas_occupancy,
-            elastic_stress_enabled=generation.elastic_stress_enabled,
-            elastic_strain_amplitudes=list(generation.elastic_strain_amplitudes),
-            liquid_enabled=generation.use_liquid,
-            liquid_temperature_k=generation.liquid_temperature,
-            liquid_timestep_fs=generation.liquid_timestep_fs,
-            liquid_equilibration_steps=generation.liquid_equilibration_steps,
-            liquid_steps_between_snapshots=generation.liquid_steps_between_snapshots,
-            liquid_friction=generation.liquid_friction,
-        )
-
-    return GenerationStage(
-        generators=configured_generators,
-        coordinator=coordinator,
-        state_store=context.state_store,
-        debug_runner=run_debug,
-        logger=logger,
-    )
+    return _compose_generation_stage(context, logger=logger)
 
 
 def _offer_project_upload(context: StageContext) -> None:
     """Offer the local seeds-only result to the configured remote project."""
 
-    config = context.config
-    scp_address = "" if config is None else config.hpc.scp_address
-    if not scp_address:
-        return
-    answer = input("Upload project to remote NEPFlow folder? [y/N]: ").strip().lower()
-    if answer not in {"y", "yes"}:
-        return
-    process_runner.run(
-        [
-            "scp",
-            "-r",
-            str(context.project_dir),
-            f"{scp_address}/projects/{context.project_dir.name}",
-        ],
-        check=True,
-        capture_output=False,
-    )
+    _offer_project_upload_impl(context, process_runner=process_runner)
 
 
 def compose_stage_registry() -> StageRegistry:
     """Compose canonical workflow stages behind the application seam."""
 
-    registry = StageRegistry()
-
-    def run_initialization(context: StageContext) -> None:
-        from nepflow.workflow.initialization import ProjectCreationService
-
-        service = ProjectCreationService(
-            context.project_name,
-            context.config_file,
-            context.state_file,
-            context.project_dir,
-        )
-        prompt_values = None
-        if service.requires_prompt_values():
-            wizard = ConfigWizard(context.project_name)
-            wizard.present_header()
-            prompt_values = wizard.collect_prompt_values(CONFIG_PROMPTS)
-        service.run(prompt_values=prompt_values)
-
-    registry.register(
-        WorkflowStage.INIT,
-        run_initialization,
+    return _compose_stage_registry(
+        logger=logger,
+        process_runner=process_runner,
+        scheduler=scheduler,
     )
-
-    def run_generation(context: StageContext) -> StageRunResult:
-        result = _build_generation_stage(context).run(context)
-        if context.seeds_only and result.base_structures:
-            _offer_project_upload(context)
-        return StageRunResult(
-            stage=WorkflowStage.GENERATE,
-            status=StageRunState.COMPLETED,
-            advanced_to=WorkflowStage.SELECT,
-            completed=result.completed,
-            message=result.status,
-        )
-
-    registry.register(WorkflowStage.GENERATE, run_generation)
-    def run_selection(context: StageContext) -> StageRunResult:
-        SelectionStage(context=context).run()
-        return StageRunResult(
-            stage=WorkflowStage.SELECT,
-            status=StageRunState.COMPLETED,
-            advanced_to=WorkflowStage.RUN_VASP,
-            completed=True,
-        )
-
-    registry.register(WorkflowStage.SELECT, run_selection)
-    def run_dft(context: StageContext) -> StageRunResult:
-        return DftStage(scheduler=scheduler).run(context).as_workflow_result()
-
-    registry.register(WorkflowStage.RUN_VASP, run_dft)
-    registry.register(
-        WorkflowStage.TRAIN_NEP,
-        lambda context: TrainingStage(scheduler=scheduler).run(context),
-    )
-
-    def run_validation(context: StageContext) -> StageRunResult:
-        return ValidationStage(context=context, scheduler=scheduler).run().as_workflow_result()
-
-    registry.register(WorkflowStage.VALIDATE, run_validation)
-    return registry
 
 
 def _resolve_project_config_path(project_name: str, output_dir: Path) -> Path:
@@ -388,7 +211,7 @@ def _get_slurm_walltime_info() -> tuple[int | None, str]:
 
 def _resolve_resubmit_command() -> tuple[list[str], Path, str]:
     """Resolve self-resubmission through the canonical workflow boundary."""
-    return canonical_resolve_resubmit_command(
+    return _resolve_runtime_resubmit_command(
         workdir=Path.cwd(),
         scheduler=scheduler,
     )
@@ -401,75 +224,54 @@ def _resubmit_slurm_job(debug: bool = False) -> None:
     If debug=True, simulates the resubmission without actually launching.
     """
     command, submit_cwd, submit_source = _resolve_resubmit_command()
-
-    logger.info("SLURM walltime deadline approaching - resubmitting nepflow")
-
-    if debug:
-        logger.info(
-            "[DEBUG] Would resubmit with: %s (cwd=%s, source=%s)",
-            " ".join(command),
-            submit_cwd,
-            submit_source,
-        )
-        return
-
-    try:
-        result = scheduler.submit(command, cwd=submit_cwd)
-        logger.info("Resubmission via sbatch: %s", result.stdout.strip())
-    except SchedulerError as e:
-        stderr = e.stderr or ""
-        stdout = e.stdout or ""
-        logger.error(
-            "Could not resubmit job via %s: %s%s%s",
-            submit_source,
-            e,
-            f" | stdout: {stdout.strip()}" if stdout.strip() else "",
-            f" | stderr: {stderr.strip()}" if stderr.strip() else "",
-        )
-        raise
-
-
-def main():
-    """Main entry point."""
-    parser = create_parser()
-    args = parser.parse_args()
-
-    if args.config:
-        project_config = _resolve_project_config_path(args.project, args.output_dir)
-        project_dir = args.output_dir / f"project_{args.project}"
-        project_dir.mkdir(parents=True, exist_ok=True)
-        try:
-            process_runner.run(
-                ["vim", str(project_config)],
-                check=False,
-                cwd=project_dir,
-                capture_output=False,
-            )
-        except ProcessError as e:
-            if e.kind != "not_found":
-                raise
-            raise FileNotFoundError("vim was not found on PATH") from e
-        return
-
-    # Setup logging for the project
-    # Log directory is inside each project: projects/project_{name}/logs/
-    project_dir = args.output_dir / f"project_{args.project}"
-    log_dir = project_dir / "logs"
-
-    configure_logging(
-        project_name=args.project,
-        log_dir=log_dir,
-        debug=args.debug,
+    _resubmit_runtime_job(
+        command,
+        submit_cwd,
+        submit_source,
+        debug=debug,
+        logger=logger,
+        scheduler=scheduler,
     )
 
+
+def _open_project_config(args: argparse.Namespace) -> None:
+    """Open the requested project config and preserve the CLI error contract."""
+
+    project_config = _resolve_project_config_path(args.project, args.output_dir)
+    project_dir = args.output_dir / f"project_{args.project}"
+    project_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        process_runner.run(
+            ["vim", str(project_config)],
+            check=False,
+            cwd=project_dir,
+            capture_output=False,
+        )
+    except ProcessError as exc:
+        if exc.kind != "not_found":
+            raise
+        raise FileNotFoundError("vim was not found on PATH") from exc
+
+
+def _configure_project_logging(args: argparse.Namespace) -> None:
+    """Configure project logging before workflow composition."""
+
+    project_dir = args.output_dir / f"project_{args.project}"
+    configure_logging(
+        project_name=args.project,
+        log_dir=project_dir / "logs",
+        debug=args.debug,
+    )
     logger.info("NEPFlow started for project: %s", args.project)
     if args.debug:
         logger.debug("Debug mode enabled")
 
+
+def _resolve_slurm_deadline() -> float | None:
+    """Resolve and log the deadline used to protect an active SLURM job."""
+
     print("[nepflow] Checking SLURM walltime (DEBUG)", file=sys.stderr)
     logger.debug("Checking for SLURM walltime...")
-
-    # Get SLURM walltime info (None if not running under SLURM)
     try:
         walltime_remaining, walltime_source = _get_slurm_walltime_info()
         print(
@@ -477,27 +279,34 @@ def main():
             f"remaining={walltime_remaining}, source={walltime_source}",
             file=sys.stderr,
         )
-    except Exception as e:
-        print(f"[nepflow] ERROR detecting SLURM walltime: {e}", file=sys.stderr)
-        logger.error("Error detecting SLURM walltime: %s", e)
+    except Exception as exc:
+        print(f"[nepflow] ERROR detecting SLURM walltime: {exc}", file=sys.stderr)
+        logger.error("Error detecting SLURM walltime: %s", exc)
         walltime_remaining, walltime_source = None, "error"
 
-    margin_seconds = 300  # 5 minutes before deadline
-
+    margin_seconds = 300
     if walltime_remaining is None:
-        logger.info("Not running under SLURM - no walltime limit, workflow will run indefinitely")
-        slurm_deadline = None
-    else:
-        slurm_deadline = time.time() + walltime_remaining - margin_seconds
         logger.info(
-            "SLURM walltime: %ds (source: %s), deadline in %ds",
-            walltime_remaining,
-            walltime_source,
-            walltime_remaining - margin_seconds,
+            "Not running under SLURM - no walltime limit, workflow will run indefinitely"
         )
+        return None
+    deadline = time.time() + walltime_remaining - margin_seconds
+    logger.info(
+        "SLURM walltime: %ds (source: %s), deadline in %ds",
+        walltime_remaining,
+        walltime_source,
+        walltime_remaining - margin_seconds,
+    )
+    return deadline
 
-    # Create workflow controller
-    controller = WorkflowController(
+
+def _create_controller(
+    args: argparse.Namespace,
+    slurm_deadline: float | None,
+) -> WorkflowController:
+    """Compose the workflow controller from parsed application arguments."""
+
+    return WorkflowController(
         project_name=args.project,
         output_dir=args.output_dir,
         init_mode=args.init,
@@ -508,8 +317,34 @@ def main():
         stage_registry=compose_stage_registry(),
     )
 
-    # Run workflow: controller reconciles StateStore-backed workflow state.
-    # If under SLURM and approaching deadline, resubmit before running
+
+def _report_workflow_failure(exc: Exception, *, debug: bool) -> None:
+    """Print the established user-facing workflow failure report."""
+
+    logger.error("Workflow failed: %s", exc)
+    print("\n" + "=" * 70, file=sys.stderr)
+    print("ERROR: Workflow failed", file=sys.stderr)
+    print("=" * 70, file=sys.stderr)
+    print("  %s: %s" % (type(exc).__name__, exc), file=sys.stderr)
+    if debug:
+        print("\nTraceback:", file=sys.stderr)
+        print("-" * 70, file=sys.stderr)
+        import traceback
+
+        traceback.print_exc(file=sys.stderr)
+        print("-" * 70, file=sys.stderr)
+    else:
+        print("\n  Use --debug for full traceback", file=sys.stderr)
+    print("=" * 70 + "\n", file=sys.stderr)
+
+
+def _run_controller(
+    args: argparse.Namespace,
+    controller: WorkflowController,
+    slurm_deadline: float | None,
+) -> None:
+    """Run the controller and handle resubmission and user-facing failures."""
+
     try:
         if not args.init:
             WorkflowStatusPresenter(logger).log(controller.workflow_state)
@@ -517,40 +352,28 @@ def main():
             logger.warning("Already past SLURM deadline - resubmitting immediately")
             _resubmit_slurm_job(debug=args.debug)
             return
-
         controller.run()
         logger.info("Workflow completed successfully")
         print("Workflow completed successfully")
-
-    except SelfResubmitExit as e:
-        # Workflow reached SLURM deadline - resubmit
-        logger.info("Workflow resubmit triggered: %s", e)
+    except SelfResubmitExit as exc:
+        logger.info("Workflow resubmit triggered: %s", exc)
         _resubmit_slurm_job(debug=args.debug)
         logger.info("Resubmission initiated, exiting")
-        return
-
-    except (ValueError, IOError, RuntimeError, StateError, ValidationError) as e:
-        # Log the error (message only, not traceback)
-        logger.error("Workflow failed: %s", e)
-
-        # Print formatted error message
-        print("\n" + "=" * 70, file=sys.stderr)
-        print("ERROR: Workflow failed", file=sys.stderr)
-        print("=" * 70, file=sys.stderr)
-        print("  %s: %s" % (type(e).__name__, e), file=sys.stderr)
-
-        if args.debug:
-            print("\nTraceback:", file=sys.stderr)
-            print("-" * 70, file=sys.stderr)
-            import traceback
-
-            traceback.print_exc(file=sys.stderr)
-            print("-" * 70, file=sys.stderr)
-        else:
-            print("\n  Use --debug for full traceback", file=sys.stderr)
-
-        print("=" * 70 + "\n", file=sys.stderr)
+    except (ValueError, IOError, RuntimeError, StateError, ValidationError) as exc:
+        _report_workflow_failure(exc, debug=args.debug)
         sys.exit(1)
+
+
+def main() -> None:
+    """Parse arguments, compose the application, and run the workflow."""
+
+    args = create_parser().parse_args()
+    if args.config:
+        _open_project_config(args)
+        return
+    _configure_project_logging(args)
+    slurm_deadline = _resolve_slurm_deadline()
+    _run_controller(args, _create_controller(args, slurm_deadline), slurm_deadline)
 
 
 if __name__ == "__main__":

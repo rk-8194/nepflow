@@ -7,13 +7,12 @@ from .creation import (
     validate_project_identity,
     write_validated_config,
 )
+from .legacy import load_legacy_config, to_legacy_config
 from .loader import (
     CANONICAL_CONFIG_NAME,
     canonical_config_path,
     find_config_path,
     load_config,
-    load_legacy_config,
-    to_legacy_config,
 )
 from .models import (
     CONFIG_SCHEMA_VERSION,
