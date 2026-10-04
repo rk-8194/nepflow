@@ -19,30 +19,23 @@ from nepflow.domain import (
     canonical_structure_text,
 )
 from nepflow.domain.models import ModelArtifactMetadata, ModelRunRecord
-from nepflow.state.store import StateStore
 from nepflow.domain.units import stress_kbar_to_ev_per_angstrom3, virial_from_stress
 
 
-def test_model_run_rejects_nep_input_artifact_identity_mismatch(tmp_path) -> None:
+def test_model_run_rejects_nep_input_artifact_identity_mismatch() -> None:
     identity = ModelRunIdentity("dataset-1", "a" * 64, "hyperparameters-1")
     model = ArtifactIdentity.from_bytes("nep_model", b"model")
     nep_in = ArtifactIdentity.from_bytes("nep_in", b"different-input")
 
-    with StateStore(tmp_path / "state.db") as store:
-        with pytest.raises(ValueError, match="nep_in_sha256|nep\\.in"):
-            store.upsert_model_run(
-                ModelRunRecord(
-                    identity,
-                    ModelArtifactMetadata(
-                        model=model,
-                        nep_in=nep_in,
-                        status="completed",
-                    ),
-                ),
+    with pytest.raises(ValueError, match="nep_in_sha256|nep\\.in"):
+        ModelRunRecord(
+            identity,
+            ModelArtifactMetadata(
+                model=model,
+                nep_in=nep_in,
                 status="completed",
-            )
-
-        assert store.get_model_run(identity.model_run_id) is None
+            ),
+        )
 
 
 def test_structure_identity_preserves_phase2_canonical_bytes() -> None:

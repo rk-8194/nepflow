@@ -438,8 +438,17 @@ def test_deterministic_identity_state_trace_reopens_as_one_chain() -> None:
             assert store.get_dft_calculation(calculation.calculation_id)["accepted_attempt_id"] == attempt_id
             assert store.get_dft_attempt(attempt_id)["status"] == "completed"
             assert store.get_dataset(dataset.dataset_id)["dataset_id"] == dataset.dataset_id
-            assert store.get_model_run(model.model_run_id)["dataset_id"] == dataset.dataset_id
-            assert store.get_model_run(model.model_run_id)["nep_in_sha256"] == nep_in_artifact.sha256
+            model_row = store.get_model_run(model.model_run_id)
+            assert model_row is not None
+            assert model_row["dataset_id"] == dataset.dataset_id
+            assert model_row["identity"]["nep_in_sha256"] == nep_in_artifact.sha256
+            assert model_row["identity"]["hyperparameters_hash"] == (
+                effective_hyperparameters.identity_hash()
+            )
+            linked = store.list_model_artifacts(model.model_run_id)
+            nep_inputs = [item for item in linked if item["role"] == "nep_in"]
+            assert len(nep_inputs) == 1
+            assert nep_inputs[0]["sha256"] == nep_in_artifact.sha256
             assert store.get_validation_run(validation.validation_run_id)["model_run_id"] == model.model_run_id
             assert store.list_validation_results(validation.validation_run_id)[0]["structure_id"] == structure.structure_id
 

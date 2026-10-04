@@ -42,25 +42,11 @@ vasp_command=vasp_std
 """.strip() + "\n"
 
 
-def make_controller(
-    tmp_path: Path,
-    stage: str = "validate",
+def build_test_registry(
     *,
-    debug: bool = False,
+    stage: str = "validate",
     stage_handler=None,
-) -> WorkflowController:
-    output_dir = tmp_path / "outputs"
-    project_dir = output_dir / "project_demo"
-    config_path = project_dir / "config" / "project.config"
-    config_path.parent.mkdir(parents=True)
-    config_path.write_text(VALID_PROJECT_CONFIG, encoding="utf-8")
-    (project_dir / ".project").write_text(stage, encoding="utf-8")
-    with StateStore(project_dir / "state.db") as store:
-        store.upsert_project(
-            "demo",
-            name="demo",
-            root_path=str(project_dir),
-        )
+) -> tuple[StageRegistry, dict[WorkflowStage, object]]:
     registry = StageRegistry()
     handlers = {
         workflow_stage: (lambda _context: None)
@@ -89,6 +75,32 @@ def make_controller(
             stage_handler,
             replace=True,
         )
+    return registry, handlers
+
+
+def make_controller(
+    tmp_path: Path,
+    stage: str = "validate",
+    *,
+    debug: bool = False,
+    stage_handler=None,
+) -> WorkflowController:
+    output_dir = tmp_path / "outputs"
+    project_dir = output_dir / "project_demo"
+    config_path = project_dir / "config" / "project.config"
+    config_path.parent.mkdir(parents=True)
+    config_path.write_text(VALID_PROJECT_CONFIG, encoding="utf-8")
+    (project_dir / ".project").write_text(stage, encoding="utf-8")
+    with StateStore(project_dir / "state.db") as store:
+        store.upsert_project(
+            "demo",
+            name="demo",
+            root_path=str(project_dir),
+        )
+    registry, handlers = build_test_registry(
+        stage=stage,
+        stage_handler=stage_handler,
+    )
     controller = WorkflowController(
         project_name="demo",
         output_dir=output_dir,
@@ -97,6 +109,24 @@ def make_controller(
     )
     controller.test_handlers = handlers
     return controller
+
+
+def reopen_controller(
+    tmp_path: Path,
+    *,
+    debug: bool = False,
+) -> WorkflowController:
+    output_dir = tmp_path / "outputs"
+    project_dir = output_dir / "project_demo"
+    assert (project_dir / "config" / "project.config").is_file()
+    assert (project_dir / "state.db").is_file()
+    registry, _ = build_test_registry()
+    return WorkflowController(
+        project_name="demo",
+        output_dir=output_dir,
+        debug=debug,
+        stage_registry=registry,
+    )
 
 
 def test_completed_stage_is_read_from_project_file(tmp_path: Path) -> None:
@@ -160,7 +190,8 @@ def _assert_failed_controller_run_does_not_advance(
         assert stage_row["status"] == StageRunState.FAILED.value
         assert store.get_stage_run(f"demo:{downstream.value}") is None
 
-    reopened = make_controller(tmp_path, stage=stage.value)
+    controller.project_file.unlink()
+    reopened = reopen_controller(tmp_path)
     assert reopened.current_stage() is stage
     with StateStore(reopened.state_file) as store:
         assert store.get_stage_run(f"demo:{stage.value}")["status"] == (
@@ -210,7 +241,8 @@ def test_terminal_dft_failure_stays_failed_after_controller_reopen(tmp_path: Pat
         assert store.get_stage_run("demo:run_vasp")["status"] == StageRunState.FAILED.value
         assert store.get_stage_run("demo:train_nep") is None
 
-    reopened = make_controller(tmp_path, stage=WorkflowStage.RUN_VASP.value)
+    controller.project_file.unlink()
+    reopened = reopen_controller(tmp_path)
     assert reopened.current_stage() is WorkflowStage.RUN_VASP
     with StateStore(reopened.state_file) as store:
         assert store.get_stage_run("demo:run_vasp")["status"] == StageRunState.FAILED.value
@@ -270,7 +302,8 @@ def test_terminal_training_failure_stays_failed_after_controller_reopen(tmp_path
         assert store.get_stage_run("demo:train_nep")["status"] == StageRunState.FAILED.value
         assert store.get_stage_run("demo:validate") is None
 
-    reopened = make_controller(tmp_path, stage=WorkflowStage.TRAIN_NEP.value)
+    controller.project_file.unlink()
+    reopened = reopen_controller(tmp_path)
     assert reopened.current_stage() is WorkflowStage.TRAIN_NEP
     with StateStore(reopened.state_file) as store:
         assert store.get_stage_run("demo:train_nep")["status"] == StageRunState.FAILED.value
