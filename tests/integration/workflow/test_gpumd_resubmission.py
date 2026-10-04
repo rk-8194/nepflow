@@ -12,6 +12,9 @@ from nepflow.mlip.gpumd import resubmission as module
 from nepflow.workflow.resubmission import resolve_resubmit_command
 
 
+REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
+
+
 class GpumdSelfResubmitTests(unittest.TestCase):
     def test_archive_and_promote_final_keeps_history_and_updates_model(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -64,7 +67,7 @@ class GpumdSelfResubmitTests(unittest.TestCase):
             result = subprocess.run(
                 [
                     sys.executable,
-                    "utilities/gpumd_self_resubmit.py",
+                    str(REPOSITORY_ROOT / "utilities" / "gpumd_self_resubmit.py"),
                     "--gpumd-command",
                     "fake-gpumd",
                     "--workdir",

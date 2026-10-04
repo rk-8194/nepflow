@@ -34,9 +34,9 @@ from nepflow.errors import StateError  # noqa: E402
 from nepflow.state.store import StateStore  # noqa: E402
 
 
-ROOT = Path(__file__).resolve().parents[1]
-OUTCAR_FIXTURE = ROOT / "tests" / "fixtures" / "outcar" / "valid_outcar"
-DFT_FIXTURE = ROOT / "tests" / "fixtures" / "structures" / "dft_reference.extxyz.fixture"
+TESTS_ROOT = Path(__file__).resolve().parents[1]
+OUTCAR_FIXTURE = TESTS_ROOT / "fixtures" / "outcar" / "valid_outcar"
+DFT_FIXTURE = TESTS_ROOT / "fixtures" / "structures" / "dft_reference.extxyz.fixture"
 
 
 def read_dft_fixture_as_vasp_result():
