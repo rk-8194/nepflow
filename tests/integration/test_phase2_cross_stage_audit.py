@@ -269,10 +269,14 @@ def test_deterministic_identity_state_trace_reopens_as_one_chain() -> None:
             code_version="trace-v1",
             config_fingerprint="config-v1",
         )
+        incar = project_dir / "INCAR"
+        incar.write_text("ENCUT = 520\nISMEAR = 0\n", encoding="utf-8")
+        potcar = project_dir / "POTCAR"
+        potcar.write_text("Si potential fixture\n", encoding="utf-8")
         calculation = DftCalculationIdentity(
             structure_id=structure.structure_id,
-            incar_hash="incar-v1",
-            potcar_hash="potcar-v1",
+            incar_hash=sha256_file(incar),
+            potcar_hash=sha256_file(potcar),
         )
         outcar_content = b"accepted fixture output\n"
         outcar_hash = sha256_bytes(outcar_content)
@@ -289,16 +293,14 @@ def test_deterministic_identity_state_trace_reopens_as_one_chain() -> None:
             units={"energy": "eV", "forces": "eV/Angstrom", "virial": "eV"},
             virial_convention="positive_compression",
         )
-        model = ModelRunIdentity(dataset.dataset_id, "nep-in-v1", "hyper-v1")
-        validation = ValidationRunIdentity(
-            model.model_run_id,
-            dataset.dataset_id,
-            {"protocol": "static-v1"},
-        )
         outcar = project_dir / "OUTCAR"
         outcar.write_bytes(outcar_content)
         nep_in = project_dir / "nep.in"
-        nep_in.write_text("type 1 Si\n", encoding="utf-8")
+        effective_hyperparameters = NepHyperparameters.from_legacy_config(audit_config())
+        nep_in.write_text(
+            NepInputRenderer().render_content(effective_hyperparameters),
+            encoding="utf-8",
+        )
         model_file = project_dir / "nep.txt"
         model_file.write_text("version 4\n", encoding="utf-8")
         report = project_dir / "validation.json"
@@ -308,6 +310,18 @@ def test_deterministic_identity_state_trace_reopens_as_one_chain() -> None:
         nep_in_artifact = ArtifactIdentity.from_file("nep_in", nep_in)
         model_artifact = ArtifactIdentity.from_file("nep_model", model_file)
         report_artifact = ArtifactIdentity.from_file("validation_report", report)
+        model = ModelRunIdentity(
+            dataset.dataset_id,
+            nep_in_artifact.sha256,
+            effective_hyperparameters.identity_hash(),
+        )
+        assert model.nep_in_sha256 == nep_in_artifact.sha256
+        assert model.hyperparameters_hash == effective_hyperparameters.identity_hash()
+        validation = ValidationRunIdentity(
+            model.model_run_id,
+            dataset.dataset_id,
+            {"protocol": "static-v1"},
+        )
         dataset_manifest = TrainingDatasetManifest(
             identity=dataset,
             records=(
@@ -328,7 +342,7 @@ def test_deterministic_identity_state_trace_reopens_as_one_chain() -> None:
             calculation_identity=calculation.to_dict(),
         )
         model_record = ModelRunRecord(
-            ModelRunIdentity(dataset.dataset_id, "nep-in-v1", "hyper-v1"),
+            model,
             ModelArtifactMetadata(
                 model=model_artifact,
                 nep_in=nep_in_artifact,
@@ -425,6 +439,7 @@ def test_deterministic_identity_state_trace_reopens_as_one_chain() -> None:
             assert store.get_dft_attempt(attempt_id)["status"] == "completed"
             assert store.get_dataset(dataset.dataset_id)["dataset_id"] == dataset.dataset_id
             assert store.get_model_run(model.model_run_id)["dataset_id"] == dataset.dataset_id
+            assert store.get_model_run(model.model_run_id)["nep_in_sha256"] == nep_in_artifact.sha256
             assert store.get_validation_run(validation.validation_run_id)["model_run_id"] == model.model_run_id
             assert store.list_validation_results(validation.validation_run_id)[0]["structure_id"] == structure.structure_id
 

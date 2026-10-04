@@ -180,7 +180,11 @@ def test_loader_uses_snake_case_model_fields_and_does_not_load_environment_secre
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("MP_API_KEY", "must-not-be-loaded")
-    text = BASE_CONFIG + "\n[train_nep]\nouterZBL = 2\n"
+    text = (
+        BASE_CONFIG
+        + "\n[materialsproject]\napi_key = historical-secret\n"
+        + "\n[train_nep]\nouterZBL = 2\n"
+    )
 
     config = load_config(write_config(tmp_path, text))
 

@@ -1,8 +1,20 @@
 from pathlib import Path
+from types import SimpleNamespace
 import pytest
 
 from nepflow.errors import StateError
 from nepflow.state import StateStore
+from nepflow.stages.dft.orchestrator import DftPreparationResult
+from nepflow.stages.dft.reconciliation import DftExecutionRecord, DftReconciliationResult
+from nepflow.stages.dft.stage import DftStage
+from nepflow.domain.datasets import DatasetIdentity, TrainingDatasetManifest
+from nepflow.stages.training.campaign import CampaignReconciliationResult
+from nepflow.stages.training.stage import TrainingStage
+from nepflow.stages.validation.reconciliation import (
+    ValidationExecutionRecord,
+    ValidationReconciliationResult,
+)
+from nepflow.stages.validation.stage import ValidationStageResult
 from nepflow.workflow import (
     StageRegistry,
     StageRunResult,
@@ -30,7 +42,13 @@ vasp_command=vasp_std
 """.strip() + "\n"
 
 
-def make_controller(tmp_path: Path, stage: str = "validate", *, debug: bool = False) -> WorkflowController:
+def make_controller(
+    tmp_path: Path,
+    stage: str = "validate",
+    *,
+    debug: bool = False,
+    stage_handler=None,
+) -> WorkflowController:
     output_dir = tmp_path / "outputs"
     project_dir = output_dir / "project_demo"
     config_path = project_dir / "config" / "project.config"
@@ -65,6 +83,12 @@ def make_controller(tmp_path: Path, stage: str = "validate", *, debug: bool = Fa
         )
 
     registry.register(WorkflowStage.VALIDATE, validate_handler, replace=True)
+    if stage_handler is not None:
+        registry.register(
+            WorkflowStage.from_legacy(stage),
+            stage_handler,
+            replace=True,
+        )
     controller = WorkflowController(
         project_name="demo",
         output_dir=output_dir,
@@ -113,3 +137,169 @@ def test_corrupt_workflow_stage_is_not_reset_to_init(tmp_path: Path) -> None:
 
     with pytest.raises(StateError, match="Invalid workflow stage"):
         controller.current_stage()
+
+
+def _assert_failed_controller_run_does_not_advance(
+    tmp_path: Path,
+    stage: WorkflowStage,
+    result: StageRunResult,
+    downstream: WorkflowStage,
+) -> None:
+    controller = make_controller(
+        tmp_path,
+        stage=stage.value,
+        stage_handler=lambda _context: result,
+    )
+
+    controller.run()
+
+    assert controller.current_stage() is stage
+    with StateStore(controller.state_file) as store:
+        stage_row = store.get_stage_run(f"demo:{stage.value}")
+        assert stage_row is not None
+        assert stage_row["status"] == StageRunState.FAILED.value
+        assert store.get_stage_run(f"demo:{downstream.value}") is None
+
+    reopened = make_controller(tmp_path, stage=stage.value)
+    assert reopened.current_stage() is stage
+    with StateStore(reopened.state_file) as store:
+        assert store.get_stage_run(f"demo:{stage.value}")["status"] == (
+            StageRunState.FAILED.value
+        )
+        assert store.get_stage_run(f"demo:{downstream.value}") is None
+
+
+def test_terminal_dft_failure_stays_failed_after_controller_reopen(tmp_path: Path) -> None:
+    class FailedPreparation:
+        def prepare_calculations(self, **_kwargs):
+            return DftPreparationResult(())
+
+    class FailedExecution:
+        def reconcile_once(self, _records):
+            return DftReconciliationResult(
+                (
+                    DftExecutionRecord(
+                        inputs=SimpleNamespace(),
+                        attempt_id="dft-attempt-failed",
+                        status="failed",
+                    ),
+                )
+            )
+
+    results = []
+
+    def failed_dft_handler(context):
+        result = DftStage(
+            orchestrator=FailedPreparation(),
+            execution_orchestrator=FailedExecution(),
+        ).run(context).as_workflow_result()
+        results.append(result)
+        return result
+
+    controller = make_controller(
+        tmp_path,
+        stage=WorkflowStage.RUN_VASP.value,
+        stage_handler=failed_dft_handler,
+    )
+    controller.run()
+
+    assert results[0].status is StageRunState.FAILED
+    assert results[0].advanced_to is None
+    assert controller.current_stage() is WorkflowStage.RUN_VASP
+    with StateStore(controller.state_file) as store:
+        assert store.get_stage_run("demo:run_vasp")["status"] == StageRunState.FAILED.value
+        assert store.get_stage_run("demo:train_nep") is None
+
+    reopened = make_controller(tmp_path, stage=WorkflowStage.RUN_VASP.value)
+    assert reopened.current_stage() is WorkflowStage.RUN_VASP
+    with StateStore(reopened.state_file) as store:
+        assert store.get_stage_run("demo:run_vasp")["status"] == StageRunState.FAILED.value
+        assert store.get_stage_run("demo:train_nep") is None
+
+
+def test_terminal_training_failure_stays_failed_after_controller_reopen(tmp_path: Path) -> None:
+    dataset = TrainingDatasetManifest(
+        DatasetIdentity.from_identity_payload(
+            {"schema_version": "nepflow.dataset.v1", "records": []}
+        ),
+        (),
+    )
+
+    class FailedCampaign:
+        def __init__(self, **_kwargs):
+            pass
+
+        def ensure(self, _specification):
+            return None
+
+        def snapshot(self):
+            return CampaignReconciliationResult(
+                campaign_id="campaign-failed",
+                status="failed",
+                candidates=(SimpleNamespace(status="failed", terminal=True),),
+            )
+
+    results = []
+
+    def failed_training_handler(context):
+        context.state_store.upsert_dataset(dataset)
+        stage = TrainingStage(
+            backend=SimpleNamespace(),
+            campaign_factory=FailedCampaign,
+        )
+        stage._assemble_dataset = lambda _context, _config, _store: (
+            dataset,
+            context.project_dir / "dataset",
+        )
+        stage._prepare_candidates = lambda *_args: None
+        result = stage.run(context)
+        results.append(result)
+        return result
+
+    controller = make_controller(
+        tmp_path,
+        stage=WorkflowStage.TRAIN_NEP.value,
+        stage_handler=failed_training_handler,
+    )
+    controller.run()
+
+    assert results[0].status is StageRunState.FAILED
+    assert results[0].advanced_to is None
+    assert controller.current_stage() is WorkflowStage.TRAIN_NEP
+    with StateStore(controller.state_file) as store:
+        assert store.get_stage_run("demo:train_nep")["status"] == StageRunState.FAILED.value
+        assert store.get_stage_run("demo:validate") is None
+
+    reopened = make_controller(tmp_path, stage=WorkflowStage.TRAIN_NEP.value)
+    assert reopened.current_stage() is WorkflowStage.TRAIN_NEP
+    with StateStore(reopened.state_file) as store:
+        assert store.get_stage_run("demo:train_nep")["status"] == StageRunState.FAILED.value
+        assert store.get_stage_run("demo:validate") is None
+
+
+def test_terminal_validation_failure_stays_failed_after_controller_reopen(tmp_path: Path) -> None:
+    validation_result = ValidationStageResult(
+        preparation=SimpleNamespace(),
+        execution=ValidationReconciliationResult(
+            validation_run_id="validation-failed",
+            status="failed",
+            cases=(
+                ValidationExecutionRecord(
+                    validation_run_id="validation-failed",
+                    case=SimpleNamespace(),
+                    attempt_id="validation-attempt-failed",
+                    attempt_number=1,
+                    status="failed",
+                ),
+            ),
+        ),
+    ).as_workflow_result()
+
+    assert validation_result.status is StageRunState.FAILED
+    assert validation_result.advanced_to is None
+    _assert_failed_controller_run_does_not_advance(
+        tmp_path,
+        WorkflowStage.VALIDATE,
+        validation_result,
+        WorkflowStage.COMPLETED,
+    )

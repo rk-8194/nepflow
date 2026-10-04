@@ -46,6 +46,15 @@ class ModelRunRecord:
     execution_metadata: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
+        if (
+            self.artifact is not None
+            and self.artifact.nep_in is not None
+            and self.artifact.nep_in.sha256 != self.identity.nep_in_sha256
+        ):
+            raise ValueError(
+                "Model-run identity nep_in_sha256 does not match the attached "
+                "nep.in artifact SHA-256"
+            )
         if self.execution_metadata is not None:
             object.__setattr__(self, "execution_metadata", _freeze(self.execution_metadata))
 

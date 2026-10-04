@@ -13,6 +13,9 @@ from nepflow.cli_wizard import CONFIG_PROMPTS, ConfigPrompt, ConfigWizard
 from nepflow.config import load_config, render_default_config
 from nepflow.errors import ConfigurationError, StateError
 from nepflow.state import CURRENT_SCHEMA_VERSION, StateStore
+from nepflow.stages.generation.generators.materials_project import (
+    build_materials_project_fetcher,
+)
 from nepflow.workflow import initialization as initialization_module
 from nepflow.workflow.initialization import ProjectCreationService
 from nepflow.workflow.stages import StageRunState, WorkflowStage
@@ -108,12 +111,17 @@ class InitConfigPromptTests(unittest.TestCase):
                     ["W", "", "BCC", "", "user@host:/opt/nepflow"],
                 )
                 service.setup_config(prompt_values=values)
+                fetcher = build_materials_project_fetcher(
+                    cache_dir=project_dir / "mp-cache",
+                    client=object(),
+                )
 
             config_text = (project_dir / "config" / "project.config").read_text(
                 encoding="utf-8"
             )
             self.assertIn("api_key=\n", config_text)
             self.assertNotIn("environment-secret", config_text)
+            self.assertEqual(fetcher.api_key, "environment-secret")
 
     def test_unknown_element_raises_value_error(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -159,7 +167,7 @@ class InitConfigPromptTests(unittest.TestCase):
             with patch.dict(os.environ, {}, clear=True):
                 values, _ = self._collect_values(
                     service,
-                    ["", "W", "", "BCC", "", "user@host:/opt/nepflow"],
+                    ["W", "", "BCC", "", "user@host:/opt/nepflow"],
                 )
             service.run(prompt_values=values)
 
@@ -184,7 +192,7 @@ class InitConfigPromptTests(unittest.TestCase):
             service = self._make_service(project_dir)
             values, _ = self._collect_values(
                 service,
-                ["", "W", "", "BCC", "", "user@host:/opt/nepflow"],
+                ["W", "", "BCC", "", "user@host:/opt/nepflow"],
             )
             service.run(prompt_values=values)
 
@@ -209,7 +217,7 @@ class InitConfigPromptTests(unittest.TestCase):
             service = self._make_service(Path(tmp))
             values, _ = self._collect_values(
                 service,
-                ["", "W", "", "BCC", "", "user@host:/opt/nepflow"],
+                ["W", "", "BCC", "", "user@host:/opt/nepflow"],
             )
             with patch("builtins.input") as input_mock, patch("builtins.print") as print_mock:
                 service.run(prompt_values=values)
@@ -224,7 +232,7 @@ class InitConfigPromptTests(unittest.TestCase):
             )
             values, _ = self._collect_values(
                 service,
-                ["", "W", "", "BCC", "", ""],
+                ["W", "", "BCC", "", ""],
             )
 
             with pytest.raises(ConfigurationError, match="schema_version"):
@@ -243,7 +251,7 @@ class InitConfigPromptTests(unittest.TestCase):
             service = self._make_service(Path(tmp))
             values, _ = self._collect_values(
                 service,
-                ["", "W", "", "BCC", "", ""],
+                ["W", "", "BCC", "", ""],
             )
             with patch.object(
                 StateStore,
@@ -321,7 +329,7 @@ class InitConfigPromptTests(unittest.TestCase):
             service = self._make_service(project_dir)
             values, _ = self._collect_values(
                 service,
-                ["", "W", "", "BCC", "", ""],
+                ["W", "", "BCC", "", ""],
             )
             service.run(prompt_values=values)
 
