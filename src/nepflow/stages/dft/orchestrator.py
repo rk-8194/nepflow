@@ -32,16 +32,8 @@ from nepflow.dft.vasp.inputs import (
 from nepflow.dft.vasp.outputs import (
     ResolvedVaspOutput,
     VaspJobEvidence,
-    VaspRegistryEvidence,
     outcar_is_complete,
     resolve_verified_output,
-)
-from nepflow.dft.vasp.registry import (
-    get_nepflow_root,
-    get_registry_entry,
-    read_completed_registry,
-    read_status,
-    write_status,
 )
 from nepflow.domain.identities import (
     DftCalculationIdentity,
@@ -219,7 +211,6 @@ class VaspPreparationOrchestrator:
         selected_dir = project_dir / "structures" / "selected"
         jobs_dir = project_dir / "vasp" / "jobs"
         backend = self.backend or self._build_backend(config, project_dir)
-        registry = read_completed_registry(get_nepflow_root(project_dir))
         prepared: list[PreparedCalculation] = []
 
         for dataset in datasets:
@@ -246,7 +237,6 @@ class VaspPreparationOrchestrator:
                         "DFT backend returned a structure identity different from the selected structure"
                     )
 
-                current_status = read_status(spec.working_directory)
                 existing_identity = read_identity(spec.working_directory)
                 current_match = bool(existing_identity) and calculation_identities_match(
                     calculation,
@@ -257,26 +247,21 @@ class VaspPreparationOrchestrator:
                 persisted_status = (
                     None if latest_attempt is None else str(latest_attempt.get("status"))
                 )
-                if current_match and persisted_status in {
-                    "submitted",
-                    "running",
-                    "failed",
-                    "completed",
-                    "reused",
-                }:
-                    persisted_marker_status = (
-                        "submitted"
-                        if persisted_status in {"submitted", "running"}
-                        else persisted_status
-                    )
-                    current_status = {
-                        **current_status,
-                        "status": persisted_marker_status,
-                        "retry_level": max(
-                            int(current_status.get("retry_level", 0)),
-                            max(0, int(latest_attempt.get("attempt_number", 1)) - 1),
-                        ),
-                    }
+                persisted_status = (
+                    "submitted"
+                    if persisted_status == "running"
+                    else "pending"
+                    if persisted_status == "prepared"
+                    else persisted_status
+                )
+                current_status = {
+                    "status": persisted_status or "pending",
+                    "retry_level": (
+                        max(0, int(latest_attempt.get("attempt_number", 1)) - 1)
+                        if latest_attempt is not None
+                        else 0
+                    ),
+                }
                 current_evidence = None
                 if current_match and current_status["status"] in {
                     "submitted",
@@ -303,7 +288,6 @@ class VaspPreparationOrchestrator:
 
                 resolved = current_evidence or self._resolve_historical_output(
                     state_store,
-                    registry,
                     calculation,
                 )
                 if current_match and persisted_status == "failed":
@@ -317,25 +301,6 @@ class VaspPreparationOrchestrator:
                 else:
                     status = "pending"
 
-                write_status(
-                    spec.working_directory,
-                    status=status,
-                    retry_level=current_status.get("retry_level", 0)
-                    if current_match
-                    else 0,
-                    structure_id=calculation.structure_id,
-                    calculation_id=calculation.calculation_id,
-                    incar_hash=calculation.incar_hash,
-                    potcar_hash=calculation.potcar_hash,
-                    **(
-                        {
-                            "reused_from": str(resolved.outcar_path.parent.resolve())
-                        }
-                        if resolved is not None
-                        and resolved.verification_source != "current_job_identity"
-                        else {}
-                    ),
-                )
                 prepared.append(
                     PreparedCalculation(
                         spec=spec,
@@ -382,37 +347,11 @@ class VaspPreparationOrchestrator:
     @staticmethod
     def _resolve_historical_output(
         state_store: StateStore,
-        registry: Mapping[str, object],
         calculation: DftCalculationIdentity,
     ) -> ResolvedVaspOutput | None:
-        state_result = VaspPreparationOrchestrator._resolve_state_artifact(
+        return VaspPreparationOrchestrator._resolve_state_artifact(
             state_store,
             calculation,
-        )
-        if state_result is not None:
-            return state_result
-
-        entry = get_registry_entry(
-            dict(registry),
-            calculation.incar_hash,
-            calculation.potcar_hash,
-            calculation.structure_id,
-        )
-        if entry is None:
-            return None
-        job_path = Path(entry["job_path"])
-        outcar = job_path / "OUTCAR"
-        expected_hash = entry.get("outcar_hash")
-        observed_hash = sha256_file(outcar, required=False)
-        if expected_hash is not None and expected_hash != observed_hash:
-            return None
-        evidence_identity = {
-            key: entry.get(key, calculation.to_dict()[key])
-            for key in ("structure_id", "incar_hash", "potcar_hash", "calculation_id")
-        }
-        return resolve_verified_output(
-            calculation.to_dict(),
-            registry_evidence=VaspRegistryEvidence(outcar, evidence_identity),
         )
 
     @staticmethod
@@ -437,9 +376,15 @@ class VaspPreparationOrchestrator:
                 continue
             if artifact.get("sha256") != sha256_file(outcar):
                 continue
-            return resolve_verified_output(
-                calculation.to_dict(),
-                registry_evidence=VaspRegistryEvidence(outcar, calculation.to_dict()),
+            return ResolvedVaspOutput(
+                outcar_path=outcar,
+                calculation_identity=tuple(
+                    sorted(
+                        (str(key), str(value))
+                        for key, value in calculation.to_dict().items()
+                    )
+                ),
+                verification_source="state_store_artifact",
             )
         return None
 

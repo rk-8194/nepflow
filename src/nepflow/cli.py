@@ -47,7 +47,7 @@ from nepflow.hpc.process import ProcessError, ProcessRunner
 from nepflow.hpc.slurm import SlurmScheduler
 from nepflow.logging import configure_logging
 from nepflow.config.loader import canonical_config_path
-from nepflow.reporting import WorkflowStatusPresenter, summarize_legacy_vasp_jobs
+from nepflow.reporting import WorkflowStatusPresenter
 from nepflow.stages.dft import DftStage
 from nepflow.stages.generation import GenerationStage
 from nepflow.stages.generation.debug import run_debug
@@ -272,14 +272,6 @@ def compose_stage_registry() -> StageRegistry:
 
     registry.register(WorkflowStage.VALIDATE, run_validation)
     return registry
-
-
-def _legacy_status_details(project_dir: Path, stage: WorkflowStage) -> dict:
-    """Adapt legacy VASP status reporting to the package CLI presenter."""
-
-    from nepflow.dft.vasp.registry import read_status
-
-    return summarize_legacy_vasp_jobs(project_dir, stage, read_status)
 
 
 def _resolve_project_config_path(project_name: str, output_dir: Path) -> Path:
@@ -516,14 +508,11 @@ def main():
         stage_registry=compose_stage_registry(),
     )
 
-    # Run workflow: controller reconciles StateStore with the legacy marker
+    # Run workflow: controller reconciles StateStore-backed workflow state.
     # If under SLURM and approaching deadline, resubmit before running
     try:
         if not args.init:
-            WorkflowStatusPresenter(
-                logger,
-                details_provider=_legacy_status_details,
-            ).log(controller.workflow_state)
+            WorkflowStatusPresenter(logger).log(controller.workflow_state)
         if slurm_deadline and time.time() >= slurm_deadline:
             logger.warning("Already past SLURM deadline - resubmitting immediately")
             _resubmit_slurm_job(debug=args.debug)

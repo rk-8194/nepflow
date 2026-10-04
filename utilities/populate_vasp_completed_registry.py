@@ -39,7 +39,6 @@ from nepflow.dft.vasp.outputs import outcar_is_complete
 from nepflow.dft.vasp.registry import (
     VASP_REGISTRY_VERSION,
     read_completed_registry,
-    write_completed_registry,
 )
 from nepflow.errors import ArtifactError
 from nepflow.io.hashing import sha256_bytes, sha256_file
@@ -173,7 +172,7 @@ def write_registry(registry_path: Path, registry: dict) -> None:
     registry_path = Path(registry_path)
     if registry_path.name != ".vasp_completed_jobs.json":
         raise ArtifactError(f"Unexpected VASP registry path: {registry_path}")
-    write_completed_registry(registry_path.parent, registry)
+    write_json(registry_path, registry)
 
 
 def registry_contains(registry: dict, incar_hash: str, potcar_hash: str, structure_id: str) -> bool:

@@ -1,17 +1,17 @@
-"""Validated legacy VASP status and completed-artifact registry records.
+"""Read-only readers for supported legacy VASP migration records.
 
-Preparation may still read these records to verify historical reuse. New
-execution results are authoritative in StateStore and do not write this
-compatibility registry.
+StateStore is the sole runtime owner of current workflow status and completed
+artifacts.  These readers remain only for explicit migration/operator tools
+that need to inspect historical ``.vasp_completed_jobs.json`` or
+``.vasp_status`` records.  Current execution never writes either format.
 """
 
 from __future__ import annotations
 
-from datetime import datetime
 from pathlib import Path
 
 from nepflow.errors import ArtifactError, StateError
-from nepflow.io.json import read_json_object, write_json
+from nepflow.io.json import read_json_object
 
 
 VASP_REGISTRY_VERSION = 1
@@ -59,11 +59,6 @@ def read_completed_registry(nepflow_root: Path) -> dict:
     return validate_completed_registry(data, path)
 
 
-def write_completed_registry(nepflow_root: Path, registry: dict) -> None:
-    """Write the shared completed-VASP registry."""
-    write_json(completed_jobs_registry_path(nepflow_root), registry)
-
-
 def get_registry_entry(
     registry: dict,
     incar_hash: str,
@@ -104,56 +99,8 @@ def get_registry_entry(
     return entry
 
 
-def upsert_registry_entry(
-    nepflow_root: Path,
-    incar_hash: str,
-    potcar_hash: str,
-    structure_id: str,
-    entry: dict,
-) -> None:
-    """Insert or replace a completed-job registry entry."""
-    registry = read_completed_registry(nepflow_root)
-    registry["jobs"].setdefault(incar_hash, {}).setdefault(potcar_hash, {})[
-        structure_id
-    ] = entry
-    write_completed_registry(nepflow_root, registry)
-
-
-def write_status(
-    struct_dir: Path,
-    status: str,
-    retry_level: int = 0,
-    slurm_job_id: str = "",
-    error: str = "",
-    initial_gpu: int | None = None,
-    initial_ncore: int | None = None,
-    initial_kpar: int | None = None,
-    current_gpu: int | None = None,
-    **extra: object,
-) -> None:
-    """Write one validated-enough launcher status record."""
-    data = {
-        "status": status,
-        "retry_level": retry_level,
-        "slurm_job_id": slurm_job_id,
-        "timestamp": datetime.now().isoformat(),
-    }
-    if error:
-        data["error"] = error
-    if initial_gpu is not None:
-        data["initial_gpu"] = initial_gpu
-    if initial_ncore is not None:
-        data["initial_ncore"] = initial_ncore
-    if initial_kpar is not None:
-        data["initial_kpar"] = initial_kpar
-    if current_gpu is not None:
-        data["current_gpu"] = current_gpu
-    data.update({key: value for key, value in extra.items() if value is not None})
-    write_json(Path(struct_dir) / ".vasp_status", data)
-
-
 def read_status(struct_dir: Path) -> dict:
-    """Read and validate one launcher status record."""
+    """Read one historical launcher status record for migration tooling."""
     status_file = Path(struct_dir) / ".vasp_status"
     data = read_json_object(
         status_file,
@@ -181,8 +128,5 @@ __all__ = [
     "get_registry_entry",
     "read_completed_registry",
     "read_status",
-    "upsert_registry_entry",
     "validate_completed_registry",
-    "write_completed_registry",
-    "write_status",
 ]

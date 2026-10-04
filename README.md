@@ -100,7 +100,7 @@ NEPFlow will continue from the stage stored in the project directory.
 ## Common Options
 
 - `--local` runs the local pre-HPC setup step and stops after seed generation.
-- If `config/project.config` contains an `hpc.scp_address`, local mode will offer to upload the project to `<scp_address>/projects/<project>` after seed generation. The address should point to the remote directory where `nepflow_cli.py` lives.
+- If `config/project.config` contains an `hpc.scp_address`, local mode will offer to upload the project to `<scp_address>/projects/<project>` after seed generation. The address should point to the remote directory where the installed `nepflow` command is available.
 - `--memory` runs VASP memory benchmarks without advancing the workflow.
 - `--config` opens the project config file in Vim and exits.
 - `--debug` enables verbose debug logging.

@@ -77,7 +77,7 @@ CONFIG_PROMPTS: tuple[ConfigPrompt, ...] = (
         key="scp_address",
         label="Remote NEPFlow directory",
         message=(
-            "Enter the remote directory where nepflow_cli.py is located "
+            "Enter the remote directory where the installed nepflow command is located "
             "(e.g. user@host:/path/to/nepflow)"
         ),
     ),

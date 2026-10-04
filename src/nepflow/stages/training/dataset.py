@@ -17,13 +17,9 @@ import os
 from pathlib import Path
 import shutil
 import tempfile
-from typing import Any, Iterable, Iterator, Mapping, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
 import numpy as np
-
-# Only used by the compatibility bridge below; the authoritative builder does
-# not import or call an ASE reader.
-ase_read = None
 
 from nepflow.dft.vasp.outputs import (
     ResolvedVaspOutput,
@@ -238,21 +234,6 @@ def _rejection(
         reason,
     )
     report.record_rejection(reason, member_index=member_index)
-
-
-def iter_labeled_structures(*args: Any, **kwargs: Any) -> Iterator[dict[str, Any]]:
-    """Compatibility bridge to the legacy Atoms-to-VASP resolver.
-
-    The authoritative dataset builder below does not call this function. It
-    remains importable for pre-Phase 4 callers while the resolver itself lives
-    in the explicitly named compatibility adapter.
-    """
-
-    from modules.train_nep.prepare import resolve_legacy_labeled_structures
-
-    if "reader" not in kwargs:
-        kwargs["reader"] = ase_read
-    return resolve_legacy_labeled_structures(*args, **kwargs)
 
 
 def _result_from_mapping(value: Mapping[str, Any]) -> VaspParseResult:
@@ -1047,7 +1028,6 @@ __all__ = [
     "DatasetSplit",
     "build_dataset_metadata",
     "build_training_dataset",
-    "iter_labeled_structures",
     "load_materialized_dataset",
     "prepare_training_dataset",
     "resolve_selected_dft_results",

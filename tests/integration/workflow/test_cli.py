@@ -33,7 +33,7 @@ class ConfigCliTests(unittest.TestCase):
                 nepflow.sys,
                 "argv",
                 [
-                    "nepflow_cli.py",
+                    "nepflow",
                     "--project",
                     "w",
                     "--config",

@@ -2,7 +2,6 @@ from pathlib import Path
 import pytest
 
 from nepflow.errors import StateError
-from nepflow.reporting import WorkflowStatusPresenter
 from nepflow.state import StateStore
 from nepflow.workflow import (
     StageRegistry,
@@ -114,13 +113,3 @@ def test_corrupt_workflow_stage_is_not_reset_to_init(tmp_path: Path) -> None:
 
     with pytest.raises(StateError, match="Invalid workflow stage"):
         controller.current_stage()
-
-
-def test_corrupt_vasp_status_is_not_reported_as_pending(tmp_path: Path) -> None:
-    controller = make_controller(tmp_path, stage="run_vasp")
-    status_file = controller.project_dir / "vasp" / "jobs" / "train" / "struct_0000" / ".vasp_status"
-    status_file.parent.mkdir(parents=True)
-    status_file.write_text("{malformed", encoding="utf-8")
-
-    status = WorkflowStatusPresenter().snapshot(controller.workflow_state)
-    assert status.stage is WorkflowStage.RUN_VASP

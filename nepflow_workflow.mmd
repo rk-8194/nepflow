@@ -1,15 +1,15 @@
 graph TD
     Start([🚀 NEPFlow Start]) 
     
-    Start --> InitStage["<b>1. INIT STAGE</b> ✓<br/>━━━━━━━━━━━━━━━━━<br/>📁 Initialize Project<br/>• Create project directory<br/>• Load configuration (YAML)<br/>• Setup logging<br/>• Validate project structure"]
+    Start --> Init["<b>1. INIT STAGE</b> ✓<br/>━━━━━━━━━━━━━━━━━<br/>📁 Initialize Project<br/>• Create project directory<br/>• Load configuration (YAML)<br/>• Setup logging<br/>• Validate project structure"]
     
-    InitStage --> GenStage["<b>2. GENERATE STAGE</b> ✓<br/>━━━━━━━━━━━━━━━━━<br/>🔬 Generate Structures<br/><br/><b>Layer 1: Composition Grid</b><br/>• Simplex sampling<br/>• Unary/Binary/Ternary<br/><br/><b>Layer 2: Configurational Generators</b><br/>• MP phases<br/>• Random solid solutions<br/>• SQS (icet)<br/>• Segregated (layered)<br/><br/><b>Layer 3: Perturbations</b><br/>• Volume profile changes<br/>• Rattling<br/>• Strain/Deformation<br/>• Vacancies/Interstitials"]
+    Init --> GenStage["<b>2. GENERATE STAGE</b> ✓<br/>━━━━━━━━━━━━━━━━━<br/>🔬 Generate Structures<br/><br/><b>Layer 1: Composition Grid</b><br/>• Simplex sampling<br/>• Unary/Binary/Ternary<br/><br/><b>Layer 2: Configurational Generators</b><br/>• MP phases<br/>• Random solid solutions<br/>• SQS (icet)<br/>• Segregated (layered)<br/><br/><b>Layer 3: Perturbations</b><br/>• Volume profile changes<br/>• Rattling<br/>• Strain/Deformation<br/>• Vacancies/Interstitials"]
     
     GenStage --> GenOut["📦 Output<br/>structures/generated/<br/>generated_structures.xyz"]
     
-    GenOut --> SelectStage["<b>3. SELECT STAGE</b> ✓<br/>━━━━━━━━━━━━━━━━━<br/>🎯 Structure Selection<br/><b>Algorithm:</b><br/>Farthest-Point Sampling<br/>(Greedy Feedforward)<br/><br/><b>Process:</b><br/>1. Load NEP89 foundation model<br/>2. Compute NEP descriptors<br/>3. Iteratively select structures<br/>   maximizing descriptor diversity<br/>4. Filter by min_distance<br/>5. Limit to max_select count"]
+    GenOut --> Select["<b>3. SELECT STAGE</b> ✓<br/>━━━━━━━━━━━━━━━━━<br/>🎯 Structure Selection<br/><b>Algorithm:</b><br/>Farthest-Point Sampling<br/>(Greedy Feedforward)<br/><br/><b>Process:</b><br/>1. Load NEP89 foundation model<br/>2. Compute NEP descriptors<br/>3. Iteratively select structures<br/>   maximizing descriptor diversity<br/>4. Filter by min_distance<br/>5. Limit to max_select count"]
     
-    SelectStage --> SelectOut["📦 Output<br/>structures/selected/<br/>selected_structures.xyz"]
+    Select --> SelectOut["📦 Output<br/>structures/selected/<br/>selected_structures.xyz"]
     
     SelectOut --> VaspStage["<b>4. RUN VASP STAGE</b> ✓<br/>━━━━━━━━━━━━━━━━━<br/>⚛️ DFT Calculations<br/><br/><b>Phase 1: Prepare</b><br/>• Validate INCAR template<br/>• Scan elements in structures<br/>• Validate POTCAR files<br/>• Create struct_XXXX folders<br/>• Write POSCAR/POTCAR/INCAR<br/><br/><b>Phase 2: Submit & Monitor</b><br/>• Query ML-predicted params<br/>• Submit to SLURM<br/>• Poll job status<br/>• Parse OUTCAR results<br/><br/><b>Phase 3: OOM Recovery</b><br/>• Detect OOM events<br/>• Escalate NCORE/KPAR<br/>• Auto-resubmit jobs<br/>• 7-level retry table"]
     
@@ -27,9 +27,9 @@ graph TD
     
     MemoryOptional --> End([✅ Complete])
     
-    style InitStage fill:#c8e6c9,stroke:#2e7d32,stroke-width:3px,color:#000
+    style Init fill:#c8e6c9,stroke:#2e7d32,stroke-width:3px,color:#000
     style GenStage fill:#c8e6c9,stroke:#2e7d32,stroke-width:3px,color:#000
-    style SelectStage fill:#c8e6c9,stroke:#2e7d32,stroke-width:3px,color:#000
+    style Select fill:#c8e6c9,stroke:#2e7d32,stroke-width:3px,color:#000
     style VaspStage fill:#c8e6c9,stroke:#2e7d32,stroke-width:3px,color:#000
     style MemoryOptional fill:#c8e6c9,stroke:#2e7d32,stroke-width:3px,color:#000
     
