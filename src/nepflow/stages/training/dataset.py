@@ -326,46 +326,18 @@ def _build_report_metadata(
     train_virial: bool,
     allow_partial: bool,
 ) -> tuple[dict[str, Any], TrainingDatasetManifest]:
-    canonical_records: list[dict[str, Any]] = []
-    accepted_identities: list[dict[str, Any]] = []
-    source_output_hashes: list[str] = []
-    requested_members: list[dict[str, Any]] = []
-    for split in (DatasetSplit.TRAIN, DatasetSplit.TEST):
-        report = reports[split]
-        requested_members.extend(report.requested_members)
-        for result in report.accepted_results:
-            canonical_records.append(
-                _canonical_record(split, result, include_virial=train_virial)
-            )
-            accepted_identities.append(
-                {
-                    "split": split.value,
-                    "structure_id": result.structure_id,
-                    "calculation_identity": dict(result.calculation_identity),
-                    "source_outcar": result.source_outcar,
-                    "source_outcar_hash": result.source_outcar_hash,
-                }
-            )
-            if result.source_outcar_hash:
-                source_output_hashes.append(result.source_outcar_hash)
-        canonical_records.extend(report.accepted_content_records)
+    (
+        canonical_records,
+        accepted_identities,
+        source_output_hashes,
+        requested_members,
+    ) = _collect_report_metadata_records(reports, train_virial=train_virial)
 
     accepted_count = sum(report.accepted_count for report in reports.values())
     if len(canonical_records) != accepted_count:
         raise RuntimeError("Accepted dataset records are missing immutable content provenance")
 
-    label_schema = {
-        "version": "nepflow.extxyz.labels.v1",
-        "geometry": ["positions", "lattice", "species", "pbc"],
-        "energy": True,
-        "forces": True,
-        "virial": train_virial,
-    }
-    units = {
-        "energy": ENERGY_UNIT_EV,
-        "forces": FORCE_UNIT_EV_PER_ANGSTROM,
-        "virial": VIRIAL_UNIT_EV,
-    }
+    label_schema, units = _dataset_label_schema(train_virial)
     identity_payload = {
         "schema_version": "nepflow.dataset.v1",
         "label_schema": label_schema,
@@ -379,23 +351,10 @@ def _build_report_metadata(
         "records": canonical_records,
     }
     identity = DatasetIdentity.from_identity_payload(identity_payload)
-    manifest = TrainingDatasetManifest(
-        identity=identity,
-        records=tuple(canonical_records),
-        selection_method="explicit_split",
-        selection_parameters={
-            "requested_train": reports[DatasetSplit.TRAIN].requested_count,
-            "requested_test": reports[DatasetSplit.TEST].requested_count,
-        },
-        created_at=datetime.now().isoformat(),
-    )
+    manifest = _build_report_manifest(identity, canonical_records, reports)
     train = reports[DatasetSplit.TRAIN]
     test = reports[DatasetSplit.TEST]
-    train_reasons = dict(train.rejected_reason_counts)
-    test_reasons = dict(test.rejected_reason_counts)
-    rejection_reasons: dict[str, int] = {}
-    for reason, count in (*train_reasons.items(), *test_reasons.items()):
-        rejection_reasons[reason] = rejection_reasons.get(reason, 0) + count
+    train_reasons, test_reasons, rejection_reasons = _report_rejection_metadata(reports)
 
     created = manifest.created_at
     metadata: dict[str, Any] = {
@@ -431,6 +390,82 @@ def _build_report_metadata(
         "partial_dataset_allowed": allow_partial,
     }
     return metadata, manifest
+
+
+def _collect_report_metadata_records(
+    reports: Mapping[DatasetSplit, DatasetBuildReport],
+    *,
+    train_virial: bool,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[str], list[dict[str, Any]]]:
+    canonical_records: list[dict[str, Any]] = []
+    accepted_identities: list[dict[str, Any]] = []
+    source_output_hashes: list[str] = []
+    requested_members: list[dict[str, Any]] = []
+    for split in (DatasetSplit.TRAIN, DatasetSplit.TEST):
+        report = reports[split]
+        requested_members.extend(report.requested_members)
+        for result in report.accepted_results:
+            canonical_records.append(
+                _canonical_record(split, result, include_virial=train_virial)
+            )
+            accepted_identities.append(
+                {
+                    "split": split.value,
+                    "structure_id": result.structure_id,
+                    "calculation_identity": dict(result.calculation_identity),
+                    "source_outcar": result.source_outcar,
+                    "source_outcar_hash": result.source_outcar_hash,
+                }
+            )
+            if result.source_outcar_hash:
+                source_output_hashes.append(result.source_outcar_hash)
+        canonical_records.extend(report.accepted_content_records)
+    return canonical_records, accepted_identities, source_output_hashes, requested_members
+
+
+def _dataset_label_schema(train_virial: bool) -> tuple[dict[str, Any], dict[str, str]]:
+    return (
+        {
+            "version": "nepflow.extxyz.labels.v1",
+            "geometry": ["positions", "lattice", "species", "pbc"],
+            "energy": True,
+            "forces": True,
+            "virial": train_virial,
+        },
+        {
+            "energy": ENERGY_UNIT_EV,
+            "forces": FORCE_UNIT_EV_PER_ANGSTROM,
+            "virial": VIRIAL_UNIT_EV,
+        },
+    )
+
+
+def _build_report_manifest(
+    identity: DatasetIdentity,
+    canonical_records: Sequence[Mapping[str, Any]],
+    reports: Mapping[DatasetSplit, DatasetBuildReport],
+) -> TrainingDatasetManifest:
+    return TrainingDatasetManifest(
+        identity=identity,
+        records=tuple(canonical_records),
+        selection_method="explicit_split",
+        selection_parameters={
+            "requested_train": reports[DatasetSplit.TRAIN].requested_count,
+            "requested_test": reports[DatasetSplit.TEST].requested_count,
+        },
+        created_at=datetime.now().isoformat(),
+    )
+
+
+def _report_rejection_metadata(
+    reports: Mapping[DatasetSplit, DatasetBuildReport],
+) -> tuple[dict[str, int], dict[str, int], dict[str, int]]:
+    train_reasons = dict(reports[DatasetSplit.TRAIN].rejected_reason_counts)
+    test_reasons = dict(reports[DatasetSplit.TEST].rejected_reason_counts)
+    rejection_reasons: dict[str, int] = {}
+    for reason, count in (*train_reasons.items(), *test_reasons.items()):
+        rejection_reasons[reason] = rejection_reasons.get(reason, 0) + count
+    return train_reasons, test_reasons, rejection_reasons
 
 
 def _record_state_members(
@@ -504,30 +539,14 @@ def _publish_dataset_artifacts(
     )
     published = False
     try:
-        train_count = write_nep_dataset(
-            staging_path / "train.xyz",
-            rendered[DatasetSplit.TRAIN],
-            include_virial=train_virial,
+        _stage_dataset_artifacts(
+            staging_path,
+            rendered,
+            metadata,
+            train_virial=train_virial,
+            expected_counts=expected_counts,
         )
-        test_count = write_nep_dataset(
-            staging_path / "test.xyz",
-            rendered[DatasetSplit.TEST],
-            include_virial=train_virial,
-        )
-        if train_count != expected_counts[DatasetSplit.TRAIN]:
-            raise RuntimeError("Staged train dataset count does not match its report")
-        if test_count != expected_counts[DatasetSplit.TEST]:
-            raise RuntimeError("Staged test dataset count does not match its report")
-        write_json(staging_path / ".dataset", dict(metadata))
-
-        for filename in ("train.xyz", "test.xyz", ".dataset"):
-            artifact = staging_path / filename
-            if not artifact.is_file():
-                raise RuntimeError(f"Staged dataset artifact is missing: {artifact}")
-
-        if target_was_empty:
-            dataset_path.rmdir()
-        os.replace(staging_path, dataset_path)
+        _promote_staged_dataset(staging_path, dataset_path, target_was_empty)
         published = True
         return target_was_empty
     except BaseException:
@@ -538,6 +557,46 @@ def _publish_dataset_artifacts(
         if staging_path.exists():
             shutil.rmtree(staging_path)
         raise
+
+
+def _stage_dataset_artifacts(
+    staging_path: Path,
+    rendered: Mapping[DatasetSplit, Sequence[Mapping[str, Any]]],
+    metadata: Mapping[str, Any],
+    *,
+    train_virial: bool,
+    expected_counts: Mapping[DatasetSplit, int],
+) -> None:
+    train_count = write_nep_dataset(
+        staging_path / "train.xyz",
+        rendered[DatasetSplit.TRAIN],
+        include_virial=train_virial,
+    )
+    test_count = write_nep_dataset(
+        staging_path / "test.xyz",
+        rendered[DatasetSplit.TEST],
+        include_virial=train_virial,
+    )
+    if train_count != expected_counts[DatasetSplit.TRAIN]:
+        raise RuntimeError("Staged train dataset count does not match its report")
+    if test_count != expected_counts[DatasetSplit.TEST]:
+        raise RuntimeError("Staged test dataset count does not match its report")
+    write_json(staging_path / ".dataset", dict(metadata))
+
+    for filename in ("train.xyz", "test.xyz", ".dataset"):
+        artifact = staging_path / filename
+        if not artifact.is_file():
+            raise RuntimeError(f"Staged dataset artifact is missing: {artifact}")
+
+
+def _promote_staged_dataset(
+    staging_path: Path,
+    dataset_path: Path,
+    target_was_empty: bool,
+) -> None:
+    if target_was_empty:
+        dataset_path.rmdir()
+    os.replace(staging_path, dataset_path)
 
 
 def _rollback_published_dataset(dataset_path: Path, *, restore_empty_target: bool) -> None:
@@ -630,22 +689,11 @@ def build_training_dataset(
         },
     )
     try:
-        transaction = getattr(state_store, "transaction", None)
-        if callable(transaction):
-            with transaction():
-                _record_state_members(
-                    state_store,
-                    preparation.manifest,
-                    preparation.reports,
-                    project_id=project_id,
-                )
-        else:
-            _record_state_members(
-                state_store,
-                    preparation.manifest,
-                    preparation.reports,
-                project_id=project_id,
-            )
+        _record_prepared_dataset(
+            state_store,
+            preparation,
+            project_id=project_id,
+        )
     except BaseException:
         _rollback_published_dataset(
             dataset_path,
@@ -657,6 +705,30 @@ def build_training_dataset(
         preparation.manifest,
         preparation.metadata,
         preparation.reports,
+    )
+
+
+def _record_prepared_dataset(
+    state_store: Any,
+    preparation: DatasetBuildPreparation,
+    *,
+    project_id: str | None,
+) -> None:
+    transaction = getattr(state_store, "transaction", None)
+    if callable(transaction):
+        with transaction():
+            _record_state_members(
+                state_store,
+                preparation.manifest,
+                preparation.reports,
+                project_id=project_id,
+            )
+        return
+    _record_state_members(
+        state_store,
+        preparation.manifest,
+        preparation.reports,
+        project_id=project_id,
     )
 
 
@@ -681,14 +753,7 @@ def prepare_training_dataset(
             "state_store is required for the authoritative training dataset path"
         )
 
-    normalized: dict[DatasetSplit, Sequence[Any]] = {}
-    for key, records in split_records.items():
-        split = DatasetSplit.coerce(key)
-        if split in normalized:
-            raise ValueError(f"Duplicate dataset split: {split.value}")
-        normalized[split] = tuple(_normalise_explicit_item(item) for item in records)
-    for split in (DatasetSplit.TRAIN, DatasetSplit.TEST):
-        normalized.setdefault(split, ())
+    normalized = _normalize_split_records(split_records)
 
     reports = {
         split: DatasetBuildReport(split, requested_count=len(normalized[split]))
@@ -700,47 +765,97 @@ def prepare_training_dataset(
     }
 
     for split in (DatasetSplit.TRAIN, DatasetSplit.TEST):
-        report = reports[split]
-        for ordinal, item in enumerate(normalized[split]):
-            member_index = report.record_requested(_record_structure_id(item), ordinal)
-            try:
-                result = item if isinstance(item, VaspParseResult) else _result_from_mapping(item)
-                if not result.accepted:
-                    _rejection(
-                        report,
-                        result.rejection_reason or "record_rejected",
-                        member_index=member_index,
-                    )
-                    continue
-                _require_state_authority(state_store, result)
-                validate_dft_result_labels(result.as_structure_dict())
-                if not result.source_outcar_hash:
-                    _rejection(
-                        report,
-                        "missing_source_outcar_hash",
-                        member_index=member_index,
-                    )
-                    continue
-                if train_virial and result.virial_ev is None:
-                    _rejection(
-                        report,
-                        "missing_required_virial",
-                        member_index=member_index,
-                    )
-                    continue
-                report.record_acceptance(result, member_index=member_index)
-                rendered[split].append(result.as_structure_dict())
-            except Exception as exc:
+        rendered[split] = _process_dataset_split(
+            normalized[split],
+            reports[split],
+            state_store,
+            train_virial=train_virial,
+        )
+    _validate_dataset_reports(reports, allow_partial=allow_partial)
+
+    metadata, manifest = _build_report_metadata(
+        Path(dataset_path),
+        reports,
+        train_virial=train_virial,
+        allow_partial=allow_partial,
+    )
+    metadata, manifest = _apply_selection_metadata(
+        metadata,
+        manifest,
+        selection_method=selection_method,
+        selection_parameters=selection_parameters,
+    )
+    return DatasetBuildPreparation(manifest, metadata, reports, rendered)
+
+
+def _normalize_split_records(
+    split_records: Mapping[DatasetSplit | str, Sequence[Any]],
+) -> dict[DatasetSplit, Sequence[Any]]:
+    normalized: dict[DatasetSplit, Sequence[Any]] = {}
+    for key, records in split_records.items():
+        split = DatasetSplit.coerce(key)
+        if split in normalized:
+            raise ValueError(f"Duplicate dataset split: {split.value}")
+        normalized[split] = tuple(_normalise_explicit_item(item) for item in records)
+    for split in (DatasetSplit.TRAIN, DatasetSplit.TEST):
+        normalized.setdefault(split, ())
+    return normalized
+
+
+def _process_dataset_split(
+    records: Sequence[Any],
+    report: DatasetBuildReport,
+    state_store: Any,
+    *,
+    train_virial: bool,
+) -> list[dict[str, Any]]:
+    rendered: list[dict[str, Any]] = []
+    for ordinal, item in enumerate(records):
+        member_index = report.record_requested(_record_structure_id(item), ordinal)
+        try:
+            result = item if isinstance(item, VaspParseResult) else _result_from_mapping(item)
+            if not result.accepted:
                 _rejection(
                     report,
-                    f"extraction_failed:{type(exc).__name__}",
+                    result.rejection_reason or "record_rejected",
                     member_index=member_index,
                 )
+                continue
+            _require_state_authority(state_store, result)
+            validate_dft_result_labels(result.as_structure_dict())
+            if not result.source_outcar_hash:
+                _rejection(
+                    report,
+                    "missing_source_outcar_hash",
+                    member_index=member_index,
+                )
+                continue
+            if train_virial and result.virial_ev is None:
+                _rejection(
+                    report,
+                    "missing_required_virial",
+                    member_index=member_index,
+                )
+                continue
+            report.record_acceptance(result, member_index=member_index)
+            rendered.append(result.as_structure_dict())
+        except Exception as exc:
+            _rejection(
+                report,
+                f"extraction_failed:{type(exc).__name__}",
+                member_index=member_index,
+            )
+    return rendered
 
+
+def _validate_dataset_reports(
+    reports: Mapping[DatasetSplit, DatasetBuildReport],
+    *,
+    allow_partial: bool,
+) -> None:
     for split in (DatasetSplit.TRAIN, DatasetSplit.TEST):
         if reports[split].rejected_count < 0:
             raise RuntimeError(f"Dataset report over-accepted {split.value} records")
-
     total_rejected = sum(report.rejected_count for report in reports.values())
     if total_rejected and not allow_partial:
         raise RuntimeError(
@@ -750,12 +865,14 @@ def prepare_training_dataset(
     if not reports[DatasetSplit.TRAIN].accepted_count or not reports[DatasetSplit.TEST].accepted_count:
         raise RuntimeError("No valid structures found; cannot create a training dataset")
 
-    metadata, manifest = _build_report_metadata(
-        Path(dataset_path),
-        reports,
-        train_virial=train_virial,
-        allow_partial=allow_partial,
-    )
+
+def _apply_selection_metadata(
+    metadata: dict[str, Any],
+    manifest: TrainingDatasetManifest,
+    *,
+    selection_method: str | None,
+    selection_parameters: Mapping[str, Any] | None,
+) -> tuple[dict[str, Any], TrainingDatasetManifest]:
     if selection_method is not None:
         metadata["selection_method"] = selection_method
         manifest = TrainingDatasetManifest(
@@ -767,7 +884,7 @@ def prepare_training_dataset(
         )
     elif selection_parameters is not None:
         metadata["selection_parameters"] = to_jsonable(selection_parameters)
-    return DatasetBuildPreparation(manifest, metadata, reports, rendered)
+    return metadata, manifest
 
 
 def resolve_selected_dft_results(
@@ -785,16 +902,7 @@ def resolve_selected_dft_results(
 
     if reader is None:
         from ase.io import read as reader  # type: ignore[no-redef]
-    calculations = state_store.list_dft_calculations(
-        statuses=("completed",),
-        selected_only=True,
-    )
-    by_structure: dict[str, list[Mapping[str, Any]]] = {}
-    for calculation in calculations:
-        identity = calculation.get("identity", {})
-        structure_id = identity.get("structure_id", calculation.get("structure_id"))
-        if structure_id:
-            by_structure.setdefault(str(structure_id), []).append(calculation)
+    by_structure = _index_selected_calculations(state_store)
 
     resolved: dict[DatasetSplit, tuple[VaspParseResult, ...]] = {}
     for split in (DatasetSplit.TRAIN, DatasetSplit.TEST):
@@ -807,76 +915,107 @@ def resolve_selected_dft_results(
         structures = reader(str(source), index=":", format="extxyz")
         if not isinstance(structures, list):
             structures = [structures]
-        split_results: list[VaspParseResult] = []
-        for atoms in structures:
-            structure_id = str(
-                atoms.info.get("structure_id", StructureIdentity.from_atoms(atoms).structure_id)
-            )
-            requested_calculation_id = atoms.info.get("calculation_id")
-            candidates = by_structure.get(structure_id, [])
-            if requested_calculation_id:
-                candidates = [
-                    calculation
-                    for calculation in candidates
-                    if calculation.get("calculation_id") == requested_calculation_id
-                    or calculation.get("identity", {}).get("calculation_id")
-                    == requested_calculation_id
-                ]
-            if len(candidates) != 1:
-                raise RuntimeError(
-                    f"StateStore must resolve exactly one completed {split.value} DFT "
-                    f"calculation for structure_id={structure_id}; found {len(candidates)}"
-                )
-            calculation = candidates[0]
-            identity = dict(calculation.get("identity", {}))
-            calculation_id = str(calculation["calculation_id"])
-            attempt_id = calculation.get("accepted_attempt_id")
-            if not isinstance(attempt_id, str) or not attempt_id.strip():
-                raise RuntimeError(
-                    f"StateStore has no accepted attempt for {calculation_id}"
-                )
-            artifacts = state_store.list_artifacts(
-                originating_attempt_id=attempt_id,
-            )
-            outcars = [
-                artifact
-                for artifact in artifacts
-                if artifact.get("artifact_type") == "vasp_outcar"
-            ]
-            if len(outcars) != 1:
-                raise RuntimeError(
-                    f"StateStore has no unique accepted OUTCAR for {calculation_id}"
-                )
-            outcar_path = Path(str(outcars[0].get("path", "")))
-            if (
-                not outcar_path.is_file()
-                or sha256_file(outcar_path) != outcars[0].get("sha256")
-            ):
-                raise RuntimeError(
-                    f"Accepted OUTCAR artifact is missing or changed for {calculation_id}"
-                )
-            evidence = ResolvedVaspOutput(
-                outcar_path=outcar_path,
-                calculation_identity=tuple(
-                    sorted((str(key), str(value)) for key, value in identity.items())
-                ),
-                verification_source="state_store_artifact",
-            )
-            result = parse_outcar_result(
-                outcar_path,
-                atoms,
-                require_virial=False,
-                calculation_identity=identity,
-                identity_evidence=evidence,
-            )
-            if not result.accepted or result.structure_id != structure_id:
-                raise RuntimeError(
-                    f"StateStore OUTCAR could not be accepted for {calculation_id}: "
-                    f"{result.rejection_reason or 'structure_identity_changed'}"
-                )
-            split_results.append(result)
-        resolved[split] = tuple(split_results)
+        resolved[split] = tuple(
+            _resolve_selected_split(structures, split, by_structure, state_store)
+        )
     return resolved
+
+
+def _index_selected_calculations(state_store: Any) -> dict[str, list[Mapping[str, Any]]]:
+    calculations = state_store.list_dft_calculations(
+        statuses=("completed",),
+        selected_only=True,
+    )
+    by_structure: dict[str, list[Mapping[str, Any]]] = {}
+    for calculation in calculations:
+        identity = calculation.get("identity", {})
+        structure_id = identity.get("structure_id", calculation.get("structure_id"))
+        if structure_id:
+            by_structure.setdefault(str(structure_id), []).append(calculation)
+    return by_structure
+
+
+def _resolve_selected_split(
+    structures: Sequence[Any],
+    split: DatasetSplit,
+    by_structure: Mapping[str, Sequence[Mapping[str, Any]]],
+    state_store: Any,
+) -> list[VaspParseResult]:
+    results: list[VaspParseResult] = []
+    for atoms in structures:
+        structure_id = str(
+            atoms.info.get("structure_id", StructureIdentity.from_atoms(atoms).structure_id)
+        )
+        requested_calculation_id = atoms.info.get("calculation_id")
+        candidates = list(by_structure.get(structure_id, ()))
+        if requested_calculation_id:
+            candidates = [
+                calculation
+                for calculation in candidates
+                if calculation.get("calculation_id") == requested_calculation_id
+                or calculation.get("identity", {}).get("calculation_id")
+                == requested_calculation_id
+            ]
+        if len(candidates) != 1:
+            raise RuntimeError(
+                f"StateStore must resolve exactly one completed {split.value} DFT "
+                f"calculation for structure_id={structure_id}; found {len(candidates)}"
+            )
+        results.append(
+            _resolve_selected_calculation(
+                atoms,
+                structure_id,
+                candidates[0],
+                state_store,
+            )
+        )
+    return results
+
+
+def _resolve_selected_calculation(
+    atoms: Any,
+    structure_id: str,
+    calculation: Mapping[str, Any],
+    state_store: Any,
+) -> VaspParseResult:
+    identity = dict(calculation.get("identity", {}))
+    calculation_id = str(calculation["calculation_id"])
+    attempt_id = calculation.get("accepted_attempt_id")
+    if not isinstance(attempt_id, str) or not attempt_id.strip():
+        raise RuntimeError(f"StateStore has no accepted attempt for {calculation_id}")
+    artifacts = state_store.list_artifacts(originating_attempt_id=attempt_id)
+    outcars = [
+        artifact
+        for artifact in artifacts
+        if artifact.get("artifact_type") == "vasp_outcar"
+    ]
+    if len(outcars) != 1:
+        raise RuntimeError(f"StateStore has no unique accepted OUTCAR for {calculation_id}")
+    outcar_path = Path(str(outcars[0].get("path", "")))
+    if not outcar_path.is_file() or sha256_file(outcar_path) != outcars[0].get("sha256"):
+        raise RuntimeError(
+            f"Accepted OUTCAR artifact is missing or changed for {calculation_id}"
+        )
+    evidence = ResolvedVaspOutput(
+        outcar_path=outcar_path,
+        calculation_identity=tuple(
+            sorted((str(key), str(value)) for key, value in identity.items())
+        ),
+        verification_source="state_store_artifact",
+    )
+    result = parse_outcar_result(
+        outcar_path,
+        atoms,
+        require_virial=False,
+        calculation_identity=identity,
+        identity_evidence=evidence,
+    )
+    if not result.accepted or result.structure_id != structure_id:
+        raise RuntimeError(
+            f"StateStore OUTCAR could not be accepted for {calculation_id}: "
+            f"{result.rejection_reason or 'structure_identity_changed'}"
+        )
+    return result
 
 
 def load_materialized_dataset(
@@ -966,59 +1105,73 @@ def write_nep_dataset(
 ) -> int:
     """Write the exact extxyz schema consumed by GPUMD NEP training."""
 
-    rendered: list[str] = []
-    count = 0
-    for structure in structures:
-        species = list(structure["species"])
-        positions = np.asarray(structure["positions"], dtype=float)
-        forces = np.asarray(structure["forces"], dtype=float)
-        lattice = np.asarray(structure["lattice"], dtype=float)
-        energy = float(structure["energy"])
-        if not np.isfinite(energy):
-            raise ValueError("Dataset energy label is not finite")
-        if positions.shape != (len(species), 3):
-            raise ValueError("Dataset positions do not match species")
-        if forces.shape != (len(species), 3) or not np.isfinite(forces).all():
-            raise ValueError("Dataset forces are invalid")
-        if lattice.shape != (3, 3) or not np.isfinite(lattice).all():
-            raise ValueError("Dataset lattice is invalid")
-        if not np.isfinite(positions).all():
-            raise ValueError("Dataset positions are not finite")
-        pbc = list(structure["pbc"])
-        if len(pbc) != 3:
-            raise ValueError("Dataset pbc must contain three flags")
-        virial = structure.get("virial")
-        if include_virial:
-            if virial is None:
-                raise ValueError("missing_required_virial")
-            virial_array = np.asarray(virial, dtype=float)
-            if virial_array.shape != (3, 3) or not np.isfinite(virial_array).all():
-                raise ValueError("Dataset virial is invalid")
-        else:
-            virial_array = None
-
-        pbc_text = " ".join("T" if flag else "F" for flag in pbc)
-        lattice_text = " ".join(f"{value:.10f}" for value in lattice.flat)
-        header = (
-            f"energy={energy:.10f} pbc=\"{pbc_text}\" "
-            f"Lattice=\"{lattice_text}\" "
-            "Properties=species:S:1:pos:R:3:force:R:3"
-        )
-        if virial_array is not None:
-            virial_text = " ".join(f"{value:.10f}" for value in virial_array.flat)
-            header += f' virial="{virial_text}"'
-        rendered.append(f"{len(species)}\n{header}\n")
-        rendered.extend(
-            f"{symbol:3s} {position[0]:15.10f} {position[1]:15.10f} {position[2]:15.10f} "
-            f"{force[0]:15.10f} {force[1]:15.10f} {force[2]:15.10f}\n"
-            for symbol, position, force in zip(species, positions, forces)
-        )
-        count += 1
+    rendered = [
+        _render_nep_structure(structure, include_virial=include_virial)
+        for structure in structures
+    ]
 
     from nepflow.io.atomic import atomic_write_text
 
     atomic_write_text(output_path, "".join(rendered))
-    return count
+    return len(rendered)
+
+
+def _render_nep_structure(
+    structure: Mapping[str, Any],
+    *,
+    include_virial: bool,
+) -> str:
+    species = list(structure["species"])
+    positions = np.asarray(structure["positions"], dtype=float)
+    forces = np.asarray(structure["forces"], dtype=float)
+    lattice = np.asarray(structure["lattice"], dtype=float)
+    energy = float(structure["energy"])
+    if not np.isfinite(energy):
+        raise ValueError("Dataset energy label is not finite")
+    if positions.shape != (len(species), 3):
+        raise ValueError("Dataset positions do not match species")
+    if forces.shape != (len(species), 3) or not np.isfinite(forces).all():
+        raise ValueError("Dataset forces are invalid")
+    if lattice.shape != (3, 3) or not np.isfinite(lattice).all():
+        raise ValueError("Dataset lattice is invalid")
+    if not np.isfinite(positions).all():
+        raise ValueError("Dataset positions are not finite")
+    pbc = list(structure["pbc"])
+    if len(pbc) != 3:
+        raise ValueError("Dataset pbc must contain three flags")
+    virial = structure.get("virial")
+    virial_array = _validated_virial(virial, include_virial)
+    pbc_text = " ".join("T" if flag else "F" for flag in pbc)
+    lattice_text = " ".join(f"{value:.10f}" for value in lattice.flat)
+    header = (
+        f"energy={energy:.10f} pbc=\"{pbc_text}\" "
+        f"Lattice=\"{lattice_text}\" "
+        "Properties=species:S:1:pos:R:3:force:R:3"
+    )
+    if virial_array is not None:
+        virial_text = " ".join(f"{value:.10f}" for value in virial_array.flat)
+        header += f' virial="{virial_text}"'
+    lines = [f"{len(species)}\n{header}\n"]
+    lines.extend(
+        f"{symbol:3s} {position[0]:15.10f} {position[1]:15.10f} {position[2]:15.10f} "
+        f"{force[0]:15.10f} {force[1]:15.10f} {force[2]:15.10f}\n"
+        for symbol, position, force in zip(species, positions, forces)
+    )
+    return "".join(lines)
+
+
+def _validated_virial(
+    virial: Any,
+    include_virial: bool,
+) -> np.ndarray | None:
+    if not include_virial:
+        return None
+    if virial is None:
+        raise ValueError("missing_required_virial")
+    virial_array = np.asarray(virial, dtype=float)
+    if virial_array.shape != (3, 3) or not np.isfinite(virial_array).all():
+        raise ValueError("Dataset virial is invalid")
+    return virial_array
 
 
 __all__ = [

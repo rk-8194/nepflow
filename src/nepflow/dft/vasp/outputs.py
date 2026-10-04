@@ -94,6 +94,12 @@ def parse_stress_from_outcar(
     except OSError:
         return None
 
+    return _parse_text_stress(outcar_text)
+
+
+def _parse_text_stress(outcar_text: str) -> np.ndarray | None:
+    """Parse the accepted non-ASE stress layouts without changing units."""
+
     matches = list(_STRESS_PATTERN.finditer(outcar_text))
     if matches:
         values = [float(matches[-1].group(index)) for index in range(1, 10)]
@@ -320,34 +326,9 @@ def resolve_verified_output(
     expected_items = _identity_items(expected)
 
     for job in current_jobs:
-        if not isinstance(job.status, Mapping):
-            raise StateError("VASP job status evidence must be an object")
-        if job.identity is None:
-            continue
-        observed = _validated_identity(job.identity, label="current VASP identity")
-        if observed != expected:
-            continue
-
-        status = job.status.get("status")
-        reused_from = job.status.get("reused_from")
-        if reused_from is not None and not isinstance(reused_from, str):
-            raise StateError("VASP reused_from status evidence must be a path")
-        if status == "reused" and reused_from:
-            reused_outcar = Path(reused_from) / "OUTCAR"
-            if outcar_is_complete(reused_outcar):
-                return ResolvedVaspOutput(
-                    outcar_path=reused_outcar,
-                    calculation_identity=expected_items,
-                    verification_source="current_job_identity_reuse",
-                )
-
-        outcar = Path(job.job_directory) / "OUTCAR"
-        if outcar_is_complete(outcar):
-            return ResolvedVaspOutput(
-                outcar_path=outcar,
-                calculation_identity=expected_items,
-                verification_source="current_job_identity",
-            )
+        resolved = _resolve_current_job_output(job, expected, expected_items)
+        if resolved is not None:
+            return resolved
 
     if registry_evidence is not None:
         observed = _validated_identity(
@@ -362,6 +343,44 @@ def resolve_verified_output(
                 calculation_identity=expected_items,
                 verification_source="completed_registry_key",
             )
+    return None
+
+
+def _resolve_current_job_output(
+    job: VaspJobEvidence,
+    expected: Mapping[str, str],
+    expected_items: tuple[tuple[str, str], ...],
+) -> ResolvedVaspOutput | None:
+    """Resolve one current job only when its identity and completion agree."""
+
+    if not isinstance(job.status, Mapping):
+        raise StateError("VASP job status evidence must be an object")
+    if job.identity is None:
+        return None
+    observed = _validated_identity(job.identity, label="current VASP identity")
+    if observed != expected:
+        return None
+
+    status = job.status.get("status")
+    reused_from = job.status.get("reused_from")
+    if reused_from is not None and not isinstance(reused_from, str):
+        raise StateError("VASP reused_from status evidence must be a path")
+    if status == "reused" and reused_from:
+        reused_outcar = Path(reused_from) / "OUTCAR"
+        if outcar_is_complete(reused_outcar):
+            return ResolvedVaspOutput(
+                outcar_path=reused_outcar,
+                calculation_identity=expected_items,
+                verification_source="current_job_identity_reuse",
+            )
+
+    outcar = Path(job.job_directory) / "OUTCAR"
+    if outcar_is_complete(outcar):
+        return ResolvedVaspOutput(
+            outcar_path=outcar,
+            calculation_identity=expected_items,
+            verification_source="current_job_identity",
+        )
     return None
 
 
@@ -386,25 +405,11 @@ def parse_outcar_result(
     source_outcar = str(Path(outcar_path).resolve())
     source_hash = sha256_file(Path(outcar_path), required=False)
 
-    def rejected(reason: str) -> VaspParseResult:
-        return VaspParseResult(
-            structure_id=structure_id,
-            calculation_identity=identity_items,
-            source_outcar=source_outcar,
-            source_outcar_hash=source_hash,
-            status="rejected",
-            rejection_reason=reason,
-            energy_ev=None,
-            forces_ev_per_angstrom=None,
-            virial_ev=None,
-            positions_angstrom=None,
-            lattice_angstrom=None,
-            species=(),
-            pbc=(),
-        )
-
     if calculation_identity is None:
-        return rejected("missing_calculation_identity")
+        return _rejected_parse_result(
+            structure_id, identity_items, source_outcar, source_hash,
+            "missing_calculation_identity",
+        )
     comparison_identity = _validated_identity(
         calculation_identity,
         label="expected VASP identity",
@@ -413,75 +418,59 @@ def parse_outcar_result(
     if identity_evidence is None:
         source_identity = identity_reader(Path(outcar_path).parent)
         if not source_identity:
-            return rejected("missing_calculation_identity")
+            return _rejected_parse_result(
+                structure_id, identity_items, source_outcar, source_hash,
+                "missing_calculation_identity",
+            )
         if any(
             source_identity.get(key) != value
             for key, value in comparison_identity.items()
         ):
-            return rejected("incompatible_calculation_identity")
+            return _rejected_parse_result(
+                structure_id, identity_items, source_outcar, source_hash,
+                "incompatible_calculation_identity",
+            )
     else:
         if identity_evidence.outcar_path.resolve() != Path(outcar_path).resolve():
-            return rejected("incompatible_calculation_identity")
+            return _rejected_parse_result(
+                structure_id, identity_items, source_outcar, source_hash,
+                "incompatible_calculation_identity",
+            )
         try:
             evidence_identity = _validated_identity(
                 dict(identity_evidence.calculation_identity),
                 label="verified VASP identity",
             )
         except StateError:
-            return rejected("incompatible_calculation_identity")
+            return _rejected_parse_result(
+                structure_id, identity_items, source_outcar, source_hash,
+                "incompatible_calculation_identity",
+            )
         if evidence_identity != comparison_identity:
-            return rejected("incompatible_calculation_identity")
+            return _rejected_parse_result(
+                structure_id, identity_items, source_outcar, source_hash,
+                "incompatible_calculation_identity",
+            )
 
     try:
         atoms = reader(str(outcar_path))
     except Exception as exc:
-        return rejected(f"outcar_parse_failed:{type(exc).__name__}:{exc}")
-
-    expected_species = tuple(ase_atoms.get_chemical_symbols())
-    actual_species = tuple(atoms.get_chemical_symbols())
-    if len(atoms) != len(ase_atoms):
-        return rejected(
-            f"atom_count_mismatch:expected={len(ase_atoms)}:actual={len(atoms)}"
-        )
-    if actual_species != expected_species:
-        return rejected(
-            f"species_mismatch:expected={expected_species}:actual={actual_species}"
+        return _rejected_parse_result(
+            structure_id, identity_items, source_outcar, source_hash,
+            f"outcar_parse_failed:{type(exc).__name__}:{exc}",
         )
 
-    try:
-        energy = float(atoms.get_potential_energy())
-    except Exception as exc:
-        return rejected(f"missing_energy:{type(exc).__name__}")
-    try:
-        forces = np.asarray(atoms.get_forces(), dtype=float)
-    except Exception as exc:
-        return rejected(f"missing_forces:{type(exc).__name__}")
-
-    try:
-        positions = np.asarray(atoms.get_positions(), dtype=float)
-        lattice = np.asarray(atoms.get_cell().array, dtype=float)
-        pbc = atoms.pbc.tolist()
-        volume = float(atoms.get_volume())
-    except Exception as exc:
-        return rejected(f"invalid_structure_geometry:{type(exc).__name__}")
-
-    virial = parse_virial_from_outcar(outcar_path, volume)
-    if require_virial and virial is None:
-        return rejected("missing_required_virial")
-
-    structure = {
-        "energy": energy,
-        "forces": forces,
-        "positions": positions,
-        "lattice": lattice,
-        "species": list(actual_species),
-        "pbc": pbc,
-        "virial": virial,
-    }
-    try:
-        validate_dft_result_labels(structure)
-    except DftOutputValidationError as exc:
-        return rejected(f"invalid_dft_labels:{exc}")
+    parsed = _parse_vasp_structure_fields(
+        atoms,
+        ase_atoms,
+        outcar_path,
+        require_virial=require_virial,
+    )
+    if isinstance(parsed, str):
+        return _rejected_parse_result(
+            structure_id, identity_items, source_outcar, source_hash, parsed,
+        )
+    energy, forces, virial, positions, lattice, actual_species, pbc = parsed
 
     return VaspParseResult(
         structure_id=structure_id,
@@ -498,6 +487,93 @@ def parse_outcar_result(
         species=actual_species,
         pbc=tuple(bool(value) for value in pbc),
     )
+
+
+def _rejected_parse_result(
+    structure_id: str,
+    identity_items: tuple[tuple[str, str], ...],
+    source_outcar: str,
+    source_hash: str | None,
+    reason: str,
+) -> VaspParseResult:
+    return VaspParseResult(
+        structure_id=structure_id,
+        calculation_identity=identity_items,
+        source_outcar=source_outcar,
+        source_outcar_hash=source_hash,
+        status="rejected",
+        rejection_reason=reason,
+        energy_ev=None,
+        forces_ev_per_angstrom=None,
+        virial_ev=None,
+        positions_angstrom=None,
+        lattice_angstrom=None,
+        species=(),
+        pbc=(),
+    )
+
+
+def _parse_vasp_structure_fields(
+    atoms: Atoms,
+    expected_atoms: Atoms,
+    outcar_path: Path,
+    *,
+    require_virial: bool,
+) -> (
+    tuple[
+        float,
+        np.ndarray,
+        np.ndarray | None,
+        np.ndarray,
+        np.ndarray,
+        tuple[str, ...],
+        list[bool],
+    ]
+    | str
+):
+    expected_species = tuple(expected_atoms.get_chemical_symbols())
+    actual_species = tuple(atoms.get_chemical_symbols())
+    if len(atoms) != len(expected_atoms):
+        return f"atom_count_mismatch:expected={len(expected_atoms)}:actual={len(atoms)}"
+    if actual_species != expected_species:
+        return f"species_mismatch:expected={expected_species}:actual={actual_species}"
+
+    try:
+        energy = float(atoms.get_potential_energy())
+    except Exception as exc:
+        return f"missing_energy:{type(exc).__name__}"
+    try:
+        forces = np.asarray(atoms.get_forces(), dtype=float)
+    except Exception as exc:
+        return f"missing_forces:{type(exc).__name__}"
+
+    try:
+        positions = np.asarray(atoms.get_positions(), dtype=float)
+        lattice = np.asarray(atoms.get_cell().array, dtype=float)
+        pbc = atoms.pbc.tolist()
+        volume = float(atoms.get_volume())
+    except Exception as exc:
+        return f"invalid_structure_geometry:{type(exc).__name__}"
+
+    virial = parse_virial_from_outcar(outcar_path, volume)
+    if require_virial and virial is None:
+        return "missing_required_virial"
+
+    try:
+        validate_dft_result_labels(
+            {
+                "energy": energy,
+                "forces": forces,
+                "positions": positions,
+                "lattice": lattice,
+                "species": list(actual_species),
+                "pbc": pbc,
+                "virial": virial,
+            }
+        )
+    except DftOutputValidationError as exc:
+        return f"invalid_dft_labels:{exc}"
+    return energy, forces, virial, positions, lattice, actual_species, pbc
 
 
 def parse_outcar(
@@ -585,19 +661,45 @@ def parse_memory_record(outcar_path: Path, gpus_per_node: int) -> dict[str, obje
     if not outcar_path.exists() or not poscar.exists() or not incar.exists():
         return None
 
-    def read_required_text(path: Path, artifact: str) -> str:
-        try:
-            return path.read_text(encoding="utf-8", errors="replace")
-        except OSError as exc:
-            raise VaspMemoryParseError(
-                f"Could not read required {artifact} artifact: {path}"
-            ) from exc
-
-    outcar_text = read_required_text(outcar_path, "OUTCAR")
+    outcar_text = _read_memory_text(outcar_path, "OUTCAR")
     if not is_completed_text(outcar_text):
         return None
 
-    poscar_lines = read_required_text(poscar, "POSCAR").splitlines()
+    n_atoms = _parse_memory_atom_count(poscar, _read_memory_text(poscar, "POSCAR"))
+    ncore, kpar = _parse_memory_parallelism(incar, _read_memory_text(incar, "INCAR"))
+
+    performance = parse_performance_evidence(outcar_text)
+    if not performance.loop_times:
+        raise VaspMemoryParseError(
+            f"Completed OUTCAR has no valid electronic loop evidence: {outcar_path}"
+        )
+    total_ranks = performance.total_ranks
+    nodes = max(1, total_ranks // gpus_per_node) if total_ranks > 0 else 1
+    gpus = total_ranks if total_ranks > 0 else gpus_per_node
+    return {
+        "n_atoms": n_atoms,
+        "n_kpoints_irr": performance.irreducible_kpoints,
+        "n_electrons": int(performance.electrons),
+        "nodes": nodes,
+        "gpus": gpus,
+        "ncore": ncore,
+        "kpar": kpar,
+        "avg_loop_time": f"{performance.average_loop_time:.4f}",
+        "oom": 0,
+    }
+
+
+def _read_memory_text(path: Path, artifact: str) -> str:
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        raise VaspMemoryParseError(
+            f"Could not read required {artifact} artifact: {path}"
+        ) from exc
+
+
+def _parse_memory_atom_count(poscar: Path, text: str) -> int:
+    poscar_lines = text.splitlines()
     if len(poscar_lines) <= 6:
         raise VaspMemoryParseError(
             f"POSCAR is missing its atom-count row: {poscar}"
@@ -612,11 +714,13 @@ def parse_memory_record(outcar_path: Path, gpus_per_node: int) -> dict[str, obje
         raise VaspMemoryParseError(
             f"POSCAR atom-count row is malformed: {poscar}"
         )
-    n_atoms = sum(atom_counts)
+    return sum(atom_counts)
 
+
+def _parse_memory_parallelism(incar: Path, text: str) -> tuple[int, int]:
     ncore = 0
     kpar = 0
-    for line in read_required_text(incar, "INCAR").splitlines():
+    for line in text.splitlines():
         key_match = re.match(r"\s*(NCORE|KPAR)\b", line, re.IGNORECASE)
         if not key_match:
             continue
@@ -643,26 +747,7 @@ def parse_memory_record(outcar_path: Path, gpus_per_node: int) -> dict[str, obje
             ncore = value
         else:
             kpar = value
-
-    performance = parse_performance_evidence(outcar_text)
-    if not performance.loop_times:
-        raise VaspMemoryParseError(
-            f"Completed OUTCAR has no valid electronic loop evidence: {outcar_path}"
-        )
-    total_ranks = performance.total_ranks
-    nodes = max(1, total_ranks // gpus_per_node) if total_ranks > 0 else 1
-    gpus = total_ranks if total_ranks > 0 else gpus_per_node
-    return {
-        "n_atoms": n_atoms,
-        "n_kpoints_irr": performance.irreducible_kpoints,
-        "n_electrons": int(performance.electrons),
-        "nodes": nodes,
-        "gpus": gpus,
-        "ncore": ncore,
-        "kpar": kpar,
-        "avg_loop_time": f"{performance.average_loop_time:.4f}",
-        "oom": 0,
-    }
+    return ncore, kpar
 
 
 __all__ = [

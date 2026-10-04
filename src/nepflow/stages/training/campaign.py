@@ -11,9 +11,6 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import logging
-import os
-import shlex
-import shutil
 from types import MappingProxyType
 from typing import Any, Mapping, Sequence
 
@@ -34,9 +31,10 @@ from nepflow.mlip.nep.artifacts import (
     write_model_run_manifest,
 )
 from nepflow.io.atomic import atomic_write_text
-from nepflow.io.hashing import sha256_bytes, sha256_file
-from nepflow.io.json import canonical_json_bytes, to_jsonable
+from nepflow.io.hashing import sha256_file
+from nepflow.io.json import to_jsonable
 
+from .execution import TrainingExecution
 from .optimisation import CandidateConfiguration
 
 
@@ -163,6 +161,11 @@ class TrainingCampaign:
         self.resources = resources
         self.dataset_path = None if dataset_path is None else Path(dataset_path)
         self._inputs: dict[str, TrainingInput] = {}
+        self._execution = TrainingExecution(
+            backend=self.backend,
+            resources=self.resources,
+            input_for=self._input_for,
+        )
 
     @classmethod
     def create(
@@ -246,70 +249,24 @@ class TrainingCampaign:
 
     def _ensure_campaign(self, specification: Mapping[str, Any] | None = None) -> None:
         events = self._events("training_campaign", self.campaign_id)
-        if events:
-            latest = events[-1].get("payload", {})
-            if latest.get("dataset_id") != self.dataset_id:
-                raise StateError(
-                    f"Training campaign {self.campaign_id} is owned by a different dataset"
-                )
-            requested = {} if specification is None else to_jsonable(dict(specification))
-            persisted = latest.get("specification", {})
-            if not isinstance(persisted, Mapping):
-                raise StateError(
-                    f"Training campaign {self.campaign_id} has a malformed specification"
-                )
-            if requested:
-                # Candidate order and effective scientific identity are
-                # immutable.  A changed matrix must produce another campaign
-                # ID instead of silently reinterpreting old attempts.
-                for key in ("candidate_keys", "candidate_matrix"):
-                    if key in persisted and key in requested and persisted[key] != requested[key]:
-                        raise StateError(
-                            f"Training campaign {self.campaign_id} has a conflicting immutable specification"
-                        )
-                if "candidate_count" in persisted and "candidate_keys" in requested:
-                    if int(persisted["candidate_count"]) != len(requested["candidate_keys"]):
-                        raise StateError(
-                            f"Training campaign {self.campaign_id} has a conflicting candidate count"
-                        )
-                if (
-                    "candidate_count" in persisted
-                    and "candidate_count" in requested
-                    and int(persisted["candidate_count"]) != int(requested["candidate_count"])
-                ):
-                    raise StateError(
-                        f"Training campaign {self.campaign_id} has a conflicting candidate count"
-                    )
-
-                merged = dict(persisted)
-                merged.update(requested)
-                policy_keys = {
-                    key
-                    for key in set(merged) | set(requested)
-                    if key not in {"candidate_keys", "candidate_matrix", "candidate_count", "schema_version"}
-                }
-                changed_policy = any(
-                    persisted.get(key) != requested.get(key)
-                    for key in policy_keys
-                    if key in requested
-                )
-                missing_policy = any(key not in persisted for key in requested if key in policy_keys)
-                if changed_policy or missing_policy:
-                    self._append(
-                        "training_campaign",
-                        self.campaign_id,
-                        "policy_updated",
-                        {
-                            **dict(latest),
-                            "status": latest.get("status", "pending"),
-                            "specification": merged,
-                            "policy_transition": {
-                                "from": {key: persisted.get(key) for key in policy_keys if key in persisted},
-                                "to": {key: requested.get(key) for key in policy_keys if key in requested},
-                            },
-                        },
-                    )
+        if not events:
+            self._create_campaign(specification)
             return
+        latest = events[-1].get("payload", {})
+        if latest.get("dataset_id") != self.dataset_id:
+            raise StateError(
+                f"Training campaign {self.campaign_id} is owned by a different dataset"
+            )
+        requested = {} if specification is None else to_jsonable(dict(specification))
+        persisted = latest.get("specification", {})
+        if not isinstance(persisted, Mapping):
+            raise StateError(
+                f"Training campaign {self.campaign_id} has a malformed specification"
+            )
+        if requested:
+            self._update_campaign_policy(latest, persisted, requested)
+
+    def _create_campaign(self, specification: Mapping[str, Any] | None) -> None:
         self._append(
             "training_campaign",
             self.campaign_id,
@@ -320,6 +277,70 @@ class TrainingCampaign:
                 "status": "pending",
                 "specification": {} if specification is None else dict(specification),
                 "promotion_decision": None,
+            },
+        )
+
+    def _update_campaign_policy(
+        self,
+        latest: Mapping[str, Any],
+        persisted: Mapping[str, Any],
+        requested: Mapping[str, Any],
+    ) -> None:
+        for key in ("candidate_keys", "candidate_matrix"):
+            if key in persisted and key in requested and persisted[key] != requested[key]:
+                raise StateError(
+                    f"Training campaign {self.campaign_id} has a conflicting immutable specification"
+                )
+        if "candidate_count" in persisted and "candidate_keys" in requested:
+            if int(persisted["candidate_count"]) != len(requested["candidate_keys"]):
+                raise StateError(
+                    f"Training campaign {self.campaign_id} has a conflicting candidate count"
+                )
+        if (
+            "candidate_count" in persisted
+            and "candidate_count" in requested
+            and int(persisted["candidate_count"]) != int(requested["candidate_count"])
+        ):
+            raise StateError(
+                f"Training campaign {self.campaign_id} has a conflicting candidate count"
+            )
+        merged = dict(persisted)
+        merged.update(requested)
+        policy_keys = {
+            key
+            for key in set(merged) | set(requested)
+            if key not in {"candidate_keys", "candidate_matrix", "candidate_count", "schema_version"}
+        }
+        changed_policy = any(
+            persisted.get(key) != requested.get(key)
+            for key in policy_keys
+            if key in requested
+        )
+        missing_policy = any(
+            key not in persisted for key in requested if key in policy_keys
+        )
+        if not (changed_policy or missing_policy):
+            return
+        self._append(
+            "training_campaign",
+            self.campaign_id,
+            "policy_updated",
+            {
+                **dict(latest),
+                "status": latest.get("status", "pending"),
+                "specification": merged,
+                "policy_transition": {
+                    "from": {
+                        key: persisted.get(key)
+                        for key in policy_keys
+                        if key in persisted
+                    },
+                    "to": {
+                        key: requested.get(key)
+                        for key in policy_keys
+                        if key in requested
+                    },
+                },
             },
         )
 
@@ -430,30 +451,7 @@ class TrainingCampaign:
 
         if not isinstance(training_input, TrainingInput):
             raise TypeError("TrainingCampaign.create_run requires a TrainingInput")
-        get_dataset = getattr(self.state_store, "get_dataset", None)
-        if callable(get_dataset):
-            dataset_row = get_dataset(self.dataset_id)
-            if dataset_row is None:
-                raise StateError(
-                    f"Training campaign dataset is not registered: {self.dataset_id}"
-                )
-            persisted_identity = dataset_row.get(
-                "identity_json", dataset_row.get("identity", {})
-            )
-            if (
-                isinstance(persisted_identity, Mapping)
-                and persisted_identity.get("dataset_id") != self.dataset_id
-            ):
-                raise StateError(
-                    f"Training campaign dataset identity is inconsistent: {self.dataset_id}"
-                )
-            if (
-                isinstance(persisted_identity, Mapping)
-                and dict(persisted_identity) != training_input.dataset.identity.to_dict()
-            ):
-                raise StateError(
-                    f"Training input dataset identity does not match StateStore: {self.dataset_id}"
-                )
+        self._validate_dataset_input(training_input)
         identity = self.backend.model_run_identity(training_input)
         if identity.dataset_id != self.dataset_id:
             raise StateError("Training candidate dataset_id does not match its campaign")
@@ -461,26 +459,89 @@ class TrainingCampaign:
         self._inputs[model_run_id] = training_input
         existing = self._candidate_payloads().get(model_run_id)
         if existing is not None:
-            if existing.get("nep_in_sha256") != identity.nep_in_sha256:
-                raise StateError(f"Candidate identity conflict: {model_run_id}")
-            existing_candidate = self._candidate_from_payload(existing)
-            self._input_for(existing_candidate)
-            return existing_candidate
+            return self._existing_candidate(existing, identity)
 
         run_directory = Path(training_input.working_directory).resolve()
+        self._materialize_training_input(run_directory, training_input, identity.nep_in_sha256)
+        payload = self._candidate_payload(
+            training_input,
+            identity,
+            candidate=candidate,
+            ordinal=ordinal,
+            script_path=script_path,
+            dataset_path=dataset_path,
+            run_directory=run_directory,
+        )
+        self._persist_candidate(identity, payload)
+        self._append("training_candidate", self.campaign_id, "prepared", payload)
+        return self._candidate_from_payload(payload)
+
+    def _validate_dataset_input(self, training_input: TrainingInput) -> None:
+        get_dataset = getattr(self.state_store, "get_dataset", None)
+        if not callable(get_dataset):
+            return
+        dataset_row = get_dataset(self.dataset_id)
+        if dataset_row is None:
+            raise StateError(
+                f"Training campaign dataset is not registered: {self.dataset_id}"
+            )
+        persisted_identity = dataset_row.get(
+            "identity_json", dataset_row.get("identity", {})
+        )
+        if (
+            isinstance(persisted_identity, Mapping)
+            and persisted_identity.get("dataset_id") != self.dataset_id
+        ):
+            raise StateError(
+                f"Training campaign dataset identity is inconsistent: {self.dataset_id}"
+            )
+        if (
+            isinstance(persisted_identity, Mapping)
+            and dict(persisted_identity) != training_input.dataset.identity.to_dict()
+        ):
+            raise StateError(
+                f"Training input dataset identity does not match StateStore: {self.dataset_id}"
+            )
+
+    def _existing_candidate(self, payload: Mapping[str, Any], identity: Any) -> TrainingCandidate:
+        model_run_id = str(identity.model_run_id)
+        if payload.get("nep_in_sha256") != identity.nep_in_sha256:
+            raise StateError(f"Candidate identity conflict: {model_run_id}")
+        candidate = self._candidate_from_payload(payload)
+        self._input_for(candidate)
+        return candidate
+
+    @staticmethod
+    def _materialize_training_input(
+        run_directory: Path,
+        training_input: TrainingInput,
+        expected_hash: str,
+    ) -> None:
         run_directory.mkdir(parents=True, exist_ok=True)
         input_path = run_directory / "nep.in"
         if input_path.is_file():
-            if sha256_file(input_path) != identity.nep_in_sha256:
+            if sha256_file(input_path) != expected_hash:
                 raise StateError(
                     f"Rendered NEP input conflicts with model-run identity: {input_path}"
                 )
         else:
             atomic_write_text(input_path, training_input.content, encoding="utf-8")
-            if sha256_file(input_path) != identity.nep_in_sha256:
+            if sha256_file(input_path) != expected_hash:
                 raise StateError(
                     f"TrainingInput content conflicts with model-run identity: {input_path}"
                 )
+
+    def _candidate_payload(
+        self,
+        training_input: TrainingInput,
+        identity: Any,
+        *,
+        candidate: CandidateConfiguration | None,
+        ordinal: int | None,
+        script_path: str | Path | None,
+        dataset_path: str | Path | None,
+        run_directory: Path,
+    ) -> dict[str, Any]:
         effective_dataset_path = (
             Path(dataset_path)
             if dataset_path is not None
@@ -501,10 +562,10 @@ class TrainingCampaign:
             if candidate is not None
             else (0 if ordinal is None else int(ordinal))
         )
-        payload = {
+        return {
             "campaign_id": self.campaign_id,
             "dataset_id": self.dataset_id,
-            "model_run_id": model_run_id,
+            "model_run_id": identity.model_run_id,
             "ordinal": candidate_ordinal,
             "status": "pending",
             "run_directory": str(run_directory),
@@ -512,17 +573,27 @@ class TrainingCampaign:
             "nep_in_sha256": identity.nep_in_sha256,
             "hyperparameters_hash": identity.hyperparameters_hash,
             "hyperparameters": hyperparameters,
-            "dataset_path": None if effective_dataset_path is None else str(effective_dataset_path.resolve()),
+            "dataset_path": (
+                None
+                if effective_dataset_path is None
+                else str(effective_dataset_path.resolve())
+            ),
             "attempt_number": 0,
             "job_id": None,
             "progress": None,
             "failure_reason": None,
         }
+
+    def _persist_candidate(
+        self,
+        identity: Any,
+        payload: Mapping[str, Any],
+    ) -> None:
         upsert_model_run = getattr(self.state_store, "upsert_model_run", None)
         existing_model = None
         get_model_run = getattr(self.state_store, "get_model_run", None)
         if callable(get_model_run):
-            existing_model = get_model_run(model_run_id)
+            existing_model = get_model_run(identity.model_run_id)
         if callable(upsert_model_run) and existing_model is None:
             upsert_model_run(
                 ModelRunRecord(
@@ -530,13 +601,11 @@ class TrainingCampaign:
                     execution_metadata={
                         "campaign_id": self.campaign_id,
                         "dataset_path": payload["dataset_path"],
-                        "potential_path": str(run_directory),
+                        "potential_path": payload["run_directory"],
                     },
                 ),
                 status="prepared",
             )
-        self._append("training_candidate", self.campaign_id, "prepared", payload)
-        return self._candidate_from_payload(payload)
 
     def _save_campaign_status(self, status: str) -> None:
         current = self._campaign_payload()
@@ -640,154 +709,61 @@ class TrainingCampaign:
             hyperparameters_hash=candidate.hyperparameters_hash,
         )
 
-    def _attempt_directory(self, candidate: TrainingCandidate, attempt_number: int) -> Path:
-        return candidate.run_directory / "attempts" / f"a{attempt_number:04d}"
-
-    def _write_script(
-        self,
-        candidate: TrainingCandidate,
-        attempt: TrainingAttempt,
-        *,
-        rewrite: bool = True,
-    ) -> tuple[Path, str, Mapping[str, Any]]:
-        """Materialize and fingerprint one deterministic attempt command.
-
-        Scientific candidate files stay in ``candidate.run_directory`` while
-        all mutable backend output is isolated below the attempt directory.
-        """
-
-        execution_directory = attempt.execution_directory or self._attempt_directory(
-            candidate, attempt.attempt_number
-        )
-        execution_directory.mkdir(parents=True, exist_ok=True)
-        for filename in ("nep.in", "train.xyz", "test.xyz"):
-            source = candidate.run_directory / filename
-            if not source.is_file():
-                continue
-            destination = execution_directory / filename
-            if destination.is_file() and sha256_file(destination) != sha256_file(source):
-                raise StateError(
-                    f"Attempt execution input conflicts with candidate identity: {destination}"
-                )
-            if not destination.is_file():
-                shutil.copy2(source, destination)
-        command = tuple(self.backend.training_command(self._input_for(candidate)))
-        if not command:
-            raise StateError(f"NEP backend returned an empty command for {candidate.model_run_id}")
-        script_path = execution_directory / "train_nep.sh"
-        script_content = (
-            "#!/bin/sh\nset -eu\ncd "
-            + shlex.quote(str(execution_directory))
-            + "\n"
-            + " ".join(shlex.quote(os.path.expandvars(str(part))) for part in command)
-            + "\n"
-        )
-        script_matches = (
-            script_path.is_file()
-            and script_path.read_text(encoding="utf-8") == script_content
-        )
-        if not script_matches and not rewrite:
-            raise StateError(
-                f"Persisted training script or execution command changed for "
-                f"active attempt {attempt.attempt_id}"
-            )
-        if not script_matches:
-            atomic_write_text(script_path, script_content, encoding="utf-8")
-        try:
-            script_path.chmod(0o755)
-        except OSError:
-            logger.debug("Could not mark training script executable: %s", script_path)
-        execution_config = to_jsonable(
-            {
-                "attempt_number": attempt.attempt_number,
-                "model_run_id": candidate.model_run_id,
-                "command": list(command),
-                "resources": asdict(self.resources) if self.resources is not None else None,
-                "execution_directory": str(execution_directory.resolve()),
-                "script_path": str(script_path.resolve()),
-                "script_sha256": sha256_file(script_path),
-            }
-        )
-        execution_config_hash = sha256_bytes(canonical_json_bytes(execution_config))
-        return script_path, execution_config_hash, execution_config
-
-    @staticmethod
-    def _job_id(value: Any) -> str:
-        job_id = getattr(value, "job_id", None)
-        if job_id is None and isinstance(value, Mapping):
-            job_id = value.get("job_id")
-        if not isinstance(job_id, str) or not job_id.strip():
-            raise StateError("Scheduler submission returned no job_id")
-        return job_id
-
-    def _submit_to_scheduler(
-        self,
-        candidate: TrainingCandidate,
-        attempt: TrainingAttempt,
-        job_name: str,
-    ) -> str:
-        submit_script = getattr(self.scheduler, "submit_script", None)
-        if callable(submit_script):
-            result = submit_script(
-                attempt.script_path,
-                resources=self.resources,
-                job_name=job_name,
-                cwd=attempt.execution_directory,
-            )
-        else:
-            submit = getattr(self.scheduler, "submit", None)
-            if not callable(submit):
-                raise TypeError("TrainingCampaign scheduler has no submission API")
-            result = submit(
-                ("sbatch", str(attempt.script_path)),
-                cwd=attempt.execution_directory,
-                resources=self.resources,
-            )
-        return self._job_id(result)
-
     def _submit(self, candidate: TrainingCandidate) -> TrainingCandidate:
         attempts = self.attempts(candidate.model_run_id)
         current = attempts[-1] if attempts else None
-        # A crash can happen after the scheduler accepts a job and the
-        # attempt transition is persisted, but before the candidate snapshot
-        # is updated.  Treat that durable attempt as authoritative so a
-        # restart repairs the candidate instead of submitting a duplicate.
-        if (
-            current is not None
-            and current.status in {"submitted", "running"}
-            and current.job_id
-        ):
-            if current.script_path is None or current.execution_config_hash is None:
-                script_path, config_hash, execution_config = self._write_script(
-                    candidate, current
-                )
-                current = self._save_attempt(
-                    current,
-                    script_path=str(script_path),
-                    execution_directory=str(script_path.parent),
-                    execution_config_hash=config_hash,
-                    execution_config=execution_config,
-                )
-            else:
-                script_path, config_hash, _execution_config = self._write_script(
-                    candidate, current, rewrite=False
-                )
-                if (
-                    str(script_path.resolve()) != str(current.script_path.resolve())
-                    or config_hash != current.execution_config_hash
-                ):
-                    raise StateError(
-                        f"Persisted execution configuration changed for active attempt "
-                        f"{current.attempt_id}"
-                    )
-            return self._save_candidate(
-                candidate,
-                status=current.status,
-                attempt_number=current.attempt_number,
-                job_id=current.job_id,
-                progress=current.progress,
-                failure_reason=None,
+        repaired = self._resume_submitted_attempt(candidate, current)
+        if repaired is not None:
+            return repaired
+        attempt = self._prepare_submission_attempt(candidate, current)
+        return self._submit_prepared_attempt(candidate, attempt)
+
+    def _resume_submitted_attempt(
+        self,
+        candidate: TrainingCandidate,
+        attempt: TrainingAttempt | None,
+    ) -> TrainingCandidate | None:
+        """Repair a durable submitted attempt without creating a duplicate job."""
+
+        if attempt is None or attempt.status not in {"submitted", "running"} or not attempt.job_id:
+            return None
+        if attempt.script_path is None or attempt.execution_config_hash is None:
+            script_path, config_hash, execution_config = self._execution.write_script(
+                candidate, attempt
             )
+            attempt = self._save_attempt(
+                attempt,
+                script_path=str(script_path),
+                execution_directory=str(script_path.parent),
+                execution_config_hash=config_hash,
+                execution_config=execution_config,
+            )
+        else:
+            script_path, config_hash, _execution_config = self._execution.write_script(
+                candidate, attempt, rewrite=False
+            )
+            if (
+                str(script_path.resolve()) != str(attempt.script_path.resolve())
+                or config_hash != attempt.execution_config_hash
+            ):
+                raise StateError(
+                    f"Persisted execution configuration changed for active attempt "
+                    f"{attempt.attempt_id}"
+                )
+        return self._save_candidate(
+            candidate,
+            status=attempt.status,
+            attempt_number=attempt.attempt_number,
+            job_id=attempt.job_id,
+            progress=attempt.progress,
+            failure_reason=None,
+        )
+
+    def _prepare_submission_attempt(
+        self,
+        candidate: TrainingCandidate,
+        current: TrainingAttempt | None,
+    ) -> TrainingAttempt:
         if current is not None and current.status == "submitting":
             attempt = current
         else:
@@ -804,13 +780,15 @@ class TrainingCampaign:
             )
             self._save_attempt(attempt)
 
-        script_path, config_hash, execution_config = self._write_script(candidate, attempt)
+        script_path, config_hash, execution_config = self._execution.write_script(
+            candidate, attempt
+        )
         if attempt.execution_config_hash and attempt.execution_config_hash != config_hash:
             raise StateError(
                 f"Execution configuration changed for persisted training attempt "
                 f"{attempt.attempt_id}; create a new attempt explicitly"
             )
-        attempt = self._save_attempt(
+        return self._save_attempt(
             attempt,
             script_path=str(script_path),
             execution_directory=str(script_path.parent),
@@ -818,15 +796,20 @@ class TrainingCampaign:
             execution_config=execution_config,
         )
 
+    def _submit_prepared_attempt(
+        self,
+        candidate: TrainingCandidate,
+        attempt: TrainingAttempt,
+    ) -> TrainingCandidate:
         finder = getattr(self.scheduler, "find_job_by_name", None)
-        existing = None
-        if callable(finder):
-            existing = finder(attempt.job_name, timeout=None)
+        existing = finder(attempt.job_name, timeout=None) if callable(finder) else None
         if existing is not None:
-            job_id = self._job_id(existing)
+            job_id = self._execution.job_id(existing)
         else:
             try:
-                job_id = self._submit_to_scheduler(candidate, attempt, str(attempt.job_name))
+                job_id = self._execution.submit(
+                    self.scheduler, attempt, str(attempt.job_name)
+                )
             except Exception as exc:
                 self._save_attempt(
                     attempt,
@@ -877,32 +860,50 @@ class TrainingCampaign:
             raise StateError("Collected NEP artifact belongs to a different model run")
         manifest_path = candidate.run_directory / "model_run_manifest.json"
         if manifest_path.is_file():
-            manifest = read_model_run_manifest(manifest_path)
-            artifact_path = Path(
-                str(collected.artifact.model.path or manifest.get("potential_artifact_path", ""))
-            )
-            if not artifact_path.is_file():
-                raise StateError(
-                    f"Collected model manifest points to a missing artifact: {artifact_path}"
-                )
-            persisted_model = ArtifactIdentity.from_file("nep_model", artifact_path)
-            if persisted_model.sha256 != collected.artifact.model.sha256:
-                raise StateError("Collected NEP artifact does not match the persisted model artifact")
-            if (
-                collected.artifact.nep_in is not None
-                and collected.artifact.nep_in.sha256 != candidate.nep_in_sha256
-            ):
-                raise StateError("Collected NEP input does not match the candidate identity")
-            manifest["potential_artifact_path"] = str(artifact_path.resolve())
-            manifest["attempt_id"] = attempt.attempt_id
-            write_model_run_manifest(manifest_path, manifest)
-            update_model_run_status(
-                candidate.run_directory,
-                "completed",
-                state_store=self.state_store,
-                model_run_id=candidate.model_run_id,
+            self._persist_manifest_completed_artifact(
+                candidate, collected, attempt, manifest_path
             )
             return
+        self._record_completed_model(candidate, collected)
+
+    def _persist_manifest_completed_artifact(
+        self,
+        candidate: TrainingCandidate,
+        collected: CollectedModelArtifacts,
+        attempt: TrainingAttempt,
+        manifest_path: Path,
+    ) -> None:
+        manifest = read_model_run_manifest(manifest_path)
+        artifact_path = Path(
+            str(collected.artifact.model.path or manifest.get("potential_artifact_path", ""))
+        )
+        if not artifact_path.is_file():
+            raise StateError(
+                f"Collected model manifest points to a missing artifact: {artifact_path}"
+            )
+        persisted_model = ArtifactIdentity.from_file("nep_model", artifact_path)
+        if persisted_model.sha256 != collected.artifact.model.sha256:
+            raise StateError("Collected NEP artifact does not match the persisted model artifact")
+        if (
+            collected.artifact.nep_in is not None
+            and collected.artifact.nep_in.sha256 != candidate.nep_in_sha256
+        ):
+            raise StateError("Collected NEP input does not match the candidate identity")
+        manifest["potential_artifact_path"] = str(artifact_path.resolve())
+        manifest["attempt_id"] = attempt.attempt_id
+        write_model_run_manifest(manifest_path, manifest)
+        update_model_run_status(
+            candidate.run_directory,
+            "completed",
+            state_store=self.state_store,
+            model_run_id=candidate.model_run_id,
+        )
+
+    def _record_completed_model(
+        self,
+        candidate: TrainingCandidate,
+        collected: CollectedModelArtifacts,
+    ) -> None:
         upsert_model_run = getattr(self.state_store, "upsert_model_run", None)
         if callable(upsert_model_run):
             upsert_model_run(
@@ -981,29 +982,20 @@ class TrainingCampaign:
             )
         result = self.scheduler.reconcile(candidate.job_id)
         state, job = self._scheduler_state(result)
-        attempts = self.attempts(candidate.model_run_id)
-        if not attempts:
-            raise StateError(f"Training candidate has no persisted attempt: {candidate.model_run_id}")
-        attempt = attempts[-1]
+        attempt = self._active_attempt(candidate)
         execution_directory = attempt.execution_directory or candidate.run_directory
         progress = self.backend.parse_progress(execution_directory)
-        progress_payload = None if progress is None else {
-            "generation": progress.generation,
-            "loss": progress.loss,
-        }
+        progress_payload = self._progress_payload(progress)
         if state is SchedulerJobState.UNKNOWN:
             raise StateError(f"Scheduler returned an unknown state for {candidate.job_id}")
         if state is SchedulerJobState.PENDING:
-            self._save_attempt(attempt, status="submitted", scheduler_state=state.value)
-            return self._save_candidate(candidate, status="submitted", progress=progress_payload)
-        if state is SchedulerJobState.RUNNING:
-            self._save_attempt(
-                attempt,
-                status="running",
-                scheduler_state=state.value,
-                progress=progress_payload,
+            return self._save_active_progress(
+                candidate, attempt, state, "submitted", progress_payload
             )
-            return self._save_candidate(candidate, status="running", progress=progress_payload)
+        if state is SchedulerJobState.RUNNING:
+            return self._save_active_progress(
+                candidate, attempt, state, "running", progress_payload
+            )
 
         # A missing queue/accounting record is not completion evidence, even
         # if an old model file happens to be present.
@@ -1015,6 +1007,52 @@ class TrainingCampaign:
                 state,
             )
 
+        return self._reconcile_terminal_attempt(
+            candidate,
+            attempt,
+            execution_directory,
+            state,
+            progress_payload,
+        )
+
+    def _active_attempt(self, candidate: TrainingCandidate) -> TrainingAttempt:
+        attempts = self.attempts(candidate.model_run_id)
+        if not attempts:
+            raise StateError(
+                f"Training candidate has no persisted attempt: {candidate.model_run_id}"
+            )
+        return attempts[-1]
+
+    @staticmethod
+    def _progress_payload(progress: Any) -> dict[str, Any] | None:
+        if progress is None:
+            return None
+        return {"generation": progress.generation, "loss": progress.loss}
+
+    def _save_active_progress(
+        self,
+        candidate: TrainingCandidate,
+        attempt: TrainingAttempt,
+        scheduler_state: SchedulerJobState,
+        status: str,
+        progress: dict[str, Any] | None,
+    ) -> TrainingCandidate:
+        self._save_attempt(
+            attempt,
+            status=status,
+            scheduler_state=scheduler_state.value,
+            progress=progress,
+        )
+        return self._save_candidate(candidate, status=status, progress=progress)
+
+    def _reconcile_terminal_attempt(
+        self,
+        candidate: TrainingCandidate,
+        attempt: TrainingAttempt,
+        execution_directory: Path,
+        scheduler_state: SchedulerJobState,
+        progress: dict[str, Any] | None,
+    ) -> TrainingCandidate:
         # Completion is read only from the active attempt directory.  A model
         # file left by an earlier failed attempt cannot complete a retry.
         completion = self.backend.parse_completion(execution_directory)
@@ -1027,13 +1065,13 @@ class TrainingCampaign:
             self._save_attempt(
                 attempt,
                 status="completed",
-                scheduler_state=state.value,
-                progress=progress_payload,
+                scheduler_state=scheduler_state.value,
+                progress=progress,
             )
             return self._save_candidate(
                 candidate,
                 status="completed",
-                progress=progress_payload,
+                progress=progress,
                 job_id=candidate.job_id,
                 failure_reason=None,
             )
@@ -1043,8 +1081,8 @@ class TrainingCampaign:
             classifier(execution_directory)
             if callable(classifier)
             else "missing_backend_completion_evidence"
-        ) or f"scheduler_{state.value}_without_backend_completion"
-        return self._fail_candidate(candidate, attempt, reason, state)
+        ) or f"scheduler_{scheduler_state.value}_without_backend_completion"
+        return self._fail_candidate(candidate, attempt, reason, scheduler_state)
 
     def _derive_status(self, candidates: Sequence[TrainingCandidate]) -> str:
         if not candidates:

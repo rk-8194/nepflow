@@ -69,18 +69,23 @@ class GenerationStage:
         self._log_settings(request)
 
         if request.debug:
-            if self.debug_runner is None:
-                raise RuntimeError("debug generation requires an explicitly injected debug runner")
-            bases = list(self.debug_runner(request))
-            manifest = self._persist_bases(request, bases)
-            manifest = self._persist_candidate_artifact(request, manifest)
-            return GenerationResult(
-                status="completed" if bases else "empty",
-                base_structures=tuple(bases),
-                manifest=manifest,
-                seeds_only=request.seeds_only,
-            )
+            return self._run_debug(request)
+        return self._run_standard(request)
 
+    def _run_debug(self, request: GenerationRequest) -> GenerationResult:
+        if self.debug_runner is None:
+            raise RuntimeError("debug generation requires an explicitly injected debug runner")
+        bases = list(self.debug_runner(request))
+        manifest = self._persist_bases(request, bases)
+        manifest = self._persist_candidate_artifact(request, manifest)
+        return GenerationResult(
+            status="completed" if bases else "empty",
+            base_structures=tuple(bases),
+            manifest=manifest,
+            seeds_only=request.seeds_only,
+        )
+
+    def _run_standard(self, request: GenerationRequest) -> GenerationResult:
         resumed = False
         seed_path = self._resolve_seed_path(request)
         if not request.seeds_only and seed_path.is_file():
@@ -98,7 +103,6 @@ class GenerationStage:
                 manifest=manifest,
                 seeds_only=request.seeds_only,
             )
-
         if request.seeds_only:
             self.logger.info("Seeds-only generation requested; skipping perturbations")
             return GenerationResult(
@@ -107,7 +111,15 @@ class GenerationStage:
                 manifest=manifest,
                 seeds_only=True,
             )
+        return self._run_perturbations(request, bases, manifest, resumed)
 
+    def _run_perturbations(
+        self,
+        request: GenerationRequest,
+        bases: list[Any],
+        manifest: GenerationManifest,
+        resumed: bool,
+    ) -> GenerationResult:
         summary = self.execute(request, bases)
         self.finalize(summary)
         manifest = self._persist_candidate_artifact(request, manifest)

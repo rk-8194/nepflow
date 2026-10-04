@@ -266,46 +266,12 @@ def build_vasp_benchmark_plan(
     if not ordered_targets or not ordered_resources:
         raise ValueError("benchmark plan requires targets and resources")
     root = Path(root_directory)
-    extra_parameters = tuple(
-        sorted(
-            ((str(key).upper(), value) for key, value in (benchmark_parameters or {}).items()),
-            key=lambda item: item[0],
-        )
-    )
-    effective_parameters = extra_parameters or _DEFAULT_BENCHMARK_PARAMETERS
-    cases: list[VaspBenchmarkCase] = []
-    for target in ordered_targets:
-        target_label = re.sub(
-            r"[^A-Za-z0-9_.-]+",
-            "_",
-            target.label or target.structure.structure_id[:12],
-        )
-        for resource in ordered_resources:
-            case_payload = {
-                "target": target.to_dict(),
-                "resource": resource.to_dict(),
-                "benchmark_parameters": dict(effective_parameters),
-            }
-            case_id = "case_" + sha256_canonical_json(case_payload)
-            case_dir = (
-                root
-                / target_label
-                / (
-                    f"nodes{resource.resources.nodes}_"
-                    f"gpus{resource.resources.gpus_per_node}_"
-                    f"ranks{resource.resources.mpi_ranks}_"
-                    f"ncore{resource.ncore}_kpar{resource.kpar}"
-                )
-            )
-            cases.append(
-                VaspBenchmarkCase(
-                    benchmark_id=case_id,
-                    target=target,
-                    resource=resource,
-                    working_directory=case_dir,
-                    benchmark_parameters=effective_parameters,
-                )
-            )
+    effective_parameters = _benchmark_parameters(benchmark_parameters)
+    cases = [
+        _build_benchmark_case(root, target, resource, effective_parameters)
+        for target in ordered_targets
+        for resource in ordered_resources
+    ]
     return VaspBenchmarkPlan(
         project_name=project_name,
         root_directory=root,
@@ -313,6 +279,54 @@ def build_vasp_benchmark_plan(
         site=site,
         hardware=hardware,
         executable_identity=executable_identity,
+    )
+
+
+def _benchmark_parameters(
+    benchmark_parameters: Mapping[str, object] | None,
+) -> tuple[tuple[str, object], ...]:
+    extra_parameters = tuple(
+        sorted(
+            ((str(key).upper(), value) for key, value in (benchmark_parameters or {}).items()),
+            key=lambda item: item[0],
+        )
+    )
+    return extra_parameters or _DEFAULT_BENCHMARK_PARAMETERS
+
+
+def _build_benchmark_case(
+    root: Path,
+    target: VaspBenchmarkTarget,
+    resource: VaspBenchmarkResource,
+    benchmark_parameters: tuple[tuple[str, object], ...],
+) -> VaspBenchmarkCase:
+    target_label = re.sub(
+        r"[^A-Za-z0-9_.-]+",
+        "_",
+        target.label or target.structure.structure_id[:12],
+    )
+    case_payload = {
+        "target": target.to_dict(),
+        "resource": resource.to_dict(),
+        "benchmark_parameters": dict(benchmark_parameters),
+    }
+    case_id = "case_" + sha256_canonical_json(case_payload)
+    case_dir = (
+        root
+        / target_label
+        / (
+            f"nodes{resource.resources.nodes}_"
+            f"gpus{resource.resources.gpus_per_node}_"
+            f"ranks{resource.resources.mpi_ranks}_"
+            f"ncore{resource.ncore}_kpar{resource.kpar}"
+        )
+    )
+    return VaspBenchmarkCase(
+        benchmark_id=case_id,
+        target=target,
+        resource=resource,
+        working_directory=case_dir,
+        benchmark_parameters=benchmark_parameters,
     )
 
 
@@ -551,66 +565,67 @@ class VaspBenchmarkRunner:
             "#!/usr/bin/env bash\nset -e\n" + render_runner(),
             encoding="utf-8",
         )
-        executions: list[VaspBenchmarkExecution] = []
-        for case in self.plan.cases:
-            case.working_directory.mkdir(parents=True, exist_ok=True)
-            upsert_structure = getattr(self.state_store, "upsert_structure", None)
-            if upsert_structure is not None:
-                upsert_structure(case.target.structure, metadata={"benchmark": True})
-            request = DftInputRequest(
-                structure=case.target.structure,
-                source_structure=case.target.source_structure,
-                source_structure_index=case.target.source_structure_index,
-                working_directory=case.working_directory,
-            )
-            inputs = self.backend.prepare_inputs(request)
-            incar_path = case.working_directory / "INCAR"
-            incar_path.write_text(
-                set_incar_parameters(
-                    incar_path.read_text(encoding="utf-8"),
-                    case.parameters,
-                ),
-                encoding="utf-8",
-            )
-            provenance = VaspBenchmarkProvenance(
-                compatibility_key=case.target.compatibility_key,
-                structure_id=inputs.calculation.structure_id,
-                calculation_id=inputs.calculation.calculation_id,
-                site=self.plan.site,
-                hardware=self.plan.hardware,
-                executable_identity=self.plan.executable_identity,
-                resources=case.resource.resources,
-            )
-            metadata = {
-                "execution_kind": "vasp_benchmark",
-                "benchmark_id": case.benchmark_id,
-                "compatibility_key": case.target.compatibility_key,
-                "scientific_identity": inputs.calculation.to_dict(),
-                "site": self.plan.site,
-                "hardware": self.plan.hardware,
-                "executable_identity": self.plan.executable_identity,
-                "benchmark_parameters": case.parameters,
-            }
-            existing = self._existing_attempt(inputs.calculation.calculation_id, case.benchmark_id)
-            status = "pending" if existing is None else str(existing.get("status", "pending"))
-            if status == "prepared":
-                status = "pending"
-            record = DftExecutionRecord(
-                inputs=inputs,
-                attempt_id=(
-                    str(existing["attempt_id"])
-                    if existing is not None
-                    else f"{case.benchmark_id}:attempt:1"
-                ),
-                status=status,
-                job_id=None if existing is None else existing.get("job_id"),
-                job_name=case.job_name,
-                resources=case.resource.resources,
-                metadata=metadata,
-            )
-            executions.append(VaspBenchmarkExecution(case, inputs, record, provenance))
+        executions = [self._prepare_case(case, DftExecutionRecord) for case in self.plan.cases]
         self._executions = tuple(executions)
         return self._executions
+
+    def _prepare_case(self, case: VaspBenchmarkCase, record_type: Any) -> VaspBenchmarkExecution:
+        case.working_directory.mkdir(parents=True, exist_ok=True)
+        upsert_structure = getattr(self.state_store, "upsert_structure", None)
+        if upsert_structure is not None:
+            upsert_structure(case.target.structure, metadata={"benchmark": True})
+        request = DftInputRequest(
+            structure=case.target.structure,
+            source_structure=case.target.source_structure,
+            source_structure_index=case.target.source_structure_index,
+            working_directory=case.working_directory,
+        )
+        inputs = self.backend.prepare_inputs(request)
+        incar_path = case.working_directory / "INCAR"
+        incar_path.write_text(
+            set_incar_parameters(
+                incar_path.read_text(encoding="utf-8"),
+                case.parameters,
+            ),
+            encoding="utf-8",
+        )
+        provenance = VaspBenchmarkProvenance(
+            compatibility_key=case.target.compatibility_key,
+            structure_id=inputs.calculation.structure_id,
+            calculation_id=inputs.calculation.calculation_id,
+            site=self.plan.site,
+            hardware=self.plan.hardware,
+            executable_identity=self.plan.executable_identity,
+            resources=case.resource.resources,
+        )
+        metadata = {
+            "execution_kind": "vasp_benchmark",
+            "benchmark_id": case.benchmark_id,
+            "compatibility_key": case.target.compatibility_key,
+            "scientific_identity": inputs.calculation.to_dict(),
+            "site": self.plan.site,
+            "hardware": self.plan.hardware,
+            "executable_identity": self.plan.executable_identity,
+            "benchmark_parameters": case.parameters,
+        }
+        existing = self._existing_attempt(inputs.calculation.calculation_id, case.benchmark_id)
+        status = "pending" if existing is None else str(existing.get("status", "pending"))
+        if status == "prepared":
+            status = "pending"
+        record = record_type(
+            inputs=inputs,
+            attempt_id=(
+                str(existing["attempt_id"])
+                if existing is not None
+                else f"{case.benchmark_id}:attempt:1"
+            ),
+            status=status,
+            job_id=None if existing is None else existing.get("job_id"),
+            job_name=case.job_name,
+            resources=case.resource.resources,
+            metadata=metadata,
+        )
+        return VaspBenchmarkExecution(case, inputs, record, provenance)
 
     @property
     def runner_path(self) -> Path:
