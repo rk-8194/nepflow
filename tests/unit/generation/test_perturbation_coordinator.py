@@ -7,6 +7,7 @@ import numpy as np
 import pytest
 
 pytest.importorskip("ase")
+pytest.importorskip("hiphive")
 from ase import Atoms
 
 from nepflow.domain.identities import calculate_structure_id
