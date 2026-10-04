@@ -42,6 +42,20 @@ FOUNDATION_IMPORTS = (
     "nepflow.reporting",
 )
 
+PUBLIC_EXPORT_PACKAGES = (
+    "nepflow.mlip.nep",
+    "nepflow.stages.dft",
+    "nepflow.stages.generation",
+    "nepflow.stages.generation.generators",
+    "nepflow.stages.generation.perturbations",
+    "nepflow.stages.training",
+    "nepflow.stages.validation",
+    "nepflow.workflow",
+    "nepflow.state",
+    "nepflow.dft.vasp",
+    "nepflow.mlip.gpumd",
+)
+
 
 @pytest.mark.parametrize("module_name", FOUNDATION_IMPORTS)
 def test_foundation_imports_cleanly(module_name: str) -> None:
@@ -49,6 +63,29 @@ def test_foundation_imports_cleanly(module_name: str) -> None:
     module = importlib.import_module(module_name)
 
     assert module.__name__ == module_name
+
+
+@pytest.mark.parametrize("package_name", PUBLIC_EXPORT_PACKAGES)
+def test_declared_public_exports_resolve(package_name: str) -> None:
+    """Every declared package export resolves from its current owner."""
+    package = importlib.import_module(package_name)
+
+    for name in package.__all__:
+        try:
+            getattr(package, name)
+        except (AttributeError, ImportError) as exc:
+            raise AssertionError(
+                f"{package_name}.__all__ contains unresolved export {name!r}"
+            ) from exc
+
+
+def test_supercell_is_not_reexported_from_generators() -> None:
+    """The supercell builder remains owned by the generation supercell module."""
+    package = importlib.import_module("nepflow.stages.generation.generators")
+
+    assert "build_target_supercell" not in package.__all__
+    with pytest.raises(AttributeError):
+        getattr(package, "build_target_supercell")
 
 
 def test_installed_package_import_is_collection_order_independent(tmp_path) -> None:

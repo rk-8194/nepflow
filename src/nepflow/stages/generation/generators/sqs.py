@@ -7,9 +7,10 @@ from typing import Any, Protocol
 
 from ase.build import bulk
 
+from nepflow.stages.generation.supercell import build_target_supercell
+
 from .composition_primitives import (
     allocate_crystal_quota,
-    build_target_supercell,
     composition_label,
     realized_composition,
 )
