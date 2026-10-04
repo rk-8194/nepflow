@@ -42,7 +42,7 @@ def main() -> None:
         )
     except ValueError as exc:
         logger.error("Failed to initialize fetcher: %s", exc)
-        logger.info("Set MP_API_KEY or add api_key to project.config")
+        logger.info("Set MP_API_KEY in the runtime environment")
         return
 
     results = fetcher.fetch_structures(elements, structures)

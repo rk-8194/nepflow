@@ -39,13 +39,6 @@ class ConfigPrompt:
 
 CONFIG_PROMPTS: tuple[ConfigPrompt, ...] = (
     ConfigPrompt(
-        key="materialsproject_api_key",
-        label="Materials Project API key",
-        message="Enter your Materials Project API key",
-        default="",
-        env_var="MP_API_KEY",
-    ),
-    ConfigPrompt(
         key="elements",
         label="Elements",
         message="Enter one or more chemical symbols, comma-separated",
@@ -107,14 +100,7 @@ class ConfigWizard:
         for index, prompt in enumerate(prompts, start=1):
             env_value = os.environ.get(prompt.env_var) if prompt.env_var else None
             if env_value is not None and env_value != "":
-                # Environment credentials are runtime inputs, never project
-                # configuration. The Materials Project client will read
-                # MP_API_KEY when it is needed.
-                values[prompt.key] = (
-                    ""
-                    if prompt.key == "materialsproject_api_key"
-                    else prompt.normalize(env_value)
-                )
+                values[prompt.key] = prompt.normalize(env_value)
                 logger.debug(
                     "Using %s from environment variable %s",
                     prompt.key,
@@ -142,12 +128,14 @@ class ConfigWizard:
         self.output_fn("Press Enter to accept any shown default.")
         self.output_fn("=" * 72)
         self.output_fn()
-        self.output_fn("1. Materials Project API key")
-        self.output_fn("2. Elements to include")
-        self.output_fn("3. Gas elements to include")
-        self.output_fn("4. Crystal structures")
-        self.output_fn("5. Target number of atoms per supercell")
-        self.output_fn("6. Remote NEPFlow directory")
+        self.output_fn("1. Elements to include")
+        self.output_fn("2. Gas elements to include")
+        self.output_fn("3. Crystal structures")
+        self.output_fn("4. Target number of atoms per supercell")
+        self.output_fn("5. Remote NEPFlow directory")
+        self.output_fn(
+            "Materials Project access uses the runtime MP_API_KEY environment variable."
+        )
         self.output_fn()
 
     @staticmethod

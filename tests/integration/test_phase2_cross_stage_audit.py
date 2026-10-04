@@ -21,11 +21,30 @@ from nepflow.mlip.nep.artifacts import (  # noqa: E402
     update_model_run_status,
     validate_model_run_manifest,
 )
-from nepflow.domain.identities import calculate_structure_id  # noqa: E402
-from nepflow.domain.datasets import DatasetIdentity, TrainingDatasetManifest  # noqa: E402
+from nepflow.domain.datasets import (  # noqa: E402
+    DatasetIdentity,
+    SelectedDatasetMember,
+    TrainingDatasetManifest,
+)
+from nepflow.domain.identities import (  # noqa: E402
+    ArtifactIdentity,
+    DftCalculationIdentity,
+    ModelRunIdentity,
+    StructureIdentity,
+    ValidationRunIdentity,
+    calculate_structure_id,
+)
+from nepflow.domain.models import (  # noqa: E402
+    ModelArtifactMetadata,
+    ModelRunRecord,
+    ValidationArtifactMetadata,
+    ValidationRunRecord,
+)
+from nepflow.domain.structures import GeneratedStructureRecord, StructureProvenance  # noqa: E402
 from nepflow.dft.vasp.inputs import read_identity  # noqa: E402
 from nepflow.dft.vasp.outputs import parse_outcar_result  # noqa: E402
 from nepflow.io.hashing import sha256_file  # noqa: E402
+from nepflow.io.hashing import sha256_bytes  # noqa: E402
 from nepflow.mlip.nep.inputs import NepHyperparameters, NepInputRenderer  # noqa: E402
 from nepflow.stages.training.dataset import build_dataset_metadata  # noqa: E402
 from nepflow.io.json import write_json  # noqa: E402
@@ -229,3 +248,190 @@ def test_deterministic_dft_to_validation_identity_trace() -> None:
             nep_in_sha256=sha256_file(relocated_nep),
             hyperparameters_hash=hyperparameters_hash,
         ) == validated_manifest["model_run_id"]
+
+
+def test_deterministic_identity_state_trace_reopens_as_one_chain() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        project_dir = Path(tmp)
+        selected = read_dft_fixture_as_vasp_result()
+        structure = StructureIdentity.from_atoms(selected)
+        provenance = StructureProvenance(
+            parent_structure_id=None,
+            generator="fixture",
+            requested_composition={"Si": 1.0},
+            realised_composition={"Si": 1.0},
+            source_database_id="fixture-db-1",
+            crystal_structure="diamond",
+            perturbation_family="reference",
+            perturbation_parameters={},
+            random_seed=42,
+            operation_id="trace:generation:0001",
+            code_version="trace-v1",
+            config_fingerprint="config-v1",
+        )
+        calculation = DftCalculationIdentity(
+            structure_id=structure.structure_id,
+            incar_hash="incar-v1",
+            potcar_hash="potcar-v1",
+        )
+        outcar_content = b"accepted fixture output\n"
+        outcar_hash = sha256_bytes(outcar_content)
+        dataset = DatasetIdentity.from_records(
+            [
+                {
+                    "split": "train",
+                    "structure_id": structure.structure_id,
+                    "calculation_id": calculation.calculation_id,
+                    "source_outcar_hash": outcar_hash,
+                }
+            ],
+            label_schema={"energy": True, "forces": True, "virial": True},
+            units={"energy": "eV", "forces": "eV/Angstrom", "virial": "eV"},
+            virial_convention="positive_compression",
+        )
+        model = ModelRunIdentity(dataset.dataset_id, "nep-in-v1", "hyper-v1")
+        validation = ValidationRunIdentity(
+            model.model_run_id,
+            dataset.dataset_id,
+            {"protocol": "static-v1"},
+        )
+        outcar = project_dir / "OUTCAR"
+        outcar.write_bytes(outcar_content)
+        nep_in = project_dir / "nep.in"
+        nep_in.write_text("type 1 Si\n", encoding="utf-8")
+        model_file = project_dir / "nep.txt"
+        model_file.write_text("version 4\n", encoding="utf-8")
+        report = project_dir / "validation.json"
+        report.write_text("{\"passed\": true}\n", encoding="utf-8")
+
+        outcar_artifact = ArtifactIdentity.from_file("vasp_outcar", outcar)
+        nep_in_artifact = ArtifactIdentity.from_file("nep_in", nep_in)
+        model_artifact = ArtifactIdentity.from_file("nep_model", model_file)
+        report_artifact = ArtifactIdentity.from_file("validation_report", report)
+        dataset_manifest = TrainingDatasetManifest(
+            identity=dataset,
+            records=(
+                {
+                    "split": "train",
+                    "structure_id": structure.structure_id,
+                    "calculation_id": calculation.calculation_id,
+                    "source_outcar_hash": outcar_artifact.sha256,
+                },
+            ),
+        )
+        member = SelectedDatasetMember(
+            split="train",
+            structure_id=structure.structure_id,
+            calculation_id=calculation.calculation_id,
+            source_outcar_hash=outcar_artifact.sha256,
+            ordinal=0,
+            calculation_identity=calculation.to_dict(),
+        )
+        model_record = ModelRunRecord(
+            ModelRunIdentity(dataset.dataset_id, "nep-in-v1", "hyper-v1"),
+            ModelArtifactMetadata(
+                model=model_artifact,
+                nep_in=nep_in_artifact,
+                status="completed",
+            ),
+        )
+        validation_record = ValidationRunRecord(
+            validation,
+            ValidationArtifactMetadata(
+                report=report_artifact,
+                metrics={"energy_rmse_ev": 0.0},
+                thresholds={"energy_rmse_ev": 0.1},
+                passed=True,
+            ),
+        )
+
+        with StateStore(project_dir / "state.db") as store:
+            store.upsert_project(
+                "trace",
+                name="trace",
+                root_path=str(project_dir),
+                config_fingerprint="config-v1",
+                metadata={"schema": "trace-v1"},
+            )
+            for stage in ("init", "generate", "select", "run_vasp", "train_nep", "validate", "completed"):
+                store.upsert_stage_run(
+                    f"trace:{stage}",
+                    "trace",
+                    stage,
+                    status="completed",
+                )
+            store.upsert_structure(
+                GeneratedStructureRecord(
+                    identity=structure,
+                    provenance=provenance,
+                    metadata={"fixture": True},
+                )
+            )
+            store.upsert_selection_run(
+                "selection-trace-v1",
+                "trace",
+                status="completed",
+                method="fps",
+                parameters={"selected_structure_ids": [structure.structure_id]},
+            )
+            store.upsert_dft_calculation(
+                calculation,
+                status="running",
+                selected=True,
+            )
+            attempt_id = f"{calculation.calculation_id}:attempt:1"
+            store.create_dft_attempt(
+                calculation.calculation_id,
+                attempt_id,
+                attempt_number=1,
+                status="running",
+                scheduler={"job_id": "trace-job-1"},
+            )
+            store.register_completed_result(
+                calculation.calculation_id,
+                attempt_id,
+                (outcar_artifact,),
+            )
+            store.upsert_dataset(dataset_manifest, project_id="trace", status="completed")
+            store.record_dataset_member(dataset.dataset_id, member)
+            store.upsert_model_run(model_record, status="completed")
+            store.upsert_validation_run(validation_record, status="completed")
+            store.record_validation_result(
+                validation.validation_run_id,
+                "energy",
+                structure_id=structure.structure_id,
+                metric_name="energy_rmse_ev",
+                observed_value=0.0,
+                threshold=0.1,
+                passed=True,
+            )
+            store.append_event(
+                "trace:training:completed",
+                "training_campaign",
+                model.model_run_id,
+                "candidate_completed",
+                {"dataset_id": dataset.dataset_id, "model_run_id": model.model_run_id},
+            )
+            store.append_event(
+                "trace:validation:completed",
+                "validation_run",
+                validation.validation_run_id,
+                "metrics_completed",
+                {"model_run_id": model.model_run_id, "dataset_id": dataset.dataset_id},
+            )
+
+            assert store.get_structure(structure.structure_id)["provenance"]["operation_id"] == provenance.operation_id
+            assert store.get_dft_calculation(calculation.calculation_id)["accepted_attempt_id"] == attempt_id
+            assert store.get_dft_attempt(attempt_id)["status"] == "completed"
+            assert store.get_dataset(dataset.dataset_id)["dataset_id"] == dataset.dataset_id
+            assert store.get_model_run(model.model_run_id)["dataset_id"] == dataset.dataset_id
+            assert store.get_validation_run(validation.validation_run_id)["model_run_id"] == model.model_run_id
+            assert store.list_validation_results(validation.validation_run_id)[0]["structure_id"] == structure.structure_id
+
+        with StateStore(project_dir / "state.db") as reopened:
+            assert reopened.get_project("trace") is not None
+            assert reopened.list_stage_runs("trace")
+            assert reopened.list_dft_attempts(calculation.calculation_id)[0]["attempt_id"] == attempt_id
+            assert reopened.list_artifacts(originating_attempt_id=attempt_id)[0]["sha256"] == outcar_artifact.sha256
+            assert reopened.list_model_artifacts(model.model_run_id)
+            assert reopened.list_events(entity_id=validation.validation_run_id)[0]["event_type"] == "metrics_completed"

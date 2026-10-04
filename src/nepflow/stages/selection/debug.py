@@ -10,7 +10,6 @@ from ase.io import read as ase_read
 
 from .artifacts import write_selected_structures
 from .models import SelectionResult
-from .representations import descriptor_cache_path
 
 
 logger = logging.getLogger("nepflow.selection.debug")
@@ -40,10 +39,11 @@ def run_debug_selection(
 
     rng = np.random.RandomState(42)
     representations = rng.randn(n, 10).astype(np.float64)
-    descriptor_cache = descriptor_cache_path(project_dir)
-    descriptor_cache.parent.mkdir(parents=True, exist_ok=True)
-    np.save(descriptor_cache, representations)
-    logger.info("[DEBUG] Saved random descriptors (%s) to %s", representations.shape, descriptor_cache)
+    logger.info(
+        "[DEBUG] Generated in-memory random descriptors (%s); no scientific "
+        "descriptor cache is written",
+        representations.shape,
+    )
 
     indices = rng.permutation(n)
     n_train = max(1, int(round(0.7 * n)))

@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import json
 import shutil
-import subprocess
 import time
 from pathlib import Path
 from typing import Any
+
+from nepflow.hpc.process import ProcessRunner
 
 
 STATE_FILE_NAME = ".gpumd_self_resubmit_state.json"
@@ -36,12 +37,23 @@ def write_segment_state(state_path: Path, state: dict[str, Any]) -> None:
     Path(state_path).write_text(json.dumps(state, indent=2), encoding="utf-8")
 
 
-def run_gpumd_segment(command: str, workdir: Path, *, dry_run: bool = False) -> None:
+def run_gpumd_segment(
+    command: str,
+    workdir: Path,
+    *,
+    process_runner: ProcessRunner | None = None,
+    dry_run: bool = False,
+) -> None:
     """Run the operator-supplied GPUMD shell command."""
 
     if dry_run:
         return
-    result = subprocess.run(command, shell=True, cwd=str(workdir), check=False)
+    result = (process_runner or ProcessRunner()).run_shell(
+        command,
+        cwd=workdir,
+        check=False,
+        capture_output=False,
+    )
     if result.returncode != 0:
         raise RuntimeError(f"GPUMD command failed with exit code {result.returncode}.")
 

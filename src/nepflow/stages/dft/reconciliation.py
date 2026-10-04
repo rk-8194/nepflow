@@ -101,7 +101,9 @@ class DftReconciliationResult:
     @property
     def all_successful(self) -> bool:
         """Return whether every calculation completed successfully or reused."""
-        return all(record.status in {"completed", "reused"} for record in self.records)
+        return bool(self.records) and all(
+            record.status in {"completed", "reused"} for record in self.records
+        )
 
     @property
     def any_failed(self) -> bool:

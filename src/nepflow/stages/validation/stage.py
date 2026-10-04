@@ -10,7 +10,7 @@ from typing import Any
 from nepflow.domain.identities import ValidationRunIdentity
 from nepflow.errors import StateError
 from nepflow.hpc.resources import JobResources
-from nepflow.hpc.slurm import SlurmScheduler
+from nepflow.hpc.scheduler import Scheduler
 from nepflow.mlip.gpumd import GpumdBackend
 from nepflow.mlip.simulation import StaticPrediction, StaticPredictionBackend
 from nepflow.workflow import StageContext, StageRunResult, StageRunState, WorkflowStage
@@ -70,7 +70,7 @@ class ValidationStage:
         dataset_id: str | None = None,
         state_store: Any | None = None,
         backend: StaticPredictionBackend | Any | None = None,
-        scheduler: Any | None = None,
+        scheduler: Scheduler | None = None,
         orchestrator: ValidationReconciliationOrchestrator | None = None,
         max_concurrent: int | None = None,
         max_attempts: int = 1,
@@ -193,7 +193,11 @@ class ValidationStage:
         if self.orchestrator is not None:
             orchestrator = self.orchestrator
         else:
-            scheduler = self.scheduler or SlurmScheduler()
+            scheduler = self.scheduler
+            if scheduler is None:
+                raise StateError(
+                    "ValidationStage requires an injected scheduler for execution"
+                )
             raw_command = getattr(backend, "command", ("gpumd",))
             command = (
                 tuple(shlex.split(raw_command))

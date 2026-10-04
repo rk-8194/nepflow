@@ -75,7 +75,7 @@ nepflow --project myproject --init
 ```
 
 This creates the project structure under `projects/project_myproject/`.
-On first run, NEPFlow will prompt for any config values it needs, starting with the Materials Project API key.
+On first run, NEPFlow will prompt for the project configuration values it needs. Materials Project access uses the runtime `MP_API_KEY` environment variable and is never stored in the project configuration.
 
 ### 2. Run local mode first
 

@@ -7,10 +7,10 @@ from enum import Enum
 import os
 from pathlib import Path
 import re
-import subprocess
 from typing import Any
 
 from nepflow.errors import SchedulerError, StateError
+from nepflow.hpc.process import ProcessRunner
 
 from .stages import WorkflowStage
 
@@ -160,6 +160,7 @@ def submit_resubmission(
     cwd: Path,
     *,
     scheduler: Any | None = None,
+    process_runner: ProcessRunner | None = None,
     dry_run: bool = False,
 ) -> str:
     """Submit a resolved workflow command through the scheduler boundary."""
@@ -169,8 +170,13 @@ def submit_resubmission(
     if scheduler is not None:
         result = scheduler.submit(command, cwd=cwd)
         return str(getattr(result, "stdout", "") or "").strip()
-    result = subprocess.run(command, capture_output=True, text=True, check=True, cwd=str(cwd))
-    return result.stdout.strip()
+    result = (process_runner or ProcessRunner()).run(
+        command,
+        cwd=cwd,
+        check=True,
+        capture_output=True,
+    )
+    return (result.stdout or "").strip()
 
 
 __all__ = [

@@ -33,7 +33,9 @@ def render_default_config(project_name: str, prompt_values: Mapping[str, str]) -
     render_values["gas_elements"] = prompt_values.get(
         "gas_elements", prompt_values.get("gasElements", "")
     )
-    render_values.setdefault("materialsproject_api_key", "")
+    # Credentials are runtime-only inputs.  Even if an older caller supplies
+    # a prompted value, never serialize it into the project configuration.
+    render_values["materialsproject_api_key"] = ""
     return """# Project Configuration File
 # Project: {project_name}
 
@@ -55,7 +57,7 @@ reports_path=reports
 
 [materialsproject]
 # Materials Project API key - get from https://next-gen.materialsproject.org/dashboard
-# Can also be set via MP_API_KEY environment variable
+# Set at runtime via MP_API_KEY; credentials are never persisted here
 api_key={materialsproject_api_key}
 
 [composition]

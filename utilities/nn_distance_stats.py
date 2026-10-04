@@ -73,31 +73,19 @@ def _load_or_compute_descriptors(
     batch_size: int,
     no_cache: bool,
 ) -> np.ndarray:
-    cache_path = potential_path / "descriptors_cache.npy"
-    descriptors = None
-
-    if cache_path.exists() and not no_cache:
-        descriptors = np.load(cache_path)
-        logger.info(f"  Loaded cached descriptors from {cache_path}")
-        if descriptors.shape[0] != len(structures):
-            logger.warning(
-                f"  Cache mismatch: {descriptors.shape[0]} vs {len(structures)} structures - recomputing"
-            )
-            descriptors = None
-
-    if descriptors is None:
-        calc = NepCalculator(str(nep_txt))
-        logger.info(f"  Loaded NepCalculator with {nep_txt.name}")
-        descriptors = compute_descriptors_batched(
-            calc,
-            structures,
-            mean_descriptor,
-            batch_size,
-        )
-        np.save(cache_path, descriptors)
-        logger.info(f"  Saved descriptor cache to {cache_path}")
-
-    return descriptors
+    del potential_path, no_cache
+    calc = NepCalculator(str(nep_txt))
+    logger.info(f"  Loaded NepCalculator with {nep_txt.name}")
+    logger.info(
+        "  Computing diagnostic descriptors through the canonical selection owner; "
+        "this utility does not create a second cache"
+    )
+    return compute_descriptors_batched(
+        calc,
+        structures,
+        mean_descriptor=mean_descriptor,
+        batch_size=batch_size,
+    )
 
 
 def main() -> None:

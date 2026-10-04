@@ -6,11 +6,12 @@ from dataclasses import dataclass
 from pathlib import Path
 import shlex
 
-from nepflow.config import NepflowConfig, load_config
+from nepflow.config import NepflowConfig
 from nepflow.dft.backend import DftBackend
 from nepflow.dft.vasp.backend import VaspBackend
+from nepflow.errors import StateError
 from nepflow.hpc.resources import JobResources
-from nepflow.hpc.slurm import SlurmScheduler
+from nepflow.hpc.scheduler import Scheduler
 from nepflow.dft.vasp.recovery import VaspRecoveryPolicy
 from nepflow.workflow.controller import StageContext
 from nepflow.workflow.stages import StageRunResult, StageRunState, WorkflowStage
@@ -78,7 +79,7 @@ class DftStage:
         context: StageContext | None = None,
         *,
         backend: DftBackend | None = None,
-        scheduler: object | None = None,
+        scheduler: Scheduler | None = None,
         orchestrator: DftPreparationOrchestrator | None = None,
         execution_orchestrator: DftReconciliationOrchestrator | None = None,
         datasets: tuple[str, ...] = ("train", "test"),
@@ -99,7 +100,7 @@ class DftStage:
         if state_store is None:
             raise TypeError("DftStage requires the controller StateStore")
 
-        scheduler = self.scheduler or SlurmScheduler()
+        scheduler = self.scheduler
         backend = self.backend
         if backend is None and self.orchestrator is None:
             backend = VaspPreparationOrchestrator._build_backend(
@@ -124,6 +125,10 @@ class DftStage:
 
         execution_orchestrator = self.execution_orchestrator
         if execution_orchestrator is None:
+            if scheduler is None:
+                raise StateError(
+                    "DftStage requires an injected scheduler for execution"
+                )
             if not isinstance(backend, VaspBackend):
                 raise TypeError(
                     "Default DFT execution requires a backend with a runner renderer"
@@ -247,13 +252,10 @@ class DftStage:
     @staticmethod
     def _validate_inputs(context: StageContext) -> NepflowConfig:
         config = context.config
-        if config is None:
-            config = load_config(
-                Path(context.config_file),
-                project_name=context.project_name,
-            )
         if not isinstance(config, NepflowConfig):
-            raise TypeError("DftStage requires typed NepflowConfig context")
+            raise TypeError(
+                "DftStage requires the injected typed NepflowConfig context"
+            )
         if not shlex.split(config.hpc.vasp_command):
             raise ValueError("Required configuration hpc.vasp_command must not be blank")
         if context.project_name != config.project.name:

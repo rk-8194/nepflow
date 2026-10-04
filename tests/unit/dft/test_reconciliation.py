@@ -356,3 +356,14 @@ def test_failed_dft_stage_does_not_advance_to_training(
     assert workflow_result.status is StageRunState.FAILED
     assert workflow_result.completed is False
     assert workflow_result.advanced_to is None
+
+
+def test_empty_dft_reconciliation_does_not_advance_to_training() -> None:
+    result = DftReconciliationResult(())
+
+    assert result.all_terminal is True
+    assert result.all_successful is False
+    assert DftStageResult(
+        preparation=DftPreparationResult(()),
+        execution=result,
+    ).as_workflow_result().advanced_to is None

@@ -9,7 +9,7 @@ from typing import Any, Callable
 
 from nepflow.errors import StateError
 from nepflow.hpc.resources import JobResources
-from nepflow.hpc.slurm import SlurmScheduler
+from nepflow.hpc.scheduler import Scheduler
 from nepflow.io.hashing import sha256_bytes, sha256_file
 from nepflow.io.json import canonical_json_bytes
 from nepflow.mlip.nep.artifacts import create_model_run_manifest, read_model_run_manifest
@@ -35,7 +35,7 @@ class TrainingStage:
     def __init__(
         self,
         *,
-        scheduler: Any | None = None,
+        scheduler: Scheduler | None = None,
         backend: Any | None = None,
         campaign_factory: Callable[..., TrainingCampaign] = TrainingCampaign,
         dataset_builder: Callable[..., DatasetBuildResult] = build_training_dataset,
@@ -302,7 +302,11 @@ class TrainingStage:
         )
         self._assert_authoritative_dataset(dataset_manifest, state_store)
         backend = self.backend or NepBackend(config.hpc.nep_command)
-        scheduler = self.scheduler or SlurmScheduler()
+        scheduler = self.scheduler
+        if config.slurm.enabled and scheduler is None:
+            raise StateError(
+                "TrainingStage requires an injected scheduler when SLURM is enabled"
+            )
         # The campaign identity includes the effective candidate matrix, so a
         # restart reopens the same event stream rather than proposing trials
         # from mutable folder order.

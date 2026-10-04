@@ -249,7 +249,9 @@ def load_config(
 
     materials_section = _section(parser, "materialsproject")
     materials_project = MaterialsProjectConfig(
-        api_key=_optional_string(materials_section.get("api_key"))
+        # API credentials are resolved by the Materials Project adapter from
+        # its injected client or MP_API_KEY; project files never own secrets.
+        api_key=None
     )
 
     composition_section = _section(parser, "composition")
@@ -518,9 +520,7 @@ def to_legacy_config(config: NepflowConfig) -> ConfigParser:
         "gpumd_path": str(config.paths.gpumd_path),
         "reports_path": str(config.paths.reports_path),
     })
-    material_values = {}
-    if config.materials_project.api_key:
-        material_values["api_key"] = config.materials_project.api_key
+    material_values = {"api_key": ""}
     add_section("materialsproject", material_values)
     add_section("composition", {
         "elements": ",".join(config.composition.elements),

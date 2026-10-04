@@ -55,7 +55,7 @@ class InitConfigPromptTests(unittest.TestCase):
         wizard = ConfigWizard(service.project_name, input_fn=input_mock)
         return wizard.collect_prompt_values(CONFIG_PROMPTS), input_mock
 
-    def test_setup_config_prompts_for_materials_project_api_key(self) -> None:
+    def test_setup_config_never_persists_materials_project_api_key(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_dir = Path(tmp)
             (project_dir / "config").mkdir(parents=True, exist_ok=True)
@@ -65,7 +65,6 @@ class InitConfigPromptTests(unittest.TestCase):
                 values, input_mock = self._collect_values(
                     service,
                     [
-                        "mp-test-key",
                         "w,cr,y,zr",
                         "",
                         "BCC, fcc",
@@ -73,12 +72,15 @@ class InitConfigPromptTests(unittest.TestCase):
                         "user@host:/opt/nepflow",
                     ],
                 )
-                service.setup_config(prompt_values=values)
+                service.setup_config(
+                    prompt_values={**values, "materialsproject_api_key": "mp-test-key"}
+                )
 
             config_text = (project_dir / "config" / "project.config").read_text(
                 encoding="utf-8"
             )
-            self.assertIn("api_key=mp-test-key", config_text)
+            self.assertIn("api_key=\n", config_text)
+            self.assertNotIn("mp-test-key", config_text)
             self.assertIn("elements=W,Cr,Y,Zr", config_text)
             self.assertIn("gas_elements=", config_text)
             self.assertIn("crystal_structures=bcc,fcc", config_text)
@@ -92,7 +94,7 @@ class InitConfigPromptTests(unittest.TestCase):
                 "composition_aware_fps_descriptor_floor_fraction=0.95",
                 config_text,
             )
-            self.assertEqual(input_mock.call_count, 6)
+            self.assertEqual(input_mock.call_count, 5)
 
     def test_materials_project_environment_key_is_not_persisted(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -118,14 +120,14 @@ class InitConfigPromptTests(unittest.TestCase):
             service = self._make_service(Path(tmp))
             with patch.dict(os.environ, {}, clear=True):
                 with self.assertRaisesRegex(ValueError, "Unknown element: Xx"):
-                    self._collect_values(service, ["mp-test-key", "W,Xx"])
+                    self._collect_values(service, ["W,Xx"])
 
     def test_blank_elements_are_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             service = self._make_service(Path(tmp))
             with patch.dict(os.environ, {}, clear=True):
                 with self.assertRaisesRegex(ValueError, "At least one element is required"):
-                    self._collect_values(service, ["mp-test-key", ""])
+                    self._collect_values(service, [""])
 
     def test_prompt_registry_is_generic(self) -> None:
         prompts = (

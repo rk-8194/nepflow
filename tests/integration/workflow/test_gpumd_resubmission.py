@@ -45,6 +45,24 @@ class GpumdSelfResubmitTests(unittest.TestCase):
         self.assertTrue(stop)
         self.assertIn("max segments", reason)
 
+    def test_gpumd_segment_uses_process_runner_boundary(self) -> None:
+        runner = Mock()
+        runner.run_shell.return_value.returncode = 0
+
+        with tempfile.TemporaryDirectory() as tmp:
+            module.run_gpumd_segment(
+                "gpumd > log",
+                Path(tmp),
+                process_runner=runner,
+            )
+
+        runner.run_shell.assert_called_once_with(
+            "gpumd > log",
+            cwd=Path(tmp),
+            check=False,
+            capture_output=False,
+        )
+
     def test_resolve_resubmit_command_falls_back_to_submit_script_in_workdir(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             workdir = Path(tmp)

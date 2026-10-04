@@ -259,12 +259,12 @@ def compose_stage_registry() -> StageRegistry:
 
     registry.register(WorkflowStage.SELECT, run_selection)
     def run_dft(context: StageContext) -> StageRunResult:
-        return DftStage().run(context).as_workflow_result()
+        return DftStage(scheduler=scheduler).run(context).as_workflow_result()
 
     registry.register(WorkflowStage.RUN_VASP, run_dft)
     registry.register(
         WorkflowStage.TRAIN_NEP,
-        lambda context: TrainingStage().run(context),
+        lambda context: TrainingStage(scheduler=scheduler).run(context),
     )
 
     def run_validation(context: StageContext) -> StageRunResult:
