@@ -14,7 +14,6 @@ from nepflow.io.atomic import atomic_write_text
 from .loader import load_config
 from .models import NepflowConfig
 
-
 logger = logging.getLogger(__name__)
 
 

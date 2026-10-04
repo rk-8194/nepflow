@@ -3,17 +3,20 @@ from configparser import ConfigParser
 import pytest
 
 from nepflow.dft.backend import DftCompletionEvidence, DftFailureEvidence
+from nepflow.dft.vasp.backend import VaspBackend
 from nepflow.dft.vasp.failures import (
     VaspFailureEvidence,
     classify_failure,
 )
-from nepflow.dft.vasp.backend import VaspBackend
-from nepflow.domain.identities import DftCalculationIdentity
-from nepflow.hpc.process import ProcessResult
-from nepflow.dft.vasp.recovery import build_retry_levels_for_gpu, decide_retry
-from nepflow.dft.vasp.recovery import write_incar_resource_parameters
 from nepflow.dft.vasp.inputs import hash_incar_text
+from nepflow.dft.vasp.recovery import (
+    build_retry_levels_for_gpu,
+    decide_retry,
+    write_incar_resource_parameters,
+)
+from nepflow.domain.identities import DftCalculationIdentity
 from nepflow.errors import VaspError
+from nepflow.hpc.process import ProcessResult
 
 
 def test_failure_classification_distinguishes_oom_from_incomplete(tmp_path) -> None:
@@ -25,9 +28,10 @@ def test_failure_classification_distinguishes_oom_from_incomplete(tmp_path) -> N
 
     incomplete = tmp_path / "incomplete"
     incomplete.mkdir()
-    assert classify_failure(
-        VaspFailureEvidence.from_job_directory(incomplete)
-    ).kind == "incomplete_output"
+    assert (
+        classify_failure(VaspFailureEvidence.from_job_directory(incomplete)).kind
+        == "incomplete_output"
+    )
 
 
 def test_recovery_decision_records_the_next_resource_level() -> None:

@@ -63,11 +63,9 @@ logger = logging.getLogger("plot_descriptors")
 # helpers - copied / adapted from select.py
 # ---------------------------------------------------------------------------
 
+
 def _latest_potential(potentials_dir: Path) -> Path:
-    candidates = [
-        d for d in potentials_dir.iterdir()
-        if d.is_dir() and (d / "nep.txt").exists()
-    ]
+    candidates = [d for d in potentials_dir.iterdir() if d.is_dir() and (d / "nep.txt").exists()]
     if not candidates:
         raise FileNotFoundError(f"No completed potential folders found in {potentials_dir}")
     return max(candidates, key=lambda d: d.stat().st_mtime)
@@ -83,9 +81,7 @@ def _match_indices(ref_ase: list, target_xyz: Path) -> list[int]:
         target = [target]
     ref_index = {structure_identity(a): i for i, a in enumerate(ref_ase)}
     indices = [
-        ref_index[structure_identity(a)]
-        for a in target
-        if structure_identity(a) in ref_index
+        ref_index[structure_identity(a)] for a in target if structure_identity(a) in ref_index
     ]
     if not indices:
         logger.warning(f"  No structures from {target_xyz.name} matched")
@@ -330,32 +326,62 @@ def _plot_shared(
 # main
 # ---------------------------------------------------------------------------
 
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Compute descriptors with a trained NEP potential and plot descriptor space."
     )
-    parser.add_argument("--project", type=Path, required=True,
-                        help="Path to the nepflow project directory")
-    parser.add_argument("--potential", default="latest",
-                        help='Potential folder inside nep/potentials/ or "latest" (default: latest)')
-    parser.add_argument("--structures", type=Path, default=None,
-                        help="XYZ file to describe (default: structures/generated/generated_structures.xyz)")
-    parser.add_argument("--train-xyz", type=Path, default=None,
-                        help="FPS-selected train set (default: structures/selected/train.xyz)")
-    parser.add_argument("--test-xyz", type=Path, default=None,
-                        help="FPS-selected test set (default: structures/selected/test.xyz)")
-    parser.add_argument("--output", type=Path, default=None,
-                        help="Output PNG path (default: reports/descriptor_space_trained.png)")
-    parser.add_argument("--batch", type=int, default=500,
-                        help="Descriptor batch size (default: 500)")
-    parser.add_argument("--no-cache", action="store_true",
-                        help="Recompute descriptors even if a cache exists")
-    parser.add_argument("--atom", action="store_true",
-                        help="Use per-atom descriptors instead of per-structure mean")
-    parser.add_argument("--compare-potential", default=None,
-                        help="Second potential folder inside nep/potentials/ for shared-PCA comparison")
-    parser.add_argument("--shared-pca", action="store_true",
-                        help="Fit one PCA basis on both potentials and plot them side by side")
+    parser.add_argument(
+        "--project", type=Path, required=True, help="Path to the nepflow project directory"
+    )
+    parser.add_argument(
+        "--potential",
+        default="latest",
+        help='Potential folder inside nep/potentials/ or "latest" (default: latest)',
+    )
+    parser.add_argument(
+        "--structures",
+        type=Path,
+        default=None,
+        help="XYZ file to describe (default: structures/generated/generated_structures.xyz)",
+    )
+    parser.add_argument(
+        "--train-xyz",
+        type=Path,
+        default=None,
+        help="FPS-selected train set (default: structures/selected/train.xyz)",
+    )
+    parser.add_argument(
+        "--test-xyz",
+        type=Path,
+        default=None,
+        help="FPS-selected test set (default: structures/selected/test.xyz)",
+    )
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=None,
+        help="Output PNG path (default: reports/descriptor_space_trained.png)",
+    )
+    parser.add_argument(
+        "--batch", type=int, default=500, help="Descriptor batch size (default: 500)"
+    )
+    parser.add_argument(
+        "--no-cache", action="store_true", help="Recompute descriptors even if a cache exists"
+    )
+    parser.add_argument(
+        "--atom", action="store_true", help="Use per-atom descriptors instead of per-structure mean"
+    )
+    parser.add_argument(
+        "--compare-potential",
+        default=None,
+        help="Second potential folder inside nep/potentials/ for shared-PCA comparison",
+    )
+    parser.add_argument(
+        "--shared-pca",
+        action="store_true",
+        help="Fit one PCA basis on both potentials and plot them side by side",
+    )
     args = parser.parse_args()
 
     project_dir = args.project
@@ -373,7 +399,6 @@ def main() -> None:
     try:
         potential_path = _resolve_potential(potentials_dir, args.potential)
         logger.info(f"Using potential: {potential_path.name}")
-        compare_potential_path = None
         compare_cache_dir = None
         compare_label = None
         if compare_requested:
@@ -382,7 +407,6 @@ def main() -> None:
                 potentials_dir,
                 args.compare_potential,
             )
-            compare_potential_path = compare_cache_dir
             logger.info(f"Using comparison target: {compare_nep_txt}")
     except FileNotFoundError as exc:
         logger.error(str(exc))
@@ -398,12 +422,17 @@ def main() -> None:
         logger.error("Comparison target could not be resolved")
         sys.exit(1)
 
-    structures_path = args.structures or (project_dir / "structures" / "generated" / "generated_structures.xyz")
+    structures_path = args.structures or (
+        project_dir / "structures" / "generated" / "generated_structures.xyz"
+    )
     train_xyz = args.train_xyz or (project_dir / "structures" / "selected" / "train.xyz")
     test_xyz = args.test_xyz or (project_dir / "structures" / "selected" / "test.xyz")
     output_path = args.output or (
-        project_dir / "reports" / (
-            "descriptor_space_shared_pca.png" if compare_requested
+        project_dir
+        / "reports"
+        / (
+            "descriptor_space_shared_pca.png"
+            if compare_requested
             else "descriptor_space_trained.png"
         )
     )
@@ -523,7 +552,14 @@ def main() -> None:
             potential_path.name,
         )
     else:
-        _plot(descriptors, train_indices, test_indices, nep_train_indices, output_path, potential_path.name)
+        _plot(
+            descriptors,
+            train_indices,
+            test_indices,
+            nep_train_indices,
+            output_path,
+            potential_path.name,
+        )
 
     logger.info("")
     logger.info("Done.")

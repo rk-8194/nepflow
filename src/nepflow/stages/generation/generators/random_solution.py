@@ -61,8 +61,7 @@ class RandomSolidSolutionGenerator:
                         "crystal_structure": crystal_structure,
                         "configurational_type": "random_solid_solution",
                         "source": (
-                            f"rss-{composition_label(composition)}-"
-                            f"{crystal_structure}-{index}"
+                            f"rss-{composition_label(composition)}-{crystal_structure}-{index}"
                         ),
                         "random_seed": self.random_seed,
                     }

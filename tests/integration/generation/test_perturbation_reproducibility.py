@@ -10,6 +10,9 @@ pytest.importorskip("hiphive")
 from ase import Atoms  # noqa: E402
 
 from nepflow.domain.identities import calculate_structure_id  # noqa: E402
+from nepflow.stages.generation.perturbations.coordinator import (  # noqa: E402
+    execute_perturbation_task,
+)
 from nepflow.stages.generation.perturbations.defects import vacancies  # noqa: E402
 from nepflow.stages.generation.perturbations.displacements import rattled  # noqa: E402
 from nepflow.stages.generation.perturbations.models import (  # noqa: E402
@@ -19,9 +22,6 @@ from nepflow.stages.generation.perturbations.models import (  # noqa: E402
 )
 from nepflow.stages.generation.perturbations.provenance import (  # noqa: E402
     annotate_generation_provenance,
-)
-from nepflow.stages.generation.perturbations.coordinator import (  # noqa: E402
-    execute_perturbation_task,
 )
 
 
@@ -110,9 +110,7 @@ class GenerationReproducibilityTests(unittest.TestCase):
             outputs = []
             for _ in range(n_structures):
                 rattled = atoms.copy()
-                rattled.positions += rng.normal(
-                    0.0, rattle_std, rattled.positions.shape
-                )
+                rattled.positions += rng.normal(0.0, rattle_std, rattled.positions.shape)
                 outputs.append(rattled)
             return outputs
 
@@ -152,8 +150,12 @@ class GenerationReproducibilityTests(unittest.TestCase):
             "hiphive.structure_generation.generate_mc_rattled_structures",
             side_effect=fake_primary_rattling,
         ):
-            rattled(base, base, 1, self.settings(random_seed=21), 21, annotate_generation_provenance)
-            rattled(base, base, 1, self.settings(random_seed=22), 22, annotate_generation_provenance)
+            rattled(
+                base, base, 1, self.settings(random_seed=21), 21, annotate_generation_provenance
+            )
+            rattled(
+                base, base, 1, self.settings(random_seed=22), 22, annotate_generation_provenance
+            )
 
         self.assertEqual(received_seeds, [21, 22])
 
@@ -248,9 +250,7 @@ class GenerationReproducibilityTests(unittest.TestCase):
             )
             results = list(result.candidates)
 
-        rattled = [
-            atoms for atoms in results if atoms.info["perturbation_type"] == "rattled"
-        ]
+        rattled = [atoms for atoms in results if atoms.info["perturbation_type"] == "rattled"]
         self.assertEqual(len(rattled), 1)
         self.assertEqual(rattled[0].info["random_seed"], child_seed)
         self.assertNotEqual(rattled[0].info["random_seed"], 1234)

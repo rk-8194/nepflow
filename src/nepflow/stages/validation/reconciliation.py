@@ -18,7 +18,6 @@ from nepflow.mlip.simulation import StaticPrediction
 
 from .protocols import ValidationCaseSpec
 
-
 _ACTIVE = frozenset({"submitted", "running"})
 _TERMINAL = frozenset({"completed", "failed"})
 
@@ -137,7 +136,9 @@ class ValidationReconciliationOrchestrator:
         if not callable(getattr(state_store, "append_event", None)) and not callable(
             getattr(state_store, "record_validation_event", None)
         ):
-            raise TypeError("ValidationReconciliationOrchestrator requires an event-capable StateStore")
+            raise TypeError(
+                "ValidationReconciliationOrchestrator requires an event-capable StateStore"
+            )
 
         self.validation_run = validation_run
         self.model = model
@@ -198,7 +199,9 @@ class ValidationReconciliationOrchestrator:
                     **kwargs,
                 )
             except TypeError:
-                recorder(entity_type, self.validation_run_id, event_type, to_jsonable(dict(payload)))
+                recorder(
+                    entity_type, self.validation_run_id, event_type, to_jsonable(dict(payload))
+                )
             return
         self.state_store.append_event(
             event_id,
@@ -317,11 +320,7 @@ class ValidationReconciliationOrchestrator:
         upsert = getattr(self.state_store, "upsert_validation_run", None)
         if not callable(upsert):
             return
-        completed_at = (
-            datetime.now(timezone.utc).isoformat()
-            if status in _TERMINAL
-            else None
-        )
+        completed_at = datetime.now(timezone.utc).isoformat() if status in _TERMINAL else None
         upsert(
             ValidationRunRecord(
                 identity=self.validation_run,
@@ -346,7 +345,9 @@ class ValidationReconciliationOrchestrator:
         updated = replace(
             record,
             status=status,
-            scheduler_state=scheduler_state if scheduler_state is not None else record.scheduler_state,
+            scheduler_state=scheduler_state
+            if scheduler_state is not None
+            else record.scheduler_state,
             job_id=record.job_id if job_id is None else job_id,
             job_name=record.job_name if job_name is None else job_name,
             failure_reason=failure_reason,
@@ -435,12 +436,16 @@ class ValidationReconciliationOrchestrator:
 
     def _reconcile_submitted(self, record: ValidationExecutionRecord) -> ValidationExecutionRecord:
         if not record.job_id:
-            raise StateError(f"Submitted validation attempt {record.attempt_id} has no scheduler job ID")
+            raise StateError(
+                f"Submitted validation attempt {record.attempt_id} has no scheduler job ID"
+            )
         result = self.scheduler.reconcile(record.job_id)
         job = getattr(result, "job", result)
         state = self._job_state(job)
         if state == SchedulerJobState.UNKNOWN:
-            raise StateError(f"Scheduler returned an unknown state for validation job {record.job_id}")
+            raise StateError(
+                f"Scheduler returned an unknown state for validation job {record.job_id}"
+            )
         if state == SchedulerJobState.PENDING:
             return self._save_status(record, "submitted", scheduler_state=state.value)
         if state == SchedulerJobState.RUNNING:

@@ -17,8 +17,7 @@ def _write_record(
 ) -> Path:
     directory.mkdir()
     (directory / "POSCAR").write_text(
-        poscar
-        or "Si\n1.0\n1 0 0\n0 1 0\n0 0 1\nSi\n2\nDirect\n0 0 0\n0.5 0.5 0.5\n",
+        poscar or "Si\n1.0\n1 0 0\n0 1 0\n0 0 1\nSi\n2\nDirect\n0 0 0\n0.5 0.5 0.5\n",
         encoding="utf-8",
     )
     (directory / "INCAR").write_text(incar, encoding="utf-8")

@@ -26,9 +26,7 @@ def test_phase2_composition_grid_preserves_unary_binary_and_ternary_order() -> N
 
 def test_four_element_pool_generates_only_supported_subsets() -> None:
     elements = ("W", "Cr", "Y", "Zr")
-    grid = CompositionGrid.from_config(
-        CompositionConfig(elements=elements, composition_step=0.25)
-    )
+    grid = CompositionGrid.from_config(CompositionConfig(elements=elements, composition_step=0.25))
 
     compositions = grid.generate()
     unary = {frozenset(composition) for composition in compositions if len(composition) == 1}

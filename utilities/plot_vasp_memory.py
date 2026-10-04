@@ -29,37 +29,41 @@ def load_rows(csv_path: Path) -> list[dict]:
         reader = csv.DictReader(f)
         rows = []
         for r in reader:
-            rows.append({
-                "n_atoms":        int(r["n_atoms"]),
-                "n_kpoints_irr":  int(r["n_kpoints_irr"]),
-                "n_electrons":    int(r["n_electrons"]),
-                "nodes":          int(r["nodes"]),
-                "gpus":           int(r["gpus"]),
-                "ncore":          int(r["ncore"]),
-                "kpar":           int(r["kpar"]),
-                "avg_loop_time":  float(r["avg_loop_time"]),
-                "oom":            int(r["oom"]),
-            })
+            rows.append(
+                {
+                    "n_atoms": int(r["n_atoms"]),
+                    "n_kpoints_irr": int(r["n_kpoints_irr"]),
+                    "n_electrons": int(r["n_electrons"]),
+                    "nodes": int(r["nodes"]),
+                    "gpus": int(r["gpus"]),
+                    "ncore": int(r["ncore"]),
+                    "kpar": int(r["kpar"]),
+                    "avg_loop_time": float(r["avg_loop_time"]),
+                    "oom": int(r["oom"]),
+                }
+            )
     return rows
 
 
 def plot_heatmaps(rows: list[dict], plot_dir: Path) -> None:
     """Plot 1: NCORE × KPAR heatmap per (n_atoms, gpus)."""
     import matplotlib
+
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     from matplotlib.colors import LogNorm
 
-    all_atoms  = sorted({r["n_atoms"] for r in rows})
-    all_ncores = sorted({r["ncore"]   for r in rows})
-    all_kpars  = sorted({r["kpar"]    for r in rows})
+    all_atoms = sorted({r["n_atoms"] for r in rows})
+    all_ncores = sorted({r["ncore"] for r in rows})
+    all_kpars = sorted({r["kpar"] for r in rows})
 
     for n_atoms in all_atoms:
-        atom_rows  = [r for r in rows if r["n_atoms"] == n_atoms]
+        atom_rows = [r for r in rows if r["n_atoms"] == n_atoms]
         gpu_counts = sorted({r["gpus"] for r in atom_rows})
 
         fig, axes = plt.subplots(
-            1, len(gpu_counts),
+            1,
+            len(gpu_counts),
             figsize=(5 * len(gpu_counts), 4),
             squeeze=False,
         )
@@ -69,10 +73,10 @@ def plot_heatmaps(rows: list[dict], plot_dir: Path) -> None:
         kp_idx = {v: i for i, v in enumerate(all_kpars)}
 
         for col, gpus in enumerate(gpu_counts):
-            ax     = axes[0, col]
+            ax = axes[0, col]
             subset = [r for r in atom_rows if r["gpus"] == gpus]
 
-            grid     = np.full((len(all_ncores), len(all_kpars)), np.nan)
+            grid = np.full((len(all_ncores), len(all_kpars)), np.nan)
             oom_mask = np.zeros_like(grid, dtype=bool)
 
             for r in subset:
@@ -88,7 +92,9 @@ def plot_heatmaps(rows: list[dict], plot_dir: Path) -> None:
             valid = grid[~np.isnan(grid)]
             if len(valid) > 0:
                 im = ax.imshow(
-                    grid, aspect="auto", origin="lower",
+                    grid,
+                    aspect="auto",
+                    origin="lower",
                     norm=LogNorm(
                         vmin=max(valid.min(), 1e-3),
                         vmax=valid.max(),
@@ -100,20 +106,43 @@ def plot_heatmaps(rows: list[dict], plot_dir: Path) -> None:
                 for ni in range(len(all_ncores)):
                     for ki in range(len(all_kpars)):
                         if oom_mask[ni, ki]:
-                            ax.text(ki, ni, "OOM", ha="center", va="center",
-                                    color="red", fontweight="bold", fontsize=8)
+                            ax.text(
+                                ki,
+                                ni,
+                                "OOM",
+                                ha="center",
+                                va="center",
+                                color="red",
+                                fontweight="bold",
+                                fontsize=8,
+                            )
                         elif not np.isnan(grid[ni, ki]):
-                            ax.text(ki, ni, f"{grid[ni, ki]:.1f}",
-                                    ha="center", va="center",
-                                    color="white", fontsize=7)
+                            ax.text(
+                                ki,
+                                ni,
+                                f"{grid[ni, ki]:.1f}",
+                                ha="center",
+                                va="center",
+                                color="white",
+                                fontsize=7,
+                            )
             else:
-                ax.imshow(np.zeros_like(grid), aspect="auto", origin="lower",
-                          cmap="Greys", vmin=0, vmax=1)
+                ax.imshow(
+                    np.zeros_like(grid), aspect="auto", origin="lower", cmap="Greys", vmin=0, vmax=1
+                )
                 for ni in range(len(all_ncores)):
                     for ki in range(len(all_kpars)):
                         if oom_mask[ni, ki]:
-                            ax.text(ki, ni, "OOM", ha="center", va="center",
-                                    color="red", fontweight="bold", fontsize=8)
+                            ax.text(
+                                ki,
+                                ni,
+                                "OOM",
+                                ha="center",
+                                va="center",
+                                color="red",
+                                fontweight="bold",
+                                fontsize=8,
+                            )
 
             ax.set_xticks(range(len(all_kpars)))
             ax.set_xticklabels(all_kpars)
@@ -133,11 +162,12 @@ def plot_heatmaps(rows: list[dict], plot_dir: Path) -> None:
 def plot_scaling(rows: list[dict], plot_dir: Path) -> None:
     """Plot 2: best loop time vs n_electrons per GPU count."""
     import matplotlib
+
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
     completed = [r for r in rows if r["oom"] == 0]
-    all_gpus  = sorted({r["gpus"] for r in rows})
+    all_gpus = sorted({r["gpus"] for r in rows})
 
     all_ne = sorted({r["n_electrons"] for r in rows})
 
@@ -162,9 +192,12 @@ def plot_scaling(rows: list[dict], plot_dir: Path) -> None:
     for gpus, (x_vals, y_vals, labels) in series.items():
         for i in {0, len(x_vals) - 1}:
             ax.annotate(
-                labels[i], (x_vals[i], y_vals[i]),
+                labels[i],
+                (x_vals[i], y_vals[i]),
                 textcoords="offset points",
-                xytext=(6, 6), fontsize=7, color="gray",
+                xytext=(6, 6),
+                fontsize=7,
+                color="gray",
                 bbox=dict(boxstyle="round,pad=0.2", fc="white", alpha=0.6, ec="none"),
             )
 
@@ -185,11 +218,12 @@ def plot_scaling(rows: list[dict], plot_dir: Path) -> None:
 def plot_oom_map(rows: list[dict], plot_dir: Path) -> None:
     """Plot 3: stacked bar of OK vs OOM counts per system size and GPU count."""
     import matplotlib
+
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
     all_atoms = sorted({r["n_atoms"] for r in rows})
-    all_gpus  = sorted({r["gpus"]   for r in rows})
+    all_gpus = sorted({r["gpus"] for r in rows})
 
     fig, ax = plt.subplots(figsize=(7, 4))
     bar_width = 0.25
@@ -203,11 +237,19 @@ def plot_oom_map(rows: list[dict], plot_dir: Path) -> None:
             oom_counts.append(sum(1 for r in sub if r["oom"] == 1))
 
         offset = (i - len(all_gpus) / 2 + 0.5) * bar_width
-        ax.bar(x_pos + offset, ok_counts, bar_width,
-               label=f"GPU={gpus} OK", color=f"C{i}", alpha=0.8)
-        ax.bar(x_pos + offset, oom_counts, bar_width, bottom=ok_counts,
-               color=f"C{i}", alpha=0.3, hatch="//",
-               label=f"GPU={gpus} OOM")
+        ax.bar(
+            x_pos + offset, ok_counts, bar_width, label=f"GPU={gpus} OK", color=f"C{i}", alpha=0.8
+        )
+        ax.bar(
+            x_pos + offset,
+            oom_counts,
+            bar_width,
+            bottom=ok_counts,
+            color=f"C{i}",
+            alpha=0.3,
+            hatch="//",
+            label=f"GPU={gpus} OOM",
+        )
 
     ax.set_xlabel("Number of atoms")
     ax.set_ylabel("Number of benchmarks")
@@ -226,20 +268,24 @@ def plot_oom_map(rows: list[dict], plot_dir: Path) -> None:
 def main() -> None:
     # Auto-detect .vasp_memory relative to this script's location
     # (utilities/ lives one level below the nepflow root)
-    script_dir   = Path(__file__).resolve().parent
+    script_dir = Path(__file__).resolve().parent
     nepflow_root = script_dir.parent
-    default_csv  = nepflow_root / ".vasp_memory"
+    default_csv = nepflow_root / ".vasp_memory"
 
     parser = argparse.ArgumentParser(
         description="Plot benchmark data from nepflow's .vasp_memory CSV."
     )
     parser.add_argument(
-        "--memory", type=Path, default=default_csv,
+        "--memory",
+        type=Path,
+        default=default_csv,
         metavar="PATH",
         help=f"Path to .vasp_memory CSV (default: {default_csv})",
     )
     parser.add_argument(
-        "--output", type=Path, default=None,
+        "--output",
+        type=Path,
+        default=None,
         metavar="DIR",
         help="Output directory for plots (default: <memory_dir>/plots/)",
     )
@@ -256,15 +302,18 @@ def main() -> None:
     try:
         import matplotlib  # noqa: F401
     except ImportError:
-        print("ERROR: matplotlib is required. Install with: pip install matplotlib",
-              file=sys.stderr)
+        print(
+            "ERROR: matplotlib is required. Install with: pip install matplotlib", file=sys.stderr
+        )
         sys.exit(1)
 
     print(f"Reading {csv_path}")
     rows = load_rows(csv_path)
-    print(f"  {len(rows)} rows loaded "
-          f"({sum(1 for r in rows if r['oom'] == 0)} timed, "
-          f"{sum(1 for r in rows if r['oom'] == 1)} OOM)")
+    print(
+        f"  {len(rows)} rows loaded "
+        f"({sum(1 for r in rows if r['oom'] == 0)} timed, "
+        f"{sum(1 for r in rows if r['oom'] == 1)} OOM)"
+    )
 
     print(f"Writing plots to {plot_dir}/")
     plot_heatmaps(rows, plot_dir)

@@ -9,9 +9,15 @@ from nepflow.stages.generation.perturbations import elasticity as module
 class CalculateElasticTensorsTests(unittest.TestCase):
     def test_strain_matrix_to_voigt_uses_engineering_shear(self) -> None:
         strain = [
-            0.0, 0.01, 0.0,
-            0.01, 0.0, 0.0,
-            0.0, 0.0, 0.0,
+            0.0,
+            0.01,
+            0.0,
+            0.01,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
         ]
 
         voigt = module.strain_matrix_to_voigt(strain)
@@ -27,14 +33,16 @@ class CalculateElasticTensorsTests(unittest.TestCase):
         c11 = 240.0
         c12 = 140.0
         c44 = 80.0
-        expected = np.array([
-            [c11, c12, c12, 0.0, 0.0, 0.0],
-            [c12, c11, c12, 0.0, 0.0, 0.0],
-            [c12, c12, c11, 0.0, 0.0, 0.0],
-            [0.0, 0.0, 0.0, c44, 0.0, 0.0],
-            [0.0, 0.0, 0.0, 0.0, c44, 0.0],
-            [0.0, 0.0, 0.0, 0.0, 0.0, c44],
-        ])
+        expected = np.array(
+            [
+                [c11, c12, c12, 0.0, 0.0, 0.0],
+                [c12, c11, c12, 0.0, 0.0, 0.0],
+                [c12, c12, c11, 0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0, c44, 0.0, 0.0],
+                [0.0, 0.0, 0.0, 0.0, c44, 0.0],
+                [0.0, 0.0, 0.0, 0.0, 0.0, c44],
+            ]
+        )
 
         strains = [
             np.array([0.01, 0.0, 0.0, 0.0, 0.0, 0.0]),

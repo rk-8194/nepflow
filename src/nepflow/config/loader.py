@@ -28,16 +28,13 @@ from .section_parsers import (
 )
 from .validation import validate_config
 
-
 CANONICAL_CONFIG_NAME = "project.config"
 
 _ALLOWED_KEYS: dict[str, frozenset[str]] = {
     "project": frozenset(
         {"name", "description", "status", "random_seed", "schema_version", "config_version"}
     ),
-    "paths": frozenset(
-        {"structures_path", "vasp_path", "nep_path", "gpumd_path", "reports_path"}
-    ),
+    "paths": frozenset({"structures_path", "vasp_path", "nep_path", "gpumd_path", "reports_path"}),
     "materialsproject": frozenset({"api_key"}),
     "composition": frozenset(
         {
@@ -240,9 +237,7 @@ def load_config(
     path = Path(config_path)
     parser = _read_parser(path)
     _reject_unknown_keys(parser)
-    sections = {
-        section.lower(): _section(parser, section) for section in parser.sections()
-    }
+    sections = {section.lower(): _section(parser, section) for section in parser.sections()}
 
     schema_version, project = parse_project(
         sections.get("project", {}),
@@ -272,9 +267,7 @@ def load_config(
             sections.get("training_sweep", {}),
             composition.elements + composition.gas_elements,
         ),
-        validation=parse_validation(
-            sections.get("validate", {}), sections.get("gpumd", {})
-        ),
+        validation=parse_validation(sections.get("validate", {}), sections.get("gpumd", {})),
         hpc=parse_hpc(sections.get("hpc", {})),
         slurm=slurm,
         source_path=path,

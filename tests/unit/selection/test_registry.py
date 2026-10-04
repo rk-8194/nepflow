@@ -1,6 +1,5 @@
 """Workflow registry dispatches SELECT through canonical SelectionStage."""
 
-from pathlib import Path
 from unittest.mock import patch
 
 import pytest

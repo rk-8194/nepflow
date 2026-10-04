@@ -11,8 +11,7 @@ from ase.io import read as ase_read
 from .artifacts import write_selected_structures
 from .models import SelectionResult
 
-
-logger = logging.getLogger("nepflow.selection.debug")
+logger = logging.getLogger(__name__)
 
 
 def run_debug_selection(
@@ -21,13 +20,10 @@ def run_debug_selection(
 ) -> SelectionResult:
     """Create the established deterministic random debug split."""
 
-    generated_path = (
-        project_dir / "structures" / "generated" / "generated_structures.xyz"
-    )
+    generated_path = project_dir / "structures" / "generated" / "generated_structures.xyz"
     if not generated_path.exists():
         raise FileNotFoundError(
-            f"No generated structures found at {generated_path}\n"
-            "Run the 'generate' stage first."
+            f"No generated structures found at {generated_path}\nRun the 'generate' stage first."
         )
 
     if ase_structures is None:

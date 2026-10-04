@@ -7,9 +7,9 @@ terminal I/O.
 
 from __future__ import annotations
 
+import builtins
 import logging
 import os
-import builtins
 from dataclasses import dataclass
 from typing import Callable, Iterable
 
@@ -21,8 +21,8 @@ from nepflow.config.validation import (
     normalize_target_n_atoms,
 )
 
-
 logger = logging.getLogger(__name__)
+
 
 @dataclass(frozen=True)
 class ConfigPrompt:
@@ -122,9 +122,7 @@ class ConfigWizard:
         self.output_fn()
         self.output_fn("=" * 72)
         self.output_fn(f"NEPFlow setup for project: {self.project_name}")
-        self.output_fn(
-            "We'll ask for a few initial config values to build the project file."
-        )
+        self.output_fn("We'll ask for a few initial config values to build the project file.")
         self.output_fn("Press Enter to accept any shown default.")
         self.output_fn("=" * 72)
         self.output_fn()
@@ -133,9 +131,7 @@ class ConfigWizard:
         self.output_fn("3. Crystal structures")
         self.output_fn("4. Target number of atoms per supercell")
         self.output_fn("5. Remote NEPFlow directory")
-        self.output_fn(
-            "Materials Project access uses the runtime MP_API_KEY environment variable."
-        )
+        self.output_fn("Materials Project access uses the runtime MP_API_KEY environment variable.")
         self.output_fn()
 
     @staticmethod

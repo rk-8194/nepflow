@@ -6,8 +6,8 @@ import hashlib
 
 import pytest
 
-from nepflow.errors import ArtifactError, StateError
 import nepflow.io.atomic as atomic_module
+from nepflow.errors import ArtifactError, StateError
 from nepflow.io.atomic import atomic_write_text
 from nepflow.io.hashing import (
     sha256_canonical_json,

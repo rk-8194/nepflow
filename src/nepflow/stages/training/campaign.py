@@ -7,10 +7,10 @@ model merely because a backend artifact exists.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-import logging
 from types import MappingProxyType
 from typing import Any, Mapping, Sequence
 
@@ -20,6 +20,9 @@ from nepflow.domain.models import ModelRunRecord
 from nepflow.errors import StateError
 from nepflow.hpc.jobs import SchedulerJobState
 from nepflow.hpc.resources import JobResources
+from nepflow.io.atomic import atomic_write_text
+from nepflow.io.hashing import sha256_file
+from nepflow.io.json import to_jsonable
 from nepflow.mlip.backend import (
     CollectedModelArtifacts,
     MlipBackend,
@@ -30,13 +33,9 @@ from nepflow.mlip.nep.artifacts import (
     update_model_run_status,
     write_model_run_manifest,
 )
-from nepflow.io.atomic import atomic_write_text
-from nepflow.io.hashing import sha256_file
-from nepflow.io.json import to_jsonable
 
 from .execution import TrainingExecution
 from .optimisation import CandidateConfiguration
-
 
 logger = logging.getLogger(__name__)
 
@@ -260,9 +259,7 @@ class TrainingCampaign:
         requested = {} if specification is None else to_jsonable(dict(specification))
         persisted = latest.get("specification", {})
         if not isinstance(persisted, Mapping):
-            raise StateError(
-                f"Training campaign {self.campaign_id} has a malformed specification"
-            )
+            raise StateError(f"Training campaign {self.campaign_id} has a malformed specification")
         if requested:
             self._update_campaign_policy(latest, persisted, requested)
 
@@ -309,16 +306,13 @@ class TrainingCampaign:
         policy_keys = {
             key
             for key in set(merged) | set(requested)
-            if key not in {"candidate_keys", "candidate_matrix", "candidate_count", "schema_version"}
+            if key
+            not in {"candidate_keys", "candidate_matrix", "candidate_count", "schema_version"}
         }
         changed_policy = any(
-            persisted.get(key) != requested.get(key)
-            for key in policy_keys
-            if key in requested
+            persisted.get(key) != requested.get(key) for key in policy_keys if key in requested
         )
-        missing_policy = any(
-            key not in persisted for key in requested if key in policy_keys
-        )
+        missing_policy = any(key not in persisted for key in requested if key in policy_keys)
         if not (changed_policy or missing_policy):
             return
         self._append(
@@ -330,16 +324,8 @@ class TrainingCampaign:
                 "status": latest.get("status", "pending"),
                 "specification": merged,
                 "policy_transition": {
-                    "from": {
-                        key: persisted.get(key)
-                        for key in policy_keys
-                        if key in persisted
-                    },
-                    "to": {
-                        key: requested.get(key)
-                        for key in policy_keys
-                        if key in requested
-                    },
+                    "from": {key: persisted.get(key) for key in policy_keys if key in persisted},
+                    "to": {key: requested.get(key) for key in policy_keys if key in requested},
                 },
             },
         )
@@ -391,9 +377,7 @@ class TrainingCampaign:
             failure_reason=payload.get("failure_reason"),
             training_input=self._inputs.get(model_run_id),
             dataset_path=(
-                None
-                if payload.get("dataset_path") is None
-                else Path(str(payload["dataset_path"]))
+                None if payload.get("dataset_path") is None else Path(str(payload["dataset_path"]))
             ),
         )
 
@@ -482,12 +466,8 @@ class TrainingCampaign:
             return
         dataset_row = get_dataset(self.dataset_id)
         if dataset_row is None:
-            raise StateError(
-                f"Training campaign dataset is not registered: {self.dataset_id}"
-            )
-        persisted_identity = dataset_row.get(
-            "identity_json", dataset_row.get("identity", {})
-        )
+            raise StateError(f"Training campaign dataset is not registered: {self.dataset_id}")
+        persisted_identity = dataset_row.get("identity_json", dataset_row.get("identity", {}))
         if (
             isinstance(persisted_identity, Mapping)
             and persisted_identity.get("dataset_id") != self.dataset_id
@@ -543,24 +523,14 @@ class TrainingCampaign:
         run_directory: Path,
     ) -> dict[str, Any]:
         effective_dataset_path = (
-            Path(dataset_path)
-            if dataset_path is not None
-            else self.dataset_path
+            Path(dataset_path) if dataset_path is not None else self.dataset_path
         )
         effective_script_path = (
-            Path(script_path)
-            if script_path is not None
-            else run_directory / "train_nep.sh"
+            Path(script_path) if script_path is not None else run_directory / "train_nep.sh"
         ).resolve()
-        hyperparameters = (
-            asdict(candidate.hyperparameters)
-            if candidate is not None
-            else {}
-        )
+        hyperparameters = asdict(candidate.hyperparameters) if candidate is not None else {}
         candidate_ordinal = (
-            candidate.ordinal
-            if candidate is not None
-            else (0 if ordinal is None else int(ordinal))
+            candidate.ordinal if candidate is not None else (0 if ordinal is None else int(ordinal))
         )
         return {
             "campaign_id": self.campaign_id,
@@ -574,9 +544,7 @@ class TrainingCampaign:
             "hyperparameters_hash": identity.hyperparameters_hash,
             "hyperparameters": hyperparameters,
             "dataset_path": (
-                None
-                if effective_dataset_path is None
-                else str(effective_dataset_path.resolve())
+                None if effective_dataset_path is None else str(effective_dataset_path.resolve())
             ),
             "attempt_number": 0,
             "job_id": None,
@@ -651,9 +619,7 @@ class TrainingCampaign:
             "progress": attempt.progress,
             "failure_reason": attempt.failure_reason,
             "execution_directory": (
-                None
-                if attempt.execution_directory is None
-                else str(attempt.execution_directory)
+                None if attempt.execution_directory is None else str(attempt.execution_directory)
             ),
             "script_path": None if attempt.script_path is None else str(attempt.script_path),
             "execution_config_hash": attempt.execution_config_hash,
@@ -677,9 +643,7 @@ class TrainingCampaign:
                 else Path(str(payload["execution_directory"]))
             ),
             script_path=(
-                None
-                if payload.get("script_path") is None
-                else Path(str(payload["script_path"]))
+                None if payload.get("script_path") is None else Path(str(payload["script_path"]))
             ),
             execution_config_hash=payload.get("execution_config_hash"),
             execution_config=payload.get("execution_config"),
@@ -774,8 +738,7 @@ class TrainingCampaign:
                 attempt_number=number,
                 status="submitting",
                 job_name=(
-                    f"nepflow-{self.campaign_id}-{candidate.model_run_id[-12:]}-"
-                    f"a{number:04d}"
+                    f"nepflow-{self.campaign_id}-{candidate.model_run_id[-12:]}-a{number:04d}"
                 ),
             )
             self._save_attempt(attempt)
@@ -807,9 +770,7 @@ class TrainingCampaign:
             job_id = self._execution.job_id(existing)
         else:
             try:
-                job_id = self._execution.submit(
-                    self.scheduler, attempt, str(attempt.job_name)
-                )
+                job_id = self._execution.submit(self.scheduler, attempt, str(attempt.job_name))
             except Exception as exc:
                 self._save_attempt(
                     attempt,
@@ -860,9 +821,7 @@ class TrainingCampaign:
             raise StateError("Collected NEP artifact belongs to a different model run")
         manifest_path = candidate.run_directory / "model_run_manifest.json"
         if manifest_path.is_file():
-            self._persist_manifest_completed_artifact(
-                candidate, collected, attempt, manifest_path
-            )
+            self._persist_manifest_completed_artifact(candidate, collected, attempt, manifest_path)
             return
         self._record_completed_model(candidate, collected)
 
@@ -914,9 +873,7 @@ class TrainingCampaign:
                         "campaign_id": self.campaign_id,
                         "potential_path": str(candidate.run_directory),
                         "dataset_path": (
-                            None
-                            if self.dataset_path is None
-                            else str(self.dataset_path.resolve())
+                            None if self.dataset_path is None else str(self.dataset_path.resolve())
                         ),
                     },
                 ),
@@ -962,9 +919,7 @@ class TrainingCampaign:
             scheduler_state=scheduler_state.value,
             failure_reason=reason,
         )
-        next_status = (
-            "pending" if attempt.attempt_number < self.max_attempts else "failed"
-        )
+        next_status = "pending" if attempt.attempt_number < self.max_attempts else "failed"
         if next_status == "failed":
             self._persist_failed_model(candidate, reason)
         return self._save_candidate(
@@ -1087,7 +1042,10 @@ class TrainingCampaign:
     def _derive_status(self, candidates: Sequence[TrainingCandidate]) -> str:
         if not candidates:
             return "pending"
-        if any(candidate.status in _ACTIVE or candidate.status in {"pending", "prepared"} for candidate in candidates):
+        if any(
+            candidate.status in _ACTIVE or candidate.status in {"pending", "prepared"}
+            for candidate in candidates
+        ):
             return "running"
         if any(candidate.status == "completed" for candidate in candidates):
             return "completed"

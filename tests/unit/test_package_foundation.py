@@ -25,7 +25,6 @@ from nepflow.errors import (
 )
 from nepflow.logging import configure_logging
 
-
 FOUNDATION_IMPORTS = (
     "nepflow",
     "nepflow.errors",
@@ -141,8 +140,7 @@ def test_configure_logging_is_idempotent(tmp_path) -> None:
     assert (tmp_path / "foundation.log").exists()
     assert any(isinstance(handler, logging.StreamHandler) for handler in first_handlers)
     assert any(
-        isinstance(handler, logging.handlers.RotatingFileHandler)
-        for handler in first_handlers
+        isinstance(handler, logging.handlers.RotatingFileHandler) for handler in first_handlers
     )
 
     configure_logging("foundation", log_dir=tmp_path)

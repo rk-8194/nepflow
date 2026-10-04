@@ -24,7 +24,6 @@ from .models import (
     VaspConfig,
 )
 
-
 _SWEEP_FIELDS = (
     "population",
     "batch",
@@ -42,9 +41,7 @@ _SWEEP_FIELDS = (
     "lambda_v",
     "lambda_shear",
 )
-_SWEEP_TUPLE_FIELDS = frozenset(
-    {"weights", "cutoff", "n_max", "basis_size", "l_max", "neuron"}
-)
+_SWEEP_TUPLE_FIELDS = frozenset({"weights", "cutoff", "n_max", "basis_size", "l_max", "neuron"})
 
 
 def parse_project(
@@ -68,9 +65,7 @@ def parse_project(
         name=values.get("name", project_name or derived_name).strip(),
         description=values.get("description", "").strip(),
         status=values.get("status", "initialized").strip(),
-        random_seed=_parse_int(
-            values.get("random_seed", "42"), "project.random_seed"
-        ),
+        random_seed=_parse_int(values.get("random_seed", "42"), "project.random_seed"),
         config_version=config_version,
     )
     return schema_version, project
@@ -86,9 +81,7 @@ def parse_paths(values: Mapping[str, str]) -> PathsConfig:
         vasp_path=_parse_path(values.get("vasp_path", "vasp"), "paths.vasp_path"),
         nep_path=_parse_path(values.get("nep_path", "nep"), "paths.nep_path"),
         gpumd_path=_parse_path(values.get("gpumd_path", "gpumd"), "paths.gpumd_path"),
-        reports_path=_parse_path(
-            values.get("reports_path", "reports"), "paths.reports_path"
-        ),
+        reports_path=_parse_path(values.get("reports_path", "reports"), "paths.reports_path"),
     )
 
 
@@ -171,21 +164,15 @@ def _parse_generation_modes(values: Mapping[str, str]) -> dict[str, Any]:
         "use_segregated": _parse_bool(
             values.get("use_segregated", "true"), "generation.use_segregated"
         ),
-        "use_liquid": _parse_bool(
-            values.get("use_liquid", "false"), "generation.use_liquid"
-        ),
+        "use_liquid": _parse_bool(values.get("use_liquid", "false"), "generation.use_liquid"),
         "n_random_solid_solution": _parse_int(
             values.get("n_random_solid_solution", "3"),
             "generation.n_random_solid_solution",
         ),
         "n_sqs": _parse_int(values.get("n_sqs", "1"), "generation.n_sqs"),
-        "n_segregated": _parse_int(
-            values.get("n_segregated", "3"), "generation.n_segregated"
-        ),
+        "n_segregated": _parse_int(values.get("n_segregated", "3"), "generation.n_segregated"),
         "n_rattled": _parse_int(values.get("n_rattled", "10"), "generation.n_rattled"),
-        "n_vacancies": _parse_int(
-            values.get("n_vacancies", "10"), "generation.n_vacancies"
-        ),
+        "n_vacancies": _parse_int(values.get("n_vacancies", "10"), "generation.n_vacancies"),
         "n_interstitials": _parse_int(
             values.get("n_interstitials", "10"), "generation.n_interstitials"
         ),
@@ -248,18 +235,14 @@ def _parse_generation_liquid(values: Mapping[str, str]) -> dict[str, Any]:
             "generation.elastic_stress_enabled",
         ),
         "elastic_strain_amplitudes": _parse_float_list(
-            values.get(
-                "elastic_strain_amplitudes", "-0.02,-0.01,-0.005,0.005,0.01,0.02"
-            ),
+            values.get("elastic_strain_amplitudes", "-0.02,-0.01,-0.005,0.005,0.01,0.02"),
             "generation.elastic_strain_amplitudes",
         ),
     }
 
 
 def _parse_generation_perturbations(values: Mapping[str, str]) -> dict[str, Any]:
-    rattle_std = _parse_float(
-        values.get("rattle_std", "0.03"), "generation.rattle_std"
-    )
+    rattle_std = _parse_float(values.get("rattle_std", "0.03"), "generation.rattle_std")
     return {
         "rattle_std": rattle_std,
         "rattle_std_min": _parse_float(
@@ -270,15 +253,9 @@ def _parse_generation_perturbations(values: Mapping[str, str]) -> dict[str, Any]
             values.get("rattle_std_max", str(2.0 * rattle_std)),
             "generation.rattle_std_max",
         ),
-        "rattle_d_min": _parse_float(
-            values.get("rattle_d_min", "1.5"), "generation.rattle_d_min"
-        ),
-        "vacancy_min": _parse_float(
-            values.get("vacancy_min", "0.0"), "generation.vacancy_min"
-        ),
-        "vacancy_max": _parse_float(
-            values.get("vacancy_max", "0.1"), "generation.vacancy_max"
-        ),
+        "rattle_d_min": _parse_float(values.get("rattle_d_min", "1.5"), "generation.rattle_d_min"),
+        "vacancy_min": _parse_float(values.get("vacancy_min", "0.0"), "generation.vacancy_min"),
+        "vacancy_max": _parse_float(values.get("vacancy_max", "0.1"), "generation.vacancy_max"),
         "interstitial_d_min": _parse_float(
             values.get("interstitial_d_min", "1.65"),
             "generation.interstitial_d_min",
@@ -349,9 +326,7 @@ def parse_selection(values: Mapping[str, str]) -> SelectionConfig:
             values.get("target_tolerance", "50"), "selection.target_tolerance"
         ),
         descriptor_type=values.get("descriptor_type", "structure").strip().lower(),
-        batch_size=_parse_int(
-            values.get("batch_size", "500"), "selection.batch_size"
-        ),
+        batch_size=_parse_int(values.get("batch_size", "500"), "selection.batch_size"),
         max_search_iterations=_parse_int(
             values.get("max_search_iterations", "30"),
             "selection.max_search_iterations",
@@ -391,39 +366,25 @@ def parse_training(
     return NepTrainingConfig(
         population=_parse_int(values.get("population", "50"), "train_nep.population"),
         batch=_parse_int(values.get("batch", "3000"), "train_nep.batch"),
-        generations=_parse_int(
-            values.get("generation", "250000"), "train_nep.generation"
-        ),
-        charge_mode=_parse_int(
-            values.get("charge_mode", "0"), "train_nep.charge_mode"
-        ),
+        generations=_parse_int(values.get("generation", "250000"), "train_nep.generation"),
+        charge_mode=_parse_int(values.get("charge_mode", "0"), "train_nep.charge_mode"),
         weights=weights,
-        outer_zbl=_parse_float(
-            values.get("outerzbl", "2.0"), "train_nep.outer_zbl"
-        ),
+        outer_zbl=_parse_float(values.get("outerzbl", "2.0"), "train_nep.outer_zbl"),
         cutoff=_parse_tokens(values.get("cutoff", "6 5"), "train_nep.cutoff"),
         n_max=_parse_tokens(values.get("n_max", "4 4"), "train_nep.n_max"),
-        basis_size=_parse_tokens(
-            values.get("basis_size", "8 8"), "train_nep.basis_size"
-        ),
+        basis_size=_parse_tokens(values.get("basis_size", "8 8"), "train_nep.basis_size"),
         l_max=_parse_tokens(values.get("l_max", "4 2 1"), "train_nep.l_max"),
         neuron=_parse_tokens(values.get("neuron", "80"), "train_nep.neuron"),
         lambda_e=_parse_float(values.get("lambda_e", "1.0"), "train_nep.lambda_e"),
         lambda_f=_parse_float(values.get("lambda_f", "1.0"), "train_nep.lambda_f"),
         lambda_v=_parse_float(values.get("lambda_v", "1.0"), "train_nep.lambda_v"),
-        lambda_shear=_parse_float(
-            values.get("lambda_shear", "1.0"), "train_nep.lambda_shear"
-        ),
-        train_virial=_parse_bool(
-            values.get("train_virial", "false"), "train_nep.train_virial"
-        ),
+        lambda_shear=_parse_float(values.get("lambda_shear", "1.0"), "train_nep.lambda_shear"),
+        train_virial=_parse_bool(values.get("train_virial", "false"), "train_nep.train_virial"),
         allow_partial_dataset=_parse_bool(
             values.get("allow_partial_dataset", "false"),
             "train_nep.allow_partial_dataset",
         ),
-        max_resubmit=_parse_int(
-            values.get("max_resubmit", "3"), "train_nep.max_resubmit"
-        ),
+        max_resubmit=_parse_int(values.get("max_resubmit", "3"), "train_nep.max_resubmit"),
         sweep=_parse_training_sweep(values, sweep_values),
     )
 
@@ -434,21 +395,15 @@ def parse_slurm(
     """Parse scheduler settings and DFT retry policy."""
 
     recovery = DftRecoveryConfig(
-        max_retry_level=_parse_int(
-            values.get("max_retry_level", "100"), "slurm.max_retry_level"
-        ),
+        max_retry_level=_parse_int(values.get("max_retry_level", "100"), "slurm.max_retry_level"),
         vasp_walltime=values.get("vasp_walltime", "01:00:00").strip(),
     )
     slurm = SlurmConfig(
         enabled=_parse_bool(values.get("enabled", "false"), "slurm.enabled"),
-        max_concurrent=_parse_int(
-            values.get("max_concurrent", "20"), "slurm.max_concurrent"
-        ),
+        max_concurrent=_parse_int(values.get("max_concurrent", "20"), "slurm.max_concurrent"),
         walltime=values.get("walltime", "03:00:00").strip(),
         train_nep_walltime=_optional_string(values.get("train_nep_walltime")),
-        poll_interval=_parse_int(
-            values.get("poll_interval", "20"), "slurm.poll_interval"
-        ),
+        poll_interval=_parse_int(values.get("poll_interval", "20"), "slurm.poll_interval"),
         gpumd_walltime=values.get("gpumd_walltime", "00:10:00").strip(),
         gpumd_nodes=_parse_int(values.get("gpumd_nodes", "1"), "slurm.gpumd_nodes"),
         gpumd_gpus=_parse_int(values.get("gpumd_gpus", "1"), "slurm.gpumd_gpus"),
@@ -465,17 +420,11 @@ def parse_hpc(values: Mapping[str, str]) -> HpcConfig:
     """Parse site resource and command settings."""
 
     return HpcConfig(
-        cores_per_node=_parse_int(
-            values.get("cores_per_node", "64"), "hpc.cores_per_node"
-        ),
-        gpus_per_node=_parse_int(
-            values.get("gpus_per_node", "4"), "hpc.gpus_per_node"
-        ),
+        cores_per_node=_parse_int(values.get("cores_per_node", "64"), "hpc.cores_per_node"),
+        gpus_per_node=_parse_int(values.get("gpus_per_node", "4"), "hpc.gpus_per_node"),
         max_nodes=_parse_int(values.get("max_nodes", "16"), "hpc.max_nodes"),
         scp_address=values.get("scp_address", "").strip(),
-        vasp_command=values.get(
-            "vasp_command", "mpirun -np {ntasks} vasp_std"
-        ).strip(),
+        vasp_command=values.get("vasp_command", "mpirun -np {ntasks} vasp_std").strip(),
         nep_command=values.get(
             "nep_command", "mpirun --bind-to none $HOME/src/GPUMD/src/nep"
         ).strip(),
@@ -510,8 +459,7 @@ def _parse_training_sweep(
     """Parse the canonical, typed training sweep declaration."""
 
     declarations: dict[str, Any] = {
-        name: _parse_sweep_options(name, raw)
-        for name, raw in sweep_values.items()
+        name: _parse_sweep_options(name, raw) for name, raw in sweep_values.items()
     }
     compact = train_values.get("sweep")
     if compact:
@@ -539,8 +487,7 @@ def _parse_training_sweep(
     unknown = sorted(set(declarations) - set(_SWEEP_FIELDS))
     if unknown:
         raise ConfigurationError(
-            "Training sweeps may vary only scientific NEP settings: "
-            + ", ".join(unknown)
+            "Training sweeps may vary only scientific NEP settings: " + ", ".join(unknown)
         )
 
     base = NepTrainingConfig()
@@ -554,10 +501,7 @@ def _parse_training_sweep(
         normalized.append(
             (
                 name,
-                tuple(
-                    _parse_sweep_value(name, value, getattr(base, name))
-                    for value in raw_values
-                ),
+                tuple(_parse_sweep_value(name, value, getattr(base, name)) for value in raw_values),
             )
         )
     return tuple(normalized)
@@ -592,9 +536,7 @@ def _parse_sweep_value(name: str, value: Any, current: Any) -> Any:
             try:
                 return tuple(float(item) for item in items)
             except (TypeError, ValueError) as exc:
-                raise ConfigurationError(
-                    f"training sweep {name} must contain numbers"
-                ) from exc
+                raise ConfigurationError(f"training sweep {name} must contain numbers") from exc
         return tuple(str(item) for item in items)
     try:
         if isinstance(current, bool):

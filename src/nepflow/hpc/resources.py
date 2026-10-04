@@ -2,18 +2,21 @@
 
 from __future__ import annotations
 
+import math
+import re
 from dataclasses import dataclass
 from datetime import timedelta
-import math
 from pathlib import Path
-import re
 from typing import Iterable
-
 
 MemoryValue = int | str
 
-_WALLTIME_PATTERN = re.compile(r"^(?:(?P<days>\d+)-)?(?P<hours>\d+):(?P<minutes>[0-5]\d):(?P<seconds>[0-5]\d)$")
-_MEMORY_PATTERN = re.compile(r"^(?P<amount>\d+(?:\.\d+)?)\s*(?P<unit>[kmgtpe]?i?b?)?$", re.IGNORECASE)
+_WALLTIME_PATTERN = re.compile(
+    r"^(?:(?P<days>\d+)-)?(?P<hours>\d+):(?P<minutes>[0-5]\d):(?P<seconds>[0-5]\d)$"
+)
+_MEMORY_PATTERN = re.compile(
+    r"^(?P<amount>\d+(?:\.\d+)?)\s*(?P<unit>[kmgtpe]?i?b?)?$", re.IGNORECASE
+)
 _RESOURCE_DIRECTIVE_KEYS = (
     "--job-name",
     "--nodes",
@@ -91,7 +94,11 @@ def _validate_memory(value: MemoryValue | None, field_name: str) -> None:
         if value < 1:
             raise ValueError(f"{field_name} must be positive")
         return
-    if not isinstance(value, str) or not value.strip() or not _MEMORY_PATTERN.fullmatch(value.strip()):
+    if (
+        not isinstance(value, str)
+        or not value.strip()
+        or not _MEMORY_PATTERN.fullmatch(value.strip())
+    ):
         raise ValueError(f"{field_name} must be a positive megabyte count or SLURM memory value")
     if float(_MEMORY_PATTERN.fullmatch(value.strip()).group("amount")) <= 0:  # type: ignore[union-attr]
         raise ValueError(f"{field_name} must be positive")
@@ -115,7 +122,11 @@ def _format_walltime(value: str | timedelta) -> str:
     days, remainder = divmod(total_seconds, 24 * 60 * 60)
     hours, remainder = divmod(remainder, 60 * 60)
     minutes, seconds = divmod(remainder, 60)
-    return f"{days}-{hours:02d}:{minutes:02d}:{seconds:02d}" if days else f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+    return (
+        f"{days}-{hours:02d}:{minutes:02d}:{seconds:02d}"
+        if days
+        else f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+    )
 
 
 def _memory_to_megabytes(value: MemoryValue) -> int:
@@ -126,7 +137,16 @@ def _memory_to_megabytes(value: MemoryValue) -> int:
         raise ValueError(f"Invalid memory value: {value}")
     amount = float(match.group("amount"))
     unit = (match.group("unit") or "m").lower().rstrip("b")
-    multiplier = {"k": 1 / 1024, "ki": 1 / 1024, "m": 1, "mi": 1, "g": 1024, "gi": 1024, "t": 1024 * 1024, "ti": 1024 * 1024}.get(unit)
+    multiplier = {
+        "k": 1 / 1024,
+        "ki": 1 / 1024,
+        "m": 1,
+        "mi": 1,
+        "g": 1024,
+        "gi": 1024,
+        "t": 1024 * 1024,
+        "ti": 1024 * 1024,
+    }.get(unit)
     if multiplier is None:
         raise ValueError(f"Unsupported memory unit: {value}")
     return max(1, math.ceil(amount * multiplier))
@@ -234,12 +254,15 @@ def render_slurm_header(
         if not line.startswith("#!") and _directive_key(line) not in replacement_keys
     ]
     prologue = [line.rstrip("\n") for line in site_prologue]
-    lines = [shebang, *render_sbatch_directives(
-        resources,
-        job_name=job_name,
-        stdout_path=stdout_path,
-        stderr_path=stderr_path,
-    )]
+    lines = [
+        shebang,
+        *render_sbatch_directives(
+            resources,
+            job_name=job_name,
+            stdout_path=stdout_path,
+            stderr_path=stderr_path,
+        ),
+    ]
     lines.extend(preserved)
     lines.extend(prologue)
     return "\n".join(lines).rstrip() + "\n"

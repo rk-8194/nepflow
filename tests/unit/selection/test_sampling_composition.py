@@ -50,8 +50,7 @@ def test_distance_metrics_preserve_duplicate_and_positive_contracts() -> None:
 def test_composition_coverage_metrics_return_subset_means() -> None:
     atoms = [_atoms("SiGe"), _atoms("SiGe"), _atoms("SiAl")]
     candidate_bins = {
-        index: sampling.composition_projection_bins(value)
-        for index, value in enumerate(atoms)
+        index: sampling.composition_projection_bins(value) for index, value in enumerate(atoms)
     }
 
     metrics = sampling.calculate_composition_coverage_metrics([0, 2], candidate_bins)

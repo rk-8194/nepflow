@@ -15,7 +15,6 @@ from .resubmission import (
     resolve_resubmit_command,
     submit_resubmission,
 )
-from .state import WorkflowState
 from .stages import (
     StageResult,
     StageRun,
@@ -28,6 +27,7 @@ from .stages import (
     stage_to_legacy,
     validate_transition,
 )
+from .state import WorkflowState
 
 __all__ = [
     "ReconciliationResult",

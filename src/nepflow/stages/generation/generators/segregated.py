@@ -40,7 +40,9 @@ class SegregatedGenerator:
 
         results: list[Any] = []
         majority_element = max(composition, key=composition.get)
-        active_elements = sorted(element for element, fraction in composition.items() if fraction > 0)
+        active_elements = sorted(
+            element for element, fraction in composition.items() if fraction > 0
+        )
         strategies = ["x", "y", "z"]
 
         for crystal_structure, crystal_quota in quota_plan:
@@ -57,9 +59,7 @@ class SegregatedGenerator:
                 target_n_atoms,
             )
             if supercell is None:
-                raise RuntimeError(
-                    f"Segregated generation failed for crystal {crystal_structure}"
-                )
+                raise RuntimeError(f"Segregated generation failed for crystal {crystal_structure}")
             for strategy in strategies[:crystal_quota]:
                 segregated = self._layered_segregation(
                     supercell,
@@ -74,8 +74,7 @@ class SegregatedGenerator:
                         "configurational_type": "segregated",
                         "segregation_axis": strategy,
                         "source": (
-                            f"seg-{composition_label(composition)}-"
-                            f"{crystal_structure}-{strategy}"
+                            f"seg-{composition_label(composition)}-{crystal_structure}-{strategy}"
                         ),
                         "random_seed": self.random_seed,
                     }

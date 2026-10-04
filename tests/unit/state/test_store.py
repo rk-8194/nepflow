@@ -137,14 +137,21 @@ def test_full_phase3_record_chain_serializes_and_reopens(tmp_path) -> None:
         assert store.schema_version == 1
         assert store.get_project("project-fixture") is not None
         assert store.get_stage_run("project-fixture:init")["stage"] == "init"
-        assert store.get_structure(structure.structure_id)["provenance"]["operation_id"] == "operation-fixture"
+        assert (
+            store.get_structure(structure.structure_id)["provenance"]["operation_id"]
+            == "operation-fixture"
+        )
         assert store.get_dft_calculation(calculation.calculation_id)["status"] == "completed"
         assert store.list_dft_attempts(calculation.calculation_id)[0]["status"] == "completed"
-        assert store.list_dataset_members(dataset.dataset_id)[0]["source_outcar_hash"] == outcar.sha256
+        assert (
+            store.list_dataset_members(dataset.dataset_id)[0]["source_outcar_hash"] == outcar.sha256
+        )
         assert store.get_model_run(model.model_run_id)["status"] == "completed"
         assert store.get_validation_run(validation.validation_run_id)["status"] == "completed"
         assert store.list_validation_results(validation.validation_run_id)[0]["passed"] == 1
-        assert store.list_events(entity_id=validation.validation_run_id, entity_type="validation_run")
+        assert store.list_events(
+            entity_id=validation.validation_run_id, entity_type="validation_run"
+        )
 
     with StateStore(path) as reopened:
         assert reopened.get_project("project-fixture") is not None

@@ -12,8 +12,8 @@ from .jobs import (
     QueueQueryResult,
     QueueStatusResult,
     ReconciledJobResult,
-    SubmissionResult,
     SlurmJobRecord,
+    SubmissionResult,
 )
 from .resources import JobResources
 
@@ -80,5 +80,6 @@ class Scheduler(Protocol):
         timeout: float | None = None,
     ) -> ReconciledJobResult:
         """Reconcile live queue state with accounting state."""
+
 
 __all__ = ["Scheduler"]

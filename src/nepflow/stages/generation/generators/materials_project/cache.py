@@ -2,17 +2,16 @@
 
 from __future__ import annotations
 
+import shutil
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-import shutil
 from typing import Any
 
 from nepflow.errors import ArtifactError
 from nepflow.io.atomic import atomic_write_text
 from nepflow.io.hashing import sha256_canonical_json
 from nepflow.io.json import dumps, loads
-
 
 MATERIALS_PROJECT_CACHE_SCHEMA = "materials-project-cache-v1"
 
@@ -61,9 +60,7 @@ class MaterialsProjectCache:
         try:
             payload = loads(path.read_text(encoding="utf-8"))
         except (OSError, UnicodeError, ValueError) as exc:
-            raise MaterialsProjectCacheError(
-                f"Malformed Materials Project cache: {path}"
-            ) from exc
+            raise MaterialsProjectCacheError(f"Malformed Materials Project cache: {path}") from exc
         if not isinstance(payload, Mapping):
             raise MaterialsProjectCacheError(f"Invalid Materials Project cache envelope: {path}")
         if payload.get("cache_schema") != MATERIALS_PROJECT_CACHE_SCHEMA:
@@ -73,7 +70,9 @@ class MaterialsProjectCache:
         if payload.get("query") != query.payload():
             raise MaterialsProjectCacheError(f"Materials Project cache query mismatch: {path}")
         records = payload.get("records")
-        if not isinstance(records, list) or not all(isinstance(record, Mapping) for record in records):
+        if not isinstance(records, list) or not all(
+            isinstance(record, Mapping) for record in records
+        ):
             raise MaterialsProjectCacheError(f"Invalid Materials Project cache records: {path}")
         return [dict(record) for record in records]
 

@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import asdict
 from datetime import datetime, timezone
-import math
 from typing import Any, Mapping, Sequence
 
 from nepflow.config.models import SelectionConfig
@@ -15,7 +15,6 @@ from nepflow.io.json import to_jsonable
 from nepflow.state import StateStore
 
 from .models import SelectionResult
-
 
 SELECTION_RUN_SCHEMA = "selection-run-v1"
 
@@ -181,14 +180,20 @@ def restore_selection_result(
     if not isinstance(parameters, Mapping):
         raise StateError("Persisted selection record has no structured parameters")
     if parameters.get("candidate_set_fingerprint") != candidate_set_fingerprint(candidate_ids):
-        raise StateError("Persisted selection candidate-set fingerprint does not match current input")
+        raise StateError(
+            "Persisted selection candidate-set fingerprint does not match current input"
+        )
     persisted_candidates = parameters.get("candidate_structure_ids")
     if sorted(persisted_candidates or ()) != sorted(candidate_ids):
         raise StateError("Persisted selection candidate identity does not match current input")
     selected = parameters.get("selected_structure_ids")
     anchors = parameters.get("mandatory_anchor_structure_ids")
     metrics = parameters.get("metrics")
-    if not isinstance(selected, Mapping) or not isinstance(anchors, Mapping) or not isinstance(metrics, Mapping):
+    if (
+        not isinstance(selected, Mapping)
+        or not isinstance(anchors, Mapping)
+        or not isinstance(metrics, Mapping)
+    ):
         raise StateError("Persisted selection record is incomplete")
 
     train_indices = _indices_for_ids(selected.get("train", ()), candidate_ids, label="train")
@@ -199,7 +204,10 @@ def restore_selection_result(
     single_indices = _indices_for_ids(
         anchors.get("single_element_elastic", ()), candidate_ids, label="single-element anchor"
     )
-    elastic_indices = _indices_for_ids(anchors.get("elastic", ()), candidate_ids, label="elastic anchor")
+    elastic_indices = _indices_for_ids(
+        anchors.get("elastic", ()), candidate_ids, label="elastic anchor"
+    )
+
     def metric(name: str, default: float) -> float:
         value = metrics.get(name)
         return default if value is None else float(value)
@@ -213,7 +221,11 @@ def restore_selection_result(
             metrics.get("train_single_element_elastic_count", len(single_indices))
         ),
         train_elastic_count=int(metrics.get("train_elastic_count", len(elastic_indices))),
-        train_anchor_count=int(metrics.get("train_anchor_count", len(set(seed_indices + single_indices + elastic_indices)))),
+        train_anchor_count=int(
+            metrics.get(
+                "train_anchor_count", len(set(seed_indices + single_indices + elastic_indices))
+            )
+        ),
         train_fps_count=int(metrics.get("train_fps_count", 0)),
         test_indices=test_indices,
         test_min_dist=metric("test_min_dist", 0.0),

@@ -40,11 +40,11 @@ from pathlib import Path
 from typing import Iterable
 
 from ase import Atoms
-from ase.io import read as ase_read, write as ase_write
+from ase.io import read as ase_read
+from ase.io import write as ase_write
 
 from nepflow.domain.identities import annotate_structure_id, calculate_structure_id
 from nepflow.stages.selection.sampling import extract_composition_fractions
-
 
 DEFAULT_PATTERNS = [
     "POSCAR",
@@ -182,10 +182,7 @@ def parse_args() -> argparse.Namespace:
         "--tag",
         action="append",
         default=None,
-        help=(
-            "Extra metadata key=value to apply to every structure. "
-            "Repeat as needed."
-        ),
+        help=("Extra metadata key=value to apply to every structure. Repeat as needed."),
     )
     return parser.parse_args()
 
@@ -252,10 +249,7 @@ def normalize_composition_map(raw: dict[str, object]) -> dict[str, float]:
     total = sum(normalized.values())
     if total <= 0.0:
         raise ValueError("composition-json must contain a positive total fraction")
-    return {
-        element: fraction / total
-        for element, fraction in sorted(normalized.items())
-    }
+    return {element: fraction / total for element, fraction in sorted(normalized.items())}
 
 
 def seed_number(seed_id: object, prefix: str) -> int | None:
@@ -263,7 +257,7 @@ def seed_number(seed_id: object, prefix: str) -> int | None:
         return None
     if not seed_id.startswith(prefix):
         return None
-    suffix = seed_id[len(prefix):]
+    suffix = seed_id[len(prefix) :]
     if not suffix.isdigit():
         return None
     return int(suffix)
@@ -365,7 +359,9 @@ def collect_input_files(
             iterator = path.rglob(pattern) if recursive else path.glob(pattern)
             matches.extend(p for p in iterator if p.is_file())
 
-        matches = sorted({match.resolve() for match in matches if match.resolve() != output_path.resolve()})
+        matches = sorted(
+            {match.resolve() for match in matches if match.resolve() != output_path.resolve()}
+        )
         for match in matches:
             if match not in seen:
                 files.append(match)
@@ -449,9 +445,7 @@ def main() -> int:
             atoms.info["composition"] = target_composition or actual_composition
             atoms.info["configurational_type"] = args.configurational_type
             atoms.info["perturbation_type"] = (
-                "elastic_stress"
-                if is_elastic_strain_structure
-                else args.perturbation_type
+                "elastic_stress" if is_elastic_strain_structure else args.perturbation_type
             )
             atoms.info["source"] = (
                 f"{args.source_prefix}:{structure_file.parent.name}/{structure_file.name}:{frame_index}"
@@ -464,9 +458,7 @@ def main() -> int:
             for key, value in user_tags.items():
                 atoms.info[key] = value
 
-            if not (
-                args.preserve_existing_seed_ids and atoms.info.get("seed_id") is not None
-            ):
+            if not (args.preserve_existing_seed_ids and atoms.info.get("seed_id") is not None):
                 atoms.info["seed_id"] = f"{args.seed_prefix}{seed_index:06d}"
                 seed_index += 1
 

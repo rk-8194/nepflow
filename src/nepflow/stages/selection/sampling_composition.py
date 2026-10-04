@@ -2,15 +2,14 @@
 
 from __future__ import annotations
 
-from collections import Counter
 import logging
 import math
+from collections import Counter
 from typing import Any
 
 import numpy as np
 
-
-logger = logging.getLogger("nepflow.selection.sampling")
+logger = logging.getLogger(__name__)
 
 
 def _sampling_module() -> Any:
@@ -245,20 +244,13 @@ def _select_composition_candidate(
     )
     frontier_size = max(1, int(math.ceil(frontier_fraction * len(remaining_pool))))
     frontier = descriptor_ranked[:frontier_size]
-    positive_frontier = [
-        index for index in frontier if current_nearest[index] > 1e-12
-    ]
+    positive_frontier = [index for index in frontier if current_nearest[index] > 1e-12]
     if positive_frontier:
         frontier = positive_frontier
     best_frontier_novelty = max(current_nearest[index] for index in frontier)
     if best_frontier_novelty > 1e-12:
-        novelty_floor = (
-            sampling.COMPOSITION_AWARE_NOVELTY_FLOOR_FRACTION
-            * best_frontier_novelty
-        )
-        novelty_frontier = [
-            index for index in frontier if current_nearest[index] >= novelty_floor
-        ]
+        novelty_floor = sampling.COMPOSITION_AWARE_NOVELTY_FLOOR_FRACTION * best_frontier_novelty
+        novelty_frontier = [index for index in frontier if current_nearest[index] >= novelty_floor]
         if novelty_frontier:
             frontier = novelty_frontier
     composition_reward = {

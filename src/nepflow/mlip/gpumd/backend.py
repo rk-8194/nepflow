@@ -8,10 +8,10 @@ then returns the actual values serialized by GPUMD.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from pathlib import Path
 import shlex
 import shutil
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Sequence
 
 import numpy as np
@@ -57,8 +57,7 @@ def _forces(atoms: Atoms) -> np.ndarray:
     forces = np.asarray(value, dtype=float)
     if forces.shape != (len(atoms), 3):
         raise MlipError(
-            "GPUMD output forces must have shape "
-            f"({len(atoms)}, 3), got {forces.shape}"
+            f"GPUMD output forces must have shape ({len(atoms)}, 3), got {forces.shape}"
         )
     if not np.isfinite(forces).all():
         raise MlipError("GPUMD output forces contain non-finite values")
@@ -86,9 +85,7 @@ def _virial(atoms: Atoms, *, required: bool) -> np.ndarray | None:
         stress = np.asarray(atoms.info["stress"], dtype=float)
         if stress.shape == (6,):
             xx, yy, zz, yz, xz, xy = stress
-            stress = np.array(
-                [[xx, xy, xz], [xy, yy, yz], [xz, yz, zz]], dtype=float
-            )
+            stress = np.array([[xx, xy, xz], [xy, yy, yz], [xz, yz, zz]], dtype=float)
         stress = _tensor(stress, "stress")
         volume = float(atoms.get_volume())
         if not np.isfinite(volume) or volume <= 0:
@@ -225,7 +222,11 @@ class GpumdBackend:
         request: StaticPredictionRequest,
         output_path: Path | None = None,
     ) -> StaticPrediction:
-        output = Path(output_path) if output_path is not None else Path(request.working_directory) / "out.xyz"
+        output = (
+            Path(output_path)
+            if output_path is not None
+            else Path(request.working_directory) / "out.xyz"
+        )
         atoms = _last_frame(output)
         if len(atoms) != request.atom_count:
             raise MlipError(
@@ -291,8 +292,7 @@ class GpumdBackend:
             species_indices = []
             for expected_symbol in expected_species:
                 candidates = [
-                    index for index in remaining
-                    if actual_species[index] == expected_symbol
+                    index for index in remaining if actual_species[index] == expected_symbol
                 ]
                 if len(candidates) != 1:
                     raise MlipError(

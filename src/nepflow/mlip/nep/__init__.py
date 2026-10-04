@@ -1,7 +1,7 @@
 """NEP backend package for NEPFlow."""
 
-from .backend import NepBackend
 from .artifacts import NepArtifactError, parse_nep_cutoff_angstrom
+from .backend import NepBackend
 from .inputs import NepHyperparameters, NepInputRenderer, canonical_tokens
 
 __all__ = [

@@ -2,12 +2,11 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import logging
+from dataclasses import dataclass
 
 from nepflow.workflow.stages import StageRunStatus, WorkflowStage
 from nepflow.workflow.state import WorkflowState
-
 
 _STAGE_LABELS = {
     WorkflowStage.INIT: "1/6  init",
@@ -18,6 +17,7 @@ _STAGE_LABELS = {
     WorkflowStage.VALIDATE: "6/6  validate",
     WorkflowStage.COMPLETED: "completed",
 }
+
 
 @dataclass(frozen=True, slots=True)
 class WorkflowStatus:

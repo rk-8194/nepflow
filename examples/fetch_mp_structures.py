@@ -7,7 +7,6 @@ from pathlib import Path
 
 from nepflow.config.loader import load_config
 
-
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 

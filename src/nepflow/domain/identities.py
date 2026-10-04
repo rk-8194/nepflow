@@ -16,7 +16,6 @@ from typing import Any
 from nepflow.io.hashing import sha256_bytes, sha256_canonical_json
 from nepflow.io.json import to_jsonable
 
-
 STRUCTURE_IDENTITY_SCHEMA = "structure-v1"
 ARTIFACT_IDENTITY_SCHEMA = "nepflow.artifact_identity.v1"
 DFT_CALCULATION_IDENTITY_SCHEMA = "nepflow.dft_calculation_identity.v1"
@@ -107,12 +106,16 @@ def _freeze(value: Any) -> Any:
     return value
 
 
-def _normalise_pairs(values: Mapping[str, Any] | Sequence[tuple[str, Any]]) -> tuple[tuple[str, Any], ...]:
+def _normalise_pairs(
+    values: Mapping[str, Any] | Sequence[tuple[str, Any]],
+) -> tuple[tuple[str, Any], ...]:
     if isinstance(values, Mapping):
         items = values.items()
     else:
         items = values
-    return tuple(sorted(((str(key), to_jsonable(value)) for key, value in items), key=lambda item: item[0]))
+    return tuple(
+        sorted(((str(key), to_jsonable(value)) for key, value in items), key=lambda item: item[0])
+    )
 
 
 def normalise_dft_calculation_identity(value: Mapping[str, Any]) -> dict[str, Any]:
@@ -159,7 +162,9 @@ class ArtifactIdentity:
     schema_version: str = ARTIFACT_IDENTITY_SCHEMA
 
     @classmethod
-    def from_bytes(cls, artifact_type: str, content: bytes, *, path: str | None = None) -> "ArtifactIdentity":
+    def from_bytes(
+        cls, artifact_type: str, content: bytes, *, path: str | None = None
+    ) -> "ArtifactIdentity":
         digest = sha256_bytes(content)
         artifact_id = "artifact_" + sha256_canonical_json(
             {
@@ -254,10 +259,14 @@ class ModelRunIdentity:
     schema_version: str = MODEL_RUN_IDENTITY_SCHEMA
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "model_run_id", "model_run_" + sha256_canonical_json(self.identity_payload()))
+        object.__setattr__(
+            self, "model_run_id", "model_run_" + sha256_canonical_json(self.identity_payload())
+        )
 
     @classmethod
-    def from_inputs(cls, dataset_id: str, nep_in_sha256: str, hyperparameters_hash: str) -> "ModelRunIdentity":
+    def from_inputs(
+        cls, dataset_id: str, nep_in_sha256: str, hyperparameters_hash: str
+    ) -> "ModelRunIdentity":
         return cls(dataset_id, nep_in_sha256, hyperparameters_hash)
 
     def identity_payload(self) -> dict[str, str]:
@@ -312,7 +321,9 @@ class DescriptorCacheIdentity:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "structure_ids", tuple(self.structure_ids))
-        object.__setattr__(self, "descriptor_shape", tuple(int(value) for value in self.descriptor_shape))
+        object.__setattr__(
+            self, "descriptor_shape", tuple(int(value) for value in self.descriptor_shape)
+        )
 
     def to_manifest(self) -> dict[str, Any]:
         return {
@@ -326,4 +337,3 @@ class DescriptorCacheIdentity:
     @property
     def cache_id(self) -> str:
         return "descriptor_cache_" + sha256_canonical_json(self.to_manifest())
-

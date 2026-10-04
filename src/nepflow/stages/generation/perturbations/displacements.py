@@ -7,7 +7,6 @@ from typing import Any
 
 from .models import PerturbationSettings
 
-
 Annotate = Callable[..., Any]
 
 

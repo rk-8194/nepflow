@@ -13,11 +13,8 @@ from pathlib import Path
 from nepflow.errors import ArtifactError, StateError
 from nepflow.io.json import read_json_object
 
-
 VASP_REGISTRY_VERSION = 1
-VALID_VASP_STATUSES = frozenset(
-    {"pending", "submitted", "completed", "reused", "failed", "oom"}
-)
+VALID_VASP_STATUSES = frozenset({"pending", "submitted", "completed", "reused", "failed", "oom"})
 
 
 def get_nepflow_root(project_dir: Path) -> Path:
@@ -73,28 +70,21 @@ def get_registry_entry(
     if incar_entries is None:
         return None
     if not isinstance(incar_entries, dict):
-        raise ArtifactError(
-            f"Registry entries for INCAR hash are malformed: {incar_hash}"
-        )
+        raise ArtifactError(f"Registry entries for INCAR hash are malformed: {incar_hash}")
     potcar_entries = incar_entries.get(potcar_hash)
     if potcar_entries is None:
         return None
     if not isinstance(potcar_entries, dict):
-        raise ArtifactError(
-            f"Registry entries for POTCAR hash are malformed: {potcar_hash}"
-        )
+        raise ArtifactError(f"Registry entries for POTCAR hash are malformed: {potcar_hash}")
     if structure_id not in potcar_entries:
         return None
     entry = potcar_entries[structure_id]
     if not isinstance(entry, dict):
-        raise ArtifactError(
-            f"Registry entry for structure ID is malformed: {structure_id}"
-        )
+        raise ArtifactError(f"Registry entry for structure ID is malformed: {structure_id}")
     job_path = entry.get("job_path")
     if not isinstance(job_path, str) or not job_path.strip():
         raise ArtifactError(
-            "Registry entry for structure ID lacks a valid job_path: "
-            f"{structure_id}"
+            f"Registry entry for structure ID lacks a valid job_path: {structure_id}"
         )
     return entry
 
@@ -111,11 +101,7 @@ def read_status(struct_dir: Path) -> dict:
     if not isinstance(status, str) or status not in VALID_VASP_STATUSES:
         raise StateError(f"VASP status is missing or invalid: {status_file}")
     retry_level = data.get("retry_level", 0)
-    if (
-        isinstance(retry_level, bool)
-        or not isinstance(retry_level, int)
-        or retry_level < 0
-    ):
+    if isinstance(retry_level, bool) or not isinstance(retry_level, int) or retry_level < 0:
         raise StateError(f"VASP status retry_level is invalid: {status_file}")
     return data
 

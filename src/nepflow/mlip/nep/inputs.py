@@ -116,9 +116,7 @@ class NepHyperparameters:
         weights_text = config.get("train_nep", "weights", fallback="").strip()
         if weights_text:
             try:
-                weights = tuple(
-                    float(value) for value in weights_text.replace(",", " ").split()
-                )
+                weights = tuple(float(value) for value in weights_text.replace(",", " ").split())
             except ValueError as exc:
                 raise ValueError("train_nep.weights must contain only numbers") from exc
         else:
@@ -128,9 +126,7 @@ class NepHyperparameters:
             gas_elements=gas_elements,
             cutoff=canonical_tokens(config.get("train_nep", "cutoff", fallback="6 5")),
             n_max=canonical_tokens(config.get("train_nep", "n_max", fallback="4 4")),
-            basis_size=canonical_tokens(
-                config.get("train_nep", "basis_size", fallback="8 8")
-            ),
+            basis_size=canonical_tokens(config.get("train_nep", "basis_size", fallback="8 8")),
             l_max=canonical_tokens(config.get("train_nep", "l_max", fallback="4 2 1")),
             neuron=canonical_tokens(config.get("train_nep", "neuron", fallback="80")),
             population=config.getint("train_nep", "population", fallback=50),
@@ -208,9 +204,22 @@ class NepInputRenderer:
     """Render one effective NEP input and bind its content to run identity."""
 
     _REPLACEMENTS = (
-        "type", "type_weight", "cutoff", "n_max", "basis_size", "l_max",
-        "neuron", "population", "batch", "generation", "charge_mode", "zbl",
-        "lambda_e", "lambda_f", "lambda_v", "lambda_shear",
+        "type",
+        "type_weight",
+        "cutoff",
+        "n_max",
+        "basis_size",
+        "l_max",
+        "neuron",
+        "population",
+        "batch",
+        "generation",
+        "charge_mode",
+        "zbl",
+        "lambda_e",
+        "lambda_f",
+        "lambda_v",
+        "lambda_shear",
     )
 
     def render(self, request: TrainingInputRequest) -> TrainingInput:
@@ -275,9 +284,8 @@ class NepInputRenderer:
         all_elements = hyperparameters.all_elements
         values = {
             "type": f"type {len(all_elements)} {' '.join(all_elements)}",
-            "type_weight": "type_weight " + " ".join(
-                str(value) for value in hyperparameters.weights
-            ),
+            "type_weight": "type_weight "
+            + " ".join(str(value) for value in hyperparameters.weights),
             "cutoff": "cutoff " + " ".join(hyperparameters.cutoff),
             "n_max": "n_max " + " ".join(hyperparameters.n_max),
             "basis_size": "basis_size " + " ".join(hyperparameters.basis_size),

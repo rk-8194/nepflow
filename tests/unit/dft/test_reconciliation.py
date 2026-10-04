@@ -29,13 +29,13 @@ from nepflow.hpc.jobs import (
     SlurmJobRecord,
     SubmissionResult,
 )
+from nepflow.stages.dft.orchestrator import DftPreparationResult
 from nepflow.stages.dft.reconciliation import (
     DftExecutionRecord,
-    DftRecoveryDecision,
     DftReconciliationOrchestrator,
     DftReconciliationResult,
+    DftRecoveryDecision,
 )
-from nepflow.stages.dft.orchestrator import DftPreparationResult
 from nepflow.stages.dft.stage import DftStageResult
 from nepflow.workflow.stages import StageRunState, WorkflowStage
 
@@ -196,9 +196,7 @@ def test_reconciliation_state_table(
     expected_status: str,
 ) -> None:
     store = FakeStateStore()
-    scheduler = FakeScheduler(
-        {"job-1": _job("job-1", job_state)} if job_state is not None else {}
-    )
+    scheduler = FakeScheduler({"job-1": _job("job-1", job_state)} if job_state is not None else {})
     backend = FakeBackend(completed=completed, failure=failure)
     reconciler = DftReconciliationOrchestrator(
         scheduler=scheduler,
@@ -262,9 +260,7 @@ def test_recoverable_failure_uses_typed_recovery_decision(
 
     reconciler = DftReconciliationOrchestrator(
         scheduler=scheduler,
-        backend=FakeBackend(
-            failure=DftFailure("out_of_memory", True, "OOM")
-        ),
+        backend=FakeBackend(failure=DftFailure("out_of_memory", True, "OOM")),
         state_store=store,
         script_path=Path("run_vasp.sh"),
         recovery_policy=recovery_policy,
@@ -363,7 +359,12 @@ def test_empty_dft_reconciliation_does_not_advance_to_training() -> None:
 
     assert result.all_terminal is True
     assert result.all_successful is False
-    assert DftStageResult(
-        preparation=DftPreparationResult(()),
-        execution=result,
-    ).as_workflow_result().advanced_to is None
+    assert (
+        DftStageResult(
+            preparation=DftPreparationResult(()),
+            execution=result,
+        )
+        .as_workflow_result()
+        .advanced_to
+        is None
+    )

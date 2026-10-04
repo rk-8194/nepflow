@@ -123,4 +123,3 @@ def _restore_generated_structure_record(
         provenance=provenance,
         metadata=payload.get("metadata"),
     )
-

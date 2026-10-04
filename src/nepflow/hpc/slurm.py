@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
 import os
-from pathlib import Path
 import re
+from collections.abc import Sequence
+from pathlib import Path
 
 from nepflow.errors import ProcessError, SchedulerError
 
@@ -21,7 +21,6 @@ from .jobs import (
 )
 from .process import ProcessRunner
 from .resources import JobResources, render_sbatch_directives
-
 
 SQUEUE_FORMAT = "%i|%j|%T|%R"
 SACCT_FORMAT = "JobIDRaw|JobName|State|Reason|ExitCode|StdOut|StdErr"
@@ -174,7 +173,9 @@ def parse_squeue_output(output: str) -> tuple[SlurmJobRecord, ...]:
     return tuple(records)
 
 
-def _sacct_fields(fields: list[str]) -> tuple[str, str | None, str, str | None, str | None, str | None, str | None]:
+def _sacct_fields(
+    fields: list[str],
+) -> tuple[str, str | None, str, str | None, str | None, str | None, str | None]:
     if len(fields) >= 7:
         return tuple(fields[:7])  # type: ignore[return-value]
     if len(fields) >= 2:
@@ -234,7 +235,9 @@ class SlurmScheduler:
         if process_runner is not None and runner is not None:
             raise ValueError("pass only one of process_runner or runner")
         self.process_runner = process_runner or runner or ProcessRunner()
-        self.user = user if user is not None else os.environ.get("USER") or os.environ.get("USERNAME")
+        self.user = (
+            user if user is not None else os.environ.get("USER") or os.environ.get("USERNAME")
+        )
         self.default_timeout = default_timeout
 
     def _run(

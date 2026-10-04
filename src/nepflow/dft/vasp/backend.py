@@ -33,9 +33,9 @@ from .inputs import (
     identity_for_structure,
 )
 from .outputs import (
+    VASP_COMPLETION_MARKERS,
     ResolvedVaspOutput,
     VaspParseResult,
-    VASP_COMPLETION_MARKERS,
     outcar_is_complete,
     parse_outcar_result,
 )
@@ -80,13 +80,10 @@ class VaspBackend:
         missing = [
             name
             for name in ("POSCAR", "INCAR")
-            if (name != "INCAR" or self._incar_text is None)
-            and not paths[name].is_file()
+            if (name != "INCAR" or self._incar_text is None) and not paths[name].is_file()
         ]
         if missing:
-            raise BackendError(
-                "VASP required input artifact(s) missing: " + ", ".join(missing)
-            )
+            raise BackendError("VASP required input artifact(s) missing: " + ", ".join(missing))
         return paths
 
     def _input_material(
@@ -100,9 +97,7 @@ class VaspBackend:
                 index=request.source_structure_index,
             )
         except Exception as exc:
-            raise BackendError(
-                f"Could not read required VASP artifact {paths['POSCAR']}"
-            ) from exc
+            raise BackendError(f"Could not read required VASP artifact {paths['POSCAR']}") from exc
         root = Path(request.source_structure)
         root = root if root.is_dir() else root.parent
         unique_elements = sorted(set(poscar_atoms.get_chemical_symbols()))
@@ -116,9 +111,7 @@ class VaspBackend:
             try:
                 potcar_data[unique_elements[0]] = combined.read_bytes()
             except (OSError, UnicodeError) as exc:
-                raise BackendError(
-                    f"Could not read required VASP artifact {combined}"
-                ) from exc
+                raise BackendError(f"Could not read required VASP artifact {combined}") from exc
             paths["POTCAR"] = combined
             return paths, potcar_data
 
@@ -134,13 +127,10 @@ class VaspBackend:
             try:
                 potcar_data[element] = element_path.read_bytes()
             except (OSError, UnicodeError) as exc:
-                raise BackendError(
-                    f"Could not read required VASP artifact {element_path}"
-                ) from exc
+                raise BackendError(f"Could not read required VASP artifact {element_path}") from exc
         if missing:
             raise BackendError(
-                "VASP required POTCAR artifact(s) missing for: "
-                + ", ".join(missing)
+                "VASP required POTCAR artifact(s) missing for: " + ", ".join(missing)
             )
         return paths, potcar_data
 
@@ -329,13 +319,9 @@ exit 1
             identity_evidence=evidence,
         )
         if not parsed.accepted:
-            raise BackendError(
-                f"VASP output was rejected: {parsed.rejection_reason}"
-            )
+            raise BackendError(f"VASP output was rejected: {parsed.rejection_reason}")
         if parsed.structure_id != inputs.calculation.structure_id:
-            raise ValidationError(
-                "VASP output structure identity does not match prepared inputs"
-            )
+            raise ValidationError("VASP output structure identity does not match prepared inputs")
         artifact = DftResultArtifact(
             calculation=inputs.calculation,
             outcar=ArtifactIdentity.from_file("vasp_outcar", outcar),

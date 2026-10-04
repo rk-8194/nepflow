@@ -14,13 +14,12 @@ from typing import Any, Mapping
 
 import numpy as np
 
-from nepflow.domain.identities import ModelRunIdentity, StructureIdentity
+from nepflow.domain.identities import StructureIdentity
 from nepflow.domain.models import ModelRunRecord
+from nepflow.errors import ValidationError
 from nepflow.io.hashing import sha256_canonical_json
 from nepflow.io.json import to_jsonable
 from nepflow.mlip.simulation import StaticPredictionRequest
-from nepflow.errors import ValidationError
-
 
 VALIDATION_CASE_SCHEMA = "nepflow.validation_case.v1"
 VALIDATION_PREPARATION_SCHEMA = "nepflow.validation_preparation.v1"
@@ -210,10 +209,7 @@ class ValidationCaseSpec:
         if len(replicates) != 3 or any(value < 1 for value in replicates):
             raise ValidationError("validation case replicates must be three positive integers")
         object.__setattr__(self, "replicates", replicates)
-        mapping = tuple(
-            tuple(int(component) for component in item)
-            for item in self.atom_mapping
-        )
+        mapping = tuple(tuple(int(component) for component in item) for item in self.atom_mapping)
         expected_count = self.reference.atom_count * int(np.prod(replicates))
         if not mapping:
             mapping = _replication_mapping(self.reference.atom_count, replicates)
@@ -225,11 +221,11 @@ class ValidationCaseSpec:
         seen: set[tuple[int, int, int, int]] = set()
         for reference_index, tx, ty, tz in mapping:
             if not 0 <= reference_index < self.reference.atom_count:
-                raise ValidationError("validation case atom_mapping contains an invalid reference index")
+                raise ValidationError(
+                    "validation case atom_mapping contains an invalid reference index"
+                )
             if not (
-                0 <= tx < replicates[0]
-                and 0 <= ty < replicates[1]
-                and 0 <= tz < replicates[2]
+                0 <= tx < replicates[0] and 0 <= ty < replicates[1] and 0 <= tz < replicates[2]
             ):
                 raise ValidationError("validation case atom_mapping contains an invalid replica")
             key = (reference_index, tx, ty, tz)
@@ -318,28 +314,27 @@ class ValidationCaseSpec:
         positions = np.asarray(self.reference.positions_angstrom, dtype=float)
         cell = np.asarray(self.reference.cell_angstrom, dtype=float)
         return np.asarray(
-            [positions[index] + tx * cell[0] + ty * cell[1] + tz * cell[2]
-             for index, tx, ty, tz in self.atom_mapping],
+            [
+                positions[index] + tx * cell[0] + ty * cell[1] + tz * cell[2]
+                for index, tx, ty, tz in self.atom_mapping
+            ],
             dtype=float,
         )
 
     @property
     def expected_cell_angstrom(self) -> np.ndarray:
-        return np.asarray(self.reference.cell_angstrom, dtype=float) * np.asarray(
-            self.replicates, dtype=float
-        )[:, None]
+        return (
+            np.asarray(self.reference.cell_angstrom, dtype=float)
+            * np.asarray(self.replicates, dtype=float)[:, None]
+        )
 
     def static_prediction_request(self, model: ModelRunRecord) -> StaticPredictionRequest:
         """Create the existing MLIP static-prediction request for this case."""
 
         if model.model_run_id != self.model_run_id:
-            raise ValidationError(
-                "validation case model_run_id does not match the supplied model"
-            )
+            raise ValidationError("validation case model_run_id does not match the supplied model")
         if model.identity.dataset_id != self.dataset_id:
-            raise ValidationError(
-                "validation case dataset_id does not match the supplied model"
-            )
+            raise ValidationError("validation case dataset_id does not match the supplied model")
         return StaticPredictionRequest(
             structure=self.reference.structure,
             model=model,
@@ -459,10 +454,7 @@ class ValidationPreparation:
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> "ValidationPreparation":
         try:
-            cases = tuple(
-                ValidationCaseSpec.from_mapping(item)
-                for item in value["cases"]
-            )
+            cases = tuple(ValidationCaseSpec.from_mapping(item) for item in value["cases"])
             return cls(
                 model_run_id=str(value["model_run_id"]),
                 dataset_id=str(value["dataset_id"]),

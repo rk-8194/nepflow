@@ -114,8 +114,7 @@ class DftResult:
             forces = np.asarray(self.forces_ev_per_angstrom, dtype=float)
             if forces.ndim != 2 or forces.shape[1] != 3:
                 raise BackendError(
-                    "DFT result forces must have shape (n_atoms, 3), "
-                    f"got {forces.shape}"
+                    f"DFT result forces must have shape (n_atoms, 3), got {forces.shape}"
                 )
             if not np.isfinite(forces).all():
                 raise BackendError("DFT result forces contain non-finite values")
@@ -129,10 +128,7 @@ class DftResult:
         else:
             virial = np.asarray(self.virial_ev, dtype=float)
             if virial.shape != (3, 3):
-                raise BackendError(
-                    "DFT result virial must have shape (3, 3), "
-                    f"got {virial.shape}"
-                )
+                raise BackendError(f"DFT result virial must have shape (3, 3), got {virial.shape}")
             if not np.isfinite(virial).all():
                 raise BackendError("DFT result virial contains non-finite values")
             virial = np.array(virial, copy=True)
@@ -143,9 +139,7 @@ class DftResult:
             self.artifact is not None
             and self.artifact.calculation.calculation_id != self.calculation.calculation_id
         ):
-            raise ValidationError(
-                "DFT result artifact identity does not match the parsed result"
-            )
+            raise ValidationError("DFT result artifact identity does not match the parsed result")
 
 
 @dataclass(frozen=True, slots=True)

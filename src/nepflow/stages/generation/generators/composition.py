@@ -2,15 +2,13 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from itertools import combinations
-import logging
 from typing import Mapping
 
 from nepflow.config.models import CompositionConfig
-
-from ..validation import validate_composition_config
-
+from nepflow.stages.generation.validation import validate_composition_config
 
 logger = logging.getLogger(__name__)
 

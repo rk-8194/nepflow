@@ -20,7 +20,6 @@ from ._structure_records import StructureRecordsMixin
 from ._workflow_records import WorkflowRecordsMixin
 from .migrations import CURRENT_SCHEMA_VERSION, migrate
 
-
 _T = TypeVar("_T")
 
 

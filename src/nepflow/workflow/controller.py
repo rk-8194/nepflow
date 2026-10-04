@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from pathlib import Path
-from collections.abc import Callable, Mapping
 import logging
 import time
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Protocol
 
 from nepflow.config import canonical_config_path, load_config
@@ -16,7 +16,6 @@ from nepflow.state import StateStore
 from .resubmission import ReconciliationResult, SelfResubmitExit
 from .stages import StageRunResult, StageRunState, StageRunStatus, WorkflowStage
 from .state import WorkflowState
-
 
 logger = logging.getLogger(__name__)
 
@@ -94,11 +93,7 @@ class StageRegistry:
             raise StateError("Completed workflow stage has no executable handler")
         if typed_stage in self._bindings and not replace:
             raise StateError(f"Stage is already registered: {typed_stage.value}")
-        typed_next = (
-            None
-            if next_stage is None
-            else WorkflowStage.from_legacy(next_stage)
-        )
+        typed_next = None if next_stage is None else WorkflowStage.from_legacy(next_stage)
         if typed_next is None:
             index = _ORDERED_RUNNABLE_STAGES.index(typed_stage)
             typed_next = (
@@ -162,16 +157,10 @@ class StageRegistry:
                 f"{type(result).__name__}"
             )
         if result.stage is not stage:
+            raise StateError(f"Stage handler returned {result.stage.value!r} for {stage.value!r}")
+        if result.advanced_to is not None and result.status is not StageRunState.COMPLETED:
             raise StateError(
-                f"Stage handler returned {result.stage.value!r} for {stage.value!r}"
-            )
-        if (
-            result.advanced_to is not None
-            and result.status is not StageRunState.COMPLETED
-        ):
-            raise StateError(
-                f"Stage {stage.value} cannot advance with status "
-                f"{result.status.value}"
+                f"Stage {stage.value} cannot advance with status {result.status.value}"
             )
         return result
 
@@ -317,9 +306,7 @@ class WorkflowController:
         current_time = time.time()
         grace_period = 300
         if current_time >= self.slurm_deadline:
-            raise SelfResubmitExit(
-                "SLURM walltime deadline reached, resubmitting workflow"
-            )
+            raise SelfResubmitExit("SLURM walltime deadline reached, resubmitting workflow")
         if current_time >= self.slurm_deadline - grace_period:
             logger.info(
                 "Approaching SLURM deadline (%.1fs remaining)",

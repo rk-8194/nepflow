@@ -12,7 +12,6 @@ from nepflow.errors import StateError
 
 from .atomic import atomic_write_text
 
-
 _MISSING = object()
 _ErrorT = TypeVar("_ErrorT", bound=Exception)
 

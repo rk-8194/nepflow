@@ -12,8 +12,8 @@ from nepflow.workflow import (
     WorkflowStage,
 )
 
-
-VALID_PROJECT_CONFIG = """
+VALID_PROJECT_CONFIG = (
+    """
 [project]
 name=demo
 schema_version=1
@@ -28,7 +28,9 @@ target_n_atoms=64
 
 [hpc]
 vasp_command=vasp_std
-""".strip() + "\n"
+""".strip()
+    + "\n"
+)
 
 
 def write_valid_config(project_dir: Path) -> None:

@@ -61,11 +61,7 @@ def _build_retry_levels(
     max_nodes: int,
 ) -> list[tuple[int, int, int, int]]:
 
-    valid_ncores = sorted(
-        p
-        for p in (2**i for i in range(1, 12))
-        if p <= cores and cores % p == 0
-    )
+    valid_ncores = sorted(p for p in (2**i for i in range(1, 12)) if p <= cores and cores % p == 0)
     if not valid_ncores:
         valid_ncores = [cores]
 
@@ -79,9 +75,7 @@ def _build_retry_levels(
             seen.add(key)
             levels.append(key)
 
-    valid_kpars = sorted(
-        k for k in (2**i for i in range(0, 8)) if k <= gpus_per_node
-    ) or [1]
+    valid_kpars = sorted(k for k in (2**i for i in range(0, 8)) if k <= gpus_per_node) or [1]
 
     def sweep_gpu_tier(gpu_count: int) -> None:
         for kpar in valid_kpars:

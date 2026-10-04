@@ -19,10 +19,10 @@ from nepflow.dft.backend import (
     DftInputArtifacts,
 )
 from nepflow.domain.calculations import DftResultArtifact
+from nepflow.errors import StateError
 from nepflow.hpc.jobs import SchedulerJobState
 from nepflow.hpc.resources import JobResources
 from nepflow.hpc.scheduler import Scheduler
-from nepflow.errors import StateError
 
 
 class ExecutionStateStore(Protocol):
@@ -93,10 +93,7 @@ class DftReconciliationResult:
 
     @property
     def all_terminal(self) -> bool:
-        return all(
-            record.status in {"completed", "reused", "failed"}
-            for record in self.records
-        )
+        return all(record.status in {"completed", "reused", "failed"} for record in self.records)
 
     @property
     def all_successful(self) -> bool:
@@ -190,15 +187,11 @@ class DftReconciliationOrchestrator:
 
     def _reconcile_submitted(self, record: DftExecutionRecord) -> DftExecutionRecord:
         if not record.job_id:
-            raise ValueError(
-                f"Submitted DFT attempt {record.attempt_id} has no scheduler job ID"
-            )
+            raise ValueError(f"Submitted DFT attempt {record.attempt_id} has no scheduler job ID")
         scheduler_result = self.scheduler.reconcile(record.job_id)
         job_state = scheduler_result.job.state
         if job_state == SchedulerJobState.UNKNOWN:
-            raise StateError(
-                f"Scheduler returned an unknown state for DFT job {record.job_id}"
-            )
+            raise StateError(f"Scheduler returned an unknown state for DFT job {record.job_id}")
         if job_state == SchedulerJobState.PENDING:
             return self._save(record.with_status("submitted", job_id=record.job_id))
         if job_state == SchedulerJobState.RUNNING:
@@ -237,8 +230,7 @@ class DftReconciliationOrchestrator:
             retry = DftExecutionRecord(
                 inputs=record.inputs,
                 attempt_id=(
-                    f"{record.inputs.calculation.calculation_id}:attempt:"
-                    f"{record.retry_level + 2}"
+                    f"{record.inputs.calculation.calculation_id}:attempt:{record.retry_level + 2}"
                 ),
                 status="pending",
                 retry_level=decision.retry_level,

@@ -2,10 +2,15 @@ from pathlib import Path
 
 from nepflow.domain.datasets import DatasetIdentity, TrainingDatasetManifest
 from nepflow.domain.identities import ArtifactIdentity
-from nepflow.hpc.jobs import ReconciledJobResult, SchedulerJobState, SlurmJobRecord, SubmissionResult
+from nepflow.hpc.jobs import (
+    ReconciledJobResult,
+    SchedulerJobState,
+    SlurmJobRecord,
+    SubmissionResult,
+)
 from nepflow.mlip.backend import TrainingCompletion, TrainingInput
-from nepflow.state.store import StateStore
 from nepflow.stages.training.campaign import TrainingCampaign
+from nepflow.state.store import StateStore
 
 
 class RestartScheduler:

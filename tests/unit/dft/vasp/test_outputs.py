@@ -2,7 +2,6 @@ import numpy as np
 import pytest
 from ase import Atoms
 from ase.calculators.singlepoint import SinglePointCalculator
-from nepflow.io.json import write_json
 
 from nepflow.dft.vasp.outputs import (
     ResolvedVaspOutput,
@@ -16,6 +15,7 @@ from nepflow.dft.vasp.outputs import (
 )
 from nepflow.domain.identities import DftCalculationIdentity, calculate_structure_id
 from nepflow.errors import StateError
+from nepflow.io.json import write_json
 
 
 def _labelled_atoms() -> Atoms:
@@ -29,12 +29,7 @@ def _labelled_atoms() -> Atoms:
 
 
 def _stress_text() -> str:
-    return (
-        "STRESS in cartesian coordinates (kB)\n"
-        "  1  2  3\n"
-        "  4  5  6\n"
-        "  7  8  9\n"
-    )
+    return "STRESS in cartesian coordinates (kB)\n  1  2  3\n  4  5  6\n  7  8  9\n"
 
 
 def _identity(atoms: Atoms) -> dict[str, str]:
@@ -201,10 +196,13 @@ def test_verified_resolution_owns_current_reuse_and_registry_rules(tmp_path) -> 
 
     mismatch = dict(identity)
     mismatch["structure_id"] = "wrong"
-    assert resolve_verified_output(
-        identity,
-        current_jobs=[VaspJobEvidence(current, mismatch, {"status": "completed"})],
-    ) is None
+    assert (
+        resolve_verified_output(
+            identity,
+            current_jobs=[VaspJobEvidence(current, mismatch, {"status": "completed"})],
+        )
+        is None
+    )
 
     historical = tmp_path / "historical"
     historical.mkdir()
@@ -240,10 +238,13 @@ def test_verified_resolution_owns_current_reuse_and_registry_rules(tmp_path) -> 
 
     wrong_registry = dict(identity)
     wrong_registry["calculation_id"] = "wrong"
-    assert resolve_verified_output(
-        identity,
-        registry_evidence=VaspRegistryEvidence(historical / "OUTCAR", wrong_registry),
-    ) is None
+    assert (
+        resolve_verified_output(
+            identity,
+            registry_evidence=VaspRegistryEvidence(historical / "OUTCAR", wrong_registry),
+        )
+        is None
+    )
 
     with pytest.raises(StateError):
         resolve_verified_output(

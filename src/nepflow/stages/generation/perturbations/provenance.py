@@ -52,9 +52,7 @@ def annotate_generation_provenance(
         requested_composition=base_info.get("composition"),
         realised_composition=realized,
         source_database_id=(
-            str(base_info["material_id"])
-            if base_info.get("material_id") is not None
-            else None
+            str(base_info["material_id"]) if base_info.get("material_id") is not None else None
         ),
         crystal_structure=(
             None
@@ -64,8 +62,7 @@ def annotate_generation_provenance(
         perturbation_family=perturbation_family,
         perturbation_parameters=dict(parameters or {}),
         random_seed=None if random_seed is None else int(random_seed),
-        operation_id=operation_id
-        or f"perturbation:{parent_structure_id}:{perturbation_family}",
+        operation_id=operation_id or f"perturbation:{parent_structure_id}:{perturbation_family}",
         code_version=None,
         config_fingerprint=None,
     )

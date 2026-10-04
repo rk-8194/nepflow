@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
+import os
+import re
 from dataclasses import dataclass
 from enum import Enum
-import os
 from pathlib import Path
-import re
 from typing import Any
 
 from nepflow.errors import SchedulerError, StateError
@@ -47,9 +47,7 @@ class ReconciliationResult:
         object.__setattr__(self, "stage", WorkflowStage.from_legacy(self.stage))
         object.__setattr__(self, "source", ReconciliationSource.from_legacy(self.source))
         if self.marker_stage is not None:
-            object.__setattr__(
-                self, "marker_stage", WorkflowStage.from_legacy(self.marker_stage)
-            )
+            object.__setattr__(self, "marker_stage", WorkflowStage.from_legacy(self.marker_stage))
         if self.authoritative_stage is not None:
             object.__setattr__(
                 self,
@@ -150,7 +148,11 @@ def resolve_resubmit_command(
     tried = [directory / "submit.slurm" for directory in candidate_dirs]
     for candidate in tried:
         if candidate.exists():
-            return ["sbatch", str(candidate)], candidate.parent, f"submit.slurm in {candidate.parent}"
+            return (
+                ["sbatch", str(candidate)],
+                candidate.parent,
+                f"submit.slurm in {candidate.parent}",
+            )
     tried_text = "\n".join(f"  - {candidate}" for candidate in tried)
     raise FileNotFoundError(f"Could not find a submit script to resubmit. Tried:\n{tried_text}")
 

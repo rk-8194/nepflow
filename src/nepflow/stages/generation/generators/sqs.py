@@ -99,7 +99,9 @@ class SQSGenerator:
         backend = self.backend if self.backend is not None else IcetSQSBackend.from_environment()
         results: list[Any] = []
         majority_element = max(composition, key=composition.get)
-        active_elements = sorted(element for element, fraction in composition.items() if fraction > 0)
+        active_elements = sorted(
+            element for element, fraction in composition.items() if fraction > 0
+        )
         target_concentrations = {
             element: composition.get(element, 0.0) for element in active_elements
         }

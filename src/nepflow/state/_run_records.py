@@ -24,9 +24,7 @@ class RunRecordsMixin:
         """Insert or update one model-run identity and its artifact links."""
 
         return self._write(
-            lambda: self._write_model_run(
-                record, status, started_at, completed_at, now()
-            )
+            lambda: self._write_model_run(record, status, started_at, completed_at, now())
         )
 
     def _write_model_run(
@@ -65,9 +63,7 @@ class RunRecordsMixin:
                 identity.dataset_id,
                 encode_json(identity.to_dict()),
                 status,
-                encode_json(
-                    {} if record.execution_metadata is None else record.execution_metadata
-                ),
+                encode_json({} if record.execution_metadata is None else record.execution_metadata),
                 started_at,
                 completed_at,
                 timestamp,
@@ -112,9 +108,7 @@ class RunRecordsMixin:
         """Insert or update one validation-run identity and artifact links."""
 
         return self._write(
-            lambda: self._write_validation_run(
-                record, status, started_at, completed_at, now()
-            )
+            lambda: self._write_validation_run(record, status, started_at, completed_at, now())
         )
 
     def _write_validation_run(
@@ -133,9 +127,7 @@ class RunRecordsMixin:
         if existing is not None and encode_json(
             decode_json(existing["identity_json"], "identity_json")
         ) != encode_json(identity.to_dict()):
-            raise StateError(
-                f"Validation-run identity conflict: {identity.validation_run_id}"
-            )
+            raise StateError(f"Validation-run identity conflict: {identity.validation_run_id}")
         passed = None if record.artifact is None else record.artifact.passed
         self._connection.execute(
             """
@@ -203,9 +195,7 @@ class RunRecordsMixin:
 
         row = self._fetchone("SELECT * FROM model_runs WHERE model_run_id = ?", (model_run_id,))
         return (
-            None
-            if row is None
-            else decode_row(row, ("identity_json", "execution_metadata_json"))
+            None if row is None else decode_row(row, ("identity_json", "execution_metadata_json"))
         )
 
     def list_model_artifacts(self, model_run_id: str) -> list[dict[str, Any]]:
@@ -218,10 +208,7 @@ class RunRecordsMixin:
             "WHERE ma.model_run_id = ? ORDER BY ma.role, a.artifact_id",
             (model_run_id,),
         )
-        return [
-            decode_row(row, ("metadata_json", "link_metadata_json"))
-            for row in rows
-        ]
+        return [decode_row(row, ("metadata_json", "link_metadata_json")) for row in rows]
 
     def record_model_run(self, record: ModelRunRecord, **kwargs: Any) -> dict[str, Any]:
         """Record one model-run identity and its artifact links."""

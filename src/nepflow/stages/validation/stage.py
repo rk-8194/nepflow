@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
+import shlex
 from dataclasses import dataclass
 from pathlib import Path
-import shlex
 from typing import Any
 
 from nepflow.domain.identities import ValidationRunIdentity
@@ -108,9 +108,7 @@ class ValidationStage:
         if not isinstance(model_run_id, str) or not model_run_id.strip():
             raise StateError("Validation requires an explicit model_run_id")
         dataset_id = self.dataset_id or options.get("dataset_id")
-        if dataset_id is not None and (
-            not isinstance(dataset_id, str) or not dataset_id.strip()
-        ):
+        if dataset_id is not None and (not isinstance(dataset_id, str) or not dataset_id.strip()):
             raise StateError("Validation dataset_id must be a non-empty string when supplied")
         return Path(project_dir), model_run_id, dataset_id, state_store
 
@@ -195,9 +193,7 @@ class ValidationStage:
         else:
             scheduler = self.scheduler
             if scheduler is None:
-                raise StateError(
-                    "ValidationStage requires an injected scheduler for execution"
-                )
+                raise StateError("ValidationStage requires an injected scheduler for execution")
             raw_command = getattr(backend, "command", ("gpumd",))
             command = (
                 tuple(shlex.split(raw_command))
@@ -225,9 +221,7 @@ class ValidationStage:
         metrics = None
         if execution.all_successful:
             predictions = tuple(
-                record.prediction
-                for record in execution.cases
-                if record.prediction is not None
+                record.prediction for record in execution.cases if record.prediction is not None
             )
             if len(predictions) != len(execution.cases):
                 predictions = self.parse_completed(preparation, active)
@@ -246,7 +240,9 @@ class ValidationStage:
         return 1 if config is None else int(config.slurm.max_concurrent)
 
     @staticmethod
-    def _persist_metrics(state_store: Any, validation_run_id: str, metrics: ValidationMetrics) -> None:
+    def _persist_metrics(
+        state_store: Any, validation_run_id: str, metrics: ValidationMetrics
+    ) -> None:
         recorder = getattr(state_store, "record_validation_result", None)
         if not callable(recorder):
             return

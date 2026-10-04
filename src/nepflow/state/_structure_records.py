@@ -26,15 +26,9 @@ class StructureRecordsMixin:
     ) -> dict[str, Any]:
         """Insert or update a structure identity and optional provenance."""
 
-        identity, provenance, metadata = _structure_values(
-            identity_or_record, provenance, metadata
-        )
+        identity, provenance, metadata = _structure_values(identity_or_record, provenance, metadata)
         timestamp = now()
-        return self._write(
-            lambda: self._write_structure(
-                identity, provenance, metadata, timestamp
-            )
-        )
+        return self._write(lambda: self._write_structure(identity, provenance, metadata, timestamp))
 
     def _write_structure(
         self,
@@ -79,9 +73,7 @@ class StructureRecordsMixin:
             (provenance.operation_id,),
         ).fetchone()
         if existing is not None and existing["structure_id"] != structure_id:
-            raise StateError(
-                f"Structure provenance identity conflict: {provenance.operation_id}"
-            )
+            raise StateError(f"Structure provenance identity conflict: {provenance.operation_id}")
         self._connection.execute(
             """
             INSERT INTO structure_provenance

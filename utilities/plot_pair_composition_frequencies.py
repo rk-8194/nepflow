@@ -44,15 +44,18 @@ logging.basicConfig(
 logger = logging.getLogger("plot_pair_composition_frequencies")
 
 
+def _load_structures(path: Path) -> list:
+    structures = ase_read(str(path), index=":", format="extxyz")
+    return structures if isinstance(structures, list) else [structures]
+
+
 def _write_composition_summary(
     compositions: list[StructureComposition],
     output_path: Path,
 ) -> None:
-    all_elements = sorted({
-        element
-        for composition in compositions
-        for element in composition.unique_elements
-    })
+    all_elements = sorted(
+        {element for composition in compositions for element in composition.unique_elements}
+    )
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with output_path.open("w", newline="", encoding="utf-8") as handle:
@@ -80,7 +83,9 @@ def _write_composition_summary(
             }
             for element in all_elements:
                 row[f"count_{element}"] = composition.element_counts.get(element, 0)
-                row[f"fraction_{element}"] = f"{composition.element_fractions.get(element, 0.0):.12f}"
+                row[f"fraction_{element}"] = (
+                    f"{composition.element_fractions.get(element, 0.0):.12f}"
+                )
             writer.writerow(row)
 
 

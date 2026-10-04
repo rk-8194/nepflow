@@ -8,7 +8,9 @@ pytest.importorskip("ase")
 pytest.importorskip("pymatgen")
 
 from ase import Atoms
+
 from nepflow.stages.generation.perturbations.coordinator import PerturbationCoordinator
+from nepflow.stages.generation.perturbations.displacements import sample_rattle_stds
 from nepflow.stages.generation.perturbations.elastic import (
     coupled_strain_matrix,
     elastic_stress_set,
@@ -16,7 +18,6 @@ from nepflow.stages.generation.perturbations.elastic import (
     shear_strain_matrix,
 )
 from nepflow.stages.generation.perturbations.liquid import liquid_snapshots
-from nepflow.stages.generation.perturbations.displacements import sample_rattle_stds
 from nepflow.stages.generation.perturbations.models import PerturbationSettings
 from nepflow.stages.generation.perturbations.provenance import (
     annotate_generation_provenance,
@@ -109,11 +110,13 @@ class ElasticStressGenerationTests(unittest.TestCase):
             cell=np.eye(3) * 3.0,
             pbc=True,
         )
-        atoms.info.update({
-            "seed_id": "seed_000001",
-            "configurational_type": "test_base",
-            "crystal_structure": "diamond",
-        })
+        atoms.info.update(
+            {
+                "seed_id": "seed_000001",
+                "configurational_type": "test_base",
+                "crystal_structure": "diamond",
+            }
+        )
         return atoms
 
     def test_elastic_stress_set_creates_all_modes_for_each_amplitude(self) -> None:
@@ -172,10 +175,7 @@ class ElasticStressGenerationTests(unittest.TestCase):
     def test_mode_cells_are_modified_as_expected(self) -> None:
         base = self.make_base()
         engine = PerturbationCoordinator(target_n_atoms=2, elastic_strain_amplitudes=[0.01])
-        structures = {
-            atoms.info["elastic_mode"]: atoms
-            for atoms in elastic_outputs(engine, base)
-        }
+        structures = {atoms.info["elastic_mode"]: atoms for atoms in elastic_outputs(engine, base)}
 
         normal = structures["normal_xx"]
         self.assertAlmostEqual(normal.cell[0, 0], 3.03, places=12)
@@ -204,9 +204,7 @@ class ElasticStressGenerationTests(unittest.TestCase):
     def test_coupled_strain_preserves_volume_with_compensating_axis(self) -> None:
         amplitude = 0.02
 
-        expected = np.diag(
-            [1.0 + amplitude, 1.0 - amplitude, 1.0 / (1.0 - amplitude**2)]
-        )
+        expected = np.diag([1.0 + amplitude, 1.0 - amplitude, 1.0 / (1.0 - amplitude**2)])
 
         np.testing.assert_allclose(
             coupled_strain_matrix(amplitude, 0, 1),
@@ -283,7 +281,7 @@ class ElasticStressGenerationTests(unittest.TestCase):
         )
 
     def test_rattle_std_sampling_uses_configured_range(self) -> None:
-        engine = PerturbationCoordinator(
+        _engine = PerturbationCoordinator(
             target_n_atoms=2,
             rattle_std=0.03,
             rattle_std_min=0.01,
@@ -305,7 +303,7 @@ class ElasticStressGenerationTests(unittest.TestCase):
         )
 
     def test_rattle_std_sampling_steps_across_range(self) -> None:
-        engine = PerturbationCoordinator(
+        _engine = PerturbationCoordinator(
             target_n_atoms=2,
             rattle_std=0.03,
             rattle_std_min=0.01,

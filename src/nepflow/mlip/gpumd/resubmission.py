@@ -10,7 +10,6 @@ from typing import Any
 
 from nepflow.hpc.process import ProcessRunner
 
-
 STATE_FILE_NAME = ".gpumd_self_resubmit_state.json"
 DEFAULT_ARCHIVE_DIR = "final_xyz_history"
 

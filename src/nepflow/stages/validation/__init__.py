@@ -1,5 +1,13 @@
 """Canonical validation identity, case, and backend preparation boundary."""
 
+from .metrics import (
+    PairedValidationCase,
+    ValidationMetrics,
+    calculate_metrics,
+    calculate_validation_metrics,
+    pair_prediction,
+    pair_prediction_to_reference,
+)
 from .preparation import (
     calculate_cell_replicates_for_cutoff,
     cell_perpendicular_heights_angstrom,
@@ -13,16 +21,6 @@ from .protocols import (
     ValidationPreparation,
     ValidationReference,
 )
-from .resolution import ResolvedModelDataset, resolve_model_dataset
-from .stage import ValidationStage, ValidationStageResult
-from .metrics import (
-    PairedValidationCase,
-    ValidationMetrics,
-    calculate_metrics,
-    calculate_validation_metrics,
-    pair_prediction,
-    pair_prediction_to_reference,
-)
 from .reconciliation import (
     ValidationAttempt,
     ValidationCampaign,
@@ -32,6 +30,8 @@ from .reconciliation import (
     ValidationReconciliationOrchestrator,
     ValidationReconciliationResult,
 )
+from .resolution import ResolvedModelDataset, resolve_model_dataset
+from .stage import ValidationStage, ValidationStageResult
 
 __all__ = [
     "VALIDATION_CASE_SCHEMA",

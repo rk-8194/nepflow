@@ -11,10 +11,10 @@ from ase.io import write as ase_write
 from nepflow.domain.datasets import DatasetIdentity, TrainingDatasetManifest
 from nepflow.domain.identities import ArtifactIdentity, ModelRunIdentity, StructureIdentity
 from nepflow.domain.models import ModelArtifactMetadata, ModelRunRecord
-from nepflow.mlip.gpumd import GpumdBackend
-from nepflow.mlip.simulation import StaticPredictionRequest
 from nepflow.errors import MlipError, ValidationError
+from nepflow.mlip.gpumd import GpumdBackend
 from nepflow.mlip.nep.artifacts import create_model_run_manifest, update_model_run_status
+from nepflow.mlip.simulation import StaticPredictionRequest
 from nepflow.stages.validation import (
     calculate_cell_replicates_for_cutoff,
     prepare_validation_cases,
@@ -27,7 +27,6 @@ from nepflow.stages.validation.protocols import (
     ValidationPreparation,
 )
 from nepflow.state.store import StateStore
-
 
 ROOT = Path(__file__).resolve().parents[2]
 DFT_FIXTURE = ROOT / "fixtures" / "structures" / "dft_reference.extxyz.fixture"
@@ -174,11 +173,10 @@ def test_static_prediction_request_rejects_partial_expected_configuration(
         StaticPredictionRequest(**common)
 
     with pytest.raises(ValidationError, match="atom_mapping"):
-        StaticPredictionRequest(atom_mapping=(0, 1), **{
-            key: value
-            for key, value in common.items()
-            if not key.startswith("expected_")
-        })
+        StaticPredictionRequest(
+            atom_mapping=(0, 1),
+            **{key: value for key, value in common.items() if not key.startswith("expected_")},
+        )
 
 
 def test_triclinic_replicates_use_perpendicular_heights() -> None:
@@ -218,7 +216,9 @@ def test_gpumd_backend_parses_actual_ml_values_and_metadata(tmp_path: Path) -> N
     prediction = GpumdBackend().parse_prediction(request, ML_FIXTURE)
     assert prediction.energy_ev == -10.25
     assert prediction.energy_ev != -10.5
-    np.testing.assert_allclose(prediction.forces_ev_per_angstrom, [[0.12, 0.01, 0.0], [-0.08, -0.01, 0.0]])
+    np.testing.assert_allclose(
+        prediction.forces_ev_per_angstrom, [[0.12, 0.01, 0.0], [-0.08, -0.01, 0.0]]
+    )
     assert prediction.cell_angstrom is not None
     np.testing.assert_allclose(prediction.cell_angstrom, np.eye(3) * 3.0)
     assert prediction.runtime.command == ("gpumd",)

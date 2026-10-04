@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
 import logging
-from pathlib import Path
 import time
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 from ase.io import read as ase_read
@@ -36,8 +36,7 @@ from .strategy import (
     select_training_set,
 )
 
-
-logger = logging.getLogger("nepflow.selection.stage")
+logger = logging.getLogger(__name__)
 
 
 class SelectionStage:
@@ -67,9 +66,7 @@ class SelectionStage:
             elif isinstance(root_config, NepflowConfig):
                 settings = root_config.selection
         if not isinstance(settings, SelectionConfig):
-            raise TypeError(
-                "SelectionStage requires the validated SelectionConfig on StageContext"
-            )
+            raise TypeError("SelectionStage requires the validated SelectionConfig on StageContext")
         return settings
 
     def run(self, context: StageContext | None = None) -> SelectionResult:
@@ -195,10 +192,9 @@ class SelectionStage:
                         "is required before selecting again"
                     )
                 persisted_parameters = existing.get("parameters")
-                if (
-                    not isinstance(persisted_parameters, dict)
-                    or persisted_parameters.get("policy") != selection_policy(settings)
-                ):
+                if not isinstance(persisted_parameters, dict) or persisted_parameters.get(
+                    "policy"
+                ) != selection_policy(settings):
                     raise StateError("Persisted selection policy does not match current input")
                 logger.info("  Reconciled completed selection by structure identity")
                 return restore_selection_result(

@@ -29,9 +29,7 @@ class DatasetRecordsMixin:
             identity = identity_or_manifest
             manifest = identity.to_dict()
         return self._write(
-            lambda: self._write_dataset(
-                identity, manifest, project_id, status, now()
-            )
+            lambda: self._write_dataset(identity, manifest, project_id, status, now())
         )
 
     def _write_dataset(
@@ -76,11 +74,7 @@ class DatasetRecordsMixin:
 
     def get_dataset(self, dataset_id: str) -> dict[str, Any] | None:
         row = self._fetchone("SELECT * FROM datasets WHERE dataset_id = ?", (dataset_id,))
-        return (
-            None
-            if row is None
-            else decode_row(row, ("identity_json", "manifest_json"))
-        )
+        return None if row is None else decode_row(row, ("identity_json", "manifest_json"))
 
     def record_dataset(
         self,
@@ -100,9 +94,7 @@ class DatasetRecordsMixin:
     ) -> dict[str, Any]:
         """Insert or update one ordered member of a training dataset."""
 
-        return self._write(
-            lambda: self._write_dataset_member(dataset_id, member, metadata)
-        )
+        return self._write(lambda: self._write_dataset_member(dataset_id, member, metadata))
 
     def _write_dataset_member(
         self,
@@ -119,9 +111,7 @@ class DatasetRecordsMixin:
             existing["structure_id"] != member.structure_id
             or existing["calculation_id"] != member.calculation_id
         ):
-            raise StateError(
-                f"Dataset member identity conflict: {dataset_id}/{member.ordinal}"
-            )
+            raise StateError(f"Dataset member identity conflict: {dataset_id}/{member.ordinal}")
         self._connection.execute(
             """
             INSERT INTO dataset_members
@@ -160,7 +150,4 @@ class DatasetRecordsMixin:
             "SELECT * FROM dataset_members WHERE dataset_id = ? ORDER BY ordinal",
             (dataset_id,),
         )
-        return [
-            decode_row(row, ("calculation_identity_json", "metadata_json"))
-            for row in rows
-        ]
+        return [decode_row(row, ("calculation_identity_json", "metadata_json")) for row in rows]

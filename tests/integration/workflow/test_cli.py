@@ -11,7 +11,6 @@ for package_name in ("ase", "hiphive", "mp_api", "pymatgen", "icet", "NepTrainKi
     pytest.importorskip(package_name)
 
 
-
 def _load_cli_module():
     """Load the installed package CLI entry point."""
     return importlib.import_module("nepflow.cli")

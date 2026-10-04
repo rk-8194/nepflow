@@ -75,9 +75,7 @@ class TrainingCompletion:
 
     def __post_init__(self) -> None:
         if self.completed and not self.artifact_paths:
-            raise MlipError(
-                "completed NEP training requires at least one model artifact"
-            )
+            raise MlipError("completed NEP training requires at least one model artifact")
 
 
 @dataclass(frozen=True, slots=True)
@@ -92,9 +90,7 @@ class CollectedModelArtifacts:
         if self.artifact is None or self.artifact.model is None:  # type: ignore[comparison-overlap]
             raise MlipError("collected model artifacts require model metadata")
         if self.model_run != self.training_input.model_run_identity:
-            raise MlipError(
-                "collected model artifact belongs to a different model run"
-            )
+            raise MlipError("collected model artifact belongs to a different model run")
 
 
 @runtime_checkable

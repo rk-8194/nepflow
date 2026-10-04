@@ -1,5 +1,4 @@
 import hashlib
-import hashlib
 import json
 import tempfile
 import unittest
@@ -12,7 +11,6 @@ import pytest
 pytest.importorskip("NepTrainKit")
 
 from nepflow.stages.selection import representations as DESCRIPTORS  # noqa: E402
-
 
 CACHE_SCHEMA_VERSION = "descriptor-cache-v1"
 
@@ -308,9 +306,7 @@ class DescriptorTests(unittest.TestCase):
                 )
 
             self.assertEqual(descriptors.shape, (3, 2))
-            self.assertTrue(
-                (project_dir / "nep" / "datasets" / "descriptors.npy").exists()
-            )
+            self.assertTrue((project_dir / "nep" / "datasets" / "descriptors.npy").exists())
 
     def test_load_or_calculate_representations_recomputes_when_cache_shape_mismatches(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

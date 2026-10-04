@@ -1,11 +1,11 @@
+import pytest
 from ase import Atoms
 from ase.io import write as ase_write
-import pytest
 
 from nepflow.dft.backend import DftBackend, DftInputRequest
-from nepflow.domain.identities import DftCalculationIdentity, StructureIdentity
 from nepflow.dft.vasp.backend import VaspBackend
 from nepflow.dft.vasp.inputs import hash_incar_text, identity_for_structure, read_identity
+from nepflow.domain.identities import DftCalculationIdentity, StructureIdentity
 from nepflow.errors import BackendError
 
 
@@ -53,7 +53,9 @@ def test_vasp_backend_prepares_canonical_inputs_and_argument_command(tmp_path) -
     (source_dir / "INCAR").write_text(
         "ENCUT = 520\nNCORE = 16\nKPAR = 4\n",
     )
-    assert backend.calculation_identity(request).calculation_id == prepared.calculation.calculation_id
+    assert (
+        backend.calculation_identity(request).calculation_id == prepared.calculation.calculation_id
+    )
 
     (prepared.working_directory / "OUTCAR").write_text("parseable labels but incomplete\n")
     with pytest.raises(BackendError, match="incomplete"):

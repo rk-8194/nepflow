@@ -19,8 +19,7 @@ from .sampling_composition import (
     select_best_sampling_attempt,
 )
 
-
-logger = logging.getLogger("nepflow.selection.sampling")
+logger = logging.getLogger(__name__)
 
 COMPOSITION_AWARE_BINARY_BINS = 20
 COMPOSITION_AWARE_TERNARY_RESOLUTION = 18
@@ -167,8 +166,7 @@ def select_farthest_points_for_target(
             mid,
         )
         logger.info(
-            "  %sIteration %s: min_distance=%.6f -> %s structures "
-            "(target=%s+/-%s)",
+            "  %sIteration %s: min_distance=%.6f -> %s structures (target=%s+/-%s)",
             prefix,
             iteration + 1,
             mid,
@@ -200,8 +198,7 @@ def select_farthest_points_for_target(
             )
     else:
         logger.info(
-            "  %sSearch did not converge within tolerance; "
-            "using min_distance=%.6f",
+            "  %sSearch did not converge within tolerance; using min_distance=%.6f",
             prefix,
             best_dist,
         )
@@ -271,18 +268,14 @@ def extract_composition_fractions(atoms: Any) -> dict[str, float]:
             total = sum(fractions.values())
             if total > 0.0:
                 return {
-                    element: fraction / total
-                    for element, fraction in sorted(fractions.items())
+                    element: fraction / total for element, fraction in sorted(fractions.items())
                 }
 
     counts = Counter(atoms.get_chemical_symbols())
     total_atoms = sum(counts.values())
     if total_atoms <= 0:
         return {}
-    return {
-        element: count / total_atoms
-        for element, count in sorted(counts.items())
-    }
+    return {element: count / total_atoms for element, count in sorted(counts.items())}
 
 
 def composition_from_atoms(atoms: Any, structure_index: int) -> StructureComposition:
@@ -299,9 +292,7 @@ def composition_from_atoms(atoms: Any, structure_index: int) -> StructureComposi
         total_atoms=total_atoms,
         unique_elements=unique_elements,
         element_counts=dict(counts),
-        element_fractions={
-            element: counts[element] / total_atoms for element in unique_elements
-        },
+        element_fractions={element: counts[element] / total_atoms for element in unique_elements},
     )
 
 
@@ -430,8 +421,7 @@ def gini(values: list[int]) -> float:
     sorted_values = sorted(values)
     n = len(sorted_values)
     weighted_sum = sum(
-        (2 * idx - n - 1) * value
-        for idx, value in enumerate(sorted_values, start=1)
+        (2 * idx - n - 1) * value for idx, value in enumerate(sorted_values, start=1)
     )
     return weighted_sum / (n * total)
 
@@ -493,11 +483,16 @@ def summarize_binary_subset(
     occupied, occupied_fraction = occupied_bin_fraction(bin_counts, bins)
     nn_distances = nearest_neighbor_distances(coordinates)
     return CoverageSummary(
-        subset_label="-".join(subset), subset_size=2, dimensions=1,
-        structure_count=len(projections), total_bins=bins,
-        occupied_bins=occupied, occupied_bin_fraction=occupied_fraction,
+        subset_label="-".join(subset),
+        subset_size=2,
+        dimensions=1,
+        structure_count=len(projections),
+        total_bins=bins,
+        occupied_bins=occupied,
+        occupied_bin_fraction=occupied_fraction,
         normalized_entropy=normalized_entropy(bin_counts, bins),
-        max_bin_fraction=max_bin_fraction(bin_counts), gini=gini(bin_counts),
+        max_bin_fraction=max_bin_fraction(bin_counts),
+        gini=gini(bin_counts),
         nn_distance_mean=statistics.fmean(nn_distances) if nn_distances else None,
         nn_distance_p95=percentile95(nn_distances),
     ), bin_counts
@@ -519,11 +514,16 @@ def summarize_ternary_subset(
     occupied, occupied_fraction = occupied_bin_fraction(dense_counts, total_bins)
     nn_distances = nearest_neighbor_distances(coordinates)
     return CoverageSummary(
-        subset_label="-".join(subset), subset_size=3, dimensions=2,
-        structure_count=len(projections), total_bins=total_bins,
-        occupied_bins=occupied, occupied_bin_fraction=occupied_fraction,
+        subset_label="-".join(subset),
+        subset_size=3,
+        dimensions=2,
+        structure_count=len(projections),
+        total_bins=total_bins,
+        occupied_bins=occupied,
+        occupied_bin_fraction=occupied_fraction,
         normalized_entropy=normalized_entropy(dense_counts, total_bins),
-        max_bin_fraction=max_bin_fraction(dense_counts), gini=gini(dense_counts),
+        max_bin_fraction=max_bin_fraction(dense_counts),
+        gini=gini(dense_counts),
         nn_distance_mean=statistics.fmean(nn_distances) if nn_distances else None,
         nn_distance_p95=percentile95(nn_distances),
     ), bin_counts
@@ -539,11 +539,13 @@ def collect_pair_frequency_points(
     for composition in compositions:
         distinct_count = len(composition.unique_elements)
         for index, element_a in enumerate(composition.unique_elements):
-            for element_b in composition.unique_elements[index + 1:]:
+            for element_b in composition.unique_elements[index + 1 :]:
                 pair = (element_a, element_b)
                 fraction = composition.element_fractions[element_b]
                 pair_fraction_counts.setdefault(pair, Counter())[fraction] += 1
-                pair_fraction_distinct.setdefault(pair, {}).setdefault(fraction, set()).add(distinct_count)
+                pair_fraction_distinct.setdefault(pair, {}).setdefault(fraction, set()).add(
+                    distinct_count
+                )
     points: dict[tuple[str, str], list[PairFrequencyPoint]] = {}
     for pair, counts in pair_fraction_counts.items():
         points[pair] = [
@@ -580,7 +582,8 @@ def composition_projection_bins(atoms: Any) -> dict[str, list[tuple]]:
     for subset in combinations(active_elements, 3):
         normalized = normalize_subset_fractions(fractions, subset)
         ternary_bins.append(
-            subset + ternary_bin_index(
+            subset
+            + ternary_bin_index(
                 normalized,
                 COMPOSITION_AWARE_TERNARY_RESOLUTION,
             )
@@ -662,9 +665,7 @@ def descriptor_distance(
 
     vector_a = representations[index_a]
     vector_b = representations[index_b]
-    return math.sqrt(
-        sum((float(a) - float(b)) ** 2 for a, b in zip(vector_a, vector_b))
-    )
+    return math.sqrt(sum((float(a) - float(b)) ** 2 for a, b in zip(vector_a, vector_b)))
 
 
 def nearest_descriptor_distance(
@@ -717,10 +718,7 @@ def initialize_nearest_distances(
             representations[candidate_indices],
             representations[selected_indices],
         ).min(axis=1)
-        return {
-            idx: float(distance)
-            for idx, distance in zip(candidate_indices, nearest)
-        }
+        return {idx: float(distance) for idx, distance in zip(candidate_indices, nearest)}
     except Exception:
         return {
             idx: nearest_descriptor_distance(representations, idx, selected_indices)
@@ -768,7 +766,7 @@ def calculate_min_distance(
         return 0.0
     best = math.inf
     for position, index in enumerate(selected_indices):
-        for other in selected_indices[position + 1:]:
+        for other in selected_indices[position + 1 :]:
             best = min(best, descriptor_distance(representations, index, other))
     return float(best if best < math.inf else 0.0)
 
@@ -783,7 +781,7 @@ def calculate_positive_min_distance(
         return 0.0
     best = math.inf
     for position, index in enumerate(selected_indices):
-        for other in selected_indices[position + 1:]:
+        for other in selected_indices[position + 1 :]:
             distance = descriptor_distance(representations, index, other)
             if distance > 1e-12:
                 best = min(best, distance)
@@ -803,7 +801,7 @@ def composition_aware_attempt_schedule(
         (min(0.25, 2.0 * frontier_fraction), ternary_weight),
         (frontier_fraction, 2.0 * ternary_weight),
     ]
-    return attempts[:max(1, adaptive_retries)]
+    return attempts[: max(1, adaptive_retries)]
 
 
 def calculate_composition_coverage_metrics(
@@ -824,8 +822,7 @@ def calculate_composition_coverage_metrics(
             ternary_subset_counts.setdefault(subset, Counter())[bin_key] += 1
 
     binary_occupied = [
-        len(counts) / COMPOSITION_AWARE_BINARY_BINS
-        for counts in binary_subset_counts.values()
+        len(counts) / COMPOSITION_AWARE_BINARY_BINS for counts in binary_subset_counts.values()
     ]
     binary_entropy = [
         normalized_entropy(list(counts.values()), COMPOSITION_AWARE_BINARY_BINS)
@@ -833,8 +830,7 @@ def calculate_composition_coverage_metrics(
     ]
     ternary_total_bins = ternary_bin_count(COMPOSITION_AWARE_TERNARY_RESOLUTION)
     ternary_occupied = [
-        len(counts) / ternary_total_bins
-        for counts in ternary_subset_counts.values()
+        len(counts) / ternary_total_bins for counts in ternary_subset_counts.values()
     ]
     ternary_entropy = [
         normalized_entropy(list(counts.values()), ternary_total_bins)
@@ -893,9 +889,7 @@ def calculate_mean_nearest_distance(
             for other_position, other in enumerate(selected_indices)
             if position != other_position
         ]
-        nearest_distances.append(
-            nearest_descriptor_distance(representations, index, candidates)
-        )
+        nearest_distances.append(nearest_descriptor_distance(representations, index, candidates))
     return mean(nearest_distances)
 
 

@@ -8,7 +8,6 @@ from nepflow.errors import StateError
 
 from .schema import MIGRATION_STATEMENTS, REQUIRED_COLUMNS, REQUIRED_TABLES, SCHEMA_VERSION
 
-
 CURRENT_SCHEMA_VERSION = SCHEMA_VERSION
 
 
@@ -41,9 +40,7 @@ def validate_schema(connection: sqlite3.Connection, version: int | None = None) 
         )
 
     try:
-        rows = connection.execute(
-            "SELECT name FROM sqlite_master WHERE type = 'table'"
-        ).fetchall()
+        rows = connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
     except sqlite3.DatabaseError as exc:
         raise StateError("Could not inspect the state database schema") from exc
     tables = {str(row[0]) for row in rows}
@@ -54,10 +51,7 @@ def validate_schema(connection: sqlite3.Connection, version: int | None = None) 
 
     for table, required_columns in REQUIRED_COLUMNS.items():
         try:
-            columns = {
-                str(row[1])
-                for row in connection.execute(f"PRAGMA table_info({table})")
-            }
+            columns = {str(row[1]) for row in connection.execute(f"PRAGMA table_info({table})")}
         except sqlite3.DatabaseError as exc:
             raise StateError(f"Could not inspect state table {table}") from exc
         missing_columns = required_columns - columns

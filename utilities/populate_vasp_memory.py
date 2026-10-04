@@ -17,8 +17,15 @@ from nepflow.dft.vasp.outputs import (
 )
 
 CSV_HEADER = [
-    "n_atoms", "n_kpoints_irr", "n_electrons",
-    "nodes", "gpus", "ncore", "kpar", "avg_loop_time", "oom",
+    "n_atoms",
+    "n_kpoints_irr",
+    "n_electrons",
+    "nodes",
+    "gpus",
+    "ncore",
+    "kpar",
+    "avg_loop_time",
+    "oom",
 ]
 
 
@@ -28,10 +35,12 @@ def parse_outcar(outcar_path: Path, gpus_per_node: int) -> Optional[dict]:
     if result is None:
         print(f"  SKIP {outcar_path.parent}: incomplete or absent OUTCAR")
         return None
-    print(f"    OK {outcar_path.parent.name}: "
-          f"atoms={result['n_atoms']} kpts={result['n_kpoints_irr']} "
-          f"nel={result['n_electrons']} ncore={result['ncore']} "
-          f"kpar={result['kpar']} avg_loop={result['avg_loop_time']}s")
+    print(
+        f"    OK {outcar_path.parent.name}: "
+        f"atoms={result['n_atoms']} kpts={result['n_kpoints_irr']} "
+        f"nel={result['n_electrons']} ncore={result['ncore']} "
+        f"kpar={result['kpar']} avg_loop={result['avg_loop_time']}s"
+    )
     return result
 
 
@@ -45,13 +54,16 @@ def main() -> None:
         help="Root directory to recursively search for OUTCAR files.",
     )
     parser.add_argument(
-        "-o", "--output",
+        "-o",
+        "--output",
         type=Path,
         default=None,
         help="Output CSV path. Defaults to <nepflow>/.vasp_memory (next to this script).",
     )
     parser.add_argument(
-        "--gpus-per-node", type=int, default=4,
+        "--gpus-per-node",
+        type=int,
+        default=4,
         help="GPUs per node on target HPC (default: 4).",
     )
     args = parser.parse_args()

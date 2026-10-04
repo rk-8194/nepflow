@@ -67,7 +67,10 @@ def test_dft_identity_excludes_execution_resources() -> None:
     )
     assert base.calculation_id == changed_resources.calculation_id
     assert base.to_dict()["resources"] != changed_resources.to_dict()["resources"]
-    assert DftCalculationIdentity("s1", "changed-incar", "potcar").calculation_id != base.calculation_id
+    assert (
+        DftCalculationIdentity("s1", "changed-incar", "potcar").calculation_id
+        != base.calculation_id
+    )
 
 
 def test_model_identity_matches_phase2_payload() -> None:
@@ -78,9 +81,12 @@ def test_model_identity_matches_phase2_payload() -> None:
         "nep_in_sha256": "nep_sha",
         "hyperparameters_hash": "params_sha",
     }
-    expected = "model_run_" + hashlib.sha256(
-        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    ).hexdigest()
+    expected = (
+        "model_run_"
+        + hashlib.sha256(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+    )
     assert identity.model_run_id == expected
 
 
@@ -115,10 +121,7 @@ def test_dataset_identity_is_ordered_and_path_invariant() -> None:
     )
     assert first.dataset_id != second.dataset_id
     relocated = DatasetIdentity.from_records(
-        [
-            {**record, "source_outcar": "/new/location/OUTCAR"}
-            for record in records
-        ],
+        [{**record, "source_outcar": "/new/location/OUTCAR"} for record in records],
         label_schema={"version": "v1"},
         units={"energy": "eV"},
         virial_convention=None,
@@ -156,12 +159,14 @@ def test_descriptor_cache_identity_preserves_order_and_manifest_fields() -> None
 
 def test_validation_and_artifact_identity_are_content_based() -> None:
     validation = ValidationRunIdentity("model_1", "dataset_1", {"threshold": 0.1})
-    assert validation.validation_run_id == ValidationRunIdentity(
-        "model_1", "dataset_1", {"threshold": 0.1}
-    ).validation_run_id
-    assert validation.validation_run_id != ValidationRunIdentity(
-        "model_1", "dataset_1", {"threshold": 0.2}
-    ).validation_run_id
+    assert (
+        validation.validation_run_id
+        == ValidationRunIdentity("model_1", "dataset_1", {"threshold": 0.1}).validation_run_id
+    )
+    assert (
+        validation.validation_run_id
+        != ValidationRunIdentity("model_1", "dataset_1", {"threshold": 0.2}).validation_run_id
+    )
     artifact = ArtifactIdentity.from_bytes("report", b"report", path="/old/report.json")
     relocated_artifact = ArtifactIdentity.from_bytes("report", b"report", path="/new/report.json")
     assert artifact.artifact_id == relocated_artifact.artifact_id
@@ -192,4 +197,3 @@ def test_provenance_record_is_immutable() -> None:
     )
     with pytest.raises(TypeError):
         provenance.requested_composition["Si"] = 3
-

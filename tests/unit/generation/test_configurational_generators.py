@@ -35,9 +35,7 @@ class ConfigurationalGeneratorTests(unittest.TestCase):
     composition = {"Si": 0.5, "Ge": 0.5}
     crystal_structures = ["bcc", "fcc"]
 
-    def assert_per_composition_quota(
-        self, results: list[Atoms], expected_total: int
-    ) -> None:
+    def assert_per_composition_quota(self, results: list[Atoms], expected_total: int) -> None:
         counts = Counter(atoms.info["crystal_structure"] for atoms in results)
         # n_structures is the total quota for one composition.  This test
         # contract allocates an even split when the quota covers both crystals.
@@ -151,9 +149,7 @@ class ConfigurationalGeneratorTests(unittest.TestCase):
         fake_icet_tools = ModuleType("icet.tools")
         fake_structure_generation = ModuleType("icet.tools.structure_generation")
         fake_icet.ClusterSpace = lambda *args, **kwargs: object()
-        fake_structure_generation.generate_sqs_from_supercells = (
-            lambda **kwargs: make_atoms("Si4")
-        )
+        fake_structure_generation.generate_sqs_from_supercells = lambda **kwargs: make_atoms("Si4")
         with patch.dict(
             sys.modules,
             {
@@ -182,9 +178,7 @@ class ConfigurationalGeneratorTests(unittest.TestCase):
         fake_icet_tools = ModuleType("icet.tools")
         fake_structure_generation = ModuleType("icet.tools.structure_generation")
         fake_icet.ClusterSpace = lambda *args, **kwargs: object()
-        fake_structure_generation.generate_sqs_from_supercells = (
-            lambda **kwargs: make_atoms("Si4")
-        )
+        fake_structure_generation.generate_sqs_from_supercells = lambda **kwargs: make_atoms("Si4")
 
         with patch.dict(
             sys.modules,

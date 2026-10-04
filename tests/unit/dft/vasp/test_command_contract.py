@@ -8,9 +8,9 @@ pytest.importorskip("ase")
 pytest.importorskip("pymatgen")
 
 from nepflow.config import load_config, render_default_config  # noqa: E402
-from nepflow.state import StateStore  # noqa: E402
 from nepflow.stages.dft import DftStage  # noqa: E402
 from nepflow.stages.dft.orchestrator import DftPreparationResult  # noqa: E402
+from nepflow.state import StateStore  # noqa: E402
 from nepflow.workflow import StageContext  # noqa: E402
 
 
@@ -65,9 +65,7 @@ def test_typed_dft_stage_delegates_hpc_command_without_legacy_stage() -> None:
             )
 
         assert result.preparation.prepared_count == 0
-        assert orchestrator.call["config"].hpc.vasp_command == (
-            "mpirun -np {ntasks} vasp_std"
-        )
+        assert orchestrator.call["config"].hpc.vasp_command == ("mpirun -np {ntasks} vasp_std")
         assert orchestrator.call["datasets"] == ("train", "test")
 
 

@@ -13,9 +13,8 @@ from types import MappingProxyType
 from typing import Any, Mapping, Sequence
 
 from nepflow.config.models import NepTrainingConfig
-from nepflow.io.json import canonical_json_bytes
 from nepflow.io.hashing import sha256_bytes
-
+from nepflow.io.json import canonical_json_bytes
 
 _SCIENTIFIC_FIELDS = frozenset(
     {
@@ -135,9 +134,7 @@ class ControlledSweep:
                 for name, value in zip(names, selected)
             }
             configuration = replace(self.base, **overrides)
-            combinations.append(
-                CandidateConfiguration(ordinal, configuration, overrides)
-            )
+            combinations.append(CandidateConfiguration(ordinal, configuration, overrides))
         return tuple(combinations)
 
     def generate(self) -> tuple[CandidateConfiguration, ...]:

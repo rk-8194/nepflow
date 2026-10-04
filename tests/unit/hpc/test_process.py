@@ -1,5 +1,5 @@
-from pathlib import Path
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -19,11 +19,7 @@ def test_string_commands_require_explicit_shell_api() -> None:
 def test_success_captures_stdout_and_stderr() -> None:
     runner = ProcessRunner()
 
-    result = runner.run(
-        python_command(
-            "import sys; print('out'); print('err', file=sys.stderr)"
-        )
-    )
+    result = runner.run(python_command("import sys; print('out'); print('err', file=sys.stderr)"))
 
     assert result.ok
     assert result.returncode == 0
@@ -33,9 +29,7 @@ def test_success_captures_stdout_and_stderr() -> None:
 
 def test_nonzero_exit_raises_typed_failure_with_context(tmp_path: Path) -> None:
     runner = ProcessRunner()
-    command = python_command(
-        "import sys; print('out'); print('err', file=sys.stderr); sys.exit(7)"
-    )
+    command = python_command("import sys; print('out'); print('err', file=sys.stderr); sys.exit(7)")
 
     with pytest.raises(ProcessError) as raised:
         runner.run(command, cwd=tmp_path)
@@ -109,19 +103,14 @@ def test_environment_overlay_and_full_replacement(monkeypatch: pytest.MonkeyPatc
 
 def test_argument_boundaries_are_not_reinterpreted_by_a_shell() -> None:
     argument = "value with spaces; echo should-not-run & [special]"
-    result = ProcessRunner().run(
-        python_command("import sys; print(sys.argv[1])", argument)
-    )
+    result = ProcessRunner().run(python_command("import sys; print(sys.argv[1])", argument))
 
     assert result.stdout == f"{argument}\n"
 
 
 def test_captured_stdout_and_stderr_do_not_deadlock() -> None:
     result = ProcessRunner().run(
-        python_command(
-            "import sys; sys.stdout.write('o' * 100000); "
-            "sys.stderr.write('e' * 100000)"
-        )
+        python_command("import sys; sys.stdout.write('o' * 100000); sys.stderr.write('e' * 100000)")
     )
 
     assert result.ok

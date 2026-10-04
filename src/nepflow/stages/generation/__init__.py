@@ -17,9 +17,9 @@ __all__ = [
 
 def __getattr__(name: str):
     if name in {"GenerationManifest", "GenerationRequest", "GenerationResult"}:
-        from .models import GenerationManifest, GenerationRequest, GenerationResult
+        from nepflow.stages.generation import models
 
-        return locals()[name]
+        return getattr(models, name)
     if name == "GenerationStage":
         from .stage import GenerationStage
 

@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict
 import logging
 import os
-from pathlib import Path
 import shlex
 import shutil
+from dataclasses import asdict
+from pathlib import Path
 from typing import Any, Callable, Mapping
 
 from nepflow.errors import StateError
@@ -15,7 +15,6 @@ from nepflow.hpc.resources import JobResources
 from nepflow.io.atomic import atomic_write_text
 from nepflow.io.hashing import sha256_bytes, sha256_file
 from nepflow.io.json import canonical_json_bytes, to_jsonable
-
 
 logger = logging.getLogger(__name__)
 
@@ -96,8 +95,7 @@ class TrainingExecution:
         attempt: Any,
     ) -> None:
         script_matches = (
-            script_path.is_file()
-            and script_path.read_text(encoding="utf-8") == script_content
+            script_path.is_file() and script_path.read_text(encoding="utf-8") == script_content
         )
         if not script_matches and not rewrite:
             raise StateError(

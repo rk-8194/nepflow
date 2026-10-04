@@ -2,16 +2,17 @@
 
 from __future__ import annotations
 
+import logging
+import os
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from typing import Any, Iterable
-import logging
-import os
 
 import numpy as np
 from ase.io import write
 
 from nepflow.domain.identities import annotate_structure_ids, calculate_structure_id
+from nepflow.stages.generation.supercell import build_target_supercell
 
 from .defects import (
     gas_in_vacancy,
@@ -31,10 +32,8 @@ from .models import (
 )
 from .provenance import annotate_generation_provenance
 from .volume import volume_profile
-from nepflow.stages.generation.supercell import build_target_supercell
 
-
-logger = logging.getLogger("nepflow.generation.perturbations")
+logger = logging.getLogger(__name__)
 _PERTURBATION_FAMILIES = frozenset(
     {
         "unperturbed",
@@ -59,8 +58,7 @@ class PerturbationTaskError(RuntimeError):
         self.seed = task.seed
         self.cause = cause
         super().__init__(
-            "Perturbation task failed for "
-            f"base={task.base_structure_id}, seed={task.seed}: {cause}"
+            f"Perturbation task failed for base={task.base_structure_id}, seed={task.seed}: {cause}"
         )
 
 
@@ -109,9 +107,7 @@ def execute_perturbation_task(task: PerturbationTask) -> PerturbationTaskResult:
             random_seed=(task.seed if family in stochastic else random_seed),
             parameters=parameters,
             operation_id=(
-                f"{task.base_structure_id}:{operation_id}"
-                if operation_id is not None
-                else None
+                f"{task.base_structure_id}:{operation_id}" if operation_id is not None else None
             ),
         )
         provenance_records.append(record)
@@ -128,7 +124,9 @@ def execute_perturbation_task(task: PerturbationTask) -> PerturbationTaskResult:
     output.append(equilibrium)
     output.extend(volume_profile(supercell, task.base, settings, annotate))
     output.extend(elastic_stress_set(supercell, task.base, settings, annotate))
-    output.extend(rattled(supercell, task.base, task.counts.n_rattled, settings, task.seed, annotate))
+    output.extend(
+        rattled(supercell, task.base, task.counts.n_rattled, settings, task.seed, annotate)
+    )
     output.extend(
         liquid_snapshots(
             supercell,
@@ -219,7 +217,9 @@ class PerturbationCoordinator:
     def _counts(self, **kwargs: int) -> PerturbationCounts:
         return PerturbationCounts(**kwargs)
 
-    def _tasks(self, base_structures: Iterable[Any], counts: PerturbationCounts) -> list[PerturbationTask]:
+    def _tasks(
+        self, base_structures: Iterable[Any], counts: PerturbationCounts
+    ) -> list[PerturbationTask]:
         bases = list(base_structures)
         seeds = self.rng.randint(0, 2**31, size=len(bases)).tolist()
         return [

@@ -7,10 +7,11 @@ perpendicular height must be greater than twice the cutoff radius.
 
 import numpy as np
 import pytest
+
+from nepflow.errors import ValidationError  # noqa: E402
 from nepflow.stages.validation.preparation import (  # noqa: E402
     calculate_cell_replicates_for_cutoff,
 )
-from nepflow.errors import ValidationError  # noqa: E402
 
 
 def perpendicular_heights(cell: np.ndarray) -> np.ndarray:
@@ -26,9 +27,7 @@ def perpendicular_heights(cell: np.ndarray) -> np.ndarray:
     )
 
 
-def strict_required_replicates(
-    heights: np.ndarray, cutoff_angstrom: float
-) -> tuple[int, int, int]:
+def strict_required_replicates(heights: np.ndarray, cutoff_angstrom: float) -> tuple[int, int, int]:
     """Return the smallest repeats for which every height is strictly above 2r."""
     required_height = 2.0 * cutoff_angstrom
     repeats = []

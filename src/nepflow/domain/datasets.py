@@ -13,7 +13,6 @@ from .identities import (
     normalise_dft_calculation_identity,
 )
 
-
 DATASET_IDENTITY_SCHEMA = "nepflow.dataset.v1"
 
 
@@ -51,9 +50,7 @@ class SelectedDatasetMember:
             calculation_id=calculation_id,
             source_outcar_hash=str(value["source_outcar_hash"]),
             ordinal=ordinal,
-            calculation_identity=tuple(
-                sorted((str(k), str(v)) for k, v in dict(identity).items())
-            ),
+            calculation_identity=tuple(sorted((str(k), str(v)) for k, v in dict(identity).items())),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -150,4 +147,3 @@ class TrainingDatasetManifest:
             if value is not None:
                 result[key] = to_jsonable(value)
         return result
-

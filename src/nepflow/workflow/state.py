@@ -51,15 +51,11 @@ class WorkflowState:
         try:
             marker = self.marker_path.read_text(encoding="utf-8")
         except OSError as exc:
-            raise StateError(
-                f"Failed to read workflow marker {self.marker_path}"
-            ) from exc
+            raise StateError(f"Failed to read workflow marker {self.marker_path}") from exc
         try:
             return parse_legacy_stage(marker)
         except StateError as exc:
-            raise StateError(
-                f"Invalid workflow stage marker in {self.marker_path}: {exc}"
-            ) from exc
+            raise StateError(f"Invalid workflow stage marker in {self.marker_path}: {exc}") from exc
 
     def _write_marker(self, stage: WorkflowStage) -> None:
         try:
@@ -70,9 +66,7 @@ class WorkflowState:
                 encoding="utf-8",
             )
         except OSError as exc:
-            raise StateError(
-                f"Failed to write workflow marker {self.marker_path}"
-            ) from exc
+            raise StateError(f"Failed to write workflow marker {self.marker_path}") from exc
 
     def _latest_run(self) -> StageRunStatus | None:
         row = self.store.get_latest_stage_run(self.project_id)
@@ -96,9 +90,7 @@ class WorkflowState:
         stored_run, marker_stage, marker_error = self._read_authoritative_state()
 
         if stored_run is not None:
-            marker_needs_repair = (
-                marker_error is not None or marker_stage is not stored_run.stage
-            )
+            marker_needs_repair = marker_error is not None or marker_stage is not stored_run.stage
             if marker_needs_repair:
                 self._write_marker(stored_run.stage)
             if marker_error is not None:
@@ -123,11 +115,7 @@ class WorkflowState:
 
         if marker_stage is not None:
             now = self._timestamp()
-            status = (
-                StageRunState.COMPLETED
-                if marker_stage.is_terminal
-                else StageRunState.RUNNING
-            )
+            status = StageRunState.COMPLETED if marker_stage.is_terminal else StageRunState.RUNNING
             with self.store.transaction():
                 self._record_stage(
                     marker_stage,
@@ -190,16 +178,20 @@ class WorkflowState:
         current = self.current_stage()
         if current is not typed_stage:
             raise StateError(
-                f"Cannot update {typed_stage.value!r} while current stage is "
-                f"{current.value!r}"
+                f"Cannot update {typed_stage.value!r} while current stage is {current.value!r}"
             )
         existing = self._latest_run()
         now = self._timestamp()
         started_at = existing.started_at if existing is not None else now
-        completed_at = now if typed_status in {
-            StageRunState.COMPLETED,
-            StageRunState.FAILED,
-        } else None
+        completed_at = (
+            now
+            if typed_status
+            in {
+                StageRunState.COMPLETED,
+                StageRunState.FAILED,
+            }
+            else None
+        )
         with self.store.transaction():
             self._record_stage(
                 typed_stage,
@@ -248,9 +240,7 @@ class WorkflowState:
             self._record_stage(
                 typed_target,
                 status=(
-                    StageRunState.COMPLETED
-                    if typed_target.is_terminal
-                    else StageRunState.RUNNING
+                    StageRunState.COMPLETED if typed_target.is_terminal else StageRunState.RUNNING
                 ),
                 started_at=target_started_at,
                 completed_at=target_started_at if typed_target.is_terminal else None,

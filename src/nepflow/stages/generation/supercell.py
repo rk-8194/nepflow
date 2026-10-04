@@ -7,8 +7,7 @@ import logging
 from ase import Atoms
 from ase.build import bulk
 
-
-logger = logging.getLogger("nepflow.generation.supercell")
+logger = logging.getLogger(__name__)
 
 
 def build_target_supercell(
@@ -34,9 +33,7 @@ def build_target_supercell(
         return _expand_atoms(source, target)
 
     if not isinstance(crystal_structure, str) or target_n_atoms is None:
-        raise TypeError(
-            "crystal_structure and target_n_atoms are required for an element source"
-        )
+        raise TypeError("crystal_structure and target_n_atoms are required for an element source")
     return _build_lattice(
         source,
         crystal_structure,

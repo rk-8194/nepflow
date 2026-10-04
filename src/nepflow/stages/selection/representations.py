@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from io import BytesIO
 import logging
 import time
+from io import BytesIO
 from pathlib import Path
 from typing import Any
 
@@ -21,8 +21,7 @@ from nepflow.io.atomic import atomic_write_bytes, atomic_write_text
 from nepflow.io.hashing import sha256_file
 from nepflow.io.json import dumps, read_json
 
-
-logger = logging.getLogger("nepflow.selection.representations")
+logger = logging.getLogger(__name__)
 DESCRIPTOR_CACHE_SCHEMA_VERSION = DESCRIPTOR_CACHE_SCHEMA
 
 

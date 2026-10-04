@@ -170,10 +170,7 @@ class EventRecordsMixin:
         """List events using the supported entity filters and ledger ordering."""
 
         query, parameters = _event_query(entity_type, entity_id)
-        return [
-            decode_row(row, ("payload_json",))
-            for row in self._fetchall(query, parameters)
-        ]
+        return [decode_row(row, ("payload_json",)) for row in self._fetchall(query, parameters)]
 
     def record_training_event(
         self,

@@ -7,7 +7,12 @@ import numpy as np
 import pytest
 
 from nepflow.domain.datasets import DatasetIdentity
-from nepflow.domain.identities import ArtifactIdentity, ModelRunIdentity, StructureIdentity, ValidationRunIdentity
+from nepflow.domain.identities import (
+    ArtifactIdentity,
+    ModelRunIdentity,
+    StructureIdentity,
+    ValidationRunIdentity,
+)
 from nepflow.domain.models import ModelArtifactMetadata, ModelRunRecord
 from nepflow.hpc.jobs import (
     QueueQueryResult,
@@ -17,9 +22,9 @@ from nepflow.hpc.jobs import (
     SubmissionResult,
 )
 from nepflow.mlip.simulation import StaticPrediction
-from nepflow.state.store import StateStore
 from nepflow.stages.validation.protocols import ValidationCaseSpec, ValidationReference
 from nepflow.stages.validation.reconciliation import ValidationReconciliationOrchestrator
+from nepflow.state.store import StateStore
 
 
 @dataclass
@@ -82,7 +87,9 @@ def _fixture(tmp_path: Path, case_count: int = 1):
             status="completed",
         ),
     )
-    validation_run = ValidationRunIdentity(model.model_run_id, dataset.dataset_id, {"fixture": "reconcile"})
+    validation_run = ValidationRunIdentity(
+        model.model_run_id, dataset.dataset_id, {"fixture": "reconcile"}
+    )
     cases = []
     for ordinal in range(case_count):
         reference = ValidationReference(
@@ -169,7 +176,12 @@ def test_reconciliation_submits_once_then_restarts_from_persisted_job(tmp_path: 
         assert completed.cases[0].prediction is not None
         assert backend.parse_count == 1
         assert store.get_validation_run(validation_run.validation_run_id)["status"] == "completed"
-        assert len(store.list_validation_events("validation_attempt", validation_run.validation_run_id)) >= 4
+        assert (
+            len(
+                store.list_validation_events("validation_attempt", validation_run.validation_run_id)
+            )
+            >= 4
+        )
     finally:
         store.close()
 

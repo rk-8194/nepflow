@@ -86,9 +86,7 @@ def test_failed_initial_migration_rolls_back(tmp_path) -> None:
         assert connection.execute("PRAGMA user_version").fetchone()[0] == 0
         tables = {
             row[0]
-            for row in connection.execute(
-                "SELECT name FROM sqlite_master WHERE type = 'table'"
-            )
+            for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
         }
         assert tables == {"project"}
     finally:

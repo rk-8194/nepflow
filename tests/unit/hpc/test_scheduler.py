@@ -30,7 +30,9 @@ class StubProcessRunner:
         return response
 
 
-def completed(command: tuple[str, ...], stdout: str = "", stderr: str = "", returncode: int = 0) -> ProcessResult:
+def completed(
+    command: tuple[str, ...], stdout: str = "", stderr: str = "", returncode: int = 0
+) -> ProcessResult:
     return ProcessResult(
         command=command,
         cwd=None,
@@ -48,10 +50,7 @@ def test_sbatch_job_id_parser_and_malformed_output() -> None:
 
 
 def test_squeue_parser_handles_active_jobs_and_empty_success() -> None:
-    records = parse_squeue_output(
-        "123|train_demo|RUNNING|None\n"
-        "124|train_wait|PENDING|Resources\n"
-    )
+    records = parse_squeue_output("123|train_demo|RUNNING|None\n124|train_wait|PENDING|Resources\n")
     assert [record.state for record in records] == [
         SchedulerJobState.RUNNING,
         SchedulerJobState.PENDING,
@@ -123,9 +122,11 @@ def test_shared_header_replaces_resources_but_preserves_site_prologue() -> None:
 
 
 def test_failed_squeue_is_scheduler_error_not_empty_query() -> None:
-    runner = StubProcessRunner([
-        completed(("squeue",), stderr="scheduler unavailable", returncode=1),
-    ])
+    runner = StubProcessRunner(
+        [
+            completed(("squeue",), stderr="scheduler unavailable", returncode=1),
+        ]
+    )
     scheduler = SlurmScheduler(process_runner=runner, user="demo")
 
     with pytest.raises(SchedulerError) as raised:
@@ -136,10 +137,12 @@ def test_failed_squeue_is_scheduler_error_not_empty_query() -> None:
 
 
 def test_scheduler_query_and_job_name_lookup() -> None:
-    runner = StubProcessRunner([
-        completed(("squeue",), "123|demo_job|RUNNING|None\n"),
-        completed(("squeue",), "123|demo_job|RUNNING|None\n"),
-    ])
+    runner = StubProcessRunner(
+        [
+            completed(("squeue",), "123|demo_job|RUNNING|None\n"),
+            completed(("squeue",), "123|demo_job|RUNNING|None\n"),
+        ]
+    )
     scheduler = SlurmScheduler(process_runner=runner, user="demo")
     result = scheduler.list_active_jobs(name_prefix="demo_")
     assert len(result.jobs) == 1
@@ -156,10 +159,12 @@ def test_cancel_uses_typed_scheduler_boundary() -> None:
 
 
 def test_submit_returns_typed_job_id_and_rejects_malformed_output() -> None:
-    runner = StubProcessRunner([
-        completed(("sbatch", "script.slurm"), "Submitted batch job 123\n"),
-        completed(("sbatch", "script.slurm"), "accepted\n"),
-    ])
+    runner = StubProcessRunner(
+        [
+            completed(("sbatch", "script.slurm"), "Submitted batch job 123\n"),
+            completed(("sbatch", "script.slurm"), "accepted\n"),
+        ]
+    )
     scheduler = SlurmScheduler(process_runner=runner)
     result = scheduler.submit(["sbatch", "script.slurm"])
     assert result.job_id == "123"
@@ -168,10 +173,12 @@ def test_submit_returns_typed_job_id_and_rejects_malformed_output() -> None:
 
 
 def test_accounting_reconciles_a_job_that_left_the_queue() -> None:
-    runner = StubProcessRunner([
-        completed(("squeue",), ""),
-        completed(("sacct",), "123|demo|COMPLETED|None|0:0|out|err\n"),
-    ])
+    runner = StubProcessRunner(
+        [
+            completed(("squeue",), ""),
+            completed(("sacct",), "123|demo|COMPLETED|None|0:0|out|err\n"),
+        ]
+    )
     result = SlurmScheduler(process_runner=runner).reconcile("123")
     assert result.source == "sacct"
     assert result.job.state is SchedulerJobState.COMPLETED
@@ -180,10 +187,12 @@ def test_accounting_reconciles_a_job_that_left_the_queue() -> None:
 
 
 def test_reconciliation_does_not_infer_completion_without_accounting() -> None:
-    runner = StubProcessRunner([
-        completed(("squeue",), ""),
-        completed(("sacct",), ""),
-    ])
+    runner = StubProcessRunner(
+        [
+            completed(("squeue",), ""),
+            completed(("sacct",), ""),
+        ]
+    )
     result = SlurmScheduler(process_runner=runner).reconcile("123")
     assert result.job.state is SchedulerJobState.NOT_FOUND
 

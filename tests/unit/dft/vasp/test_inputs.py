@@ -39,7 +39,7 @@ def test_incar_defaults_preserve_phase2_injection() -> None:
 
 def test_missing_identity_is_optional_but_malformed_identity_fails(tmp_path) -> None:
     assert read_identity(tmp_path) == {}
-    (tmp_path / ".vasp_identity").write_text("{\"structure_id\": 3}")
+    (tmp_path / ".vasp_identity").write_text('{"structure_id": 3}')
     try:
         read_identity(tmp_path)
     except StateError as exc:

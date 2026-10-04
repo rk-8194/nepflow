@@ -2,16 +2,15 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
 import logging
+from collections.abc import Callable
 from typing import Any
 
 import numpy as np
 
 from .models import PerturbationSettings
 
-
-logger = logging.getLogger("nepflow.generation.perturbations.liquid")
+logger = logging.getLogger(__name__)
 Annotate = Callable[..., Any]
 
 

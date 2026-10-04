@@ -10,7 +10,6 @@ from ase import Atom
 
 from .models import PerturbationSettings
 
-
 Annotate = Callable[..., Any]
 
 
@@ -201,7 +200,9 @@ def gas_in_vacancy(
                 fractional -= np.floor(fractional)
                 candidate = fractional @ cell
                 if len(remaining_positions) > 0:
-                    distance = _minimum_image_distances(remaining_positions, candidate, cell, inv_cell)
+                    distance = _minimum_image_distances(
+                        remaining_positions, candidate, cell, inv_cell
+                    )
                     if float(np.min(distance)) < float(settings.gas_interstitial_d_min) ** 2:
                         candidate = vacancy_position.copy()
                 position = candidate

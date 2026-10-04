@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import logging
 import random
-from pathlib import Path
 from typing import Any
 
 from ase import Atom
@@ -15,8 +14,7 @@ from nepflow.domain.identities import annotate_structure_ids
 
 from .models import GenerationRequest
 
-
-logger = logging.getLogger("nepflow.generation.debug")
+logger = logging.getLogger(__name__)
 
 
 def run_debug(request: GenerationRequest) -> list[Any]:

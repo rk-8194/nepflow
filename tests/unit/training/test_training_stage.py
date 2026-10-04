@@ -6,9 +6,9 @@ from nepflow.config.models import CompositionConfig, NepflowConfig, SlurmConfig
 from nepflow.domain.datasets import DatasetIdentity, TrainingDatasetManifest
 from nepflow.domain.identities import ArtifactIdentity
 from nepflow.mlip.backend import TrainingInput
-from nepflow.state.store import StateStore
 from nepflow.stages.training.campaign import CampaignReconciliationResult
 from nepflow.stages.training.stage import TrainingStage
+from nepflow.state.store import StateStore
 from nepflow.workflow import StageContext, StageRunState
 
 

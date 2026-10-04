@@ -4,7 +4,6 @@ import tempfile
 from configparser import ConfigParser
 from dataclasses import replace
 from pathlib import Path
-from unittest.mock import patch
 
 import numpy as np
 import pytest
@@ -12,15 +11,11 @@ import pytest
 pytest.importorskip("ase")
 pytest.importorskip("pymatgen")
 
-from ase.io import read as ase_read  # noqa: E402
 from ase.calculators.singlepoint import SinglePointCalculator  # noqa: E402
+from ase.io import read as ase_read  # noqa: E402
 
-from nepflow.mlip.nep.artifacts import (  # noqa: E402
-    compute_model_run_id,
-    create_model_run_manifest,
-    update_model_run_status,
-    validate_model_run_manifest,
-)
+from nepflow.dft.vasp.inputs import read_identity  # noqa: E402
+from nepflow.dft.vasp.outputs import parse_outcar_result  # noqa: E402
 from nepflow.domain.datasets import (  # noqa: E402
     DatasetIdentity,
     SelectedDatasetMember,
@@ -41,17 +36,22 @@ from nepflow.domain.models import (  # noqa: E402
     ValidationRunRecord,
 )
 from nepflow.domain.structures import GeneratedStructureRecord, StructureProvenance  # noqa: E402
-from nepflow.dft.vasp.inputs import read_identity  # noqa: E402
-from nepflow.dft.vasp.outputs import parse_outcar_result  # noqa: E402
-from nepflow.io.hashing import sha256_file  # noqa: E402
-from nepflow.io.hashing import sha256_bytes  # noqa: E402
+from nepflow.errors import StateError  # noqa: E402
+from nepflow.io.hashing import (
+    sha256_bytes,  # noqa: E402
+    sha256_file,  # noqa: E402
+)
+from nepflow.io.json import write_json  # noqa: E402
+from nepflow.mlip.nep.artifacts import (  # noqa: E402
+    compute_model_run_id,
+    create_model_run_manifest,
+    update_model_run_status,
+    validate_model_run_manifest,
+)
 from nepflow.mlip.nep.inputs import NepHyperparameters, NepInputRenderer  # noqa: E402
 from nepflow.stages.training.dataset import build_dataset_metadata  # noqa: E402
-from nepflow.io.json import write_json  # noqa: E402
 from nepflow.stages.validation.resolution import resolve_model_dataset  # noqa: E402
-from nepflow.errors import StateError  # noqa: E402
 from nepflow.state.store import StateStore  # noqa: E402
-
 
 TESTS_ROOT = Path(__file__).resolve().parents[1]
 OUTCAR_FIXTURE = TESTS_ROOT / "fixtures" / "outcar" / "valid_outcar"
@@ -109,9 +109,7 @@ def test_deterministic_dft_to_validation_identity_trace() -> None:
             "incar_hash": "incar-hash-v1",
             "potcar_hash": "potcar-hash-v1",
         }
-        (vasp_job / ".vasp_identity").write_text(
-            json.dumps(calculation_identity), encoding="utf-8"
-        )
+        (vasp_job / ".vasp_identity").write_text(json.dumps(calculation_identity), encoding="utf-8")
 
         accepted = parse_outcar_result(
             outcar_path,
@@ -154,7 +152,10 @@ def test_deterministic_dft_to_validation_identity_trace() -> None:
         assert persisted_dataset["accepted_train_structures"] == 1
         assert persisted_dataset["rejected_train_structures"] == 1
         assert persisted_dataset["rejection_reason_counts"] == {"completed_outcar_missing": 1}
-        assert persisted_dataset["accepted_calculation_identities"][0]["structure_id"] == accepted.structure_id
+        assert (
+            persisted_dataset["accepted_calculation_identities"][0]["structure_id"]
+            == accepted.structure_id
+        )
         assert persisted_dataset["source_output_hashes"] == [accepted.source_outcar_hash] * 2
         assert persisted_dataset["label_schema"]["virial"] is True
         assert persisted_dataset["units"]["energy"] == "eV"
@@ -221,7 +222,9 @@ def test_deterministic_dft_to_validation_identity_trace() -> None:
         assert completed_manifest["model_run_id"] == validated_manifest["model_run_id"]
         assert validated_manifest["dataset_id"] == metadata["dataset_id"]
         assert validated_manifest["nep_in_sha256"] == sha256_file(potential_path / "nep.in")
-        assert validated_manifest["potential_artifact_sha256"] == sha256_file(potential_path / "nep.txt")
+        assert validated_manifest["potential_artifact_sha256"] == sha256_file(
+            potential_path / "nep.txt"
+        )
         assert validated_manifest["nep_in_sha256"] == nep_in_hash
 
         resolved = resolve_model_dataset(project_dir, validated_manifest["model_run_id"])
@@ -243,11 +246,14 @@ def test_deterministic_dft_to_validation_identity_trace() -> None:
         relocated_nep = project_dir / "moved" / "nep.in"
         relocated_nep.parent.mkdir(parents=True)
         shutil.copy2(potential_path / "nep.in", relocated_nep)
-        assert compute_model_run_id(
-            dataset_id=metadata["dataset_id"],
-            nep_in_sha256=sha256_file(relocated_nep),
-            hyperparameters_hash=hyperparameters_hash,
-        ) == validated_manifest["model_run_id"]
+        assert (
+            compute_model_run_id(
+                dataset_id=metadata["dataset_id"],
+                nep_in_sha256=sha256_file(relocated_nep),
+                hyperparameters_hash=hyperparameters_hash,
+            )
+            == validated_manifest["model_run_id"]
+        )
 
 
 def test_deterministic_identity_state_trace_reopens_as_one_chain() -> None:
@@ -304,7 +310,7 @@ def test_deterministic_identity_state_trace_reopens_as_one_chain() -> None:
         model_file = project_dir / "nep.txt"
         model_file.write_text("version 4\n", encoding="utf-8")
         report = project_dir / "validation.json"
-        report.write_text("{\"passed\": true}\n", encoding="utf-8")
+        report.write_text('{"passed": true}\n', encoding="utf-8")
 
         outcar_artifact = ArtifactIdentity.from_file("vasp_outcar", outcar)
         nep_in_artifact = ArtifactIdentity.from_file("nep_in", nep_in)
@@ -367,7 +373,15 @@ def test_deterministic_identity_state_trace_reopens_as_one_chain() -> None:
                 config_fingerprint="config-v1",
                 metadata={"schema": "trace-v1"},
             )
-            for stage in ("init", "generate", "select", "run_vasp", "train_nep", "validate", "completed"):
+            for stage in (
+                "init",
+                "generate",
+                "select",
+                "run_vasp",
+                "train_nep",
+                "validate",
+                "completed",
+            ):
                 store.upsert_stage_run(
                     f"trace:{stage}",
                     "trace",
@@ -434,8 +448,14 @@ def test_deterministic_identity_state_trace_reopens_as_one_chain() -> None:
                 {"model_run_id": model.model_run_id, "dataset_id": dataset.dataset_id},
             )
 
-            assert store.get_structure(structure.structure_id)["provenance"]["operation_id"] == provenance.operation_id
-            assert store.get_dft_calculation(calculation.calculation_id)["accepted_attempt_id"] == attempt_id
+            assert (
+                store.get_structure(structure.structure_id)["provenance"]["operation_id"]
+                == provenance.operation_id
+            )
+            assert (
+                store.get_dft_calculation(calculation.calculation_id)["accepted_attempt_id"]
+                == attempt_id
+            )
             assert store.get_dft_attempt(attempt_id)["status"] == "completed"
             assert store.get_dataset(dataset.dataset_id)["dataset_id"] == dataset.dataset_id
             model_row = store.get_model_run(model.model_run_id)
@@ -449,13 +469,28 @@ def test_deterministic_identity_state_trace_reopens_as_one_chain() -> None:
             nep_inputs = [item for item in linked if item["role"] == "nep_in"]
             assert len(nep_inputs) == 1
             assert nep_inputs[0]["sha256"] == nep_in_artifact.sha256
-            assert store.get_validation_run(validation.validation_run_id)["model_run_id"] == model.model_run_id
-            assert store.list_validation_results(validation.validation_run_id)[0]["structure_id"] == structure.structure_id
+            assert (
+                store.get_validation_run(validation.validation_run_id)["model_run_id"]
+                == model.model_run_id
+            )
+            assert (
+                store.list_validation_results(validation.validation_run_id)[0]["structure_id"]
+                == structure.structure_id
+            )
 
         with StateStore(project_dir / "state.db") as reopened:
             assert reopened.get_project("trace") is not None
             assert reopened.list_stage_runs("trace")
-            assert reopened.list_dft_attempts(calculation.calculation_id)[0]["attempt_id"] == attempt_id
-            assert reopened.list_artifacts(originating_attempt_id=attempt_id)[0]["sha256"] == outcar_artifact.sha256
+            assert (
+                reopened.list_dft_attempts(calculation.calculation_id)[0]["attempt_id"]
+                == attempt_id
+            )
+            assert (
+                reopened.list_artifacts(originating_attempt_id=attempt_id)[0]["sha256"]
+                == outcar_artifact.sha256
+            )
             assert reopened.list_model_artifacts(model.model_run_id)
-            assert reopened.list_events(entity_id=validation.validation_run_id)[0]["event_type"] == "metrics_completed"
+            assert (
+                reopened.list_events(entity_id=validation.validation_run_id)[0]["event_type"]
+                == "metrics_completed"
+            )

@@ -62,7 +62,9 @@ class CompositionCoverageTests(unittest.TestCase):
         uniform_summary, _ = module.summarize_binary_subset(("W", "Y"), uniform, bins=5)
         clustered_summary, _ = module.summarize_binary_subset(("W", "Y"), clustered, bins=5)
 
-        self.assertGreater(uniform_summary.occupied_bin_fraction, clustered_summary.occupied_bin_fraction)
+        self.assertGreater(
+            uniform_summary.occupied_bin_fraction, clustered_summary.occupied_bin_fraction
+        )
         self.assertGreater(uniform_summary.normalized_entropy, clustered_summary.normalized_entropy)
         self.assertLess(uniform_summary.max_bin_fraction, clustered_summary.max_bin_fraction)
         self.assertLess(uniform_summary.gini, clustered_summary.gini)
@@ -87,7 +89,9 @@ class CompositionCoverageTests(unittest.TestCase):
             module.TernaryProjection(("Cr", "W", "Y"), 2, (0.50, 0.25, 0.25)),
         ]
 
-        summary, counts = module.summarize_ternary_subset(("Cr", "W", "Y"), projections, resolution=8)
+        summary, counts = module.summarize_ternary_subset(
+            ("Cr", "W", "Y"), projections, resolution=8
+        )
 
         self.assertEqual(summary.structure_count, 3)
         self.assertGreaterEqual(summary.occupied_bins, 2)

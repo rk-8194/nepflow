@@ -30,7 +30,12 @@ def cell_perpendicular_heights_angstrom(cell: Any) -> np.ndarray:
         ],
         dtype=float,
     )
-    if not np.isfinite(volume) or volume <= 0 or not np.all(np.isfinite(faces)) or np.any(faces <= 0):
+    if (
+        not np.isfinite(volume)
+        or volume <= 0
+        or not np.all(np.isfinite(faces))
+        or np.any(faces <= 0)
+    ):
         raise ValidationError("validation cell must be non-degenerate")
     heights = volume / faces
     if not np.all(np.isfinite(heights)) or np.any(heights <= 0):

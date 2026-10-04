@@ -15,7 +15,6 @@ import numpy as np
 
 from nepflow.dft.vasp.outputs import parse_stress_from_outcar
 
-
 VOIGT_LABELS = ("xx", "yy", "zz", "yz", "xz", "xy")
 
 
@@ -56,9 +55,7 @@ def strain_matrix_to_voigt(strain_matrix: Iterable[float]) -> np.ndarray:
 def voigt_to_tensor(voigt: Iterable[float]) -> np.ndarray:
     e1, e2, e3, e4, e5, e6 = [float(value) for value in voigt]
     return np.array(
-        [[e1, 0.5 * e6, 0.5 * e5],
-         [0.5 * e6, e2, 0.5 * e4],
-         [0.5 * e5, 0.5 * e4, e3]],
+        [[e1, 0.5 * e6, 0.5 * e5], [0.5 * e6, e2, 0.5 * e4], [0.5 * e5, 0.5 * e4, e3]],
         dtype=float,
     )
 
@@ -83,8 +80,12 @@ def reference_cell_from_metadata(strained_cell, strain_matrix: Iterable[float]) 
 def stress_matrix_to_voigt(stress_gpa: np.ndarray) -> np.ndarray:
     return np.array(
         [
-            stress_gpa[0, 0], stress_gpa[1, 1], stress_gpa[2, 2],
-            stress_gpa[1, 2], stress_gpa[0, 2], stress_gpa[0, 1],
+            stress_gpa[0, 0],
+            stress_gpa[1, 1],
+            stress_gpa[2, 2],
+            stress_gpa[1, 2],
+            stress_gpa[0, 2],
+            stress_gpa[0, 1],
         ],
         dtype=float,
     )
@@ -130,7 +131,9 @@ def parse_stress_tensor_gpa(outcar_path: Path) -> np.ndarray | None:
     return np.asarray(stress, dtype=float) * 160.21766208
 
 
-def fit_elastic_tensor(records: list[ElasticRecord]) -> tuple[np.ndarray, np.ndarray, str, np.ndarray]:
+def fit_elastic_tensor(
+    records: list[ElasticRecord],
+) -> tuple[np.ndarray, np.ndarray, str, np.ndarray]:
     structure_name = (records[0].structure_name or "").lower()
     if structure_name in {"bcc", "fcc"}:
         return fit_cubic_tensor(records)
@@ -139,7 +142,9 @@ def fit_elastic_tensor(records: list[ElasticRecord]) -> tuple[np.ndarray, np.nda
     return fit_general_tensor(records)
 
 
-def fit_general_tensor(records: list[ElasticRecord]) -> tuple[np.ndarray, np.ndarray, str, np.ndarray]:
+def fit_general_tensor(
+    records: list[ElasticRecord],
+) -> tuple[np.ndarray, np.ndarray, str, np.ndarray]:
     strains = np.array([record.strain_voigt for record in records], dtype=float)
     stresses = np.array([record.stress_voigt_gpa for record in records], dtype=float)
     if strains.ndim != 2 or strains.shape[1] != 6:
@@ -159,7 +164,9 @@ def fit_general_tensor(records: list[ElasticRecord]) -> tuple[np.ndarray, np.nda
     return 0.5 * (tensor + tensor.T), tensor, "general", offsets
 
 
-def paired_strain_stress_differences(records: list[ElasticRecord]) -> list[tuple[np.ndarray, np.ndarray]]:
+def paired_strain_stress_differences(
+    records: list[ElasticRecord],
+) -> list[tuple[np.ndarray, np.ndarray]]:
     buckets: dict[tuple[str, float], dict[str, list[ElasticRecord]]] = {}
     for record in records:
         key = (record.elastic_mode, round(abs(record.strain_amplitude), 12))
@@ -174,21 +181,26 @@ def paired_strain_stress_differences(records: list[ElasticRecord]) -> list[tuple
         positives = sorted(bucket["positive"], key=lambda item: str(item.outcar_path))
         negatives = sorted(bucket["negative"], key=lambda item: str(item.outcar_path))
         for positive, negative in zip(positives, negatives):
-            pairs.append((
-                positive.strain_voigt - negative.strain_voigt,
-                positive.stress_voigt_gpa - negative.stress_voigt_gpa,
-            ))
+            pairs.append(
+                (
+                    positive.strain_voigt - negative.strain_voigt,
+                    positive.stress_voigt_gpa - negative.stress_voigt_gpa,
+                )
+            )
     return pairs
 
 
 def _cubic_tensor(c11: float, c12: float, c44: float) -> np.ndarray:
     return np.array(
-        [[c11, c12, c12, 0.0, 0.0, 0.0],
-         [c12, c11, c12, 0.0, 0.0, 0.0],
-         [c12, c12, c11, 0.0, 0.0, 0.0],
-         [0.0, 0.0, 0.0, c44, 0.0, 0.0],
-         [0.0, 0.0, 0.0, 0.0, c44, 0.0],
-         [0.0, 0.0, 0.0, 0.0, 0.0, c44]], dtype=float,
+        [
+            [c11, c12, c12, 0.0, 0.0, 0.0],
+            [c12, c11, c12, 0.0, 0.0, 0.0],
+            [c12, c12, c11, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, c44, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 0.0, c44, 0.0],
+            [0.0, 0.0, 0.0, 0.0, 0.0, c44],
+        ],
+        dtype=float,
     )
 
 
@@ -201,7 +213,9 @@ def cubic_offsets_from_tensor(records: list[ElasticRecord], tensor: np.ndarray) 
     return np.array([sigma0_normal] * 3 + [sigma0_shear] * 3, dtype=float)
 
 
-def fit_cubic_tensor(records: list[ElasticRecord]) -> tuple[np.ndarray, np.ndarray, str, np.ndarray]:
+def fit_cubic_tensor(
+    records: list[ElasticRecord],
+) -> tuple[np.ndarray, np.ndarray, str, np.ndarray]:
     paired_differences = paired_strain_stress_differences(records)
     if paired_differences:
         design_rows: list[list[float]] = []
@@ -209,11 +223,16 @@ def fit_cubic_tensor(records: list[ElasticRecord]) -> tuple[np.ndarray, np.ndarr
         for strain_delta, stress_delta in paired_differences:
             e1, e2, e3, e4, e5, e6 = strain_delta
             s1, s2, s3, s4, s5, s6 = stress_delta
-            design_rows.extend([
-                [e1, e2 + e3, 0.0], [e2, e1 + e3, 0.0],
-                [e3, e1 + e2, 0.0], [0.0, 0.0, e4],
-                [0.0, 0.0, e5], [0.0, 0.0, e6],
-            ])
+            design_rows.extend(
+                [
+                    [e1, e2 + e3, 0.0],
+                    [e2, e1 + e3, 0.0],
+                    [e3, e1 + e2, 0.0],
+                    [0.0, 0.0, e4],
+                    [0.0, 0.0, e5],
+                    [0.0, 0.0, e6],
+                ]
+            )
             targets.extend([s1, s2, s3, s4, s5, s6])
         design = np.array(design_rows, dtype=float)
         if design.size and np.linalg.matrix_rank(design) >= 3:
@@ -226,11 +245,16 @@ def fit_cubic_tensor(records: list[ElasticRecord]) -> tuple[np.ndarray, np.ndarr
     for record in records:
         e1, e2, e3, e4, e5, e6 = record.strain_voigt
         s1, s2, s3, s4, s5, s6 = record.stress_voigt_gpa
-        design_rows.extend([
-            [1.0, 0.0, e1, e2 + e3, 0.0], [1.0, 0.0, e2, e1 + e3, 0.0],
-            [1.0, 0.0, e3, e1 + e2, 0.0], [0.0, 1.0, 0.0, 0.0, e4],
-            [0.0, 1.0, 0.0, 0.0, e5], [0.0, 1.0, 0.0, 0.0, e6],
-        ])
+        design_rows.extend(
+            [
+                [1.0, 0.0, e1, e2 + e3, 0.0],
+                [1.0, 0.0, e2, e1 + e3, 0.0],
+                [1.0, 0.0, e3, e1 + e2, 0.0],
+                [0.0, 1.0, 0.0, 0.0, e4],
+                [0.0, 1.0, 0.0, 0.0, e5],
+                [0.0, 1.0, 0.0, 0.0, e6],
+            ]
+        )
         targets.extend([s1, s2, s3, s4, s5, s6])
     coeffs, *_ = np.linalg.lstsq(np.array(design_rows), np.array(targets), rcond=None)
     sigma0_normal, sigma0_shear, c11, c12, c44 = coeffs.tolist()
@@ -252,13 +276,21 @@ def hexagonal_offsets_from_tensor(records: list[ElasticRecord], tensor: np.ndarr
 def _hexagonal_tensor(c11: float, c12: float, c13: float, c33: float, c44: float) -> np.ndarray:
     c66 = 0.5 * (c11 - c12)
     return np.array(
-        [[c11, c12, c13, 0.0, 0.0, 0.0], [c12, c11, c13, 0.0, 0.0, 0.0],
-         [c13, c13, c33, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, c44, 0.0, 0.0],
-         [0.0, 0.0, 0.0, 0.0, c44, 0.0], [0.0, 0.0, 0.0, 0.0, 0.0, c66]], dtype=float,
+        [
+            [c11, c12, c13, 0.0, 0.0, 0.0],
+            [c12, c11, c13, 0.0, 0.0, 0.0],
+            [c13, c13, c33, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, c44, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 0.0, c44, 0.0],
+            [0.0, 0.0, 0.0, 0.0, 0.0, c66],
+        ],
+        dtype=float,
     )
 
 
-def fit_hexagonal_tensor(records: list[ElasticRecord]) -> tuple[np.ndarray, np.ndarray, str, np.ndarray]:
+def fit_hexagonal_tensor(
+    records: list[ElasticRecord],
+) -> tuple[np.ndarray, np.ndarray, str, np.ndarray]:
     paired_differences = paired_strain_stress_differences(records)
     if paired_differences:
         design_rows: list[list[float]] = []
@@ -266,31 +298,43 @@ def fit_hexagonal_tensor(records: list[ElasticRecord]) -> tuple[np.ndarray, np.n
         for strain_delta, stress_delta in paired_differences:
             e1, e2, e3, e4, e5, e6 = strain_delta
             s1, s2, s3, s4, s5, s6 = stress_delta
-            design_rows.extend([
-                [e1, e2, e3, 0.0, 0.0], [e2, e1, e3, 0.0, 0.0],
-                [0.0, 0.0, e1 + e2, e3, 0.0], [0.0, 0.0, 0.0, 0.0, e4],
-                [0.0, 0.0, 0.0, 0.0, e5], [0.5 * e6, -0.5 * e6, 0.0, 0.0, 0.0],
-            ])
+            design_rows.extend(
+                [
+                    [e1, e2, e3, 0.0, 0.0],
+                    [e2, e1, e3, 0.0, 0.0],
+                    [0.0, 0.0, e1 + e2, e3, 0.0],
+                    [0.0, 0.0, 0.0, 0.0, e4],
+                    [0.0, 0.0, 0.0, 0.0, e5],
+                    [0.5 * e6, -0.5 * e6, 0.0, 0.0, 0.0],
+                ]
+            )
             targets.extend([s1, s2, s3, s4, s5, s6])
         design = np.array(design_rows, dtype=float)
         if design.size and np.linalg.matrix_rank(design) >= 5:
             coeffs, *_ = np.linalg.lstsq(design, np.array(targets), rcond=None)
             tensor = _hexagonal_tensor(*coeffs.tolist())
-            return tensor, tensor.copy(), "hexagonal", hexagonal_offsets_from_tensor(records, tensor)
+            return (
+                tensor,
+                tensor.copy(),
+                "hexagonal",
+                hexagonal_offsets_from_tensor(records, tensor),
+            )
 
     design_rows = []
     targets = []
     for record in records:
         e1, e2, e3, e4, e5, e6 = record.strain_voigt
         s1, s2, s3, s4, s5, s6 = record.stress_voigt_gpa
-        design_rows.extend([
-            [1.0, 0.0, 0.0, e1, e2, e3, 0.0, 0.0],
-            [1.0, 0.0, 0.0, e2, e1, e3, 0.0, 0.0],
-            [0.0, 1.0, 0.0, 0.0, 0.0, e1 + e2, e3, 0.0],
-            [0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, e4],
-            [0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, e5],
-            [0.0, 0.0, 1.0, 0.5 * e6, -0.5 * e6, 0.0, 0.0, 0.0],
-        ])
+        design_rows.extend(
+            [
+                [1.0, 0.0, 0.0, e1, e2, e3, 0.0, 0.0],
+                [1.0, 0.0, 0.0, e2, e1, e3, 0.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0, 0.0, e1 + e2, e3, 0.0],
+                [0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, e4],
+                [0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, e5],
+                [0.0, 0.0, 1.0, 0.5 * e6, -0.5 * e6, 0.0, 0.0, 0.0],
+            ]
+        )
         targets.extend([s1, s2, s3, s4, s5, s6])
     coeffs, *_ = np.linalg.lstsq(np.array(design_rows), np.array(targets), rcond=None)
     sigma0_xx, sigma0_zz, sigma0_shear, c11, c12, c13, c33, c44 = coeffs.tolist()
@@ -324,31 +368,59 @@ def summarise_group(
         warnings.append("large_asymmetry_before_symmetrization")
     named_constants: dict[str, float] = {}
     if fit_model == "cubic":
-        named_constants = {"C11": float(tensor_gpa[0, 0]), "C12": float(tensor_gpa[0, 1]), "C44": float(tensor_gpa[3, 3])}
+        named_constants = {
+            "C11": float(tensor_gpa[0, 0]),
+            "C12": float(tensor_gpa[0, 1]),
+            "C44": float(tensor_gpa[3, 3]),
+        }
     elif fit_model == "hexagonal":
         named_constants = {
-            "C11": float(tensor_gpa[0, 0]), "C12": float(tensor_gpa[0, 1]),
-            "C13": float(tensor_gpa[0, 2]), "C33": float(tensor_gpa[2, 2]),
-            "C44": float(tensor_gpa[3, 3]), "C66": float(tensor_gpa[5, 5]),
+            "C11": float(tensor_gpa[0, 0]),
+            "C12": float(tensor_gpa[0, 1]),
+            "C13": float(tensor_gpa[0, 2]),
+            "C33": float(tensor_gpa[2, 2]),
+            "C44": float(tensor_gpa[3, 3]),
+            "C66": float(tensor_gpa[5, 5]),
         }
     return {
-        "group_key": records[0].group_key, "source_label": records[0].source_label,
-        "structure_id": records[0].structure_id, "formula": records[0].formula,
-        "material_id": records[0].material_id, "structure_name": records[0].structure_name,
-        "fit_model": fit_model, "num_records": len(records), "modes": mode_counts,
-        "tensor_gpa": tensor_gpa.tolist(), "stress_offset_gpa": stress_offset_gpa.tolist(),
-        "fit_rmse_gpa": rmse, "min_eigenvalue_gpa": float(np.min(eigenvalues)),
-        "max_asymmetry_gpa": max_asymmetry, "named_constants_gpa": named_constants,
+        "group_key": records[0].group_key,
+        "source_label": records[0].source_label,
+        "structure_id": records[0].structure_id,
+        "formula": records[0].formula,
+        "material_id": records[0].material_id,
+        "structure_name": records[0].structure_name,
+        "fit_model": fit_model,
+        "num_records": len(records),
+        "modes": mode_counts,
+        "tensor_gpa": tensor_gpa.tolist(),
+        "stress_offset_gpa": stress_offset_gpa.tolist(),
+        "fit_rmse_gpa": rmse,
+        "min_eigenvalue_gpa": float(np.min(eigenvalues)),
+        "max_asymmetry_gpa": max_asymmetry,
+        "named_constants_gpa": named_constants,
         "warnings": warnings,
     }
 
 
 __all__ = [
-    "ElasticRecord", "VOIGT_LABELS", "cell_strain_voigt", "conventional_rotation_rows",
-    "cubic_offsets_from_tensor", "deformation_matrix_from_metadata", "fit_cubic_tensor",
-    "fit_elastic_tensor", "fit_general_tensor", "fit_hexagonal_tensor",
-    "hexagonal_offsets_from_tensor", "paired_strain_stress_differences",
-    "parse_stress_tensor_gpa", "reference_cell_from_metadata", "rotate_tensor",
-    "strain_matrix_to_voigt", "stress_matrix_to_voigt", "summarise_group",
-    "tensor_to_strain_voigt", "voigt_to_tensor",
+    "ElasticRecord",
+    "VOIGT_LABELS",
+    "cell_strain_voigt",
+    "conventional_rotation_rows",
+    "cubic_offsets_from_tensor",
+    "deformation_matrix_from_metadata",
+    "fit_cubic_tensor",
+    "fit_elastic_tensor",
+    "fit_general_tensor",
+    "fit_hexagonal_tensor",
+    "hexagonal_offsets_from_tensor",
+    "paired_strain_stress_differences",
+    "parse_stress_tensor_gpa",
+    "reference_cell_from_metadata",
+    "rotate_tensor",
+    "strain_matrix_to_voigt",
+    "stress_matrix_to_voigt",
+    "summarise_group",
+    "tensor_to_strain_voigt",
+    "voigt_to_tensor",
 ]

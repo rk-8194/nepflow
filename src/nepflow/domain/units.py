@@ -6,7 +6,6 @@ from typing import Any
 
 import numpy as np
 
-
 ENERGY_UNIT_EV = "eV"
 FORCE_UNIT_EV_PER_ANGSTROM = "eV/Angstrom"
 STRESS_UNIT_EV_PER_ANGSTROM3 = "eV/Angstrom^3"
@@ -42,4 +41,3 @@ def require_tensor_shape(value: Any, shape: tuple[int, ...], *, name: str) -> np
     if array.shape != shape:
         raise ValueError(f"{name} must have shape {shape}, got {array.shape}")
     return array
-

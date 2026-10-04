@@ -11,7 +11,6 @@ from nepflow.errors import SchedulerError
 from nepflow.mlip.gpumd import resubmission as module
 from nepflow.workflow.resubmission import resolve_resubmit_command
 
-
 REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
 
 
@@ -126,9 +125,7 @@ class GpumdSelfResubmitTests(unittest.TestCase):
             submit_script = workdir / "original.slurm"
             submit_script.write_text("#!/bin/bash\n", encoding="utf-8")
             scheduler = Mock()
-            scheduler.show_job.return_value = (
-                f"JobId=123 Command={submit_script} WorkDir={workdir}"
-            )
+            scheduler.show_job.return_value = f"JobId=123 Command={submit_script} WorkDir={workdir}"
 
             command, cwd, source = resolve_resubmit_command(
                 workdir=workdir,

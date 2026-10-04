@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
 import math
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -12,7 +12,6 @@ from nepflow.domain.models import ModelArtifactMetadata, ModelRunRecord
 from nepflow.errors import ArtifactError
 from nepflow.io.hashing import sha256_file
 from nepflow.io.json import read_json_object, write_json
-
 
 MODEL_RUN_MANIFEST_FILENAME = "model_run_manifest.json"
 MODEL_RUN_MANIFEST_SCHEMA = "nepflow.model_run_manifest.v1"
@@ -150,8 +149,7 @@ def update_model_run_status(
         )
     if manifest.get("identity_schema_version") != MODEL_RUN_IDENTITY_SCHEMA:
         raise NepArtifactError(
-            "Unsupported model-run identity schema: "
-            f"{manifest.get('identity_schema_version')}"
+            f"Unsupported model-run identity schema: {manifest.get('identity_schema_version')}"
         )
     authoritative_identity: ModelRunIdentity | None = None
     execution_metadata: dict[str, Any] = {}
@@ -193,9 +191,11 @@ def update_model_run_status(
                 f"Unsupported model-run manifest schema: {manifest.get('schema_version')}"
             )
         stored_dataset_path = execution_metadata.get("dataset_path")
-        if stored_dataset_path and Path(str(manifest.get("dataset_path", ""))).resolve() != Path(
-            str(stored_dataset_path)
-        ).resolve():
+        if (
+            stored_dataset_path
+            and Path(str(manifest.get("dataset_path", ""))).resolve()
+            != Path(str(stored_dataset_path)).resolve()
+        ):
             raise NepArtifactError(
                 "Filesystem model-run manifest dataset path conflicts with StateStore"
             )
@@ -222,9 +222,7 @@ def update_model_run_status(
             raise NepArtifactError(
                 f"Completed model run has no non-empty potential artifact: {artifact_path}"
             )
-        artifact_hash = sha256_file(
-            artifact_path, required=True, error_type=NepArtifactError
-        )
+        artifact_hash = sha256_file(artifact_path, required=True, error_type=NepArtifactError)
         manifest["potential_artifact_sha256"] = artifact_hash
         evidence = {
             "status": "completed",
@@ -283,9 +281,16 @@ def validate_model_run_manifest(
 ) -> dict[str, Any]:
     manifest = read_model_run_manifest(manifest_path)
     required = (
-        "model_run_id", "dataset_id", "identity_schema_version",
-        "hyperparameters_hash", "dataset_path", "potential_artifact_path",
-        "potential_artifact_sha256", "nep_in_path", "nep_in_sha256", "status",
+        "model_run_id",
+        "dataset_id",
+        "identity_schema_version",
+        "hyperparameters_hash",
+        "dataset_path",
+        "potential_artifact_path",
+        "potential_artifact_sha256",
+        "nep_in_path",
+        "nep_in_sha256",
+        "status",
         "completion_evidence",
     )
     missing = [key for key in required if key not in manifest]
@@ -333,13 +338,13 @@ def validate_model_run_manifest(
             )
         execution_metadata = row.get("execution_metadata", {})
         stored_dataset_path = (
-            execution_metadata.get("dataset_path")
-            if isinstance(execution_metadata, dict)
-            else None
+            execution_metadata.get("dataset_path") if isinstance(execution_metadata, dict) else None
         )
-        if stored_dataset_path and Path(str(manifest["dataset_path"])).resolve() != Path(
-            str(stored_dataset_path)
-        ).resolve():
+        if (
+            stored_dataset_path
+            and Path(str(manifest["dataset_path"])).resolve()
+            != Path(str(stored_dataset_path)).resolve()
+        ):
             raise NepArtifactError(
                 "Filesystem model-run manifest dataset path conflicts with StateStore"
             )
@@ -356,8 +361,7 @@ def validate_model_run_manifest(
                     )
     if manifest["status"] != "completed":
         raise NepArtifactError(
-            f"Model run {manifest['model_run_id']} is not completed "
-            f"(status={manifest['status']!r})"
+            f"Model run {manifest['model_run_id']} is not completed (status={manifest['status']!r})"
         )
     if manifest["identity_schema_version"] != MODEL_RUN_IDENTITY_SCHEMA:
         raise NepArtifactError(
@@ -392,9 +396,10 @@ def validate_model_run_manifest(
         expected_hash = manifest[hash_key]
         if not artifact.is_file():
             raise NepArtifactError(f"Manifest artifact is missing: {artifact}")
-        if not expected_hash or sha256_file(
-            artifact, required=True, error_type=NepArtifactError
-        ) != expected_hash:
+        if (
+            not expected_hash
+            or sha256_file(artifact, required=True, error_type=NepArtifactError) != expected_hash
+        ):
             raise NepArtifactError(f"Manifest hash mismatch for {artifact}")
     return manifest
 
@@ -406,9 +411,7 @@ def find_model_run_manifest(project_dir: Path, model_run_id: str) -> Path:
         raise ValueError("model_run_id is required; latest model discovery is disabled")
     potentials_dir = project_dir / "nep" / "potentials"
     if not potentials_dir.is_dir():
-        raise FileNotFoundError(
-            f"No canonical NEP potential directory found: {potentials_dir}"
-        )
+        raise FileNotFoundError(f"No canonical NEP potential directory found: {potentials_dir}")
     matches = []
     for manifest_path in potentials_dir.rglob(MODEL_RUN_MANIFEST_FILENAME):
         try:
@@ -418,9 +421,7 @@ def find_model_run_manifest(project_dir: Path, model_run_id: str) -> Path:
         if manifest.get("model_run_id") == model_run_id:
             matches.append(manifest_path)
     if not matches:
-        raise FileNotFoundError(
-            f"No model-run manifest found for model_run_id={model_run_id}"
-        )
+        raise FileNotFoundError(f"No model-run manifest found for model_run_id={model_run_id}")
     if len(matches) != 1:
         raise NepArtifactError(
             f"Multiple manifests found for model_run_id={model_run_id}: {matches}"

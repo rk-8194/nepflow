@@ -13,21 +13,15 @@ from ase.io import read, write
 
 from nepflow.stages.selection import strategy
 
-
 SEED_LINEAGE_FIXTURE = (
-    Path(__file__).parents[2]
-    / "fixtures"
-    / "structures"
-    / "seed_lineage.extxyz.fixture"
+    Path(__file__).parents[2] / "fixtures" / "structures" / "seed_lineage.extxyz.fixture"
 )
 
 
 def _seed_project(tmp_path):
     lineage = read(SEED_LINEAGE_FIXTURE, index=":", format="extxyz")
     base = next(
-        atoms
-        for atoms in lineage
-        if str(atoms.info.get("perturbation_type", "")) == "unperturbed"
+        atoms for atoms in lineage if str(atoms.info.get("perturbation_type", "")) == "unperturbed"
     )
     seed_path = tmp_path / "structures" / "seeds" / "base_structures.xyz"
     seed_path.parent.mkdir(parents=True)

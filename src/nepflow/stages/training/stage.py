@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
+import shutil
 from dataclasses import asdict
 from pathlib import Path
-import shutil
 from typing import Any, Callable
 
 from nepflow.errors import StateError
@@ -12,9 +12,9 @@ from nepflow.hpc.resources import JobResources
 from nepflow.hpc.scheduler import Scheduler
 from nepflow.io.hashing import sha256_bytes, sha256_file
 from nepflow.io.json import canonical_json_bytes
+from nepflow.mlip.backend import TrainingInputRequest
 from nepflow.mlip.nep.artifacts import create_model_run_manifest, read_model_run_manifest
 from nepflow.mlip.nep.backend import NepBackend
-from nepflow.mlip.backend import TrainingInputRequest
 from nepflow.mlip.nep.inputs import NepHyperparameters
 from nepflow.workflow import StageContext, StageRunResult, StageRunState, WorkflowStage
 
@@ -60,8 +60,7 @@ class TrainingStage:
             source = selected_dir / f"{split}.xyz"
             if not source.is_file():
                 raise FileNotFoundError(
-                    f"Selected {split} structures not found at {source}; "
-                    "run the select stage first"
+                    f"Selected {split} structures not found at {source}; run the select stage first"
                 )
         raise StateError(
             "Dataset storage is keyed by the resolved authoritative dataset identity; "
@@ -109,9 +108,7 @@ class TrainingStage:
 
     def _config(self, context: StageContext) -> Any:
         if context.config is None:
-            raise StateError(
-                "TrainingStage requires the injected typed project configuration"
-            )
+            raise StateError("TrainingStage requires the injected typed project configuration")
         return context.config
 
     @staticmethod
@@ -123,9 +120,7 @@ class TrainingStage:
         row = get_dataset(dataset_id)
         persisted = None if row is None else row.get("identity_json", row.get("identity"))
         if not isinstance(persisted, dict) or persisted != dataset_manifest.identity.to_dict():
-            raise StateError(
-                "Training dataset is not registered in authoritative StateStore"
-            )
+            raise StateError("Training dataset is not registered in authoritative StateStore")
 
     def _assemble_dataset(
         self,
@@ -158,9 +153,7 @@ class TrainingStage:
                 raise StateError(
                     "Materialized training dataset conflicts with the resolved DFT identity"
                 )
-            if bool(metadata.get("virial_required", False)) != bool(
-                config.train_nep.train_virial
-            ):
+            if bool(metadata.get("virial_required", False)) != bool(config.train_nep.train_virial):
                 raise StateError(
                     "Materialized dataset label schema does not match train_nep.train_virial"
                 )
@@ -304,9 +297,7 @@ class TrainingStage:
         backend = self.backend or NepBackend(config.hpc.nep_command)
         scheduler = self.scheduler
         if config.slurm.enabled and scheduler is None:
-            raise StateError(
-                "TrainingStage requires an injected scheduler when SLURM is enabled"
-            )
+            raise StateError("TrainingStage requires an injected scheduler when SLURM is enabled")
         # The campaign identity includes the effective candidate matrix, so a
         # restart reopens the same event stream rather than proposing trials
         # from mutable folder order.

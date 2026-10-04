@@ -13,7 +13,6 @@ from nepflow.dft.backend import DftFailure
 
 from .outputs import outcar_is_complete
 
-
 OOM_MARKER = ".vasp_oom_detected"
 LEGACY_OOM_MARKER = ".vasp_oom_marker"
 

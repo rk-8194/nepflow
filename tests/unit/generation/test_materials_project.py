@@ -8,7 +8,6 @@ import pytest
 
 pytest.importorskip("ase")
 pytest.importorskip("pymatgen")
-from ase import Atoms
 from pymatgen.core import Lattice, Structure
 
 from nepflow.stages.generation.generators.materials_project.cache import (
@@ -59,11 +58,14 @@ def test_query_identity_includes_type_inputs_and_cache_schema() -> None:
 
     assert pure.query_id != compound.query_id
     assert pure.payload()["cache_schema"]
-    assert pure.query_id == MaterialsProjectQuery(
-        query_type="pure_structures",
-        elements=("Si",),
-        crystal_structures=("bcc",),
-    ).query_id
+    assert (
+        pure.query_id
+        == MaterialsProjectQuery(
+            query_type="pure_structures",
+            elements=("Si",),
+            crystal_structures=("bcc",),
+        ).query_id
+    )
 
 
 def test_cache_rejects_corruption_and_identity_mismatch(tmp_path: Path) -> None:

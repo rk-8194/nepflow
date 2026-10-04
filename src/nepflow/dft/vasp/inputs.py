@@ -48,9 +48,7 @@ def canonical_poscar_text(atoms) -> str:
 
     lines = [str(comment), "1.0"]
     for row in cell:
-        lines.append(
-            f"  {row[0]:20.14f}  {row[1]:20.14f}  {row[2]:20.14f}"
-        )
+        lines.append(f"  {row[0]:20.14f}  {row[1]:20.14f}  {row[2]:20.14f}")
     lines.append("  " + "  ".join(unique_elements))
     lines.append("  " + "  ".join(str(c) for c in counts))
     lines.append("Direct")
@@ -92,9 +90,7 @@ def set_incar_parameters(
     """
 
     normalized = {
-        str(key).strip().upper(): value
-        for key, value in parameters.items()
-        if str(key).strip()
+        str(key).strip().upper(): value for key, value in parameters.items() if str(key).strip()
     }
     if not normalized:
         return incar_text.rstrip() + "\n"
@@ -137,21 +133,13 @@ def inject_incar_defaults(
     """
     lines = incar_text.rstrip("\n")
 
-    has_kspacing = bool(
-        re.search(r"^\s*KSPACING\s*=", incar_text, re.MULTILINE | re.IGNORECASE)
-    )
-    has_kgamma = bool(
-        re.search(r"^\s*KGAMMA\s*=", incar_text, re.MULTILINE | re.IGNORECASE)
-    )
+    has_kspacing = bool(re.search(r"^\s*KSPACING\s*=", incar_text, re.MULTILINE | re.IGNORECASE))
+    has_kgamma = bool(re.search(r"^\s*KGAMMA\s*=", incar_text, re.MULTILINE | re.IGNORECASE))
 
     additions = []
     if not has_kspacing:
         if isinstance(config, NepflowConfig):
-            kspacing = (
-                "0.30"
-                if config.vasp.kspacing == 0.30
-                else repr(config.vasp.kspacing)
-            )
+            kspacing = "0.30" if config.vasp.kspacing == 0.30 else repr(config.vasp.kspacing)
         else:
             kspacing = config.get("vasp", "kspacing", fallback="0.30")
         additions.append(f"KSPACING = {kspacing}")
@@ -227,12 +215,9 @@ def build_input_context(project_dir: Path) -> VaspInputContext | None:
         project_name=project_dir.name.removeprefix("project_"),
         require_scientific_fields=False,
     )
-    incar_text = inject_incar_defaults(
-        incar_template.read_text(encoding="utf-8"), typed_config
-    )
+    incar_text = inject_incar_defaults(incar_template.read_text(encoding="utf-8"), typed_config)
     potcar_data = {
-        path.name.split("_", 1)[1]: path.read_bytes()
-        for path in vasp_config_dir.glob("POTCAR_*")
+        path.name.split("_", 1)[1]: path.read_bytes() for path in vasp_config_dir.glob("POTCAR_*")
     }
     return VaspInputContext(hash_incar_text(incar_text), potcar_data)
 
@@ -247,9 +232,7 @@ def identity_for_structure(atoms, input_context: Mapping[str, object]) -> VaspIn
     missing = [element for element in elements if element not in potcar_data]
     if missing:
         raise FileNotFoundError(f"missing POTCAR files for: {', '.join(missing)}")
-    potcar_hash = hash_potcar_bytes(
-        b"".join(bytes(potcar_data[element]) for element in elements)
-    )
+    potcar_hash = hash_potcar_bytes(b"".join(bytes(potcar_data[element]) for element in elements))
     incar_hash = input_context.get("incar_hash")
     if not isinstance(incar_hash, str) or not incar_hash:
         raise ValueError("VASP input context is missing INCAR identity")
@@ -276,9 +259,7 @@ def read_identity(struct_dir: Path) -> dict:
     for key in ("structure_id", "incar_hash", "potcar_hash", "calculation_id"):
         value = data.get(key)
         if not isinstance(value, str) or not value.strip():
-            raise StateError(
-                f"VASP identity is missing a valid {key}: {identity_path}"
-            )
+            raise StateError(f"VASP identity is missing a valid {key}: {identity_path}")
     return data
 
 

@@ -138,9 +138,7 @@ def test_runtime_training_policy_does_not_change_carried_model_identity(
 
 
 def test_collected_model_artifacts_reject_missing_or_mismatched_identity() -> None:
-    training_input = FakeMlipBackend().render_training_input(
-        _training_request(Path("training"))
-    )
+    training_input = FakeMlipBackend().render_training_input(_training_request(Path("training")))
     artifact = ModelArtifactMetadata(
         model=ArtifactIdentity.from_bytes("nep-model", b"model"),
         status="completed",

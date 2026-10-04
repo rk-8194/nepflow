@@ -12,7 +12,6 @@ pytest.importorskip("NepTrainKit")
 from ase import Atoms
 
 from nepflow.config.models import NepflowConfig, ProjectConfig, SelectionConfig
-from nepflow.state import StateStore
 from nepflow.stages.selection import stage as selection_stage_module
 from nepflow.stages.selection.models import SelectionResult
 from nepflow.stages.selection.persistence import (
@@ -20,6 +19,7 @@ from nepflow.stages.selection.persistence import (
     structure_ids,
 )
 from nepflow.stages.selection.stage import SelectionStage
+from nepflow.state import StateStore
 from nepflow.workflow import StageContext
 
 
@@ -88,8 +88,9 @@ def test_prepare_returns_none_for_an_empty_generated_file(tmp_path):
     settings = SelectionConfig()
     with StateStore(tmp_path / "state.db") as store:
         stage = SelectionStage(context=_context(tmp_path, store, settings))
-        with patch.object(selection_stage_module.Structure, "read_multiple", return_value=[]), patch.object(
-            selection_stage_module, "ase_read", return_value=[]
+        with (
+            patch.object(selection_stage_module.Structure, "read_multiple", return_value=[]),
+            patch.object(selection_stage_module, "ase_read", return_value=[]),
         ):
             assert stage.prepare(tmp_path) is None
 
@@ -104,9 +105,11 @@ def test_stage_consumes_injected_typed_config_without_discovery(tmp_path):
             "ase_structures": [_atoms("Si", 0.0), _atoms("Ge", 1.0)],
         }
         result = _result(np.ones((2, 2)))
-        with patch.object(stage, "prepare", return_value=prepared), patch.object(
-            stage, "execute", return_value=result
-        ) as execute, patch.object(stage, "finalize", return_value=result) as finalize:
+        with (
+            patch.object(stage, "prepare", return_value=prepared),
+            patch.object(stage, "execute", return_value=result) as execute,
+            patch.object(stage, "finalize", return_value=result) as finalize,
+        ):
             returned = stage.run()
 
     assert returned is result
@@ -174,14 +177,17 @@ def test_reopen_reconciles_by_identity_after_candidate_reordering(tmp_path):
     with StateStore(state_path) as reopened_store:
         context = _context(tmp_path, reopened_store, settings)
         stage = SelectionStage(context=context)
-        with patch.object(
-            selection_stage_module,
-            "load_or_calculate_representations",
-            return_value=np.ones((2, 2)),
-        ), patch.object(
-            selection_stage_module,
-            "select_training_set",
-            side_effect=AssertionError("reconciliation must not recompute training"),
+        with (
+            patch.object(
+                selection_stage_module,
+                "load_or_calculate_representations",
+                return_value=np.ones((2, 2)),
+            ),
+            patch.object(
+                selection_stage_module,
+                "select_training_set",
+                side_effect=AssertionError("reconciliation must not recompute training"),
+            ),
         ):
             restored = stage.execute(settings, prepared, context=context)
 
@@ -200,19 +206,19 @@ def test_report_failure_does_not_remove_completed_scientific_result(tmp_path):
             "ase_structures": [_atoms("Si", 0.0), _atoms("Ge", 1.0)],
         }
         result = _result(np.ones((2, 2)))
-        with patch.object(stage, "prepare", return_value=prepared), patch.object(
-            stage, "execute", return_value=result
-        ), patch.object(
-            selection_stage_module,
-            "plot_descriptor_space",
-            side_effect=RuntimeError("report failed"),
+        with (
+            patch.object(stage, "prepare", return_value=prepared),
+            patch.object(stage, "execute", return_value=result),
+            patch.object(
+                selection_stage_module,
+                "plot_descriptor_space",
+                side_effect=RuntimeError("report failed"),
+            ),
         ):
             with pytest.raises(RuntimeError, match="report failed"):
                 stage.run()
 
-        run_ids = store.connection.execute(
-            "SELECT selection_run_id FROM selection_runs"
-        ).fetchall()
+        run_ids = store.connection.execute("SELECT selection_run_id FROM selection_runs").fetchall()
         assert len(run_ids) == 1
         record = store.get_selection_run(run_ids[0][0])
         assert record["status"] == "completed"

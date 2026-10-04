@@ -1,10 +1,9 @@
 """Immutable typed models for the project configuration schema."""
 
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from collections.abc import Mapping
 from typing import Any
-
 
 CONFIG_SCHEMA_VERSION = 1
 
@@ -275,10 +274,7 @@ def _normalize_mapping(value: object) -> object:
     if isinstance(value, list):
         return [_normalize_mapping(item) for item in value]
     if isinstance(value, dict):
-        return {
-            str(key): _normalize_mapping(value[key])
-            for key in sorted(value)
-        }
+        return {str(key): _normalize_mapping(value[key]) for key in sorted(value)}
     return value
 
 

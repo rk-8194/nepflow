@@ -7,10 +7,10 @@ VASP interpretation remain owned by their canonical boundaries.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from enum import Enum
-import re
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -121,11 +121,7 @@ def build_benchmark_resources(
         raise ValueError("cores_per_node and gpus_per_node must be positive")
     ncores = tuple(
         ncore_values
-        or (
-            value
-            for value in _powers_of_two(cores_per_node)
-            if cores_per_node % value == 0
-        )
+        or (value for value in _powers_of_two(cores_per_node) if cores_per_node % value == 0)
     )
     if not ncores:
         ncores = (cores_per_node,)

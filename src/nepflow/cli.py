@@ -43,21 +43,31 @@ _SOURCE_ROOT = Path(__file__).resolve().parents[1]
 
 from nepflow.application.composition import (  # noqa: E402
     build_generation_stage as _compose_generation_stage,
+)
+from nepflow.application.composition import (  # noqa: E402
     compose_stage_registry as _compose_stage_registry,
+)
+from nepflow.application.composition import (  # noqa: E402
     offer_project_upload as _offer_project_upload_impl,
 )
 from nepflow.application.runtime import (  # noqa: E402
     create_process_runner,
     create_scheduler,
+)
+from nepflow.application.runtime import (  # noqa: E402
     resolve_resubmit_command as _resolve_runtime_resubmit_command,
+)
+from nepflow.application.runtime import (  # noqa: E402
     resubmit_slurm_job as _resubmit_runtime_job,
 )
 from nepflow.config.loader import canonical_config_path  # noqa: E402
 from nepflow.errors import (  # noqa: E402
     ProcessError,
-    SchedulerError as _SchedulerError,
     StateError,
     ValidationError,
+)
+from nepflow.errors import (  # noqa: E402
+    SchedulerError as _SchedulerError,
 )
 from nepflow.logging import configure_logging  # noqa: E402
 from nepflow.reporting import WorkflowStatusPresenter  # noqa: E402
@@ -69,7 +79,7 @@ from nepflow.workflow import (  # noqa: E402
     WorkflowController,
 )
 
-logger = logging.getLogger("nepflow")
+logger = logging.getLogger(__name__)
 SchedulerError = _SchedulerError
 process_runner = create_process_runner(logger)
 scheduler = create_scheduler(process_runner)
@@ -84,7 +94,11 @@ def _build_generation_stage(context: StageContext) -> GenerationStage:
 def _offer_project_upload(context: StageContext) -> None:
     """Offer the local seeds-only result to the configured remote project."""
 
-    _offer_project_upload_impl(context, process_runner=process_runner)
+    _offer_project_upload_impl(
+        context,
+        process_runner=process_runner,
+        confirm=input,
+    )
 
 
 def compose_stage_registry() -> StageRegistry:
@@ -92,8 +106,8 @@ def compose_stage_registry() -> StageRegistry:
 
     return _compose_stage_registry(
         logger=logger,
-        process_runner=process_runner,
         scheduler=scheduler,
+        offer_upload=_offer_project_upload,
     )
 
 
@@ -286,9 +300,7 @@ def _resolve_slurm_deadline() -> float | None:
 
     margin_seconds = 300
     if walltime_remaining is None:
-        logger.info(
-            "Not running under SLURM - no walltime limit, workflow will run indefinitely"
-        )
+        logger.info("Not running under SLURM - no walltime limit, workflow will run indefinitely")
         return None
     deadline = time.time() + walltime_remaining - margin_seconds
     logger.info(

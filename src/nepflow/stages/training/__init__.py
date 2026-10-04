@@ -3,10 +3,9 @@
 from .campaign import (
     CampaignReconciliationResult,
     TrainingAttempt,
-    TrainingCandidate,
     TrainingCampaign,
+    TrainingCandidate,
 )
-
 from .dataset import (
     DatasetBuildReport,
     DatasetBuildResult,

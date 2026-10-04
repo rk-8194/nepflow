@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping, Sequence
 import logging
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -14,8 +14,8 @@ from nepflow.domain.identities import ArtifactIdentity, StructureIdentity, annot
 from nepflow.domain.structures import GeneratedStructureRecord, StructureProvenance
 from nepflow.workflow.controller import StageContext
 
-from .generators.composition import CompositionGrid
 from .generators.base import ConfigurationalGenerator
+from .generators.composition import CompositionGrid
 from .models import GenerationManifest, GenerationRequest, GenerationResult
 from .provenance import (
     annotate_base_structures,
@@ -23,6 +23,8 @@ from .provenance import (
     deduplicate_base_structures,
 )
 from .validation import validate_composition_config, validate_generation_config
+
+logger = logging.getLogger(__name__)
 
 
 class PerturbationCoordinator(Protocol):
@@ -50,7 +52,7 @@ class GenerationStage:
         self.coordinator = coordinator
         self.state_store = state_store
         self.debug_runner = debug_runner
-        self.logger = logger or logging.getLogger("nepflow.generation")
+        self.logger = logger or logging.getLogger(__name__)
         self._candidate_path: Path | None = None
 
     def run(
@@ -220,9 +222,7 @@ class GenerationStage:
 
     @staticmethod
     def _load_saved_bases(path: Path) -> list[Any]:
-        logging.getLogger("nepflow.generation").info(
-            "Found existing seeds - loading from %s", path
-        )
+        logger.info("Found existing seeds - loading from %s", path)
         loaded = read(str(path), index=":")
         return list(loaded) if isinstance(loaded, list) else [loaded]
 
@@ -258,7 +258,12 @@ class GenerationStage:
         if candidate_path is None and not request.debug:
             return manifest
         if candidate_path is None:
-            candidate_path = request.project_dir / request.structures_path / "generated" / "generated_structures.xyz"
+            candidate_path = (
+                request.project_dir
+                / request.structures_path
+                / "generated"
+                / "generated_structures.xyz"
+            )
         if not candidate_path.is_file():
             return manifest
         artifact = ArtifactIdentity.from_file("generation_candidate_structures", candidate_path)
@@ -348,7 +353,9 @@ class GenerationStage:
             info = dict(base.info)
             provenance = StructureProvenance(
                 parent_structure_id=None,
-                generator=str(info.get("generator") or info.get("configurational_type") or "generation"),
+                generator=str(
+                    info.get("generator") or info.get("configurational_type") or "generation"
+                ),
                 requested_composition=info.get("composition"),
                 realised_composition=info.get("actual_composition"),
                 source_database_id=(
@@ -361,14 +368,14 @@ class GenerationStage:
                     )
                 ),
                 crystal_structure=(
-                    None if info.get("crystal_structure") is None else str(info.get("crystal_structure"))
+                    None
+                    if info.get("crystal_structure") is None
+                    else str(info.get("crystal_structure"))
                 ),
                 perturbation_family=info.get("configurational_type"),
                 perturbation_parameters=None,
                 random_seed=(
-                    int(info["random_seed"])
-                    if info.get("random_seed") is not None
-                    else None
+                    int(info["random_seed"]) if info.get("random_seed") is not None else None
                 ),
                 operation_id=f"generation:{request.project_name}:{info.get('seed_id', identity.structure_id)}",
                 code_version=None,
@@ -448,7 +455,6 @@ class GenerationStage:
     ) -> None:
         if not bases:
             return
-        logger = logging.getLogger("nepflow.generation")
         if generator_name != "MaterialsProject":
             logger.info("  %s / %s: %s structure(s)", composition_label, generator_name, len(bases))
             return

@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
 import logging
 import os
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
@@ -21,8 +21,7 @@ from .conversion import (
     serialize_structure,
 )
 
-
-logger = logging.getLogger("nepflow.generation.materials_project")
+logger = logging.getLogger(__name__)
 
 
 class MaterialsProjectFetcher:

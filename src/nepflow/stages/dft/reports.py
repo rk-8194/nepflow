@@ -76,13 +76,9 @@ class DftPerformanceRecorder:
             status="completed",
             total_ranks=0 if evidence is None else evidence.total_ranks,
             mpi_ranks=0 if evidence is None else evidence.mpi_ranks,
-            irreducible_kpoints=(
-                0 if evidence is None else evidence.irreducible_kpoints
-            ),
+            irreducible_kpoints=(0 if evidence is None else evidence.irreducible_kpoints),
             electrons=0.0 if evidence is None else evidence.electrons,
-            average_loop_time=(
-                0.0 if evidence is None else evidence.average_loop_time
-            ),
+            average_loop_time=(0.0 if evidence is None else evidence.average_loop_time),
         )
         self._record(record, performance, result)
 
@@ -107,9 +103,7 @@ class DftPerformanceRecorder:
     ) -> None:
         payload = performance.to_dict()
         if result is not None and hasattr(result, "artifact"):
-            payload["artifact"] = (
-                None if result.artifact is None else result.artifact.to_dict()
-            )
+            payload["artifact"] = None if result.artifact is None else result.artifact.to_dict()
         self.state_store.append_event(
             f"dft-performance:{record.attempt_id}:{performance.status}",
             "dft_attempt",
@@ -148,8 +142,7 @@ def summarize_benchmark_results(results: Sequence[Any]) -> VaspBenchmarkSummary:
         total=len(results),
         completed=len(completed),
         out_of_memory=sum(
-            getattr(getattr(result, "outcome", None), "value", None)
-            == "out_of_memory"
+            getattr(getattr(result, "outcome", None), "value", None) == "out_of_memory"
             for result in results
         ),
         failed=sum(
@@ -174,9 +167,7 @@ def benchmark_plot_data(results: Sequence[Any]) -> tuple[dict[str, Any], ...]:
             "total_gpus": result.provenance.resources.total_gpus,
             "mpi_ranks": result.provenance.resources.mpi_ranks,
             "average_loop_time": (
-                None
-                if result.performance is None
-                else result.performance.average_loop_time
+                None if result.performance is None else result.performance.average_loop_time
             ),
         }
         for result in results

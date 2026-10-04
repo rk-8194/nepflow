@@ -6,18 +6,17 @@ interpret scheduler output or assign meaning to scheduler return codes.
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
 import logging
 import os
-from pathlib import Path
 import shlex
 import subprocess
 import time
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from nepflow.errors import ProcessError
-
 
 _CommandPart = str | os.PathLike[str]
 
@@ -92,7 +91,7 @@ class ProcessRunner:
     """Run argument-list commands with one consistent failure contract."""
 
     def __init__(self, logger: logging.Logger | None = None) -> None:
-        self.logger = logger or logging.getLogger("nepflow.hpc.process")
+        self.logger = logger or logging.getLogger(__name__)
 
     def run(
         self,

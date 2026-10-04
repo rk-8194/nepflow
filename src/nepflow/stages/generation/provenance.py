@@ -8,7 +8,6 @@ from typing import Any
 
 from nepflow.domain.identities import calculate_structure_id
 
-
 logger = logging.getLogger(__name__)
 
 
@@ -51,9 +50,7 @@ def merge_provenance(representative: Any, duplicate: Any | None = None) -> None:
             continue
         path_values.extend(metadata_values(atoms.info.get("provenance_paths")))
         path_values.extend(metadata_values(atoms.info.get("source")))
-        material_values.extend(
-            metadata_values(atoms.info.get("provenance_material_ids"))
-        )
+        material_values.extend(metadata_values(atoms.info.get("provenance_material_ids")))
         material_values.extend(metadata_values(atoms.info.get("material_id")))
 
     representative.info["provenance_paths"] = sorted(set(path_values))

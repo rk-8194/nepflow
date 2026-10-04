@@ -7,8 +7,7 @@ from pathlib import Path
 
 import numpy as np
 
-
-logger = logging.getLogger("nepflow.selection.reports")
+logger = logging.getLogger(__name__)
 
 
 def plot_descriptor_space(

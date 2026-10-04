@@ -170,8 +170,7 @@ class DftRecordsMixin:
                 raise StateError(f"DFT attempt identity conflict: {attempt_id}")
             return _decode_attempt(existing)
         duplicate_number = self._connection.execute(
-            "SELECT attempt_id FROM dft_attempts "
-            "WHERE calculation_id = ? AND attempt_number = ?",
+            "SELECT attempt_id FROM dft_attempts WHERE calculation_id = ? AND attempt_number = ?",
             (calculation_id, attempt_number),
         ).fetchone()
         if duplicate_number is not None:
@@ -249,9 +248,7 @@ class DftRecordsMixin:
         """Atomically accept one attempt and register all result artifacts."""
 
         return self._write(
-            lambda: self._complete_dft_result(
-                calculation_id, attempt_id, tuple(artifacts)
-            )
+            lambda: self._complete_dft_result(calculation_id, attempt_id, tuple(artifacts))
         )
 
     def _complete_dft_result(
@@ -288,8 +285,7 @@ class DftRecordsMixin:
             )
         completed_at = now()
         self._connection.execute(
-            "UPDATE dft_attempts SET status = 'completed', completed_at = ? "
-            "WHERE attempt_id = ?",
+            "UPDATE dft_attempts SET status = 'completed', completed_at = ? WHERE attempt_id = ?",
             (completed_at, attempt_id),
         )
         self._connection.execute(
@@ -344,9 +340,7 @@ class DftRecordsMixin:
         failure_evidence = {"reason": reason} if reason is not None else None
         if existing_attempt is None:
             attempts = self.list_dft_attempts(calculation_id)
-            attempt_number = max(
-                (int(item["attempt_number"]) for item in attempts), default=0
-            ) + 1
+            attempt_number = max((int(item["attempt_number"]) for item in attempts), default=0) + 1
             self.create_dft_attempt(
                 calculation_id,
                 record.attempt_id,
@@ -376,9 +370,7 @@ class DftRecordsMixin:
     ) -> None:
         if not hasattr(artifact, "outcar"):
             raise StateError("DFT execution artifact has no VASP artifact fields")
-        identities = tuple(
-            item for item in (artifact.outcar, artifact.vasprun) if item is not None
-        )
+        identities = tuple(item for item in (artifact.outcar, artifact.vasprun) if item is not None)
         self.register_completed_result(calculation_id, attempt_id, identities)
 
     def get_dft_calculation(self, calculation_id: str) -> dict[str, Any] | None:

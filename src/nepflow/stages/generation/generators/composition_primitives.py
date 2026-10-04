@@ -2,13 +2,11 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
 from collections import Counter
+from collections.abc import Mapping, Sequence
 
 import numpy as np
 from ase import Atoms
-
-from ..supercell import build_target_supercell
 
 
 def allocate_crystal_quota(

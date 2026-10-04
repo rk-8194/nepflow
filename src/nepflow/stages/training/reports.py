@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Mapping
 
-from .campaign import CampaignReconciliationResult, TrainingCandidate
+from .campaign import CampaignReconciliationResult
 
 
 @dataclass(frozen=True, slots=True)
@@ -37,9 +37,7 @@ class TrainingCampaignReport:
                 if candidate.status == "failed"
             ),
             promotion_decision=(
-                None
-                if result.promotion_decision is None
-                else dict(result.promotion_decision)
+                None if result.promotion_decision is None else dict(result.promotion_decision)
             ),
         )
 

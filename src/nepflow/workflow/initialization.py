@@ -18,7 +18,6 @@ from nepflow.state import CURRENT_SCHEMA_VERSION, StateStore
 
 from .stages import StageRunState, StageRunStatus, WorkflowStage
 
-
 logger = logging.getLogger(__name__)
 
 
@@ -45,8 +44,7 @@ class ProjectCreationService:
         if (self.project_dir / ".project").exists():
             return False
         return not (
-            self.config_file.exists()
-            and self.config_file.resolve() != project_config.resolve()
+            self.config_file.exists() and self.config_file.resolve() != project_config.resolve()
         )
 
     def run(
@@ -193,9 +191,7 @@ class ProjectCreationService:
         state_was_present: bool,
     ) -> None:
         """Record project and initial workflow state through StateStore APIs."""
-        config_fingerprint = sha256_canonical_json(
-            config.effective_mapping(redact_secrets=True)
-        )
+        config_fingerprint = sha256_canonical_json(config.effective_mapping(redact_secrets=True))
         project_root = str(self.project_dir.resolve())
         metadata = {
             "project_id": self.project_name,
@@ -223,8 +219,7 @@ class ProjectCreationService:
                     )
                 existing_metadata = existing.get("metadata")
                 if not isinstance(existing_metadata, dict) or any(
-                    existing_metadata.get(key) != value
-                    for key, value in metadata.items()
+                    existing_metadata.get(key) != value for key, value in metadata.items()
                 ):
                     raise StateError(
                         "Existing project metadata is incomplete or incompatible; "

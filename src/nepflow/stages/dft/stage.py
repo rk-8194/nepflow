@@ -2,17 +2,16 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from pathlib import Path
 import shlex
+from dataclasses import dataclass
 
 from nepflow.config import NepflowConfig
 from nepflow.dft.backend import DftBackend
 from nepflow.dft.vasp.backend import VaspBackend
+from nepflow.dft.vasp.recovery import VaspRecoveryPolicy
 from nepflow.errors import StateError
 from nepflow.hpc.resources import JobResources
 from nepflow.hpc.scheduler import Scheduler
-from nepflow.dft.vasp.recovery import VaspRecoveryPolicy
 from nepflow.workflow.controller import StageContext
 from nepflow.workflow.stages import StageRunResult, StageRunState, WorkflowStage
 
@@ -25,9 +24,9 @@ from .orchestrator import (
 )
 from .reconciliation import (
     DftExecutionRecord,
-    DftRecoveryDecision,
     DftReconciliationOrchestrator,
     DftReconciliationResult,
+    DftRecoveryDecision,
 )
 from .reports import DftPerformanceRecorder
 
@@ -46,11 +45,7 @@ class DftStageResult:
         failed = execution is not None and execution.any_failed
         complete = execution is not None and execution.all_successful
         status = (
-            StageRunState.FAILED
-            if failed
-            else StageRunState.COMPLETED
-            if complete
-            else self.status
+            StageRunState.FAILED if failed else StageRunState.COMPLETED if complete else self.status
         )
         return StageRunResult(
             stage=self.stage,
@@ -126,13 +121,9 @@ class DftStage:
         execution_orchestrator = self.execution_orchestrator
         if execution_orchestrator is None:
             if scheduler is None:
-                raise StateError(
-                    "DftStage requires an injected scheduler for execution"
-                )
+                raise StateError("DftStage requires an injected scheduler for execution")
             if not isinstance(backend, VaspBackend):
-                raise TypeError(
-                    "Default DFT execution requires a backend with a runner renderer"
-                )
+                raise TypeError("Default DFT execution requires a backend with a runner renderer")
             runner_path = active_context.project_dir / "vasp" / "run_vasp.sh"
             runner_path.parent.mkdir(parents=True, exist_ok=True)
             runner_path.write_text(
@@ -175,11 +166,7 @@ class DftStage:
                     retry_level=record.retry_level,
                     reason=failure.reason,
                 )
-            starting_gpu = (
-                record.resources.gpus_per_node
-                if record.resources is not None
-                else 1
-            )
+            starting_gpu = record.resources.gpus_per_node if record.resources is not None else 1
             initial_ncore = record.inputs.calculation.ncore or max(
                 2,
                 config.hpc.cores_per_node // max(1, starting_gpu),
@@ -238,13 +225,10 @@ class DftStage:
             status=status,
             job_id=(None if latest is None else latest.get("job_id")),
             job_name=(
-                f"nf_{item.spec.project_name}_{item.spec.dataset}_"
-                f"{item.spec.selected_index:04d}"
+                f"nf_{item.spec.project_name}_{item.spec.dataset}_{item.spec.selected_index:04d}"
             ),
             retry_level=(
-                max(0, int(latest.get("attempt_number", 1)) - 1)
-                if latest is not None
-                else 0
+                max(0, int(latest.get("attempt_number", 1)) - 1) if latest is not None else 0
             ),
             resources=resources,
         )
@@ -253,15 +237,11 @@ class DftStage:
     def _validate_inputs(context: StageContext) -> NepflowConfig:
         config = context.config
         if not isinstance(config, NepflowConfig):
-            raise TypeError(
-                "DftStage requires the injected typed NepflowConfig context"
-            )
+            raise TypeError("DftStage requires the injected typed NepflowConfig context")
         if not shlex.split(config.hpc.vasp_command):
             raise ValueError("Required configuration hpc.vasp_command must not be blank")
         if context.project_name != config.project.name:
-            raise ValueError(
-                "DFT stage project context does not match the typed configuration"
-            )
+            raise ValueError("DFT stage project context does not match the typed configuration")
         return config
 
 

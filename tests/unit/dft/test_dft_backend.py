@@ -6,9 +6,6 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from nepflow.domain.identities import DftCalculationIdentity, StructureIdentity
-from nepflow.errors import BackendError, ValidationError
-from nepflow.hpc.process import ProcessResult
 from nepflow.dft.backend import (
     DftBackend,
     DftCompletionEvidence,
@@ -19,6 +16,9 @@ from nepflow.dft.backend import (
     DftResult,
     DftResultRequirements,
 )
+from nepflow.domain.identities import DftCalculationIdentity, StructureIdentity
+from nepflow.errors import BackendError, ValidationError
+from nepflow.hpc.process import ProcessResult
 
 
 def _request(tmp_path: Path) -> DftInputRequest:
@@ -99,9 +99,7 @@ def test_fake_dft_backend_conforms_without_scheduler_methods(tmp_path: Path) -> 
 
 
 def test_dft_result_uses_canonical_identity_and_units(tmp_path: Path) -> None:
-    result = FakeDftBackend().parse_result(
-        FakeDftBackend().prepare_inputs(_request(tmp_path))
-    )
+    result = FakeDftBackend().parse_result(FakeDftBackend().prepare_inputs(_request(tmp_path)))
 
     assert result.calculation.structure_id == "structure-1"
     assert result.energy_unit == "eV"

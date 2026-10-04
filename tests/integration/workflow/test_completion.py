@@ -1,13 +1,13 @@
 from pathlib import Path
 from types import SimpleNamespace
+
 import pytest
 
+from nepflow.domain.datasets import DatasetIdentity, TrainingDatasetManifest
 from nepflow.errors import StateError
-from nepflow.state import StateStore
 from nepflow.stages.dft.orchestrator import DftPreparationResult
 from nepflow.stages.dft.reconciliation import DftExecutionRecord, DftReconciliationResult
 from nepflow.stages.dft.stage import DftStage
-from nepflow.domain.datasets import DatasetIdentity, TrainingDatasetManifest
 from nepflow.stages.training.campaign import CampaignReconciliationResult
 from nepflow.stages.training.stage import TrainingStage
 from nepflow.stages.validation.reconciliation import (
@@ -15,6 +15,7 @@ from nepflow.stages.validation.reconciliation import (
     ValidationReconciliationResult,
 )
 from nepflow.stages.validation.stage import ValidationStageResult
+from nepflow.state import StateStore
 from nepflow.workflow import (
     StageRegistry,
     StageRunResult,
@@ -23,8 +24,8 @@ from nepflow.workflow import (
     WorkflowStage,
 )
 
-
-VALID_PROJECT_CONFIG = """
+VALID_PROJECT_CONFIG = (
+    """
 [project]
 name=demo
 schema_version=1
@@ -39,7 +40,9 @@ target_n_atoms=64
 
 [hpc]
 vasp_command=vasp_std
-""".strip() + "\n"
+""".strip()
+    + "\n"
+)
 
 
 def build_test_registry(
@@ -194,9 +197,7 @@ def _assert_failed_controller_run_does_not_advance(
     reopened = reopen_controller(tmp_path)
     assert reopened.current_stage() is stage
     with StateStore(reopened.state_file) as store:
-        assert store.get_stage_run(f"demo:{stage.value}")["status"] == (
-            StageRunState.FAILED.value
-        )
+        assert store.get_stage_run(f"demo:{stage.value}")["status"] == (StageRunState.FAILED.value)
         assert store.get_stage_run(f"demo:{downstream.value}") is None
 
 
@@ -220,10 +221,14 @@ def test_terminal_dft_failure_stays_failed_after_controller_reopen(tmp_path: Pat
     results = []
 
     def failed_dft_handler(context):
-        result = DftStage(
-            orchestrator=FailedPreparation(),
-            execution_orchestrator=FailedExecution(),
-        ).run(context).as_workflow_result()
+        result = (
+            DftStage(
+                orchestrator=FailedPreparation(),
+                execution_orchestrator=FailedExecution(),
+            )
+            .run(context)
+            .as_workflow_result()
+        )
         results.append(result)
         return result
 

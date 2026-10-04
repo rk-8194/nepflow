@@ -55,7 +55,9 @@ class FPSTests(unittest.TestCase):
         structures = [StructureStub(), StructureStub()]
 
         with patch.object(SAMPLING, "_selected_count", return_value=2):
-            with patch.object(SAMPLING, "select_farthest_points", return_value=[0, 1]) as select_points:
+            with patch.object(
+                SAMPLING, "select_farthest_points", return_value=[0, 1]
+            ) as select_points:
                 indices, best_dist = SAMPLING.select_farthest_points_for_target(
                     descriptors,
                     structures,
@@ -79,7 +81,9 @@ class FPSTests(unittest.TestCase):
         count_values = [5, 4, 3, 3]
 
         with patch.object(SAMPLING, "_selected_count", side_effect=count_values):
-            with patch.object(SAMPLING, "select_farthest_points", return_value=[0, 1, 2]) as select_points:
+            with patch.object(
+                SAMPLING, "select_farthest_points", return_value=[0, 1, 2]
+            ) as select_points:
                 indices, best_dist = SAMPLING.select_farthest_points_for_target(
                     descriptors,
                     structures,
@@ -102,11 +106,13 @@ class FPSTests(unittest.TestCase):
         self.assertEqual(result, (float("inf"), float("inf")))
 
     def test_cross_distance_returns_min_and_mean(self) -> None:
-        descriptors = np.array([
-            [0.0, 0.0],
-            [2.0, 0.0],
-            [3.0, 0.0],
-        ])
+        descriptors = np.array(
+            [
+                [0.0, 0.0],
+                [2.0, 0.0],
+                [3.0, 0.0],
+            ]
+        )
 
         min_dist, mean_dist = SAMPLING.calculate_cross_distance_stats(descriptors, [0], [1, 2])
 

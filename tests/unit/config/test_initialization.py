@@ -12,10 +12,10 @@ pytest.importorskip("pymatgen")
 from nepflow.cli_wizard import CONFIG_PROMPTS, ConfigPrompt, ConfigWizard
 from nepflow.config import load_config, render_default_config
 from nepflow.errors import ConfigurationError, StateError
-from nepflow.state import CURRENT_SCHEMA_VERSION, StateStore
 from nepflow.stages.generation.generators.materials_project import (
     build_materials_project_fetcher,
 )
+from nepflow.state import CURRENT_SCHEMA_VERSION, StateStore
 from nepflow.workflow import initialization as initialization_module
 from nepflow.workflow.initialization import ProjectCreationService
 from nepflow.workflow.stages import StageRunState, WorkflowStage
@@ -79,9 +79,7 @@ class InitConfigPromptTests(unittest.TestCase):
                     prompt_values={**values, "materialsproject_api_key": "mp-test-key"}
                 )
 
-            config_text = (project_dir / "config" / "project.config").read_text(
-                encoding="utf-8"
-            )
+            config_text = (project_dir / "config" / "project.config").read_text(encoding="utf-8")
             self.assertIn("api_key=\n", config_text)
             self.assertNotIn("mp-test-key", config_text)
             self.assertIn("elements=W,Cr,Y,Zr", config_text)
@@ -116,9 +114,7 @@ class InitConfigPromptTests(unittest.TestCase):
                     client=object(),
                 )
 
-            config_text = (project_dir / "config" / "project.config").read_text(
-                encoding="utf-8"
-            )
+            config_text = (project_dir / "config" / "project.config").read_text(encoding="utf-8")
             self.assertIn("api_key=\n", config_text)
             self.assertNotIn("environment-secret", config_text)
             self.assertEqual(fetcher.api_key, "environment-secret")
@@ -334,9 +330,7 @@ class InitConfigPromptTests(unittest.TestCase):
             service.run(prompt_values=values)
 
             with StateStore(project_dir / "state.db") as store:
-                store.connection.execute(
-                    "DELETE FROM stage_runs WHERE project_id = ?", ("demo",)
-                )
+                store.connection.execute("DELETE FROM stage_runs WHERE project_id = ?", ("demo",))
 
             with pytest.raises(StateError, match="no stage history"):
                 service.run()

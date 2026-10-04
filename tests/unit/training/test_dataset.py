@@ -19,8 +19,7 @@ from nepflow.stages.training.dataset import (
 class FakeStateStore:
     def __init__(self, results: list[VaspParseResult]) -> None:
         self.results = {
-            dict(result.calculation_identity)["calculation_id"]: result
-            for result in results
+            dict(result.calculation_identity)["calculation_id"]: result for result in results
         }
         self.datasets = []
         self.members = []

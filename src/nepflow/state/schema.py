@@ -7,7 +7,6 @@ metadata, and mutable operational status.
 
 from __future__ import annotations
 
-
 SCHEMA_VERSION = 1
 
 REQUIRED_TABLES = frozenset(

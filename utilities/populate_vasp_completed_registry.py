@@ -33,16 +33,16 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
-from nepflow.domain.identities import DftCalculationIdentity, calculate_structure_id
 from nepflow.dft.vasp.inputs import strip_resource_incar_params
 from nepflow.dft.vasp.outputs import outcar_is_complete
 from nepflow.dft.vasp.registry import (
-    VASP_REGISTRY_VERSION,
     read_completed_registry,
 )
+from nepflow.domain.identities import DftCalculationIdentity, calculate_structure_id
 from nepflow.errors import ArtifactError
 from nepflow.io.hashing import sha256_bytes, sha256_file
 from nepflow.io.json import write_json
+
 
 def hash_incar_file(incar_path: Path) -> str:
     return sha256_bytes(
@@ -98,7 +98,7 @@ def parse_poscar(poscar_path: Path) -> dict[str, Any]:
     coord_mode = lines[coord_line_idx].lower()
     coord_start = coord_line_idx + 1
     n_atoms = sum(counts)
-    coord_lines = lines[coord_start:coord_start + n_atoms]
+    coord_lines = lines[coord_start : coord_start + n_atoms]
     if len(coord_lines) != n_atoms:
         raise ValueError("atom coordinate count mismatch")
 
@@ -145,11 +145,7 @@ def _invert_3x3(matrix: list[list[float]]) -> list[list[float]]:
     a, b, c = matrix[0]
     d, e, f = matrix[1]
     g, h, i = matrix[2]
-    det = (
-        a * (e * i - f * h)
-        - b * (d * i - f * g)
-        + c * (d * h - e * g)
-    )
+    det = a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g)
     if abs(det) < 1e-15:
         raise ValueError("singular lattice")
     return [
@@ -177,21 +173,22 @@ def write_registry(registry_path: Path, registry: dict) -> None:
 
 def registry_contains(registry: dict, incar_hash: str, potcar_hash: str, structure_id: str) -> bool:
     return (
-        registry.get("jobs", {})
-        .get(incar_hash, {})
-        .get(potcar_hash, {})
-        .get(structure_id)
+        registry.get("jobs", {}).get(incar_hash, {}).get(potcar_hash, {}).get(structure_id)
         is not None
     )
 
 
-def upsert_registry(registry: dict, incar_hash: str, potcar_hash: str, structure_id: str, entry: dict) -> None:
+def upsert_registry(
+    registry: dict, incar_hash: str, potcar_hash: str, structure_id: str, entry: dict
+) -> None:
     jobs = registry.setdefault("jobs", {})
     jobs.setdefault(incar_hash, {}).setdefault(potcar_hash, {})[structure_id] = entry
 
 
 def parse_job_context(struct_dir: Path, projects_dir: Path) -> dict:
-    project_dir = next((parent for parent in struct_dir.parents if parent.parent == projects_dir), None)
+    project_dir = next(
+        (parent for parent in struct_dir.parents if parent.parent == projects_dir), None
+    )
     project_name = project_dir.name.removeprefix("project_") if project_dir else ""
     dataset = struct_dir.parent.name if struct_dir.parent.name != "jobs" else ""
     selected_index = None
@@ -215,7 +212,11 @@ def build_entry(
     potcar = struct_dir / "POTCAR"
     outcar = struct_dir / "OUTCAR"
 
-    missing = [name for name, path in (("POSCAR", poscar), ("INCAR", incar), ("POTCAR", potcar)) if not path.exists()]
+    missing = [
+        name
+        for name, path in (("POSCAR", poscar), ("INCAR", incar), ("POTCAR", potcar))
+        if not path.exists()
+    ]
     if missing:
         if verbose:
             print(f"SKIP {struct_dir}: missing {', '.join(missing)}")
@@ -315,8 +316,7 @@ def main() -> None:
     except ArtifactError as exc:
         sys.exit(f"Error: could not read {registry_path}: {exc}")
     struct_dirs = sorted(
-        path for path in projects_dir.glob("project_*/vasp/jobs/*/struct_*")
-        if path.is_dir()
+        path for path in projects_dir.glob("project_*/vasp/jobs/*/struct_*") if path.is_dir()
     )
 
     scanned = completed = added = already = identities = 0

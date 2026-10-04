@@ -12,13 +12,6 @@ pytest.importorskip("pymatgen")
 
 from ase import Atoms
 
-from nepflow.domain.calculations import DftResultArtifact
-from nepflow.domain.identities import (
-    ArtifactIdentity,
-    DftCalculationIdentity,
-    StructureIdentity,
-    calculate_structure_id,
-)
 from nepflow.dft.backend import DftInputArtifacts
 from nepflow.dft.vasp.inputs import (
     hash_incar_text,
@@ -26,9 +19,19 @@ from nepflow.dft.vasp.inputs import (
     inject_incar_defaults,
     read_identity,
 )
+from nepflow.domain.calculations import DftResultArtifact
+from nepflow.domain.identities import (
+    ArtifactIdentity,
+    DftCalculationIdentity,
+    StructureIdentity,
+    calculate_structure_id,
+)
 from nepflow.errors import StateError
-from nepflow.stages.dft import DftExecutionRecord, VaspPreparationOrchestrator
-from nepflow.stages.dft import calculation_identities_match
+from nepflow.stages.dft import (
+    DftExecutionRecord,
+    VaspPreparationOrchestrator,
+    calculation_identities_match,
+)
 from nepflow.state import StateStore
 
 
@@ -47,14 +50,10 @@ class DftStateReuseTests(unittest.TestCase):
         moved = self.silicon_atoms()
         moved.set_scaled_positions([[0.25, 0.0, 0.0]])
         larger_cell = self.silicon_atoms()
-        larger_cell.set_cell(
-            [[2.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
-        )
+        larger_cell.set_cell([[2.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
 
         self.assertNotEqual(calculate_structure_id(first), calculate_structure_id(moved))
-        self.assertNotEqual(
-            calculate_structure_id(first), calculate_structure_id(larger_cell)
-        )
+        self.assertNotEqual(calculate_structure_id(first), calculate_structure_id(larger_cell))
 
     def test_incar_hash_ignores_resource_params(self) -> None:
         original = "ENCUT = 520\nNCORE = 16\nKPAR = 1\nISMEAR = 0\n"
@@ -72,9 +71,7 @@ class DftStateReuseTests(unittest.TestCase):
         first_effective = inject_incar_defaults(template, first_config)
         second_effective = inject_incar_defaults(template, second_config)
 
-        self.assertNotEqual(
-            hash_incar_text(first_effective), hash_incar_text(second_effective)
-        )
+        self.assertNotEqual(hash_incar_text(first_effective), hash_incar_text(second_effective))
         self.assertNotEqual(hash_incar_text(template), hash_incar_text(first_effective))
 
     def test_execution_resources_do_not_change_scientific_identity(self) -> None:
@@ -163,9 +160,7 @@ class DftStateReuseTests(unittest.TestCase):
                     state_store,
                     calculation,
                 )
-                calculation_row = state_store.get_dft_calculation(
-                    calculation.calculation_id
-                )
+                calculation_row = state_store.get_dft_calculation(calculation.calculation_id)
                 artifacts = state_store.list_artifacts()
 
             self.assertIsNotNone(calculation_row)

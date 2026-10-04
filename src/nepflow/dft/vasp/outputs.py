@@ -88,9 +88,7 @@ def parse_stress_from_outcar(
             pass
 
     try:
-        outcar_text = outcar_path.read_text(
-            encoding="utf-8", errors="replace"
-        )
+        outcar_text = outcar_path.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return None
 
@@ -103,9 +101,7 @@ def _parse_text_stress(outcar_text: str) -> np.ndarray | None:
     matches = list(_STRESS_PATTERN.finditer(outcar_text))
     if matches:
         values = [float(matches[-1].group(index)) for index in range(1, 10)]
-        return stress_kbar_to_ev_per_angstrom3(
-            np.asarray(values, dtype=float).reshape(3, 3)
-        )
+        return stress_kbar_to_ev_per_angstrom3(np.asarray(values, dtype=float).reshape(3, 3))
 
     # Preserve the two alternate text layouts accepted by the elastic
     # analysis utility without making that utility another OUTCAR parser.
@@ -407,7 +403,10 @@ def parse_outcar_result(
 
     if calculation_identity is None:
         return _rejected_parse_result(
-            structure_id, identity_items, source_outcar, source_hash,
+            structure_id,
+            identity_items,
+            source_outcar,
+            source_hash,
             "missing_calculation_identity",
         )
     comparison_identity = _validated_identity(
@@ -419,21 +418,27 @@ def parse_outcar_result(
         source_identity = identity_reader(Path(outcar_path).parent)
         if not source_identity:
             return _rejected_parse_result(
-                structure_id, identity_items, source_outcar, source_hash,
+                structure_id,
+                identity_items,
+                source_outcar,
+                source_hash,
                 "missing_calculation_identity",
             )
-        if any(
-            source_identity.get(key) != value
-            for key, value in comparison_identity.items()
-        ):
+        if any(source_identity.get(key) != value for key, value in comparison_identity.items()):
             return _rejected_parse_result(
-                structure_id, identity_items, source_outcar, source_hash,
+                structure_id,
+                identity_items,
+                source_outcar,
+                source_hash,
                 "incompatible_calculation_identity",
             )
     else:
         if identity_evidence.outcar_path.resolve() != Path(outcar_path).resolve():
             return _rejected_parse_result(
-                structure_id, identity_items, source_outcar, source_hash,
+                structure_id,
+                identity_items,
+                source_outcar,
+                source_hash,
                 "incompatible_calculation_identity",
             )
         try:
@@ -443,12 +448,18 @@ def parse_outcar_result(
             )
         except StateError:
             return _rejected_parse_result(
-                structure_id, identity_items, source_outcar, source_hash,
+                structure_id,
+                identity_items,
+                source_outcar,
+                source_hash,
                 "incompatible_calculation_identity",
             )
         if evidence_identity != comparison_identity:
             return _rejected_parse_result(
-                structure_id, identity_items, source_outcar, source_hash,
+                structure_id,
+                identity_items,
+                source_outcar,
+                source_hash,
                 "incompatible_calculation_identity",
             )
 
@@ -456,7 +467,10 @@ def parse_outcar_result(
         atoms = reader(str(outcar_path))
     except Exception as exc:
         return _rejected_parse_result(
-            structure_id, identity_items, source_outcar, source_hash,
+            structure_id,
+            identity_items,
+            source_outcar,
+            source_hash,
             f"outcar_parse_failed:{type(exc).__name__}:{exc}",
         )
 
@@ -468,7 +482,11 @@ def parse_outcar_result(
     )
     if isinstance(parsed, str):
         return _rejected_parse_result(
-            structure_id, identity_items, source_outcar, source_hash, parsed,
+            structure_id,
+            identity_items,
+            source_outcar,
+            source_hash,
+            parsed,
         )
     energy, forces, virial, positions, lattice, actual_species, pbc = parsed
 
@@ -625,9 +643,7 @@ def parse_performance_evidence(outcar_text: str) -> VaspPerformanceEvidence:
             outcar_text,
         )
     )
-    kpoints_match = re.search(
-        r"Found\s+(\d+)\s+irreducible k-points", outcar_text
-    )
+    kpoints_match = re.search(r"Found\s+(\d+)\s+irreducible k-points", outcar_text)
     electrons_match = re.search(r"NELECT\s*=\s*([\d.]+)", outcar_text)
     return VaspPerformanceEvidence(
         total_ranks=int(ranks_match.group(1)) if ranks_match else 0,
@@ -693,27 +709,19 @@ def _read_memory_text(path: Path, artifact: str) -> str:
     try:
         return path.read_text(encoding="utf-8", errors="replace")
     except OSError as exc:
-        raise VaspMemoryParseError(
-            f"Could not read required {artifact} artifact: {path}"
-        ) from exc
+        raise VaspMemoryParseError(f"Could not read required {artifact} artifact: {path}") from exc
 
 
 def _parse_memory_atom_count(poscar: Path, text: str) -> int:
     poscar_lines = text.splitlines()
     if len(poscar_lines) <= 6:
-        raise VaspMemoryParseError(
-            f"POSCAR is missing its atom-count row: {poscar}"
-        )
+        raise VaspMemoryParseError(f"POSCAR is missing its atom-count row: {poscar}")
     try:
         atom_counts = [int(value) for value in poscar_lines[6].split()]
     except (TypeError, ValueError) as exc:
-        raise VaspMemoryParseError(
-            f"POSCAR atom-count row is malformed: {poscar}"
-        ) from exc
+        raise VaspMemoryParseError(f"POSCAR atom-count row is malformed: {poscar}") from exc
     if not atom_counts or any(value < 0 for value in atom_counts):
-        raise VaspMemoryParseError(
-            f"POSCAR atom-count row is malformed: {poscar}"
-        )
+        raise VaspMemoryParseError(f"POSCAR atom-count row is malformed: {poscar}")
     return sum(atom_counts)
 
 
@@ -724,9 +732,7 @@ def _parse_memory_parallelism(incar: Path, text: str) -> tuple[int, int]:
         key_match = re.match(r"\s*(NCORE|KPAR)\b", line, re.IGNORECASE)
         if not key_match:
             continue
-        match = re.match(
-            r"\s*(NCORE|KPAR)\s*=\s*([^#!]+)", line, re.IGNORECASE
-        )
+        match = re.match(r"\s*(NCORE|KPAR)\s*=\s*([^#!]+)", line, re.IGNORECASE)
         if not match:
             raise VaspMemoryParseError(
                 f"{key_match.group(1).upper()} assignment is malformed: {incar}"
@@ -739,9 +745,7 @@ def _parse_memory_parallelism(incar: Path, text: str) -> tuple[int, int]:
                 f"{key_match.group(1).upper()} value is malformed: {incar}"
             ) from exc
         if not np.isfinite(numeric_value) or not numeric_value.is_integer():
-            raise VaspMemoryParseError(
-                f"{key_match.group(1).upper()} value is malformed: {incar}"
-            )
+            raise VaspMemoryParseError(f"{key_match.group(1).upper()} value is malformed: {incar}")
         value = int(numeric_value)
         if key_match.group(1).upper() == "NCORE":
             ncore = value

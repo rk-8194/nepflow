@@ -7,7 +7,6 @@ from pathlib import Path
 
 from .models import NepflowConfig
 
-
 _CANONICAL_SECTIONS = frozenset(
     {
         "project",
@@ -148,9 +147,7 @@ def _generation_values(config: NepflowConfig) -> dict[str, str]:
         "volume_scale_max": str(generation.volume_scale_max),
         "n_volume_points": str(generation.n_volume_points),
         "elastic_stress_enabled": _bool_text(generation.elastic_stress_enabled),
-        "elastic_strain_amplitudes": ",".join(
-            map(str, generation.elastic_strain_amplitudes)
-        ),
+        "elastic_strain_amplitudes": ",".join(map(str, generation.elastic_strain_amplitudes)),
         "n_rattled": str(generation.n_rattled),
         "n_vacancies": str(generation.n_vacancies),
         "n_interstitials": str(generation.n_interstitials),
@@ -186,9 +183,7 @@ def _selection_values(config: NepflowConfig) -> dict[str, str]:
         "composition_aware_fps_frontier_fraction": str(
             selection.composition_aware_fps_frontier_fraction
         ),
-        "composition_aware_fps_ternary_weight": str(
-            selection.composition_aware_fps_ternary_weight
-        ),
+        "composition_aware_fps_ternary_weight": str(selection.composition_aware_fps_ternary_weight),
         "composition_aware_fps_adaptive_retries": str(
             selection.composition_aware_fps_adaptive_retries
         ),

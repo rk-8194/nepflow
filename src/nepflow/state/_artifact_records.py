@@ -72,8 +72,7 @@ class ArtifactRecordsMixin:
             )
         except sqlite3.IntegrityError as exc:
             raise StateError(
-                "Artifact content is already registered under another identity: "
-                f"{artifact.sha256}"
+                f"Artifact content is already registered under another identity: {artifact.sha256}"
             ) from exc
         row = self._connection.execute(
             "SELECT * FROM artifacts WHERE artifact_id = ?", (artifact.artifact_id,)

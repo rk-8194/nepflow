@@ -9,16 +9,21 @@ from nepflow.domain.datasets import DatasetIdentity, TrainingDatasetManifest
 from nepflow.domain.identities import ArtifactIdentity
 from nepflow.domain.models import ModelArtifactMetadata
 from nepflow.errors import StateError
-from nepflow.hpc.jobs import ReconciledJobResult, SchedulerJobState, SlurmJobRecord, SubmissionResult
+from nepflow.hpc.jobs import (
+    ReconciledJobResult,
+    SchedulerJobState,
+    SlurmJobRecord,
+    SubmissionResult,
+)
 from nepflow.mlip.backend import (
     CollectedModelArtifacts,
     TrainingCompletion,
     TrainingInput,
     TrainingProgress,
 )
-from nepflow.state.store import StateStore
 from nepflow.stages.training.campaign import TrainingAttempt, TrainingCampaign
 from nepflow.stages.training.optimisation import ControlledSweep
+from nepflow.state.store import StateStore
 
 
 class FakeScheduler:
@@ -129,7 +134,9 @@ def _input(tmp_path: Path, name: str) -> TrainingInput:
     )
 
 
-def _campaign(tmp_path: Path, store: StateStore, scheduler: FakeScheduler, backend: FakeBackend, **kwargs):
+def _campaign(
+    tmp_path: Path, store: StateStore, scheduler: FakeScheduler, backend: FakeBackend, **kwargs
+):
     store.upsert_dataset(_dataset().identity)
     return TrainingCampaign(
         campaign_id="campaign-1",
@@ -342,9 +349,7 @@ def test_campaign_persists_execution_policy_and_rejects_matrix_changes(
                 {
                     **specification,
                     "candidate_keys": ["candidate-b"],
-                    "candidate_matrix": [
-                        {"ordinal": 0, "candidate_key": "candidate-b"}
-                    ],
+                    "candidate_matrix": [{"ordinal": 0, "candidate_key": "candidate-b"}],
                 }
             )
 

@@ -9,10 +9,7 @@ from nepflow.errors import ConfigurationError
 
 from .models import NepflowConfig
 
-
-ALLOWED_CRYSTAL_STRUCTURES = frozenset(
-    {"bcc", "fcc", "hcp", "diamond", "simple_cubic"}
-)
+ALLOWED_CRYSTAL_STRUCTURES = frozenset({"bcc", "fcc", "hcp", "diamond", "simple_cubic"})
 # Atomic representations do not yet have a structure-level selection result
 # contract.  Reject the nominal mode instead of allowing it to fail later in
 # descriptor caching or FPS row-to-structure mapping.
@@ -97,16 +94,12 @@ def validate_config(
             f"Unsupported configuration schema_version={config.schema_version}; expected 1"
         )
     if config.project.config_version != config.schema_version:
-        raise ConfigurationError(
-            "project.config_version must match the root schema_version"
-        )
+        raise ConfigurationError("project.config_version must match the root schema_version")
 
     if require_scientific_fields and not config.composition.elements:
         raise ConfigurationError("Required configuration composition.elements is missing")
     if require_scientific_fields and not config.generation.crystal_structures:
-        raise ConfigurationError(
-            "Required configuration generation.crystal_structures is missing"
-        )
+        raise ConfigurationError("Required configuration generation.crystal_structures is missing")
 
     if config.composition.elements and not all(
         _is_element_symbol(element) for element in config.composition.elements
@@ -115,9 +108,7 @@ def validate_config(
     if config.composition.gas_elements and not all(
         _is_element_symbol(element) for element in config.composition.gas_elements
     ):
-        raise ConfigurationError(
-            "composition.gas_elements contains an invalid element symbol"
-        )
+        raise ConfigurationError("composition.gas_elements contains an invalid element symbol")
     if not 0.0 < config.composition.composition_step <= 1.0:
         raise ConfigurationError("composition.composition_step must be in (0, 1]")
     composition_steps = round(1.0 / config.composition.composition_step)
@@ -160,9 +151,7 @@ def validate_config(
         "liquid_steps_between_snapshots",
         "max_gas_occupancy",
     ):
-        _require_non_negative(
-            f"generation.{field_name}", getattr(config.generation, field_name)
-        )
+        _require_non_negative(f"generation.{field_name}", getattr(config.generation, field_name))
     for field_name in (
         "liquid_temperature",
         "liquid_timestep_fs",
@@ -201,9 +190,7 @@ def validate_config(
             "generation.elastic_strain_amplitudes must contain at least one value"
         )
     if not all(math.isfinite(value) for value in config.generation.elastic_strain_amplitudes):
-        raise ConfigurationError(
-            "generation.elastic_strain_amplitudes must contain finite values"
-        )
+        raise ConfigurationError("generation.elastic_strain_amplitudes must contain finite values")
 
     if config.selection.descriptor_type not in ALLOWED_DESCRIPTOR_TYPES:
         raise ConfigurationError(
@@ -219,7 +206,9 @@ def validate_config(
         "composition_aware_fps_adaptive_retries",
     ):
         _require_non_negative(
-            f"selection.{field_name}", getattr(config.selection, field_name), strictly_positive=field_name not in {"target_tolerance"}
+            f"selection.{field_name}",
+            getattr(config.selection, field_name),
+            strictly_positive=field_name not in {"target_tolerance"},
         )
     for field_name in (
         "test_pool_factor",
@@ -236,9 +225,7 @@ def validate_config(
 
     if config.vasp.kspacing <= 0.0 or not math.isfinite(config.vasp.kspacing):
         raise ConfigurationError("vasp.kspacing must be a positive finite float")
-    _require_non_negative(
-        "dft_recovery.max_retry_level", config.dft_recovery.max_retry_level
-    )
+    _require_non_negative("dft_recovery.max_retry_level", config.dft_recovery.max_retry_level)
     _validate_time("dft_recovery.vasp_walltime", config.dft_recovery.vasp_walltime)
 
     if config.train_nep.charge_mode not in (0, 1):
@@ -255,12 +242,8 @@ def validate_config(
     if config.train_nep.weights and len(config.train_nep.weights) != len(
         config.composition.elements + config.composition.gas_elements
     ):
-        raise ConfigurationError(
-            "train_nep.weights count must match the configured element count"
-        )
-    if not all(
-        math.isfinite(weight) and weight >= 0.0 for weight in config.train_nep.weights
-    ):
+        raise ConfigurationError("train_nep.weights count must match the configured element count")
+    if not all(math.isfinite(weight) and weight >= 0.0 for weight in config.train_nep.weights):
         raise ConfigurationError("train_nep.weights must be finite and non-negative")
     for field_name in (
         "outer_zbl",
@@ -277,7 +260,9 @@ def validate_config(
             raise ConfigurationError(f"train_nep.{field_name} must not be empty")
 
     for field_name in ("cores_per_node", "gpus_per_node", "max_nodes"):
-        _require_non_negative(f"hpc.{field_name}", getattr(config.hpc, field_name), strictly_positive=True)
+        _require_non_negative(
+            f"hpc.{field_name}", getattr(config.hpc, field_name), strictly_positive=True
+        )
     for field_name in (
         "max_concurrent",
         "poll_interval",
@@ -285,7 +270,9 @@ def validate_config(
         "gpumd_gpus",
         "memory_poll_interval",
     ):
-        _require_non_negative(f"slurm.{field_name}", getattr(config.slurm, field_name), strictly_positive=True)
+        _require_non_negative(
+            f"slurm.{field_name}", getattr(config.slurm, field_name), strictly_positive=True
+        )
     _validate_time("slurm.walltime", config.slurm.walltime)
     _validate_time("slurm.train_nep_walltime", config.slurm.train_nep_walltime)
     _validate_time("slurm.gpumd_walltime", config.slurm.gpumd_walltime)

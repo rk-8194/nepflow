@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
+import logging
 from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
-import logging
 from typing import Any
 
 from ase import Atoms
@@ -12,8 +12,7 @@ from ase.build import bulk
 from pymatgen.io.ase import AseAtomsAdaptor
 from pymatgen.symmetry.analyzer import SpacegroupAnalyzer
 
-
-logger = logging.getLogger("nepflow.generation.materials_project.conversion")
+logger = logging.getLogger(__name__)
 
 SPACE_GROUP_TO_STRUCTURE = {
     229: "bcc",

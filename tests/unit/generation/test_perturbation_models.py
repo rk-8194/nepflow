@@ -9,6 +9,7 @@ import pytest
 pytest.importorskip("ase")
 from ase import Atoms
 
+from nepflow.domain.identities import calculate_structure_id
 from nepflow.stages.generation.perturbations.models import (
     PerturbationCounts,
     PerturbationSettings,
@@ -18,7 +19,6 @@ from nepflow.stages.generation.perturbations.provenance import (
     annotate_generation_provenance,
 )
 from nepflow.stages.generation.supercell import build_target_supercell
-from nepflow.domain.identities import calculate_structure_id
 
 
 def test_worker_task_is_pickle_serializable_and_carries_exact_identity() -> None:

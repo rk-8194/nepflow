@@ -46,10 +46,7 @@ logger = logging.getLogger("nn_distance_stats")
 
 
 def _latest_potential(potentials_dir: Path) -> Path:
-    candidates = [
-        d for d in potentials_dir.iterdir()
-        if d.is_dir() and (d / "nep.txt").exists()
-    ]
+    candidates = [d for d in potentials_dir.iterdir() if d.is_dir() and (d / "nep.txt").exists()]
     if not candidates:
         raise FileNotFoundError(f"No completed potential folders found in {potentials_dir}")
     return max(candidates, key=lambda d: d.stat().st_mtime)
@@ -92,18 +89,29 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Compute nearest-neighbor distance statistics for a trained NEP potential."
     )
-    parser.add_argument("--project", type=Path, required=True,
-                        help="Path to the nepflow project directory")
-    parser.add_argument("--potential", default="latest",
-                        help='Potential folder inside nep/potentials/ or "latest" (default: latest)')
-    parser.add_argument("--structures", type=Path, default=None,
-                        help="XYZ file to analyze (default: structures/generated/generated_structures.xyz)")
-    parser.add_argument("--batch", type=int, default=500,
-                        help="Descriptor batch size (default: 500)")
-    parser.add_argument("--no-cache", action="store_true",
-                        help="Recompute descriptors even if a cache exists")
-    parser.add_argument("--atom", action="store_true",
-                        help="Use per-atom descriptors instead of per-structure mean")
+    parser.add_argument(
+        "--project", type=Path, required=True, help="Path to the nepflow project directory"
+    )
+    parser.add_argument(
+        "--potential",
+        default="latest",
+        help='Potential folder inside nep/potentials/ or "latest" (default: latest)',
+    )
+    parser.add_argument(
+        "--structures",
+        type=Path,
+        default=None,
+        help="XYZ file to analyze (default: structures/generated/generated_structures.xyz)",
+    )
+    parser.add_argument(
+        "--batch", type=int, default=500, help="Descriptor batch size (default: 500)"
+    )
+    parser.add_argument(
+        "--no-cache", action="store_true", help="Recompute descriptors even if a cache exists"
+    )
+    parser.add_argument(
+        "--atom", action="store_true", help="Use per-atom descriptors instead of per-structure mean"
+    )
     args = parser.parse_args()
 
     project_dir = args.project

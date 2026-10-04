@@ -5,7 +5,6 @@ import pytest
 from nepflow.config import find_config_path, load_config, load_legacy_config
 from nepflow.errors import ConfigurationError
 
-
 BASE_CONFIG = """
 [project]
 name = demo
@@ -52,7 +51,10 @@ def test_config_path_resolution_is_canonical_and_deterministic(tmp_path: Path) -
     canonical.parent.mkdir(parents=True)
     canonical.write_text(BASE_CONFIG, encoding="utf-8")
 
-    assert find_config_path(project_dir, explicit_path=project_dir / "config" / "demo.ini") == canonical
+    assert (
+        find_config_path(project_dir, explicit_path=project_dir / "config" / "demo.ini")
+        == canonical
+    )
 
     canonical.unlink()
     legacy = project_dir / "config" / "demo.ini"
@@ -70,18 +72,14 @@ def test_config_path_resolution_is_canonical_and_deterministic(tmp_path: Path) -
         ("elastic_strain_amplitudes", "not-a-list"),
     ],
 )
-def test_loader_rejects_bad_types(
-    tmp_path: Path, key: str, value: str
-) -> None:
+def test_loader_rejects_bad_types(tmp_path: Path, key: str, value: str) -> None:
     defaults = {
         "random_seed": "7",
         "composition_step": "0.125",
         "use_liquid": "false",
         "elastic_strain_amplitudes": "-0.02, -0.01, 0.01, 0.02",
     }
-    text = BASE_CONFIG.replace(
-        f"{key} = {defaults[key]}", f"{key} = {value}"
-    )
+    text = BASE_CONFIG.replace(f"{key} = {defaults[key]}", f"{key} = {value}")
 
     with pytest.raises(ConfigurationError):
         load_config(write_config(tmp_path, text))
@@ -112,9 +110,7 @@ def test_loader_rejects_unsupported_atomic_descriptor_mode(tmp_path: Path) -> No
         (BASE_CONFIG.replace("vasp_command = vasp_std", ""), "hpc.vasp_command"),
     ],
 )
-def test_loader_rejects_missing_required_fields(
-    tmp_path: Path, text: str, message: str
-) -> None:
+def test_loader_rejects_missing_required_fields(tmp_path: Path, text: str, message: str) -> None:
     with pytest.raises(ConfigurationError, match=message):
         load_config(write_config(tmp_path, text))
 
@@ -138,9 +134,7 @@ def test_loader_rejects_unknown_keys_and_legacy_project_dir(tmp_path: Path) -> N
 
 
 def test_loader_rejects_conflicting_canonical_and_legacy_aliases(tmp_path: Path) -> None:
-    conflicting = BASE_CONFIG.replace(
-        "gas_elements = He", "gas_elements = He\ngasElements = Ne"
-    )
+    conflicting = BASE_CONFIG.replace("gas_elements = He", "gas_elements = He\ngasElements = Ne")
 
     with pytest.raises(ConfigurationError, match="canonical and legacy"):
         load_config(write_config(tmp_path, conflicting))

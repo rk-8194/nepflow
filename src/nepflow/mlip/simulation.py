@@ -49,9 +49,7 @@ class StaticPredictionRequest:
         if self.atom_count < 1:
             raise ValidationError("static prediction atom_count must be positive")
         if self.model.artifact is None:
-            raise ValidationError(
-                "static prediction requires a model run with a model artifact"
-            )
+            raise ValidationError("static prediction requires a model run with a model artifact")
         expected_fields = (
             self.expected_species,
             self.expected_positions_angstrom,
@@ -105,31 +103,22 @@ class StaticPredictionRequest:
             expected_positions = np.asarray(self.expected_positions_angstrom, dtype=float)
             if expected_positions.shape != (self.atom_count, 3):
                 raise ValidationError(
-                    "static prediction expected positions must have shape "
-                    f"({self.atom_count}, 3)"
+                    f"static prediction expected positions must have shape ({self.atom_count}, 3)"
                 )
             if not np.isfinite(expected_positions).all():
-                raise ValidationError(
-                    "static prediction expected positions are not finite"
-                )
+                raise ValidationError("static prediction expected positions are not finite")
             object.__setattr__(
                 self, "expected_positions_angstrom", np.array(expected_positions, copy=True)
             )
         if self.expected_cell_angstrom is not None:
             expected_cell = np.asarray(self.expected_cell_angstrom, dtype=float)
             if expected_cell.shape != (3, 3) or not np.isfinite(expected_cell).all():
-                raise ValidationError(
-                    "static prediction expected cell must be a finite 3x3 matrix"
-                )
-            object.__setattr__(
-                self, "expected_cell_angstrom", np.array(expected_cell, copy=True)
-            )
+                raise ValidationError("static prediction expected cell must be a finite 3x3 matrix")
+            object.__setattr__(self, "expected_cell_angstrom", np.array(expected_cell, copy=True))
         if self.expected_pbc is not None:
             expected_pbc = tuple(bool(value) for value in self.expected_pbc)
             if len(expected_pbc) != 3:
-                raise ValidationError(
-                    "static prediction expected pbc must have three flags"
-                )
+                raise ValidationError("static prediction expected pbc must have three flags")
             object.__setattr__(self, "expected_pbc", expected_pbc)  # type: ignore[assignment]
         if self.atom_mapping is not None:
             mapping = tuple(int(value) for value in self.atom_mapping)
@@ -214,13 +203,10 @@ class StaticPrediction:
             virial = np.asarray(self.virial_ev, dtype=float)
             if virial.shape != (3, 3):
                 raise ValidationError(
-                    "static prediction virial must have shape (3, 3), "
-                    f"got {virial.shape}"
+                    f"static prediction virial must have shape (3, 3), got {virial.shape}"
                 )
             if not np.isfinite(virial).all():
-                raise ValidationError(
-                    "static prediction virial contains non-finite values"
-                )
+                raise ValidationError("static prediction virial contains non-finite values")
             virial = np.array(virial, copy=True)
             virial.setflags(write=False)
             object.__setattr__(self, "virial_ev", virial)
@@ -228,9 +214,7 @@ class StaticPrediction:
         if self.species is not None:
             species = tuple(str(value) for value in self.species)
             if len(species) != self.atom_count:
-                raise ValidationError(
-                    "static prediction species count does not match atom_count"
-                )
+                raise ValidationError("static prediction species count does not match atom_count")
             object.__setattr__(self, "species", species)
         if self.positions_angstrom is not None:
             positions = np.asarray(self.positions_angstrom, dtype=float)
@@ -247,9 +231,7 @@ class StaticPrediction:
         if self.cell_angstrom is not None:
             cell = np.asarray(self.cell_angstrom, dtype=float)
             if cell.shape != (3, 3) or not np.isfinite(cell).all():
-                raise ValidationError(
-                    "static prediction cell must be a finite 3x3 matrix"
-                )
+                raise ValidationError("static prediction cell must be a finite 3x3 matrix")
             cell = np.array(cell, copy=True)
             cell.setflags(write=False)
             object.__setattr__(self, "cell_angstrom", cell)

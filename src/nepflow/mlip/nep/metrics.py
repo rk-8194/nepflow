@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 import math
 import re
+from pathlib import Path
 
 from nepflow.errors import MlipError
 from nepflow.mlip.backend import TrainingProgress

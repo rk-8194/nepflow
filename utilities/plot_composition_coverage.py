@@ -30,10 +30,8 @@ from typing import Iterable
 
 from nepflow.stages.selection.sampling import (
     SQRT3_OVER_2,
-    BinaryProjection,
     CoverageSummary,
     StructureComposition,
-    TernaryProjection,
     barycentric_to_cartesian,
     collect_binary_projections,
     collect_ternary_projections,
@@ -62,11 +60,9 @@ def _write_composition_summary(
     compositions: list[StructureComposition],
     output_path: Path,
 ) -> None:
-    all_elements = sorted({
-        element
-        for composition in compositions
-        for element in composition.unique_elements
-    })
+    all_elements = sorted(
+        {element for composition in compositions for element in composition.unique_elements}
+    )
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with output_path.open("w", newline="", encoding="utf-8") as handle:
@@ -93,7 +89,9 @@ def _write_composition_summary(
             }
             for element in all_elements:
                 row[f"count_{element}"] = composition.element_counts.get(element, 0)
-                row[f"fraction_{element}"] = f"{composition.element_fractions.get(element, 0.0):.12f}"
+                row[f"fraction_{element}"] = (
+                    f"{composition.element_fractions.get(element, 0.0):.12f}"
+                )
             writer.writerow(row)
 
 
@@ -120,12 +118,12 @@ def _write_summary_csv(
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
         for summary in summaries:
-            writer.writerow({
-                key: (
-                    f"{value:.12f}" if isinstance(value, float) else value
-                )
-                for key, value in asdict(summary).items()
-            })
+            writer.writerow(
+                {
+                    key: (f"{value:.12f}" if isinstance(value, float) else value)
+                    for key, value in asdict(summary).items()
+                }
+            )
 
 
 def _write_summary_json(

@@ -18,7 +18,9 @@ class StructureStub:
 def _atoms(symbols: str, x: float = 0.0) -> Atoms:
     atoms = Atoms(
         symbols,
-        positions=np.array([[x + index, 0.0, 0.0] for index in range(len(Atoms(symbols)))], dtype=float),
+        positions=np.array(
+            [[x + index, 0.0, 0.0] for index in range(len(Atoms(symbols)))], dtype=float
+        ),
         cell=np.eye(3) * 5.0,
         pbc=True,
     )
@@ -123,7 +125,9 @@ def test_test_selection_returns_cross_distance_metrics(monkeypatch):
 
 def test_distance_helpers_are_owned_by_sampling():
     representations = np.array([[0.0], [1.0], [3.0]])
-    assert sampling.calculate_mean_nearest_distance(representations, [0, 1, 2]) == pytest.approx(4.0 / 3.0)
-    assert sampling.calculate_positive_min_distance(
-        np.array([[0.0], [0.0], [2.0]]), [0, 1, 2]
-    ) == 2.0
+    assert sampling.calculate_mean_nearest_distance(representations, [0, 1, 2]) == pytest.approx(
+        4.0 / 3.0
+    )
+    assert (
+        sampling.calculate_positive_min_distance(np.array([[0.0], [0.0], [2.0]]), [0, 1, 2]) == 2.0
+    )

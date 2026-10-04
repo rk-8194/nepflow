@@ -21,6 +21,8 @@ from nepflow.mlip.gpumd.resubmission import (
 )
 from nepflow.workflow.resubmission import (
     resolve_resubmit_command as canonical_resolve_resubmit_command,
+)
+from nepflow.workflow.resubmission import (
     submit_resubmission,
 )
 
@@ -55,7 +57,7 @@ def parse_args() -> argparse.Namespace:
         required=True,
         help=(
             "Shell command used to run one GPUMD segment, for example "
-            "\"mpirun -np 1 --bind-to none $HOME/src/GPUMD/src/gpumd < run.in > gpumd.log 2>&1\"."
+            '"mpirun -np 1 --bind-to none $HOME/src/GPUMD/src/gpumd < run.in > gpumd.log 2>&1".'
         ),
     )
     parser.add_argument(

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 
 from nepflow.cli_wizard import CONFIG_PROMPTS, ConfigWizard
 from nepflow.errors import ValidationError
@@ -80,18 +81,14 @@ def _build_materials_project_generator(context: StageContext) -> tuple[str, obje
     config = context.config
     assert config is not None
     try:
-        fetcher = build_materials_project_fetcher(
-            api_key=config.materials_project.api_key
-        )
+        fetcher = build_materials_project_fetcher(api_key=config.materials_project.api_key)
         generator = MaterialsProjectGenerator(
             fetcher,
             max_per_composition=5,
             gas_elements=list(config.composition.gas_elements),
         )
     except Exception as exc:
-        raise RuntimeError(
-            "Cannot initialise the enabled Materials Project generator"
-        ) from exc
+        raise RuntimeError("Cannot initialise the enabled Materials Project generator") from exc
     return "MaterialsProject", generator
 
 
@@ -172,6 +169,7 @@ def offer_project_upload(
     context: StageContext,
     *,
     process_runner: ProcessRunner,
+    confirm: Callable[[str], str],
 ) -> None:
     """Offer the local seeds-only result to the configured remote project."""
 
@@ -179,7 +177,7 @@ def offer_project_upload(
     scp_address = "" if config is None else config.hpc.scp_address
     if not scp_address:
         return
-    answer = input("Upload project to remote NEPFlow folder? [y/N]: ").strip().lower()
+    answer = confirm("Upload project to remote NEPFlow folder? [y/N]: ").strip().lower()
     if answer not in {"y", "yes"}:
         return
     process_runner.run(
@@ -197,14 +195,18 @@ def offer_project_upload(
 def compose_stage_registry(
     *,
     logger: logging.Logger,
-    process_runner: ProcessRunner,
     scheduler: SlurmScheduler,
+    offer_upload: Callable[[StageContext], None] | None = None,
 ) -> StageRegistry:
     """Compose workflow stages behind the application composition boundary."""
 
     registry = StageRegistry()
     _register_initialization(registry)
-    _register_generation(registry, logger=logger, process_runner=process_runner)
+    _register_generation(
+        registry,
+        logger=logger,
+        offer_upload=offer_upload,
+    )
     _register_selection(registry)
     _register_scheduler_stages(registry, scheduler=scheduler)
     return registry
@@ -234,12 +236,12 @@ def _register_generation(
     registry: StageRegistry,
     *,
     logger: logging.Logger,
-    process_runner: ProcessRunner,
+    offer_upload: Callable[[StageContext], None] | None,
 ) -> None:
     def run_generation(context: StageContext) -> StageRunResult:
         result = build_generation_stage(context, logger=logger).run(context)
-        if context.seeds_only and result.base_structures:
-            offer_project_upload(context, process_runner=process_runner)
+        if context.seeds_only and result.base_structures and offer_upload is not None:
+            offer_upload(context)
         return StageRunResult(
             stage=WorkflowStage.GENERATE,
             status=StageRunState.COMPLETED,
@@ -273,9 +275,7 @@ def _register_scheduler_stages(
         return DftStage(scheduler=scheduler).run(context).as_workflow_result()
 
     def run_validation(context: StageContext) -> StageRunResult:
-        return ValidationStage(
-            context=context, scheduler=scheduler
-        ).run().as_workflow_result()
+        return ValidationStage(context=context, scheduler=scheduler).run().as_workflow_result()
 
     registry.register(WorkflowStage.RUN_VASP, run_dft)
     registry.register(

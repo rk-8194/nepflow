@@ -7,8 +7,7 @@ from pathlib import Path
 
 from ase.io import write as ase_write
 
-
-logger = logging.getLogger("nepflow.selection.artifacts")
+logger = logging.getLogger(__name__)
 
 
 def write_selected_structures(

@@ -6,7 +6,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from nepflow.dft.backend import DftCompletionEvidence, DftFailure, DftInputArtifacts, DftInputRequest
+from nepflow.dft.backend import (
+    DftCompletionEvidence,
+    DftFailure,
+    DftInputArtifacts,
+    DftInputRequest,
+)
 from nepflow.dft.vasp.benchmarking import (
     BenchmarkOutcome,
     VaspBenchmarkProvenance,
@@ -19,7 +24,13 @@ from nepflow.dft.vasp.benchmarking import (
 )
 from nepflow.dft.vasp.inputs import hash_incar_text, set_incar_parameters
 from nepflow.domain.identities import DftCalculationIdentity, StructureIdentity
-from nepflow.hpc.jobs import QueueQueryResult, ReconciledJobResult, SchedulerJobState, SlurmJobRecord, SubmissionResult
+from nepflow.hpc.jobs import (
+    QueueQueryResult,
+    ReconciledJobResult,
+    SchedulerJobState,
+    SlurmJobRecord,
+    SubmissionResult,
+)
 from nepflow.stages.dft.reports import summarize_benchmark_results
 
 
@@ -52,7 +63,9 @@ def test_plan_and_resource_grid_are_deterministic(tmp_path: Path) -> None:
     )
 
     assert first.benchmark_id == second.benchmark_id
-    assert [case.benchmark_id for case in first.cases] == [case.benchmark_id for case in second.cases]
+    assert [case.benchmark_id for case in first.cases] == [
+        case.benchmark_id for case in second.cases
+    ]
     assert all(
         case.resource.resources.total_gpus
         == case.resource.resources.nodes * case.resource.resources.gpus_per_node
@@ -117,7 +130,9 @@ class FakeStateStore:
         return None
 
     def list_dft_attempts(self, calculation_id: str) -> list[dict[str, Any]]:
-        return [value for value in self.attempts.values() if value["calculation_id"] == calculation_id]
+        return [
+            value for value in self.attempts.values() if value["calculation_id"] == calculation_id
+        ]
 
     def save_execution(self, record, *, artifact=None, reason=None) -> None:
         del artifact, reason
@@ -130,13 +145,15 @@ class FakeStateStore:
         }
 
     def append_event(self, event_id, entity_type, entity_id, event_type, payload, **_kwargs):
-        self.events.append({
-            "event_id": event_id,
-            "entity_type": entity_type,
-            "entity_id": entity_id,
-            "event_type": event_type,
-            "payload": payload,
-        })
+        self.events.append(
+            {
+                "event_id": event_id,
+                "entity_type": entity_type,
+                "entity_id": entity_id,
+                "event_type": event_type,
+                "payload": payload,
+            }
+        )
 
     def list_events(self, *, entity_type=None, entity_id=None):
         return [
@@ -182,7 +199,9 @@ class FakeScheduler:
 
     def submit_script(self, script_path, **_kwargs):
         self.submissions.append(Path(script_path))
-        return SubmissionResult(f"job-{len(self.submissions)}", "", "", ("sbatch", str(script_path)))
+        return SubmissionResult(
+            f"job-{len(self.submissions)}", "", "", ("sbatch", str(script_path))
+        )
 
     def reconcile(self, job_id: str, **_kwargs) -> ReconciledJobResult:
         return ReconciledJobResult(

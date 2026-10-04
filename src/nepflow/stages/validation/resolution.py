@@ -178,9 +178,7 @@ def _resolve_with_store(
 
     execution = model_row.get("execution_metadata", {})
     dataset_path_value = (
-        execution.get("dataset_path")
-        if isinstance(execution, Mapping)
-        else None
+        execution.get("dataset_path") if isinstance(execution, Mapping) else None
     ) or model_manifest.get("dataset_path")
     if not isinstance(dataset_path_value, str) or not dataset_path_value.strip():
         raise StateError("Authoritative model run has no dataset path")
@@ -188,9 +186,7 @@ def _resolve_with_store(
     canonical_dataset_dir = (project_dir / "nep" / "datasets").resolve()
     try:
         if dataset_path.parent != canonical_dataset_dir:
-            raise StateError(
-                f"Authoritative dataset is outside canonical storage: {dataset_path}"
-            )
+            raise StateError(f"Authoritative dataset is outside canonical storage: {dataset_path}")
     except OSError as exc:
         raise StateError(f"Could not resolve authoritative dataset path: {dataset_path}") from exc
     metadata_path = dataset_path / ".dataset"
@@ -214,9 +210,7 @@ def _resolve_with_store(
     model_path = Path(model_path_value).resolve()
     canonical_model_dir = (project_dir / "nep" / "potentials").resolve()
     if model_path.parent.parent != canonical_model_dir:
-        raise StateError(
-            f"Authoritative model artifact is outside canonical storage: {model_path}"
-        )
+        raise StateError(f"Authoritative model artifact is outside canonical storage: {model_path}")
     if not model_path.is_file():
         raise FileNotFoundError(f"Authoritative model artifact is missing: {model_path}")
     if sha256_file(model_path) != artifact_row.get("sha256"):
@@ -257,9 +251,7 @@ def resolve_model_dataset(
         return _resolve_with_store(project_dir, model_run_id, state_store, dataset_id=dataset_id)
     state_path = project_dir / "state.db"
     if not state_path.is_file():
-        raise StateError(
-            f"Authoritative StateStore is required for validation: {state_path}"
-        )
+        raise StateError(f"Authoritative StateStore is required for validation: {state_path}")
     with StateStore(state_path) as store:
         return _resolve_with_store(project_dir, model_run_id, store, dataset_id=dataset_id)
 

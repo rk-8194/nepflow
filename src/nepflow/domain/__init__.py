@@ -1,14 +1,14 @@
 """Domain records and scientific identities for NEPFlow."""
+
 from .calculations import DftExecutionResources, DftResultArtifact
 from .datasets import DatasetIdentity, SelectedDatasetMember, TrainingDatasetManifest
-
 from .identities import (
+    VALIDATION_RUN_IDENTITY_SCHEMA,
     ArtifactIdentity,
     DescriptorCacheIdentity,
     DftCalculationIdentity,
     ModelRunIdentity,
     StructureIdentity,
-    VALIDATION_RUN_IDENTITY_SCHEMA,
     ValidationRunIdentity,
     annotate_structure_id,
     annotate_structure_ids,

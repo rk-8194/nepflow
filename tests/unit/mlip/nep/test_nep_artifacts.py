@@ -45,13 +45,9 @@ def test_filesystem_manifest_cannot_override_state_identity(tmp_path: Path) -> N
             hyperparameters_hash="hyperparameters-authoritative",
             state_store=store,
         )
-        filesystem_manifest = json.loads(
-            (potential_path / "model_run_manifest.json").read_text()
-        )
+        filesystem_manifest = json.loads((potential_path / "model_run_manifest.json").read_text())
         filesystem_manifest["dataset_id"] = "dataset-filesystem-only"
-        (potential_path / "model_run_manifest.json").write_text(
-            json.dumps(filesystem_manifest)
-        )
+        (potential_path / "model_run_manifest.json").write_text(json.dumps(filesystem_manifest))
 
         with pytest.raises(NepArtifactError, match="conflicts with StateStore"):
             validate_model_run_manifest(
@@ -103,5 +99,3 @@ def test_completed_model_artifact_is_linked_to_authoritative_run(tmp_path: Path)
             expected_model_run_id=manifest["model_run_id"],
             state_store=store,
         )
-
-

@@ -9,14 +9,14 @@ the result in the dataset manifest.
 
 from __future__ import annotations
 
+import logging
+import os
+import shutil
+import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-import logging
-import os
 from pathlib import Path
-import shutil
-import tempfile
 from typing import Any, Iterable, Mapping, Sequence
 
 import numpy as np
@@ -37,15 +37,14 @@ from nepflow.domain.units import (
     ENERGY_UNIT_EV,
     FORCE_UNIT_EV_PER_ANGSTROM,
     VIRIAL_CONVENTION_POSITIVE_COMPRESSION,
-    VIRIAL_UNIT_EV,
     VIRIAL_TENSOR_CONVENTION_CARTESIAN_3X3,
+    VIRIAL_UNIT_EV,
 )
 from nepflow.errors import StateError
-from nepflow.io.json import read_json_object, to_jsonable, write_json
 from nepflow.io.hashing import sha256_file
+from nepflow.io.json import read_json_object, to_jsonable, write_json
 
-
-logger = logging.getLogger("nepflow.training.dataset")
+logger = logging.getLogger(__name__)
 
 
 class DatasetSplit(str, Enum):
@@ -103,9 +102,7 @@ class DatasetBuildReport:
 
     def record_rejection(self, reason: str, *, member_index: int | None = None) -> None:
         reason = str(reason)
-        self.rejected_reason_counts[reason] = (
-            self.rejected_reason_counts.get(reason, 0) + 1
-        )
+        self.rejected_reason_counts[reason] = self.rejected_reason_counts.get(reason, 0) + 1
         if member_index is not None and member_index < len(self.requested_members):
             member = self.requested_members[member_index]
             member["status"] = "rejected"
@@ -342,9 +339,7 @@ def _build_report_metadata(
         "schema_version": "nepflow.dataset.v1",
         "label_schema": label_schema,
         "units": units,
-        "virial_convention": (
-            VIRIAL_CONVENTION_POSITIVE_COMPRESSION if train_virial else None
-        ),
+        "virial_convention": (VIRIAL_CONVENTION_POSITIVE_COMPRESSION if train_virial else None),
         "virial_tensor_convention": (
             VIRIAL_TENSOR_CONVENTION_CARTESIAN_3X3 if train_virial else None
         ),
@@ -405,9 +400,7 @@ def _collect_report_metadata_records(
         report = reports[split]
         requested_members.extend(report.requested_members)
         for result in report.accepted_results:
-            canonical_records.append(
-                _canonical_record(split, result, include_virial=train_virial)
-            )
+            canonical_records.append(_canonical_record(split, result, include_virial=train_virial))
             accepted_identities.append(
                 {
                     "split": split.value,
@@ -524,9 +517,7 @@ def _publish_dataset_artifacts(
     dataset_path = Path(dataset_path)
     dataset_path.parent.mkdir(parents=True, exist_ok=True)
     target_was_empty = dataset_path.exists()
-    if target_was_empty and (
-        not dataset_path.is_dir() or any(dataset_path.iterdir())
-    ):
+    if target_was_empty and (not dataset_path.is_dir() or any(dataset_path.iterdir())):
         raise FileExistsError(
             f"Dataset publication target is not an empty directory: {dataset_path}"
         )
@@ -618,9 +609,7 @@ def _require_state_authority(state_store: Any, result: VaspParseResult) -> None:
     get_calculation = getattr(state_store, "get_dft_calculation", None)
     list_artifacts = getattr(state_store, "list_artifacts", None)
     if not callable(get_calculation) or not callable(list_artifacts):
-        raise TypeError(
-            "authoritative dataset building requires StateStore DFT result APIs"
-        )
+        raise TypeError("authoritative dataset building requires StateStore DFT result APIs")
     calculation = get_calculation(calculation_id)
     if not isinstance(calculation, Mapping):
         raise ValueError("state_dft_calculation_missing")
@@ -634,9 +623,7 @@ def _require_state_authority(state_store: Any, result: VaspParseResult) -> None:
             raise ValueError("state_dft_identity_mismatch")
         if persisted_identity.get("structure_id") != result.structure_id:
             raise ValueError("state_dft_structure_identity_mismatch")
-    artifacts = list_artifacts(
-        originating_attempt_id=str(calculation["accepted_attempt_id"])
-    )
+    artifacts = list_artifacts(originating_attempt_id=str(calculation["accepted_attempt_id"]))
     if not any(
         artifact.get("artifact_type") == "vasp_outcar"
         and artifact.get("sha256") == result.source_outcar_hash
@@ -749,9 +736,7 @@ def prepare_training_dataset(
     """
 
     if state_store is None:
-        raise ValueError(
-            "state_store is required for the authoritative training dataset path"
-        )
+        raise ValueError("state_store is required for the authoritative training dataset path")
 
     normalized = _normalize_split_records(split_records)
 
@@ -862,7 +847,10 @@ def _validate_dataset_reports(
             "Dataset creation rejected selected structures; "
             "set train_nep.allow_partial_dataset=true to allow explicit partial data"
         )
-    if not reports[DatasetSplit.TRAIN].accepted_count or not reports[DatasetSplit.TEST].accepted_count:
+    if (
+        not reports[DatasetSplit.TRAIN].accepted_count
+        or not reports[DatasetSplit.TEST].accepted_count
+    ):
         raise RuntimeError("No valid structures found; cannot create a training dataset")
 
 
@@ -953,8 +941,7 @@ def _resolve_selected_split(
                 calculation
                 for calculation in candidates
                 if calculation.get("calculation_id") == requested_calculation_id
-                or calculation.get("identity", {}).get("calculation_id")
-                == requested_calculation_id
+                or calculation.get("identity", {}).get("calculation_id") == requested_calculation_id
             ]
         if len(candidates) != 1:
             raise RuntimeError(
@@ -984,18 +971,12 @@ def _resolve_selected_calculation(
     if not isinstance(attempt_id, str) or not attempt_id.strip():
         raise RuntimeError(f"StateStore has no accepted attempt for {calculation_id}")
     artifacts = state_store.list_artifacts(originating_attempt_id=attempt_id)
-    outcars = [
-        artifact
-        for artifact in artifacts
-        if artifact.get("artifact_type") == "vasp_outcar"
-    ]
+    outcars = [artifact for artifact in artifacts if artifact.get("artifact_type") == "vasp_outcar"]
     if len(outcars) != 1:
         raise RuntimeError(f"StateStore has no unique accepted OUTCAR for {calculation_id}")
     outcar_path = Path(str(outcars[0].get("path", "")))
     if not outcar_path.is_file() or sha256_file(outcar_path) != outcars[0].get("sha256"):
-        raise RuntimeError(
-            f"Accepted OUTCAR artifact is missing or changed for {calculation_id}"
-        )
+        raise RuntimeError(f"Accepted OUTCAR artifact is missing or changed for {calculation_id}")
     evidence = ResolvedVaspOutput(
         outcar_path=outcar_path,
         calculation_identity=tuple(
@@ -1106,8 +1087,7 @@ def write_nep_dataset(
     """Write the exact extxyz schema consumed by GPUMD NEP training."""
 
     rendered = [
-        _render_nep_structure(structure, include_virial=include_virial)
-        for structure in structures
+        _render_nep_structure(structure, include_virial=include_virial) for structure in structures
     ]
 
     from nepflow.io.atomic import atomic_write_text
@@ -1144,8 +1124,8 @@ def _render_nep_structure(
     pbc_text = " ".join("T" if flag else "F" for flag in pbc)
     lattice_text = " ".join(f"{value:.10f}" for value in lattice.flat)
     header = (
-        f"energy={energy:.10f} pbc=\"{pbc_text}\" "
-        f"Lattice=\"{lattice_text}\" "
+        f'energy={energy:.10f} pbc="{pbc_text}" '
+        f'Lattice="{lattice_text}" '
         "Properties=species:S:1:pos:R:3:force:R:3"
     )
     if virial_array is not None:

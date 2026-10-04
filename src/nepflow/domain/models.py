@@ -121,4 +121,3 @@ class ValidationRunRecord:
         if self.metadata is not None:
             result["metadata"] = to_jsonable(self.metadata)
         return result
-

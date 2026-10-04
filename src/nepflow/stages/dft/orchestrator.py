@@ -7,11 +7,11 @@ StateStore-backed attempts through scheduler and backend evidence.
 
 from __future__ import annotations
 
+import logging
+import shlex
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-import logging
 from pathlib import Path
-import shlex
 from typing import Protocol
 
 from ase.io import iread
@@ -43,7 +43,6 @@ from nepflow.domain.identities import (
 from nepflow.errors import StateError
 from nepflow.io.hashing import sha256_file
 from nepflow.state import StateStore
-
 
 logger = logging.getLogger(__name__)
 
@@ -143,9 +142,7 @@ def calculation_identities_match(
 ) -> bool:
     """Compare the complete scientific identity, including calculation ID."""
     expected_payload = (
-        expected.to_dict()
-        if isinstance(expected, DftCalculationIdentity)
-        else dict(expected)
+        expected.to_dict() if isinstance(expected, DftCalculationIdentity) else dict(expected)
     )
     expected_payload = normalise_dft_calculation_identity(expected_payload)
     observed_payload = normalise_dft_calculation_identity(observed)
@@ -217,8 +214,7 @@ class VaspPreparationOrchestrator:
             source_path = selected_dir / f"{dataset}.xyz"
             if not source_path.is_file():
                 raise FileNotFoundError(
-                    f"Selected structures not found at {source_path}\n"
-                    "Run the 'select' stage first."
+                    f"Selected structures not found at {source_path}\nRun the 'select' stage first."
                 )
             for selected_index, atoms in enumerate(iread(str(source_path), format="extxyz")):
                 spec = DftCalculationSpec(
@@ -280,8 +276,7 @@ class VaspPreparationOrchestrator:
                     )
 
                 if not current_match or (
-                    current_status["status"] not in {"submitted"}
-                    and current_evidence is None
+                    current_status["status"] not in {"submitted"} and current_evidence is None
                 ):
                     clean_stale_outputs(spec.working_directory)
                 artifacts = backend.prepare_inputs(request)
@@ -292,12 +287,20 @@ class VaspPreparationOrchestrator:
                 )
                 if current_match and persisted_status == "failed":
                     status = "failed"
-                elif current_match and persisted_status in {"completed", "reused"} and resolved is None:
+                elif (
+                    current_match
+                    and persisted_status in {"completed", "reused"}
+                    and resolved is None
+                ):
                     status = persisted_status
                 elif current_match and current_status["status"] == "submitted" and resolved is None:
                     status = "submitted"
                 elif resolved is not None:
-                    status = "reused" if resolved.verification_source != "current_job_identity" else "completed"
+                    status = (
+                        "reused"
+                        if resolved.verification_source != "current_job_identity"
+                        else "completed"
+                    )
                 else:
                     status = "pending"
 
@@ -331,9 +334,7 @@ class VaspPreparationOrchestrator:
                 f"Place your VASP INCAR file in: {vasp_config_dir}/"
             )
         input_files = {
-            path.name: path
-            for path in vasp_config_dir.glob("POTCAR_*")
-            if path.is_file()
+            path.name: path for path in vasp_config_dir.glob("POTCAR_*") if path.is_file()
         }
         return VaspBackend(
             command=command,
@@ -379,10 +380,7 @@ class VaspPreparationOrchestrator:
             return ResolvedVaspOutput(
                 outcar_path=outcar,
                 calculation_identity=tuple(
-                    sorted(
-                        (str(key), str(value))
-                        for key, value in calculation.to_dict().items()
-                    )
+                    sorted((str(key), str(value)) for key, value in calculation.to_dict().items())
                 ),
                 verification_source="state_store_artifact",
             )

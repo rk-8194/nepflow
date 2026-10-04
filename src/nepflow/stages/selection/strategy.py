@@ -13,16 +13,15 @@ from nepflow.config.models import SelectionConfig
 from nepflow.domain.identities import calculate_structure_id
 
 from .sampling import (
-    calculate_cross_distance_stats,
     build_composition_aware_candidate_set,
+    calculate_cross_distance_stats,
     composition_aware_attempt_schedule,
     composition_projection_bins,
     select_best_sampling_attempt,
     select_farthest_points_for_target,
 )
 
-
-logger = logging.getLogger("nepflow.selection.strategy")
+logger = logging.getLogger(__name__)
 
 
 def setting(settings: SelectionConfig | Mapping[str, Any], name: str) -> Any:
@@ -61,9 +60,7 @@ def select_training_set(
     seed_indices = sorted(set(seed_indices or []))
     single_element_elastic_indices = sorted(set(single_element_elastic_indices or []))
     elastic_indices = sorted(set(elastic_indices or []))
-    anchor_indices = sorted(
-        set(seed_indices + single_element_elastic_indices + elastic_indices)
-    )
+    anchor_indices = sorted(set(seed_indices + single_element_elastic_indices + elastic_indices))
     target_train = setting(settings, "target_train_count")
     if len(anchor_indices) > target_train:
         raise ValueError(
@@ -103,9 +100,7 @@ def select_training_set(
         return list(range(len(structures))), 0.0
 
     anchor_set = set(anchor_indices)
-    remaining_indices = [
-        index for index in range(len(structures)) if index not in anchor_set
-    ]
+    remaining_indices = [index for index in range(len(structures)) if index not in anchor_set]
     remaining_target = target_train - len(anchor_indices)
     if remaining_target == 0:
         return anchor_indices, 0.0
@@ -190,16 +185,20 @@ def select_composition_aware_training_set(
         index: composition_projection_bins(ase_structures[index])
         for index in range(len(ase_structures))
     }
-    total_binary_bins = len({
-        bin_key
-        for index in remaining_indices + anchor_indices
-        for bin_key in candidate_bins[index]["binary"]
-    })
-    total_ternary_bins = len({
-        bin_key
-        for index in remaining_indices + anchor_indices
-        for bin_key in candidate_bins[index]["ternary"]
-    })
+    total_binary_bins = len(
+        {
+            bin_key
+            for index in remaining_indices + anchor_indices
+            for bin_key in candidate_bins[index]["binary"]
+        }
+    )
+    total_ternary_bins = len(
+        {
+            bin_key
+            for index in remaining_indices + anchor_indices
+            for bin_key in candidate_bins[index]["ternary"]
+        }
+    )
     if total_binary_bins == 0 and total_ternary_bins == 0:
         logger.info(
             "  No binary or ternary composition projections found; "
@@ -410,9 +409,7 @@ def is_single_element_structure(atoms: Any) -> bool:
     if isinstance(composition, dict):
         try:
             positive = [
-                element
-                for element, fraction in composition.items()
-                if float(fraction) > 0.0
+                element for element, fraction in composition.items() if float(fraction) > 0.0
             ]
         except (TypeError, ValueError):
             positive = []
@@ -430,9 +427,7 @@ def resolve_seed_indices(project_dir: Path, reference_ase: list) -> list[int]:
 
     seeds_path = project_dir / "structures" / "seeds" / "base_structures.xyz"
     if not seeds_path.exists():
-        raise FileNotFoundError(
-            f"Seed structures requested, but file not found: {seeds_path}"
-        )
+        raise FileNotFoundError(f"Seed structures requested, but file not found: {seeds_path}")
 
     logger.info("")
     logger.info("Step 2b: Loading seed structures")
@@ -440,9 +435,7 @@ def resolve_seed_indices(project_dir: Path, reference_ase: list) -> list[int]:
     if not isinstance(seed_ase, list):
         seed_ase = [seed_ase]
     if len(seed_ase) == 0:
-        raise ValueError(
-            f"Seed inclusion enabled, but no structures were found in {seeds_path}"
-        )
+        raise ValueError(f"Seed inclusion enabled, but no structures were found in {seeds_path}")
 
     reference_index: dict[str, int] = {}
     for index, atoms in enumerate(reference_ase):
@@ -478,10 +471,7 @@ def find_elastic_stress_indices(reference_ase: list) -> list[int]:
 
     logger.info("")
     logger.info("Step 2d: Loading elastic stress structures")
-    indices = [
-        index for index, atoms in enumerate(reference_ase)
-        if is_elastic_stress(atoms)
-    ]
+    indices = [index for index, atoms in enumerate(reference_ase) if is_elastic_stress(atoms)]
     if not indices:
         raise ValueError(
             "Elastic stress structure inclusion enabled, but no generated "

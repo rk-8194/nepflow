@@ -9,16 +9,13 @@ from completed ``OUTCAR`` files, and fits 6x6 elastic stiffness tensors in GPa.
 from __future__ import annotations
 
 import argparse
-import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 
-
 from nepflow.config.loader import load_config
-from nepflow.domain.identities import DftCalculationIdentity, calculate_structure_id
 from nepflow.dft.vasp.inputs import (
     hash_incar_text,
     identity_for_structure,
@@ -29,20 +26,19 @@ from nepflow.dft.vasp.outputs import (
     outcar_is_complete,
     resolve_verified_output,
 )
-from nepflow.errors import StateError
-from nepflow.io.json import write_json
-from nepflow.io.json import read_json_object
 from nepflow.dft.vasp.registry import (
     get_nepflow_root,
     read_completed_registry,
     read_status,
 )
+from nepflow.domain.identities import DftCalculationIdentity, calculate_structure_id
+from nepflow.errors import StateError
+from nepflow.io.json import read_json_object, write_json
 from nepflow.stages.generation.perturbations.elasticity import (
-    ElasticRecord,
     VOIGT_LABELS,
+    ElasticRecord,
     cell_strain_voigt,
     conventional_rotation_rows,
-    deformation_matrix_from_metadata,
     fit_elastic_tensor,
     parse_stress_tensor_gpa,
     reference_cell_from_metadata,
@@ -54,11 +50,12 @@ from nepflow.stages.generation.perturbations.elasticity import (
     voigt_to_tensor,
 )
 
-
 DEFAULT_DATASETS = ("train", "test")
 PROGRESS_EVERY_FRAMES = 500
 PREVIEW_LIMIT = 8
 MATCHED_PREVIEW_LIMIT = 5
+
+
 @dataclass
 class LocalJobRecord:
     dataset: str
@@ -206,7 +203,9 @@ def incar_elastic_warnings(settings: dict[str, str]) -> list[str]:
             if isif_value >= 3:
                 warnings.append(f"ISIF={isif_text} allows cell relaxation during elastic jobs")
             elif isif_value == 2:
-                warnings.append(f"ISIF={isif_text} computes stress but still permits ionic relaxation if NSW>0")
+                warnings.append(
+                    f"ISIF={isif_text} computes stress but still permits ionic relaxation if NSW>0"
+                )
         except ValueError:
             warnings.append(f"ISIF={isif_text} could not be parsed")
 
@@ -351,11 +350,7 @@ def format_named_constants(result: dict) -> str | None:
         if result.get("fit_model") == "cubic"
         else ("C11", "C12", "C13", "C33", "C44", "C66")
     )
-    parts = [
-        f"{key}={named[key]:.3f}"
-        for key in ordered_keys
-        if key in named
-    ]
+    parts = [f"{key}={named[key]:.3f}" for key in ordered_keys if key in named]
     return "  constants_gpa=" + " ".join(parts)
 
 
@@ -367,7 +362,9 @@ def format_stress_offset(result: dict) -> str:
     )
 
 
-def debug_status_lines(structure_sources: list[Path], unresolved: list[UnresolvedCandidate]) -> list[str]:
+def debug_status_lines(
+    structure_sources: list[Path], unresolved: list[UnresolvedCandidate]
+) -> list[str]:
     lines = [
         (
             "Status: "
@@ -565,7 +562,7 @@ def stream_elastic_records(
                         f"source={build_source_label(metadata)} "
                         f"mode={elastic_mode} amp={strain_amplitude} "
                         f"outcar={outcar_path}"
-                )
+                    )
                 continue
 
             try:
@@ -678,7 +675,9 @@ def main() -> int:
             )
             continue
         try:
-            tensor_gpa, raw_tensor_gpa, fit_model, stress_offset_gpa = fit_elastic_tensor(group_records)
+            tensor_gpa, raw_tensor_gpa, fit_model, stress_offset_gpa = fit_elastic_tensor(
+                group_records
+            )
         except ValueError as exc:
             print(f"  fit failed for group {group_key}: {exc}")
             continue

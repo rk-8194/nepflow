@@ -151,11 +151,7 @@ def pair_prediction(
         # A backend may provide an optional virial even when the authoritative
         # dataset did not request one; it must not turn an otherwise valid
         # non-virial comparison into a pairing error.
-        ml_virial_ev=(
-            prediction.virial_ev
-            if case.reference.virial_ev is not None
-            else None
-        ),
+        ml_virial_ev=(prediction.virial_ev if case.reference.virial_ev is not None else None),
     )
 
 
@@ -184,16 +180,12 @@ def calculate_metrics(paired: Sequence[PairedValidationCase]) -> ValidationMetri
     force_magnitude_errors = np.concatenate(
         [
             np.linalg.norm(item.ml_forces_ev_per_angstrom, axis=1)
-            - np.linalg.norm(
-                item.dft_forces_ev_per_angstrom[list(item.reference_indices)], axis=1
-            )
+            - np.linalg.norm(item.dft_forces_ev_per_angstrom[list(item.reference_indices)], axis=1)
             for item in records
         ]
     )
     energy_mae, energy_rmse = _mae_rmse(energy_errors, "energy errors")
-    force_component_mae, force_component_rmse = _mae_rmse(
-        force_errors, "force errors"
-    )
+    force_component_mae, force_component_rmse = _mae_rmse(force_errors, "force errors")
     force_magnitude_mae, force_magnitude_rmse = _mae_rmse(
         force_magnitude_errors, "force magnitude errors"
     )
@@ -204,10 +196,7 @@ def calculate_metrics(paired: Sequence[PairedValidationCase]) -> ValidationMetri
         if len(virial_values) != len(records):
             raise ValidationError("virial labels must be present for every paired case")
         virial_errors = np.concatenate(
-            [
-                item.ml_virial_ev / item.repeat_count - item.dft_virial_ev
-                for item in virial_values
-            ],
+            [item.ml_virial_ev / item.repeat_count - item.dft_virial_ev for item in virial_values],
             axis=0,
         )
         virial_mae, virial_rmse = _mae_rmse(virial_errors, "virial errors")

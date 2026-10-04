@@ -40,9 +40,7 @@ class SummaryPoint:
 def _parse_point(text: str) -> SummaryPoint:
     parts = [part.strip() for part in text.split(",")]
     if len(parts) != 4:
-        raise argparse.ArgumentTypeError(
-            "Points must be formatted as N,MEAN,P95,P99"
-        )
+        raise argparse.ArgumentTypeError("Points must be formatted as N,MEAN,P95,P99")
     try:
         return SummaryPoint(
             structures=int(parts[0]),
@@ -63,9 +61,7 @@ def _load_points_from_file(path: Path) -> list[SummaryPoint]:
         required = {"structures", "mean", "p95", "p99"}
         missing = required.difference(reader.fieldnames or [])
         if missing:
-            raise ValueError(
-                f"Input file must contain columns: {', '.join(sorted(required))}"
-            )
+            raise ValueError(f"Input file must contain columns: {', '.join(sorted(required))}")
         points: list[SummaryPoint] = []
         for row in reader:
             points.append(
