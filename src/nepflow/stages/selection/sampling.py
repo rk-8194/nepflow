@@ -725,7 +725,10 @@ def initialize_nearest_distances(
             representations[selected_indices],
         ).min(axis=1)
         return {idx: float(distance) for idx, distance in zip(candidate_indices, nearest)}
-    except Exception:
+    except (ImportError, TypeError, ValueError, FloatingPointError):
+        # SciPy's cdist is an optional acceleration.  These are the expected
+        # dependency/input failures; the scalar implementation is equivalent
+        # and remains fully identity-preserving.
         return {
             idx: nearest_descriptor_distance(representations, idx, selected_indices)
             for idx in candidate_indices
@@ -752,7 +755,10 @@ def update_nearest_distances(
         distances = flatten_single_column_distances(distance_matrix)
         for idx, distance in zip(candidate_indices, distances):
             current_nearest[idx] = min(current_nearest[idx], float(distance))
-    except Exception:
+    except (ImportError, TypeError, ValueError, FloatingPointError):
+        # Keep the same explicitly equivalent fallback as the initial
+        # distance calculation; arbitrary programming or resource failures
+        # must remain visible.
         for idx in candidate_indices:
             distance = descriptor_distance(
                 representations,

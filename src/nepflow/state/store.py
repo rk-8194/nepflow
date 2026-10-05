@@ -105,6 +105,8 @@ class StateStore(
             try:
                 yield self
             except BaseException:
+                # Roll back on every abort, including interruption, so a
+                # partially completed state transaction is never committed.
                 if not nested:
                     self._connection.rollback()
                 raise

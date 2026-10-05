@@ -102,6 +102,9 @@ class VaspBackend:
                 ),
             )
         except Exception as exc:
+            # ASE's VASP reader raises parser-specific exception classes.  At
+            # this external boundary every such failure is a required-input
+            # BackendError, never an empty or guessed structure.
             raise BackendError(f"Could not read required VASP artifact {paths['POSCAR']}") from exc
         root = Path(request.source_structure)
         root = root if root.is_dir() else root.parent
@@ -150,6 +153,8 @@ class VaspBackend:
                 index=request.source_structure_index,
             )
         except Exception as exc:
+            # Preserve parser failures as context-rich backend errors so a
+            # malformed POSCAR cannot acquire a new identity by fallback.
             raise BackendError("Could not canonicalize VASP POSCAR") from exc
         if self._incar_text is None:
             try:
@@ -309,6 +314,8 @@ exit 1
         try:
             expected = cast(Atoms, ase_read(str(inputs.working_directory / "POSCAR")))
         except Exception as exc:
+            # The prepared POSCAR is required evidence for output identity;
+            # an ASE read failure must reject the completed output.
             raise BackendError("Could not read prepared VASP POSCAR") from exc
         identity = inputs.calculation.to_dict()
         evidence = ResolvedVaspOutput(

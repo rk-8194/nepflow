@@ -121,6 +121,8 @@ class SQSGenerator:
                 if supercell is None:
                     raise RuntimeError("unable to build the SQS supercell")
             except Exception as exc:
+                # Supercell construction is part of the SQS contract.  A
+                # failed setup cannot be relabelled as random or empty output.
                 raise SQSGenerationError(
                     f"SQS generation failed for composition {composition!r}, "
                     f"crystal structure {crystal_structure!r}, "
@@ -156,6 +158,8 @@ class SQSGenerator:
                     sqs_atoms.info["actual_composition"] = realized_composition(sqs_atoms)
                     results.append(sqs_atoms)
                 except Exception as exc:
+                    # icet/backend failures are terminal for this requested
+                    # SQS slot and retain the original cause for diagnosis.
                     raise SQSGenerationError(
                         f"SQS generation failed for composition {composition!r}, "
                         f"crystal structure {crystal_structure!r}, "

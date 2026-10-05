@@ -116,6 +116,9 @@ def resolve_resubmit_command(
         try:
             output = scheduler.show_job(job_id)
         except Exception as exc:
+            # Scheduler adapters and test doubles do not share one exception
+            # type.  Every query failure becomes SchedulerError; it is never
+            # interpreted as an absent job or an empty queue.
             if isinstance(exc, SchedulerError):
                 raise
             raise SchedulerError(

@@ -545,6 +545,8 @@ def _publish_dataset_artifacts(
         published = True
         return target_was_empty
     except BaseException:
+        # Publication and rollback form one filesystem transaction; include
+        # interruption so a cancelled build cannot leave a partial dataset.
         if published and dataset_path.exists():
             shutil.rmtree(dataset_path)
         if target_was_empty and not dataset_path.exists():
@@ -689,6 +691,9 @@ def build_training_dataset(
             project_id=project_id,
         )
     except BaseException:
+        # State publication is part of the dataset transaction.  Restore the
+        # previous materialized dataset even when cancellation interrupts the
+        # event write.
         _rollback_published_dataset(
             dataset_path,
             restore_empty_target=restore_empty_target,
@@ -833,6 +838,9 @@ def _process_dataset_split(
             report.record_acceptance(result, member_index=member_index)
             rendered.append(result.as_structure_dict())
         except Exception as exc:
+            # One malformed selected result is recorded as a rejection with
+            # its type.  It can only be omitted when the caller explicitly
+            # enabled allow_partial; it is never turned into synthetic labels.
             _rejection(
                 report,
                 f"extraction_failed:{type(exc).__name__}",

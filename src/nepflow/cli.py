@@ -286,17 +286,12 @@ def _resolve_slurm_deadline() -> float | None:
 
     print("[nepflow] Checking SLURM walltime (DEBUG)", file=sys.stderr)
     logger.debug("Checking for SLURM walltime...")
-    try:
-        walltime_remaining, walltime_source = _get_slurm_walltime_info()
-        print(
-            "[nepflow] SLURM walltime result: "
-            f"remaining={walltime_remaining}, source={walltime_source}",
-            file=sys.stderr,
-        )
-    except Exception as exc:
-        print(f"[nepflow] ERROR detecting SLURM walltime: {exc}", file=sys.stderr)
-        logger.error("Error detecting SLURM walltime: %s", exc)
-        walltime_remaining, walltime_source = None, "error"
+    walltime_remaining, walltime_source = _get_slurm_walltime_info()
+    print(
+        "[nepflow] SLURM walltime result: "
+        f"remaining={walltime_remaining}, source={walltime_source}",
+        file=sys.stderr,
+    )
 
     margin_seconds = 300
     if walltime_remaining is None:

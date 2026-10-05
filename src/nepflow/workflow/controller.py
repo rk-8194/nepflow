@@ -260,7 +260,9 @@ class WorkflowController:
             if latest is not None:
                 # Validate persisted vocabulary before publishing the store.
                 StageRunStatus.from_mapping(latest)
-        except BaseException:
+        except Exception:
+            # Store validation failed after opening the temporary handle;
+            # close it before exposing the typed startup failure.
             store.close()
             raise
 
@@ -327,10 +329,14 @@ class WorkflowController:
             result = self.stage_registry.execute(stage, context)
         except SelfResubmitExit:
             raise
-        except BaseException as exc:
+        except Exception as exc:
+            # Stage failures remain visible to the caller.  Persisting the
+            # failed status is best-effort secondary evidence, not recovery.
             try:
                 self.workflow_state.mark_failed(exc)
-            except BaseException:
+            except Exception:
+                # Preserve the original stage exception if failure recording
+                # itself cannot complete.
                 logger.exception("Could not record failed stage %s", stage.value)
             raise
 

@@ -58,18 +58,23 @@ def atomic_write_bytes(
         if durable:
             _sync_directory(target.parent)
     except BaseException:
+        # Cleanup must also run for KeyboardInterrupt/SystemExit so an
+        # interrupted atomic write never leaves an open descriptor or temp
+        # artifact.  The original exception is always re-raised below.
         if file_descriptor is not None:
             try:
                 os.close(file_descriptor)
             except OSError:
-                pass
+                # The original write failure remains authoritative.
+                file_descriptor = None
         if temporary_path is not None:
             try:
                 temporary_path.unlink()
             except FileNotFoundError:
-                pass
+                temporary_path = None
             except OSError:
-                pass
+                # Cleanup is best effort; preserve the original write error.
+                temporary_path = None
         raise
 
 

@@ -65,8 +65,14 @@ def serialize_structure(document: Any) -> dict[str, Any]:
     structure = document.structure
     try:
         structure = SpacegroupAnalyzer(structure).get_conventional_standard_structure()
-    except Exception:
-        logger.warning("Could not convert to conventional structure", exc_info=True)
+    except Exception as exc:
+        # A conventional-cell conversion changes the structure represented by
+        # the record.  It is therefore not an optional convenience fallback:
+        # returning the source structure would hide a provenance change.
+        raise RuntimeError(
+            f"Could not convert Materials Project structure {document.material_id} "
+            "to a conventional standard cell"
+        ) from exc
     lattice = structure.lattice
     space_group = document.symmetry.number
     return {
@@ -99,11 +105,18 @@ def documents_to_ase(documents: Iterable[Any]) -> list[Atoms]:
         try:
             structure = document.structure
             structure = SpacegroupAnalyzer(structure).get_conventional_standard_structure()
-        except Exception:
-            structure = document.structure
+        except Exception as exc:
+            # Do not silently mix primitive/source cells with the documented
+            # conventional-cell output contract.
+            raise RuntimeError(
+                f"Could not convert Materials Project structure {document.material_id} "
+                "to a conventional standard cell"
+            ) from exc
         try:
             atoms = cast(Atoms, adaptor.get_atoms(structure))
         except Exception as exc:
+            # pymatgen/ASE conversion errors vary by adapter version; expose
+            # the material identity while preserving the original exception.
             raise RuntimeError(
                 f"pymatgen→ASE conversion failed for {document.material_id}"
             ) from exc
@@ -140,6 +153,8 @@ def pure_records_to_ase(records: Iterable[Mapping[str, Any]]) -> list[Atoms]:
                 else bulk(element, structure, a=lattice["a"])
             )
         except Exception as exc:
+            # ASE bulk construction is an external structure boundary.  A
+            # malformed cached record must fail rather than yield a guessed cell.
             raise RuntimeError(
                 f"Could not build Materials Project structure {element}-{structure}"
             ) from exc

@@ -19,11 +19,11 @@ class DftPerformanceRecord:
     calculation_id: str
     attempt_id: str
     status: str
-    total_ranks: int = 0
-    mpi_ranks: int = 0
-    irreducible_kpoints: int = 0
-    electrons: float = 0.0
-    average_loop_time: float = 0.0
+    total_ranks: int | None = None
+    mpi_ranks: int | None = None
+    irreducible_kpoints: int | None = None
+    electrons: float | None = None
+    average_loop_time: float | None = None
     failure_kind: str | None = None
     failure_reason: str | None = None
 
@@ -68,17 +68,49 @@ class DftPerformanceRecorder:
             evidence = parse_performance_evidence(
                 outcar.read_text(encoding="utf-8", errors="replace")
             )
-        except OSError:
-            evidence = None
+        except OSError as exc:
+            # Completion of the calculation does not make an unreadable
+            # performance artifact valid.  Preserve the DFT result while
+            # recording missing optional reporting evidence explicitly.
+            self._record(
+                record,
+                DftPerformanceRecord(
+                    calculation_id=record.inputs.calculation.calculation_id,
+                    attempt_id=record.attempt_id,
+                    status="completed",
+                    failure_kind="missing_performance_evidence",
+                    failure_reason=f"Could not read completed OUTCAR: {exc}",
+                ),
+                result,
+            )
+            return
+        if (
+            not evidence.loop_times
+            or evidence.total_ranks is None
+            or evidence.irreducible_kpoints is None
+            or evidence.electrons is None
+        ):
+            self._record(
+                record,
+                DftPerformanceRecord(
+                    calculation_id=record.inputs.calculation.calculation_id,
+                    attempt_id=record.attempt_id,
+                    status="completed",
+                    failure_kind="missing_performance_evidence",
+                    failure_reason="Completed OUTCAR contains no performance loop timing evidence",
+                ),
+                result,
+            )
+            return
         performance = DftPerformanceRecord(
             calculation_id=record.inputs.calculation.calculation_id,
             attempt_id=record.attempt_id,
             status="completed",
-            total_ranks=0 if evidence is None else evidence.total_ranks,
-            mpi_ranks=0 if evidence is None else evidence.mpi_ranks,
-            irreducible_kpoints=(0 if evidence is None else evidence.irreducible_kpoints),
-            electrons=0.0 if evidence is None else evidence.electrons,
-            average_loop_time=(0.0 if evidence is None else evidence.average_loop_time),
+            total_ranks=evidence.total_ranks,
+            mpi_ranks=evidence.mpi_ranks,
+            irreducible_kpoints=evidence.irreducible_kpoints,
+            electrons=evidence.electrons,
+            average_loop_time=evidence.average_loop_time,
         )
         self._record(record, performance, result)
 

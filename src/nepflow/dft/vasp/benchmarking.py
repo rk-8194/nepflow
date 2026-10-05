@@ -19,6 +19,7 @@ from nepflow.dft.backend import DftBackend, DftInputArtifacts, DftInputRequest
 from nepflow.dft.vasp.inputs import set_incar_parameters
 from nepflow.dft.vasp.outputs import VaspPerformanceEvidence, parse_performance_evidence
 from nepflow.domain.identities import StructureIdentity
+from nepflow.errors import StateError
 from nepflow.hpc.resources import JobResources
 from nepflow.hpc.scheduler import Scheduler
 from nepflow.io.hashing import sha256_canonical_json
@@ -470,8 +471,38 @@ class _BenchmarkPerformanceRecorder:
             performance = parse_performance_evidence(
                 outcar.read_text(encoding="utf-8", errors="replace")
             )
-        except OSError:
-            performance = VaspPerformanceEvidence(0, (), 0, 0.0, 0)
+        except OSError as exc:
+            # A completed VASP calculation is not evidence that its benchmark
+            # performance record exists.  Never publish fabricated zero-valued
+            # timing data for an unreadable required artifact.
+            self._record(
+                VaspBenchmarkResult(
+                    benchmark_id=str(record.metadata["benchmark_id"]),
+                    attempt_id=record.attempt_id,
+                    outcome=BenchmarkOutcome.FAILED,
+                    provenance=provenance,
+                    failure_kind="missing_performance_evidence",
+                    failure_reason=f"Could not read completed OUTCAR: {exc}",
+                )
+            )
+            return
+        if (
+            not performance.loop_times
+            or performance.total_ranks is None
+            or performance.irreducible_kpoints is None
+            or performance.electrons is None
+        ):
+            self._record(
+                VaspBenchmarkResult(
+                    benchmark_id=str(record.metadata["benchmark_id"]),
+                    attempt_id=record.attempt_id,
+                    outcome=BenchmarkOutcome.FAILED,
+                    provenance=provenance,
+                    failure_kind="missing_performance_evidence",
+                    failure_reason="Completed OUTCAR contains no benchmark loop timing evidence",
+                )
+            )
+            return
         self._record(
             VaspBenchmarkResult(
                 benchmark_id=str(record.metadata["benchmark_id"]),
@@ -702,13 +733,35 @@ def _result_from_dict(payload: Mapping[str, Any]) -> VaspBenchmarkResult:
     performance_data = payload.get("performance")
     performance = None
     if performance_data is not None:
-        performance = VaspPerformanceEvidence(
-            total_ranks=int(performance_data.get("total_ranks", 0)),
-            mpi_ranks=int(performance_data.get("mpi_ranks", 0)),
-            loop_times=tuple(float(value) for value in performance_data.get("loop_times", ())),
-            irreducible_kpoints=int(performance_data.get("irreducible_kpoints", 0)),
-            electrons=float(performance_data.get("electrons", 0.0)),
+        if not isinstance(performance_data, Mapping):
+            raise StateError("VASP benchmark performance evidence must be an object")
+        required = (
+            "total_ranks",
+            "mpi_ranks",
+            "loop_times",
+            "irreducible_kpoints",
+            "electrons",
         )
+        missing = [key for key in required if key not in performance_data]
+        if missing:
+            raise StateError(
+                "VASP benchmark performance evidence is missing: " + ", ".join(missing)
+            )
+        if any(
+            performance_data[key] is None
+            for key in ("total_ranks", "loop_times", "irreducible_kpoints", "electrons")
+        ):
+            raise StateError("VASP benchmark performance evidence is incomplete")
+        try:
+            performance = VaspPerformanceEvidence(
+                total_ranks=int(performance_data["total_ranks"]),
+                mpi_ranks=int(performance_data["mpi_ranks"]),
+                loop_times=tuple(float(value) for value in performance_data["loop_times"]),
+                irreducible_kpoints=int(performance_data["irreducible_kpoints"]),
+                electrons=float(performance_data["electrons"]),
+            )
+        except (TypeError, ValueError, KeyError) as exc:
+            raise StateError("Malformed VASP benchmark performance evidence") from exc
     return VaspBenchmarkResult(
         benchmark_id=str(payload["benchmark_id"]),
         attempt_id=str(payload["attempt_id"]),

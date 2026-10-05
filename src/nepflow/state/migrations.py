@@ -98,6 +98,9 @@ def migrate(connection: sqlite3.Connection) -> int:
             connection.rollback()
         raise StateError("Could not migrate the state database") from exc
     except Exception as exc:
+        # Migration readers may encounter malformed historical payloads that
+        # are not sqlite exceptions.  Roll back and expose one typed state
+        # boundary rather than continuing with a partially migrated ledger.
         if not started_transaction:
             connection.rollback()
         raise StateError("Unexpected failure while migrating the state database") from exc

@@ -91,7 +91,7 @@ def _build_materials_project_generator(
             max_per_composition=5,
             gas_elements=list(config.composition.gas_elements),
         )
-    except Exception as exc:
+    except (ImportError, OSError, TypeError, ValueError, RuntimeError) as exc:
         raise RuntimeError("Cannot initialise the enabled Materials Project generator") from exc
     return "MaterialsProject", generator
 

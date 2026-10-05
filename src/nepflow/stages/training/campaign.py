@@ -212,8 +212,11 @@ class TrainingCampaign:
                 latest = max(datetime.fromisoformat(value) for value in existing_times)
                 if occurred_at <= latest:
                     occurred_at = latest + timedelta(microseconds=1)
-            except ValueError:
-                pass
+            except ValueError as exc:
+                raise StateError(
+                    f"Training event history for {entity_type}/{entity_id} contains "
+                    "an invalid occurred_at timestamp"
+                ) from exc
         occurred_text = occurred_at.isoformat()
         if callable(recorder):
             try:
@@ -781,6 +784,9 @@ class TrainingCampaign:
             try:
                 job_id = self._execution.submit(self.scheduler, attempt, str(attempt.job_name))
             except Exception as exc:
+                # Submission is an external execution boundary.  Persist the
+                # failed attempt and its explicit retry/terminal decision;
+                # never make a failed submit look like a pending job.
                 self._save_attempt(
                     attempt,
                     status="failed",

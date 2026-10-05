@@ -310,6 +310,8 @@ class PerturbationCoordinator:
         try:
             return execute_perturbation_task(task)
         except Exception as exc:
+            # Worker boundaries must preserve any task implementation failure
+            # while adding task identity for the coordinator/report.
             raise PerturbationTaskError(task, exc) from exc
 
     @staticmethod
@@ -317,6 +319,8 @@ class PerturbationCoordinator:
         try:
             return future.result()
         except Exception as exc:
+            # Future implementations may wrap arbitrary worker exceptions;
+            # normalize them once without treating the task as successful.
             if isinstance(exc, PerturbationTaskError):
                 raise
             raise PerturbationTaskError(task, exc) from exc

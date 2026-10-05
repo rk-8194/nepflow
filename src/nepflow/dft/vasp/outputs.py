@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass, field
 from numbers import Real
@@ -28,6 +29,8 @@ from nepflow.errors import StateError
 from nepflow.io.hashing import sha256_file
 
 from .inputs import read_identity
+
+logger = logging.getLogger(__name__)
 
 VASP_COMPLETION_MARKERS = ("General timing", "Voluntary context switches")
 
@@ -82,10 +85,11 @@ def parse_stress_from_outcar(
             stress = np.asarray(atoms.get_stress(voigt=False), dtype=float)
             if stress.shape == (3, 3) and np.all(np.isfinite(stress)):
                 return stress
-        except Exception:
-            # Continue to the established text parser for unusual layouts
-            # that ASE does not accept.
-            pass
+        except Exception as exc:
+            # ASE is an optional fast path.  Its reader has backend-specific
+            # exception types; the established text parser is the equivalent
+            # authoritative fallback and records no fabricated values.
+            logger.debug("ASE could not parse VASP stress; using text parser: %s", exc)
 
     try:
         outcar_text = outcar_path.read_text(encoding="utf-8", errors="replace")
@@ -467,6 +471,9 @@ def parse_outcar_result(
     try:
         atoms = reader(str(outcar_path))
     except Exception as exc:
+        # The injected ASE-compatible reader is an external boundary with
+        # several parser-specific exception classes.  Convert every reader
+        # failure into an explicit rejected result; never treat it as usable.
         return _rejected_parse_result(
             structure_id,
             identity_items,
@@ -560,10 +567,14 @@ def _parse_vasp_structure_fields(
     try:
         energy = float(atoms.get_potential_energy())
     except Exception as exc:
+        # ASE calculators expose heterogeneous missing-energy exceptions.  A
+        # typed rejection keeps the missing label visible to dataset builders.
         return f"missing_energy:{type(exc).__name__}"
     try:
         forces = np.asarray(atoms.get_forces(), dtype=float)
     except Exception as exc:
+        # As above, preserve the exact failure category instead of creating a
+        # zero force array.
         return f"missing_forces:{type(exc).__name__}"
 
     try:
@@ -572,6 +583,8 @@ def _parse_vasp_structure_fields(
         pbc = atoms.pbc.tolist()
         volume = float(atoms.get_volume())
     except Exception as exc:
+        # Geometry access is another ASE adapter boundary; malformed geometry
+        # rejects the result rather than being silently defaulted.
         return f"invalid_structure_geometry:{type(exc).__name__}"
 
     virial = parse_virial_from_outcar(outcar_path, volume)
@@ -622,15 +635,15 @@ def parse_outcar(
 class VaspPerformanceEvidence:
     """Performance fields parsed directly from one completed OUTCAR."""
 
-    total_ranks: int
+    total_ranks: int | None
     loop_times: tuple[float, ...]
-    irreducible_kpoints: int
-    electrons: float
-    mpi_ranks: int = 0
+    irreducible_kpoints: int | None
+    electrons: float | None
+    mpi_ranks: int | None = None
 
     @property
-    def average_loop_time(self) -> float:
-        return sum(self.loop_times) / len(self.loop_times) if self.loop_times else 0.0
+    def average_loop_time(self) -> float | None:
+        return sum(self.loop_times) / len(self.loop_times) if self.loop_times else None
 
 
 def parse_performance_evidence(outcar_text: str) -> VaspPerformanceEvidence:
@@ -647,11 +660,11 @@ def parse_performance_evidence(outcar_text: str) -> VaspPerformanceEvidence:
     kpoints_match = re.search(r"Found\s+(\d+)\s+irreducible k-points", outcar_text)
     electrons_match = re.search(r"NELECT\s*=\s*([\d.]+)", outcar_text)
     return VaspPerformanceEvidence(
-        total_ranks=int(ranks_match.group(1)) if ranks_match else 0,
-        mpi_ranks=int(mpi_ranks_match.group(1)) if mpi_ranks_match else 0,
+        total_ranks=int(ranks_match.group(1)) if ranks_match else None,
+        mpi_ranks=int(mpi_ranks_match.group(1)) if mpi_ranks_match else None,
         loop_times=loops,
-        irreducible_kpoints=int(kpoints_match.group(1)) if kpoints_match else 0,
-        electrons=float(electrons_match.group(1)) if electrons_match else 0.0,
+        irreducible_kpoints=int(kpoints_match.group(1)) if kpoints_match else None,
+        electrons=float(electrons_match.group(1)) if electrons_match else None,
     )
 
 
@@ -686,9 +699,14 @@ def parse_memory_record(outcar_path: Path, gpus_per_node: int) -> dict[str, obje
     ncore, kpar = _parse_memory_parallelism(incar, _read_memory_text(incar, "INCAR"))
 
     performance = parse_performance_evidence(outcar_text)
-    if not performance.loop_times:
+    if (
+        not performance.loop_times
+        or performance.total_ranks is None
+        or performance.irreducible_kpoints is None
+        or performance.electrons is None
+    ):
         raise VaspMemoryParseError(
-            f"Completed OUTCAR has no valid electronic loop evidence: {outcar_path}"
+            f"Completed OUTCAR has incomplete performance evidence: {outcar_path}"
         )
     total_ranks = performance.total_ranks
     nodes = max(1, total_ranks // gpus_per_node) if total_ranks > 0 else 1

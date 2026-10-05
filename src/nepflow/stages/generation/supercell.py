@@ -69,6 +69,9 @@ def _build_lattice(
         else:
             base = bulk(element, crystal_structure, a=3.0)
     except Exception:
+        # ASE bulk builders expose several structure-specific exception types.
+        # ``None`` is a deliberate optional-generator result only when the
+        # caller did not request fail-fast behaviour.
         if raise_on_error:
             raise
         logger.debug("Cannot build %s-%s", element, crystal_structure, exc_info=True)

@@ -56,7 +56,8 @@ def configure_logging(
     try:
         from loguru import logger as loguru_logger
     except ImportError:
-        pass
+        # loguru integration is optional; stdlib logging remains authoritative.
+        project_logger.debug("Optional loguru integration is unavailable")
     else:
         loguru_logger.disable("NepTrainKit")
 

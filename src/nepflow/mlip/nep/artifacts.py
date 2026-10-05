@@ -425,8 +425,11 @@ def find_model_run_manifest(project_dir: Path, model_run_id: str) -> Path:
     for manifest_path in potentials_dir.rglob(MODEL_RUN_MANIFEST_FILENAME):
         try:
             manifest = read_model_run_manifest(manifest_path)
-        except NepArtifactError:
-            continue
+        except NepArtifactError as exc:
+            # A corrupt manifest is authoritative-state evidence, not an
+            # absent candidate.  Do not hide it by returning another model or
+            # by reporting that the requested identity was never written.
+            raise NepArtifactError(f"Could not read model-run manifest: {manifest_path}") from exc
         if manifest.get("model_run_id") == model_run_id:
             matches.append(manifest_path)
     if not matches:

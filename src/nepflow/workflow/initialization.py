@@ -76,6 +76,8 @@ class ProjectCreationService:
             # A newly rendered config or ledger is not useful without the
             # other authoritative foundation. Remove only artifacts created
             # by this invocation; existing project state is never destroyed.
+            # Catching BaseException is deliberate so interruption also gets
+            # the same transaction-like cleanup before the signal propagates.
             if not config_was_present:
                 try:
                     config_path.unlink(missing_ok=True)

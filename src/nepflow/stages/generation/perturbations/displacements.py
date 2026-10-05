@@ -50,6 +50,9 @@ def rattled(
                 seed=int(seed),
             )
         except Exception as exc:
+            # HipHive is an external generator with version-dependent
+            # exception classes.  Its failure is terminal for this requested
+            # perturbation family; a Gaussian substitute is non-equivalent.
             raise RuntimeError(
                 "HipHive rattling failed; Gaussian substitution is disabled"
             ) from exc

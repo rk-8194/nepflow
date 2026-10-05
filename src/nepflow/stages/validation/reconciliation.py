@@ -189,8 +189,11 @@ class ValidationReconciliationOrchestrator:
                 latest = max(datetime.fromisoformat(value) for value in existing_times)
                 if occurred_at <= latest:
                     occurred_at = latest + timedelta(microseconds=1)
-            except ValueError:
-                pass
+            except ValueError as exc:
+                raise StateError(
+                    f"Validation event history for {self.validation_run_id} contains "
+                    "an invalid occurred_at timestamp"
+                ) from exc
         recorder = getattr(self.state_store, "record_validation_event", None)
         kwargs = {
             "event_id": event_id,
@@ -425,6 +428,8 @@ class ValidationReconciliationOrchestrator:
                 resources=self.resources,
             )
         except Exception as exc:
+            # Scheduler adapter failures become an explicit failed/retry
+            # transition.  They are never converted into an empty queue.
             return self._fail_or_retry(
                 record,
                 f"submission:{type(exc).__name__}:{exc}",
@@ -469,6 +474,8 @@ class ValidationReconciliationOrchestrator:
             try:
                 prediction = parser(request, record.case.output_path)
             except Exception as exc:
+                # Completed jobs still require a readable, typed prediction;
+                # parser failures remain terminal/retry evidence, not success.
                 return self._fail_or_retry(
                     record,
                     f"completed validation job produced unusable output: {exc}",

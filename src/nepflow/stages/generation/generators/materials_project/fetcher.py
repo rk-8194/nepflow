@@ -103,6 +103,9 @@ class MaterialsProjectFetcher:
                         ],
                     )
                 except Exception as exc:
+                    # The remote API boundary has client/version-specific
+                    # exception types; expose query failure with its query
+                    # context instead of returning an empty result.
                     raise RuntimeError(
                         "Materials Project query failed for "
                         f"element={element}, structures={list(crystal_structures)}"
@@ -163,6 +166,8 @@ class MaterialsProjectFetcher:
                 ],
             )
         except Exception as exc:
+            # Preserve remote-client failure context.  An unavailable query
+            # is not equivalent to a successful empty Materials Project set.
             raise RuntimeError(
                 f"Materials Project query failed for elements={list(elements)}"
             ) from exc

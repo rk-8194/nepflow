@@ -102,6 +102,8 @@ def _last_frame(path: Path) -> Atoms:
     try:
         frames = ase_read(str(path), index=":", format="extxyz")
     except Exception as exc:
+        # ASE's extxyz reader is an external parser boundary; all parser
+        # failures become a typed MLIP error and no frame is substituted.
         raise MlipError(f"Could not parse GPUMD output {path}: {exc}") from exc
     if isinstance(frames, Atoms):
         return frames

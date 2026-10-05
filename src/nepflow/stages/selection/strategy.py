@@ -11,6 +11,7 @@ from ase.io import read as ase_read
 
 from nepflow.config.models import SelectionConfig
 from nepflow.domain.identities import calculate_structure_id
+from nepflow.errors import ValidationError
 
 from .sampling import (
     build_composition_aware_candidate_set,
@@ -417,9 +418,10 @@ def is_single_element_structure(atoms: Any) -> bool:
             return len(positive) == 1
 
     try:
-        return len(set(atoms.get_chemical_symbols())) == 1
-    except Exception:
-        return False
+        symbols = atoms.get_chemical_symbols()
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise ValidationError("Structure does not expose readable chemical symbols") from exc
+    return len(set(symbols)) == 1
 
 
 def resolve_seed_indices(project_dir: Path, reference_ase: list) -> list[int]:
