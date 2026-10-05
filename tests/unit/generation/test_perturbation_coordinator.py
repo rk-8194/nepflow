@@ -222,16 +222,16 @@ def test_failed_task_identifies_base_and_effective_seed() -> None:
 def test_existing_candidate_family_order_is_locked_before_source_scoping(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    family_names = (
-        "volume_profile",
-        "elastic_stress",
-        "rattled",
-        "liquid",
-        "vacancy",
-        "interstitial",
-        "gas_interstitial",
-        "vacancy_interstitial",
-        "gas_in_vacancy",
+    family_generators = (
+        ("volume_profile", "volume_profile"),
+        ("elastic_stress_set", "elastic_stress"),
+        ("rattled", "rattled"),
+        ("liquid_snapshots", "liquid"),
+        ("vacancies", "vacancy"),
+        ("interstitials", "interstitial"),
+        ("gas_interstitials", "gas_interstitial"),
+        ("vacancy_interstitial", "vacancy_interstitial"),
+        ("gas_in_vacancy", "gas_in_vacancy"),
     )
 
     def tagged_family(name: str):
@@ -243,8 +243,12 @@ def test_existing_candidate_family_order_is_locked_before_source_scoping(
 
         return generate
 
-    for family_name in family_names:
-        monkeypatch.setattr(coordinator_module, family_name, tagged_family(family_name))
+    for generator_name, family_name in family_generators:
+        monkeypatch.setattr(
+            coordinator_module,
+            generator_name,
+            tagged_family(family_name),
+        )
 
     result = execute_perturbation_task(
         PerturbationTask(
@@ -271,7 +275,7 @@ def test_existing_candidate_family_order_is_locked_before_source_scoping(
 
     assert [item.info["perturbation_type"] for item in result.candidates] == [
         "unperturbed",
-        *family_names,
+        *(family_name for _generator_name, family_name in family_generators),
     ]
 
 
