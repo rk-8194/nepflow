@@ -941,9 +941,8 @@ def resolve_selected_dft_results(
 ) -> dict[DatasetSplit, tuple[VaspParseResult, ...]]:
     """Load selected structures and resolve their exact accepted DFT results.
 
-    This is the canonical input adapter for ``TrainingStage``.  It never
-    chooses a latest folder, creates synthetic labels, or falls back to a
-    filesystem-only OUTCAR.
+    This canonical ``TrainingStage`` adapter requires manifest-bound accepted
+    DFT results and rejects unverified filesystem-only records.
     """
 
     if reader is None:

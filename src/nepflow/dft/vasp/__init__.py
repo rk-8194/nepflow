@@ -48,7 +48,7 @@ from .outputs import (
 )
 from .recovery import (
     VaspRecoveryDecision,
-    build_retry_levels_for_gpu,
+    build_retry_levels_for_config,
     decide_retry,
     write_incar_resource_parameters,
 )
@@ -74,7 +74,7 @@ __all__ = [
     "VaspPerformanceEvidence",
     "VaspMemoryParseError",
     "VaspRecoveryDecision",
-    "build_retry_levels_for_gpu",
+    "build_retry_levels_for_config",
     "build_benchmark_resources",
     "build_vasp_benchmark_plan",
     "build_vasp_benchmark_plan_from_config",

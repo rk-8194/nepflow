@@ -1,8 +1,7 @@
-from configparser import ConfigParser
-
 import pytest
 from ase import Atoms
 
+from nepflow.config.models import VaspConfig
 from nepflow.dft.vasp.inputs import (
     canonical_poscar_bytes,
     canonical_poscar_text,
@@ -35,7 +34,7 @@ def test_resource_only_incar_changes_do_not_change_scientific_hash() -> None:
 
 
 def test_incar_defaults_preserve_phase2_injection() -> None:
-    config = ConfigParser()
+    config = VaspConfig()
     assert "KSPACING = 0.30" in inject_incar_defaults("ENCUT = 520\n", config)
     assert "KGAMMA = .TRUE." in inject_incar_defaults("ENCUT = 520\n", config)
 

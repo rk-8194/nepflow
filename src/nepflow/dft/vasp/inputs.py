@@ -9,7 +9,6 @@ calculation identity.
 from __future__ import annotations
 
 import re
-from configparser import ConfigParser
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
@@ -17,7 +16,7 @@ from typing import Mapping
 import numpy as np
 
 from nepflow.config import load_config
-from nepflow.config.models import NepflowConfig
+from nepflow.config.models import VaspConfig
 from nepflow.domain.identities import (
     DFT_CALCULATION_IDENTITY_SCHEMA,
     DftCalculationIdentity,
@@ -125,12 +124,13 @@ def hash_potcar_bytes(potcar_bytes: bytes) -> str:
 
 def inject_incar_defaults(
     incar_text: str,
-    config: ConfigParser | NepflowConfig,
+    config: VaspConfig,
 ) -> str:
     """Append KSPACING and KGAMMA when the user template omits them.
 
-    ``ConfigParser`` remains accepted for the still-unmigrated launcher, while
-    canonical callers pass the typed project configuration directly.
+    The input is the validated typed VASP configuration. Keeping this helper
+    at the VASP boundary prevents legacy parser defaults from leaking into
+    scientific identity construction.
     """
     lines = incar_text.rstrip("\n")
 
@@ -139,16 +139,10 @@ def inject_incar_defaults(
 
     additions = []
     if not has_kspacing:
-        if isinstance(config, NepflowConfig):
-            kspacing = "0.30" if config.vasp.kspacing == 0.30 else repr(config.vasp.kspacing)
-        else:
-            kspacing = config.get("vasp", "kspacing", fallback="0.30")
+        kspacing = "0.30" if config.kspacing == 0.30 else repr(config.kspacing)
         additions.append(f"KSPACING = {kspacing}")
     if not has_kgamma:
-        if isinstance(config, NepflowConfig):
-            kgamma = ".TRUE." if config.vasp.kgamma else ".FALSE."
-        else:
-            kgamma = config.get("vasp", "kgamma", fallback=".TRUE.")
+        kgamma = ".TRUE." if config.kgamma else ".FALSE."
         additions.append(f"KGAMMA = {kgamma}")
 
     if additions:
@@ -216,7 +210,10 @@ def build_input_context(project_dir: Path) -> VaspInputContext | None:
         project_name=project_dir.name.removeprefix("project_"),
         require_scientific_fields=False,
     )
-    incar_text = inject_incar_defaults(incar_template.read_text(encoding="utf-8"), typed_config)
+    incar_text = inject_incar_defaults(
+        incar_template.read_text(encoding="utf-8"),
+        typed_config.vasp,
+    )
     potcar_data = {
         path.name.split("_", 1)[1]: path.read_bytes() for path in vasp_config_dir.glob("POTCAR_*")
     }

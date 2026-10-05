@@ -1,8 +1,7 @@
-from configparser import ConfigParser
-
 import pytest
 
 import nepflow.dft.vasp.recovery as recovery_module
+from nepflow.config.models import NepflowConfig
 from nepflow.dft.backend import DftCompletionEvidence, DftFailureEvidence
 from nepflow.dft.vasp.backend import VaspBackend
 from nepflow.dft.vasp.failures import (
@@ -11,7 +10,7 @@ from nepflow.dft.vasp.failures import (
 )
 from nepflow.dft.vasp.inputs import hash_incar_text
 from nepflow.dft.vasp.recovery import (
-    build_retry_levels_for_gpu,
+    build_retry_levels_for_config,
     decide_retry,
     write_incar_resource_parameters,
 )
@@ -36,8 +35,7 @@ def test_failure_classification_distinguishes_oom_from_incomplete(tmp_path) -> N
 
 
 def test_recovery_decision_records_the_next_resource_level() -> None:
-    config = ConfigParser()
-    levels = build_retry_levels_for_gpu(1, 2, 1, config)
+    levels = build_retry_levels_for_config(1, 2, 1, NepflowConfig())
     decision = decide_retry(levels, 0, max_retry_level=6)
     assert decision.retry
     assert decision.retry_level == 1

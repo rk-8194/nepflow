@@ -31,18 +31,10 @@ jobs:
       - name: Upgrade pip
         run: python -m pip install --upgrade pip
 
-      - name: Install NEPFlow and test runner
+      - name: Install NEPFlow and quality tools
         run: |
           python -m pip install -e .
           python -m pip install pytest ruff pyright
-
-      - name: Validate Ruff configuration
-        run: |
-          ruff --version
-          ruff check --show-settings src/nepflow/__init__.py > /dev/null
-
-      - name: Type-check package
-        run: pyright
 
       - name: Check tracked repository hygiene
         run: |
@@ -56,16 +48,49 @@ jobs:
           tracked = [path for path in tracked if path]
 
           prohibited = []
+          generated_roots = {
+              "archive",
+              "build",
+              "cafps",
+              "dist",
+              "htmlcov",
+              "pairs",
+              "plots",
+              "projects",
+              "reports",
+          }
+          transient_directories = {
+              ".mypy_cache",
+              ".nox",
+              ".pytest_cache",
+              ".pyright",
+              ".ruff_cache",
+              ".tox",
+          }
           for path in tracked:
               parts = PurePosixPath(path).parts
               if "__pycache__" in parts or path.endswith((".pyc", ".pyo")):
                   prohibited.append(path)
-              if path.startswith("projects/project_"):
+              if (
+                  parts
+                  and (parts[0] in generated_roots or parts[0].startswith("run_"))
+              ) or any(part in transient_directories for part in parts):
+                  prohibited.append(path)
+              filename = PurePosixPath(path).name.lower()
+              if (
+                  filename == ".coverage"
+                  or filename.startswith(".coverage.")
+                  or filename == "coverage.xml"
+                  or filename in {".env", ".env.local", "credentials.json", "service-account.json"}
+                  or filename == "potcar"
+                  or filename.startswith("potcar.")
+                  or filename.endswith((".err", ".log", ".out", ".p12", ".pem", ".pfx"))
+              ):
                   prohibited.append(path)
 
           if prohibited:
               raise SystemExit(
-                  "Tracked generated/local artifacts found:\n"
+                  "Tracked generated/local/secret artifacts found:\n"
                   + "\n".join(sorted(set(prohibited)))
               )
           PY
@@ -94,8 +119,17 @@ jobs:
       - name: Compile package and tests
         run: python -m compileall -q src tests utilities examples
 
+      - name: Check Ruff formatting
+        run: ruff format --check .
+
+      - name: Check Ruff lint
+        run: ruff check .
+
+      - name: Type-check package
+        run: pyright
+
       - name: Collect tests
         run: python -m pytest --collect-only -q
 
       - name: Run tests
-        run: python -m pytest -ra -m "not external"
+        run: python -m pytest -ra

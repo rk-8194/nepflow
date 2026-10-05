@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import re
-from configparser import ConfigParser
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -11,32 +10,6 @@ from typing import Callable
 from nepflow.config.models import NepflowConfig
 from nepflow.errors import VaspError
 from nepflow.io.atomic import atomic_write_text
-
-
-def build_retry_levels_for_gpu(
-    starting_gpu: int,
-    initial_ncore: int,
-    initial_kpar: int,
-    config: ConfigParser,
-) -> list[tuple[int, int, int, int]]:
-    """Build the accepted Phase 2 GPU-aware retry escalation table.
-
-    The parser form remains for compatibility with existing recovery callers.
-    New DFT stage code should use :func:`build_retry_levels_for_config`.
-
-    Each tuple is ``(NCORE, KPAR, nodes, GPUs per node)``.  Levels are ordered
-    from the starting resource tier through explicit GPU and node escalation;
-    the starting tuple itself is excluded so a retry always changes resources.
-    """
-    starting_gpus_per_node = starting_gpu
-    return _build_retry_levels(
-        starting_gpus_per_node,
-        initial_ncore,
-        initial_kpar,
-        cores=config.getint("hpc", "cores_per_node", fallback=64),
-        gpus_per_node=config.getint("hpc", "gpus_per_node", fallback=4),
-        max_nodes=config.getint("hpc", "max_nodes", fallback=16),
-    )
 
 
 def build_retry_levels_for_config(
@@ -271,7 +244,6 @@ def decide_retry(
 __all__ = [
     "VaspRecoveryDecision",
     "VaspRecoveryPolicy",
-    "build_retry_levels_for_gpu",
     "build_retry_levels_for_config",
     "decide_retry",
     "write_incar_resource_parameters",

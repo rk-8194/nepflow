@@ -230,7 +230,10 @@ def load_input_context(project_dir: Path) -> dict:
         require_scientific_fields=True,
     )
 
-    incar_text = inject_incar_defaults(incar_template.read_text(encoding="utf-8"), config)
+    incar_text = inject_incar_defaults(
+        incar_template.read_text(encoding="utf-8"),
+        config.vasp,
+    )
     incar_settings = parse_incar_settings(incar_text)
     potcar_data = {
         potcar_path.name.split("_", 1)[1]: potcar_path.read_bytes()

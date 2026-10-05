@@ -45,7 +45,7 @@ known-first-party = ["nepflow"]
 line-ending = "lf"
 
 [tool.pytest.ini_options]
-addopts = "--strict-markers"
+addopts = '--strict-markers -m "not external"'
 markers = [
     "external: requires a live external service or executable and is excluded from ordinary CI",
     "slurm: requires a live SLURM cluster",

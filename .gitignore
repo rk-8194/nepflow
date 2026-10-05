@@ -20,6 +20,34 @@ __pycache__/
 .ruff_cache/
 .pyright/
 .mypy_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.tox/
+.nox/
+build/
+dist/
+*.egg-info/
+.venv/
+venv/
+
+# Credentials and pseudopotentials must never be tracked
+.env
+.env.*
+!.env.example
+credentials.json
+service-account.json
+*.pem
+*.p12
+*.pfx
+POTCAR
+POTCAR.*
+
+# Scheduler and run logs are disposable outputs
+*.err
+*.log
+*.out
 
 # Generated scientific output
 *.npy

@@ -1,33 +1,38 @@
-from configparser import ConfigParser
+from dataclasses import replace
 
 import pytest
 
+from nepflow.config.models import CompositionConfig, NepTrainingConfig, NepflowConfig
 from nepflow.mlip.nep.inputs import NepHyperparameters, NepInputRenderer
 
 
-def make_train_config(**overrides: object) -> ConfigParser:
-    config = ConfigParser()
-    config["composition"] = {"elements": "Si,Ge", "gasElements": ""}
-    config["train_nep"] = {
-        "cutoff": "6 5",
-        "n_max": "4 4",
-        "basis_size": "8 8",
-        "l_max": "4 2 1",
-        "neuron": "80",
-        "population": "50",
-        "batch": "3000",
-        "generation": "250000",
-        "outerZBL": "2.0",
-        "charge_mode": "0",
-        "weights": "1,1",
-        "lambda_e": "1.0",
-        "lambda_f": "1.0",
-        "lambda_v": "1.0",
-        "lambda_shear": "1.0",
+def make_train_config(**overrides: object) -> NepflowConfig:
+    field_names = {
+        "outerZBL": "outer_zbl",
+        "generation": "generations",
     }
+    token_fields = {"cutoff", "n_max", "basis_size", "l_max", "neuron"}
+    int_fields = {"population", "batch", "charge_mode"}
+    float_fields = {"lambda_e", "lambda_f", "lambda_v", "lambda_shear"}
+    values: dict[str, object] = {}
     for key, value in overrides.items():
-        config["train_nep"][key] = str(value)
-    return config
+        field_name = field_names.get(key, key)
+        if key == "weights":
+            values[field_name] = tuple(
+                float(item) for item in str(value).replace(",", " ").split()
+            )
+        elif field_name in token_fields:
+            values[field_name] = tuple(str(value).replace(",", " ").split())
+        elif field_name in int_fields or field_name == "generations":
+            values[field_name] = int(value)
+        elif field_name in float_fields or field_name == "outer_zbl":
+            values[field_name] = float(value)
+        else:
+            raise ValueError(f"Unsupported NEP test field: {key}")
+    return NepflowConfig(
+        composition=CompositionConfig(elements=("Si", "Ge")),
+        train_nep=replace(NepTrainingConfig(), **values),
+    )
 
 
 def render_and_identify(
@@ -37,9 +42,14 @@ def render_and_identify(
     **overrides: object,
 ) -> tuple[str, str]:
     config = make_train_config(**overrides)
-    config["composition"]["elements"] = composition_elements
-    config["composition"]["gasElements"] = composition_gas_elements
-    hyperparameters = NepHyperparameters.from_legacy_config(config)
+    config = replace(
+        config,
+        composition=CompositionConfig(
+            elements=tuple(composition_elements.replace(",", " ").split()),
+            gas_elements=tuple(composition_gas_elements.replace(",", " ").split()),
+        ),
+    )
+    hyperparameters = NepHyperparameters.from_config(config.composition, config.train_nep)
     rendered = NepInputRenderer().render_content(hyperparameters)
     return rendered, hyperparameters.identity_hash()
 
@@ -114,4 +124,4 @@ def test_lambda_shear_is_rendered_from_typed_settings() -> None:
 def test_invalid_nonempty_weights_are_not_replaced_by_equal_weights() -> None:
     config = make_train_config(weights="1")
     with pytest.raises(ValueError, match="weights"):
-        NepHyperparameters.from_legacy_config(config)
+        NepHyperparameters.from_config(config.composition, config.train_nep)

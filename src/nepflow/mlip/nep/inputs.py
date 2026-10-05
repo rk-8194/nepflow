@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from configparser import ConfigParser
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -27,10 +26,6 @@ def canonical_tokens(value: str) -> tuple[str, ...]:
         except ValueError:
             normalized.append(token)
     return tuple(normalized)
-
-
-def _elements(value: str) -> tuple[str, ...]:
-    return tuple(item.strip() for item in value.replace(",", " ").split() if item.strip())
 
 
 @dataclass(frozen=True, slots=True)
@@ -121,41 +116,6 @@ class NepHyperparameters:
             lambda_f=training.lambda_f,
             lambda_v=training.lambda_v,
             lambda_shear=training.lambda_shear,
-        )
-
-    @classmethod
-    def from_legacy_config(cls, config: ConfigParser) -> "NepHyperparameters":
-        """Read the pre-typed config boundary without owning stage orchestration."""
-
-        elements = _elements(config.get("composition", "elements"))
-        gas_elements = _elements(config.get("composition", "gasElements", fallback=""))
-        all_elements = elements + gas_elements
-        weights_text = config.get("train_nep", "weights", fallback="").strip()
-        if weights_text:
-            try:
-                weights = tuple(float(value) for value in weights_text.replace(",", " ").split())
-            except ValueError as exc:
-                raise ValueError("train_nep.weights must contain only numbers") from exc
-        else:
-            weights = tuple(1.0 for _ in all_elements)
-        return cls(
-            elements=elements,
-            gas_elements=gas_elements,
-            cutoff=canonical_tokens(config.get("train_nep", "cutoff", fallback="6 5")),
-            n_max=canonical_tokens(config.get("train_nep", "n_max", fallback="4 4")),
-            basis_size=canonical_tokens(config.get("train_nep", "basis_size", fallback="8 8")),
-            l_max=canonical_tokens(config.get("train_nep", "l_max", fallback="4 2 1")),
-            neuron=canonical_tokens(config.get("train_nep", "neuron", fallback="80")),
-            population=config.getint("train_nep", "population", fallback=50),
-            batch=config.getint("train_nep", "batch", fallback=3000),
-            generations=config.getint("train_nep", "generation", fallback=250000),
-            outer_zbl=config.getfloat("train_nep", "outerZBL", fallback=2.0),
-            charge_mode=config.getint("train_nep", "charge_mode", fallback=0),
-            weights=weights,
-            lambda_e=config.getfloat("train_nep", "lambda_e", fallback=1.0),
-            lambda_f=config.getfloat("train_nep", "lambda_f", fallback=1.0),
-            lambda_v=config.getfloat("train_nep", "lambda_v", fallback=1.0),
-            lambda_shear=config.getfloat("train_nep", "lambda_shear", fallback=1.0),
         )
 
     def canonical_dict(self) -> dict[str, object]:

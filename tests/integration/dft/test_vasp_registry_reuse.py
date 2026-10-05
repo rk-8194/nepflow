@@ -1,7 +1,6 @@
 import json
 import tempfile
 import unittest
-from configparser import ConfigParser
 from pathlib import Path
 
 import numpy as np
@@ -12,6 +11,7 @@ pytest.importorskip("pymatgen")
 
 from ase import Atoms
 
+from nepflow.config.models import VaspConfig
 from nepflow.dft.backend import DftInputArtifacts
 from nepflow.dft.vasp.inputs import (
     hash_incar_text,
@@ -63,10 +63,8 @@ class DftStateReuseTests(unittest.TestCase):
 
     def test_effective_incar_defaults_participate_in_identity(self) -> None:
         template = "ENCUT = 520\n"
-        first_config = ConfigParser()
-        first_config["vasp"] = {"kspacing": "0.30", "kgamma": ".TRUE."}
-        second_config = ConfigParser()
-        second_config["vasp"] = {"kspacing": "0.35", "kgamma": ".TRUE."}
+        first_config = VaspConfig(kspacing=0.30, kgamma=True)
+        second_config = VaspConfig(kspacing=0.35, kgamma=True)
 
         first_effective = inject_incar_defaults(template, first_config)
         second_effective = inject_incar_defaults(template, second_config)

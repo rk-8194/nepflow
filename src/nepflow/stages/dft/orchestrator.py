@@ -346,7 +346,7 @@ class VaspPreparationOrchestrator:
             input_files=input_files,
             incar_text=inject_incar_defaults(
                 incar_template.read_text(encoding="utf-8"),
-                config,
+                config.vasp,
             ),
         )
 

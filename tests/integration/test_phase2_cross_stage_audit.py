@@ -1,7 +1,6 @@
 import json
 import shutil
 import tempfile
-from configparser import ConfigParser
 from dataclasses import replace
 from pathlib import Path
 
@@ -14,6 +13,11 @@ pytest.importorskip("pymatgen")
 from ase.calculators.singlepoint import SinglePointCalculator  # noqa: E402
 from ase.io import read as ase_read  # noqa: E402
 
+from nepflow.config.models import (  # noqa: E402
+    CompositionConfig,
+    NepTrainingConfig,
+    NepflowConfig,
+)
 from nepflow.dft.vasp.inputs import read_identity  # noqa: E402
 from nepflow.dft.vasp.outputs import parse_outcar_result  # noqa: E402
 from nepflow.domain.datasets import (  # noqa: E402
@@ -74,11 +78,11 @@ def read_dft_fixture_as_vasp_result():
     return atoms
 
 
-def audit_config() -> ConfigParser:
-    config = ConfigParser()
-    config["composition"] = {"elements": "Si"}
-    config["train_nep"] = {"charge_mode": "0"}
-    return config
+def audit_config() -> NepflowConfig:
+    return NepflowConfig(
+        composition=CompositionConfig(elements=("Si",)),
+        train_nep=NepTrainingConfig(charge_mode=0),
+    )
 
 
 def empty_report(requested_count: int, accepted_results: list) -> dict:
@@ -163,7 +167,7 @@ def test_deterministic_dft_to_validation_identity_trace() -> None:
 
         # Rendered NEP input -> immutable hyperparameter identity.
         config = audit_config()
-        hyperparameters = NepHyperparameters.from_legacy_config(config)
+        hyperparameters = NepHyperparameters.from_config(config.composition, config.train_nep)
         (dataset_path / "nep.in").write_text(
             NepInputRenderer().render_content(hyperparameters), encoding="utf-8"
         )
@@ -171,9 +175,15 @@ def test_deterministic_dft_to_validation_identity_trace() -> None:
         nep_in_hash = sha256_file(nep_in)
         hyperparameters_hash = hyperparameters.identity_hash()
         variant_config = audit_config()
-        variant_config["train_nep"]["charge_mode"] = "1"
+        variant_config = replace(
+            variant_config,
+            train_nep=replace(variant_config.train_nep, charge_mode=1),
+        )
         assert (
-            NepHyperparameters.from_legacy_config(variant_config).identity_hash()
+            NepHyperparameters.from_config(
+                variant_config.composition,
+                variant_config.train_nep,
+            ).identity_hash()
             != hyperparameters_hash
         )
 
@@ -302,7 +312,11 @@ def test_deterministic_identity_state_trace_reopens_as_one_chain() -> None:
         outcar = project_dir / "OUTCAR"
         outcar.write_bytes(outcar_content)
         nep_in = project_dir / "nep.in"
-        effective_hyperparameters = NepHyperparameters.from_legacy_config(audit_config())
+        effective_config = audit_config()
+        effective_hyperparameters = NepHyperparameters.from_config(
+            effective_config.composition,
+            effective_config.train_nep,
+        )
         nep_in.write_text(
             NepInputRenderer().render_content(effective_hyperparameters),
             encoding="utf-8",
