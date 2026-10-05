@@ -1,6 +1,6 @@
 # Phase 2 Implementation Plan — Correctness Blockers
 
-**Workflow position:** 2 of 5  
+**Workflow position:** 2 of 7  
 **Required predecessor:** Phase 1 — Regression Tests  
 **Required successor:** Phase 3 — Shared Architectural Foundations  
 **Governing documents:** `.docs/MASTER_PDD.md`, `.docs/CODEBASE_ARCHITECTURE_AND_STYLE_PDD.md`  
