@@ -196,7 +196,12 @@ class ArtifactIdentity:
 
 @dataclass(frozen=True)
 class DftCalculationIdentity:
-    """Identity of scientific DFT inputs, separate from execution resources."""
+    """Identity of scientific DFT inputs, separate from execution resources.
+
+    Resource fields are retained in the historical identity payload for
+    compatibility.  In particular, ``gpus`` means GPUs per node; callers can
+    use :attr:`gpus_per_node` to make that scope explicit.
+    """
 
     structure_id: str
     incar_hash: str
@@ -211,6 +216,12 @@ class DftCalculationIdentity:
     gpus: int | None = None
     walltime: str | None = None
     calculation_id: str = field(init=False)
+
+    @property
+    def gpus_per_node(self) -> int | None:
+        """Return the legacy GPU field with its node scope made explicit."""
+
+        return self.gpus
 
     def __post_init__(self) -> None:
         payload = self.scientific_payload()

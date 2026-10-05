@@ -9,7 +9,14 @@ from typing import Any
 from nepflow.domain.identities import ArtifactIdentity, DftCalculationIdentity
 from nepflow.errors import StateError
 
-from ._record_codec import decode_json, decode_row, encode_json, identity_payload, now
+from ._record_codec import (
+    canonical_timestamp,
+    decode_json,
+    decode_row,
+    encode_json,
+    identity_payload,
+    now,
+)
 from ._typing import StateStoreMixinSupport, require_state_row
 
 
@@ -126,6 +133,8 @@ class DftRecordsMixin(StateStoreMixinSupport):
 
         if attempt_number < 1:
             raise StateError("DFT attempt_number must be positive")
+        started_at = canonical_timestamp(started_at)
+        completed_at = canonical_timestamp(completed_at)
         return self._write(
             lambda: self._write_dft_attempt(
                 calculation_id,
@@ -447,6 +456,8 @@ class DftRecordsMixin(StateStoreMixinSupport):
     ) -> dict[str, Any]:
         """Update mutable execution fields without replacing attempt history."""
 
+        started_at = canonical_timestamp(started_at)
+        completed_at = canonical_timestamp(completed_at)
         return self._write(
             lambda: self._update_dft_attempt(
                 attempt_id,

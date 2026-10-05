@@ -17,8 +17,14 @@ logger = logging.getLogger(__name__)
 def run_debug_selection(
     project_dir: Path,
     ase_structures: list | None = None,
+    *,
+    random_seed: int = 42,
 ) -> SelectionResult:
-    """Create the established deterministic random debug split."""
+    """Create the established deterministic random debug split.
+
+    The debug descriptor and split operations share this explicit local seed;
+    they never consume process-global NumPy RNG state.
+    """
 
     generated_path = project_dir / "structures" / "generated" / "generated_structures.xyz"
     if not generated_path.exists():
@@ -32,7 +38,7 @@ def run_debug_selection(
     n = len(ase_structures)
     logger.info("[DEBUG] Loaded %d structures from %s", n, generated_path)
 
-    rng = np.random.RandomState(42)
+    rng = np.random.RandomState(random_seed)
     representations = rng.randn(n, 10).astype(np.float64)
     logger.info(
         "[DEBUG] Generated in-memory random descriptors (%s); no scientific "

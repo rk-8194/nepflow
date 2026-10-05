@@ -7,6 +7,10 @@ from typing import Any, Sequence
 
 import numpy as np
 
+from nepflow.domain.units import (
+    VIRIAL_CONVENTION_POSITIVE_COMPRESSION,
+    VIRIAL_TENSOR_CONVENTION_CARTESIAN_3X3,
+)
 from nepflow.errors import ValidationError
 from nepflow.mlip.simulation import StaticPrediction
 
@@ -39,6 +43,8 @@ class PairedValidationCase:
     repeat_count: int
     dft_virial_ev: np.ndarray | None = None
     ml_virial_ev: np.ndarray | None = None
+    virial_convention: str = VIRIAL_CONVENTION_POSITIVE_COMPRESSION
+    virial_tensor_convention: str = VIRIAL_TENSOR_CONVENTION_CARTESIAN_3X3
 
     def __post_init__(self) -> None:
         try:
@@ -69,6 +75,15 @@ class PairedValidationCase:
             frozen.setflags(write=False)
             object.__setattr__(self, name, frozen)
         object.__setattr__(self, "reference_indices", tuple(int(i) for i in self.reference_indices))
+
+        if self.virial_convention != VIRIAL_CONVENTION_POSITIVE_COMPRESSION:
+            raise ValidationError(
+                "paired validation virial must use the positive-compression convention"
+            )
+        if self.virial_tensor_convention != VIRIAL_TENSOR_CONVENTION_CARTESIAN_3X3:
+            raise ValidationError(
+                "paired validation virial must use Cartesian 3x3 tensor ordering"
+            )
 
         if (self.dft_virial_ev is None) != (self.ml_virial_ev is None):
             raise ValidationError("paired validation virials must be present as a complete pair")
@@ -137,6 +152,15 @@ def pair_prediction(
     counts = {index: reference_indices.count(index) for index in range(case.atom_count)}
     if any(count != expected_repeats for count in counts.values()):
         raise ValidationError("prediction atom provenance does not cover each reference atom")
+    if case.reference.virial_ev is not None:
+        if prediction.virial_convention != VIRIAL_CONVENTION_POSITIVE_COMPRESSION:
+            raise ValidationError(
+                "prediction virial uses a convention incompatible with the DFT reference"
+            )
+        if prediction.virial_tensor_convention != VIRIAL_TENSOR_CONVENTION_CARTESIAN_3X3:
+            raise ValidationError(
+                "prediction virial tensor ordering is incompatible with the DFT reference"
+            )
 
     return PairedValidationCase(
         case_id=case.case_id,
@@ -152,6 +176,8 @@ def pair_prediction(
         # dataset did not request one; it must not turn an otherwise valid
         # non-virial comparison into a pairing error.
         ml_virial_ev=(prediction.virial_ev if case.reference.virial_ev is not None else None),
+        virial_convention=case.reference.virial_convention,
+        virial_tensor_convention=case.reference.virial_tensor_convention,
     )
 
 
@@ -202,6 +228,8 @@ def calculate_metrics(paired: Sequence[PairedValidationCase]) -> ValidationMetri
             if ml_virial is None or dft_virial is None:
                 raise ValidationError("virial labels must be present for every paired case")
             virial_pairs.append((ml_virial, dft_virial, item.repeat_count))
+        # Both boundaries carry positive-compression Cartesian tensors in eV;
+        # only replication normalization is needed before direct comparison.
         virial_errors = np.concatenate(
             [ml / repeat_count - dft for ml, dft, repeat_count in virial_pairs],
             axis=0,

@@ -14,6 +14,7 @@ from typing import Iterable
 import numpy as np
 
 from nepflow.dft.vasp.outputs import parse_stress_from_outcar
+from nepflow.domain.units import stress_ev_per_angstrom3_to_gpa
 
 VOIGT_LABELS = ("xx", "yy", "zz", "yz", "xz", "xy")
 
@@ -128,7 +129,7 @@ def parse_stress_tensor_gpa(outcar_path: Path) -> np.ndarray | None:
     stress = parse_stress_from_outcar(Path(outcar_path))
     if stress is None:
         return None
-    return np.asarray(stress, dtype=float) * 160.21766208
+    return stress_ev_per_angstrom3_to_gpa(stress)
 
 
 def fit_elastic_tensor(

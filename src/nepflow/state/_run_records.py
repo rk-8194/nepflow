@@ -7,7 +7,7 @@ from typing import Any
 from nepflow.domain.models import ModelRunRecord, ValidationRunRecord
 from nepflow.errors import StateError
 
-from ._record_codec import decode_json, decode_row, encode_json, now
+from ._record_codec import canonical_timestamp, decode_json, decode_row, encode_json, now
 from ._typing import StateStoreMixinSupport, require_state_row
 
 
@@ -24,6 +24,8 @@ class RunRecordsMixin(StateStoreMixinSupport):
     ) -> dict[str, Any]:
         """Insert or update one model-run identity and its artifact links."""
 
+        started_at = canonical_timestamp(started_at)
+        completed_at = canonical_timestamp(completed_at)
         return self._write(
             lambda: self._write_model_run(record, status, started_at, completed_at, now())
         )
@@ -108,6 +110,8 @@ class RunRecordsMixin(StateStoreMixinSupport):
     ) -> dict[str, Any]:
         """Insert or update one validation-run identity and artifact links."""
 
+        started_at = canonical_timestamp(started_at)
+        completed_at = canonical_timestamp(completed_at)
         return self._write(
             lambda: self._write_validation_run(record, status, started_at, completed_at, now())
         )

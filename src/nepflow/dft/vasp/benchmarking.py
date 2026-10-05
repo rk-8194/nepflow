@@ -126,25 +126,25 @@ def build_benchmark_resources(
     )
     if not ncores:
         ncores = (cores_per_node,)
-    gpus = tuple(gpu_values or _powers_of_two(gpus_per_node))
-    if not gpus:
-        gpus = (gpus_per_node,)
+    gpu_counts_per_node = tuple(gpu_values or _powers_of_two(gpus_per_node))
+    if not gpu_counts_per_node:
+        gpu_counts_per_node = (gpus_per_node,)
     kpars = tuple(kpar_values or _powers_of_two(gpus_per_node))
 
     result: list[VaspBenchmarkResource] = []
-    for gpu_count in sorted(set(gpus)):
-        if gpu_count < 1 or gpu_count > gpus_per_node:
+    for gpus_per_node_for_case in sorted(set(gpu_counts_per_node)):
+        if gpus_per_node_for_case < 1 or gpus_per_node_for_case > gpus_per_node:
             raise ValueError("each benchmark GPU count must fit on one node")
         for ncore in sorted(set(ncores)):
             if ncore < 1 or ncore > cores_per_node:
                 raise ValueError("each benchmark NCORE value must fit on one node")
             for kpar in sorted(set(kpars)):
-                if kpar < 1 or kpar > nodes * gpu_count:
+                if kpar < 1 or kpar > nodes * gpus_per_node_for_case:
                     continue
                 resources = JobResources(
                     nodes=nodes,
-                    gpus_per_node=gpu_count,
-                    mpi_ranks=nodes * gpu_count,
+                    gpus_per_node=gpus_per_node_for_case,
+                    mpi_ranks=nodes * gpus_per_node_for_case,
                     memory_per_node=memory_per_node,
                     walltime=walltime,
                 )

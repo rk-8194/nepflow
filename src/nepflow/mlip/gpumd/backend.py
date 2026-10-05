@@ -19,6 +19,7 @@ from ase.atoms import Atoms
 from ase.io import read as ase_read
 from ase.io import write as ase_write
 
+from nepflow.domain.units import virial_from_stress
 from nepflow.errors import MlipError
 from nepflow.io.hashing import sha256_file
 from nepflow.mlip.simulation import (
@@ -90,7 +91,7 @@ def _virial(atoms: Atoms, *, required: bool) -> np.ndarray | None:
         volume = float(atoms.get_volume())
         if not np.isfinite(volume) or volume <= 0:
             raise MlipError("GPUMD output stress requires a positive cell volume")
-        return -stress * volume
+        return virial_from_stress(stress, volume)
     if required:
         raise MlipError("GPUMD output is missing requested virial/stress")
     return None

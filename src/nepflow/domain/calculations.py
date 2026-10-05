@@ -12,11 +12,24 @@ from .identities import ArtifactIdentity, DftCalculationIdentity, _freeze
 
 @dataclass(frozen=True)
 class DftExecutionResources:
+    """Legacy DFT execution resources with explicitly documented scopes.
+
+    The ``gpus`` field is retained for persisted-record compatibility and
+    means GPUs per node.  New code should read :attr:`gpus_per_node`.
+    ``nodes`` and ``walltime`` retain the external VASP record spellings.
+    """
+
     nodes: str | None = None
     ncore: int | None = None
     kpar: int | None = None
     gpus: int | None = None
     walltime: str | None = None
+
+    @property
+    def gpus_per_node(self) -> int | None:
+        """Return the legacy GPU field with its node scope made explicit."""
+
+        return self.gpus
 
     def to_dict(self) -> dict[str, Any]:
         return {

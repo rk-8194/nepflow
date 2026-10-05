@@ -82,9 +82,42 @@ class JobResources:
 
     @property
     def tasks(self) -> int:
-        """Alias for MPI ranks at the scheduler boundary."""
+        """Compatibility alias for the total MPI-rank/task count."""
 
         return self.mpi_ranks
+
+    @property
+    def total_mpi_ranks(self) -> int:
+        """Return the total MPI ranks requested across all nodes."""
+
+        return self.mpi_ranks
+
+    @property
+    def total_cpus(self) -> int | None:
+        """Return total requested CPU slots when ``cpus_per_task`` is known."""
+
+        if self.cpus_per_task is None:
+            return None
+        return self.mpi_ranks * self.cpus_per_task
+
+    @property
+    def walltime_seconds(self) -> int | None:
+        """Return scheduler walltime as whole seconds, when configured."""
+
+        if self.walltime is None:
+            return None
+        if isinstance(self.walltime, timedelta):
+            return int(self.walltime.total_seconds())
+        match = _WALLTIME_PATTERN.fullmatch(self.walltime.strip())
+        if match is None:
+            raise ValueError("walltime must use HH:MM:SS or D-HH:MM:SS format")
+        days = int(match.group("days") or 0)
+        return (
+            days * 24 * 60 * 60
+            + int(match.group("hours")) * 60 * 60
+            + int(match.group("minutes")) * 60
+            + int(match.group("seconds"))
+        )
 
 
 def _validate_memory(value: MemoryValue | None, field_name: str) -> None:
@@ -129,6 +162,13 @@ def _format_walltime(value: str | timedelta) -> str:
 
 
 def _memory_to_megabytes(value: MemoryValue) -> int:
+    """Convert a scheduler memory value to whole megabytes.
+
+    Integer inputs are already MB.  Unit-bearing strings use binary
+    scheduler units (1024 MB per GiB) and are rounded up so a request never
+    falls below the configured amount.
+    """
+
     if isinstance(value, int):
         return value
     match = _MEMORY_PATTERN.fullmatch(value.strip())
@@ -181,9 +221,9 @@ def render_sbatch_directives(
         directives.append(f"#SBATCH --cpus-per-task={resources.cpus_per_task}")
     if resources.gpus_per_node:
         directives.append(f"#SBATCH --gpus-per-node={resources.gpus_per_node}")
-    memory = _render_memory(resources)
-    if memory is not None:
-        directives.append(f"#SBATCH --mem={memory}")
+    memory_directive = _render_memory(resources)
+    if memory_directive is not None:
+        directives.append(f"#SBATCH --mem={memory_directive}")
     if resources.walltime is not None:
         directives.append(f"#SBATCH --time={_format_walltime(resources.walltime)}")
     if resources.partition:

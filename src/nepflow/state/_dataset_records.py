@@ -7,7 +7,7 @@ from typing import Any
 from nepflow.domain.datasets import DatasetIdentity, SelectedDatasetMember, TrainingDatasetManifest
 from nepflow.errors import StateError
 
-from ._record_codec import decode_json, decode_row, encode_json, now
+from ._record_codec import canonical_timestamp, decode_json, decode_row, encode_json, now
 from ._typing import StateStoreMixinSupport, require_state_row
 
 
@@ -29,6 +29,8 @@ class DatasetRecordsMixin(StateStoreMixinSupport):
         else:
             identity = identity_or_manifest
             manifest = identity.to_dict()
+        if manifest.get("created_at") is not None:
+            manifest["created_at"] = canonical_timestamp(manifest["created_at"])
         return self._write(
             lambda: self._write_dataset(identity, manifest, project_id, status, now())
         )

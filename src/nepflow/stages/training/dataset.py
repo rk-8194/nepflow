@@ -15,7 +15,7 @@ import shutil
 import tempfile
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence, cast
@@ -40,6 +40,7 @@ from nepflow.domain.units import (
     VIRIAL_CONVENTION_POSITIVE_COMPRESSION,
     VIRIAL_TENSOR_CONVENTION_CARTESIAN_3X3,
     VIRIAL_UNIT_EV,
+    require_tensor_shape,
 )
 from nepflow.errors import StateError
 from nepflow.io.hashing import sha256_file
@@ -270,7 +271,10 @@ def _result_from_mapping(value: Mapping[str, Any]) -> VaspParseResult:
         force_unit=str(value.get("force_unit", FORCE_UNIT_EV_PER_ANGSTROM)),
         virial_unit=str(value.get("virial_unit", VIRIAL_UNIT_EV)),
         virial_convention=str(
-            value.get("virial_convention", VIRIAL_CONVENTION_POSITIVE_COMPRESSION)
+            value.get("virial_convention") or VIRIAL_CONVENTION_POSITIVE_COMPRESSION
+        ),
+        virial_tensor_convention=str(
+            value.get("virial_tensor_convention") or VIRIAL_TENSOR_CONVENTION_CARTESIAN_3X3
         ),
     )
 
@@ -283,6 +287,10 @@ def _canonical_record(
 ) -> dict[str, Any]:
     if not result.accepted:
         raise ValueError("Only accepted VASP results can become dataset records")
+    if result.virial_convention != VIRIAL_CONVENTION_POSITIVE_COMPRESSION:
+        raise ValueError("Dataset virial must use the positive-compression convention")
+    if result.virial_tensor_convention != VIRIAL_TENSOR_CONVENTION_CARTESIAN_3X3:
+        raise ValueError("Dataset virial must use Cartesian 3x3 tensor ordering")
     forces = cast(np.ndarray, result.forces_ev_per_angstrom)
     positions = cast(np.ndarray, result.positions_angstrom)
     lattice = cast(np.ndarray, result.lattice_angstrom)
@@ -450,7 +458,7 @@ def _build_report_manifest(
             "requested_train": reports[DatasetSplit.TRAIN].requested_count,
             "requested_test": reports[DatasetSplit.TEST].requested_count,
         },
-        created_at=datetime.now().isoformat(),
+        created_at=datetime.now(timezone.utc).isoformat(),
     )
 
 
@@ -1166,8 +1174,11 @@ def _validated_virial(
         return None
     if virial is None:
         raise ValueError("missing_required_virial")
-    virial_array = np.asarray(virial, dtype=float)
-    if virial_array.shape != (3, 3) or not np.isfinite(virial_array).all():
+    try:
+        virial_array = require_tensor_shape(virial, (3, 3), name="Dataset virial")
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Dataset virial is invalid") from exc
+    if not np.isfinite(virial_array).all():
         raise ValueError("Dataset virial is invalid")
     return virial_array
 

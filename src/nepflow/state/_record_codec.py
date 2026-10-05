@@ -18,6 +18,22 @@ def now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def canonical_timestamp(value: str | None) -> str | None:
+    """Validate and canonicalize an optional timezone-aware ISO timestamp."""
+
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise StateError("persisted timestamps must be ISO 8601 text")
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise StateError("persisted timestamps must be valid ISO 8601 text") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise StateError("persisted timestamps must include a timezone offset")
+    return parsed.astimezone(timezone.utc).isoformat()
+
+
 def encode_json(value: Any) -> str:
     """Encode a ledger value using canonical JSON."""
 

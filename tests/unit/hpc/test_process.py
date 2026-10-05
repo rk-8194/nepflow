@@ -4,7 +4,7 @@ from pathlib import Path
 import pytest
 
 from nepflow.errors import ProcessError
-from nepflow.hpc.process import ProcessRunner
+from nepflow.hpc.process import MonotonicElapsedTimer, ProcessRunner
 
 
 def python_command(source: str, *arguments: str) -> list[str]:
@@ -14,6 +14,12 @@ def python_command(source: str, *arguments: str) -> list[str]:
 def test_string_commands_require_explicit_shell_api() -> None:
     with pytest.raises(TypeError, match="argument list"):
         ProcessRunner().run("echo not-an-argument-list")  # type: ignore[arg-type]
+
+
+def test_elapsed_timer_uses_injected_monotonic_seconds() -> None:
+    ticks = iter((10.0, 10.75))
+    timer = MonotonicElapsedTimer(lambda: next(ticks))
+    assert timer.elapsed_seconds == 0.75
 
 
 def test_success_captures_stdout_and_stderr() -> None:

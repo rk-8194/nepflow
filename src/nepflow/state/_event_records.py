@@ -7,7 +7,7 @@ from uuid import uuid4
 
 from nepflow.errors import StateError
 
-from ._record_codec import decode_row, encode_json, now
+from ._record_codec import canonical_timestamp, decode_row, encode_json, now
 from ._typing import StateStoreMixinSupport
 
 
@@ -154,7 +154,7 @@ class EventRecordsMixin(StateStoreMixinSupport):
                 entity_id,
                 event_type,
                 encoded_payload,
-                occurred_at or now(),
+                canonical_timestamp(occurred_at) or now(),
             ),
         )
         row = self._connection.execute(

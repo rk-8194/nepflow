@@ -11,6 +11,10 @@ import numpy as np
 from nepflow.domain.datasets import DatasetIdentity, TrainingDatasetManifest
 from nepflow.domain.identities import ArtifactIdentity, ModelRunIdentity, StructureIdentity
 from nepflow.domain.models import ModelArtifactMetadata, ModelRunRecord
+from nepflow.domain.units import (
+    VIRIAL_CONVENTION_POSITIVE_COMPRESSION,
+    VIRIAL_TENSOR_CONVENTION_CARTESIAN_3X3,
+)
 from nepflow.errors import StateError
 from nepflow.io.hashing import sha256_file
 from nepflow.io.json import read_json_object
@@ -96,6 +100,13 @@ def _reference_from_record(record: Mapping[str, Any]) -> ValidationReference:
             None if record.get("virial") is None else np.asarray(record["virial"], dtype=float)
         ),
         metadata=metadata,
+        virial_convention=str(
+            record.get("virial_convention") or VIRIAL_CONVENTION_POSITIVE_COMPRESSION
+        ),
+        virial_tensor_convention=str(
+            record.get("virial_tensor_convention")
+            or VIRIAL_TENSOR_CONVENTION_CARTESIAN_3X3
+        ),
     )
 
 

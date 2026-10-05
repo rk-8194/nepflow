@@ -96,6 +96,9 @@ def test_resources_validate_gpu_and_memory_semantics() -> None:
     )
     assert resources.total_gpus == 8
     assert resources.tasks == 8
+    assert resources.total_mpi_ranks == 8
+    assert resources.total_cpus == 16
+    assert resources.walltime_seconds == 3723
     assert "#SBATCH --gpus-per-node=4" in render_sbatch_directives(resources)
     assert "#SBATCH --mem=64G" in render_sbatch_directives(resources)
 

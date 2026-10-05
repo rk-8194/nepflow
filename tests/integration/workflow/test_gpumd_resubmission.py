@@ -1,3 +1,4 @@
+from datetime import datetime
 import subprocess
 import sys
 import tempfile
@@ -43,6 +44,18 @@ class GpumdSelfResubmitTests(unittest.TestCase):
         )
         self.assertTrue(stop)
         self.assertIn("max segments", reason)
+
+    def test_segment_state_persists_timezone_aware_iso_timestamps(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / module.STATE_FILE_NAME
+            state = module.load_segment_state(state_path)
+            module.write_segment_state(state_path, state)
+            persisted = module.load_segment_state(state_path)
+
+        for field in ("created", "updated"):
+            parsed = datetime.fromisoformat(persisted[field])
+            self.assertIsNotNone(parsed.tzinfo)
+            self.assertIsNotNone(parsed.utcoffset())
 
     def test_gpumd_segment_uses_process_runner_boundary(self) -> None:
         runner = Mock()

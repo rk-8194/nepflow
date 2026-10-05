@@ -167,14 +167,16 @@ class DftStage:
                     retry_level=record.retry_level,
                     reason=failure.reason,
                 )
-            starting_gpu = record.resources.gpus_per_node if record.resources is not None else 1
+            starting_gpus_per_node = (
+                record.resources.gpus_per_node if record.resources is not None else 1
+            )
             initial_ncore = record.inputs.calculation.ncore or max(
                 2,
-                config.hpc.cores_per_node // max(1, starting_gpu),
+                config.hpc.cores_per_node // max(1, starting_gpus_per_node),
             )
             initial_kpar = record.inputs.calculation.kpar or 1
             decision = vasp_policy.decide(
-                starting_gpu=starting_gpu,
+                starting_gpu=starting_gpus_per_node,
                 initial_ncore=initial_ncore,
                 initial_kpar=initial_kpar,
                 retry_level=record.retry_level,
@@ -186,10 +188,11 @@ class DftStage:
                     reason=decision.reason,
                 )
             vasp_policy.apply(decision, record.inputs.working_directory)
+            gpus_per_node = decision.gpus_per_node or starting_gpus_per_node
             resources = JobResources(
                 nodes=decision.nodes or 1,
-                gpus_per_node=decision.gpus or starting_gpu,
-                mpi_ranks=decision.gpus or starting_gpu,
+                gpus_per_node=gpus_per_node,
+                mpi_ranks=gpus_per_node,
                 walltime=config.dft_recovery.vasp_walltime,
             )
             return DftRecoveryDecision(

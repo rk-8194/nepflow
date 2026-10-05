@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import shutil
-import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -14,25 +14,58 @@ STATE_FILE_NAME = ".gpumd_self_resubmit_state.json"
 DEFAULT_ARCHIVE_DIR = "final_xyz_history"
 
 
+def _utc_timestamp() -> str:
+    """Return a timezone-aware ISO 8601 timestamp for persisted state."""
+
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _canonical_timestamp(value: Any) -> str | None:
+    """Normalize current and legacy GPUMD state timestamps to UTC ISO 8601."""
+
+    if isinstance(value, (int, float)):
+        return datetime.fromtimestamp(float(value), timezone.utc).isoformat()
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise RuntimeError("GPUMD state timestamp is not valid ISO 8601") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc).isoformat()
+
+
+def _normalise_state_timestamps(state: dict[str, Any]) -> dict[str, Any]:
+    for field in ("created", "updated"):
+        if field in state:
+            timestamp = _canonical_timestamp(state[field])
+            if timestamp is not None:
+                state[field] = timestamp
+    return state
+
+
 def load_segment_state(state_path: Path) -> dict[str, Any]:
     """Load one segment state record, or return a new state."""
 
     state_path = Path(state_path)
     if not state_path.exists():
-        return {"segments_completed": 0, "history": [], "created": time.time()}
+        return {"segments_completed": 0, "history": [], "created": _utc_timestamp()}
     try:
         value = json.loads(state_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise RuntimeError(f"Could not read state file: {state_path}") from exc
     if not isinstance(value, dict):
         raise RuntimeError(f"GPUMD state file must contain an object: {state_path}")
-    return value
+    return _normalise_state_timestamps(value)
 
 
 def write_segment_state(state_path: Path, state: dict[str, Any]) -> None:
     """Persist the segment state with an update timestamp."""
 
-    state["updated"] = time.time()
+    state.setdefault("created", _utc_timestamp())
+    _normalise_state_timestamps(state)
+    state["updated"] = _utc_timestamp()
     Path(state_path).write_text(json.dumps(state, indent=2), encoding="utf-8")
 
 

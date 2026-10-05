@@ -16,6 +16,10 @@ import numpy as np
 
 from nepflow.domain.identities import StructureIdentity
 from nepflow.domain.models import ModelRunRecord
+from nepflow.domain.units import (
+    VIRIAL_CONVENTION_POSITIVE_COMPRESSION,
+    VIRIAL_TENSOR_CONVENTION_CARTESIAN_3X3,
+)
 from nepflow.errors import ValidationError
 from nepflow.io.hashing import sha256_canonical_json
 from nepflow.io.json import to_jsonable
@@ -84,6 +88,8 @@ class ValidationReference:
     forces_ev_per_angstrom: np.ndarray
     virial_ev: np.ndarray | None = None
     metadata: Mapping[str, Any] | None = None
+    virial_convention: str = VIRIAL_CONVENTION_POSITIVE_COMPRESSION
+    virial_tensor_convention: str = VIRIAL_TENSOR_CONVENTION_CARTESIAN_3X3
 
     def __post_init__(self) -> None:
         species = tuple(str(value) for value in self.species)
@@ -126,6 +132,14 @@ class ValidationReference:
                 self,
                 "virial_ev",
                 _immutable_array(self.virial_ev, (3, 3), "validation reference virial"),
+            )
+        if self.virial_convention != VIRIAL_CONVENTION_POSITIVE_COMPRESSION:
+            raise ValidationError(
+                "validation reference virial must use the positive-compression convention"
+            )
+        if self.virial_tensor_convention != VIRIAL_TENSOR_CONVENTION_CARTESIAN_3X3:
+            raise ValidationError(
+                "validation reference virial must use Cartesian 3x3 tensor ordering"
             )
         if self.metadata is not None:
             object.__setattr__(self, "metadata", to_jsonable(dict(self.metadata)))
@@ -179,6 +193,13 @@ class ValidationReference:
             forces_ev_per_angstrom=value["forces_ev_per_angstrom"],
             virial_ev=value.get("virial_ev"),
             metadata=value.get("metadata"),
+            virial_convention=str(
+                value.get("virial_convention") or VIRIAL_CONVENTION_POSITIVE_COMPRESSION
+            ),
+            virial_tensor_convention=str(
+                value.get("virial_tensor_convention")
+                or VIRIAL_TENSOR_CONVENTION_CARTESIAN_3X3
+            ),
         )
 
 

@@ -305,14 +305,14 @@ class WorkflowController:
     def _check_deadline(self) -> None:
         if self.slurm_deadline is None:
             return
-        current_time = time.time()
+        wall_clock_epoch_seconds = time.time()
         grace_period = 300
-        if current_time >= self.slurm_deadline:
+        if wall_clock_epoch_seconds >= self.slurm_deadline:
             raise SelfResubmitExit("SLURM walltime deadline reached, resubmitting workflow")
-        if current_time >= self.slurm_deadline - grace_period:
+        if wall_clock_epoch_seconds >= self.slurm_deadline - grace_period:
             logger.info(
                 "Approaching SLURM deadline (%.1fs remaining)",
-                self.slurm_deadline - current_time,
+                self.slurm_deadline - wall_clock_epoch_seconds,
             )
 
     def _execute_stage(

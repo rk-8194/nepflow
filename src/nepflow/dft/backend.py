@@ -126,6 +126,12 @@ class DftResult:
             if self.requirements.virial_requested:
                 raise BackendError("DFT result is missing requested virial/stress")
         else:
+            if self.virial_convention != VIRIAL_CONVENTION_POSITIVE_COMPRESSION:
+                raise BackendError(
+                    "DFT result virial must use the positive-compression convention"
+                )
+            if self.virial_tensor_convention != VIRIAL_TENSOR_CONVENTION_CARTESIAN_3X3:
+                raise BackendError("DFT result virial must use Cartesian 3x3 tensor ordering")
             virial = np.asarray(self.virial_ev, dtype=float)
             if virial.shape != (3, 3):
                 raise BackendError(f"DFT result virial must have shape (3, 3), got {virial.shape}")

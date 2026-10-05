@@ -35,7 +35,12 @@ def _elements(value: str) -> tuple[str, ...]:
 
 @dataclass(frozen=True, slots=True)
 class NepHyperparameters:
-    """The complete scientific NEP setting set used for rendering and identity."""
+    """The complete scientific NEP setting set used for rendering and identity.
+
+    ``cutoff`` and ``outer_zbl`` retain their legacy persisted/configuration
+    spellings.  Their explicit Angstrom accessors are available to scientific
+    callers without changing the NEP input or identity schema.
+    """
 
     elements: tuple[str, ...]
     gas_elements: tuple[str, ...]
@@ -71,6 +76,18 @@ class NepHyperparameters:
     @property
     def all_elements(self) -> tuple[str, ...]:
         return self.elements + self.gas_elements
+
+    @property
+    def cutoff_angstrom(self) -> tuple[float, ...]:
+        """Return configured radial cutoffs in Angstroms."""
+
+        return tuple(float(value) for value in self.cutoff)
+
+    @property
+    def outer_zbl_angstrom(self) -> float:
+        """Return the outer ZBL cutoff in Angstroms."""
+
+        return float(self.outer_zbl)
 
     @staticmethod
     def _float(value: float) -> str:

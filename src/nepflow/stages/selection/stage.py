@@ -88,6 +88,9 @@ class SelectionStage:
             result = run_debug_selection(
                 active.project_dir,
                 prepared["ase_structures"],
+                random_seed=int(
+                    getattr(getattr(active.config, "project", None), "random_seed", 42)
+                ),
             )
         else:
             result = self.execute(settings, prepared, context=active)

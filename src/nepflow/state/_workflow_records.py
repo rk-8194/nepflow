@@ -6,7 +6,7 @@ from typing import Any
 
 from nepflow.errors import StateError
 
-from ._record_codec import decode_row, encode_json, now
+from ._record_codec import canonical_timestamp, decode_row, encode_json, now
 from ._typing import StateStoreMixinSupport, require_state_row
 
 
@@ -91,6 +91,8 @@ class WorkflowRecordsMixin(StateStoreMixinSupport):
         """Insert or update one workflow stage-run record."""
 
         timestamp = now()
+        started_at = canonical_timestamp(started_at)
+        completed_at = canonical_timestamp(completed_at)
         return self._write(
             lambda: self._write_stage_run(
                 stage_run_id,
@@ -201,6 +203,8 @@ class WorkflowRecordsMixin(StateStoreMixinSupport):
         """Insert or update one selection-run record."""
 
         timestamp = now()
+        started_at = canonical_timestamp(started_at)
+        completed_at = canonical_timestamp(completed_at)
         return self._write(
             lambda: self._write_selection_run(
                 selection_run_id,

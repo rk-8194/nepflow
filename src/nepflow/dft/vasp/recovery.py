@@ -23,8 +23,9 @@ def build_retry_levels_for_gpu(
     The parser form remains for compatibility with existing recovery callers.
     New DFT stage code should use :func:`build_retry_levels_for_config`.
     """
+    starting_gpus_per_node = starting_gpu
     return _build_retry_levels(
-        starting_gpu,
+        starting_gpus_per_node,
         initial_ncore,
         initial_kpar,
         cores=config.getint("hpc", "cores_per_node", fallback=64),
@@ -41,8 +42,9 @@ def build_retry_levels_for_config(
 ) -> list[tuple[int, int, int, int]]:
     """Build retry levels from the canonical typed configuration."""
 
+    starting_gpus_per_node = starting_gpu
     return _build_retry_levels(
-        starting_gpu,
+        starting_gpus_per_node,
         initial_ncore,
         initial_kpar,
         cores=config.hpc.cores_per_node,
@@ -52,7 +54,7 @@ def build_retry_levels_for_config(
 
 
 def _build_retry_levels(
-    starting_gpu: int,
+    starting_gpus_per_node: int,
     initial_ncore: int,
     initial_kpar: int,
     *,
@@ -67,10 +69,10 @@ def _build_retry_levels(
 
     levels: list[tuple[int, int, int, int]] = []
     seen = set()
-    initial_key = (initial_ncore, initial_kpar, 1, starting_gpu)
+    initial_key = (initial_ncore, initial_kpar, 1, starting_gpus_per_node)
 
-    def add(ncore: int, kpar: int, nodes: int, gpus: int) -> None:
-        key = (ncore, kpar, nodes, gpus)
+    def add(ncore: int, kpar: int, nodes: int, gpus_per_node: int) -> None:
+        key = (ncore, kpar, nodes, gpus_per_node)
         if key not in seen and key != initial_key:
             seen.add(key)
             levels.append(key)
@@ -82,19 +84,19 @@ def _build_retry_levels(
             for ncore in valid_ncores:
                 add(ncore, kpar, 1, gpu_count)
 
-    sweep_gpu_tier(starting_gpu)
+    sweep_gpu_tier(starting_gpus_per_node)
 
     valid_gpus = sorted(g for g in [1, 2, 4, 8] if g <= gpus_per_node)
     for gpu in valid_gpus:
-        if gpu > starting_gpu:
+        if gpu > starting_gpus_per_node:
             sweep_gpu_tier(gpu)
 
-    highest_gpu = valid_gpus[-1] if valid_gpus else starting_gpu
+    highest_gpus_per_node = valid_gpus[-1] if valid_gpus else starting_gpus_per_node
     nodes = 2
     while nodes <= max_nodes:
-        kpar = nodes * highest_gpu
+        kpar = nodes * highest_gpus_per_node
         for ncore in valid_ncores:
-            add(ncore, kpar, nodes, highest_gpu)
+            add(ncore, kpar, nodes, highest_gpus_per_node)
         nodes *= 2
     return levels
 
@@ -143,6 +145,12 @@ class VaspRecoveryDecision:
     nodes: int | None = None
     gpus: int | None = None
     reason: str = ""
+
+    @property
+    def gpus_per_node(self) -> int | None:
+        """Return the legacy ``gpus`` value with its node scope explicit."""
+
+        return self.gpus
 
 
 class VaspRecoveryPolicy:
@@ -213,14 +221,14 @@ def decide_retry(
             retry_level=retry_level,
             reason="retry_limit_exhausted",
         )
-    ncore, kpar, nodes, gpus = levels[next_level - 1]
+    ncore, kpar, nodes, gpus_per_node = levels[next_level - 1]
     return VaspRecoveryDecision(
         retry=True,
         retry_level=next_level,
         ncore=ncore,
         kpar=kpar,
         nodes=nodes,
-        gpus=gpus,
+        gpus=gpus_per_node,
         reason="oom_escalation",
     )
 

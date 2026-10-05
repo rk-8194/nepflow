@@ -189,7 +189,7 @@ def _get_slurm_walltime_info() -> tuple[int | None, str]:
     if not slurm_job_id:
         return None, "not_in_slurm"
 
-    start_time = time.time()
+    wall_clock_epoch_seconds = time.time()
 
     # Try SLURM_JOB_END_TIME first (Unix timestamp, most accurate)
     slurm_job_end_time = os.environ.get("SLURM_JOB_END_TIME")
@@ -197,7 +197,7 @@ def _get_slurm_walltime_info() -> tuple[int | None, str]:
 
     if slurm_job_end_time:
         try:
-            remaining = int(slurm_job_end_time) - int(start_time)
+            remaining = int(slurm_job_end_time) - int(wall_clock_epoch_seconds)
             logger.debug("Using SLURM_JOB_END_TIME: remaining=%d", remaining)
             return remaining, "SLURM_JOB_END_TIME"
         except (ValueError, TypeError) as e:
@@ -297,14 +297,14 @@ def _resolve_slurm_deadline() -> float | None:
     if walltime_remaining is None:
         logger.info("Not running under SLURM - no walltime limit, workflow will run indefinitely")
         return None
-    deadline = time.time() + walltime_remaining - margin_seconds
+    wall_clock_deadline_epoch_seconds = time.time() + walltime_remaining - margin_seconds
     logger.info(
         "SLURM walltime: %ds (source: %s), deadline in %ds",
         walltime_remaining,
         walltime_source,
         walltime_remaining - margin_seconds,
     )
-    return deadline
+    return wall_clock_deadline_epoch_seconds
 
 
 def _create_controller(

@@ -14,7 +14,7 @@ import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from nepflow.errors import ProcessError
 
@@ -87,11 +87,31 @@ class ProcessResult:
         return self.returncode == 0
 
 
+class MonotonicElapsedTimer:
+    """Small injectable elapsed-time boundary backed by a monotonic clock."""
+
+    def __init__(self, clock: Callable[[], float] = time.monotonic) -> None:
+        self._clock = clock
+        self._started = clock()
+
+    @property
+    def elapsed_seconds(self) -> float:
+        """Return elapsed wall duration in seconds, never a wall timestamp."""
+
+        return self._clock() - self._started
+
+
 class ProcessRunner:
     """Run argument-list commands with one consistent failure contract."""
 
-    def __init__(self, logger: logging.Logger | None = None) -> None:
+    def __init__(
+        self,
+        logger: logging.Logger | None = None,
+        *,
+        monotonic_clock: Callable[[], float] = time.monotonic,
+    ) -> None:
         self.logger = logger or logging.getLogger(__name__)
+        self._monotonic_clock = monotonic_clock
 
     def run(
         self,
@@ -182,7 +202,7 @@ class ProcessRunner:
             cwd_value or "<inherited>",
         )
 
-        started = time.monotonic()
+        elapsed_timer = MonotonicElapsedTimer(self._monotonic_clock)
         try:
             completed = subprocess.run(
                 command[0] if shell else command,
@@ -231,7 +251,7 @@ class ProcessRunner:
             returncode=completed.returncode,
             stdout=_text_output(completed.stdout),
             stderr=_text_output(completed.stderr),
-            duration_seconds=time.monotonic() - started,
+            duration_seconds=elapsed_timer.elapsed_seconds,
         )
         if check and not result.ok:
             raise ProcessError(
@@ -246,4 +266,4 @@ class ProcessRunner:
         return result
 
 
-__all__ = ["ProcessError", "ProcessResult", "ProcessRunner"]
+__all__ = ["MonotonicElapsedTimer", "ProcessError", "ProcessResult", "ProcessRunner"]

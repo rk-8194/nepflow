@@ -21,6 +21,7 @@ from nepflow.domain.units import (
     ENERGY_UNIT_EV,
     FORCE_UNIT_EV_PER_ANGSTROM,
     VIRIAL_CONVENTION_POSITIVE_COMPRESSION,
+    VIRIAL_TENSOR_CONVENTION_CARTESIAN_3X3,
     VIRIAL_UNIT_EV,
     stress_kbar_to_ev_per_angstrom3,
     virial_from_stress,
@@ -143,7 +144,12 @@ def _parse_text_stress(outcar_text: str) -> np.ndarray | None:
 
 
 def parse_virial_from_outcar(outcar_path: Path, volume: float) -> np.ndarray | None:
-    """Parse VASP stress and convert it to NEPFlow's virial convention."""
+    """Parse VASP stress and convert it to a positive-compression virial.
+
+    ``volume`` is the positive cell volume in Angstrom^3.  The returned
+    Cartesian 3x3 tensor is in eV and applies exactly
+    ``virial = -stress[eV/Angstrom^3] * volume[Angstrom^3]``.
+    """
     try:
         # Keep the verified Phase 2 text semantics for the canonical virial
         # result even when ASE offers a different OUTCAR interpretation.
@@ -221,6 +227,7 @@ class VaspParseResult:
     force_unit: str = FORCE_UNIT_EV_PER_ANGSTROM
     virial_unit: str = VIRIAL_UNIT_EV
     virial_convention: str = VIRIAL_CONVENTION_POSITIVE_COMPRESSION
+    virial_tensor_convention: str = VIRIAL_TENSOR_CONVENTION_CARTESIAN_3X3
 
     def __post_init__(self) -> None:
         for field_name in (
@@ -234,6 +241,10 @@ class VaspParseResult:
                 immutable = np.array(value, dtype=float, copy=True)
                 immutable.setflags(write=False)
                 object.__setattr__(self, field_name, immutable)
+        if self.virial_convention != VIRIAL_CONVENTION_POSITIVE_COMPRESSION:
+            raise ValueError("VASP virial must use the positive-compression convention")
+        if self.virial_tensor_convention != VIRIAL_TENSOR_CONVENTION_CARTESIAN_3X3:
+            raise ValueError("VASP virial must use Cartesian 3x3 tensor ordering")
 
     @property
     def accepted(self) -> bool:
@@ -258,6 +269,7 @@ class VaspParseResult:
             "force_unit": self.force_unit,
             "virial_unit": self.virial_unit,
             "virial_convention": self.virial_convention,
+            "virial_tensor_convention": self.virial_tensor_convention,
         }
 
 
@@ -708,15 +720,18 @@ def parse_memory_record(outcar_path: Path, gpus_per_node: int) -> dict[str, obje
         raise VaspMemoryParseError(
             f"Completed OUTCAR has incomplete performance evidence: {outcar_path}"
         )
-    total_ranks = performance.total_ranks
-    nodes = max(1, total_ranks // gpus_per_node) if total_ranks > 0 else 1
-    gpus = total_ranks if total_ranks > 0 else gpus_per_node
+    total_mpi_ranks = performance.total_ranks
+    nodes = max(1, total_mpi_ranks // gpus_per_node) if total_mpi_ranks > 0 else 1
+    total_gpus = total_mpi_ranks if total_mpi_ranks > 0 else gpus_per_node
     return {
         "n_atoms": n_atoms,
         "n_kpoints_irr": performance.irreducible_kpoints,
         "n_electrons": int(performance.electrons),
         "nodes": nodes,
-        "gpus": gpus,
+        # ``gpus`` is a legacy output key.  Its historical value is the
+        # total rank/GPU count, so keep it while naming the internal value
+        # explicitly to avoid confusing it with GPUs per node.
+        "gpus": total_gpus,
         "ncore": ncore,
         "kpar": kpar,
         "avg_loop_time": f"{performance.average_loop_time:.4f}",
