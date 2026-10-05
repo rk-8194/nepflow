@@ -14,7 +14,7 @@ from nepflow.domain.units import (
 from nepflow.errors import ValidationError
 from nepflow.mlip.simulation import StaticPrediction
 
-from .protocols import VALIDATION_RESULT_SCHEMA, ValidationCaseSpec
+from .protocols import ValidationCaseSpec
 
 
 def _finite(values: Any, label: str) -> np.ndarray:
@@ -121,14 +121,6 @@ class ValidationMetrics:
             "force_magnitude_rmse": self.force_magnitude_rmse,
             "virial_mae": self.virial_mae,
             "virial_rmse": self.virial_rmse,
-        }
-
-    def to_report(self) -> dict[str, Any]:
-        """Return the versioned aggregate result report persisted in StateStore."""
-
-        return {
-            "schema_version": VALIDATION_RESULT_SCHEMA,
-            "metrics": self.to_dict(),
         }
 
 
@@ -263,7 +255,6 @@ calculate_validation_metrics = calculate_metrics
 
 __all__ = [
     "PairedValidationCase",
-    "VALIDATION_RESULT_SCHEMA",
     "ValidationMetrics",
     "calculate_metrics",
     "calculate_validation_metrics",

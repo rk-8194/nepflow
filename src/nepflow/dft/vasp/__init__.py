@@ -19,7 +19,6 @@ from .benchmarking import (
 )
 from .failures import VaspFailureEvidence, classify_failure
 from .inputs import (
-    VASP_IDENTITY_SCHEMA,
     VaspInputContext,
     VaspInputIdentity,
     build_input_context,
@@ -67,7 +66,6 @@ __all__ = [
     "VaspBenchmarkRunner",
     "VaspBenchmarkTarget",
     "VaspBackend",
-    "VASP_IDENTITY_SCHEMA",
     "VaspFailureEvidence",
     "VaspInputIdentity",
     "VaspJobEvidence",

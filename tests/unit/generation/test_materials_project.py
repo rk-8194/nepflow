@@ -44,7 +44,7 @@ def make_document(formula: str = "Si") -> SimpleNamespace:
     )
 
 
-def test_query_identity_includes_type_inputs_and_cache_schema() -> None:
+def test_query_identity_includes_type_inputs_and_schema() -> None:
     pure = MaterialsProjectQuery(
         query_type="pure_structures",
         elements=("Si",),
@@ -57,7 +57,7 @@ def test_query_identity_includes_type_inputs_and_cache_schema() -> None:
     )
 
     assert pure.query_id != compound.query_id
-    assert pure.payload()["cache_schema"]
+    assert "schema_version" not in pure.payload()
     assert (
         pure.query_id
         == MaterialsProjectQuery(
@@ -84,7 +84,7 @@ def test_cache_rejects_corruption_and_identity_mismatch(tmp_path: Path) -> None:
     other_path.write_text(
         json.dumps(
             {
-                "cache_schema": "materials-project-cache-v1",
+                "schema_version": "materials-project-cache-v1",
                 "query_id": query.query_id,
                 "query": query.payload(),
                 "records": [],
@@ -94,6 +94,23 @@ def test_cache_rejects_corruption_and_identity_mismatch(tmp_path: Path) -> None:
     )
     with pytest.raises(MaterialsProjectCacheError, match="identity|query"):
         cache.load(other)
+
+
+@pytest.mark.parametrize("mutation", ["missing", "wrong"])
+def test_cache_requires_matching_record_content_hash(tmp_path: Path, mutation: str) -> None:
+    cache = MaterialsProjectCache(tmp_path)
+    query = MaterialsProjectQuery("compounds", ("Si",), max_per_query=1)
+    cache.save(query, [{"material_id": "mp-1"}])
+    path = cache.path_for(query)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if mutation == "missing":
+        del payload["records_sha256"]
+    else:
+        payload["records_sha256"] = "0" * 64
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(MaterialsProjectCacheError, match="records"):
+        cache.load(query)
 
 
 def test_cache_save_is_atomic_and_leaves_no_temporary_files(tmp_path: Path) -> None:

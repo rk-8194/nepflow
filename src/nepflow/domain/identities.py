@@ -21,7 +21,7 @@ ARTIFACT_IDENTITY_SCHEMA = "nepflow.artifact_identity.v1"
 DFT_CALCULATION_IDENTITY_SCHEMA = "nepflow.dft_calculation_identity.v1"
 MODEL_RUN_IDENTITY_SCHEMA = "nepflow.model_run_identity.v1"
 VALIDATION_RUN_IDENTITY_SCHEMA = "nepflow.validation_run_identity.v1"
-DESCRIPTOR_CACHE_SCHEMA = "descriptor-cache-v1"
+DESCRIPTOR_CACHE_SCHEMA = "descriptor-cache-v2"
 
 
 def _format_vector(values: Sequence[float]) -> str:

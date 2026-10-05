@@ -33,12 +33,16 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
-from nepflow.dft.vasp.inputs import VASP_IDENTITY_SCHEMA, strip_resource_incar_params
+from nepflow.dft.vasp.inputs import strip_resource_incar_params
 from nepflow.dft.vasp.outputs import outcar_is_complete
 from nepflow.dft.vasp.registry import (
     read_completed_registry,
 )
-from nepflow.domain.identities import DftCalculationIdentity, calculate_structure_id
+from nepflow.domain.identities import (
+    DFT_CALCULATION_IDENTITY_SCHEMA,
+    DftCalculationIdentity,
+    calculate_structure_id,
+)
 from nepflow.errors import ArtifactError
 from nepflow.io.hashing import sha256_bytes, sha256_file
 from nepflow.io.json import write_json
@@ -262,7 +266,7 @@ def write_identity(struct_dir: Path, entry: dict, dry_run: bool) -> bool:
     if identity_path.exists():
         return False
     identity = {
-        "schema_version": VASP_IDENTITY_SCHEMA,
+        "schema_version": DFT_CALCULATION_IDENTITY_SCHEMA,
         "project_name": entry.get("project_name", ""),
         "dataset": entry.get("dataset", ""),
         "selected_index": entry.get("selected_index"),

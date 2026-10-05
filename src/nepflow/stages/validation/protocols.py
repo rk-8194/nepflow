@@ -27,8 +27,6 @@ from nepflow.mlip.simulation import StaticPredictionRequest
 
 VALIDATION_CASE_SCHEMA = "nepflow.validation_case.v1"
 VALIDATION_PREPARATION_SCHEMA = "nepflow.validation_preparation.v1"
-VALIDATION_REFERENCE_SCHEMA = "nepflow.validation_reference.v1"
-VALIDATION_RESULT_SCHEMA = "nepflow.validation_result.v1"
 
 AtomMapping = tuple[tuple[int, int, int, int], ...]
 
@@ -80,7 +78,11 @@ def _pbc(value: Any) -> tuple[bool, bool, bool]:
 
 @dataclass(frozen=True, slots=True)
 class ValidationReference:
-    """Authoritative DFT labels and geometry for one validation structure."""
+    """Authoritative DFT labels and geometry for one validation case.
+
+    This typed nested record intentionally has no independent persisted schema;
+    ``ValidationCaseSpec`` owns the serialized case contract.
+    """
 
     structure: StructureIdentity
     species: tuple[str, ...]
@@ -94,14 +96,7 @@ class ValidationReference:
     virial_convention: str = VIRIAL_CONVENTION_POSITIVE_COMPRESSION
     virial_tensor_convention: str = VIRIAL_TENSOR_CONVENTION_CARTESIAN_3X3
 
-    schema_version: str = VALIDATION_REFERENCE_SCHEMA
-
     def __post_init__(self) -> None:
-        if self.schema_version != VALIDATION_REFERENCE_SCHEMA:
-            raise ValidationError(
-                f"unsupported validation reference schema {self.schema_version!r}; "
-                f"expected {VALIDATION_REFERENCE_SCHEMA!r}"
-            )
         species = tuple(str(value) for value in self.species)
         if not species:
             raise ValidationError("validation reference must contain at least one atom")
@@ -164,7 +159,6 @@ class ValidationReference:
 
     def to_dict(self) -> dict[str, Any]:
         result: dict[str, Any] = {
-            "schema_version": self.schema_version,
             "structure": self.structure.to_dict(),
             "species": list(self.species),
             "positions_angstrom": self.positions_angstrom.tolist(),
@@ -211,7 +205,6 @@ class ValidationReference:
                 value.get("virial_tensor_convention")
                 or VIRIAL_TENSOR_CONVENTION_CARTESIAN_3X3
             ),
-            schema_version=str(value["schema_version"]),
         )
 
 
@@ -529,8 +522,6 @@ ValidationCase = ValidationCaseSpec
 __all__ = [
     "VALIDATION_CASE_SCHEMA",
     "VALIDATION_PREPARATION_SCHEMA",
-    "VALIDATION_REFERENCE_SCHEMA",
-    "VALIDATION_RESULT_SCHEMA",
     "ValidationCaseSpec",
     "ValidationCase",
     "ValidationPreparation",

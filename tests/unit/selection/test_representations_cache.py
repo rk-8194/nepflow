@@ -12,7 +12,7 @@ pytest.importorskip("NepTrainKit")
 
 from nepflow.stages.selection import representations as DESCRIPTORS  # noqa: E402
 
-CACHE_SCHEMA_VERSION = "descriptor-cache-v1"
+CACHE_SCHEMA_VERSION = "descriptor-cache-v2"
 
 
 class CacheStructure:
@@ -71,7 +71,8 @@ class DescriptorTests(unittest.TestCase):
         cache_dir = project_dir / "nep" / "datasets"
         cache_dir.mkdir(parents=True, exist_ok=True)
         cached = np.arange(np.prod(cached_shape), dtype=float).reshape(cached_shape)
-        np.save(cache_dir / "descriptors.npy", cached)
+        cache_path = cache_dir / "descriptors.npy"
+        np.save(cache_path, cached)
 
         model_dir = project_dir / "config" / "nep"
         model_dir.mkdir(parents=True, exist_ok=True)
@@ -88,6 +89,7 @@ class DescriptorTests(unittest.TestCase):
                 },
                 "settings": {"mean_descriptor": mean_descriptor},
                 "descriptor_shape": list(cached.shape),
+                "artifact_sha256": hashlib.sha256(cache_path.read_bytes()).hexdigest(),
             }
             self.cache_manifest_path(project_dir).write_text(
                 json.dumps(manifest),
@@ -288,6 +290,30 @@ class DescriptorTests(unittest.TestCase):
 
             self.assert_cache_recomputed(project_dir, structures)
 
+    def test_missing_descriptor_artifact_hash_invalidates_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_dir = Path(tmp)
+            structures = [CacheStructure(f"structure-{i}") for i in range(3)]
+            self.write_cache_fixture(project_dir, structures)
+            manifest_path = self.cache_manifest_path(project_dir)
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            del manifest["artifact_sha256"]
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+            self.assert_cache_recomputed(project_dir, structures)
+
+    def test_wrong_descriptor_artifact_hash_invalidates_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_dir = Path(tmp)
+            structures = [CacheStructure(f"structure-{i}") for i in range(3)]
+            self.write_cache_fixture(project_dir, structures)
+            manifest_path = self.cache_manifest_path(project_dir)
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["artifact_sha256"] = "0" * 64
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+            self.assert_cache_recomputed(project_dir, structures)
+
     def test_load_or_calculate_representations_computes_and_saves_when_missing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_dir = Path(tmp)
@@ -357,6 +383,10 @@ class DescriptorTests(unittest.TestCase):
             self.assertTrue(manifest_path.exists())
             np.testing.assert_array_equal(saved, descriptors)
             self.assertEqual(manifest["descriptor_shape"], list(saved.shape))
+            self.assertEqual(
+                manifest["artifact_sha256"],
+                hashlib.sha256(cache_path.read_bytes()).hexdigest(),
+            )
 
     def test_load_or_calculate_representations_raises_when_model_file_missing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

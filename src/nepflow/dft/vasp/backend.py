@@ -30,7 +30,6 @@ from nepflow.io.json import write_json
 
 from .failures import VaspFailureEvidence, classify_failure
 from .inputs import (
-    VASP_IDENTITY_SCHEMA,
     canonical_poscar_bytes,
     hash_incar_text,
     identity_for_structure,
@@ -223,7 +222,6 @@ class VaspBackend:
             write_json(
                 working / ".vasp_identity",
                 {
-                    "schema_version": VASP_IDENTITY_SCHEMA,
                     **calculation.scientific_payload(),
                     "calculation_id": calculation.calculation_id,
                 },

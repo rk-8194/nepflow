@@ -149,7 +149,7 @@ def test_selected_dataset_member_promotes_calculation_id() -> None:
 def test_descriptor_cache_identity_preserves_order_and_manifest_fields() -> None:
     identity = DescriptorCacheIdentity(("s1", "s2"), "nep89.txt", "model-sha", True, (2, 4))
     assert identity.to_manifest() == {
-        "schema_version": "descriptor-cache-v1",
+        "schema_version": "descriptor-cache-v2",
         "structure_ids": ["s1", "s2"],
         "model": {"filename": "nep89.txt", "sha256": "model-sha"},
         "settings": {"mean_descriptor": True},

@@ -7,6 +7,7 @@ from nepflow.dft.vasp.backend import VaspBackend
 from nepflow.dft.vasp.inputs import hash_incar_text, identity_for_structure, read_identity
 from nepflow.domain.identities import DftCalculationIdentity, StructureIdentity
 from nepflow.errors import BackendError
+from nepflow.io.json import read_json
 
 
 def test_vasp_backend_prepares_canonical_inputs_and_argument_command(tmp_path) -> None:
@@ -40,9 +41,15 @@ def test_vasp_backend_prepares_canonical_inputs_and_argument_command(tmp_path) -
 
     sidecar = read_identity(prepared.working_directory)
     assert sidecar == {
-        **prepared.calculation.scientific_payload(),
+        **{
+            key: value
+            for key, value in prepared.calculation.scientific_payload().items()
+            if key != "schema_version"
+        },
         "calculation_id": prepared.calculation.calculation_id,
     }
+    persisted = read_json(prepared.working_directory / ".vasp_identity", require_object=True)
+    assert persisted == prepared.calculation.to_dict()
     reconstructed = DftCalculationIdentity(
         structure_id=sidecar["structure_id"],
         incar_hash=sidecar["incar_hash"],

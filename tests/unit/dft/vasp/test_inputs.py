@@ -1,5 +1,6 @@
 from configparser import ConfigParser
 
+import pytest
 from ase import Atoms
 
 from nepflow.dft.vasp.inputs import (
@@ -9,7 +10,9 @@ from nepflow.dft.vasp.inputs import (
     inject_incar_defaults,
     read_identity,
 )
+from nepflow.domain.identities import DftCalculationIdentity
 from nepflow.errors import StateError
+from nepflow.io.json import write_json
 
 
 def test_poscar_text_and_bytes_are_one_canonical_representation() -> None:
@@ -46,3 +49,12 @@ def test_missing_identity_is_optional_but_malformed_identity_fails(tmp_path) -> 
         assert "structure_id" in str(exc)
     else:
         raise AssertionError("malformed present identity did not fail")
+
+
+def test_unknown_identity_schema_is_rejected(tmp_path) -> None:
+    identity = DftCalculationIdentity("structure", "incar", "potcar").to_dict()
+    identity["schema_version"] = "nepflow.unknown_identity.v999"
+    write_json(tmp_path / ".vasp_identity", identity)
+
+    with pytest.raises(StateError, match="schema"):
+        read_identity(tmp_path)

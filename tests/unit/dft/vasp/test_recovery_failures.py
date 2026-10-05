@@ -2,6 +2,7 @@ from configparser import ConfigParser
 
 import pytest
 
+import nepflow.dft.vasp.recovery as recovery_module
 from nepflow.dft.backend import DftCompletionEvidence, DftFailureEvidence
 from nepflow.dft.vasp.backend import VaspBackend
 from nepflow.dft.vasp.failures import (
@@ -94,13 +95,11 @@ def test_recovery_application_fails_explicitly_and_preserves_scientific_hash(tmp
 def test_recovery_write_failure_is_typed(monkeypatch, tmp_path) -> None:
     incar = tmp_path / "INCAR"
     incar.write_text("NCORE = 2\nKPAR = 1\n")
-    original_write_text = type(incar).write_text
 
     def fail_write(path, *args, **kwargs):
         if path == incar:
             raise OSError("read-only test")
-        return original_write_text(path, *args, **kwargs)
 
-    monkeypatch.setattr(type(incar), "write_text", fail_write)
+    monkeypatch.setattr(recovery_module, "atomic_write_text", fail_write)
     with pytest.raises(VaspError, match="Could not apply"):
         write_incar_resource_parameters(tmp_path, 8, 4)

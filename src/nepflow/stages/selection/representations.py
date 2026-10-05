@@ -173,10 +173,11 @@ def _load_valid_cached_descriptors(
         if not np.all(np.isfinite(descriptors)):
             return None
         expected_cache_hash = manifest.get("artifact_sha256")
-        if expected_cache_hash is not None:
-            actual_cache_hash = sha256_file(descriptor_cache, required=True, error_type=StateError)
-            if actual_cache_hash != expected_cache_hash:
-                return None
+        if not isinstance(expected_cache_hash, str) or not expected_cache_hash:
+            return None
+        actual_cache_hash = sha256_file(descriptor_cache, required=True, error_type=StateError)
+        if actual_cache_hash != expected_cache_hash:
+            return None
         return descriptors
     except (OSError, StateError, TypeError, ValueError, EOFError) as exc:
         logger.warning("  Ignoring invalid descriptor cache metadata: %s", exc)

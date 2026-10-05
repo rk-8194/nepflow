@@ -19,6 +19,7 @@ import numpy as np
 from nepflow.config import load_config
 from nepflow.config.models import NepflowConfig
 from nepflow.domain.identities import (
+    DFT_CALCULATION_IDENTITY_SCHEMA,
     DftCalculationIdentity,
     calculate_structure_id,
     normalise_dft_calculation_identity,
@@ -26,8 +27,6 @@ from nepflow.domain.identities import (
 from nepflow.errors import StateError
 from nepflow.io.hashing import sha256_bytes
 from nepflow.io.json import read_json
-
-VASP_IDENTITY_SCHEMA = "nepflow.vasp_identity.v1"
 
 
 def canonical_poscar_text(atoms) -> str:
@@ -257,19 +256,32 @@ def read_identity(struct_dir: Path) -> dict:
     if not identity_path.exists():
         return {}
     data = read_json(identity_path, error_type=StateError, require_object=True)
-    schema_version = data.pop("schema_version", None)
-    if schema_version not in (None, VASP_IDENTITY_SCHEMA):
-        raise StateError(f"Unsupported VASP identity schema: {schema_version!r}")
+    schema_version = data.get("schema_version")
+    if schema_version not in (None, DFT_CALCULATION_IDENTITY_SCHEMA):
+        raise StateError(f"Unsupported DFT calculation identity schema: {schema_version!r}")
+    data.pop("schema_version", None)
+    # A missing schema is the explicitly supported pre-Phase-4 sidecar form;
+    # normalise it once for historical readers without making it current.
     data = normalise_dft_calculation_identity(data)
     for key in ("structure_id", "incar_hash", "potcar_hash", "calculation_id"):
         value = data.get(key)
         if not isinstance(value, str) or not value.strip():
             raise StateError(f"VASP identity is missing a valid {key}: {identity_path}")
+    reconstructed = DftCalculationIdentity(
+        structure_id=data["structure_id"],
+        incar_hash=data["incar_hash"],
+        potcar_hash=data["potcar_hash"],
+        poscar_hash=data.get("poscar_hash"),
+        kpoints_hash=data.get("kpoints_hash"),
+        backend_inputs_hash=data.get("backend_inputs_hash"),
+        executable_version=data.get("executable_version"),
+    )
+    if data["calculation_id"] != reconstructed.calculation_id:
+        raise StateError(f"VASP identity calculation_id does not match its fields: {identity_path}")
     return data
 
 
 __all__ = [
-    "VASP_IDENTITY_SCHEMA",
     "VaspInputContext",
     "VaspInputIdentity",
     "canonical_poscar_bytes",

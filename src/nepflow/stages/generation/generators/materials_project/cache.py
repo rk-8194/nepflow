@@ -12,7 +12,7 @@ from nepflow.errors import ArtifactError
 from nepflow.io.hashing import sha256_canonical_json
 from nepflow.io.json import read_json_object, to_jsonable, write_json
 
-MATERIALS_PROJECT_CACHE_SCHEMA = "materials-project-cache-v1"
+MATERIALS_PROJECT_CACHE_SCHEMA = "materials-project-cache-v2"
 
 
 class MaterialsProjectCacheError(ArtifactError):
@@ -30,7 +30,6 @@ class MaterialsProjectQuery:
 
     def payload(self) -> dict[str, Any]:
         return {
-            "cache_schema": MATERIALS_PROJECT_CACHE_SCHEMA,
             "query_type": self.query_type,
             "elements": sorted(set(self.elements)),
             "crystal_structures": sorted(set(self.crystal_structures)),
@@ -39,7 +38,12 @@ class MaterialsProjectQuery:
 
     @property
     def query_id(self) -> str:
-        return sha256_canonical_json(self.payload())
+        return sha256_canonical_json(
+            {
+                "schema_version": MATERIALS_PROJECT_CACHE_SCHEMA,
+                "query": self.payload(),
+            }
+        )
 
 
 class MaterialsProjectCache:
@@ -60,8 +64,6 @@ class MaterialsProjectCache:
             payload = read_json_object(path, error_type=MaterialsProjectCacheError)
         except (OSError, UnicodeError, ValueError, MaterialsProjectCacheError) as exc:
             raise MaterialsProjectCacheError(f"Malformed Materials Project cache: {path}") from exc
-        if payload.get("cache_schema") != MATERIALS_PROJECT_CACHE_SCHEMA:
-            raise MaterialsProjectCacheError(f"Unsupported Materials Project cache schema: {path}")
         if payload.get("query_id") != query.query_id:
             raise MaterialsProjectCacheError(f"Materials Project cache identity mismatch: {path}")
         if payload.get("query") != query.payload():
@@ -89,7 +91,6 @@ class MaterialsProjectCache:
         normalized_records = [dict(to_jsonable(record)) for record in records]
         envelope = {
             "schema_version": MATERIALS_PROJECT_CACHE_SCHEMA,
-            "cache_schema": MATERIALS_PROJECT_CACHE_SCHEMA,
             "query_id": query.query_id,
             "query": query.payload(),
             "records": normalized_records,

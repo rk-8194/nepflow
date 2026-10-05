@@ -18,7 +18,7 @@ from nepflow.workflow import StageContext, StageRunResult, StageRunState, Workfl
 
 from .metrics import ValidationMetrics, calculate_metrics, pair_prediction
 from .preparation import prepare_validation_cases
-from .protocols import VALIDATION_RESULT_SCHEMA, ValidationPreparation
+from .protocols import ValidationPreparation
 from .reconciliation import (
     ValidationReconciliationOrchestrator,
     ValidationReconciliationResult,
@@ -258,11 +258,6 @@ class ValidationStage:
                 metric_name=name,
                 observed_value=float(value),
                 passed=None,
-                metadata={
-                    "schema_version": VALIDATION_RESULT_SCHEMA,
-                    "metric_name": name,
-                    "report": metrics.to_report(),
-                },
             )
 
 

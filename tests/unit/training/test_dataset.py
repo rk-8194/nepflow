@@ -8,10 +8,12 @@ import numpy as np
 import pytest
 
 from nepflow.dft.vasp.outputs import VaspParseResult
+from nepflow.errors import StateError
 from nepflow.stages.training import dataset as dataset_module
 from nepflow.stages.training.dataset import (
     DatasetSplit,
     build_training_dataset,
+    load_materialized_dataset,
     write_nep_dataset,
 )
 
@@ -47,6 +49,12 @@ class FakeStateStore:
 
     def upsert_dataset(self, manifest, **kwargs):
         self.datasets.append(manifest)
+
+    def get_dataset(self, dataset_id):
+        for manifest in self.datasets:
+            if manifest.identity.dataset_id == dataset_id:
+                return {"manifest": manifest.to_dict()}
+        return None
 
     def upsert_structure(self, identity, **kwargs):
         return None
@@ -134,6 +142,38 @@ def test_build_training_dataset_preserves_authoritative_members_and_splits(tmp_p
         }
         for ordinal, item in enumerate(manifest["accepted_members"])
     ]
+
+    loaded, loaded_metadata = load_materialized_dataset(result.dataset_path, state_store)
+    assert loaded.identity.dataset_id == result.dataset_id
+    assert loaded_metadata["schema_version"] == "nepflow.dataset_manifest.v1"
+    assert loaded_metadata["artifacts"]["train.xyz"]["sha256"]
+
+    manifest_path = result.dataset_path / ".dataset"
+    persisted = json.loads(manifest_path.read_text(encoding="utf-8"))
+    persisted["schema_version"] = "nepflow.dataset_manifest.v999"
+    manifest_path.write_text(json.dumps(persisted), encoding="utf-8")
+    with pytest.raises(StateError, match="schema"):
+        load_materialized_dataset(result.dataset_path, state_store)
+
+    persisted["schema_version"] = "nepflow.dataset_manifest.v1"
+    del persisted["artifacts"]
+    manifest_path.write_text(json.dumps(persisted), encoding="utf-8")
+    with pytest.raises(StateError, match="artifact index"):
+        load_materialized_dataset(result.dataset_path, state_store)
+
+    persisted["artifacts"] = loaded_metadata["artifacts"]
+    manifest_path.write_text(json.dumps(persisted), encoding="utf-8")
+    train_path = result.dataset_path / "train.xyz"
+    test_path = result.dataset_path / "test.xyz"
+    train_original = train_path.read_bytes()
+    test_original = test_path.read_bytes()
+    train_path.write_bytes(train_original + b"\n")
+    with pytest.raises(StateError, match="changed"):
+        load_materialized_dataset(result.dataset_path, state_store)
+    train_path.write_bytes(train_original)
+    test_path.write_bytes(test_original + b"\n")
+    with pytest.raises(StateError, match="changed"):
+        load_materialized_dataset(result.dataset_path, state_store)
 
 
 def test_writer_failure_does_not_prepare_dataset_in_state_store(
