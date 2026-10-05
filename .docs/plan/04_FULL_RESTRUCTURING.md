@@ -1,6 +1,6 @@
 # Phase 4 Implementation Plan — Full Restructuring
 
-**Workflow position:** 4 of 5  
+**Workflow position:** 4 of 7  
 **Required predecessor:** Phase 3 — Shared Architectural Foundations  
 **Required successor:** Phase 5 — Style Cleanup  
 **Governing documents:** `.docs/MASTER_PDD.md`, `.docs/CODEBASE_ARCHITECTURE_AND_STYLE_PDD.md`  
