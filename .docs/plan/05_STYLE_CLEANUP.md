@@ -1,8 +1,8 @@
 # Phase 5 Implementation Plan — Style Cleanup and Conformance
 
-**Workflow position:** 5 of 5  
+**Workflow position:** 5 of 7  
 **Required predecessor:** Phase 4 — Full Restructuring  
-**Required successor:** none; this phase closes the migration  
+**Required successor:** Phase 6 — Generation Stage; this phase closes the architectural migration  
 **Governing documents:** `.docs/MASTER_PDD.md`, `.docs/CODEBASE_ARCHITECTURE_AND_STYLE_PDD.md`  
 **Source review:** `.docs/reports/CODEBASE_REVIEW_2026-09-18.md`
 
