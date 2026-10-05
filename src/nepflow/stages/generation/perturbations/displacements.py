@@ -11,7 +11,11 @@ Annotate = Callable[..., Any]
 
 
 def sample_rattle_stds(settings: PerturbationSettings, n: int) -> list[float]:
-    """Return the accepted inclusive linear rattle-amplitude schedule."""
+    """Return the inclusive linear rattle schedule in Angstroms.
+
+    The endpoints come from ``settings.rattle_std_min/max``; a single value
+    uses the configured standard deviation.  No random state is consumed.
+    """
 
     if n <= 0:
         return []
@@ -35,7 +39,12 @@ def rattled(
     seed: int,
     annotate: Annotate,
 ) -> list[Any]:
-    """Generate HipHive rattled structures without a scientific fallback."""
+    """Generate HipHive rattled structures with a minimum distance in Angstroms.
+
+    ``supercell`` is treated as a periodic ASE-like cell and ``seed`` is passed
+    to HipHive for reproducibility.  HipHive failure raises ``RuntimeError``;
+    Gaussian substitution would not be scientifically equivalent.
+    """
 
     from hiphive.structure_generation import generate_mc_rattled_structures
 

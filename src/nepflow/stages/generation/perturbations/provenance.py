@@ -19,7 +19,13 @@ def annotate_generation_provenance(
     parameters: Mapping[str, Any] | None = None,
     operation_id: str | None = None,
 ) -> GeneratedStructureRecord:
-    """Attach a canonical record while retaining accepted ``Atoms.info`` fields."""
+    """Attach canonical provenance and return the candidate identity record.
+
+    Existing source metadata is retained, while the realized composition and
+    perturbation parameters are recorded separately.  The candidate's
+    ``Atoms.info`` is mutated intentionally; ``random_seed`` is persisted when
+    the family is stochastic.
+    """
 
     base_info = getattr(base, "info", {})
     candidate_info = getattr(candidate, "info", {})

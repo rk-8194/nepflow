@@ -350,6 +350,7 @@ class PerturbationCoordinator:
             self._by_config[configuration] = self._by_config.get(configuration, 0) + 1
 
     def get_summary(self) -> dict[str, Any]:
+        """Return candidate totals grouped by perturbation and configuration."""
         return {
             "total": self._total,
             "by_type": dict(self._by_type),

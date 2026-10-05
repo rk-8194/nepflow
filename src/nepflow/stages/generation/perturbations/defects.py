@@ -28,6 +28,12 @@ def vacancies(
     *,
     seed: int | None = None,
 ) -> list[Any]:
+    """Generate vacancy structures using the supplied seeded RNG.
+
+    ``vacancy_range`` is a fraction of the periodic supercell atom count; at
+    least one atom is removed while retaining one atom.  Candidate provenance
+    records the realized count and no input structure is mutated.
+    """
     output: list[Any] = []
     for index in range(n):
         vacancy = supercell.copy()
@@ -58,6 +64,12 @@ def interstitials(
     *,
     seed: int | None = None,
 ) -> list[Any]:
+    """Generate host interstitials at least ``d_min`` Angstrom apart.
+
+    Positions are sampled in fractional coordinates and wrapped through the
+    supplied periodic cell.  ``rng`` is the sole random source and failures to
+    find a site are recorded by omitting that attempted insertion.
+    """
     elements = base.info.get("elements", sorted(set(supercell.get_chemical_symbols())))
     if isinstance(elements, str):
         elements = [elements]
@@ -86,6 +98,7 @@ def gas_interstitials(
     *,
     seed: int | None = None,
 ) -> list[Any]:
+    """Generate gas-species interstitials with the configured cutoff."""
     if not settings.gas_elements:
         return []
     return _insert_interstitials(
@@ -113,6 +126,7 @@ def vacancy_interstitial(
     *,
     seed: int | None = None,
 ) -> list[Any]:
+    """Generate combined vacancy/interstitial structures in a periodic cell."""
     all_elements = base.info.get("elements", sorted(set(supercell.get_chemical_symbols())))
     if isinstance(all_elements, str):
         all_elements = [all_elements]
@@ -180,6 +194,11 @@ def gas_in_vacancy(
     *,
     seed: int | None = None,
 ) -> list[Any]:
+    """Place configured gas species around a vacancy within the cell.
+
+    Distances and search radius are in Angstroms; periodic minimum-image
+    distances enforce the configured gas cutoff.
+    """
     if not settings.gas_elements:
         return []
     cell = np.array(supercell.cell)
@@ -252,6 +271,12 @@ def find_interstitial_site(
     max_attempts: int = 500,
     d_min: float,
 ) -> np.ndarray | None:
+    """Find a random fractional-cell site at least ``d_min`` Angstrom away.
+
+    ``positions`` has shape ``(n_atoms, 3)`` and ``cell``/``inv_cell`` have
+    shape ``(3, 3)``.  ``None`` means no valid site was found in
+    ``max_attempts`` trials.
+    """
     d_min_squared = d_min**2
     for _ in range(max_attempts):
         fractional = rng.random(3)
@@ -273,6 +298,11 @@ def find_site_near(
     d_min: float,
     max_attempts: int = 500,
 ) -> np.ndarray | None:
+    """Find a wrapped site near ``centre`` using periodic minimum images.
+
+    ``radius`` and ``d_min`` are in Angstroms; the returned Cartesian position
+    is inside the supplied periodic cell or ``None`` after the attempt limit.
+    """
     d_min_squared = d_min**2
     for _ in range(max_attempts):
         direction = rng.normal(size=3)

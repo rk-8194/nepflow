@@ -23,6 +23,10 @@ def build_retry_levels_for_gpu(
 
     The parser form remains for compatibility with existing recovery callers.
     New DFT stage code should use :func:`build_retry_levels_for_config`.
+
+    Each tuple is ``(NCORE, KPAR, nodes, GPUs per node)``.  Levels are ordered
+    from the starting resource tier through explicit GPU and node escalation;
+    the starting tuple itself is excluded so a retry always changes resources.
     """
     starting_gpus_per_node = starting_gpu
     return _build_retry_levels(
@@ -41,7 +45,12 @@ def build_retry_levels_for_config(
     initial_kpar: int,
     config: NepflowConfig,
 ) -> list[tuple[int, int, int, int]]:
-    """Build retry levels from the canonical typed configuration."""
+    """Build explicit retry levels from typed HPC configuration.
+
+    Returned tuples are ``(NCORE, KPAR, nodes, GPUs per node)`` and contain no
+    duplicate starting level.  This function has no filesystem or scheduler
+    side effects.
+    """
 
     starting_gpus_per_node = starting_gpu
     return _build_retry_levels(
@@ -109,7 +118,12 @@ def write_incar_resource_parameters(
     *,
     warn: Callable[[str], object] | None = None,
 ) -> None:
-    """Update only launcher-controlled NCORE/KPAR values in an INCAR."""
+    """Update only launcher-controlled NCORE/KPAR values in an INCAR.
+
+    The write is atomic and all other scientific INCAR parameters are kept.
+    Missing or unreadable INCAR files raise ``VaspError``; ``warn`` is an
+    optional presentation callback and does not suppress the exception.
+    """
     incar_path = Path(struct_dir) / "INCAR"
     if not incar_path.exists():
         if warn is not None:
@@ -137,7 +151,11 @@ def write_incar_resource_parameters(
 
 @dataclass(frozen=True, slots=True)
 class VaspRecoveryDecision:
-    """A recorded recovery choice, separate from applying the choice."""
+    """A recorded recovery choice, separate from applying side effects.
+
+    ``gpus`` is retained for persisted compatibility and means GPUs per node;
+    ``retry_level`` is the one-based level selected for the next attempt.
+    """
 
     retry: bool
     retry_level: int
@@ -155,7 +173,12 @@ class VaspRecoveryDecision:
 
 
 class VaspRecoveryPolicy:
-    """Typed VASP retry policy used by the canonical DFT reconciler."""
+    """Typed VASP retry policy used by the DFT reconciler.
+
+    ``decide`` is pure with respect to the working directory.  ``apply``
+    changes only retry-controlled INCAR resources and removes stale output so
+    the retry cannot be mistaken for completion of an earlier attempt.
+    """
 
     def __init__(self, config: NepflowConfig) -> None:
         self.config = config
@@ -168,6 +191,7 @@ class VaspRecoveryPolicy:
         initial_kpar: int,
         retry_level: int,
     ) -> VaspRecoveryDecision:
+        """Choose the next resource tier without mutating calculation files."""
         levels = build_retry_levels_for_config(
             starting_gpu,
             initial_ncore,
@@ -181,7 +205,12 @@ class VaspRecoveryPolicy:
         )
 
     def apply(self, decision: VaspRecoveryDecision, working_directory: Path) -> None:
-        """Apply one recorded resource decision before a retry submission."""
+        """Apply one recorded resource decision before retry submission.
+
+        A non-retry decision is a no-op.  A retry rewrites NCORE/KPAR and
+        removes stale completion/output artifacts to make restart semantics
+        idempotent and attempt-local.
+        """
         if not decision.retry:
             return
         if decision.ncore is None or decision.kpar is None:
@@ -214,7 +243,12 @@ def decide_retry(
     *,
     max_retry_level: int,
 ) -> VaspRecoveryDecision:
-    """Choose the next explicit retry level without applying side effects."""
+    """Choose the next explicit retry level without applying side effects.
+
+    ``retry_level`` is the previously attempted zero-based count and
+    ``max_retry_level`` caps escalation.  Exhaustion returns a terminal
+    ``retry=False`` decision rather than reusing the starting resources.
+    """
     next_level = retry_level + 1
     if next_level > max_retry_level or next_level > len(levels):
         return VaspRecoveryDecision(

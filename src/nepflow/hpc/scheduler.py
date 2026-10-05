@@ -20,7 +20,12 @@ from .resources import JobResources
 
 @runtime_checkable
 class Scheduler(Protocol):
-    """Operations required by stages without exposing SLURM syntax."""
+    """Scheduler operations required by stages without exposing SLURM syntax.
+
+    Queue absence and accounting absence are represented explicitly by result
+    records; implementations must raise on query/transport failure so callers
+    cannot mistake an unavailable scheduler for an empty queue.
+    """
 
     def submit(
         self,
@@ -86,7 +91,12 @@ class Scheduler(Protocol):
         *,
         timeout: float | None = None,
     ) -> ReconciledJobResult:
-        """Reconcile live queue state with accounting state."""
+        """Reconcile live queue state with accounting state.
+
+        Active ``squeue`` evidence wins because it is the current execution
+        state.  ``sacct`` is consulted only after queue absence so terminal
+        states remain visible after a job leaves the queue.
+        """
         ...
 
 

@@ -16,7 +16,15 @@ from .resolution import ResolvedModelDataset, resolve_model_dataset
 
 
 def cell_perpendicular_heights_angstrom(cell: Any) -> np.ndarray:
-    """Return the three perpendicular cell-plane heights in Angstroms."""
+    """Return triclinic cell-plane heights in Angstroms.
+
+    ``cell`` is interpreted as three row vectors with shape ``(3, 3)`` in
+    Angstroms.  For each lattice direction, the height is
+    ``abs(det(cell)) / |cross(other two vectors)|``; this is the periodic
+    thickness normal to that cell face, not the norm of a lattice vector.
+    The cell must be finite and non-degenerate.  Returns a finite ``(3,)``
+    array in the same axis order as the input, or raises ``ValidationError``.
+    """
 
     vectors = np.asarray(cell, dtype=float)
     if vectors.shape != (3, 3) or not np.isfinite(vectors).all():
@@ -47,7 +55,15 @@ def calculate_cell_replicates_for_cutoff(
     cell: Any,
     cutoff_angstrom: float,
 ) -> tuple[int, int, int]:
-    """Choose deterministic repeats whose perpendicular heights exceed ``2*cutoff``."""
+    """Choose repeats that make every periodic thickness exceed ``2*cutoff``.
+
+    ``cutoff_angstrom`` is the interaction cutoff in Angstroms.  The returned
+    tuple follows the cell-axis order and is the smallest deterministic set of
+    positive integer repeats satisfying ``repeat[i] * height[i] > 2 * cutoff``.
+    Perpendicular heights are used because a triclinic lattice vector norm
+    does not measure the shortest periodic separation across a face.  Raises
+    ``ValidationError`` for a non-positive/non-finite cutoff or degenerate cell.
+    """
 
     cutoff = float(cutoff_angstrom)
     if not np.isfinite(cutoff) or cutoff <= 0:
@@ -75,7 +91,16 @@ def prepare_validation_cases(
     gpumd_potential_dir: Path | None = None,
     backend: GpumdBackend | None = None,
 ) -> ValidationPreparation:
-    """Resolve exact identities and create deterministic GPUMD case folders."""
+    """Resolve identities and create deterministic GPUMD validation cases.
+
+    The model run and dataset identities are resolved from authoritative state;
+    each test reference receives a stable case ordinal, an input/output path,
+    and repeats sufficient for the NEP cutoff.  This function creates the
+    case directories and backend inputs as an idempotent preparation side
+    effect, but does not submit or execute jobs.  Raises the resolver or
+    backend's typed validation errors when identities, model artifacts, or
+    cell geometry are invalid.
+    """
 
     resolved: ResolvedModelDataset = resolve_model_dataset(
         project_dir,

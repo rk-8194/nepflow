@@ -21,7 +21,12 @@ from .outputs import collect_model_artifacts, parse_completion
 
 
 class NepBackend:
-    """Implement the backend contract for one prepared NEP training run."""
+    """Implement one prepared NEP training run without scheduler policy.
+
+    Rendering, progress/completion parsing, and artifact collection remain
+    bound to the exact dataset/input/model identity; campaign retries and
+    promotion are owned by :class:`TrainingCampaign`.
+    """
 
     def __init__(
         self,
@@ -37,6 +42,7 @@ class NepBackend:
         self.renderer = renderer or NepInputRenderer()
 
     def render_training_input(self, request: TrainingInputRequest) -> TrainingInput:
+        """Render and identity-bind one ``nep.in`` file."""
         return self.renderer.render(request)
 
     def training_command(self, inputs: TrainingInput) -> tuple[str, ...]:
@@ -51,9 +57,11 @@ class NepBackend:
         return self._command
 
     def parse_progress(self, run_directory: Path) -> TrainingProgress | None:
+        """Read optional generation/loss progress from a run directory."""
         return parse_progress(run_directory)
 
     def parse_completion(self, run_directory: Path) -> TrainingCompletion:
+        """Return completion evidence only when required NEP output exists."""
         return parse_completion(run_directory)
 
     def collect_model_artifacts(
@@ -61,12 +69,15 @@ class NepBackend:
         run_directory: Path,
         inputs: TrainingInput,
     ) -> CollectedModelArtifacts:
+        """Collect model artifacts and verify their run identity and hashes."""
         return collect_model_artifacts(run_directory, inputs)
 
     def model_run_identity(self, inputs: TrainingInput) -> ModelRunIdentity:
+        """Return the identity derived from the exact rendered training input."""
         return inputs.model_run_identity
 
     def classify_error(self, run_directory: Path) -> str | None:
+        """Classify observable NEP failure evidence without marking success."""
         classified = classify_training_error(run_directory)
         if classified is not None:
             return classified

@@ -18,7 +18,6 @@ from .slurm import (
     map_slurm_state,
     parse_sacct_output,
     parse_sbatch_job_id,
-    parse_sbatch_output,
     parse_squeue_output,
 )
 
@@ -41,7 +40,6 @@ __all__ = [
     "map_slurm_state",
     "parse_sacct_output",
     "parse_sbatch_job_id",
-    "parse_sbatch_output",
     "parse_squeue_output",
     "render_sbatch_directives",
     "render_slurm_header",

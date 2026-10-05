@@ -59,6 +59,7 @@ class DatasetSplit(str, Enum):
 
     @classmethod
     def coerce(cls, value: "DatasetSplit | str") -> "DatasetSplit":
+        """Normalize a split spelling or raise for an unsupported value."""
         if isinstance(value, cls):
             return value
         try:
@@ -80,13 +81,16 @@ class DatasetBuildReport:
 
     @property
     def accepted_count(self) -> int:
+        """Return the number of accepted typed or content-backed records."""
         return len(self.accepted_results) + len(self.accepted_content_records)
 
     @property
     def rejected_count(self) -> int:
+        """Return requested minus accepted records for this split."""
         return self.requested_count - self.accepted_count
 
     def reset(self, requested_count: int) -> None:
+        """Clear prior accounting and set the new requested count."""
         self.requested_count = int(requested_count)
         self.accepted_results.clear()
         self.accepted_content_records.clear()
@@ -94,6 +98,7 @@ class DatasetBuildReport:
         self.requested_members.clear()
 
     def record_requested(self, structure_id: str | None, ordinal: int) -> int:
+        """Record one requested member and return its report index."""
         self.requested_members.append(
             {
                 "split": self.split.value,
@@ -105,6 +110,7 @@ class DatasetBuildReport:
         return len(self.requested_members) - 1
 
     def record_rejection(self, reason: str, *, member_index: int | None = None) -> None:
+        """Record a visible rejection reason and optionally update its member."""
         reason = str(reason)
         self.rejected_reason_counts[reason] = self.rejected_reason_counts.get(reason, 0) + 1
         if member_index is not None and member_index < len(self.requested_members):
@@ -119,6 +125,7 @@ class DatasetBuildReport:
         content_record: Mapping[str, Any] | None = None,
         member_index: int | None = None,
     ) -> None:
+        """Record an accepted parsed result or explicit content record."""
         if result is not None:
             self.accepted_results.append(result)
             identity = dict(result.calculation_identity)
@@ -148,6 +155,7 @@ class DatasetBuildReport:
             self.requested_members.append(member)
 
     def to_dict(self) -> dict[str, Any]:
+        """Return JSON-shaped split accounting and provenance."""
         return {
             "split": self.split.value,
             "requested_count": self.requested_count,
@@ -171,14 +179,17 @@ class DatasetBuildResult:
 
     @property
     def dataset_id(self) -> str:
+        """Return the content-derived dataset identity."""
         return self.manifest.identity.dataset_id
 
     @property
     def train_count(self) -> int:
+        """Return the accepted training-record count."""
         return self.reports[DatasetSplit.TRAIN].accepted_count
 
     @property
     def test_count(self) -> int:
+        """Return the accepted test-record count."""
         return self.reports[DatasetSplit.TEST].accepted_count
 
 
@@ -684,6 +695,10 @@ def build_training_dataset(
     pipeline.  It accepts only verified :class:`VaspParseResult` records (or
     mappings containing one).  ASE structures must be resolved by the named
     compatibility adapter before this boundary.
+
+    The dataset directory and manifest are published atomically, then accepted
+    members are recorded in ``state_store``.  Rejected records are fatal unless
+    ``allow_partial=True``; no synthetic scientific labels are created.
     """
 
     dataset_path = Path(dataset_path)
@@ -769,6 +784,10 @@ def prepare_training_dataset(
 
     Training-stage orchestration uses this preview to derive the immutable
     dataset ID before deciding whether a materialization can be reused.
+
+    ``state_store`` must be the authoritative DFT-result store.  Rendered
+    records use eV, eV/Angstrom, Angstrom, and optionally positive-compression
+    Cartesian virials in eV.
     """
 
     if state_store is None:
@@ -1049,7 +1068,11 @@ def load_materialized_dataset(
     dataset_path: Path,
     state_store: Any,
 ) -> tuple[TrainingDatasetManifest, Mapping[str, Any]]:
-    """Load a dataset only when both its artifact and ledger identity exist."""
+    """Load a dataset only when artifacts and ledger identity both verify.
+
+    File hashes, manifest schema, and the StateStore dataset identity are
+    checked; changed or missing files raise rather than becoming empty data.
+    """
 
     dataset_path = Path(dataset_path)
     metadata_path = dataset_path / ".dataset"
@@ -1108,7 +1131,10 @@ def build_dataset_metadata(
     train_virial: bool,
     allow_partial: bool,
 ) -> dict[str, Any]:
-    """Build the Phase 2 manifest shape for compatibility callers."""
+    """Build the canonical manifest shape from split accounting records.
+
+    This helper does not publish files or mutate StateStore.
+    """
 
     reports: dict[DatasetSplit, DatasetBuildReport] = {}
     for split, source in (
@@ -1145,7 +1171,15 @@ def write_nep_dataset(
     *,
     include_virial: bool = False,
 ) -> int:
-    """Write the exact extxyz schema consumed by GPUMD NEP training."""
+    """Write the canonical NEP extxyz label schema and return frame count.
+
+    Positions and forces are ``(n_atoms, 3)`` arrays in Angstrom and
+    eV/Angstrom respectively; lattice is a Cartesian ``(3, 3)`` matrix in
+    Angstrom, energy is eV, and optional virial is a positive-compression
+    Cartesian ``(3, 3)`` tensor in eV.  Species and atom rows retain their
+    input order.  Invalid shapes, units, or non-finite labels raise
+    ``ValueError``; output is written atomically as UTF-8.
+    """
 
     rendered = [
         _render_nep_structure(structure, include_virial=include_virial) for structure in structures
@@ -1231,4 +1265,3 @@ __all__ = [
     "resolve_selected_dft_results",
     "write_nep_dataset",
 ]
-# End of canonical dataset module.

@@ -38,6 +38,12 @@ class ElasticRecord:
 
 
 def strain_matrix_to_voigt(strain_matrix: Iterable[float]) -> np.ndarray:
+    """Convert a strain tensor to engineering Voigt order ``xx,yy,zz,yz,xz,xy``.
+
+    The input is reshaped to ``(3, 3)`` and symmetrized.  Normal components
+    are dimensionless tensor strains; shear components are doubled, so this
+    function returns engineering shear values ``2*epsilon_ij``.
+    """
     matrix = np.array(list(strain_matrix), dtype=float).reshape(3, 3)
     symmetric = 0.5 * (matrix + matrix.T)
     return np.array(
@@ -54,6 +60,7 @@ def strain_matrix_to_voigt(strain_matrix: Iterable[float]) -> np.ndarray:
 
 
 def voigt_to_tensor(voigt: Iterable[float]) -> np.ndarray:
+    """Convert engineering Voigt strain order to a symmetric ``(3, 3)`` tensor."""
     e1, e2, e3, e4, e5, e6 = [float(value) for value in voigt]
     return np.array(
         [[e1, 0.5 * e6, 0.5 * e5], [0.5 * e6, e2, 0.5 * e4], [0.5 * e5, 0.5 * e4, e3]],
@@ -62,6 +69,13 @@ def voigt_to_tensor(voigt: Iterable[float]) -> np.ndarray:
 
 
 def cell_strain_voigt(reference_cell, strained_cell) -> np.ndarray:
+    """Calculate engineering Voigt strain between two ``(3, 3)`` cells.
+
+    Cells are row-vector Cartesian lattices.  The deformation gradient is
+    ``inv(reference_cell) @ strained_cell`` and the small-strain symmetric
+    approximation is used; large rotations or finite-strain interpretation
+    are outside this helper's validity range.
+    """
     reference = np.array(reference_cell, dtype=float)
     strained = np.array(strained_cell, dtype=float)
     deformation_gradient = np.linalg.inv(reference) @ strained
@@ -70,15 +84,22 @@ def cell_strain_voigt(reference_cell, strained_cell) -> np.ndarray:
 
 
 def deformation_matrix_from_metadata(strain_matrix: Iterable[float]) -> np.ndarray:
+    """Return ``I + E`` from flattened dimensionless strain metadata."""
     return np.eye(3) + np.array(list(strain_matrix), dtype=float).reshape(3, 3)
 
 
 def reference_cell_from_metadata(strained_cell, strain_matrix: Iterable[float]) -> np.ndarray:
+    """Recover a reference ``(3, 3)`` cell from deformation metadata."""
     strained = np.array(strained_cell, dtype=float)
     return np.linalg.inv(deformation_matrix_from_metadata(strain_matrix)) @ strained
 
 
 def stress_matrix_to_voigt(stress_gpa: np.ndarray) -> np.ndarray:
+    """Convert a GPa stress tensor to Cartesian Voigt order.
+
+    The result order is ``xx, yy, zz, yz, xz, xy`` and retains the backend
+    stress sign; no virial sign conversion is performed.
+    """
     return np.array(
         [
             stress_gpa[0, 0],
@@ -93,10 +114,12 @@ def stress_matrix_to_voigt(stress_gpa: np.ndarray) -> np.ndarray:
 
 
 def tensor_to_strain_voigt(strain_tensor: np.ndarray) -> np.ndarray:
+    """Convert a dimensionless ``(3, 3)`` strain tensor to engineering Voigt."""
     return strain_matrix_to_voigt(np.asarray(strain_tensor).reshape(-1))
 
 
 def rotate_tensor(tensor: np.ndarray, rotation_rows: np.ndarray | None) -> np.ndarray:
+    """Rotate a Cartesian tensor as ``R @ tensor @ R.T`` when ``R`` is given."""
     if rotation_rows is None:
         return tensor
     return rotation_rows @ tensor @ rotation_rows.T
@@ -106,6 +129,7 @@ def conventional_rotation_rows(
     reference_cell: np.ndarray,
     structure_name: str | None,
 ) -> np.ndarray | None:
+    """Return normalized conventional cubic axes for ``bcc`` or ``fcc`` cells."""
     name = (structure_name or "").lower()
     cell = np.array(reference_cell, dtype=float)
     if cell.shape != (3, 3):
@@ -135,6 +159,12 @@ def parse_stress_tensor_gpa(outcar_path: Path) -> np.ndarray | None:
 def fit_elastic_tensor(
     records: list[ElasticRecord],
 ) -> tuple[np.ndarray, np.ndarray, str, np.ndarray]:
+    """Fit GPa stress/strain records using the declared crystal symmetry.
+
+    Each record contains six-component engineering strain and stress vectors in
+    ``xx,yy,zz,yz,xz,xy`` order.  Returns symmetric fitted tensor, raw tensor,
+    model name, and fitted stress offset, all in GPa.
+    """
     structure_name = (records[0].structure_name or "").lower()
     if structure_name in {"bcc", "fcc"}:
         return fit_cubic_tensor(records)
@@ -146,6 +176,7 @@ def fit_elastic_tensor(
 def fit_general_tensor(
     records: list[ElasticRecord],
 ) -> tuple[np.ndarray, np.ndarray, str, np.ndarray]:
+    """Fit a rank-six general linear stiffness tensor in GPa."""
     strains = np.array([record.strain_voigt for record in records], dtype=float)
     stresses = np.array([record.stress_voigt_gpa for record in records], dtype=float)
     if strains.ndim != 2 or strains.shape[1] != 6:
@@ -168,6 +199,11 @@ def fit_general_tensor(
 def paired_strain_stress_differences(
     records: list[ElasticRecord],
 ) -> list[tuple[np.ndarray, np.ndarray]]:
+    """Return positive-minus-negative paired strain/stress differences.
+
+    Pairing uses perturbation family, absolute dimensionless amplitude, and
+    deterministic OUTCAR path order; unmatched signs are ignored.
+    """
     buckets: dict[tuple[str, float], dict[str, list[ElasticRecord]]] = {}
     for record in records:
         key = (record.elastic_mode, round(abs(record.strain_amplitude), 12))
@@ -217,6 +253,7 @@ def cubic_offsets_from_tensor(records: list[ElasticRecord], tensor: np.ndarray) 
 def fit_cubic_tensor(
     records: list[ElasticRecord],
 ) -> tuple[np.ndarray, np.ndarray, str, np.ndarray]:
+    """Fit cubic ``C11/C12/C44`` stiffness coefficients in GPa."""
     paired_differences = paired_strain_stress_differences(records)
     if paired_differences:
         design_rows: list[list[float]] = []
@@ -292,6 +329,7 @@ def _hexagonal_tensor(c11: float, c12: float, c13: float, c33: float, c44: float
 def fit_hexagonal_tensor(
     records: list[ElasticRecord],
 ) -> tuple[np.ndarray, np.ndarray, str, np.ndarray]:
+    """Fit hexagonal stiffness coefficients in GPa using engineering Voigt data."""
     paired_differences = paired_strain_stress_differences(records)
     if paired_differences:
         design_rows: list[list[float]] = []
@@ -351,6 +389,7 @@ def summarise_group(
     fit_model: str,
     stress_offset_gpa: np.ndarray,
 ) -> dict:
+    """Summarize fit error, symmetry, stability, and mode counts for a group."""
     strains = np.array([record.strain_voigt for record in records], dtype=float)
     stresses = np.array([record.stress_voigt_gpa for record in records], dtype=float)
     predicted = strains @ tensor_gpa.T + stress_offset_gpa

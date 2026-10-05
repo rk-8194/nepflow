@@ -115,8 +115,8 @@ Each project lives under `projects/project_<name>/` and typically contains:
 
 - `config/` for project settings
 - `logs/` for runtime logs
-- `state.db` for workflow state
-- `.project` for the current workflow stage
+- `state.db` for authoritative workflow state and stage history
+- `.project` as a legacy/interoperability marker repaired from `state.db`
 
 The project configuration is stored in the project `config/` directory. Edit it to control:
 

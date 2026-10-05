@@ -27,7 +27,14 @@ from nepflow.errors import ValidationError
 
 @dataclass(frozen=True, slots=True)
 class StaticPredictionRequest:
-    """One model/structure request for a genuine static prediction."""
+    """One model/structure request for a genuine static prediction.
+
+    Optional positions are Cartesian Angstrom arrays with shape ``(n_atoms, 3)``;
+    cells are finite ``(3, 3)`` Angstrom matrices and ``pbc`` has three flags.
+    Expected geometry plus ``atom_mapping`` is the identity-safe provenance
+    contract for replicated periodic cases; incomplete metadata raises
+    ``ValidationError``.
+    """
 
     structure: StructureIdentity
     model: ModelRunRecord
@@ -145,7 +152,10 @@ class StaticPredictionRequest:
 
 @dataclass(frozen=True, slots=True)
 class PredictionRuntimeMetadata:
-    """Execution metadata kept separate from scientific prediction values."""
+    """Execution metadata kept separate from scientific prediction values.
+
+    ``elapsed_seconds`` is wall-clock duration, not part of model identity.
+    """
 
     elapsed_seconds: float | None = None
     backend_version: str | None = None
@@ -154,7 +164,13 @@ class PredictionRuntimeMetadata:
 
 @dataclass(frozen=True, slots=True)
 class StaticPrediction:
-    """Canonical static energy/force/virial values returned by a backend."""
+    """Canonical static energy/force/virial values returned by a backend.
+
+    Energy is eV, forces have shape ``(atom_count, 3)`` in eV/Angstrom, and an
+    optional virial is a positive-compression Cartesian ``(3, 3)`` tensor in
+    eV.  Positions/cell metadata, when present, are Angstrom and preserve
+    output atom order; invalid or non-finite values raise ``ValidationError``.
+    """
 
     structure: StructureIdentity
     model_run: ModelRunIdentity

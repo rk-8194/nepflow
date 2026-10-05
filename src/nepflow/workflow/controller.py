@@ -88,6 +88,11 @@ class StageRegistry:
         reconcile: StageReconciler | None = None,
         replace: bool = False,
     ) -> None:
+        """Register one executable stage and its optional reconciliation hook.
+
+        The default successor follows the canonical stage order.  Duplicate
+        registration raises ``StateError`` unless ``replace=True``.
+        """
         typed_stage = WorkflowStage.from_legacy(stage)
         if typed_stage is WorkflowStage.COMPLETED:
             raise StateError("Completed workflow stage has no executable handler")
@@ -119,6 +124,7 @@ class StageRegistry:
         self._auxiliary[key] = handler
 
     def binding(self, stage: WorkflowStage | str) -> StageBinding:
+        """Return a registered stage binding or raise ``StateError``."""
         typed_stage = WorkflowStage.from_legacy(stage)
         try:
             return self._bindings[typed_stage]
@@ -126,6 +132,7 @@ class StageRegistry:
             raise StateError(f"No workflow handler is registered for {typed_stage.value}") from exc
 
     def auxiliary(self, name: str) -> StageHandler:
+        """Return a named non-progressing application handler."""
         try:
             return self._auxiliary[name]
         except KeyError as exc:
@@ -137,11 +144,13 @@ class StageRegistry:
         return tuple(stage for stage in _ORDERED_RUNNABLE_STAGES if stage in self._bindings)
 
     def reconcile(self, stage: WorkflowStage, context: StageContext) -> None:
+        """Run a stage's resume hook when one is registered."""
         hook = self.binding(stage).reconcile
         if hook is not None:
             hook(context)
 
     def execute(self, stage: WorkflowStage, context: StageContext) -> StageRunResult:
+        """Execute one stage and validate its typed result/advance contract."""
         binding = self.binding(stage)
         result = binding.handler(context)
         if result is None:
@@ -165,11 +174,17 @@ class StageRegistry:
         return result
 
     def execute_auxiliary(self, name: str, context: StageContext) -> StageRunResult | None:
+        """Execute a named auxiliary handler without changing workflow state."""
         return self.auxiliary(name)(context)
 
 
 class WorkflowController:
-    """Orchestrate workflow stages through a composed ``StageRegistry``."""
+    """Orchestrate workflow stages through a composed ``StageRegistry``.
+
+    ``StateStore``/``state.db`` is authoritative for stage state.  The
+    ``.project`` file is maintained only as an interoperability marker and is
+    repaired from the ledger during reconciliation.
+    """
 
     def __init__(
         self,
@@ -213,12 +228,14 @@ class WorkflowController:
 
     @property
     def state_store(self) -> StateStore:
+        """Return the initialized authoritative state store."""
         if self._state_store is None:
             raise StateError("Workflow state store is not available before initialization")
         return self._state_store
 
     @property
     def workflow_state(self) -> WorkflowState:
+        """Return the initialized workflow-state service."""
         if self._workflow_state is None:
             raise StateError("Workflow state is not available before initialization")
         return self._workflow_state
@@ -294,12 +311,15 @@ class WorkflowController:
         )
 
     def current_stage(self) -> WorkflowStage:
+        """Return the reconciled authoritative current stage."""
         return self.workflow_state.current_stage()
 
     def reconcile_stage(self) -> ReconciliationResult:
+        """Repair the legacy marker from StateStore and return the evidence."""
         return self.workflow_state.reconcile()
 
     def transition_to(self, stage: WorkflowStage | str) -> StageRunStatus:
+        """Validate and persist one explicit workflow transition."""
         return self.workflow_state.transition_to(stage)
 
     def _check_deadline(self) -> None:

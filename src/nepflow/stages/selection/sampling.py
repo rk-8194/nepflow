@@ -41,6 +41,7 @@ class StructureComposition:
 
 @dataclass(frozen=True)
 class BinaryProjection:
+    """One normalized binary composition coordinate in ``[0, 1]``."""
     subset: tuple[str, str]
     structure_index: int
     normalized_fraction_b: float
@@ -48,6 +49,7 @@ class BinaryProjection:
 
 @dataclass(frozen=True)
 class TernaryProjection:
+    """One normalized ternary composition point in barycentric order."""
     subset: tuple[str, str, str]
     structure_index: int
     barycentric: tuple[float, float, float]
@@ -55,6 +57,7 @@ class TernaryProjection:
 
 @dataclass(frozen=True)
 class CoverageSummary:
+    """Histogram, entropy, concentration, and novelty diagnostics for a subset."""
     subset_label: str
     subset_size: int
     dimensions: int
@@ -71,6 +74,7 @@ class CoverageSummary:
 
 @dataclass(frozen=True)
 class PairFrequencyPoint:
+    """Frequency of one binary composition fraction across structures."""
     pair: tuple[str, str]
     b_fraction: float
     frequency: int
@@ -83,7 +87,13 @@ def select_farthest_points(
     mean_descriptor: bool,
     min_dist: float,
 ) -> list[int]:
-    """Return sorted frame indices selected by the accepted FPS policy."""
+    """Select frame indices using descriptor-space farthest-point sampling.
+
+    ``representations`` has one row per descriptor atom or frame, depending on
+    ``mean_descriptor``.  ``structures`` supplies atom counts for mapping
+    atomic rows back to frame indices.  Returned indices are sorted unique
+    frame positions; distances use the descriptor's native units.
+    """
 
     from NepTrainKit.core.io import farthest_point_sampling
 
@@ -128,7 +138,13 @@ def select_farthest_points_for_target(
     max_iterations: int,
     label: str = "",
 ) -> tuple[list[int], float]:
-    """Binary-search a minimum distance to hit the accepted target count."""
+    """Binary-search a descriptor distance for a target FPS frame count.
+
+    ``target`` is a frame count and ``tolerance`` is an allowed count error.
+    The returned distance is in representation units and the indices are
+    sorted frame positions.  The search is monotonic only under the accepted
+    FPS implementation; failure to converge returns the best observed point.
+    """
 
     prefix = f"[{label}] " if label else ""
     lo = 0.0
@@ -237,7 +253,12 @@ def calculate_cross_distance_stats(
     indices_a: list[int],
     indices_b: list[int],
 ) -> tuple[float, float]:
-    """Return (minimum, mean) nearest-neighbour distance from B to A."""
+    """Return minimum and mean nearest distance from B to A.
+
+    ``representations`` has shape ``(n_rows, n_features)`` and indices refer
+    to its rows.  Distances are Euclidean in descriptor units; empty inputs
+    return ``(inf, inf)`` to preserve the absence of cross-comparisons.
+    """
 
     from scipy.spatial.distance import cdist
 
@@ -300,7 +321,11 @@ def normalize_subset_fractions(
     fractions: dict[str, float],
     subset: tuple[str, ...],
 ) -> tuple[float, ...]:
-    """Normalize fractions onto one binary or ternary element subset."""
+    """Normalize composition fractions onto a binary or ternary subset.
+
+    The result follows ``subset`` ordering and sums to one when the subset has
+    positive support; unsupported subsets return zeros.
+    """
 
     subset_total = sum(fractions[element] for element in subset)
     if subset_total <= 0.0:
@@ -363,7 +388,12 @@ def largest_remainder_integer_partition(
     values: tuple[float, float, float],
     total: int,
 ) -> tuple[int, int, int]:
-    """Convert barycentric fractions into deterministic integer coordinates."""
+    """Convert barycentric fractions to deterministic simplex coordinates.
+
+    ``values`` are ordered fractions summing approximately to one and ``total``
+    is the integer resolution.  The returned non-negative coordinates sum to
+    ``total``; ties are resolved by original component order.
+    """
 
     scaled = [value * total for value in values]
     floors = [math.floor(value) for value in scaled]
@@ -398,27 +428,32 @@ def ternary_bin_center(
     index: tuple[int, int, int],
     resolution: int,
 ) -> tuple[float, float, float]:
+    """Return the normalized barycentric center represented by one bin."""
     return index[0] / resolution, index[1] / resolution, index[2] / resolution
 
 
 def barycentric_to_cartesian(
     barycentric: tuple[float, float, float],
 ) -> tuple[float, float]:
+    """Map ``(a,b,c)`` barycentric fractions to a unit equilateral triangle."""
     _a, b, c = barycentric
     return b + 0.5 * c, c * SQRT3_OVER_2
 
 
 def occupied_bin_fraction(counts: list[int], total_bins: int) -> tuple[int, float]:
+    """Return occupied-bin count and occupied fraction."""
     occupied = sum(1 for count in counts if count > 0)
     return occupied, occupied / total_bins if total_bins > 0 else 0.0
 
 
 def max_bin_fraction(counts: list[int]) -> float:
+    """Return the largest bin count divided by the total count."""
     total = sum(counts)
     return max(counts) / total if total > 0 else 0.0
 
 
 def gini(values: list[int]) -> float:
+    """Return the count-distribution Gini coefficient in ``[0, 1]``."""
     if not values:
         return 0.0
     total = sum(values)
@@ -433,6 +468,7 @@ def gini(values: list[int]) -> float:
 
 
 def nearest_neighbor_distances(points: list[tuple[float, ...]]) -> list[float]:
+    """Return each point's Euclidean nearest-neighbour distance."""
     if len(points) < 2:
         return []
     distances: list[float] = []
@@ -462,6 +498,7 @@ def nearest_representation_distances(representations: np.ndarray) -> np.ndarray:
 
 
 def percentile95(values: list[float]) -> float | None:
+    """Return linearly interpolated 95th percentile or ``None`` when empty."""
     if not values:
         return None
     if len(values) == 1:
@@ -481,6 +518,7 @@ def summarize_binary_subset(
     projections: list[BinaryProjection],
     bins: int,
 ) -> tuple[CoverageSummary, list[int]]:
+    """Summarize one binary projection using deterministic histogram bins."""
     bin_counts = [0] * bins
     coordinates: list[tuple[float]] = []
     for projection in projections:
@@ -509,6 +547,7 @@ def summarize_ternary_subset(
     projections: list[TernaryProjection],
     resolution: int,
 ) -> tuple[CoverageSummary, dict[tuple[int, int, int], int]]:
+    """Summarize one ternary projection on the integer simplex grid."""
     bin_counts: dict[tuple[int, int, int], int] = {}
     coordinates: list[tuple[float, float]] = []
     for projection in projections:
@@ -563,6 +602,7 @@ def collect_pair_frequency_points(
 
 
 def fraction_label(value: float) -> str:
+    """Render a composition fraction as a simple rational when possible."""
     fraction = Fraction(value).limit_denominator()
     if math.isclose(float(fraction), value, rel_tol=0.0, abs_tol=1e-12):
         return f"{fraction.numerator}/{fraction.denominator}"
@@ -915,7 +955,6 @@ __all__ = [
     "SQRT3_OVER_2",
     "StructureComposition",
     "TernaryProjection",
-    "_selected_count",
     "binary_bin_index",
     "build_composition_aware_candidate_set",
     "calculate_cross_distance_stats",

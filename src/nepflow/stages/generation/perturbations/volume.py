@@ -18,7 +18,12 @@ def volume_profile(
     settings: PerturbationSettings,
     annotate: Annotate,
 ) -> list[Any]:
-    """Generate the accepted isotropic E-V profile in configured order."""
+    """Generate an isotropic volume profile in configured order.
+
+    ``volume_scale_range`` scales volume relative to the input cell; the
+    applied linear scale is ``volume_scale ** (1/3)``.  Positions are scaled
+    with the cell, and the input cell is not mutated.
+    """
 
     scale_factors = np.linspace(
         settings.volume_scale_range[0],

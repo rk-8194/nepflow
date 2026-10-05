@@ -46,6 +46,7 @@ _TERMINAL = frozenset({"completed", "failed"})
 
 @dataclass(frozen=True, slots=True)
 class TrainingAttempt:
+    """Immutable persisted scheduler attempt for one model candidate."""
     attempt_id: str
     model_run_id: str
     attempt_number: int
@@ -63,6 +64,7 @@ class TrainingAttempt:
 
 @dataclass(frozen=True, slots=True)
 class TrainingCandidate:
+    """Identity-bound model candidate and its latest execution projection."""
     campaign_id: str
     dataset_id: str
     model_run_id: str
@@ -82,15 +84,18 @@ class TrainingCandidate:
 
     @property
     def active(self) -> bool:
+        """Return whether this candidate has an in-flight attempt."""
         return self.status in _ACTIVE
 
     @property
     def terminal(self) -> bool:
+        """Return whether this candidate reached completed or failed state."""
         return self.status in _TERMINAL
 
 
 @dataclass(frozen=True, slots=True)
 class CampaignReconciliationResult:
+    """Campaign status after reconciling all candidate attempts."""
     campaign_id: str
     status: str
     candidates: tuple[TrainingCandidate, ...]
@@ -98,22 +103,26 @@ class CampaignReconciliationResult:
 
     @property
     def all_terminal(self) -> bool:
+        """Return whether every candidate is terminal."""
         return bool(self.candidates) and all(candidate.terminal for candidate in self.candidates)
 
     @property
     def all_successful(self) -> bool:
+        """Return whether every candidate completed with a verified artifact."""
         return bool(self.candidates) and all(
             candidate.status == "completed" for candidate in self.candidates
         )
 
     @property
     def ready_for_validation(self) -> bool:
+        """Return whether the campaign is terminal with at least one model."""
         return self.all_terminal and any(
             candidate.status == "completed" for candidate in self.candidates
         )
 
     @property
     def counts(self) -> dict[str, int]:
+        """Return a count of candidates by persisted status."""
         counts: dict[str, int] = {}
         for candidate in self.candidates:
             counts[candidate.status] = counts.get(candidate.status, 0) + 1
@@ -121,7 +130,13 @@ class CampaignReconciliationResult:
 
 
 class TrainingCampaign:
-    """Reconcile immutable model candidates through scheduler/backend evidence."""
+    """Reconcile immutable model candidates through scheduler/backend evidence.
+
+    The campaign owns append-only candidate/attempt transitions and bounded
+    retries.  A completed scheduler job is not a completed model until the
+    backend parses and hash-verifies the active attempt artifact; promotion is
+    represented separately and is never inferred by reconciliation.
+    """
 
     def __init__(
         self,
@@ -179,6 +194,7 @@ class TrainingCampaign:
         specification: Mapping[str, Any] | None = None,
         **kwargs: Any,
     ) -> "TrainingCampaign":
+        """Construct a campaign and persist/validate its explicit specification."""
         campaign = cls(
             campaign_id=campaign_id,
             dataset_id=dataset_id,
@@ -341,7 +357,7 @@ class TrainingCampaign:
         )
 
     def ensure(self, specification: Mapping[str, Any] | None = None) -> None:
-        """Ensure the immutable campaign identity exists in StateStore."""
+        """Ensure the campaign identity and policy exist without new runs."""
 
         self._ensure_campaign(specification)
 
@@ -392,6 +408,7 @@ class TrainingCampaign:
         )
 
     def candidates(self) -> tuple[TrainingCandidate, ...]:
+        """Return current candidate projections in deterministic ordinal order."""
         return tuple(
             self._candidate_from_payload(payload)
             for payload in sorted(
@@ -401,6 +418,7 @@ class TrainingCampaign:
         )
 
     def attempts(self, model_run_id: str | None = None) -> tuple[TrainingAttempt, ...]:
+        """Return persisted attempts, optionally restricted to one model run."""
         records = []
         for payload in self._attempt_payloads().values():
             if model_run_id is not None and payload.get("model_run_id") != model_run_id:
@@ -441,7 +459,12 @@ class TrainingCampaign:
         script_path: str | Path | None = None,
         dataset_path: str | Path | None = None,
     ) -> TrainingCandidate:
-        """Persist one immutable candidate, idempotently by model-run identity."""
+        """Create or reuse one identity-bound model candidate run.
+
+        Reuse is allowed only when the persisted model-run identity and input
+        hashes match.  The run directory and candidate event are the durable
+        restart boundary; no scheduler submission occurs here.
+        """
 
         if not isinstance(training_input, TrainingInput):
             raise TypeError("TrainingCampaign.create_run requires a TrainingInput")
@@ -928,6 +951,7 @@ class TrainingCampaign:
         reason: str,
         scheduler_state: SchedulerJobState,
     ) -> TrainingCandidate:
+        """Persist an attempt failure and create only an explicitly allowed retry."""
         self._save_attempt(
             attempt,
             status="failed",
@@ -1070,7 +1094,13 @@ class TrainingCampaign:
         return "failed"
 
     def reconcile(self) -> CampaignReconciliationResult:
-        """Apply one idempotent state-table reconciliation pass."""
+        """Apply one idempotent state-table reconciliation pass.
+
+        Existing submitted/running attempts are reconciled first to avoid
+        duplicate jobs after restart.  Only remaining capacity is used for new
+        submissions; backend completion and artifact identity are required for
+        success, while promotion remains a separate explicit decision.
+        """
 
         self._ensure_campaign()
         current = list(self.candidates())

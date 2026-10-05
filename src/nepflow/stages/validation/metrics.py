@@ -31,7 +31,14 @@ def _mae_rmse(values: Any, label: str) -> tuple[float, float]:
 
 @dataclass(frozen=True, slots=True)
 class PairedValidationCase:
-    """One output prediction paired to authoritative reference labels."""
+    """One prediction paired to authoritative reference labels.
+
+    Energies are in eV, forces are Cartesian eV/Angstrom with shape
+    ``(n_atoms, 3)``, and optional virials are positive-compression Cartesian
+    ``(3, 3)`` tensors in eV.  ``reference_indices`` maps prediction order to
+    the original reference atom order; repeated-cell predictions may contain
+    each reference atom ``repeat_count`` times.
+    """
 
     case_id: str
     structure_id: str
@@ -100,7 +107,13 @@ class PairedValidationCase:
 
 @dataclass(frozen=True, slots=True)
 class ValidationMetrics:
-    """Aggregate finite DFT-vs-ML validation metrics."""
+    """Aggregate finite DFT-vs-ML metrics.
+
+    Energy and virial fields are in eV; force fields are in eV/Angstrom.
+    Component metrics use Cartesian ``x, y, z`` values, while magnitude
+    metrics use the Euclidean norm per atom.  Virial metrics compare
+    positive-compression Cartesian tensors after repeat normalization.
+    """
 
     energy_mae: float
     energy_rmse: float
@@ -112,6 +125,7 @@ class ValidationMetrics:
     virial_rmse: float | None = None
 
     def to_dict(self) -> dict[str, float | None]:
+        """Return JSON-shaped metric names and numeric values."""
         return {
             "energy_mae": self.energy_mae,
             "energy_rmse": self.energy_rmse,
@@ -132,6 +146,11 @@ def pair_prediction(
 
     The backend supplies output-order provenance through ``atom_mapping``;
     this function performs no file I/O and never guesses atom order.
+
+    The prediction must contain ``n_atoms * prod(replicates)`` atoms.  Virials,
+    when requested by the reference, must use positive-compression Cartesian
+    ``(3, 3)`` tensors in eV.  ``ValidationError`` is raised for identity,
+    shape, provenance, or convention mismatches.
     """
 
     expected_count = case.atom_count * int(np.prod(case.replicates))
@@ -182,7 +201,17 @@ def pair_prediction(
 
 
 def calculate_metrics(paired: Sequence[PairedValidationCase]) -> ValidationMetrics:
-    """Calculate aggregate metrics from already paired scientific values."""
+    """Calculate aggregate metrics from already paired scientific values.
+
+    Energies are normalized per atom before error calculation; forces are
+    compared in prediction order mapped back to reference atoms.  Virials are
+    normalized by the cell repeat count but retain the positive-compression
+    Cartesian convention.  No plotting or persistence occurs.
+
+    Raises:
+        ValidationError: If no cases are supplied or virial availability is
+            inconsistent across cases.
+    """
 
     records = tuple(paired)
     if not records:

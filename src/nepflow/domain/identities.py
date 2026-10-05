@@ -45,11 +45,13 @@ def _pbc_values(atoms: Any) -> tuple[bool, bool, bool]:
 
 
 def canonical_structure_text(atoms: Any) -> str:
-    """Return the Phase 2 canonical structure text unchanged.
+    """Return the versioned canonical text used for structure identity.
 
     Fractional coordinates are grouped by sorted element while preserving the
     original order within each element.  Labels and other mutable annotations
-    are intentionally not part of this representation.
+    are intentionally not part of this representation.  The cell is a
+    Cartesian ``(3, 3)`` matrix and all three periodic-boundary flags are
+    recorded explicitly.
     """
 
     symbols = list(atoms.get_chemical_symbols())
@@ -72,12 +74,21 @@ def canonical_structure_text(atoms: Any) -> str:
 
 
 def calculate_structure_id(atoms: Any) -> str:
-    """Calculate the stable structure ID using the Phase 2 byte semantics."""
+    """Hash the canonical structure bytes into a stable structure ID.
+
+    The ID changes with cell, periodic flags, species, or fractional
+    positions, but not with mutable ``Atoms.info`` annotations.
+    """
 
     return sha256_bytes(canonical_structure_text(atoms).encode("utf-8"))
 
 
 def annotate_structure_id(atoms: Any, *, overwrite: bool = True) -> str:
+    """Attach and return the canonical ID in ``atoms.info``.
+
+    ``overwrite=False`` preserves an existing annotation; the input object is
+    otherwise mutated as a deliberate provenance side effect.
+    """
     structure_id = calculate_structure_id(atoms)
     info = getattr(atoms, "info", None)
     if info is None:
@@ -141,14 +152,17 @@ def normalise_dft_calculation_identity(value: Mapping[str, Any]) -> dict[str, An
 
 @dataclass(frozen=True)
 class StructureIdentity:
+    """Versioned identity of one canonical structure."""
     structure_id: str
     schema_version: str = STRUCTURE_IDENTITY_SCHEMA
 
     @classmethod
     def from_atoms(cls, atoms: Any) -> "StructureIdentity":
+        """Create an identity from an ASE-like structure."""
         return cls(calculate_structure_id(atoms))
 
     def to_dict(self) -> dict[str, str]:
+        """Serialize the structure ID and schema version."""
         return {
             "structure_id": self.structure_id,
             "structure_id_version": self.schema_version,
@@ -157,6 +171,7 @@ class StructureIdentity:
 
 @dataclass(frozen=True)
 class ArtifactIdentity:
+    """Content hash and provenance for one persisted artifact."""
     artifact_id: str
     artifact_type: str
     sha256: str
@@ -167,6 +182,7 @@ class ArtifactIdentity:
     def from_bytes(
         cls, artifact_type: str, content: bytes, *, path: str | None = None
     ) -> "ArtifactIdentity":
+        """Create an artifact identity from exact bytes and optional path."""
         digest = sha256_bytes(content)
         artifact_id = "artifact_" + sha256_canonical_json(
             {
@@ -179,10 +195,12 @@ class ArtifactIdentity:
 
     @classmethod
     def from_file(cls, artifact_type: str, path: str | Path) -> "ArtifactIdentity":
+        """Hash a file into an artifact identity without guessing on I/O failure."""
         resolved = Path(path).resolve()
         return cls.from_bytes(artifact_type, resolved.read_bytes(), path=str(resolved))
 
     def to_dict(self) -> dict[str, str]:
+        """Serialize the artifact type, digest, schema, and optional path."""
         result = {
             "artifact_id": self.artifact_id,
             "artifact_type": self.artifact_type,
@@ -228,6 +246,7 @@ class DftCalculationIdentity:
         object.__setattr__(self, "calculation_id", "calculation_" + sha256_canonical_json(payload))
 
     def scientific_payload(self) -> dict[str, Any]:
+        """Return hash-defining DFT inputs, excluding execution resources."""
         payload: dict[str, Any] = {
             "schema_version": DFT_CALCULATION_IDENTITY_SCHEMA,
             "structure_id": self.structure_id,
@@ -245,6 +264,7 @@ class DftCalculationIdentity:
         return payload
 
     def to_dict(self) -> dict[str, Any]:
+        """Serialize scientific identity and explicitly retained resources."""
         result = dict(self.scientific_payload())
         result["calculation_id"] = self.calculation_id
         resources = {
@@ -265,6 +285,7 @@ class DftCalculationIdentity:
 
 @dataclass(frozen=True)
 class ModelRunIdentity:
+    """Identity of one dataset/input/hyperparameter training run."""
     dataset_id: str
     nep_in_sha256: str
     hyperparameters_hash: str
@@ -283,6 +304,7 @@ class ModelRunIdentity:
         return cls(dataset_id, nep_in_sha256, hyperparameters_hash)
 
     def identity_payload(self) -> dict[str, str]:
+        """Return the ordered, hash-defining model training inputs."""
         return {
             "schema_version": self.schema_version,
             "dataset_id": self.dataset_id,
@@ -291,11 +313,13 @@ class ModelRunIdentity:
         }
 
     def to_dict(self) -> dict[str, str]:
+        """Serialize this model-run identity for state and manifests."""
         return {"model_run_id": self.model_run_id, **self.identity_payload()}
 
 
 @dataclass(frozen=True)
 class ValidationRunIdentity:
+    """Identity of one model/dataset/settings validation campaign."""
     model_run_id: str
     dataset_id: str
     validation_settings: Mapping[str, Any] = field(default_factory=dict)
@@ -312,6 +336,7 @@ class ValidationRunIdentity:
         )
 
     def identity_payload(self) -> dict[str, Any]:
+        """Return normalized validation inputs used to derive the run ID."""
         return {
             "schema_version": self.schema_version,
             "model_run_id": self.model_run_id,
@@ -320,11 +345,13 @@ class ValidationRunIdentity:
         }
 
     def to_dict(self) -> dict[str, Any]:
+        """Serialize the validation-run identity and its settings."""
         return {"validation_run_id": self.validation_run_id, **to_jsonable(self.identity_payload())}
 
 
 @dataclass(frozen=True)
 class DescriptorCacheIdentity:
+    """Identity of an ordered descriptor cache and its model fingerprint."""
     structure_ids: tuple[str, ...]
     model_filename: str
     model_sha256: str
@@ -339,6 +366,7 @@ class DescriptorCacheIdentity:
         )
 
     def to_manifest(self) -> dict[str, Any]:
+        """Return the cache manifest, including ordered IDs and model hash."""
         return {
             "schema_version": self.schema_version,
             "structure_ids": list(self.structure_ids),
@@ -349,4 +377,5 @@ class DescriptorCacheIdentity:
 
     @property
     def cache_id(self) -> str:
+        """Return the deterministic ID for this exact descriptor cache."""
         return "descriptor_cache_" + sha256_canonical_json(self.to_manifest())

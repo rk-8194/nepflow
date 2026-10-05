@@ -13,7 +13,12 @@ Annotate = Callable[..., Any]
 
 
 def normal_strain_matrix(amplitude: float, axis: int) -> np.ndarray:
-    """Return a diagonal normal strain tensor, with amplitude in fractional units."""
+    """Return a diagonal deformation matrix for normal strain.
+
+    ``amplitude`` is dimensionless and ``axis`` is zero-based.  The returned
+    ``(3, 3)`` matrix has ``1 + amplitude`` on the selected diagonal entry;
+    callers apply it to the cell as ``matrix @ cell``.
+    """
 
     matrix = np.eye(3)
     matrix[axis, axis] += amplitude
@@ -21,7 +26,13 @@ def normal_strain_matrix(amplitude: float, axis: int) -> np.ndarray:
 
 
 def coupled_strain_matrix(amplitude: float, axis_a: int, axis_b: int) -> np.ndarray:
-    """Return a volume-preserving coupled normal strain tensor."""
+    """Return a coupled normal deformation matrix with unit determinant.
+
+    ``amplitude`` is dimensionless and must avoid ``1 - amplitude**2 == 0``;
+    the two selected axes receive opposite normal strains and the remaining
+    axis compensates the volume.  The result is a dimensionless ``(3, 3)``
+    matrix.
+    """
 
     matrix = np.eye(3)
     axis_c = ({0, 1, 2} - {axis_a, axis_b}).pop()
@@ -32,7 +43,12 @@ def coupled_strain_matrix(amplitude: float, axis_a: int, axis_b: int) -> np.ndar
 
 
 def shear_strain_matrix(amplitude: float, axis_a: int, axis_b: int) -> np.ndarray:
-    """Return tensor shear (not engineering shear) for one axis pair."""
+    """Return a symmetric tensor-shear deformation matrix.
+
+    ``amplitude`` is the tensor shear component, not engineering shear
+    ``gamma``; both off-diagonal entries are set to that value.  The result is
+    dimensionless with shape ``(3, 3)``.
+    """
 
     matrix = np.eye(3)
     matrix[axis_a, axis_b] = amplitude
@@ -46,7 +62,13 @@ def elastic_stress_set(
     settings: PerturbationSettings,
     annotate: Annotate,
 ) -> list[Any]:
-    """Generate every enabled strain mode for every non-zero amplitude."""
+    """Generate enabled strain modes from a periodic cell.
+
+    Each output cell is ``matrix @ supercell.cell`` and positions are scaled
+    with the cell.  Strain amplitudes are dimensionless, modes preserve the
+    declared tensor-shear convention, and provenance is attached through
+    ``annotate``.  The input structures are not mutated.
+    """
 
     if not settings.elastic_stress_enabled:
         return []

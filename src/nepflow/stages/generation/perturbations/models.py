@@ -22,7 +22,13 @@ class PerturbationCounts:
 
 @dataclass(frozen=True, slots=True)
 class PerturbationSettings:
-    """Scientific settings shared by one worker task."""
+    """Scientific settings shared by one worker task.
+
+    Distances and rattle amplitudes are in Angstrom, volume scales and strains
+    are dimensionless, temperature is kelvin, timestep is femtoseconds, and
+    ``target_n_atoms``/step/count fields are integers.  ``random_seed`` is
+    persisted into task provenance so worker output is reproducible.
+    """
 
     rattle_std: float = 0.03
     rattle_std_min: float | None = None

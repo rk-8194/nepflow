@@ -23,7 +23,14 @@ def liquid_snapshots(
     seed: int,
     annotate: Annotate,
 ) -> list[Any]:
-    """Run deterministic Lennard-Jones MD and return requested snapshots."""
+    """Run seeded Lennard-Jones MD and return requested snapshots.
+
+    Temperature is in kelvin, timestep in femtoseconds, and the configured
+    equilibration/snapshot counts are integration steps.  The ASE cell and
+    periodic flags are retained; this is a configurable perturbation model,
+    not a production thermodynamic ensemble or a replacement for a target
+    potential.
+    """
 
     if not settings.liquid_enabled or n_configurations <= 0 or n_snapshots <= 0:
         return []

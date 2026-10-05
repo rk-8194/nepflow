@@ -115,7 +115,13 @@ def _last_frame(path: Path) -> Atoms:
 
 
 class GpumdBackend:
-    """Parse and render the existing one-step GPUMD static protocol."""
+    """Render inputs and parse one-step GPUMD static predictions.
+
+    The adapter validates model-artifact hashes before materialization and
+    returns energy in eV, forces in eV/Angstrom with shape ``(n_atoms, 3)``,
+    and optional positive-compression Cartesian virial ``(3, 3)`` in eV.
+    Scheduler submission is intentionally outside this class.
+    """
 
     def __init__(self, command: str | Sequence[str] = ("gpumd",)) -> None:
         if isinstance(command, str):
@@ -126,10 +132,12 @@ class GpumdBackend:
 
     @property
     def command(self) -> tuple[str, ...]:
+        """Return the configured GPUMD executable command."""
         return self._command
 
     @property
     def executable_identity(self) -> tuple[str, ...]:
+        """Return command tokens used for execution provenance."""
         return self._command
 
     @staticmethod
@@ -139,6 +147,7 @@ class GpumdBackend:
         potential_filename: str = "nep.txt",
         output_filename: str = "out.xyz",
     ) -> str:
+        """Render a one-step GPUMD input for positive replicate factors."""
         values = tuple(int(value) for value in replicates)
         if len(values) != 3 or any(value < 1 for value in values):
             raise ValueError("GPUMD replicate factors must be three positive integers")
@@ -165,6 +174,12 @@ class GpumdBackend:
         replicates: tuple[int, int, int] = (1, 1, 1),
         potential_filename: str = "nep.txt",
     ) -> GpumdStaticInput:
+        """Materialize verified model/input artifacts and return their paths.
+
+        Input geometry is serialized as extxyz when supplied on the request;
+        otherwise the requested source file is copied.  Missing files or hash
+        mismatches raise and no prediction is inferred.
+        """
         artifact = request.model.artifact
         if artifact is None:
             raise MlipError("GPUMD input preparation requires a model artifact")
@@ -228,6 +243,7 @@ class GpumdBackend:
         request: StaticPredictionRequest,
         output_path: Path | None = None,
     ) -> StaticPrediction:
+        """Parse the completed GPUMD output and validate atom provenance."""
         output = (
             Path(output_path)
             if output_path is not None
@@ -353,6 +369,7 @@ class GpumdBackend:
     # Keep the protocol spelling as the primary public operation.  Execution
     # is intentionally outside this adapter; predict parses completed output.
     def predict(self, request: StaticPredictionRequest) -> StaticPrediction:
+        """Parse the completed prediction for the request's working directory."""
         return self.parse_prediction(request)
 
     parse_output = parse_prediction

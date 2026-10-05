@@ -19,6 +19,7 @@ DATASET_MANIFEST_SCHEMA = "nepflow.dataset_manifest.v1"
 
 @dataclass(frozen=True)
 class SelectedDatasetMember:
+    """One selected structure and its accepted, hash-bound DFT result."""
     split: str
     structure_id: str
     calculation_id: str
@@ -38,6 +39,7 @@ class SelectedDatasetMember:
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any], ordinal: int) -> "SelectedDatasetMember":
+        """Parse one persisted member and require a usable calculation ID."""
         identity = value.get("calculation_identity", value.get("calculation_id", {}))
         if isinstance(identity, str):
             identity = {"calculation_id": identity}
@@ -55,6 +57,7 @@ class SelectedDatasetMember:
         )
 
     def to_dict(self) -> dict[str, Any]:
+        """Serialize membership with normalized calculation identity fields."""
         return {
             "split": self.split,
             "structure_id": self.structure_id,
@@ -67,6 +70,7 @@ class SelectedDatasetMember:
 
 @dataclass(frozen=True)
 class DatasetIdentity:
+    """Immutable content identity for a complete train/test dataset."""
     dataset_id: str
     identity_payload: Mapping[str, Any]
     schema_version: str = DATASET_IDENTITY_SCHEMA
@@ -76,6 +80,7 @@ class DatasetIdentity:
 
     @classmethod
     def from_identity_payload(cls, payload: Mapping[str, Any]) -> "DatasetIdentity":
+        """Hash a JSON-shaped payload without filesystem paths."""
         frozen_payload = to_jsonable(dict(payload))
         return cls("dataset_" + sha256_canonical_json(frozen_payload), frozen_payload)
 
@@ -89,6 +94,11 @@ class DatasetIdentity:
         virial_convention: str | None,
         virial_tensor_convention: str | None = None,
     ) -> "DatasetIdentity":
+        """Derive identity from label schema, units, and ordered records.
+
+        Source paths are excluded so relocating unchanged data does not change
+        its scientific identity.
+        """
         payload: dict[str, Any] = {
             "schema_version": DATASET_IDENTITY_SCHEMA,
             "label_schema": label_schema,
@@ -109,11 +119,13 @@ class DatasetIdentity:
         return cls.from_identity_payload(payload)
 
     def to_dict(self) -> dict[str, Any]:
+        """Serialize the dataset ID together with its identity payload."""
         return {"dataset_id": self.dataset_id, **to_jsonable(self.identity_payload)}
 
 
 @dataclass(frozen=True)
 class TrainingDatasetManifest:
+    """Persisted dataset membership, identity, and selection provenance."""
     identity: DatasetIdentity
     records: tuple[Mapping[str, Any], ...]
     selection_method: str | None = None
@@ -133,6 +145,7 @@ class TrainingDatasetManifest:
                 object.__setattr__(self, name, _freeze(value))
 
     def to_dict(self) -> dict[str, Any]:
+        """Serialize the manifest using the canonical dataset schema."""
         result: dict[str, Any] = {
             "schema_version": DATASET_MANIFEST_SCHEMA,
             "dataset_id": self.identity.dataset_id,

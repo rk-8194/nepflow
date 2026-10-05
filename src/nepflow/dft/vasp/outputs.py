@@ -37,12 +37,16 @@ VASP_COMPLETION_MARKERS = ("General timing", "Voluntary context switches")
 
 
 def is_completed_text(outcar_text: str) -> bool:
-    """Check completion markers in already-read OUTCAR text."""
+    """Return whether already-read OUTCAR text contains a completion marker."""
     return any(marker in outcar_text[-2000:] for marker in VASP_COMPLETION_MARKERS)
 
 
 def outcar_is_complete(outcar_path: Path) -> bool:
-    """Check whether an OUTCAR tail contains a VASP completion marker."""
+    """Return whether a readable OUTCAR contains a completion marker.
+
+    Only the final 50,000 bytes are inspected; missing or unreadable files
+    return ``False`` rather than being treated as completed output.
+    """
     outcar_path = Path(outcar_path)
     if not outcar_path.exists():
         return False
@@ -77,7 +81,8 @@ def parse_stress_from_outcar(
     verified Phase 2 handling for the kB matrix layouts used by existing
     utilities and fixtures.  The returned tensor keeps the backend-native
     stress sign; conversion to NEPFlow's positive-compression virial remains
-    the responsibility of :func:`parse_virial_from_outcar`.
+    the responsibility of :func:`parse_virial_from_outcar`.  Its shape is
+    ``(3, 3)`` in Cartesian row-major order and its units are eV/Angstrom^3.
     """
     outcar_path = Path(outcar_path)
     if prefer_ase:
@@ -149,6 +154,9 @@ def parse_virial_from_outcar(outcar_path: Path, volume: float) -> np.ndarray | N
     ``volume`` is the positive cell volume in Angstrom^3.  The returned
     Cartesian 3x3 tensor is in eV and applies exactly
     ``virial = -stress[eV/Angstrom^3] * volume[Angstrom^3]``.
+
+    Missing or malformed stress returns ``None``; a non-positive volume is
+    invalid at the conversion boundary.
     """
     try:
         # Keep the verified Phase 2 text semantics for the canonical virial
@@ -166,7 +174,14 @@ class DftOutputValidationError(ValueError):
 
 
 def validate_dft_result_labels(structure: Mapping[str, object]) -> bool:
-    """Validate VASP labels with the accepted Phase 2 error vocabulary."""
+    """Validate finite DFT labels and their scientific shapes.
+
+    Energy is eV, forces are eV/Angstrom with shape ``(n_atoms, 3)``, lattice
+    is Angstrom with shape ``(3, 3)``, and optional virial is eV with shape
+    ``(3, 3)`` in positive-compression Cartesian order.  Raises
+    ``DftOutputValidationError`` with a stable reason instead of fabricating
+    missing labels.
+    """
     energy = structure.get("energy")
     if not isinstance(energy, Real) or not np.isfinite(float(energy)):
         raise DftOutputValidationError("missing_or_nonfinite_energy")
@@ -208,7 +223,12 @@ def validate_dft_result_labels(structure: Mapping[str, object]) -> bool:
 
 @dataclass(frozen=True)
 class VaspParseResult:
-    """Immutable, authoritative result of parsing one VASP OUTCAR."""
+    """Immutable accepted/rejected result for one identity-bound OUTCAR.
+
+    Accepted energies are eV; forces are ``(n_atoms, 3)`` eV/Angstrom;
+    positions/lattice are Angstrom; and optional virials are positive-
+    compression Cartesian ``(3, 3)`` tensors in eV.
+    """
 
     structure_id: str
     calculation_identity: tuple[tuple[str, str], ...]
@@ -248,9 +268,15 @@ class VaspParseResult:
 
     @property
     def accepted(self) -> bool:
+        """Return whether this parse contains complete accepted labels."""
         return self.status == "accepted"
 
     def as_structure_dict(self) -> dict:
+        """Return accepted labels in the legacy structure mapping shape.
+
+        Raises:
+            ValueError: If this parse result was rejected.
+        """
         if not self.accepted:
             raise ValueError(self.rejection_reason or "rejected_parse_result")
         return {
@@ -333,6 +359,10 @@ def resolve_verified_output(
     persistence.  This function owns the trust rule: a current job must have
     a matching identity sidecar, while a reused or registry OUTCAR may be in a
     historical directory without a sidecar of its own.
+
+    ``None`` means no identity-matching completed output was evidenced.  The
+    function never searches for a newest directory or treats scheduler absence
+    as completion.
     """
     expected = _validated_identity(expected_identity, label="expected VASP identity")
     expected_items = _identity_items(expected)
@@ -406,7 +436,14 @@ def parse_outcar_result(
     reader: Callable[[str], Atoms] | None = None,
     identity_reader: Callable[[Path], dict] | None = None,
 ) -> VaspParseResult:
-    """Parse one OUTCAR into an immutable accepted/rejected result."""
+    """Parse one identity-bound OUTCAR into an accepted/rejected result.
+
+    ``ase_atoms`` supplies the expected structure identity.  Accepted forces
+    have shape ``(n_atoms, 3)`` in eV/Angstrom, positions/lattice are Angstrom,
+    and optional virial is a positive-compression Cartesian ``(3, 3)`` tensor
+    in eV.  Identity or label failures become a rejected result with a stable
+    reason; no placeholder scientific values are emitted.
+    """
     if reader is None:
         reader = cast(Callable[[str], Atoms], ase_read)
     identity_reader = read_identity if identity_reader is None else identity_reader
@@ -630,7 +667,11 @@ def parse_outcar(
     reader: Callable[[str], Atoms] | None = None,
     identity_reader: Callable[[Path], dict] | None = None,
 ) -> dict | None:
-    """Return legacy structure data only for an accepted parse."""
+    """Return legacy structure data only for an accepted parse.
+
+    This thin adapter returns ``None`` for rejected output and never supplies
+    placeholder labels.
+    """
     result = parse_outcar_result(
         outcar_path,
         ase_atoms,
@@ -645,7 +686,11 @@ def parse_outcar(
 
 @dataclass(frozen=True, slots=True)
 class VaspPerformanceEvidence:
-    """Performance fields parsed directly from one completed OUTCAR."""
+    """Performance fields parsed from one completed OUTCAR.
+
+    Loop times are elapsed seconds; rank, electron, and k-point fields are
+    counts.  Missing evidence remains ``None`` or an empty tuple.
+    """
 
     total_ranks: int | None
     loop_times: tuple[float, ...]
@@ -655,11 +700,15 @@ class VaspPerformanceEvidence:
 
     @property
     def average_loop_time(self) -> float | None:
+        """Return mean elapsed loop time in seconds, if any loops were parsed."""
         return sum(self.loop_times) / len(self.loop_times) if self.loop_times else None
 
 
 def parse_performance_evidence(outcar_text: str) -> VaspPerformanceEvidence:
-    """Parse canonical performance evidence for DFT reports and benchmarks."""
+    """Parse performance evidence for reports and benchmarks.
+
+    Absent fields remain absent and are not converted to zero-valued claims.
+    """
     ranks_match = re.search(r"running on\s+(\d+)\s+total cores", outcar_text)
     mpi_ranks_match = re.search(r"running\s+(\d+)\s+mpi-ranks", outcar_text)
     loops = tuple(
@@ -692,6 +741,9 @@ def parse_memory_record(outcar_path: Path, gpus_per_node: int) -> dict[str, obje
     inputs are present, malformed or unreadable evidence raises
     :class:`VaspMemoryParseError` so migration diagnostics cannot silently
     discard a completed run.
+
+    Loop time is in seconds; atom, rank, node, and GPU fields are counts, with
+    ``gpus_per_node`` explicitly scoped to one node.
     """
 
     if gpus_per_node < 1:

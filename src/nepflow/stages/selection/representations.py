@@ -31,7 +31,16 @@ def compute_structure_descriptors(
     *,
     mean_descriptor: bool,
 ) -> np.ndarray:
-    """Compute structure representations through supported NepTrainKit APIs."""
+    """Compute one descriptor row per structure through NepTrainKit APIs.
+
+    ``structures`` are passed in their existing order.  ``mean_descriptor``
+    selects NepTrainKit's per-structure mean representation versus its native
+    descriptor aggregation.  Returns a finite-compatible 2D array with shape
+    ``(len(structures), n_features)``; the feature width is supplied by the
+    model and is not assumed here.  Raises ``AttributeError`` when neither
+    supported calculator API is available; shape and finiteness are validated
+    by the cache-writing boundary.
+    """
 
     descriptors = getattr(calc, "descriptors", None)
     if callable(descriptors):
@@ -241,7 +250,16 @@ def load_or_calculate_representations(
     batch_size: int,
     nep_model_file: str,
 ) -> np.ndarray:
-    """Load an exact-identity cache or calculate representations from NEP."""
+    """Load or calculate identity-matched NEP representations.
+
+    Cache rows retain the input structure order and are reusable only when
+    structure identities, model filename/content hash, aggregation setting,
+    shape, and artifact hash all match.  ``batch_size`` bounds descriptor
+    calculation memory.  Returns a ``(len(structures), n_features)`` array
+    and atomically publishes a cache/manifest pair on a miss; raises when the
+    model is absent or calculated descriptors are non-numeric, non-finite, or
+    have the wrong row count.
+    """
 
     descriptor_cache = descriptor_cache_path(project_dir)
     nep_model_path = project_dir / "config" / "nep" / nep_model_file
@@ -289,7 +307,15 @@ def compute_descriptors_batched(
     mean_descriptor: bool,
     batch_size: int,
 ) -> np.ndarray:
-    """Compute representations in batches to avoid OOM."""
+    """Compute representations in input order using bounded batches.
+
+    ``batch_size`` is a positive number of structures per calculator call;
+    output rows remain aligned with ``structures`` and are concatenated into a
+    2D ``(len(structures), n_features)`` array.  The function logs progress
+    and elapsed/estimated time as a non-persistent side effect.  Raises the
+    calculator's errors or ``ValueError`` for an invalid batch size/empty
+    result.
+    """
 
     all_descriptors = []
     n = len(structures)

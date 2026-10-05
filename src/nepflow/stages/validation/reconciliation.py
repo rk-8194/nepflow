@@ -24,7 +24,11 @@ _TERMINAL = frozenset({"completed", "failed"})
 
 @dataclass(frozen=True, slots=True)
 class ValidationExecutionRecord:
-    """The latest persisted attempt for one identity-bound validation case."""
+    """Latest persisted attempt for one identity-bound validation case.
+
+    A scheduler terminal state is not success: ``prediction`` must be parsed
+    and identity-checked before ``status`` becomes ``completed``.
+    """
 
     validation_run_id: str
     case: ValidationCaseSpec
@@ -39,14 +43,17 @@ class ValidationExecutionRecord:
 
     @property
     def case_id(self) -> str:
+        """Return the immutable case identity."""
         return self.case.case_id
 
     @property
     def output_path(self) -> Path:
+        """Return the output path owned by the case definition."""
         return self.case.output_path
 
     @property
     def terminal(self) -> bool:
+        """Return whether this attempt is completed or failed."""
         return self.status in _TERMINAL
 
 
@@ -58,7 +65,11 @@ ValidationAttempt = ValidationExecutionRecord
 
 @dataclass(frozen=True, slots=True)
 class ValidationReconciliationResult:
-    """The state table after one idempotent reconciliation pass."""
+    """Validation case state after one idempotent reconciliation pass.
+
+    ``all_terminal`` reports no pending/running cases; ``all_successful`` is
+    stricter and requires every case to have a typed prediction.
+    """
 
     validation_run_id: str
     status: str
@@ -72,18 +83,22 @@ class ValidationReconciliationResult:
 
     @property
     def all_terminal(self) -> bool:
+        """Return whether every validation case is terminal."""
         return bool(self.cases) and all(case.terminal for case in self.cases)
 
     @property
     def all_successful(self) -> bool:
+        """Return whether every validation case produced a prediction."""
         return bool(self.cases) and all(case.status == "completed" for case in self.cases)
 
     @property
     def any_failed(self) -> bool:
+        """Return whether at least one case is terminally failed."""
         return any(case.status == "failed" for case in self.cases)
 
     @property
     def counts(self) -> dict[str, int]:
+        """Return a count of cases by persisted status."""
         result: dict[str, int] = {}
         for case in self.cases:
             result[case.status] = result.get(case.status, 0) + 1
@@ -96,6 +111,10 @@ class ValidationReconciliationOrchestrator:
     Case definitions are immutable snapshots in StateStore.  Only the latest
     case status is projected from append-only ``validation_case`` events;
     every attempt remains available through ``validation_attempt`` events.
+
+    Reconciliation never infers success from queue disappearance or a stale
+    output file; completion requires a parseable backend prediction for the
+    current attempt directory.
     """
 
     def __init__(
@@ -155,6 +174,7 @@ class ValidationReconciliationOrchestrator:
 
     @property
     def validation_run_id(self) -> str:
+        """Return the canonical validation-run identity string."""
         return self.validation_run.validation_run_id
 
     def _events(self, entity_type: str, entity_id: str | None = None) -> list[dict[str, Any]]:
@@ -296,11 +316,13 @@ class ValidationReconciliationOrchestrator:
         )
 
     def cases(self) -> tuple[ValidationExecutionRecord, ...]:
+        """Return current case projections in deterministic case order."""
         payloads = self._latest_case_payloads()
         records = [self._record_from_payload(payloads[case.case_id]) for case in self._cases]
         return tuple(records)
 
     def attempts(self, case_id: str | None = None) -> tuple[ValidationExecutionRecord, ...]:
+        """Return persisted attempts, optionally restricted to one case."""
         records = []
         for payload in self._attempt_payloads().values():
             if case_id is not None and payload.get("case_id") != case_id:
@@ -383,6 +405,12 @@ class ValidationReconciliationOrchestrator:
         reason: str,
         scheduler_state: SchedulerJobState,
     ) -> ValidationExecutionRecord:
+        """Persist failure before creating the next attempt, if allowed.
+
+        Keeping the failed attempt event preserves evidence and makes restart
+        idempotent; the next attempt receives a new ID rather than overwriting
+        the failed execution.
+        """
         failed = self._save_status(
             record,
             "failed",
@@ -504,7 +532,13 @@ class ValidationReconciliationOrchestrator:
         return "failed"
 
     def reconcile_once(self) -> ValidationReconciliationResult:
-        """Apply one scheduler/backend state pass without guessing outcomes."""
+        """Apply one scheduler/backend pass without guessing outcomes.
+
+        Active queue evidence consumes concurrency; terminal scheduler evidence
+        then requires a current-attempt prediction parse.  Parser failures are
+        recorded as retry/terminal evidence, not promoted to validation
+        success.
+        """
 
         current = self.cases()
         active_jobs = self.scheduler.list_active_jobs(name_prefix=self.job_name_prefix).active_jobs

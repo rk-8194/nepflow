@@ -29,7 +29,11 @@ from nepflow.hpc.process import ProcessResult
 
 @dataclass(frozen=True, slots=True)
 class DftResultRequirements:
-    """Explicit required quantities for one parsed DFT result."""
+    """Explicit required quantities for one parsed DFT result.
+
+    ``virial_requested`` requires a positive-compression Cartesian ``(3, 3)``
+    virial in eV at the parser boundary.
+    """
 
     energy_required: bool = True
     forces_required: bool = True
@@ -38,7 +42,12 @@ class DftResultRequirements:
 
 @dataclass(frozen=True, slots=True)
 class DftInputRequest:
-    """Typed inputs needed to prepare one scientific DFT calculation."""
+    """Typed inputs needed to prepare one scientific DFT calculation.
+
+    ``source_structure_index`` selects the source frame; the backend must
+    verify that its structure identity matches ``structure`` before writing
+    inputs.
+    """
 
     structure: StructureIdentity
     source_structure: Path
@@ -49,7 +58,11 @@ class DftInputRequest:
 
 @dataclass(frozen=True, slots=True)
 class DftInputArtifacts:
-    """Prepared files and their canonical scientific calculation identity."""
+    """Prepared files and their canonical scientific calculation identity.
+
+    Paths are materialized artifacts for one working directory; they are not a
+    substitute for the persisted StateStore artifact records.
+    """
 
     calculation: DftCalculationIdentity
     working_directory: Path
@@ -74,6 +87,9 @@ class DftResult:
     optional 3x3 tensor in eV using the positive-compression convention.
     The explicit requirements record determines which quantities may be
     absent; it is carried from the input request through the prepared inputs.
+
+    Forces have shape ``(n_atoms, 3)`` and virial has shape ``(3, 3)`` in
+    Cartesian row-major order.  Missing required labels raise ``BackendError``.
     """
 
     structure: StructureIdentity

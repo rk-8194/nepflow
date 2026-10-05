@@ -34,7 +34,9 @@ class ExecutionStateStore(Protocol):
         *,
         artifact: DftResultArtifact | None = None,
         reason: str | None = None,
-    ) -> None: ...
+    ) -> None:
+        """Persist the latest attempt status and optional artifact evidence."""
+        ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,16 +50,24 @@ class DftRecoveryDecision:
 
 
 class DftRecoveryPolicy(Protocol):
+    """Policy that converts typed DFT failure evidence into retry/terminal choice."""
     def __call__(
         self,
         record: "DftExecutionRecord",
         failure: Any,
-    ) -> DftRecoveryDecision: ...
+    ) -> DftRecoveryDecision:
+        """Return a bounded retry decision for typed failure evidence."""
+        ...
 
 
 @dataclass(frozen=True, slots=True)
 class DftExecutionRecord:
-    """Persistable state for one prepared DFT attempt."""
+    """Persistable state for one prepared DFT attempt.
+
+    ``status`` distinguishes preparation, scheduler activity, scientific
+    completion, reuse, and terminal failure.  ``retry_level`` is persisted so
+    restart cannot silently repeat a resource tier.
+    """
 
     inputs: DftInputArtifacts
     attempt_id: str
@@ -76,6 +86,7 @@ class DftExecutionRecord:
         retry_level: int | None = None,
         resources: JobResources | None = None,
     ) -> "DftExecutionRecord":
+        """Return an immutable status update without changing input state."""
         return replace(
             self,
             status=status,
@@ -87,12 +98,18 @@ class DftExecutionRecord:
 
 @dataclass(frozen=True, slots=True)
 class DftReconciliationResult:
-    """Records after one idempotent reconciliation pass."""
+    """Records after one idempotent reconciliation pass.
+
+    Terminal means no further scheduler transition is expected; successful
+    means only ``completed`` or verified ``reused`` records, never merely a
+    terminal scheduler state.
+    """
 
     records: tuple[DftExecutionRecord, ...]
 
     @property
     def all_terminal(self) -> bool:
+        """Return whether every record is completed, reused, or failed."""
         return all(record.status in {"completed", "reused", "failed"} for record in self.records)
 
     @property
@@ -109,6 +126,7 @@ class DftReconciliationResult:
 
     @property
     def counts(self) -> dict[str, int]:
+        """Return a count of records by persisted status."""
         result: dict[str, int] = {}
         for record in self.records:
             result[record.status] = result.get(record.status, 0) + 1
@@ -116,7 +134,13 @@ class DftReconciliationResult:
 
 
 class DftReconciliationOrchestrator:
-    """Advance prepared DFT attempts through scheduler/backend state."""
+    """Advance prepared DFT attempts through scheduler/backend evidence.
+
+    One pass is restart-safe: persisted submitted/running attempts are
+    reconciled before new submissions, active jobs consume concurrency slots,
+    and a backend-completed output is required before success is recorded.
+    Failed attempts are retained before a new retry record is created.
+    """
 
     _TERMINAL_STATUSES = frozenset({"completed", "reused", "failed"})
 
@@ -153,7 +177,12 @@ class DftReconciliationOrchestrator:
         self,
         records: Sequence[DftExecutionRecord],
     ) -> DftReconciliationResult:
-        """Apply the state table once, preserving input order."""
+        """Apply one idempotent state pass while preserving input order.
+
+        Queue/accounting results control operational state, but only backend
+        completion and parsed labels establish scientific success.  Unknown
+        states raise rather than being interpreted as an empty queue.
+        """
         current = tuple(records)
         active_jobs = self.scheduler.list_active_jobs(
             name_prefix=self.job_name_prefix,
@@ -186,6 +215,7 @@ class DftReconciliationOrchestrator:
         return DftReconciliationResult(tuple(reconciled))
 
     def _reconcile_submitted(self, record: DftExecutionRecord) -> DftExecutionRecord:
+        """Resolve one submitted attempt and persist completion or retry evidence."""
         if not record.job_id:
             raise ValueError(f"Submitted DFT attempt {record.attempt_id} has no scheduler job ID")
         scheduler_result = self.scheduler.reconcile(record.job_id)
@@ -225,6 +255,8 @@ class DftReconciliationOrchestrator:
             self.performance_recorder.record_failure(record, failure)
         decision = self._recovery_decision(record, failure)
         if decision.retry:
+            # Retain the failed attempt before creating a new identity so a
+            # restart cannot submit the same failed attempt twice.
             failed = record.with_status("failed")
             self._save(failed, reason=failure.reason)
             retry = DftExecutionRecord(

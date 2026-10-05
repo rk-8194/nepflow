@@ -125,7 +125,7 @@ def parse_sbatch_job_id(output: str) -> str:
 
 
 def parse_sbatch_output(output: str) -> str:
-    """Compatibility name for :func:`parse_sbatch_job_id`."""
+    """Parse the submitted job ID from ``sbatch`` output."""
 
     return parse_sbatch_job_id(output)
 
@@ -222,7 +222,12 @@ def parse_sacct_output(output: str) -> tuple[SlurmJobRecord, ...]:
 
 
 class SlurmScheduler:
-    """Run and parse SLURM commands through :class:`ProcessRunner`."""
+    """Run and parse SLURM commands through the shared process boundary.
+
+    Submission/query methods return typed records and preserve scheduler
+    communication errors as ``SchedulerError``.  A missing queue row is not a
+    failed query and is resolved through accounting where appropriate.
+    """
 
     def __init__(
         self,
@@ -318,6 +323,7 @@ class SlurmScheduler:
         cwd: str | Path | None = None,
         timeout: float | None = None,
     ) -> SubmissionResult:
+        """Render resource directives and submit one script."""
         directives = render_sbatch_directives(
             resources or JobResources(),
             job_name=job_name,
@@ -333,6 +339,7 @@ class SlurmScheduler:
         return self.submit(command, cwd=cwd, timeout=timeout)
 
     def cancel(self, job_id: str, *, timeout: float | None = None) -> CancellationResult:
+        """Cancel a job and return the scheduler command result."""
         if not job_id.strip():
             raise ValueError("job_id must not be blank")
         command = ("scancel", job_id)
@@ -376,6 +383,7 @@ class SlurmScheduler:
         return QueueQueryResult(parse_squeue_output(result.stdout or ""))
 
     def queue_status(self, job_id: str, *, timeout: float | None = None) -> QueueStatusResult:
+        """Query queue state; a missing row is distinct from query failure."""
         query = self._queue_query(job_id=job_id, active_only=False, timeout=timeout)
         job = next((candidate for candidate in query.jobs if candidate.job_id == job_id), None)
         return QueueStatusResult(job_id=job_id, job=job)
@@ -387,6 +395,7 @@ class SlurmScheduler:
         name_prefix: str | None = None,
         timeout: float | None = None,
     ) -> QueueQueryResult:
+        """List active queue jobs, optionally filtered by name prefix."""
         query = self._queue_query(user=user, active_only=True, timeout=timeout)
         if name_prefix is None:
             return query
@@ -401,10 +410,12 @@ class SlurmScheduler:
         user: str | None = None,
         timeout: float | None = None,
     ) -> SlurmJobRecord | None:
+        """Find an active job by exact name, or return ``None`` if absent."""
         query = self.list_active_jobs(user=user, timeout=timeout)
         return next((job for job in query.jobs if job.name == job_name), None)
 
     def accounting_status(self, job_id: str, *, timeout: float | None = None) -> AccountingResult:
+        """Query terminal accounting state for one job ID."""
         command = [
             "sacct",
             "--noheader",
@@ -423,6 +434,13 @@ class SlurmScheduler:
         return AccountingResult(job_id=job_id, job=job)
 
     def reconcile(self, job_id: str, *, timeout: float | None = None) -> ReconciledJobResult:
+        """Prefer queue evidence, then consult accounting for terminal state.
+
+        This ordering prevents a running job from being misclassified as
+        finished while also allowing reconciliation to converge after SLURM
+        removes a job from ``squeue``.  If both sources are absent, the typed
+        result is ``NOT_FOUND``; command failures still raise.
+        """
         queue = self.queue_status(job_id, timeout=timeout)
         if queue.job is not None:
             return ReconciledJobResult(job_id=job_id, job=queue.job, source="squeue")
@@ -440,13 +458,6 @@ class SlurmScheduler:
             source="sacct",
         )
 
-    # Explicit aliases keep the boundary easy to adopt without adding parser
-    # logic to legacy caller modules.
-    status = reconcile
-    active_jobs = list_active_jobs
-    job_name_lookup = find_job_by_name
-
-
 __all__ = [
     "SACCT_FORMAT",
     "SQUEUE_FORMAT",
@@ -454,6 +465,5 @@ __all__ = [
     "map_slurm_state",
     "parse_sacct_output",
     "parse_sbatch_job_id",
-    "parse_sbatch_output",
     "parse_squeue_output",
 ]

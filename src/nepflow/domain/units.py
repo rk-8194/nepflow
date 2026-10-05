@@ -27,6 +27,15 @@ def stress_kbar_to_ev_per_angstrom3(stress_kbar: Any) -> np.ndarray:
     stress-to-virial sign change is performed here; callers that need the
     NEPFlow positive-compression virial must use :func:`virial_from_stress`.
     Matrix components are ordered ``(xx, xy, xz; yx, yy, yz; zx, zy, zz)``.
+
+    Args:
+        stress_kbar: Numeric array with shape ``(3, 3)``.
+
+    Returns:
+        A ``(3, 3)`` array in eV/Angstrom^3.
+
+    Raises:
+        ValueError: If the input does not have shape ``(3, 3)``.
     """
 
     stress_tensor = require_tensor_shape(stress_kbar, (3, 3), name="stress_kbar")
@@ -38,6 +47,15 @@ def stress_ev_per_angstrom3_to_gpa(stress_ev_per_angstrom3: Any) -> np.ndarray:
 
     The input and output retain the same Cartesian component order and sign;
     this is a unit conversion only, not a virial convention conversion.
+
+    Args:
+        stress_ev_per_angstrom3: Numeric ``(3, 3)`` stress tensor.
+
+    Returns:
+        The tensor in GPa with unchanged Cartesian ordering and sign.
+
+    Raises:
+        ValueError: If the input does not have shape ``(3, 3)``.
     """
 
     stress_tensor = require_tensor_shape(
@@ -56,6 +74,10 @@ def virial_from_stress(stress_ev_per_angstrom3: Any, volume_angstrom3: float) ->
     positive cell volume in Angstrom^3.  The returned 3x3 tensor is in eV and
     uses ``virial = -stress * volume``; the minus sign is the sole convention
     change at this boundary.
+
+    Raises:
+        ValueError: If the stress is not ``(3, 3)`` or the volume is not finite
+            and strictly positive.
     """
 
     stress_tensor = require_tensor_shape(
@@ -72,6 +94,10 @@ def stress_from_virial(virial_ev: Any, volume_angstrom3: float) -> np.ndarray:
     ``virial_ev`` is a 3x3 tensor in eV and ``volume_angstrom3`` is in
     Angstrom^3.  The returned tensor is in eV/Angstrom^3 with the same
     Cartesian ordering as the input and applies ``stress = -virial / volume``.
+
+    Raises:
+        ValueError: If the virial is not ``(3, 3)`` or the volume is not finite
+            and strictly positive.
     """
 
     virial_tensor = require_tensor_shape(virial_ev, (3, 3), name="virial_ev")
@@ -86,7 +112,11 @@ def _require_positive_volume(volume_angstrom3: float) -> float:
 
 
 def require_tensor_shape(value: Any, shape: tuple[int, ...], *, name: str) -> np.ndarray:
-    """Return a finite-ness-neutral float tensor with the required shape."""
+    """Coerce a value to a float array with exactly ``shape``.
+
+    Finiteness is intentionally not checked here; callers decide whether
+    non-finite values are meaningful for their boundary.
+    """
 
     array = np.asarray(value, dtype=float)
     if array.shape != shape:

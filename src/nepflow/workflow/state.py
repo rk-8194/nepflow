@@ -85,7 +85,12 @@ class WorkflowState:
         return stored_run, marker_stage, marker_error
 
     def reconcile(self) -> ReconciliationResult:
-        """Reconcile the compatibility marker from authoritative ledger state."""
+        """Reconcile the marker from authoritative ledger state.
+
+        A committed StateStore stage always wins; the marker is repaired as a
+        cache.  Only when no ledger row exists is a valid legacy marker
+        imported into the store, making migration explicit and one-way.
+        """
 
         stored_run, marker_stage, marker_error = self._read_authoritative_state()
 
