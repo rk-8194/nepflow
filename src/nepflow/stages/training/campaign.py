@@ -47,6 +47,7 @@ _TERMINAL = frozenset({"completed", "failed"})
 @dataclass(frozen=True, slots=True)
 class TrainingAttempt:
     """Immutable persisted scheduler attempt for one model candidate."""
+
     attempt_id: str
     model_run_id: str
     attempt_number: int
@@ -65,6 +66,7 @@ class TrainingAttempt:
 @dataclass(frozen=True, slots=True)
 class TrainingCandidate:
     """Identity-bound model candidate and its latest execution projection."""
+
     campaign_id: str
     dataset_id: str
     model_run_id: str
@@ -96,6 +98,7 @@ class TrainingCandidate:
 @dataclass(frozen=True, slots=True)
 class CampaignReconciliationResult:
     """Campaign status after reconciling all candidate attempts."""
+
     campaign_id: str
     status: str
     candidates: tuple[TrainingCandidate, ...]

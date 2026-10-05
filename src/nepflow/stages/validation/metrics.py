@@ -88,9 +88,7 @@ class PairedValidationCase:
                 "paired validation virial must use the positive-compression convention"
             )
         if self.virial_tensor_convention != VIRIAL_TENSOR_CONVENTION_CARTESIAN_3X3:
-            raise ValidationError(
-                "paired validation virial must use Cartesian 3x3 tensor ordering"
-            )
+            raise ValidationError("paired validation virial must use Cartesian 3x3 tensor ordering")
 
         if (self.dft_virial_ev is None) != (self.ml_virial_ev is None):
             raise ValidationError("paired validation virials must be present as a complete pair")

@@ -15,8 +15,8 @@ from ase.io import read as ase_read  # noqa: E402
 
 from nepflow.config.models import (  # noqa: E402
     CompositionConfig,
-    NepTrainingConfig,
     NepflowConfig,
+    NepTrainingConfig,
 )
 from nepflow.dft.vasp.inputs import read_identity  # noqa: E402
 from nepflow.dft.vasp.outputs import parse_outcar_result  # noqa: E402

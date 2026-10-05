@@ -153,6 +153,7 @@ def normalise_dft_calculation_identity(value: Mapping[str, Any]) -> dict[str, An
 @dataclass(frozen=True)
 class StructureIdentity:
     """Versioned identity of one canonical structure."""
+
     structure_id: str
     schema_version: str = STRUCTURE_IDENTITY_SCHEMA
 
@@ -172,6 +173,7 @@ class StructureIdentity:
 @dataclass(frozen=True)
 class ArtifactIdentity:
     """Content hash and provenance for one persisted artifact."""
+
     artifact_id: str
     artifact_type: str
     sha256: str
@@ -286,6 +288,7 @@ class DftCalculationIdentity:
 @dataclass(frozen=True)
 class ModelRunIdentity:
     """Identity of one dataset/input/hyperparameter training run."""
+
     dataset_id: str
     nep_in_sha256: str
     hyperparameters_hash: str
@@ -320,6 +323,7 @@ class ModelRunIdentity:
 @dataclass(frozen=True)
 class ValidationRunIdentity:
     """Identity of one model/dataset/settings validation campaign."""
+
     model_run_id: str
     dataset_id: str
     validation_settings: Mapping[str, Any] = field(default_factory=dict)
@@ -352,6 +356,7 @@ class ValidationRunIdentity:
 @dataclass(frozen=True)
 class DescriptorCacheIdentity:
     """Identity of an ordered descriptor cache and its model fingerprint."""
+
     structure_ids: tuple[str, ...]
     model_filename: str
     model_sha256: str

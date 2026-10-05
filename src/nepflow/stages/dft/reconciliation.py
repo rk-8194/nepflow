@@ -51,6 +51,7 @@ class DftRecoveryDecision:
 
 class DftRecoveryPolicy(Protocol):
     """Policy that converts typed DFT failure evidence into retry/terminal choice."""
+
     def __call__(
         self,
         record: "DftExecutionRecord",

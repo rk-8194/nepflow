@@ -104,8 +104,7 @@ def _reference_from_record(record: Mapping[str, Any]) -> ValidationReference:
             record.get("virial_convention") or VIRIAL_CONVENTION_POSITIVE_COMPRESSION
         ),
         virial_tensor_convention=str(
-            record.get("virial_tensor_convention")
-            or VIRIAL_TENSOR_CONVENTION_CARTESIAN_3X3
+            record.get("virial_tensor_convention") or VIRIAL_TENSOR_CONVENTION_CARTESIAN_3X3
         ),
     )
 

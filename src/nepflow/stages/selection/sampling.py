@@ -42,6 +42,7 @@ class StructureComposition:
 @dataclass(frozen=True)
 class BinaryProjection:
     """One normalized binary composition coordinate in ``[0, 1]``."""
+
     subset: tuple[str, str]
     structure_index: int
     normalized_fraction_b: float
@@ -50,6 +51,7 @@ class BinaryProjection:
 @dataclass(frozen=True)
 class TernaryProjection:
     """One normalized ternary composition point in barycentric order."""
+
     subset: tuple[str, str, str]
     structure_index: int
     barycentric: tuple[float, float, float]
@@ -58,6 +60,7 @@ class TernaryProjection:
 @dataclass(frozen=True)
 class CoverageSummary:
     """Histogram, entropy, concentration, and novelty diagnostics for a subset."""
+
     subset_label: str
     subset_size: int
     dimensions: int
@@ -75,6 +78,7 @@ class CoverageSummary:
 @dataclass(frozen=True)
 class PairFrequencyPoint:
     """Frequency of one binary composition fraction across structures."""
+
     pair: tuple[str, str]
     b_fraction: float
     frequency: int

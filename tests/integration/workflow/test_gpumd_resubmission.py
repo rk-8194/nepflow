@@ -1,8 +1,8 @@
-from datetime import datetime
 import subprocess
 import sys
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import Mock
 

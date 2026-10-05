@@ -20,6 +20,7 @@ DATASET_MANIFEST_SCHEMA = "nepflow.dataset_manifest.v1"
 @dataclass(frozen=True)
 class SelectedDatasetMember:
     """One selected structure and its accepted, hash-bound DFT result."""
+
     split: str
     structure_id: str
     calculation_id: str
@@ -71,6 +72,7 @@ class SelectedDatasetMember:
 @dataclass(frozen=True)
 class DatasetIdentity:
     """Immutable content identity for a complete train/test dataset."""
+
     dataset_id: str
     identity_payload: Mapping[str, Any]
     schema_version: str = DATASET_IDENTITY_SCHEMA
@@ -126,6 +128,7 @@ class DatasetIdentity:
 @dataclass(frozen=True)
 class TrainingDatasetManifest:
     """Persisted dataset membership, identity, and selection provenance."""
+
     identity: DatasetIdentity
     records: tuple[Mapping[str, Any], ...]
     selection_method: str | None = None

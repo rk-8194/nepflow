@@ -1080,8 +1080,7 @@ def load_materialized_dataset(
     metadata = read_json_object(metadata_path)
     if metadata.get("schema_version") != DATASET_MANIFEST_SCHEMA:
         raise StateError(
-            f"Unsupported materialized dataset manifest schema: "
-            f"{metadata.get('schema_version')!r}"
+            f"Unsupported materialized dataset manifest schema: {metadata.get('schema_version')!r}"
         )
     artifacts = metadata.get("artifacts")
     if not isinstance(artifacts, Mapping):

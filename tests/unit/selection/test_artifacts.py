@@ -70,11 +70,7 @@ def test_selection_publication_rolls_back_existing_triplet(tmp_path, monkeypatch
     ]
     write_selected_structures(tmp_path, structures, [0], [1])
     selected_dir = tmp_path / "structures" / "selected"
-    before = {
-        path.name: path.read_bytes()
-        for path in selected_dir.iterdir()
-        if path.is_file()
-    }
+    before = {path.name: path.read_bytes() for path in selected_dir.iterdir() if path.is_file()}
 
     def fail_manifest(*_args, **_kwargs):
         raise OSError("manifest publication failed")

@@ -458,6 +458,7 @@ class SlurmScheduler:
             source="sacct",
         )
 
+
 __all__ = [
     "SACCT_FORMAT",
     "SQUEUE_FORMAT",

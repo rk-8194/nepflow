@@ -2,7 +2,7 @@ from dataclasses import replace
 
 import pytest
 
-from nepflow.config.models import CompositionConfig, NepTrainingConfig, NepflowConfig
+from nepflow.config.models import CompositionConfig, NepflowConfig, NepTrainingConfig
 from nepflow.mlip.nep.inputs import NepHyperparameters, NepInputRenderer
 
 
@@ -18,9 +18,7 @@ def make_train_config(**overrides: object) -> NepflowConfig:
     for key, value in overrides.items():
         field_name = field_names.get(key, key)
         if key == "weights":
-            values[field_name] = tuple(
-                float(item) for item in str(value).replace(",", " ").split()
-            )
+            values[field_name] = tuple(float(item) for item in str(value).replace(",", " ").split())
         elif field_name in token_fields:
             values[field_name] = tuple(str(value).replace(",", " ").split())
         elif field_name in int_fields or field_name == "generations":

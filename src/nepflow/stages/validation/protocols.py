@@ -202,8 +202,7 @@ class ValidationReference:
                 value.get("virial_convention") or VIRIAL_CONVENTION_POSITIVE_COMPRESSION
             ),
             virial_tensor_convention=str(
-                value.get("virial_tensor_convention")
-                or VIRIAL_TENSOR_CONVENTION_CARTESIAN_3X3
+                value.get("virial_tensor_convention") or VIRIAL_TENSOR_CONVENTION_CARTESIAN_3X3
             ),
         )
 
