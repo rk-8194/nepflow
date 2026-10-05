@@ -8,6 +8,8 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, TypeVar
 
+import numpy as np
+
 from nepflow.errors import StateError
 
 from .atomic import atomic_write_text
@@ -31,11 +33,13 @@ def to_jsonable(value: Any) -> Any:
         return [to_jsonable(item) for item in value]
     if isinstance(value, Path):
         return str(value)
-    if hasattr(value, "tolist") and callable(value.tolist):
+    if isinstance(value, np.ndarray):
         return to_jsonable(value.tolist())
-    if hasattr(value, "item") and callable(value.item):
+    if isinstance(value, np.generic):
         return to_jsonable(value.item())
-    return value
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    raise TypeError(f"Value of type {type(value).__name__} is not JSON serializable")
 
 
 def dumps(

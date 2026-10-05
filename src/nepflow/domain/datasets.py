@@ -14,6 +14,7 @@ from .identities import (
 )
 
 DATASET_IDENTITY_SCHEMA = "nepflow.dataset.v1"
+DATASET_MANIFEST_SCHEMA = "nepflow.dataset_manifest.v1"
 
 
 @dataclass(frozen=True)
@@ -133,6 +134,7 @@ class TrainingDatasetManifest:
 
     def to_dict(self) -> dict[str, Any]:
         result: dict[str, Any] = {
+            "schema_version": DATASET_MANIFEST_SCHEMA,
             "dataset_id": self.identity.dataset_id,
             "identity": self.identity.to_dict(),
             "records": [to_jsonable(record) for record in self.records],

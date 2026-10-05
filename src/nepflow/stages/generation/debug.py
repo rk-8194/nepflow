@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import random
+from io import StringIO
 from typing import Any
 
 from ase import Atom
@@ -11,6 +12,7 @@ from ase.build import bulk
 from ase.io import write
 
 from nepflow.domain.identities import annotate_structure_ids
+from nepflow.io.atomic import atomic_write_text
 
 from .models import GenerationRequest
 
@@ -72,10 +74,12 @@ def run_debug(request: GenerationRequest) -> list[Any]:
     structures_dir = request.project_dir / request.structures_path
     seeds_file = structures_dir / "seeds" / "base_structures.xyz"
     seeds_file.parent.mkdir(parents=True, exist_ok=True)
-    write(str(seeds_file), structures)
+    rendered = StringIO()
+    write(rendered, structures, format="extxyz")
+    atomic_write_text(seeds_file, rendered.getvalue(), encoding="utf-8")
     generated_file = structures_dir / "generated" / "generated_structures.xyz"
     generated_file.parent.mkdir(parents=True, exist_ok=True)
-    write(str(generated_file), structures)
+    atomic_write_text(generated_file, rendered.getvalue(), encoding="utf-8")
     logger.info("[DEBUG] Saved %s seed structures to %s", len(structures), seeds_file)
     logger.info("[DEBUG] Saved %s generated structures to %s", len(structures), generated_file)
     return structures

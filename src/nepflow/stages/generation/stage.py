@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable, Mapping, Sequence
+from io import StringIO
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
@@ -12,6 +13,9 @@ from ase.io import read, write
 from nepflow.config.models import NepflowConfig
 from nepflow.domain.identities import ArtifactIdentity, StructureIdentity, annotate_structure_ids
 from nepflow.domain.structures import GeneratedStructureRecord, StructureProvenance
+from nepflow.errors import ArtifactError
+from nepflow.io.atomic import atomic_write_text
+from nepflow.io.hashing import sha256_file
 from nepflow.workflow.controller import StageContext
 
 from .generators.base import ConfigurationalGenerator
@@ -113,7 +117,7 @@ class GenerationStage:
     def _run_standard(self, request: GenerationRequest) -> GenerationResult:
         resumed = False
         seed_path = self._resolve_seed_path(request)
-        if not request.seeds_only and seed_path.is_file():
+        if not request.seeds_only and seed_path is not None and seed_path.is_file():
             bases = self._load_saved_bases(seed_path)
             manifest = self._manifest_for_existing(request, seed_path, bases)
             resumed = True
@@ -258,7 +262,9 @@ class GenerationStage:
         if bases:
             path.parent.mkdir(parents=True, exist_ok=True)
             annotate_structure_ids(bases)
-            write(str(path), bases)
+            rendered = StringIO()
+            write(rendered, bases, format="extxyz")
+            atomic_write_text(path, rendered.getvalue(), encoding="utf-8")
             self.logger.info("  Saved seeds to %s", path)
             artifact = ArtifactIdentity.from_file("generation_seed_structures", path)
             self._persist_structure_records(request, bases)
@@ -341,7 +347,7 @@ class GenerationStage:
         )
         return manifest
 
-    def _resolve_seed_path(self, request: GenerationRequest) -> Path:
+    def _resolve_seed_path(self, request: GenerationRequest) -> Path | None:
         """Resolve a prior seed artifact through the authoritative event ledger."""
 
         store = request.state_store if request.state_store is not None else self.state_store
@@ -363,9 +369,25 @@ class GenerationStage:
                 payload = event.get("payload") or {}
                 artifact = payload.get("artifact") if isinstance(payload, Mapping) else None
                 path = artifact.get("path") if isinstance(artifact, Mapping) else None
-                if path and Path(path).is_file():
-                    return Path(path)
-        return request.seeds_file
+                expected_hash = artifact.get("sha256") if isinstance(artifact, Mapping) else None
+                if path:
+                    resolved_path = Path(path)
+                    if not resolved_path.is_file():
+                        raise ArtifactError(
+                            f"Persisted generation artifact is missing: {resolved_path}"
+                        )
+                    actual_hash = sha256_file(resolved_path, required=True)
+                    if not expected_hash or actual_hash != expected_hash:
+                        raise ArtifactError(
+                            f"Persisted generation artifact changed: {resolved_path}"
+                        )
+                    return resolved_path
+        # With an authoritative store, absence of a persisted artifact event
+        # means there is no runtime authority to reuse a filesystem-only seed.
+        # The explicit migration utilities are the only route for adopting
+        # historical files.  A store-less debug/compatibility caller may still
+        # use the established seed path.
+        return request.seeds_file if store is None else None
 
     def _persist_structure_records(self, request: GenerationRequest, bases: list[Any]) -> None:
         store = request.state_store if request.state_store is not None else self.state_store

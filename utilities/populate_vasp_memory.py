@@ -9,12 +9,14 @@ completed OUTCAR files, writing results to <nepflow_root>/.vasp_memory.
 import argparse
 import csv
 import sys
+from io import StringIO
 from pathlib import Path
 from typing import Optional
 
 from nepflow.dft.vasp.outputs import (
     parse_memory_record,
 )
+from nepflow.io.atomic import atomic_write_text
 
 CSV_HEADER = [
     "n_atoms",
@@ -88,11 +90,13 @@ def main() -> None:
         print("No completed VASP runs found.")
         return
 
-    with open(output_path, "w", encoding="utf-8", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(CSV_HEADER)
-        for row in rows:
-            writer.writerow([row[col] for col in CSV_HEADER])
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    rendered = StringIO(newline="")
+    writer = csv.writer(rendered, lineterminator="\n")
+    writer.writerow(CSV_HEADER)
+    for row in rows:
+        writer.writerow([row[col] for col in CSV_HEADER])
+    atomic_write_text(output_path, rendered.getvalue(), encoding="utf-8")
 
     print(f"Wrote {len(rows)} entries to {output_path}")
 

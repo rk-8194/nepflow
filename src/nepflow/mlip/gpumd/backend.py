@@ -9,8 +9,8 @@ then returns the actual values serialized by GPUMD.
 from __future__ import annotations
 
 import shlex
-import shutil
 from dataclasses import dataclass
+from io import StringIO
 from pathlib import Path
 from typing import Sequence
 
@@ -21,6 +21,7 @@ from ase.io import write as ase_write
 
 from nepflow.domain.units import virial_from_stress
 from nepflow.errors import MlipError
+from nepflow.io.atomic import atomic_write_bytes, atomic_write_text
 from nepflow.io.hashing import sha256_file
 from nepflow.mlip.simulation import (
     PredictionRuntimeMetadata,
@@ -197,23 +198,25 @@ class GpumdBackend:
                 cell=np.asarray(request.cell_angstrom, dtype=float),
                 pbc=request.pbc,
             )
+            rendered = StringIO()
             ase_write(
-                str(working_input_path),
+                rendered,
                 atoms,
                 format="extxyz",
                 write_info=False,
                 write_results=False,
             )
+            atomic_write_text(working_input_path, rendered.getvalue(), encoding="utf-8")
         elif not input_path.is_file():
             raise FileNotFoundError(f"GPUMD model input not found: {input_path}")
         elif input_path.resolve() != working_input_path.resolve():
-            shutil.copy2(input_path, working_input_path)
+            atomic_write_bytes(working_input_path, input_path.read_bytes())
         target_potential = working_directory / potential_filename
         if source_potential.resolve() != target_potential.resolve():
-            shutil.copy2(source_potential, target_potential)
+            atomic_write_bytes(target_potential, source_potential.read_bytes())
         run_in_path = working_directory / "run.in"
         output_path = working_directory / "out.xyz"
-        run_in_path.write_text(content, encoding="utf-8", newline="\n")
+        atomic_write_text(run_in_path, content, encoding="utf-8")
         return GpumdStaticInput(working_input_path, run_in_path, output_path, content)
 
     # A descriptive alias for callers that use backend terminology rather

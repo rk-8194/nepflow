@@ -48,10 +48,22 @@ def read_model_run_manifest(path: Path) -> dict[str, Any]:
         value = read_json_object(path, error_type=NepArtifactError)
     except FileNotFoundError as exc:
         raise FileNotFoundError(f"Model-run manifest not found: {path}") from exc
+    if value.get("schema_version") != MODEL_RUN_MANIFEST_SCHEMA:
+        raise NepArtifactError(
+            f"Unsupported model-run manifest schema: {value.get('schema_version')!r}"
+        )
+    if value.get("identity_schema_version") != MODEL_RUN_IDENTITY_SCHEMA:
+        raise NepArtifactError(
+            f"Unsupported model-run identity schema: {value.get('identity_schema_version')!r}"
+        )
     return value
 
 
 def write_model_run_manifest(path: Path, manifest: dict[str, Any]) -> None:
+    if manifest.get("schema_version") != MODEL_RUN_MANIFEST_SCHEMA:
+        raise NepArtifactError(
+            f"Unsupported model-run manifest schema: {manifest.get('schema_version')!r}"
+        )
     write_json(path, manifest)
 
 
@@ -79,6 +91,9 @@ def create_model_run_manifest(
     hyperparameters_hash: str,
     state_store: Any | None = None,
 ) -> dict[str, Any]:
+    potential_path = Path(potential_path)
+    dataset_path = Path(dataset_path)
+    nep_in_path = Path(nep_in_path)
     nep_in_path = nep_in_path.resolve()
     potential_path = potential_path.resolve()
     if not nep_in_path.is_file():
@@ -144,6 +159,7 @@ def update_model_run_status(
     state_store: Any | None = None,
     model_run_id: str | None = None,
 ) -> dict[str, Any]:
+    potential_path = Path(potential_path)
     manifest_path = potential_path / MODEL_RUN_MANIFEST_FILENAME
     manifest = read_model_run_manifest(manifest_path)
     if manifest.get("schema_version") != MODEL_RUN_MANIFEST_SCHEMA:
@@ -282,6 +298,7 @@ def validate_model_run_manifest(
     expected_model_run_id: str | None = None,
     state_store: Any | None = None,
 ) -> dict[str, Any]:
+    manifest_path = Path(manifest_path)
     manifest = read_model_run_manifest(manifest_path)
     required = (
         "model_run_id",
@@ -397,6 +414,21 @@ def validate_model_run_manifest(
             f"Dataset identity mismatch for {dataset_path}: "
             f"expected {manifest['dataset_id']}, found {metadata.get('dataset_id')}"
         )
+    dataset_artifacts = metadata.get("artifacts")
+    if dataset_artifacts is not None:
+        if not isinstance(dataset_artifacts, Mapping):
+            raise NepArtifactError("Dataset artifact index is malformed")
+        for filename in ("train.xyz", "test.xyz"):
+            record = dataset_artifacts.get(filename)
+            artifact = dataset_path / filename
+            if (
+                not isinstance(record, Mapping)
+                or record.get("path") != filename
+                or not artifact.is_file()
+                or sha256_file(artifact, required=True, error_type=NepArtifactError)
+                != record.get("sha256")
+            ):
+                raise NepArtifactError(f"Dataset artifact hash mismatch for {artifact}")
     for path_key, hash_key in (
         ("potential_artifact_path", "potential_artifact_sha256"),
         ("nep_in_path", "nep_in_sha256"),
@@ -418,6 +450,7 @@ def find_model_run_manifest(project_dir: Path, model_run_id: str) -> Path:
 
     if not model_run_id:
         raise ValueError("model_run_id is required; latest model discovery is disabled")
+    project_dir = Path(project_dir)
     potentials_dir = project_dir / "nep" / "potentials"
     if not potentials_dir.is_dir():
         raise FileNotFoundError(f"No canonical NEP potential directory found: {potentials_dir}")

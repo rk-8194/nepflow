@@ -252,7 +252,7 @@ class NepInputRenderer:
         working_directory = Path(request.working_directory)
         working_directory.mkdir(parents=True, exist_ok=True)
         output_path = working_directory / "nep.in"
-        atomic_write_text(output_path, content)
+        atomic_write_text(output_path, content, encoding="utf-8")
         return TrainingInput(
             dataset=request.dataset,
             working_directory=working_directory,
@@ -275,7 +275,7 @@ class NepInputRenderer:
         working_directory = Path(working_directory)
         working_directory.mkdir(parents=True, exist_ok=True)
         output_path = working_directory / "nep.in"
-        atomic_write_text(output_path, content)
+        atomic_write_text(output_path, content, encoding="utf-8")
         return TrainingInput(
             dataset=dataset,
             working_directory=working_directory,

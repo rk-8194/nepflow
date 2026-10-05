@@ -9,9 +9,8 @@ from pathlib import Path
 from typing import Any
 
 from nepflow.errors import ArtifactError
-from nepflow.io.atomic import atomic_write_text
 from nepflow.io.hashing import sha256_canonical_json
-from nepflow.io.json import dumps, loads
+from nepflow.io.json import read_json_object, to_jsonable, write_json
 
 MATERIALS_PROJECT_CACHE_SCHEMA = "materials-project-cache-v1"
 
@@ -58,33 +57,45 @@ class MaterialsProjectCache:
         if not path.exists():
             return None
         try:
-            payload = loads(path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeError, ValueError) as exc:
+            payload = read_json_object(path, error_type=MaterialsProjectCacheError)
+        except (OSError, UnicodeError, ValueError, MaterialsProjectCacheError) as exc:
             raise MaterialsProjectCacheError(f"Malformed Materials Project cache: {path}") from exc
-        if not isinstance(payload, Mapping):
-            raise MaterialsProjectCacheError(f"Invalid Materials Project cache envelope: {path}")
         if payload.get("cache_schema") != MATERIALS_PROJECT_CACHE_SCHEMA:
             raise MaterialsProjectCacheError(f"Unsupported Materials Project cache schema: {path}")
         if payload.get("query_id") != query.query_id:
             raise MaterialsProjectCacheError(f"Materials Project cache identity mismatch: {path}")
         if payload.get("query") != query.payload():
             raise MaterialsProjectCacheError(f"Materials Project cache query mismatch: {path}")
+        if payload.get("schema_version") != MATERIALS_PROJECT_CACHE_SCHEMA:
+            raise MaterialsProjectCacheError(f"Unsupported Materials Project cache schema: {path}")
         records = payload.get("records")
         if not isinstance(records, list) or not all(
             isinstance(record, Mapping) for record in records
         ):
             raise MaterialsProjectCacheError(f"Invalid Materials Project cache records: {path}")
+        expected_records_hash = payload.get("records_sha256")
+        if not isinstance(expected_records_hash, str) or not expected_records_hash:
+            raise MaterialsProjectCacheError(
+                f"Materials Project cache has no records content identity: {path}"
+            )
+        if sha256_canonical_json(records) != expected_records_hash:
+            raise MaterialsProjectCacheError(
+                f"Materials Project cache records content mismatch: {path}"
+            )
         return [dict(record) for record in records]
 
     def save(self, query: MaterialsProjectQuery, records: Sequence[Mapping[str, Any]]) -> Path:
         path = self.path_for(query)
+        normalized_records = [dict(to_jsonable(record)) for record in records]
         envelope = {
+            "schema_version": MATERIALS_PROJECT_CACHE_SCHEMA,
             "cache_schema": MATERIALS_PROJECT_CACHE_SCHEMA,
             "query_id": query.query_id,
             "query": query.payload(),
-            "records": [dict(record) for record in records],
+            "records": normalized_records,
+            "records_sha256": sha256_canonical_json(normalized_records),
         }
-        atomic_write_text(path, dumps(envelope, indent=2))
+        write_json(path, envelope)
         return path
 
     def clear(self) -> None:

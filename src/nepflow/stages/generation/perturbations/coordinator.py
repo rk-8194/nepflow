@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import os
 from concurrent.futures import ProcessPoolExecutor
+from io import StringIO
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -12,6 +13,7 @@ import numpy as np
 from ase.io import write
 
 from nepflow.domain.identities import annotate_structure_ids, calculate_structure_id
+from nepflow.io.atomic import atomic_write_bytes, atomic_write_text
 from nepflow.stages.generation.supercell import build_target_supercell
 
 from .defects import (
@@ -278,7 +280,7 @@ class PerturbationCoordinator:
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         self._output_file = output_dir / "generated_structures.xyz"
-        self._output_file.write_text("")
+        atomic_write_text(self._output_file, "", encoding="utf-8")
         counts = self._counts(
             n_rattled=n_rattled,
             n_liquid_configurations=n_liquid_configurations,
@@ -336,7 +338,10 @@ class PerturbationCoordinator:
             if family not in _PERTURBATION_FAMILIES:
                 raise ValueError(f"Unknown perturbation type: {family!r}")
         annotate_structure_ids(batch)
-        write(str(self._output_file), batch, append=True)
+        rendered = StringIO()
+        write(rendered, batch, format="extxyz")
+        existing = self._output_file.read_bytes()
+        atomic_write_bytes(self._output_file, existing + rendered.getvalue().encode("utf-8"))
         for candidate in batch:
             family = candidate.info.get("perturbation_type", "unknown")
             configuration = candidate.info.get("configurational_type", "unknown")

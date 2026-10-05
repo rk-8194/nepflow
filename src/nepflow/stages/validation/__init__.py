@@ -16,6 +16,8 @@ from .preparation import (
 from .protocols import (
     VALIDATION_CASE_SCHEMA,
     VALIDATION_PREPARATION_SCHEMA,
+    VALIDATION_REFERENCE_SCHEMA,
+    VALIDATION_RESULT_SCHEMA,
     ValidationCase,
     ValidationCaseSpec,
     ValidationPreparation,
@@ -36,6 +38,8 @@ from .stage import ValidationStage, ValidationStageResult
 __all__ = [
     "VALIDATION_CASE_SCHEMA",
     "VALIDATION_PREPARATION_SCHEMA",
+    "VALIDATION_REFERENCE_SCHEMA",
+    "VALIDATION_RESULT_SCHEMA",
     "ResolvedModelDataset",
     "ValidationCaseSpec",
     "ValidationCase",

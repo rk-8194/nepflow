@@ -33,7 +33,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
-from nepflow.dft.vasp.inputs import strip_resource_incar_params
+from nepflow.dft.vasp.inputs import VASP_IDENTITY_SCHEMA, strip_resource_incar_params
 from nepflow.dft.vasp.outputs import outcar_is_complete
 from nepflow.dft.vasp.registry import (
     read_completed_registry,
@@ -221,18 +221,18 @@ def build_entry(
         if verbose:
             print(f"SKIP {struct_dir}: missing {', '.join(missing)}")
         return None
-    if not outcar_is_complete(outcar):
-        if verbose:
-            print(f"SKIP {struct_dir}: OUTCAR is absent or incomplete")
-        return None
-
     try:
+        if not outcar_is_complete(outcar):
+            if verbose:
+                print(f"SKIP {struct_dir}: OUTCAR is absent or incomplete")
+            return None
         structure_id = calculate_poscar_structure_id(poscar)
         incar_hash = hash_incar_file(incar)
         potcar_hash = sha256_bytes(potcar.read_bytes())
-    except Exception as e:
-        if verbose:
-            print(f"SKIP {struct_dir}: could not hash inputs: {e}")
+    except Exception as exc:
+        # A folder with the required files is an eligible historical record.
+        # Never hide a malformed record behind the normal incomplete-job skip.
+        print(f"MALFORMED {struct_dir}: could not read/hash migration inputs: {exc}")
         return None
 
     context = parse_job_context(struct_dir, projects_dir)
@@ -262,6 +262,7 @@ def write_identity(struct_dir: Path, entry: dict, dry_run: bool) -> bool:
     if identity_path.exists():
         return False
     identity = {
+        "schema_version": VASP_IDENTITY_SCHEMA,
         "project_name": entry.get("project_name", ""),
         "dataset": entry.get("dataset", ""),
         "selected_index": entry.get("selected_index"),

@@ -2,16 +2,17 @@
 
 from __future__ import annotations
 
-import json
 import shutil
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from nepflow.hpc.process import ProcessRunner
+from nepflow.io.json import read_json_object, write_json
 
 STATE_FILE_NAME = ".gpumd_self_resubmit_state.json"
 DEFAULT_ARCHIVE_DIR = "final_xyz_history"
+GPUMD_STATE_SCHEMA = "nepflow.gpumd_segment_state.v1"
 
 
 def _utc_timestamp() -> str:
@@ -50,13 +51,20 @@ def load_segment_state(state_path: Path) -> dict[str, Any]:
 
     state_path = Path(state_path)
     if not state_path.exists():
-        return {"segments_completed": 0, "history": [], "created": _utc_timestamp()}
+        return {
+            "schema_version": GPUMD_STATE_SCHEMA,
+            "segments_completed": 0,
+            "history": [],
+            "created": _utc_timestamp(),
+        }
     try:
-        value = json.loads(state_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+        value = read_json_object(state_path, error_type=RuntimeError)
+    except (OSError, RuntimeError) as exc:
         raise RuntimeError(f"Could not read state file: {state_path}") from exc
-    if not isinstance(value, dict):
-        raise RuntimeError(f"GPUMD state file must contain an object: {state_path}")
+    schema_version = value.get("schema_version")
+    if schema_version not in (None, GPUMD_STATE_SCHEMA):
+        raise RuntimeError(f"Unsupported GPUMD state schema: {schema_version!r}")
+    value["schema_version"] = GPUMD_STATE_SCHEMA
     return _normalise_state_timestamps(value)
 
 
@@ -64,9 +72,10 @@ def write_segment_state(state_path: Path, state: dict[str, Any]) -> None:
     """Persist the segment state with an update timestamp."""
 
     state.setdefault("created", _utc_timestamp())
+    state["schema_version"] = GPUMD_STATE_SCHEMA
     _normalise_state_timestamps(state)
     state["updated"] = _utc_timestamp()
-    Path(state_path).write_text(json.dumps(state, indent=2), encoding="utf-8")
+    write_json(Path(state_path), state)
 
 
 def run_gpumd_segment(
@@ -130,6 +139,7 @@ def should_stop(
 
 __all__ = [
     "DEFAULT_ARCHIVE_DIR",
+    "GPUMD_STATE_SCHEMA",
     "STATE_FILE_NAME",
     "archive_and_promote_final",
     "load_segment_state",

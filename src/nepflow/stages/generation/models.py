@@ -9,6 +9,8 @@ from typing import Any, Mapping
 from nepflow.config.models import CompositionConfig, GenerationConfig
 from nepflow.domain.identities import ArtifactIdentity
 
+GENERATION_MANIFEST_SCHEMA = "nepflow.generation_manifest.v1"
+
 
 @dataclass(frozen=True, slots=True)
 class GenerationRequest:
@@ -54,6 +56,7 @@ class GenerationManifest:
 
     def to_dict(self) -> dict[str, Any]:
         return {
+            "schema_version": GENERATION_MANIFEST_SCHEMA,
             "artifact": None if self.artifact is None else self.artifact.to_dict(),
             "path": str(self.path),
             "structure_ids": list(self.structure_ids),

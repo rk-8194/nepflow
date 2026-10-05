@@ -179,7 +179,7 @@ class ArtifactIdentity:
 
     @classmethod
     def from_file(cls, artifact_type: str, path: str | Path) -> "ArtifactIdentity":
-        resolved = Path(path)
+        resolved = Path(path).resolve()
         return cls.from_bytes(artifact_type, resolved.read_bytes(), path=str(resolved))
 
     def to_dict(self) -> dict[str, str]:

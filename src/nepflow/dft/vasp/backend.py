@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import os
-import shutil
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import cast
@@ -26,10 +25,12 @@ from nepflow.domain.identities import (
     StructureIdentity,
 )
 from nepflow.errors import BackendError, ValidationError
+from nepflow.io.atomic import atomic_write_bytes, atomic_write_text
 from nepflow.io.json import write_json
 
 from .failures import VaspFailureEvidence, classify_failure
 from .inputs import (
+    VASP_IDENTITY_SCHEMA,
     canonical_poscar_bytes,
     hash_incar_text,
     identity_for_structure,
@@ -190,7 +191,8 @@ class VaspBackend:
             destination = working / name
             try:
                 if name == "POSCAR":
-                    destination.write_text(
+                    atomic_write_text(
+                        destination,
                         canonical_poscar_bytes(
                             ase_read(
                                 str(source),
@@ -200,9 +202,9 @@ class VaspBackend:
                         encoding="utf-8",
                     )
                 elif name == "INCAR" and self._incar_text is not None:
-                    destination.write_text(self._incar_text, encoding="utf-8")
+                    atomic_write_text(destination, self._incar_text, encoding="utf-8")
                 else:
-                    shutil.copyfile(source, destination)
+                    atomic_write_bytes(destination, source.read_bytes())
             except (OSError, TypeError, ValueError) as exc:
                 raise BackendError(
                     f"Could not prepare required VASP artifact {source}: {exc}"
@@ -210,8 +212,9 @@ class VaspBackend:
             files.append(destination)
         potcar_path = working / "POTCAR"
         try:
-            potcar_path.write_bytes(
-                b"".join(potcar_data[element] for element in sorted(potcar_data))
+            atomic_write_bytes(
+                potcar_path,
+                b"".join(potcar_data[element] for element in sorted(potcar_data)),
             )
         except OSError as exc:
             raise BackendError(f"Could not prepare required VASP artifact POTCAR: {exc}") from exc
@@ -220,6 +223,7 @@ class VaspBackend:
             write_json(
                 working / ".vasp_identity",
                 {
+                    "schema_version": VASP_IDENTITY_SCHEMA,
                     **calculation.scientific_payload(),
                     "calculation_id": calculation.calculation_id,
                 },

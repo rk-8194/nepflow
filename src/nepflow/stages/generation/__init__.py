@@ -6,7 +6,12 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .generators.composition import CompositionGrid
-    from .models import GenerationManifest, GenerationRequest, GenerationResult
+    from .models import (
+        GENERATION_MANIFEST_SCHEMA,
+        GenerationManifest,
+        GenerationRequest,
+        GenerationResult,
+    )
     from .provenance import (
         annotate_base_structures,
         assign_seed_ids,
@@ -17,6 +22,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "GenerationManifest",
+    "GENERATION_MANIFEST_SCHEMA",
     "GenerationRequest",
     "GenerationResult",
     "GenerationStage",
@@ -29,7 +35,12 @@ __all__ = [
 
 
 def __getattr__(name: str):
-    if name in {"GenerationManifest", "GenerationRequest", "GenerationResult"}:
+    if name in {
+        "GENERATION_MANIFEST_SCHEMA",
+        "GenerationManifest",
+        "GenerationRequest",
+        "GenerationResult",
+    }:
         from nepflow.stages.generation import models
 
         return getattr(models, name)

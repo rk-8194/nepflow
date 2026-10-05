@@ -22,6 +22,7 @@ from nepflow.domain.identities import StructureIdentity
 from nepflow.errors import StateError
 from nepflow.hpc.resources import JobResources
 from nepflow.hpc.scheduler import Scheduler
+from nepflow.io.atomic import atomic_write_text
 from nepflow.io.hashing import sha256_canonical_json
 
 if TYPE_CHECKING:
@@ -588,7 +589,8 @@ class VaspBenchmarkRunner:
         if render_runner is None:
             raise TypeError("VASP benchmark backend must render its runner body")
         runner_path = self.runner_path
-        runner_path.write_text(
+        atomic_write_text(
+            runner_path,
             "#!/usr/bin/env bash\nset -e\n" + render_runner(),
             encoding="utf-8",
         )
@@ -609,7 +611,8 @@ class VaspBenchmarkRunner:
         )
         inputs = self.backend.prepare_inputs(request)
         incar_path = case.working_directory / "INCAR"
-        incar_path.write_text(
+        atomic_write_text(
+            incar_path,
             set_incar_parameters(
                 incar_path.read_text(encoding="utf-8"),
                 case.parameters,

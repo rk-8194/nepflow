@@ -1,7 +1,12 @@
 """Domain records and scientific identities for NEPFlow."""
 
 from .calculations import DftExecutionResources, DftResultArtifact
-from .datasets import DatasetIdentity, SelectedDatasetMember, TrainingDatasetManifest
+from .datasets import (
+    DATASET_MANIFEST_SCHEMA,
+    DatasetIdentity,
+    SelectedDatasetMember,
+    TrainingDatasetManifest,
+)
 from .identities import (
     VALIDATION_RUN_IDENTITY_SCHEMA,
     ArtifactIdentity,
@@ -47,6 +52,7 @@ __all__ = [
     "ArtifactIdentity",
     "CARTESIAN_3X3_COMPONENT_ORDER",
     "DatasetIdentity",
+    "DATASET_MANIFEST_SCHEMA",
     "DescriptorCacheIdentity",
     "DftCalculationIdentity",
     "DftExecutionResources",

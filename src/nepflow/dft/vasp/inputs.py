@@ -27,6 +27,8 @@ from nepflow.errors import StateError
 from nepflow.io.hashing import sha256_bytes
 from nepflow.io.json import read_json
 
+VASP_IDENTITY_SCHEMA = "nepflow.vasp_identity.v1"
+
 
 def canonical_poscar_text(atoms) -> str:
     """Return NEPFlow's deterministic VASP5 POSCAR representation."""
@@ -255,6 +257,9 @@ def read_identity(struct_dir: Path) -> dict:
     if not identity_path.exists():
         return {}
     data = read_json(identity_path, error_type=StateError, require_object=True)
+    schema_version = data.pop("schema_version", None)
+    if schema_version not in (None, VASP_IDENTITY_SCHEMA):
+        raise StateError(f"Unsupported VASP identity schema: {schema_version!r}")
     data = normalise_dft_calculation_identity(data)
     for key in ("structure_id", "incar_hash", "potcar_hash", "calculation_id"):
         value = data.get(key)
@@ -264,6 +269,7 @@ def read_identity(struct_dir: Path) -> dict:
 
 
 __all__ = [
+    "VASP_IDENTITY_SCHEMA",
     "VaspInputContext",
     "VaspInputIdentity",
     "canonical_poscar_bytes",

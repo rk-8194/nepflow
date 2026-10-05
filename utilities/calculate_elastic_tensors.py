@@ -50,6 +50,7 @@ from nepflow.stages.generation.perturbations.elasticity import (
     voigt_to_tensor,
 )
 
+ELASTIC_TENSOR_REPORT_SCHEMA = "nepflow.elastic_tensor_report.v1"
 DEFAULT_DATASETS = ("train", "test")
 PROGRESS_EVERY_FRAMES = 500
 PREVIEW_LIMIT = 8
@@ -723,7 +724,13 @@ def main() -> int:
 
     if args.output_json is not None:
         args.output_json.parent.mkdir(parents=True, exist_ok=True)
-        write_json(args.output_json, results)
+        write_json(
+            args.output_json,
+            {
+                "schema_version": ELASTIC_TENSOR_REPORT_SCHEMA,
+                "results": results,
+            },
+        )
 
     return 0
 

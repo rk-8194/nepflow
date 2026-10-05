@@ -29,11 +29,12 @@ from nepflow.dft.vasp.outputs import (
     validate_dft_result_labels,
 )
 from nepflow.domain.datasets import (
+    DATASET_MANIFEST_SCHEMA,
     DatasetIdentity,
     SelectedDatasetMember,
     TrainingDatasetManifest,
 )
-from nepflow.domain.identities import StructureIdentity
+from nepflow.domain.identities import StructureIdentity, calculate_structure_id
 from nepflow.domain.units import (
     ENERGY_UNIT_EV,
     FORCE_UNIT_EV_PER_ANGSTROM,
@@ -45,6 +46,7 @@ from nepflow.domain.units import (
 from nepflow.errors import StateError
 from nepflow.io.hashing import sha256_file
 from nepflow.io.json import read_json_object, to_jsonable, write_json
+from nepflow.stages.selection.artifacts import read_selection_manifest
 
 logger = logging.getLogger(__name__)
 
@@ -365,6 +367,7 @@ def _build_report_metadata(
 
     created = manifest.created_at
     metadata: dict[str, Any] = {
+        "schema_version": DATASET_MANIFEST_SCHEMA,
         "dataset_id": identity.dataset_id,
         "dataset_schema_version": "nepflow.dataset.v1",
         "label_schema": label_schema,
@@ -586,7 +589,19 @@ def _stage_dataset_artifacts(
         raise RuntimeError("Staged train dataset count does not match its report")
     if test_count != expected_counts[DatasetSplit.TEST]:
         raise RuntimeError("Staged test dataset count does not match its report")
-    write_json(staging_path / ".dataset", dict(metadata))
+    persisted_metadata = dict(to_jsonable(metadata))
+    persisted_metadata["schema_version"] = DATASET_MANIFEST_SCHEMA
+    persisted_metadata["artifacts"] = {
+        filename: {
+            "path": filename,
+            "sha256": sha256_file(staging_path / filename, required=True),
+        }
+        for filename in ("train.xyz", "test.xyz")
+    }
+    write_json(staging_path / ".dataset", persisted_metadata)
+    if isinstance(metadata, dict):
+        metadata.clear()
+        metadata.update(persisted_metadata)
 
     for filename in ("train.xyz", "test.xyz", ".dataset"):
         artifact = staging_path / filename
@@ -917,6 +932,7 @@ def resolve_selected_dft_results(
 
         reader = ase_read
     by_structure = _index_selected_calculations(state_store)
+    selection_manifest = read_selection_manifest(project_dir)
 
     resolved: dict[DatasetSplit, tuple[VaspParseResult, ...]] = {}
     for split in (DatasetSplit.TRAIN, DatasetSplit.TEST):
@@ -929,6 +945,12 @@ def resolve_selected_dft_results(
         structures = reader(str(source), index=":", format="extxyz")
         if not isinstance(structures, list):
             structures = [structures]
+        expected_ids = selection_manifest[f"{split.value}_structure_ids"]
+        actual_ids = [calculate_structure_id(atoms) for atoms in structures]
+        if actual_ids != expected_ids:
+            raise StateError(
+                f"Selected {split.value} structure content does not match its manifest"
+            )
         resolved[split] = tuple(
             _resolve_selected_split(structures, split, by_structure, state_store)
         )
@@ -957,9 +979,7 @@ def _resolve_selected_split(
 ) -> list[VaspParseResult]:
     results: list[VaspParseResult] = []
     for atoms in structures:
-        structure_id = str(
-            atoms.info.get("structure_id", StructureIdentity.from_atoms(atoms).structure_id)
-        )
+        structure_id = calculate_structure_id(atoms)
         requested_calculation_id = atoms.info.get("calculation_id")
         candidates = list(by_structure.get(structure_id, ()))
         if requested_calculation_id:
@@ -1036,6 +1056,21 @@ def load_materialized_dataset(
     if not dataset_path.is_dir() or not metadata_path.is_file():
         raise FileNotFoundError(f"Materialized training dataset is missing: {dataset_path}")
     metadata = read_json_object(metadata_path)
+    if metadata.get("schema_version") != DATASET_MANIFEST_SCHEMA:
+        raise StateError(
+            f"Unsupported materialized dataset manifest schema: "
+            f"{metadata.get('schema_version')!r}"
+        )
+    artifacts = metadata.get("artifacts")
+    if not isinstance(artifacts, Mapping):
+        raise StateError(f"Materialized dataset artifact index is malformed: {metadata_path}")
+    for filename in ("train.xyz", "test.xyz"):
+        artifact = artifacts.get(filename)
+        if not isinstance(artifact, Mapping) or artifact.get("path") != filename:
+            raise StateError(f"Materialized dataset artifact metadata is malformed: {filename}")
+        artifact_path = dataset_path / filename
+        if not artifact_path.is_file() or sha256_file(artifact_path) != artifact.get("sha256"):
+            raise StateError(f"Materialized dataset artifact changed: {artifact_path}")
     dataset_id = metadata.get("dataset_id")
     if not isinstance(dataset_id, str) or not dataset_id:
         raise ValueError(f"Materialized dataset has no dataset_id: {metadata_path}")
@@ -1118,7 +1153,7 @@ def write_nep_dataset(
 
     from nepflow.io.atomic import atomic_write_text
 
-    atomic_write_text(output_path, "".join(rendered))
+    atomic_write_text(output_path, "".join(rendered), encoding="utf-8")
     return len(rendered)
 
 
@@ -1184,6 +1219,7 @@ def _validated_virial(
 
 
 __all__ = [
+    "DATASET_MANIFEST_SCHEMA",
     "DatasetBuildReport",
     "DatasetBuildPreparation",
     "DatasetBuildResult",

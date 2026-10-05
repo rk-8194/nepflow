@@ -27,6 +27,9 @@ from nepflow.mlip.simulation import StaticPredictionRequest
 
 VALIDATION_CASE_SCHEMA = "nepflow.validation_case.v1"
 VALIDATION_PREPARATION_SCHEMA = "nepflow.validation_preparation.v1"
+VALIDATION_REFERENCE_SCHEMA = "nepflow.validation_reference.v1"
+VALIDATION_RESULT_SCHEMA = "nepflow.validation_result.v1"
+
 AtomMapping = tuple[tuple[int, int, int, int], ...]
 
 
@@ -91,7 +94,14 @@ class ValidationReference:
     virial_convention: str = VIRIAL_CONVENTION_POSITIVE_COMPRESSION
     virial_tensor_convention: str = VIRIAL_TENSOR_CONVENTION_CARTESIAN_3X3
 
+    schema_version: str = VALIDATION_REFERENCE_SCHEMA
+
     def __post_init__(self) -> None:
+        if self.schema_version != VALIDATION_REFERENCE_SCHEMA:
+            raise ValidationError(
+                f"unsupported validation reference schema {self.schema_version!r}; "
+                f"expected {VALIDATION_REFERENCE_SCHEMA!r}"
+            )
         species = tuple(str(value) for value in self.species)
         if not species:
             raise ValidationError("validation reference must contain at least one atom")
@@ -154,6 +164,7 @@ class ValidationReference:
 
     def to_dict(self) -> dict[str, Any]:
         result: dict[str, Any] = {
+            "schema_version": self.schema_version,
             "structure": self.structure.to_dict(),
             "species": list(self.species),
             "positions_angstrom": self.positions_angstrom.tolist(),
@@ -200,6 +211,7 @@ class ValidationReference:
                 value.get("virial_tensor_convention")
                 or VIRIAL_TENSOR_CONVENTION_CARTESIAN_3X3
             ),
+            schema_version=str(value["schema_version"]),
         )
 
 
@@ -274,6 +286,18 @@ class ValidationCaseSpec:
         object.__setattr__(self, "input_path", Path(self.input_path))
         object.__setattr__(self, "working_directory", Path(self.working_directory))
         object.__setattr__(self, "output_path", Path(self.output_path))
+        expected_case_id = "validation_case_" + sha256_canonical_json(
+            {
+                "schema_version": VALIDATION_CASE_SCHEMA,
+                "ordinal": int(self.ordinal),
+                "model_run_id": str(self.model_run_id),
+                "dataset_id": str(self.dataset_id),
+                "structure_id": self.reference.structure_id,
+                "replicates": [int(value) for value in self.replicates],
+            }
+        )
+        if self.case_id != expected_case_id:
+            raise ValidationError("validation case_id does not match its content identity")
 
     @classmethod
     def create(
@@ -505,6 +529,8 @@ ValidationCase = ValidationCaseSpec
 __all__ = [
     "VALIDATION_CASE_SCHEMA",
     "VALIDATION_PREPARATION_SCHEMA",
+    "VALIDATION_REFERENCE_SCHEMA",
+    "VALIDATION_RESULT_SCHEMA",
     "ValidationCaseSpec",
     "ValidationCase",
     "ValidationPreparation",

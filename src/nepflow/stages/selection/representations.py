@@ -17,9 +17,9 @@ from nepflow.domain.identities import (
     calculate_structure_id,
 )
 from nepflow.errors import StateError
-from nepflow.io.atomic import atomic_write_bytes, atomic_write_text
-from nepflow.io.hashing import sha256_file
-from nepflow.io.json import dumps, read_json
+from nepflow.io.atomic import atomic_write_bytes
+from nepflow.io.hashing import sha256_bytes, sha256_file
+from nepflow.io.json import read_json_object, write_json
 
 logger = logging.getLogger(__name__)
 DESCRIPTOR_CACHE_SCHEMA_VERSION = DESCRIPTOR_CACHE_SCHEMA
@@ -144,9 +144,7 @@ def _load_valid_cached_descriptors(
         return None
 
     try:
-        manifest = read_json(manifest_path, error_type=StateError)
-        if not isinstance(manifest, dict):
-            return None
+        manifest = read_json_object(manifest_path, error_type=StateError)
         if manifest.get("schema_version") != DESCRIPTOR_CACHE_SCHEMA_VERSION:
             return None
         if manifest.get("structure_ids") != structure_ids:
@@ -174,6 +172,11 @@ def _load_valid_cached_descriptors(
             return None
         if not np.all(np.isfinite(descriptors)):
             return None
+        expected_cache_hash = manifest.get("artifact_sha256")
+        if expected_cache_hash is not None:
+            actual_cache_hash = sha256_file(descriptor_cache, required=True, error_type=StateError)
+            if actual_cache_hash != expected_cache_hash:
+                return None
         return descriptors
     except (OSError, StateError, TypeError, ValueError, EOFError) as exc:
         logger.warning("  Ignoring invalid descriptor cache metadata: %s", exc)
@@ -207,8 +210,26 @@ def _write_descriptor_cache(
 
     array_buffer = BytesIO()
     np.save(array_buffer, descriptors, allow_pickle=False)
-    atomic_write_bytes(descriptor_cache, array_buffer.getvalue())
-    atomic_write_text(manifest_path, dumps(manifest, indent=None), encoding="utf-8")
+    array_bytes = array_buffer.getvalue()
+    previous_array = descriptor_cache.read_bytes() if descriptor_cache.is_file() else None
+    previous_manifest = manifest_path.read_bytes() if manifest_path.is_file() else None
+    try:
+        atomic_write_bytes(descriptor_cache, array_bytes)
+        persisted_manifest = dict(manifest)
+        persisted_manifest["artifact_sha256"] = sha256_bytes(array_bytes)
+        write_json(manifest_path, persisted_manifest, indent=None)
+    except BaseException:
+        # The array and its identity manifest form one reusable cache record.
+        # Restore the prior pair if publication of the second member fails.
+        if previous_array is None:
+            descriptor_cache.unlink(missing_ok=True)
+        else:
+            atomic_write_bytes(descriptor_cache, previous_array)
+        if previous_manifest is None:
+            manifest_path.unlink(missing_ok=True)
+        else:
+            atomic_write_bytes(manifest_path, previous_manifest)
+        raise
 
 
 def load_or_calculate_representations(

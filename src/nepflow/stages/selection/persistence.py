@@ -179,6 +179,10 @@ def restore_selection_result(
     parameters = record.get("parameters")
     if not isinstance(parameters, Mapping):
         raise StateError("Persisted selection record has no structured parameters")
+    if parameters.get("schema_version") != SELECTION_RUN_SCHEMA:
+        raise StateError(
+            f"Unsupported persisted selection schema: {parameters.get('schema_version')!r}"
+        )
     if parameters.get("candidate_set_fingerprint") != candidate_set_fingerprint(candidate_ids):
         raise StateError(
             "Persisted selection candidate-set fingerprint does not match current input"

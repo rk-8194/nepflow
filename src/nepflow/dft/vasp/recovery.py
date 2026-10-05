@@ -10,6 +10,7 @@ from typing import Callable
 
 from nepflow.config.models import NepflowConfig
 from nepflow.errors import VaspError
+from nepflow.io.atomic import atomic_write_text
 
 
 def build_retry_levels_for_gpu(
@@ -127,7 +128,7 @@ def write_incar_resource_parameters(
                 output.append(f"KPAR = {kpar}\n")
             else:
                 output.append(line)
-        incar_path.write_text("".join(output), encoding="utf-8")
+        atomic_write_text(incar_path, "".join(output), encoding="utf-8")
     except (OSError, UnicodeError) as exc:
         if warn is not None:
             warn(f"    Failed to write INCAR: {exc}")

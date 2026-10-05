@@ -12,6 +12,7 @@ from nepflow.dft.vasp.recovery import VaspRecoveryPolicy
 from nepflow.errors import StateError
 from nepflow.hpc.resources import JobResources
 from nepflow.hpc.scheduler import Scheduler
+from nepflow.io.atomic import atomic_write_text
 from nepflow.workflow.controller import StageContext
 from nepflow.workflow.stages import StageRunResult, StageRunState, WorkflowStage
 
@@ -127,7 +128,8 @@ class DftStage:
                 raise TypeError("Default DFT execution requires a backend with a runner renderer")
             runner_path = active_context.project_dir / "vasp" / "run_vasp.sh"
             runner_path.parent.mkdir(parents=True, exist_ok=True)
-            runner_path.write_text(
+            atomic_write_text(
+                runner_path,
                 "#!/usr/bin/env bash\nset -e\n" + backend.render_runner_script(),
                 encoding="utf-8",
             )
