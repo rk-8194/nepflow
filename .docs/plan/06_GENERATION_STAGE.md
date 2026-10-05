@@ -59,12 +59,7 @@ Generation must not attempt to replace selection by generating only a tiny hand-
 
 The governing rule is:
 
-[
-oxed{
-	ext{generate scientifically distinct families deliberately;
-do not automatically multiply every family by every other family}
-}
-]
+> **Generate scientifically distinct families deliberately; do not automatically multiply every family by every other family.**
 
 ---
 
@@ -397,17 +392,17 @@ The immediate requirements are:
 - integer composition realisability is measured;
 - unrealistically poor realisation is not silently accepted.
 
-For target composition (x_e), atom count (N), and realised integer count (n_e),
+For target composition (x_e), atom count (N), and realised integer count (n_e), the realised fraction is:
 
-[
-hat{x}_e=rac{n_e}{N}.
-]
+```text
+x_hat_e = n_e / N
+```
 
-The generator shall calculate a deterministic composition error, for example
+The generator shall calculate a deterministic composition error, for example:
 
-[
-epsilon_x = max_e |hat{x}_e-x_e|.
-]
+```text
+epsilon_x = max_e |x_hat_e - x_e|
+```
 
 The exact accepted metric and tolerance shall be part of generation configuration and provenance.
 
@@ -435,14 +430,11 @@ Do not create surface-, defect-, magnetic- or SQS-specific duplicate repeat logi
 
 ### 8.2 Improve current isotropic repeat rule
 
-The current implementation chooses one scalar repetition count from:
+The current implementation chooses one scalar repetition count approximately as:
 
-[
-r approx
-left(
-rac{N_{mathrm{target}}}{N_{mathrm{base}}}
-ight)^{1/3}
-]
+```text
+r = (N_target / N_base)^(1/3)
+```
 
 and repeats equally along all three axes.
 
