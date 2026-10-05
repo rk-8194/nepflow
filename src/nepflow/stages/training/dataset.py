@@ -13,11 +13,12 @@ import logging
 import os
 import shutil
 import tempfile
+from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence, cast
 
 import numpy as np
 
@@ -282,15 +283,18 @@ def _canonical_record(
 ) -> dict[str, Any]:
     if not result.accepted:
         raise ValueError("Only accepted VASP results can become dataset records")
+    forces = cast(np.ndarray, result.forces_ev_per_angstrom)
+    positions = cast(np.ndarray, result.positions_angstrom)
+    lattice = cast(np.ndarray, result.lattice_angstrom)
     record = {
         "split": split.value,
         "structure_id": result.structure_id,
         "calculation_identity": dict(result.calculation_identity),
         "source_outcar_hash": result.source_outcar_hash,
         "energy": result.energy_ev,
-        "forces": result.forces_ev_per_angstrom.tolist(),
-        "positions": result.positions_angstrom.tolist(),
-        "lattice": result.lattice_angstrom.tolist(),
+        "forces": forces.tolist(),
+        "positions": positions.tolist(),
+        "lattice": lattice.tolist(),
         "species": list(result.species),
         "pbc": list(result.pbc),
         "label_units": {
@@ -623,7 +627,10 @@ def _require_state_authority(state_store: Any, result: VaspParseResult) -> None:
             raise ValueError("state_dft_identity_mismatch")
         if persisted_identity.get("structure_id") != result.structure_id:
             raise ValueError("state_dft_structure_identity_mismatch")
-    artifacts = list_artifacts(originating_attempt_id=str(calculation["accepted_attempt_id"]))
+    raw_artifacts = list_artifacts(originating_attempt_id=str(calculation["accepted_attempt_id"]))
+    if not isinstance(raw_artifacts, (list, tuple)):
+        raise ValueError("state_dft_artifacts_malformed")
+    artifacts = [item for item in raw_artifacts if isinstance(item, Mapping)]
     if not any(
         artifact.get("artifact_type") == "vasp_outcar"
         and artifact.get("sha256") == result.source_outcar_hash
@@ -703,7 +710,8 @@ def _record_prepared_dataset(
 ) -> None:
     transaction = getattr(state_store, "transaction", None)
     if callable(transaction):
-        with transaction():
+        transaction_context = cast(Callable[[], AbstractContextManager[Any]], transaction)
+        with transaction_context():
             _record_state_members(
                 state_store,
                 preparation.manifest,
@@ -889,7 +897,9 @@ def resolve_selected_dft_results(
     """
 
     if reader is None:
-        from ase.io import read as reader  # type: ignore[no-redef]
+        from ase.io import read as ase_read
+
+        reader = ase_read
     by_structure = _index_selected_calculations(state_store)
 
     resolved: dict[DatasetSplit, tuple[VaspParseResult, ...]] = {}

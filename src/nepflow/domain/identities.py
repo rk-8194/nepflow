@@ -11,7 +11,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any
+from typing import Any, cast
 
 from nepflow.io.hashing import sha256_bytes, sha256_canonical_json
 from nepflow.io.json import to_jsonable
@@ -30,16 +30,18 @@ def _format_vector(values: Sequence[float]) -> str:
 
 def _pbc_values(atoms: Any) -> tuple[bool, bool, bool]:
     pbc = getattr(atoms, "pbc", (True, True, True))
-    if hasattr(pbc, "tolist"):
-        pbc = pbc.tolist()
+    tolist = getattr(pbc, "tolist", None)
+    if callable(tolist):
+        pbc = tolist()
     if isinstance(pbc, bool):
         return (pbc, pbc, pbc)
-    values = list(pbc)
+    values = list(cast(Sequence[Any], pbc))
     if len(values) == 0:
         return (True, True, True)
     if len(values) == 1:
-        return (bool(values[0]),) * 3
-    return tuple(bool(value) for value in values[:3])  # type: ignore[return-value]
+        value = bool(values[0])
+        return value, value, value
+    return cast(tuple[bool, bool, bool], tuple(bool(value) for value in values[:3]))
 
 
 def canonical_structure_text(atoms: Any) -> str:

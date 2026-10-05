@@ -12,6 +12,8 @@ from nepflow.hpc.slurm import SlurmScheduler
 from nepflow.stages.dft import DftStage
 from nepflow.stages.generation import GenerationStage
 from nepflow.stages.generation.debug import run_debug
+from nepflow.stages.generation.generators.base import ConfigurationalGenerator
+from nepflow.stages.generation.stage import PerturbationCoordinator
 from nepflow.stages.selection import SelectionStage
 from nepflow.stages.training import TrainingStage
 from nepflow.stages.validation import ValidationStage
@@ -54,13 +56,13 @@ def build_generation_stage(
     )
 
 
-def _build_generators(context: StageContext) -> list[tuple[str, object]]:
+def _build_generators(context: StageContext) -> list[tuple[str, ConfigurationalGenerator]]:
     """Build enabled configurational generators from typed settings."""
 
     config = context.config
     assert config is not None
     generation = config.generation
-    configured: list[tuple[str, object]] = []
+    configured: list[tuple[str, ConfigurationalGenerator]] = []
     if generation.use_materials_project:
         configured.append(_build_materials_project_generator(context))
     if generation.use_random_solid_solution:
@@ -72,7 +74,9 @@ def _build_generators(context: StageContext) -> list[tuple[str, object]]:
     return configured
 
 
-def _build_materials_project_generator(context: StageContext) -> tuple[str, object]:
+def _build_materials_project_generator(
+    context: StageContext,
+) -> tuple[str, ConfigurationalGenerator]:
     from nepflow.stages.generation.generators import (
         MaterialsProjectGenerator,
         build_materials_project_fetcher,
@@ -94,7 +98,7 @@ def _build_materials_project_generator(context: StageContext) -> tuple[str, obje
 
 def _build_random_solid_solution_generator(
     context: StageContext,
-) -> tuple[str, object]:
+) -> tuple[str, ConfigurationalGenerator]:
     from nepflow.stages.generation.generators import RandomSolidSolutionGenerator
 
     config = context.config
@@ -106,7 +110,7 @@ def _build_random_solid_solution_generator(
     return "RandomSolidSolution", generator
 
 
-def _build_sqs_generator(context: StageContext) -> tuple[str, object]:
+def _build_sqs_generator(context: StageContext) -> tuple[str, ConfigurationalGenerator]:
     from nepflow.stages.generation.generators import SQSGenerator
 
     config = context.config
@@ -118,7 +122,7 @@ def _build_sqs_generator(context: StageContext) -> tuple[str, object]:
     return "SQS", generator
 
 
-def _build_segregated_generator(context: StageContext) -> tuple[str, object]:
+def _build_segregated_generator(context: StageContext) -> tuple[str, ConfigurationalGenerator]:
     from nepflow.stages.generation.generators import SegregatedGenerator
 
     config = context.config
@@ -130,16 +134,18 @@ def _build_segregated_generator(context: StageContext) -> tuple[str, object]:
     return "Segregated", generator
 
 
-def _build_perturbation_coordinator(context: StageContext) -> object:
+def _build_perturbation_coordinator(context: StageContext) -> PerturbationCoordinator:
     """Build the configured perturbation coordinator."""
-
-    from nepflow.stages.generation.perturbations import PerturbationCoordinator
 
     config = context.config
     assert config is not None
     composition = config.composition
     generation = config.generation
-    return PerturbationCoordinator(
+    from nepflow.stages.generation.perturbations import (
+        PerturbationCoordinator as ConcreteCoordinator,
+    )
+
+    return ConcreteCoordinator(
         rattle_std=generation.rattle_std,
         rattle_std_min=generation.rattle_std_min,
         rattle_std_max=generation.rattle_std_max,

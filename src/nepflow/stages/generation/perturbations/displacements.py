@@ -15,8 +15,10 @@ def sample_rattle_stds(settings: PerturbationSettings, n: int) -> list[float]:
 
     if n <= 0:
         return []
-    minimum = float(settings.rattle_std_min)
-    maximum = float(settings.rattle_std_max)
+    minimum = settings.rattle_std_min
+    maximum = settings.rattle_std_max
+    if minimum is None or maximum is None:
+        minimum = maximum = settings.rattle_std
     if abs(maximum - minimum) < 1e-12:
         return [float(settings.rattle_std)] * n
     if n == 1:

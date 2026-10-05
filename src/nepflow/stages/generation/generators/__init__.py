@@ -2,6 +2,23 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .base import ConfigurationalGenerator
+    from .composition import CompositionGrid
+    from .composition_primitives import (
+        allocate_crystal_quota,
+        assign_composition,
+        composition_label,
+        realized_composition,
+    )
+    from .materials_project import MaterialsProjectFetcher, build_materials_project_fetcher
+    from .materials_project_generator import MaterialsProjectGenerator
+    from .random_solution import RandomSolidSolutionGenerator
+    from .segregated import SegregatedGenerator
+    from .sqs import IcetSQSBackend, SQSGenerationError, SQSGenerator
+
 __all__ = [
     "ConfigurationalGenerator",
     "CompositionGrid",

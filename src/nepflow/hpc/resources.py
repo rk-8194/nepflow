@@ -94,13 +94,12 @@ def _validate_memory(value: MemoryValue | None, field_name: str) -> None:
         if value < 1:
             raise ValueError(f"{field_name} must be positive")
         return
-    if (
-        not isinstance(value, str)
-        or not value.strip()
-        or not _MEMORY_PATTERN.fullmatch(value.strip())
-    ):
+    if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{field_name} must be a positive megabyte count or SLURM memory value")
-    if float(_MEMORY_PATTERN.fullmatch(value.strip()).group("amount")) <= 0:  # type: ignore[union-attr]
+    match = _MEMORY_PATTERN.fullmatch(value.strip())
+    if match is None:
+        raise ValueError(f"{field_name} must be a positive megabyte count or SLURM memory value")
+    if float(match.group("amount")) <= 0:
         raise ValueError(f"{field_name} must be positive")
 
 

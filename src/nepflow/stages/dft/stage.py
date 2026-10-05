@@ -20,6 +20,7 @@ from .orchestrator import (
     DftPreparationResult,
     PreparedCalculation,
     VaspPreparationOrchestrator,
+    _attempt_number,
     _scientific_attempts,
 )
 from .reconciliation import (
@@ -215,6 +216,8 @@ class DftStage:
             status = str(latest.get("status", status))
         if status == "prepared":
             status = "pending"
+        raw_job_id = None if latest is None else latest.get("job_id")
+        job_id = raw_job_id if isinstance(raw_job_id, str) else None
         return DftExecutionRecord(
             inputs=item.artifacts,
             attempt_id=(
@@ -223,13 +226,11 @@ class DftStage:
                 else f"{item.calculation.calculation_id}:attempt:1"
             ),
             status=status,
-            job_id=(None if latest is None else latest.get("job_id")),
+            job_id=job_id,
             job_name=(
                 f"nf_{item.spec.project_name}_{item.spec.dataset}_{item.spec.selected_index:04d}"
             ),
-            retry_level=(
-                max(0, int(latest.get("attempt_number", 1)) - 1) if latest is not None else 0
-            ),
+            retry_level=(max(0, _attempt_number(latest) - 1) if latest is not None else 0),
             resources=resources,
         )
 

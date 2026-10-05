@@ -87,7 +87,7 @@ class CollectedModelArtifacts:
     artifact: ModelArtifactMetadata
 
     def __post_init__(self) -> None:
-        if self.artifact is None or self.artifact.model is None:  # type: ignore[comparison-overlap]
+        if self.artifact is None or not isinstance(self.artifact.model, ArtifactIdentity):
             raise MlipError("collected model artifacts require model metadata")
         if self.model_run != self.training_input.model_run_identity:
             raise MlipError("collected model artifact belongs to a different model run")
@@ -99,15 +99,19 @@ class MlipBackend(Protocol):
 
     def render_training_input(self, request: TrainingInputRequest) -> TrainingInput:
         """Render ``nep.in`` from typed dataset and scientific settings."""
+        ...
 
     def training_command(self, inputs: TrainingInput) -> tuple[str, ...]:
         """Return the training executable and arguments without shell syntax."""
+        ...
 
     def parse_progress(self, run_directory: Path) -> TrainingProgress | None:
         """Read optional in-progress generation/loss evidence."""
+        ...
 
     def parse_completion(self, run_directory: Path) -> TrainingCompletion:
         """Determine completion from backend output evidence."""
+        ...
 
     def collect_model_artifacts(
         self,
@@ -115,9 +119,11 @@ class MlipBackend(Protocol):
         inputs: TrainingInput,
     ) -> CollectedModelArtifacts:
         """Collect required artifacts bound to the rendered model-run identity."""
+        ...
 
     def model_run_identity(self, inputs: TrainingInput) -> ModelRunIdentity:
         """Expose the exact dataset/input/settings identity of the run."""
+        ...
 
 
 __all__ = [

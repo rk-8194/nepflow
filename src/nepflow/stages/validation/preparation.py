@@ -63,7 +63,7 @@ def calculate_cell_replicates_for_cutoff(
     result = tuple(int(value) for value in repeats)
     if any(repeat * height <= required for repeat, height in zip(result, heights)):
         raise ValidationError("validation replication does not satisfy cutoff thickness")
-    return result  # type: ignore[return-value]
+    return result[0], result[1], result[2]
 
 
 def prepare_validation_cases(

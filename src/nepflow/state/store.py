@@ -39,6 +39,8 @@ class StateStore(
     locking, transaction boundaries, and write-error translation.
     """
 
+    _connection: sqlite3.Connection
+
     def __init__(self, path: str | Path, *, timeout: float = 30.0) -> None:
         self._database = str(path)
         self.path = None if self._database == ":memory:" else Path(path)
@@ -82,6 +84,8 @@ class StateStore(
         connection = getattr(self, "_connection", None)
         if connection is not None:
             connection.close()
+            # Keep the closed-handle sentinel used by the existing lifecycle;
+            # record mixins only access the connection while the store is open.
             self._connection = None  # type: ignore[assignment]
 
     def __enter__(self) -> "StateStore":

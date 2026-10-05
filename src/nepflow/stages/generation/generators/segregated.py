@@ -40,7 +40,7 @@ class SegregatedGenerator:
             return []
 
         results: list[Any] = []
-        majority_element = max(composition, key=composition.get)
+        majority_element = max(composition, key=lambda element: composition[element])
         active_elements = sorted(
             element for element, fraction in composition.items() if fraction > 0
         )

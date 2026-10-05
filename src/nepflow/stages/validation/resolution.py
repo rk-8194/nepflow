@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
+import numpy as np
+
 from nepflow.domain.datasets import DatasetIdentity, TrainingDatasetManifest
 from nepflow.domain.identities import ArtifactIdentity, ModelRunIdentity, StructureIdentity
 from nepflow.domain.models import ModelArtifactMetadata, ModelRunRecord
@@ -76,15 +78,23 @@ def _reference_from_record(record: Mapping[str, Any]) -> ValidationReference:
         for key in ("calculation_identity", "source_outcar_hash", "split")
         if key in record
     }
+    positions = record.get("positions")
+    cell = record.get("lattice", record.get("cell"))
+    energy = record.get("energy")
+    forces = record.get("forces")
+    if positions is None or cell is None or energy is None or forces is None:
+        raise StateError(f"Authoritative validation record is missing labels: {structure_id}")
     return ValidationReference(
         structure=StructureIdentity(structure_id),
         species=tuple(str(value) for value in record.get("species", ())),
-        positions_angstrom=record.get("positions"),
-        cell_angstrom=record.get("lattice", record.get("cell")),
+        positions_angstrom=np.asarray(positions, dtype=float),
+        cell_angstrom=np.asarray(cell, dtype=float),
         pbc=tuple(record.get("pbc", (True, True, True))),
-        energy_ev=record.get("energy"),
-        forces_ev_per_angstrom=record.get("forces"),
-        virial_ev=record.get("virial"),
+        energy_ev=float(energy),
+        forces_ev_per_angstrom=np.asarray(forces, dtype=float),
+        virial_ev=(
+            None if record.get("virial") is None else np.asarray(record["virial"], dtype=float)
+        ),
         metadata=metadata,
     )
 

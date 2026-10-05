@@ -26,6 +26,13 @@ VALIDATION_PREPARATION_SCHEMA = "nepflow.validation_preparation.v1"
 AtomMapping = tuple[tuple[int, int, int, int], ...]
 
 
+def _replicates(value: Any) -> tuple[int, int, int]:
+    values = tuple(int(item) for item in value)
+    if len(values) != 3:
+        raise ValidationError("validation case replicates must contain exactly three values")
+    return values[0], values[1], values[2]
+
+
 def _replication_mapping(
     atom_count: int,
     replicates: tuple[int, int, int],
@@ -61,7 +68,7 @@ def _pbc(value: Any) -> tuple[bool, bool, bool]:
     values = tuple(bool(item) for item in value)
     if len(values) != 3:
         raise ValidationError("validation case pbc must contain exactly three flags")
-    return values  # type: ignore[return-value]
+    return values[0], values[1], values[2]
 
 
 @dataclass(frozen=True, slots=True)
@@ -403,7 +410,7 @@ class ValidationCaseSpec:
                 input_path=Path(str(value["input_path"])),
                 working_directory=Path(str(value["working_directory"])),
                 output_path=Path(str(value["output_path"])),
-                replicates=tuple(int(item) for item in value.get("replicates", (1, 1, 1))),
+                replicates=_replicates(value.get("replicates", (1, 1, 1))),
                 virial_requested=bool(value.get("virial_requested", False)),
                 schema_version=str(value["schema_version"]),
                 atom_mapping=mapping,

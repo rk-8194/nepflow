@@ -99,7 +99,7 @@ class SQSGenerator:
         quota_plan = allocate_crystal_quota(self.n_structures, crystal_structures)
         backend = self.backend if self.backend is not None else IcetSQSBackend.from_environment()
         results: list[Any] = []
-        majority_element = max(composition, key=composition.get)
+        majority_element = max(composition, key=lambda element: composition[element])
         active_elements = sorted(
             element for element, fraction in composition.items() if fraction > 0
         )

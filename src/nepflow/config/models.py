@@ -262,7 +262,10 @@ class NepflowConfig:
             materials_project = mapping["materials_project"]
             if isinstance(materials_project, dict):
                 materials_project["api_key"] = None
-        return _normalize_mapping(mapping)
+        normalized = _normalize_mapping(mapping)
+        if not isinstance(normalized, dict):
+            raise TypeError("effective configuration must normalize to a mapping")
+        return {str(key): value for key, value in normalized.items()}
 
 
 def _normalize_mapping(value: object) -> object:

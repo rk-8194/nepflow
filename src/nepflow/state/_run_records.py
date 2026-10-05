@@ -8,9 +8,10 @@ from nepflow.domain.models import ModelRunRecord, ValidationRunRecord
 from nepflow.errors import StateError
 
 from ._record_codec import decode_json, decode_row, encode_json, now
+from ._typing import StateStoreMixinSupport, require_state_row
 
 
-class RunRecordsMixin:
+class RunRecordsMixin(StateStoreMixinSupport):
     """Provide StateStore persistence for model and validation runs."""
 
     def upsert_model_run(
@@ -71,7 +72,7 @@ class RunRecordsMixin:
             ),
         )
         self._link_model_artifacts(record)
-        return self.get_model_run(identity.model_run_id)  # type: ignore[return-value]
+        return require_state_row(self.get_model_run(identity.model_run_id), "model run")
 
     def _link_model_artifacts(self, record: ModelRunRecord) -> None:
         if record.artifact is None:
@@ -159,7 +160,9 @@ class RunRecordsMixin:
             ),
         )
         self._link_validation_artifacts(record)
-        return self.get_validation_run(identity.validation_run_id)  # type: ignore[return-value]
+        return require_state_row(
+            self.get_validation_run(identity.validation_run_id), "validation run"
+        )
 
     def _link_validation_artifacts(self, record: ValidationRunRecord) -> None:
         if record.artifact is None:

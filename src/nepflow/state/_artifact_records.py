@@ -9,9 +9,10 @@ from nepflow.domain.identities import ArtifactIdentity
 from nepflow.errors import StateError
 
 from ._record_codec import decode_row, encode_json, now
+from ._typing import StateStoreMixinSupport
 
 
-class ArtifactRecordsMixin:
+class ArtifactRecordsMixin(StateStoreMixinSupport):
     """Provide StateStore persistence for shared artifact rows."""
 
     def record_artifact(

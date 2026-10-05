@@ -6,7 +6,9 @@ import os
 import shutil
 from collections.abc import Mapping, Sequence
 from pathlib import Path
+from typing import cast
 
+from ase.atoms import Atoms
 from ase.io import read as ase_read
 
 from nepflow.dft.backend import (
@@ -92,9 +94,12 @@ class VaspBackend:
     ) -> tuple[dict[str, Path], dict[str, bytes]]:
         paths = self._source_inputs(request)
         try:
-            poscar_atoms = ase_read(
-                str(paths["POSCAR"]),
-                index=request.source_structure_index,
+            poscar_atoms = cast(
+                Atoms,
+                ase_read(
+                    str(paths["POSCAR"]),
+                    index=request.source_structure_index,
+                ),
             )
         except Exception as exc:
             raise BackendError(f"Could not read required VASP artifact {paths['POSCAR']}") from exc
@@ -302,7 +307,7 @@ exit 1
         if not outcar_is_complete(outcar):
             raise BackendError(f"VASP OUTCAR is incomplete: {outcar}")
         try:
-            expected = ase_read(str(inputs.working_directory / "POSCAR"))
+            expected = cast(Atoms, ase_read(str(inputs.working_directory / "POSCAR")))
         except Exception as exc:
             raise BackendError("Could not read prepared VASP POSCAR") from exc
         identity = inputs.calculation.to_dict()

@@ -5,8 +5,9 @@ from __future__ import annotations
 import logging
 from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
-from typing import Any
+from typing import Any, cast
 
+import numpy as np
 from ase import Atoms
 from ase.build import bulk
 from pymatgen.io.ase import AseAtomsAdaptor
@@ -101,7 +102,7 @@ def documents_to_ase(documents: Iterable[Any]) -> list[Atoms]:
         except Exception:
             structure = document.structure
         try:
-            atoms = adaptor.get_atoms(structure)
+            atoms = cast(Atoms, adaptor.get_atoms(structure))
         except Exception as exc:
             raise RuntimeError(
                 f"pymatgen→ASE conversion failed for {document.material_id}"
@@ -167,7 +168,7 @@ def atoms_to_cache_records(atoms_list: Iterable[Atoms]) -> list[dict[str, Any]]:
             {
                 "numbers": atoms.numbers.tolist(),
                 "positions": atoms.positions.tolist(),
-                "cell": atoms.cell.tolist(),
+                "cell": np.asarray(atoms.cell).tolist(),
                 "pbc": atoms.pbc.tolist(),
                 "info": _json_safe_mapping(atoms.info),
             }

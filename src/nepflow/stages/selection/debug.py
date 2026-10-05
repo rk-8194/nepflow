@@ -27,9 +27,8 @@ def run_debug_selection(
         )
 
     if ase_structures is None:
-        ase_structures = ase_read(str(generated_path), index=":", format="extxyz")
-    if not isinstance(ase_structures, list):
-        ase_structures = [ase_structures]
+        loaded = ase_read(str(generated_path), index=":", format="extxyz")
+        ase_structures = loaded if isinstance(loaded, list) else [loaded]
     n = len(ase_structures)
     logger.info("[DEBUG] Loaded %d structures from %s", n, generated_path)
 

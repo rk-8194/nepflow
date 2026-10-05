@@ -77,7 +77,7 @@ class GeneratedStructureRecord:
         return self.identity.structure_id
 
     def to_dict(self) -> dict[str, Any]:
-        result = self.identity.to_dict()
+        result: dict[str, Any] = self.identity.to_dict()
         result["provenance"] = self.provenance.to_dict()
         if self.metadata is not None:
             result["metadata"] = to_jsonable(self.metadata)

@@ -158,10 +158,17 @@ class ValidationReconciliationOrchestrator:
         return self.validation_run.validation_run_id
 
     def _events(self, entity_type: str, entity_id: str | None = None) -> list[dict[str, Any]]:
+        def rows(value: object) -> list[dict[str, Any]]:
+            if not isinstance(value, (list, tuple)) or not all(
+                isinstance(item, Mapping) for item in value
+            ):
+                raise StateError("StateStore validation event API returned malformed rows")
+            return [dict(item) for item in value]
+
         lister = getattr(self.state_store, "list_validation_events", None)
         if callable(lister):
-            return list(lister(entity_type, entity_id))
-        return list(self.state_store.list_events(entity_type=entity_type, entity_id=entity_id))
+            return rows(lister(entity_type, entity_id))
+        return rows(self.state_store.list_events(entity_type=entity_type, entity_id=entity_id))
 
     def _append(
         self,
@@ -172,11 +179,11 @@ class ValidationReconciliationOrchestrator:
         events = self._events(entity_type, self.validation_run_id)
         event_id = f"validation:{entity_type}:{self.validation_run_id}:{len(events):012d}"
         occurred_at = datetime.now(timezone.utc)
-        existing_times = [
-            event.get("occurred_at")
-            for event in events
-            if isinstance(event.get("occurred_at"), str)
-        ]
+        existing_times: list[str] = []
+        for event in events:
+            value = event.get("occurred_at")
+            if isinstance(value, str):
+                existing_times.append(value)
         if existing_times:
             try:
                 latest = max(datetime.fromisoformat(value) for value in existing_times)
@@ -216,6 +223,8 @@ class ValidationReconciliationOrchestrator:
         getter = getattr(self.state_store, "get_validation_run", None)
         existing = getter(self.validation_run_id) if callable(getter) else None
         if existing is not None:
+            if not isinstance(existing, Mapping):
+                raise StateError("Persisted validation run row is malformed")
             persisted = existing.get("identity", existing.get("identity_json", {}))
             if isinstance(persisted, Mapping) and dict(persisted) != self.validation_run.to_dict():
                 raise StateError(f"Validation-run identity conflict: {self.validation_run_id}")

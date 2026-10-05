@@ -15,6 +15,8 @@ class TimeoutSession(Session):
         super().__init__()
         self._timeout = timeout
 
+    # requests exposes this method through a dynamically typed kwargs-heavy
+    # overload set, so its concrete adapter signature cannot satisfy the stub.
     def request(self, method: str, url: str, **kwargs: Any):  # type: ignore[override]
         kwargs.setdefault("timeout", self._timeout)
         return super().request(method, url, **kwargs)

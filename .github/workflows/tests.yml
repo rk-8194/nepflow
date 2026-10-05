@@ -34,12 +34,15 @@ jobs:
       - name: Install NEPFlow and test runner
         run: |
           python -m pip install -e .
-          python -m pip install pytest ruff
+          python -m pip install pytest ruff pyright
 
       - name: Validate Ruff configuration
         run: |
           ruff --version
           ruff check --show-settings src/nepflow/__init__.py > /dev/null
+
+      - name: Type-check package
+        run: pyright
 
       - name: Check tracked repository hygiene
         run: |

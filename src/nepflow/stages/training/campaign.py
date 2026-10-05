@@ -202,11 +202,11 @@ class TrainingCampaign:
         event_number = len(self._events(entity_type, entity_id))
         event_id = f"training:{entity_type}:{entity_id}:{event_number:012d}"
         occurred_at = datetime.now(timezone.utc)
-        existing_times = [
-            event.get("occurred_at")
-            for event in self._events(entity_type, entity_id)
-            if isinstance(event.get("occurred_at"), str)
-        ]
+        existing_times: list[str] = []
+        for event in self._events(entity_type, entity_id):
+            value = event.get("occurred_at")
+            if isinstance(value, str):
+                existing_times.append(value)
         if existing_times:
             try:
                 latest = max(datetime.fromisoformat(value) for value in existing_times)
@@ -241,10 +241,17 @@ class TrainingCampaign:
         )
 
     def _events(self, entity_type: str, entity_id: str | None = None) -> list[dict[str, Any]]:
+        def rows(value: object) -> list[dict[str, Any]]:
+            if not isinstance(value, (list, tuple)):
+                raise StateError("StateStore event API returned a non-list payload")
+            if not all(isinstance(item, Mapping) for item in value):
+                raise StateError("StateStore event API returned a malformed row")
+            return [dict(item) for item in value]
+
         lister = getattr(self.state_store, "list_training_events", None)
         if callable(lister):
-            return list(lister(entity_type, entity_id))
-        return list(self.state_store.list_events(entity_type=entity_type, entity_id=entity_id))
+            return rows(lister(entity_type, entity_id))
+        return rows(self.state_store.list_events(entity_type=entity_type, entity_id=entity_id))
 
     def _ensure_campaign(self, specification: Mapping[str, Any] | None = None) -> None:
         events = self._events("training_campaign", self.campaign_id)
@@ -467,6 +474,8 @@ class TrainingCampaign:
         dataset_row = get_dataset(self.dataset_id)
         if dataset_row is None:
             raise StateError(f"Training campaign dataset is not registered: {self.dataset_id}")
+        if not isinstance(dataset_row, Mapping):
+            raise StateError("Training campaign dataset row is malformed")
         persisted_identity = dataset_row.get("identity_json", dataset_row.get("identity", {}))
         if (
             isinstance(persisted_identity, Mapping)
@@ -1033,10 +1042,13 @@ class TrainingCampaign:
 
         classifier = getattr(self.backend, "classify_error", None)
         reason = (
-            classifier(execution_directory)
-            if callable(classifier)
-            else "missing_backend_completion_evidence"
-        ) or f"scheduler_{scheduler_state.value}_without_backend_completion"
+            str(
+                classifier(execution_directory)
+                if callable(classifier)
+                else "missing_backend_completion_evidence"
+            )
+            or f"scheduler_{scheduler_state.value}_without_backend_completion"
+        )
         return self._fail_candidate(candidate, attempt, reason, scheduler_state)
 
     def _derive_status(self, candidates: Sequence[TrainingCandidate]) -> str:

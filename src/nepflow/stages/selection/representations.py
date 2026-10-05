@@ -33,12 +33,16 @@ def compute_structure_descriptors(
 ) -> np.ndarray:
     """Compute structure representations through supported NepTrainKit APIs."""
 
-    if hasattr(calc, "descriptors"):
-        return calc.descriptors(structures, mean=mean_descriptor)
-    if hasattr(calc, "get_structures_descriptor"):
-        return calc.get_structures_descriptor(
-            structures,
-            mean_descriptor=mean_descriptor,
+    descriptors = getattr(calc, "descriptors", None)
+    if callable(descriptors):
+        return np.asarray(descriptors(structures, mean=mean_descriptor))
+    legacy_descriptors = getattr(calc, "get_structures_descriptor", None)
+    if callable(legacy_descriptors):
+        return np.asarray(
+            legacy_descriptors(
+                structures,
+                mean_descriptor=mean_descriptor,
+            )
         )
     raise AttributeError(
         "NepCalculator does not provide a supported descriptor API. "
@@ -101,9 +105,12 @@ def _model_identity(model_path: Path, model_filename: str) -> dict[str, str]:
             "  https://github.com/brucefan1983/GPUMD/tree/master/potentials/nep/nep89_20250409\n"
             f"Place the model file as: {model_path}"
         )
+    digest = sha256_file(model_path, required=True)
+    if digest is None:
+        raise StateError(f"Could not hash NEP model: {model_path}")
     return {
         "filename": model_filename,
-        "sha256": sha256_file(model_path, required=True),
+        "sha256": digest,
     }
 
 

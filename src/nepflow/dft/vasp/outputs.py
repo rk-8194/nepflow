@@ -6,7 +6,7 @@ import re
 from dataclasses import dataclass, field
 from numbers import Real
 from pathlib import Path
-from typing import Callable, Iterable, Mapping
+from typing import Callable, Iterable, Mapping, cast
 
 import numpy as np
 from ase.atoms import Atoms
@@ -78,7 +78,7 @@ def parse_stress_from_outcar(
     outcar_path = Path(outcar_path)
     if prefer_ase:
         try:
-            atoms = ase_read(str(outcar_path), format="vasp-out")
+            atoms = cast(Atoms, ase_read(str(outcar_path), format="vasp-out"))
             stress = np.asarray(atoms.get_stress(voigt=False), dtype=float)
             if stress.shape == (3, 3) and np.all(np.isfinite(stress)):
                 return stress
@@ -391,7 +391,8 @@ def parse_outcar_result(
     identity_reader: Callable[[Path], dict] | None = None,
 ) -> VaspParseResult:
     """Parse one OUTCAR into an immutable accepted/rejected result."""
-    reader = ase_read if reader is None else reader
+    if reader is None:
+        reader = cast(Callable[[str], Atoms], ase_read)
     identity_reader = read_identity if identity_reader is None else identity_reader
     structure_id = calculate_structure_id(ase_atoms)
     identity_items_source = dict(calculation_identity or {})

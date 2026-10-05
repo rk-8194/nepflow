@@ -167,9 +167,11 @@ class DftBackend(Protocol):
 
     def prepare_inputs(self, request: DftInputRequest) -> DftInputArtifacts:
         """Render POSCAR/POTCAR/INCAR-like scientific input artifacts."""
+        ...
 
     def execution_command(self, inputs: DftInputArtifacts) -> tuple[str, ...]:
         """Return an argument-oriented command; never an implicit shell body."""
+        ...
 
     def parse_completion(
         self,
@@ -177,15 +179,19 @@ class DftBackend(Protocol):
         process: ProcessResult | None = None,
     ) -> DftCompletionEvidence:
         """Determine completion from backend evidence, not scheduler absence."""
+        ...
 
     def parse_result(self, inputs: DftInputArtifacts) -> DftResult:
         """Parse required scientific labels and canonicalize their units."""
+        ...
 
     def classify_failure(self, evidence: DftFailureEvidence) -> DftFailure:
         """Classify backend output for workflow recovery/quarantine policy."""
+        ...
 
     def calculation_identity(self, request: DftInputRequest) -> DftCalculationIdentity:
         """Expose the identity of the scientific inputs being prepared."""
+        ...
 
     def validate_calculation_identity(
         self,
@@ -193,6 +199,7 @@ class DftBackend(Protocol):
         observed: DftCalculationIdentity,
     ) -> None:
         """Reject output whose scientific identity does not match the request."""
+        ...
 
 
 __all__ = [

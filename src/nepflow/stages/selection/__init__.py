@@ -8,6 +8,11 @@ import requirement.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .stage import SelectionStage
+
 __all__ = ["SelectionStage"]
 
 

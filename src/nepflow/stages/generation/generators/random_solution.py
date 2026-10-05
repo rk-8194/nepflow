@@ -41,7 +41,7 @@ class RandomSolidSolutionGenerator:
             return []
 
         results: list[Any] = []
-        majority_element = max(composition, key=composition.get)
+        majority_element = max(composition, key=lambda element: composition[element])
         for crystal_structure, crystal_quota in quota_plan:
             if crystal_quota == 0:
                 continue

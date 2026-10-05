@@ -7,9 +7,10 @@ from typing import Any
 from nepflow.errors import StateError
 
 from ._record_codec import decode_row, encode_json, now
+from ._typing import StateStoreMixinSupport, require_state_row
 
 
-class WorkflowRecordsMixin:
+class WorkflowRecordsMixin(StateStoreMixinSupport):
     """Provide StateStore persistence for workflow ledger records."""
 
     def upsert_project(
@@ -63,7 +64,7 @@ class WorkflowRecordsMixin:
                 timestamp,
             ),
         )
-        return self.get_project(project_id)  # type: ignore[return-value]
+        return require_state_row(self.get_project(project_id), "project")
 
     def get_project(self, project_id: str) -> dict[str, Any] | None:
         row = self._fetchone("SELECT * FROM project WHERE project_id = ?", (project_id,))
@@ -152,7 +153,7 @@ class WorkflowRecordsMixin:
                 encode_json({} if metadata is None else metadata),
             ),
         )
-        return self.get_stage_run(stage_run_id)  # type: ignore[return-value]
+        return require_state_row(self.get_stage_run(stage_run_id), "stage run")
 
     def get_stage_run(self, stage_run_id: str) -> dict[str, Any] | None:
         row = self._fetchone("SELECT * FROM stage_runs WHERE stage_run_id = ?", (stage_run_id,))
@@ -254,7 +255,7 @@ class WorkflowRecordsMixin:
                 timestamp,
             ),
         )
-        return self.get_selection_run(selection_run_id)  # type: ignore[return-value]
+        return require_state_row(self.get_selection_run(selection_run_id), "selection run")
 
     def get_selection_run(self, selection_run_id: str) -> dict[str, Any] | None:
         row = self._fetchone(

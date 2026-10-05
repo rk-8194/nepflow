@@ -8,9 +8,10 @@ from uuid import uuid4
 from nepflow.errors import StateError
 
 from ._record_codec import decode_row, encode_json, now
+from ._typing import StateStoreMixinSupport
 
 
-class EventRecordsMixin:
+class EventRecordsMixin(StateStoreMixinSupport):
     """Provide StateStore persistence for result and event ledger rows."""
 
     def record_validation_result(
@@ -244,7 +245,7 @@ class EventRecordsMixin:
 def _event_query(
     entity_type: str | None,
     entity_id: str | None,
-) -> tuple[str, tuple[str, ...]]:
+) -> tuple[str, tuple[str | None, ...]]:
     order = " ORDER BY occurred_at, event_id"
     if entity_type is None and entity_id is None:
         return "SELECT * FROM events" + order, ()

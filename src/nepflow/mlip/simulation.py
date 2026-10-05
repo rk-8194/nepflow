@@ -91,7 +91,7 @@ class StaticPredictionRequest:
             values = tuple(bool(value) for value in self.pbc)
             if len(values) != 3:
                 raise ValidationError("static prediction reference pbc must have three flags")
-            object.__setattr__(self, "pbc", values)  # type: ignore[assignment]
+            object.__setattr__(self, "pbc", (values[0], values[1], values[2]))
         if self.expected_species is not None:
             expected_species = tuple(str(value) for value in self.expected_species)
             if len(expected_species) != self.atom_count:
@@ -119,7 +119,9 @@ class StaticPredictionRequest:
             expected_pbc = tuple(bool(value) for value in self.expected_pbc)
             if len(expected_pbc) != 3:
                 raise ValidationError("static prediction expected pbc must have three flags")
-            object.__setattr__(self, "expected_pbc", expected_pbc)  # type: ignore[assignment]
+            object.__setattr__(
+                self, "expected_pbc", (expected_pbc[0], expected_pbc[1], expected_pbc[2])
+            )
         if self.atom_mapping is not None:
             mapping = tuple(int(value) for value in self.atom_mapping)
             if len(mapping) != self.atom_count or any(value < 0 for value in mapping):
@@ -239,7 +241,7 @@ class StaticPrediction:
             values = tuple(bool(value) for value in self.pbc)
             if len(values) != 3:
                 raise ValidationError("static prediction pbc must have three flags")
-            object.__setattr__(self, "pbc", values)  # type: ignore[assignment]
+            object.__setattr__(self, "pbc", (values[0], values[1], values[2]))
         if self.atom_mapping is not None:
             mapping = tuple(int(value) for value in self.atom_mapping)
             if len(mapping) != self.atom_count or any(value < 0 for value in mapping):
@@ -267,6 +269,7 @@ class StaticPredictionBackend(Protocol):
 
     def predict(self, request: StaticPredictionRequest) -> StaticPrediction:
         """Return energy, forces, and requested virial with runtime metadata."""
+        ...
 
 
 __all__ = [

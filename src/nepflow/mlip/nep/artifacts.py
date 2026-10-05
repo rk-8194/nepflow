@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -85,6 +86,8 @@ def create_model_run_manifest(
     if not dataset_id:
         raise NepArtifactError("Cannot create a model run without dataset_id")
     nep_in_hash = sha256_file(nep_in_path, required=True, error_type=NepArtifactError)
+    if nep_in_hash is None:
+        raise NepArtifactError(f"Could not hash NEP input: {nep_in_path}")
     model_run_id = compute_model_run_id(
         dataset_id=dataset_id,
         nep_in_sha256=nep_in_hash,
@@ -352,7 +355,13 @@ def validate_model_run_manifest(
         if callable(list_model_artifacts):
             linked = list_model_artifacts(str(manifest["model_run_id"]))
             if manifest["status"] == "completed":
-                model_artifacts = [item for item in linked if item.get("role") == "model"]
+                if not isinstance(linked, (list, tuple)):
+                    raise NepArtifactError("StateStore model artifacts are malformed")
+                model_artifacts = [
+                    item
+                    for item in linked
+                    if isinstance(item, Mapping) and item.get("role") == "model"
+                ]
                 if len(model_artifacts) != 1 or model_artifacts[0].get("sha256") != manifest.get(
                     "potential_artifact_sha256"
                 ):

@@ -13,6 +13,11 @@ from .models import PerturbationSettings
 Annotate = Callable[..., Any]
 
 
+def _gas_interstitial_distance(settings: PerturbationSettings) -> float:
+    value = settings.gas_interstitial_d_min
+    return settings.interstitial_d_min if value is None else value
+
+
 def vacancies(
     supercell: Any,
     base: Any,
@@ -90,7 +95,7 @@ def gas_interstitials(
         settings,
         rng,
         list(settings.gas_elements),
-        float(settings.gas_interstitial_d_min),
+        _gas_interstitial_distance(settings),
         "gas_interstitial",
         "n_gas_interstitials",
         annotate,
@@ -132,7 +137,7 @@ def vacancy_interstitial(
         for _ in range(n_add):
             element = all_elements[rng.randint(len(all_elements))]
             d_min = (
-                float(settings.gas_interstitial_d_min)
+                _gas_interstitial_distance(settings)
                 if element in settings.gas_elements
                 else settings.interstitial_d_min
             )
@@ -203,7 +208,7 @@ def gas_in_vacancy(
                     distance = _minimum_image_distances(
                         remaining_positions, candidate, cell, inv_cell
                     )
-                    if float(np.min(distance)) < float(settings.gas_interstitial_d_min) ** 2:
+                    if float(np.min(distance)) < _gas_interstitial_distance(settings) ** 2:
                         candidate = vacancy_position.copy()
                 position = candidate
             else:
@@ -214,7 +219,7 @@ def gas_in_vacancy(
                     inv_cell,
                     rng,
                     radius=2.5,
-                    d_min=float(settings.gas_interstitial_d_min),
+                    d_min=_gas_interstitial_distance(settings),
                     max_attempts=500,
                 )
             if position is not None:

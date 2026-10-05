@@ -5,7 +5,7 @@ from __future__ import annotations
 import shutil
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Sequence
 
 from nepflow.errors import StateError
 from nepflow.hpc.resources import JobResources
@@ -21,6 +21,7 @@ from nepflow.workflow import StageContext, StageRunResult, StageRunState, Workfl
 from .campaign import TrainingCampaign
 from .dataset import (
     DatasetBuildResult,
+    DatasetSplit,
     build_training_dataset,
     load_materialized_dataset,
     prepare_training_dataset,
@@ -118,7 +119,11 @@ class TrainingStage:
             raise StateError("TrainingStage requires StateStore dataset identity APIs")
         dataset_id = dataset_manifest.identity.dataset_id
         row = get_dataset(dataset_id)
-        persisted = None if row is None else row.get("identity_json", row.get("identity"))
+        persisted = (
+            None
+            if row is None or not isinstance(row, dict)
+            else row.get("identity_json", row.get("identity"))
+        )
         if not isinstance(persisted, dict) or persisted != dataset_manifest.identity.to_dict():
             raise StateError("Training dataset is not registered in authoritative StateStore")
 
@@ -136,14 +141,16 @@ class TrainingStage:
             state_store,
             reader=self.reader,
         )
+        prepared_split_records: dict[DatasetSplit | str, Sequence[Any]] = {
+            split: records for split, records in split_records.items()
+        }
         preview_path = context.project_dir / "nep" / "datasets" / ".identity-preview"
         preparation = prepare_training_dataset(
-            split_records,
+            prepared_split_records,
             preview_path,
             train_virial=config.train_nep.train_virial,
             allow_partial=config.train_nep.allow_partial_dataset,
             state_store=state_store,
-            project_id=context.project_name,
         )
         dataset_id = preparation.manifest.identity.dataset_id
         dataset_path = context.project_dir / "nep" / "datasets" / dataset_id

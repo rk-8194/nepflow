@@ -176,6 +176,11 @@ def _is_benchmark_attempt(attempt: Mapping[str, object]) -> bool:
     return isinstance(metadata, Mapping) and metadata.get("execution_kind") == "vasp_benchmark"
 
 
+def _attempt_number(attempt: Mapping[str, object]) -> int:
+    value = attempt.get("attempt_number", 1)
+    return int(value) if isinstance(value, (int, float, str)) else 1
+
+
 class VaspPreparationOrchestrator:
     """Prepare VASP inputs and record typed calculation/reuse state."""
 
@@ -253,7 +258,7 @@ class VaspPreparationOrchestrator:
                 current_status = {
                     "status": persisted_status or "pending",
                     "retry_level": (
-                        max(0, int(latest_attempt.get("attempt_number", 1)) - 1)
+                        max(0, _attempt_number(latest_attempt) - 1)
                         if latest_attempt is not None
                         else 0
                     ),

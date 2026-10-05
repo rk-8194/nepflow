@@ -195,8 +195,15 @@ def calculate_metrics(paired: Sequence[PairedValidationCase]) -> ValidationMetri
     if virial_values:
         if len(virial_values) != len(records):
             raise ValidationError("virial labels must be present for every paired case")
+        virial_pairs: list[tuple[np.ndarray, np.ndarray, int]] = []
+        for item in virial_values:
+            ml_virial = item.ml_virial_ev
+            dft_virial = item.dft_virial_ev
+            if ml_virial is None or dft_virial is None:
+                raise ValidationError("virial labels must be present for every paired case")
+            virial_pairs.append((ml_virial, dft_virial, item.repeat_count))
         virial_errors = np.concatenate(
-            [item.ml_virial_ev / item.repeat_count - item.dft_virial_ev for item in virial_values],
+            [ml / repeat_count - dft for ml, dft, repeat_count in virial_pairs],
             axis=0,
         )
         virial_mae, virial_rmse = _mae_rmse(virial_errors, "virial errors")

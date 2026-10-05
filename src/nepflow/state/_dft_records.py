@@ -10,9 +10,10 @@ from nepflow.domain.identities import ArtifactIdentity, DftCalculationIdentity
 from nepflow.errors import StateError
 
 from ._record_codec import decode_json, decode_row, encode_json, identity_payload, now
+from ._typing import StateStoreMixinSupport, require_state_row
 
 
-class DftRecordsMixin:
+class DftRecordsMixin(StateStoreMixinSupport):
     """Provide StateStore persistence for DFT execution records."""
 
     def upsert_dft_calculation(
@@ -103,7 +104,7 @@ class DftRecordsMixin:
                 timestamp,
             ),
         )
-        return self.get_dft_calculation(calculation_id)  # type: ignore[return-value]
+        return require_state_row(self.get_dft_calculation(calculation_id), "DFT calculation")
 
     def create_dft_attempt(
         self,
@@ -502,7 +503,7 @@ class DftRecordsMixin:
                 attempt_id,
             ),
         )
-        return self.get_dft_attempt(attempt_id)  # type: ignore[return-value]
+        return require_state_row(self.get_dft_attempt(attempt_id), "DFT attempt")
 
 
 def _calculation_keys(payload: Mapping[str, Any]) -> tuple[str, str]:

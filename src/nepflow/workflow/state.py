@@ -17,7 +17,7 @@ from nepflow.errors import StateError
 from nepflow.io.atomic import atomic_write_text
 from nepflow.state import StateStore
 
-from .resubmission import ReconciliationResult
+from .resubmission import ReconciliationResult, ReconciliationSource
 from .stages import (
     StageRunState,
     StageRunStatus,
@@ -103,7 +103,7 @@ class WorkflowState:
                 reason = None
             return ReconciliationResult(
                 stage=stored_run.stage,
-                source="state_store",
+                source=ReconciliationSource.STATE_STORE,
                 marker_stage=marker_stage,
                 authoritative_stage=stored_run.stage,
                 changed=marker_needs_repair,
@@ -126,7 +126,7 @@ class WorkflowState:
                 )
             return ReconciliationResult(
                 stage=marker_stage,
-                source="legacy_marker",
+                source=ReconciliationSource.LEGACY_MARKER,
                 marker_stage=marker_stage,
                 authoritative_stage=marker_stage,
                 changed=True,

@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import shlex
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from nepflow.domain.identities import ValidationRunIdentity
 from nepflow.errors import StateError
@@ -151,12 +152,14 @@ class ValidationStage:
             request = case.static_prediction_request(resolved.model_run)
             parser = getattr(backend, "parse_prediction", None)
             if callable(parser):
-                predictions.append(parser(request, case.output_path))
+                parse = cast(Callable[..., StaticPrediction], parser)
+                predictions.append(parse(request, case.output_path))
                 continue
             predictor = getattr(backend, "predict", None)
             if not callable(predictor):
                 raise StateError("Validation backend must implement parse_prediction or predict")
-            predictions.append(predictor(request))
+            predict = cast(Callable[..., StaticPrediction], predictor)
+            predictions.append(predict(request))
         return tuple(predictions)
 
     def _resources(self, context: StageContext | None) -> JobResources | None:

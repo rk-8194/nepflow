@@ -31,6 +31,7 @@ class Scheduler(Protocol):
         resources: JobResources | None = None,
     ) -> SubmissionResult:
         """Submit an already-rendered backend command."""
+        ...
 
     def submit_script(
         self,
@@ -45,15 +46,19 @@ class Scheduler(Protocol):
         timeout: float | None = None,
     ) -> SubmissionResult:
         """Build and submit one sbatch script command."""
+        ...
 
     def cancel(self, job_id: str, *, timeout: float | None = None) -> CancellationResult:
         """Cancel a job or raise a scheduler communication error."""
+        ...
 
     def queue_status(self, job_id: str, *, timeout: float | None = None) -> QueueStatusResult:
         """Return active queue status; absent is distinct from query failure."""
+        ...
 
     def accounting_status(self, job_id: str, *, timeout: float | None = None) -> AccountingResult:
         """Return accounting status; absent accounting is distinct from failure."""
+        ...
 
     def list_active_jobs(
         self,
@@ -63,6 +68,7 @@ class Scheduler(Protocol):
         timeout: float | None = None,
     ) -> QueueQueryResult:
         """List active jobs from a successful queue query."""
+        ...
 
     def find_job_by_name(
         self,
@@ -72,6 +78,7 @@ class Scheduler(Protocol):
         timeout: float | None = None,
     ) -> SlurmJobRecord | None:
         """Find one active job by exact name."""
+        ...
 
     def reconcile(
         self,
@@ -80,6 +87,7 @@ class Scheduler(Protocol):
         timeout: float | None = None,
     ) -> ReconciledJobResult:
         """Reconcile live queue state with accounting state."""
+        ...
 
 
 __all__ = ["Scheduler"]

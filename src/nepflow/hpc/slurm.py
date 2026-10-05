@@ -177,7 +177,7 @@ def _sacct_fields(
     fields: list[str],
 ) -> tuple[str, str | None, str, str | None, str | None, str | None, str | None]:
     if len(fields) >= 7:
-        return tuple(fields[:7])  # type: ignore[return-value]
+        return fields[0], fields[1], fields[2], fields[3], fields[4], fields[5], fields[6]
     if len(fields) >= 2:
         # Compact fixtures may omit JobName and use id|state|reason|exit|out|err.
         values = fields + [""] * (6 - len(fields))

@@ -2,6 +2,19 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .generators.composition import CompositionGrid
+    from .models import GenerationManifest, GenerationRequest, GenerationResult
+    from .provenance import (
+        annotate_base_structures,
+        assign_seed_ids,
+        deduplicate_base_structures,
+        merge_provenance,
+    )
+    from .stage import GenerationStage
+
 __all__ = [
     "GenerationManifest",
     "GenerationRequest",

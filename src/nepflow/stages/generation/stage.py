@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Protocol, runtime_checkable
 
 from ase.io import read, write
 
@@ -28,9 +28,32 @@ logger = logging.getLogger(__name__)
 
 
 class PerturbationCoordinator(Protocol):
-    def process(self, base_structures: list[Any], output_dir: Path, **kwargs: Any) -> Any: ...
+    def process(
+        self,
+        base_structures: list[Any],
+        output_dir: Path,
+        n_rattled: int = 10,
+        n_liquid_configurations: int = 0,
+        n_liquid_snapshots: int = 0,
+        n_vacancies: int = 10,
+        n_interstitials: int = 10,
+        n_gas_interstitials: int = 0,
+        n_vacancy_interstitial: int = 0,
+        n_gas_in_vacancy: int = 0,
+        n_workers: int = 0,
+    ) -> Path: ...
 
     def get_summary(self) -> Mapping[str, Any]: ...
+
+
+@runtime_checkable
+class GasPhaseGenerator(Protocol):
+    def generate_gas_phases(
+        self,
+        metal_elements: list[str],
+        gas_elements: list[str],
+        target_n_atoms: int,
+    ) -> list[Any]: ...
 
 
 DebugRunner = Callable[[GenerationRequest], list[Any]]
@@ -415,7 +438,7 @@ class GenerationStage:
             (candidate for name, candidate in self.generators if name == "MaterialsProject"),
             None,
         )
-        if generator is None or not hasattr(generator, "generate_gas_phases"):
+        if generator is None or not isinstance(generator, GasPhaseGenerator):
             self.logger.warning("  MP generator not available - skipping gas-phase fetch")
             return
         gas_bases = generator.generate_gas_phases(

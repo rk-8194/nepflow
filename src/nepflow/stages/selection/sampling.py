@@ -344,7 +344,7 @@ def collect_ternary_projections(
                 TernaryProjection(
                     subset,
                     composition.structure_index,
-                    normalize_composition_subset(composition, subset),
+                    _as_ternary(normalize_composition_subset(composition, subset)),
                 )
             )
     return projections
@@ -360,9 +360,9 @@ def binary_bin_index(value: float, bins: int) -> int:
 
 
 def largest_remainder_integer_partition(
-    values: tuple[float, ...],
+    values: tuple[float, float, float],
     total: int,
-) -> tuple[int, ...]:
+) -> tuple[int, int, int]:
     """Convert barycentric fractions into deterministic integer coordinates."""
 
     scaled = [value * total for value in values]
@@ -376,7 +376,13 @@ def largest_remainder_integer_partition(
         )
         for idx, _ in ranked[:remainder]:
             floors[idx] += 1
-    return tuple(int(value) for value in floors)
+    return int(floors[0]), int(floors[1]), int(floors[2])
+
+
+def _as_ternary(values: tuple[float, ...]) -> tuple[float, float, float]:
+    if len(values) != 3:
+        raise ValueError("ternary composition requires exactly three fractions")
+    return values[0], values[1], values[2]
 
 
 def ternary_bin_index(
@@ -392,7 +398,7 @@ def ternary_bin_center(
     index: tuple[int, int, int],
     resolution: int,
 ) -> tuple[float, float, float]:
-    return tuple(value / resolution for value in index)
+    return index[0] / resolution, index[1] / resolution, index[2] / resolution
 
 
 def barycentric_to_cartesian(
@@ -584,7 +590,7 @@ def composition_projection_bins(atoms: Any) -> dict[str, list[tuple]]:
         ternary_bins.append(
             subset
             + ternary_bin_index(
-                normalized,
+                _as_ternary(normalized),
                 COMPOSITION_AWARE_TERNARY_RESOLUTION,
             )
         )

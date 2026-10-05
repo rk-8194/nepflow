@@ -12,9 +12,10 @@ from nepflow.domain.structures import (
 from nepflow.errors import StateError
 
 from ._record_codec import decode_row, encode_json, now
+from ._typing import StateStoreMixinSupport, require_state_row
 
 
-class StructureRecordsMixin:
+class StructureRecordsMixin(StateStoreMixinSupport):
     """Provide the StateStore structure-record persistence boundary."""
 
     def upsert_structure(
@@ -60,7 +61,7 @@ class StructureRecordsMixin:
         )
         if provenance is not None:
             self._write_provenance(identity.structure_id, provenance, timestamp)
-        return self.get_structure(identity.structure_id)  # type: ignore[return-value]
+        return require_state_row(self.get_structure(identity.structure_id), "structure")
 
     def _write_provenance(
         self,

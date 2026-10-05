@@ -250,7 +250,7 @@ class GpumdBackend:
             species=tuple(atoms.get_chemical_symbols()),
             positions_angstrom=np.asarray(atoms.positions, dtype=float),
             cell_angstrom=np.asarray(atoms.cell, dtype=float),
-            pbc=tuple(bool(value) for value in atoms.pbc),
+            pbc=(bool(atoms.pbc[0]), bool(atoms.pbc[1]), bool(atoms.pbc[2])),
             atom_mapping=atom_mapping,
         )
 

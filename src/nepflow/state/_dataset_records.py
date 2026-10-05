@@ -8,9 +8,10 @@ from nepflow.domain.datasets import DatasetIdentity, SelectedDatasetMember, Trai
 from nepflow.errors import StateError
 
 from ._record_codec import decode_json, decode_row, encode_json, now
+from ._typing import StateStoreMixinSupport, require_state_row
 
 
-class DatasetRecordsMixin:
+class DatasetRecordsMixin(StateStoreMixinSupport):
     """Provide StateStore persistence for dataset ledger records."""
 
     def upsert_dataset(
@@ -70,7 +71,7 @@ class DatasetRecordsMixin:
                 timestamp,
             ),
         )
-        return self.get_dataset(identity.dataset_id)  # type: ignore[return-value]
+        return require_state_row(self.get_dataset(identity.dataset_id), "dataset")
 
     def get_dataset(self, dataset_id: str) -> dict[str, Any] | None:
         row = self._fetchone("SELECT * FROM datasets WHERE dataset_id = ?", (dataset_id,))

@@ -6,6 +6,15 @@ owning packages; this root intentionally exposes only the five stage names.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .dft import DftStage
+    from .generation import GenerationStage
+    from .selection import SelectionStage
+    from .training import TrainingStage
+    from .validation import ValidationStage
+
 __all__ = [
     "DftStage",
     "GenerationStage",
