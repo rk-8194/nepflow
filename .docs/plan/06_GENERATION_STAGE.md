@@ -1,1189 +1,1486 @@
-# Phase 6 Product Design and Implementation Plan — Generation Stage
+# Phase 6 Product Design Document — Generation Stage Extension
 
-**Workflow position:** 6 of 7  
+**Document status:** Normative Phase 6 development PDD  
+**Workflow position:** Phase 6 of 7  
+**Target branch reviewed:** `dev` at `90cbd94691b9d2a3a30b252c4d3bbf265d270457`  
 **Required predecessor:** Phase 5 — Style Cleanup and Conformance  
 **Required successor:** Phase 7 — Information-Entropy Selection  
-**Governing documents:** `.docs/MASTER_PDD.md`, `.docs/CODEBASE_ARCHITECTURE_AND_STYLE_PDD.md`, `.docs/STRUCTURE_GENERATION_PDD.md`, `.docs/MAGNETIC_ORDERING_GENERATION_PDD.md`  
-**Source reviewed:** `dev` at `3cf040d5d8ffc5f493ef8c96dd74506b615a83a2`  
-**Primary scope:** Complete the generation-stage scientific/data contract before the information-entropy selector is implemented.  
-**Scientific constraint:** Generation defines the candidate population; it must not use DFT labels, model uncertainty, foundation-potential predictions, or selection scores to decide which ordinary candidates exist.
+**Governing documents:** `.docs/MASTER_PDD.md`, `.docs/CODEBASE_ARCHITECTURE_AND_STYLE_PDD.md`, `.docs/STRUCTURE_GENERATION_PDD.md`, `.docs/MAGNETIC_ORDERING_GENERATION_PDD.md`
 
 ---
 
-## 1. Objective
+## 1. Purpose
 
-Bring the canonical `src/nepflow/stages/generation/` implementation into conformance with the Structure Generation PDD and establish the magnetic-candidate contract required by the Magnetic Ordering Generation PDD.
+Phase 6 extends the generation stage created and migrated during Phases 1–5.
 
-At the end of this phase, the generation stage shall produce a reproducible, admissible, deduplicated, provenance-complete candidate population with explicit coverage accounting. The candidate population shall be a trustworthy input to Phase 7 rather than a loose collection of structures that the selector is expected to repair.
+It does **not** redesign the generation architecture.
 
-The completed flow shall be:
+The `dev` branch already establishes the canonical generation-stage framework:
 
-```text
-validated generation domain
-    -> composition requests
-    -> seed acquisition / construction
-    -> geometry-aware supercell construction
-    -> explicit transformation recipes
-    -> candidate attempts
-    -> admissibility / rejection / controlled regeneration
-    -> exact structural deduplication with provenance merge
-    -> optional magnetic expansion
-    -> candidate identity
-    -> canonical candidate artifact + manifests/reports
-    -> Phase 7 selection
-```
+- `GenerationStage` is the stage orchestration boundary;
+- `ConfigurationalGenerator` is the interface for base/configurational structure generators;
+- `PerturbationCoordinator` coordinates derived structures from generated bases;
+- focused modules under `stages/generation/perturbations/` own individual scientific transformations;
+- `supercell.py` owns target-supercell construction;
+- `provenance.py` and `perturbations/provenance.py` own generation provenance;
+- typed configuration is defined in `config/models.py`, parsed by `config/section_parsers.py`, validated by `config/validation.py` and stage-local validation, and composed in `application/composition.py`;
+- `StateStore`, artifact identities, structure identities, and workflow stage state are already authoritative infrastructure;
+- tests mirror the generation modules and protect deterministic scientific behaviour.
 
-This phase shall not perform DFT, calculate selection descriptors, choose the final training set, train a potential, or use downstream accuracy as a substitute for generation coverage.
+Phase 6 shall extend these existing seams.
 
----
+The objective is to make NEPFlow's generation stage capable of producing a broad, scientifically useful candidate population for NEP and future MLIP training while avoiding the current tendency to apply every perturbation to every base structure.
 
-## 2. Why this phase belongs here
-
-The first five phases establish correctness, shared architecture, canonical package ownership, and code-quality rules. Those foundations are now prerequisites for implementing the generation PDD without creating new legacy infrastructure.
-
-Information-entropy selection must follow generation because its objective is defined over the complete generated candidate pool. Implementing the selector first would freeze assumptions about:
-
-- candidate identity;
-- composition coverage;
-- structure-family representation;
-- magnetic state storage;
-- provenance;
-- duplicate handling;
-- restart semantics;
-- candidate ordering.
-
-Therefore generation becomes Phase 6 and information-entropy selection becomes Phase 7.
-
-Magnetic ordering also belongs inside this phase at the end of structural generation, because the Magnetic Ordering Generation PDD explicitly defines:
-
-```text
-structural candidate
-    -> magnetic configuration expansion
-    -> joint structural/magnetic selection
-```
-
-The constrained magnetic VASP implementation remains outside this phase and is a downstream DFT concern.
+The stage should produce **diverse local atomic environments and relevant thermodynamic/mechanical/defect environments**, not an uncontrolled Cartesian product of every available generation operation.
 
 ---
 
-## 3. Current dev-branch baseline
+## 2. Product objective
 
-The current generation subsystem already contains useful foundations that shall be preserved where scientifically correct.
+NEPFlow generation exists to create candidate atomic configurations from which selection and DFT can build a transferable MLIP training dataset.
 
-### 3.1 Existing strengths
+For ordinary NEP, the generated population must contain useful diversity in the local structural environments that determine:
 
-Current files include:
+- total energies;
+- atomic forces;
+- virials/stresses where required;
+- phase stability;
+- elastic response;
+- point-defect energetics;
+- surfaces and interfaces;
+- grain-boundary environments;
+- thermal disorder;
+- liquid/amorphous environments;
+- relevant chemical ordering and segregation.
 
-- `src/nepflow/stages/generation/stage.py`;
-- `src/nepflow/stages/generation/models.py`;
-- `src/nepflow/stages/generation/provenance.py`;
-- `src/nepflow/stages/generation/supercell.py`;
-- `src/nepflow/stages/generation/validation.py`;
-- `src/nepflow/stages/generation/generators/`;
-- `src/nepflow/stages/generation/perturbations/`;
-- `src/nepflow/domain/structures.py`;
-- `src/nepflow/domain/identities.py`;
-- `src/nepflow/state/_structure_records.py`.
+The generation stage is therefore responsible for **constructing the candidate domain**, while Phase 7 is responsible for selecting a sparse DFT subset from that domain.
 
-The branch already provides:
+Generation must not attempt to replace selection by generating only a tiny hand-picked set, and selection must not be expected to repair a generation stage that has produced millions of almost identical structures through unnecessary Cartesian products.
 
-- typed generation requests and config;
-- unary/binary/ternary simplex-grid generation;
-- Materials Project seed import;
-- random solid solutions;
-- SQS generation through an explicit backend;
-- segregated configurations;
-- deterministic volume and elastic perturbations;
-- seeded rattling;
-- seeded liquid-like Lennard-Jones snapshots;
-- vacancies;
-- host/gas interstitials;
-- vacancy/interstitial and gas-in-vacancy complexes;
-- physical structure hashing;
-- base-structure deduplication;
-- typed provenance records;
-- deterministic process-pool task ordering;
-- atomic artifact writes;
-- basic generation unit and integration tests.
-
-These capabilities should be migrated into the final generation contracts rather than replaced gratuitously.
-
-### 3.2 Current gaps relative to the PDD
-
-The implementation is not yet a complete generation stage.
-
-Important gaps include:
-
-1. `CompositionGrid` is limited to pure/binary/ternary regular grids and has no explicit-composition, range, exclusion, sparse high-dimensional, or imported-composition strategy.
-2. Composition assignment records realised fractions but does not enforce a configured composition-error tolerance or enlarge/reject cells based on integer realisability.
-3. `build_target_supercell()` uses one isotropic cube-root repeat rule for all families; it is not geometry-aware and does not record effective atom count, dimensions, aspect ratio, composition error, or transformation matrix.
-4. Structural topology required for later AFM generation is not retained through supercell construction.
-5. Seed sourcing is not a first-class abstraction for user structures, prior-project structures, explicit prototypes, ordered compounds, or externally requested generation targets.
-6. Transformation composition is implicit. The coordinator directly invokes a fixed list of one-step perturbations rather than executing explicit transformation recipes.
-7. Required perturbations such as substitutions and antisites are absent; defect separation and species-specific vacancy controls are incomplete.
-8. Candidate admissibility is not centralized. There is no mandatory pipeline for invalid cells, non-finite coordinates, pair distances, density/volume, aspect ratio, composition error, atom-count bounds, or family-specific checks.
-9. Interstitial placement can fail to place requested atoms without producing a first-class rejection/regeneration record.
-10. Exact deduplication occurs only for base structures. Perturbed candidates can duplicate one another and still survive into selection.
-11. The state store can contain multiple provenance operations for one structure, but `get_structure()` exposes only the latest provenance and generation does not persist the full candidate population as authoritative structure/provenance state.
-12. `GenerationManifest` primarily describes the seed artifact; it does not provide the PDD-required final candidate identities, rejection report, duplicate report, coverage report, or generation-run fingerprint.
-13. The current summary only counts perturbation/configurational types; it does not measure composition, density, minimum distance, strain, defects, temperature, parent-seed coverage, or gaps.
-14. Restart currently reuses saved base structures but does not resume fine-grained perturbation units.
-15. Stochastic worker seeds are allocated from coordinator RNG state rather than derived from stable generation-unit identities, which complicates fine-grained restart.
-16. `PerturbationCoordinator._execute()` resolves all futures into a list, so the worker boundary is not truly streaming.
-17. `PerturbationCoordinator._flush()` reads the complete accumulated candidate artifact and rewrites it for every batch, producing avoidable O(total-output²) I/O.
-18. No project/subsystem/family/seed budget model or mandatory/core/boundary/exploratory priority class exists.
-19. There is no canonical candidate identity separate from structure identity, which is required once magnetic variants share one geometry.
-20. The current selection persistence rejects duplicate `structure_id` values, so magnetic variants cannot yet cross the generation-selection boundary safely.
-
-Phase 6 addresses these generation-stage gaps in dependency order.
-
----
-
-## 4. Phase principles
-
-All Phase 6 work shall follow these rules.
-
-1. Preserve `StructureIdentity` as physical geometry identity.
-2. Do not make provenance fields part of physical identity.
-3. Do not make magnetic state part of `StructureIdentity`.
-4. A generated candidate must be accepted by explicit admissibility rules before it enters the final pool.
-5. Rejection is a valid scientific outcome and must be persisted.
-6. Regeneration is permitted only through an explicit bounded retry policy.
-7. Repair is permitted only when the transformation defines a deterministic scientifically equivalent repair.
-8. Exact deduplication must preserve every contributing provenance path.
-9. Near-duplicate thinning must remain separate from exact identity deduplication and is disabled unless explicitly configured.
-10. Randomness is a scientific input: derive, persist, and test it.
-11. Worker count and restart point must not change the final candidate identities or ordering.
-12. No enabled generator silently substitutes another generator.
-13. No composition, defect count, or domain bound may be silently changed to keep generation running.
-14. The generation stage may measure geometry and coverage but must not use DFT energies, forces, model uncertainty, or selection descriptors as ordinary generation criteria.
-15. Advanced structure families not implemented in this phase must have explicit extension boundaries rather than placeholder outputs.
-
----
-
-## 5. Target generation data model
-
-### 5.1 Domain definition
-
-Add typed domain/config concepts sufficient to describe:
-
-- chemical subsystem;
-- composition request;
-- structure/seed family;
-- domain class: mandatory, core, boundary, exploratory;
-- supercell requirements;
-- transformation recipe;
-- admissibility profile;
-- generation budget;
-- magnetic expansion settings where enabled.
-
-Do not pass a growing untyped dictionary between major components.
-
-### 5.2 Generation run identity
-
-Introduce a versioned `GenerationRunIdentity` derived from the scientific inputs that define the candidate population:
-
-- effective generation/composition/magnetism configuration;
-- seed-source identities/hashes;
-- software/generator schema versions;
-- root random seed;
-- transformation definitions.
-
-Operational values such as worker count shall not change the scientific run identity.
-
-### 5.3 Generation unit identity
-
-A generation unit is the smallest resumable deterministic work item, conceptually:
-
-```text
-(root seed, composition request, structure family, transformation recipe, output slot)
-```
-
-Its identity shall be stable and shall be the basis for:
-
-- per-unit random-seed derivation;
-- retries;
-- restart;
-- output ordering;
-- persisted status.
-
-### 5.4 Candidate identity
-
-Before magnetism, one structural candidate can be addressed by `structure_id`.
-
-For the final stage boundary introduce a versioned `candidate_id`:
-
-```text
-candidate_id = H(structure_id, magnetic_state_id-or-nonmagnetic-state)
-```
-
-This allows multiple magnetic candidates to share one `structure_id`.
-
-All candidates, including ordinary non-magnetic candidates, should expose a candidate identity once the final artifact schema is versioned.
-
-### 5.5 Provenance graph
-
-Keep each transformation as an operation with a parent structure/candidate identity rather than flattening a chain into a single label.
-
-The authoritative provenance must support reconstruction of chains such as:
-
-```text
-Materials Project phase
-    -> supercell
-    -> alloy occupation
-    -> hydrostatic compression
-    -> vacancy
-    -> rattle
-    -> magnetic expansion
-```
-
-The final manifest may contain compact path summaries, but the StateStore must preserve the machine-readable operation graph.
-
----
-
-## 6. Workstream A — regression boundary and schemas
-
-Implement the new contracts before expanding scientific capability.
-
-### Relevant current files
-
-- `src/nepflow/domain/identities.py`
-- `src/nepflow/domain/structures.py`
-- `src/nepflow/state/schema.py`
-- `src/nepflow/state/migrations.py`
-- `src/nepflow/state/_structure_records.py`
-- `src/nepflow/stages/generation/models.py`
-- `tests/unit/domain/test_identities.py`
-- `tests/unit/state/`
-- `tests/unit/generation/`
-
-### Required changes
-
-Add versioned domain records for generation run, unit, candidate, rejection/attempt result, and transformation provenance.
-
-Add a StateStore migration rather than altering migration 1 in place. The migration should provide explicit persistence for:
-
-- generation runs;
-- generation units/attempts;
-- final candidate membership/order;
-- candidate identity;
-- run-level report/artifact references.
-
-Retain the existing `structures` table as physical-structure ownership.
-
-Update structure-provenance reads so all provenance paths can be retrieved; do not expose only the newest path when scientific accounting requires all paths.
-
-Prevent `upsert_structure()` from losing scientifically relevant merged metadata when the same physical structure arrives through another generation path.
-
-### Required tests
-
-Add tests proving:
-
-- run identity ignores worker count but changes with scientific generation config;
-- unit identity is stable;
-- candidate identity is distinct from structure identity;
-- duplicate physical structures can have several provenance operations;
-- migrations preserve existing Phase 1–5 state;
-- malformed generation state fails explicitly.
-
-Do not begin new generators until these contracts are green.
-
----
-
-## 7. Workstream B — composition-domain implementation
-
-### Relevant current files
-
-- `src/nepflow/config/models.py`
-- `src/nepflow/config/section_parsers.py`
-- `src/nepflow/config/validation.py`
-- `src/nepflow/config/creation.py`
-- `src/nepflow/stages/generation/generators/composition.py`
-- `src/nepflow/stages/generation/generators/composition_primitives.py`
-- `tests/unit/generation/test_composition.py`
-
-### Required changes
-
-Replace the assumption that generation equals one unary/binary/ternary regular grid with an explicit composition-strategy contract.
-
-Implement at least:
-
-1. generalized simplex-grid sampling with configurable maximum subsystem order;
-2. explicit composition lists;
-3. bounded composition regions/exclusions;
-4. a deterministic sparse high-dimensional strategy suitable when an exhaustive grid is not requested.
-
-The implementation shall remain extensible to later adaptive/imported composition requests.
-
-Represent every requested point as a typed `CompositionRequest` containing:
-
-- requested fractions;
-- originating strategy;
-- subsystem/order;
-- domain/priority class;
-- optional weight/importance used only for generation budgeting;
-- stable request identity.
-
-### Integer realisability
-
-For a target fraction vector (x_e) and chosen atom count (N), compute integer counts (n_e) with
+The governing rule is:
 
 [
-sum_e n_e=N
+oxed{
+	ext{generate scientifically distinct families deliberately;
+do not automatically multiply every family by every other family}
+}
 ]
 
-and realised fractions
+---
+
+## 3. Existing architecture is normative
+
+### 3.1 GenerationStage
+
+Current owner:
+
+`src/nepflow/stages/generation/stage.py`
+
+`GenerationStage` shall remain a thin orchestrator.
+
+Its responsibilities remain:
+
+1. receive a validated `GenerationRequest`;
+2. obtain base structures from injected configurational generators;
+3. deduplicate and persist base structures;
+4. request derived candidates from the injected perturbation coordinator;
+5. persist the canonical generated-candidate artifact;
+6. expose a typed `GenerationResult`.
+
+Scientific algorithms shall not be moved into `GenerationStage`.
+
+Phase 6 shall not introduce a replacement `GenerationEngine`, generic pipeline framework, or parallel orchestration hierarchy.
+
+### 3.2 ConfigurationalGenerator
+
+Current owner:
+
+`src/nepflow/stages/generation/generators/base.py`
+
+The existing protocol:
+
+```python
+class ConfigurationalGenerator(Protocol):
+    def generate(
+        self,
+        composition: Mapping[str, float],
+        crystal_structures: Sequence[str],
+        target_n_atoms: int = 250,
+    ) -> list[Any]: ...
+```
+
+is the extension seam for generators that establish base/configurational structures.
+
+Current implementations include:
+
+- Materials Project;
+- random solid solution;
+- SQS;
+- segregated structures.
+
+New base/configurational generators should use this interface where its semantics fit.
+
+Do not introduce a second generic "generation family" interface for the same responsibility.
+
+### 3.3 PerturbationCoordinator and focused perturbation modules
+
+Current owners:
+
+```text
+src/nepflow/stages/generation/perturbations/
+    coordinator.py
+    models.py
+    provenance.py
+    volume.py
+    elastic.py
+    displacements.py
+    defects.py
+    liquid.py
+```
+
+This package owns structures derived from an existing base/supercell.
+
+The current convention is intentionally simple:
+
+- scientific behaviour lives in focused functions/modules;
+- settings are typed in `PerturbationSettings`;
+- requested multiplicities are typed in `PerturbationCounts`;
+- process-worker inputs are represented by `PerturbationTask`;
+- worker outputs are represented by `PerturbationTaskResult`;
+- the coordinator owns orchestration, ordering, concurrency and persistence.
+
+Phase 6 shall extend this pattern.
+
+It shall not replace these functions with a class hierarchy merely to make transformations "generic".
+
+### 3.4 Application composition
+
+Current owner:
+
+`src/nepflow/application/composition.py`
+
+This remains the place where concrete generation implementations are created from validated configuration and injected into `GenerationStage`.
+
+New generation capabilities shall be wired here, not discovered dynamically from config inside stage code.
+
+### 3.5 Configuration
+
+Current owners:
+
+- `src/nepflow/config/models.py`;
+- `src/nepflow/config/section_parsers.py`;
+- `src/nepflow/config/validation.py`;
+- `src/nepflow/config/creation.py`;
+- `src/nepflow/stages/generation/validation.py`.
+
+New user-facing generation settings must follow the existing typed configuration flow.
+
+If Phase 6 changes the public meaning of generation configuration rather than only adding optional keys, the configuration schema shall be versioned explicitly.
+
+### 3.6 Provenance and identity
+
+Current owners:
+
+- `src/nepflow/domain/identities.py`;
+- `src/nepflow/domain/structures.py`;
+- `src/nepflow/stages/generation/provenance.py`;
+- `src/nepflow/stages/generation/perturbations/provenance.py`.
+
+Phase 6 shall extend these authoritative owners where necessary.
+
+It shall not introduce duplicate hashing, identity, provenance or state mechanisms.
+
+---
+
+## 4. Generation model
+
+NEPFlow shall distinguish two existing categories of generation work.
+
+### 4.1 Base/configurational generation
+
+Base generators establish a candidate crystal/configuration from composition and structural family.
+
+Examples:
+
+- Materials Project phases;
+- random solid solutions;
+- SQS;
+- segregated configurations;
+- explicit prototypes added in future.
+
+These produce the structures upon which derived generation acts.
+
+### 4.2 Derived-structure generation
+
+Derived generation starts from an existing base structure and produces new atomic environments.
+
+Examples:
+
+- unperturbed supercell;
+- isotropic volume variation;
+- elastic strain;
+- rattling;
+- vacancies;
+- interstitials;
+- substitutions;
+- antisites;
+- defect complexes;
+- liquid/disordered snapshots;
+- surfaces;
+- grain boundaries;
+- magnetic configurations.
+
+The existing `perturbations/` package is the canonical owner for this category even where the word "perturbation" is physically broader than a small displacement.
+
+Phase 6 shall not rename or relocate this package simply to introduce new derived families.
+
+---
+
+## 5. Avoid Cartesian-product generation
+
+### 5.1 Current problem
+
+The current `execute_perturbation_task()` applies essentially every enabled perturbation family to every base structure.
+
+Conceptually:
+
+```text
+each base
+    -> unperturbed
+    -> all volume points
+    -> all elastic strains
+    -> all rattles
+    -> all liquid configurations
+    -> all vacancies
+    -> all interstitials
+    -> all gas defects
+```
+
+This is deterministic and simple, but it does not scale to the intended generation-stage scope.
+
+Adding surfaces, grain boundaries, magnetic configurations, substitutions, antisites and other families without changing applicability would create a rapidly expanding and highly redundant candidate pool.
+
+### 5.2 Required behaviour
+
+Each derived family shall have an explicit **source scope**.
+
+The source scope answers:
+
+> Which generated base/configurational structures is this family applied to?
+
+This is distinct from the family count.
+
+For example:
+
+```text
+Materials Project equilibrium phases
+    -> volume
+    -> elastic
+    -> surfaces
+    -> selected defects
+    -> magnetism
+
+SQS alloy representatives
+    -> rattle
+    -> selected point defects
+
+random solid solutions
+    -> rattle
+
+segregated structures
+    -> selected interface/chemical-disorder sampling
+```
+
+The exact policy is user configuration. It must not be hidden in the scientific function.
+
+### 5.3 Minimal implementation convention
+
+Phase 6 shall add applicability/scoping through the existing typed settings and coordinator rather than introducing a recipe framework.
+
+A derived family should be invoked only when:
+
+1. it is enabled;
+2. its requested count/domain is nonzero;
+3. the current base matches its configured source scope.
+
+The coordinator remains explicit code.
+
+A small shared scope-checking function or typed record may be introduced in `perturbations/models.py` if it removes duplicated checks, but it must have one narrow responsibility.
+
+### 5.4 No implicit chaining
+
+Enabling two derived families shall not imply that the output of one becomes the input of the other.
+
+For example:
+
+```text
+vacancy enabled
+magnetism enabled
+```
+
+does not by itself mean every vacancy is magnetically expanded.
+
+Chaining must be explicitly supported by the family policy.
+
+For Phase 6, the important explicit chains are magnetic generation after selected defect structures.
+
+---
+
+## 6. Candidate pathways
+
+The intended Phase 6 candidate graph is conceptually:
+
+```text
+base/configurational structure
+│
+├── unperturbed
+├── volume profile
+├── elastic strain
+├── rattle
+├── liquid/disordered snapshots
+├── vacancy
+│   └── optional magnetic generation
+├── interstitial
+│   └── optional magnetic generation
+├── substitution
+│   └── optional magnetic generation
+├── antisite
+│   └── optional magnetic generation
+├── selected defect complexes
+│   └── optional magnetic generation
+├── surface
+├── grain boundary
+└── pristine magnetic generation
+```
+
+This is not a hard-coded universal policy.
+
+It documents the intended initial relationships between families.
+
+In particular, Phase 6 does **not** require magnetic variants of every:
+
+- volume point;
+- elastic strain;
+- rattled structure;
+- liquid snapshot;
+- surface;
+- grain boundary.
+
+Those combinations may be added later if a specific potential objective requires magnetovolume coupling, finite-temperature spin-lattice coupling, surface magnetism or grain-boundary magnetism.
+
+---
+
+## 7. Base/configurational generation development
+
+### 7.1 Preserve existing generators
+
+The following current generators are already correctly separated and shall be extended in place when needed:
+
+- `MaterialsProjectGenerator`;
+- `RandomSolidSolutionGenerator`;
+- `SQSGenerator`;
+- `SegregatedGenerator`.
+
+Their current module ownership shall remain.
+
+### 7.2 Composition generation
+
+Current `CompositionGrid` explicitly supports unary, binary and ternary composition generation.
+
+Phase 6 may extend composition generation where required, but shall not redesign the generator interface around hypothetical future high-dimensional strategies.
+
+The immediate requirements are:
+
+- requested composition remains explicit;
+- realised composition remains explicit;
+- the two are never silently conflated;
+- integer composition realisability is measured;
+- unrealistically poor realisation is not silently accepted.
+
+For target composition (x_e), atom count (N), and realised integer count (n_e),
 
 [
 hat{x}_e=rac{n_e}{N}.
 ]
 
-Record an explicit composition error, for example
+The generator shall calculate a deterministic composition error, for example
 
 [
-epsilon_x=max_e|hat{x}_e-x_e|.
+epsilon_x = max_e |hat{x}_e-x_e|.
 ]
 
-The exact metric shall be documented and versioned.
+The exact accepted metric and tolerance shall be part of generation configuration and provenance.
 
-If (epsilon_x) exceeds the configured tolerance, the supercell planner shall attempt another allowed cell size. If no admissible cell exists inside configured atom/cell bounds, reject the requested generation unit. Do not silently accept a poor composition.
+### 7.3 Ordered structures
 
-### Configuration migration
+The stage should support ordered compounds/prototypes without forcing them through the random-solution path.
 
-If the public config schema changes, bump the schema version and provide an explicit migration path. Do not implement runtime ambiguity between old and new meanings.
+Where ordered structures already exist in Materials Project they may naturally enter through that generator.
 
----
-
-## 8. Workstream C — seed sources and configurational generation
-
-### Relevant current files
-
-- `src/nepflow/stages/generation/generators/base.py`
-- `src/nepflow/stages/generation/generators/materials_project/`
-- `src/nepflow/stages/generation/generators/materials_project_generator.py`
-- `src/nepflow/stages/generation/generators/random_solution.py`
-- `src/nepflow/stages/generation/generators/sqs.py`
-- `src/nepflow/stages/generation/generators/segregated.py`
-- `src/nepflow/application/composition.py`
-
-### Required changes
-
-Separate seed acquisition from transformations/occupancy generation.
-
-Introduce a narrow seed-source protocol whose implementations can include:
-
-- Materials Project;
-- explicit crystallographic prototypes;
-- user-provided ASE-readable structures;
-- structures from a prior NEPFlow project;
-- externally requested structures from a future active-learning/discovery caller.
-
-Preserve current Materials Project provenance and add source revision/query/retrieval metadata where the provider exposes it.
-
-Keep random solution, SQS, segregated occupation, and ordered occupation as configurational generation/transformations rather than pretending every one is an external seed source.
-
-Add an explicit path for known/ordered compounds. The initial implementation may use configured prototype/site-occupation definitions and imported known phases; it does not need to invent arbitrary chemically plausible ordered compounds.
-
-All seed/configurational outputs must pass the same candidate validation boundary.
-
-### SQS
-
-Retain the explicit `SQSBackend` and fail-fast behavior. Extend provenance to record:
-
-- cluster-space/cutoff definition;
-- requested concentrations;
-- achieved concentrations;
-- backend identity/version where available;
-- objective/quality information where the backend exposes it.
-
-Never substitute a random alloy when SQS generation fails.
+Future explicitly authored prototypes should be implemented as a focused configurational generator if added.
 
 ---
 
-## 9. Workstream D — geometry-aware supercell construction
+## 8. Supercell construction
 
-### Relevant current file
+Current owner:
 
 `src/nepflow/stages/generation/supercell.py`
 
-### Required changes
+### 8.1 Preserve one authoritative supercell implementation
 
-Replace the universal isotropic cube-root repeat rule with one canonical geometry-aware planner.
+All generation paths that require target-cell construction shall continue to use `build_target_supercell()` or focused functions owned by this module.
 
-Define `target_n_atoms` as a preferred atom count rather than an undocumented minimum/maximum. Add explicit lower/upper bounds where needed.
+Do not create surface-, defect-, magnetic- or SQS-specific duplicate repeat logic unless the scientific operation genuinely requires a different construction algorithm.
 
-The planner shall consider:
+### 8.2 Improve current isotropic repeat rule
 
-- parent cell geometry;
-- preferred/allowed atom-count range;
-- maximum aspect ratio;
-- minimum periodic dimensions;
+The current implementation chooses one scalar repetition count from:
+
+[
+r approx
+left(
+rac{N_{mathrm{target}}}{N_{mathrm{base}}}
+ight)^{1/3}
+]
+
+and repeats equally along all three axes.
+
+Phase 6 should extend this to a deterministic geometry-aware choice when the family needs it.
+
+The selection should consider:
+
+- requested/acceptable atom count;
+- parent cell shape;
+- minimum cell dimensions;
+- maximum aspect ratio where applicable;
 - composition realisability;
-- family-specific requirements such as isolated-defect separation;
-- deterministic tie-breaking.
+- defect periodic-image separation;
+- magnetic commensurability where magnetic order is requested;
+- DFT computational cost.
 
-Initially, diagonal integer repeat matrices are sufficient if the search is geometry-aware and the limitation is explicit. The API/data model should permit a general integer transformation matrix later.
+A modest deterministic search over diagonal integer repeats is sufficient initially.
 
-Record:
+Do not implement a general lattice-reduction/supercell-optimisation framework unless a concrete generator requires it.
 
-- repeat/transformation matrix;
-- source and final atom count;
-- cell-vector lengths;
-- aspect ratio;
-- composition error;
-- family-specific satisfied constraints.
+### 8.3 Family-specific cell requirements
 
-### Magnetic topology
+Different derived families may impose different requirements.
 
-At this point in the workflow also implement the topology metadata required by the Magnetic Ordering Generation PDD.
+Examples:
 
-Before perturbation destroys exact symmetry, record per atom:
+- point defects require enough separation from periodic images;
+- grain boundaries may construct their own bicrystal cell;
+- surfaces require a slab/vacuum geometry;
+- AFM order requires a commensurate existing supercell;
+- liquid cells should avoid pathological anisotropy.
 
-- parent site index;
+These requirements shall be explicit scientific parameters, not hidden modifications.
+
+---
+
+## 9. Parent topology for magnetic generation
+
+AFM generation requires knowledge of the parent crystallographic topology even if later defect generation removes or replaces atoms.
+
+Topology metadata shall therefore be created when the relevant periodic supercell is constructed, before operations that destroy exact parent symmetry.
+
+For mapped atoms retain, as required by the magnetic-ordering design:
+
+- parent-site index;
 - parent crystallographic orbit;
-- integer parent-cell translation;
-- unwrapped parent fractional position;
-- topology-mapped flag.
+- parent-cell translation;
+- unwrapped parent fractional coordinate;
+- topology-mapped state;
+- supercell transformation/repeat information.
 
-Record the supercell transformation matrix and symmetry tolerance at structure level.
+The topology belongs to structural provenance.
 
-Existing mapped topology must be composed rather than overwritten if a mapped structure is repeated again.
+It is **not itself a magnetic configuration**.
 
-Add tests for non-cubic parents, anisotropic repeat choices, topology propagation, and deterministic tie-breaking.
+It must survive ordinary ASE copy/slice/repeat operations where the parent mapping remains meaningful.
 
----
+Vacancies naturally remove mapped rows.
 
-## 10. Workstream E — explicit transformation model
+Substitutions/antisites retain the parent-site mapping.
 
-### Relevant current files
-
-- `src/nepflow/stages/generation/perturbations/coordinator.py`
-- `src/nepflow/stages/generation/perturbations/models.py`
-- `src/nepflow/stages/generation/perturbations/volume.py`
-- `src/nepflow/stages/generation/perturbations/elastic.py`
-- `src/nepflow/stages/generation/perturbations/displacements.py`
-- `src/nepflow/stages/generation/perturbations/defects.py`
-- `src/nepflow/stages/generation/perturbations/liquid.py`
-- `src/nepflow/stages/generation/perturbations/provenance.py`
-
-### Required changes
-
-Introduce a common transformation contract.
-
-Each transformation shall declare:
-
-- accepted input family/domain;
-- parameter schema;
-- deterministic or stochastic behavior;
-- expected multiplicity;
-- whether it changes composition;
-- whether it changes atom count;
-- whether it changes cell;
-- admissibility assumptions;
-- provenance output.
-
-Adapt the existing implementations to this contract rather than rewriting correct scientific formulas.
-
-Replace the coordinator's implicit "run every enabled function once from the same supercell" model with explicit transformation recipes.
-
-A recipe may be one operation:
-
-```text
-seed -> vacancy
-```
-
-or an explicitly configured chain:
-
-```text
-seed -> compression -> vacancy -> rattle
-```
-
-No pairwise/higher-order combination is generated merely because several transformations are enabled.
-
-The default configuration may preserve current one-step families during migration, but the meaning must be explicit in the versioned config.
+Inserted interstitials are explicitly unmapped unless a crystallographic site was intentionally specified.
 
 ---
 
-## 11. Workstream F — complete the core structural transformations
+## 10. Volume-profile generation
 
-Normalize the currently implemented families first, then add missing PDD V1 point-defect capabilities.
+Current owner:
 
-### Existing families to preserve and harden
+`src/nepflow/stages/generation/perturbations/volume.py`
 
-- unperturbed;
-- volume profile;
-- elastic stress set;
-- rattling;
-- liquid/exploration snapshots;
-- vacancy;
-- interstitial;
-- gas interstitial;
-- vacancy + interstitial;
+The current implementation correctly:
+
+- scales volume rather than silently interpreting the configured value as a linear factor;
+- scales atomic positions with the cell;
+- records the applied volume scale;
+- leaves the input structure unchanged.
+
+Phase 6 shall preserve this implementation style.
+
+The required development is primarily **scope**, not a new algorithm.
+
+Volume profiles should usually be generated for representative equilibrium/configurational structures rather than indiscriminately for every random configuration.
+
+The stage must record the source structure and volume scale.
+
+---
+
+## 11. Elastic-strain generation
+
+Current owner:
+
+`src/nepflow/stages/generation/perturbations/elastic.py`
+
+The current implementation already has focused, documented mathematical owners for:
+
+- normal strain;
+- coupled normal strain;
+- tensor shear;
+- the complete configured elastic stress set.
+
+Phase 6 shall preserve these formulas and the existing tests unless a scientific correction is explicitly required.
+
+As with volume generation, the principal change is source applicability.
+
+Elastic sets are potentially large and should be applied to structures for which mechanical-response coverage is intentionally requested.
+
+The presence of an elastic generator does not justify creating a full elastic set for every random/SQS/segregated base.
+
+---
+
+## 12. Rattled structures
+
+Current owner:
+
+`src/nepflow/stages/generation/perturbations/displacements.py`
+
+Rattled structures remain a core NEP generation mechanism because they generate non-equilibrium local environments and informative forces around relevant structures.
+
+Phase 6 shall retain HipHive-backed MC rattling and the explicit failure behaviour.
+
+Required development includes:
+
+- source scoping;
+- deterministic independent randomness for distinct requested rattled outputs;
+- candidate validation after generation;
+- provenance sufficient to reconstruct rattle amplitude and effective random seed.
+
+A failed HipHive operation remains a failure. Gaussian displacement is not an acceptable silent substitute.
+
+---
+
+## 13. Point defects
+
+Current owner:
+
+`src/nepflow/stages/generation/perturbations/defects.py`
+
+### 13.1 Existing families
+
+The current implementation includes:
+
+- vacancies;
+- host interstitials;
+- gas interstitials;
+- vacancy/interstitial combinations;
 - gas in vacancy.
 
-### Required additions
+These implementations and the shared site-placement functions are the starting point.
 
-Implement:
+### 13.2 Required extensions
 
-- species-specific vacancy requests;
-- substitutional defects;
-- antisite defects for ordered structures;
-- configured crystallographic interstitial sites in addition to random sites;
-- explicit vacancy/interstitial cluster recipes where requested;
-- defect-defect and periodic-image minimum separation rules.
+Phase 6 should add, within the same owner:
 
-Every defect transformation shall record:
+- species-specific vacancies;
+- substitutions;
+- antisites;
+- explicitly configured crystallographic interstitial positions where appropriate;
+- improved defect-complex controls where required.
 
-- requested operation/count;
-- realised operation/count;
-- realised concentration;
-- species affected;
-- separation metrics where applicable.
+Do not create one file/class per tiny defect variant unless the existing `defects.py` becomes too large to remain readable.
 
-A failed interstitial placement must become a rejected/regeneration outcome when the requested defect was not realised. It must not silently create an accepted lower-defect or unchanged structure.
+### 13.3 Realisation must be explicit
 
-### Out of scope for Phase 6 implementation
+For every defect candidate record:
 
-Do not attempt to implement all extended-defect families now:
+- requested defect family;
+- requested defect count/concentration;
+- realised defect count/concentration;
+- affected species;
+- effective random seed where stochastic.
 
-- grain boundaries;
-- dislocations;
-- cracks;
-- arbitrary coherent/incoherent interfaces;
-- full precipitate microstructures.
+The current interstitial code may fail to place all attempted atoms and still emit the partially realised result.
 
-Instead, ensure they can be introduced later as first-class structure-family generators without abusing the point-defect transformation interface.
+Phase 6 shall make this behaviour explicit.
+
+If a requested defect state cannot be realised within the configured placement attempts, the candidate must be either:
+
+- rejected; or
+- accepted only under an explicitly configured "partial realisation" policy.
+
+The default must not silently relabel an incompletely realised defect as though the request succeeded.
+
+### 13.4 Defect separation
+
+Point-defect generation shall support explicit minimum separation from:
+
+- other defects in the same candidate where applicable;
+- periodic images where scientifically required.
+
+The supercell planner and defect generator must not independently guess contradictory separation requirements.
 
 ---
 
-## 12. Workstream G — mandatory admissibility pipeline
+## 14. Surface generation
 
-### New recommended package
+### 14.1 Ownership
+
+Surface generation is derived from a bulk parent and therefore belongs within the existing derived-generation package.
+
+Recommended initial owner:
+
+`src/nepflow/stages/generation/perturbations/surfaces.py`
+
+Do not introduce a new top-level surface stage.
+
+### 14.2 Required inputs
+
+A surface request shall define, as applicable:
+
+- parent structure;
+- Miller index;
+- slab thickness or number of layers;
+- vacuum thickness;
+- surface termination policy;
+- minimum in-plane repeat dimensions;
+- whether a symmetric slab is required;
+- allowed composition/stoichiometry changes introduced by termination.
+
+### 14.3 Output/provenance
+
+Each generated slab shall record:
+
+- parent structure identity;
+- Miller index;
+- slab thickness/layers;
+- vacuum;
+- termination identity;
+- in-plane replication;
+- PBC/cell semantics;
+- any stoichiometry change.
+
+### 14.4 Scope
+
+Surfaces shall be generated only for configured parent families/compositions.
+
+The presence of a surface generator must not create surfaces from every SQS/random/disordered structure by default.
+
+### 14.5 Failure behaviour
+
+If the requested surface cannot be constructed with the configured geometry/termination constraints, fail or omit it with explicit diagnostic provenance.
+
+Do not silently change Miller index, termination or slab thickness.
+
+---
+
+## 15. Grain-boundary generation
+
+### 15.1 Ownership
+
+Grain boundaries are also derived from crystalline parent structures.
+
+Recommended initial owner:
+
+`src/nepflow/stages/generation/perturbations/grain_boundaries.py`
+
+A subpackage is warranted only if the implementation grows into several distinct responsibilities.
+
+### 15.2 Required inputs
+
+A grain-boundary request shall identify the crystallographic relationship sufficiently to reproduce it, for example through the chosen supported parameterisation:
+
+- rotation axis;
+- misorientation angle and/or Sigma relationship;
+- grain-boundary plane;
+- cell-size/repeat constraints;
+- minimum grain thickness;
+- atom-overlap treatment tolerance.
+
+Phase 6 should support one explicit, well-tested parameterisation rather than several partially supported ones.
+
+### 15.3 Provenance
+
+Record the complete construction parameters and the parent structure identity.
+
+Any atom removal used to resolve exact overlaps shall be explicit provenance, not an undocumented cleanup.
+
+### 15.4 Scope
+
+Grain boundaries should be generated from representative crystalline parents chosen explicitly by source scope.
+
+They shall not be generated automatically for every configurational structure.
+
+---
+
+## 16. Liquid and amorphous generation
+
+Current owner:
+
+`src/nepflow/stages/generation/perturbations/liquid.py`
+
+### 16.1 Current implementation
+
+The existing implementation uses:
+
+- ASE Langevin dynamics;
+- the ASE Lennard-Jones calculator;
+- explicit seeded velocity generation;
+- configurable temperature, timestep, equilibration and snapshot spacing.
+
+This is a valid **geometry-disordering mechanism**.
+
+It is not automatically a physically faithful liquid model for arbitrary multicomponent systems.
+
+Phase 6 shall preserve that distinction in provenance and documentation.
+
+### 16.2 Required development
+
+Liquid generation should remain in the existing module.
+
+The implementation shall record:
+
+- generation method/backend;
+- fidelity/method label;
+- temperature;
+- timestep;
+- equilibration length;
+- snapshot spacing;
+- effective random seed;
+- source composition/parent.
+
+If additional liquid-generation methods are introduced later, add a small backend seam only when there are at least two genuine methods requiring substitution.
+
+Do not introduce an abstract backend in advance.
+
+### 16.3 Snapshot correlation
+
+Snapshots from one trajectory shall be spaced deliberately.
+
+The generator should not create many trivially correlated adjacent frames merely to increase candidate count.
+
+### 16.4 Future melt-quench/amorphous support
+
+Melt-quench or physically informed amorphous generation may be added through `liquid.py` or a narrowly named sibling module when implemented.
+
+The current Lennard-Jones method must never be relabelled as a physically validated melt-quench workflow.
+
+---
+
+## 17. Magnetic ordering generation
+
+### 17.1 Role in Phase 6
+
+Magnetic ordering is a derived candidate transformation.
+
+It shall not be a universal postprocessor over `generated_structures.xyz`.
+
+It shall be invoked on configured source structures through the existing generation coordinator.
+
+### 17.2 Recommended ownership
+
+Because the scientific logic is larger than one ordinary perturbation function, the generation implementation may use:
 
 ```text
-src/nepflow/stages/generation/admissibility/
-    __init__.py
-    models.py
-    structural.py
-    geometry.py
-    composition.py
-    defects.py
-    pipeline.py
-```
-
-### Required checks
-
-Every candidate must pass a central validation pipeline before entering the accepted pool.
-
-Implement at minimum:
-
-- nonzero atom count;
-- valid species;
-- finite positions/cell;
-- nonsingular periodic cell;
-- valid PBC;
-- atom-count bounds;
-- minimum pair distance under PBC;
-- optional species-pair minimum distances;
-- volume per atom;
-- mass density where configured;
-- cell-vector minimum dimensions;
-- maximum aspect ratio;
-- composition tolerance;
-- required/forbidden species;
-- defect-operation consistency;
-- defect count/concentration;
-- family-specific bounds.
-
-Checks shall return typed measured evidence rather than only bool.
-
-### Domain profiles
-
-Support separate admissibility profiles for:
-
-- core;
-- boundary;
-- exploratory.
-
-This allows deliberately compressed/high-energy structures without weakening the ordinary core-domain checks.
-
-### Rejection/regeneration
-
-Each candidate attempt terminates as:
-
-- accepted;
-- repaired and accepted;
-- rejected;
-- regeneration requested.
-
-Initial generic repair should be minimal. Do not invent geometry corrections merely to reduce rejection count.
-
-Stochastic regeneration uses a configured maximum attempt count and a deterministic retry seed.
-
-Persist every rejection reason and measured threshold evidence.
-
----
-
-## 13. Workstream H — deterministic randomness and resumable units
-
-### Current concern
-
-`PerturbationCoordinator` currently draws child seeds sequentially from coordinator RNG state. That is deterministic for one uninterrupted ordered run, but is not the right foundation for independent resumable generation units.
-
-### Required change
-
-Derive each stochastic attempt seed deterministically from:
-
-- root project seed;
-- generation run identity;
-- generation unit identity;
-- retry/attempt number.
-
-For example, hash the canonical tuple and map it to the external library's accepted integer range.
-
-Do not use Python's process-randomized `hash()`.
-
-The same unit shall therefore receive the same first-attempt seed regardless of:
-
-- worker count;
-- restart point;
-- scheduling order;
-- unrelated units being added elsewhere.
-
-All stochastic third-party APIs must receive that explicit seed/RNG.
-
----
-
-## 14. Workstream I — candidate budgeting and priorities
-
-### Required model
-
-Introduce a generation-budget planner with explicit hierarchy:
-
-- project total;
-- subsystem/composition region;
-- structure family;
-- perturbation/transformation family;
-- parent seed.
-
-Support:
-
-- fixed quotas;
-- deterministic proportional allocation;
-- configured importance-weighted allocation.
-
-Adaptive descriptor/model-based allocation is not part of this phase.
-
-### Priority classes
-
-Every requested generation family/unit may be classified:
-
-- mandatory;
-- core;
-- boundary;
-- exploratory.
-
-Mandatory coverage is attempted before discretionary budget allocation.
-
-When a global budget cannot satisfy all requested non-mandatory work, record exactly what was omitted and why.
-
-The budget system controls how many candidates are attempted. It must not impersonate Phase 7 sparse selection.
-
----
-
-## 15. Workstream J — exact deduplication and provenance merge
-
-### Current concern
-
-`deduplicate_base_structures()` handles base structures, but final perturbation outputs are not globally deduplicated before selection.
-
-### Required changes
-
-Create one canonical exact-deduplication service that operates on accepted structural candidates before magnetic expansion.
-
-For every duplicate `structure_id`:
-
-- retain one physical structure;
-- preserve every contributing generation operation/provenance path;
-- record the duplicate in the duplicate report;
-- preserve deterministic representative selection.
-
-Do not simply keep the last `Atoms.info` mapping.
-
-Add an optional symmetry-equivalent deduplication interface using an explicitly configured algorithm/tolerance. Keep it disabled unless its semantics are tested.
-
-Near-duplicate thinning must remain a separate optional policy and must never be described as exact deduplication.
-
-Phase 7 selection remains responsible for information-aware sparse sampling.
-
----
-
-## 16. Workstream K — coverage accounting and reports
-
-### Required artifacts
-
-A completed generation run shall publish, atomically and consistently:
-
-```text
-structures/generated/generated_structures.xyz
-structures/generated/generation_manifest.json
-structures/generated/generation_summary.json
-structures/generated/generation_rejections.json
-structures/generated/generation_duplicates.json
-structures/generated/generation_coverage.json
-reports/generation_report.md
-```
-
-Exact filenames may be adjusted to the repository's artifact conventions, but there shall be one canonical owner for each report.
-
-### Generation manifest
-
-Version `GenerationManifest` and make the final candidate artifact—not only the seed artifact—the primary output contract.
-
-Record at minimum:
-
-- generation_run_id;
-- input fingerprint;
-- final candidate artifact identity/hash;
-- ordered candidate IDs;
-- underlying structure IDs;
-- seed/source identities;
-- counts attempted/accepted/rejected/repaired/deduplicated;
-- configuration/software fingerprints;
-- report artifact identities;
-- magnetic-expansion status.
-
-### Coverage metrics
-
-Implement quantitative coverage for:
-
-- subsystem/order;
-- requested vs realised compositions;
-- composition error;
-- seed/prototype/family;
-- perturbation/transformation;
-- atom-count distribution;
-- volume per atom/density;
-- minimum pair distance;
-- strain amplitude;
-- defect concentration;
-- thermal temperature/fidelity;
-- parent-seed coverage.
-
-Identify requested regions/families with zero accepted structures.
-
-A mandatory coverage gap must prevent the stage from reporting unconditional success.
-
----
-
-## 17. Workstream L — fine-grained restart and bounded-memory persistence
-
-### Current concern
-
-Generation currently resumes at the seed-artifact level only.
-
-### Required changes
-
-Persist status at generation-unit granularity.
-
-Recommended runtime layout:
-
-```text
-structures/generated/units/<generation_unit_id>.xyz
-```
-
-Each completed unit artifact is:
-
-- atomically written;
-- content-hashed;
-- registered in StateStore;
-- associated with its unit status and attempt history.
-
-On restart:
-
-1. resolve the generation run through StateStore;
-2. verify completed unit artifacts by identity/hash;
-3. skip verified completed units;
-4. retry only incomplete/retryable units;
-5. preserve prior rejection history;
-6. finalize the candidate pool in deterministic unit order.
-
-Do not adopt unregistered filesystem shards as authoritative state.
-
-### Streaming fix
-
-Refactor `PerturbationCoordinator._execute()` or its replacement so results can be consumed in deterministic order without holding every task result in memory.
-
-Remove the current pattern in `_flush()` that reads and rewrites the entire candidate file for each batch.
-
-Final assembly should stream verified unit artifacts to a temporary final artifact and publish it once by atomic rename.
-
-Worker count must not alter final candidate ordering.
-
----
-
-## 18. Workstream M — magnetic ordering expansion
-
-This workstream implements the generation-side portion of `.docs/MAGNETIC_ORDERING_GENERATION_PDD.md` after the structural candidate pool is admissible and exactly deduplicated.
-
-### New recommended modules
-
-```text
-src/nepflow/domain/magnetism.py
-src/nepflow/stages/generation/magnetism/
+src/nepflow/stages/generation/perturbations/magnetism/
     __init__.py
     models.py
     topology.py
     orderings.py
-    expander.py
-    provenance.py
+    generator.py
 ```
 
-### Configuration
+Cross-stage magnetic data required later by DFT may live in `src/nepflow/domain/magnetism.py` if and when it is consumed outside generation.
 
-Add a first-class typed `MagnetismConfig` rather than mixing magnetic settings into unrelated structural perturbation fields.
+This placement preserves the current stage architecture: the coordinator invokes a focused derived-generation implementation.
 
-Initial supported states:
+### 17.3 Initial scope
+
+Initial magnetic generation supports:
 
 - non-magnetic;
 - ferromagnetic;
 - collinear antiferromagnetic.
 
-Use explicitly configured named moment sets. Do not infer oxidation/high-spin/low-spin states.
+The mathematical ordering rules remain defined by `.docs/MAGNETIC_ORDERING_GENERATION_PDD.md`.
 
-### Scientific implementation
+Where that document describes magnetism as a universal final expansion over all generated structures, **this Phase 6 document supersedes that integration strategy**.
 
-Use the topology attached during Workstream D.
+### 17.4 Initial source policy
 
-For mapped magnetic atom (i=(\alpha,\mathbf n)), generate:
+The initial implementation shall support magnetic generation from:
 
-[
-\mathbf m_i
-=
-\chi_i\mu_i\eta_{g(\alpha)}
-\tau_i(\mathbf q)\hat{\mathbf z}
-]
+- pristine/unperturbed crystalline candidates;
+- vacancy structures, when enabled;
+- interstitial structures, when enabled and topology permits;
+- substitution structures, when enabled;
+- antisite structures, when enabled;
+- explicitly selected defect complexes.
 
-with
+It does not need to generate magnetic variants for routine:
 
-[
-\tau_i(\mathbf q)
-=
-\operatorname{sign}
-\left[
-\cos(2\pi\mathbf q\cdot\mathbf u_i)
-\right].
-]
+- volume profiles;
+- elastic stress sets;
+- rattled structures;
+- liquid structures;
+- surfaces;
+- grain boundaries.
 
-Initial propagation-vector components are:
+Those couplings may be added later through explicit applicability policy.
 
-[
-q_j\in\{0,1/2\}.
-]
+### 17.5 Defect interaction
 
-Require existing-supercell commensurability:
+Vacancies and substitutions preserve inherited parent topology for surviving/replaced lattice sites.
 
-[
-\mathbf S^{\mathsf T}\mathbf q\in\mathbb Z^3.
-]
+Interstitials may be:
 
-Do not enlarge the structural supercell during magnetic generation.
+- crystallographically mapped, if inserted at an explicitly known site; or
+- unmapped, for general stochastic positions.
 
-Enumerate orbit phases deterministically, canonicalize global spin inversion, remove duplicate magnetic states, and enforce the explicit per-structure magnetic budget.
+AFM generation must not guess an inherited sublattice for an unmapped magnetic interstitial.
 
-Inserted magnetic atoms without topology must follow the configured unsupported/unmapped policy; never guess an AFM sign.
+### 17.6 No magnetic Cartesian product
 
-### Identity
+If a base produces ten vacancies and the magnetic generator supports ten magnetic states, the system shall generate the product only when the configured magnetic-defect policy explicitly requests it.
 
-Add:
-
-- `magnetic_state_id`;
-- `candidate_id`.
-
-NM/FM/AFM variants of one geometry must retain the same `structure_id` and receive distinct candidate IDs.
-
-Persist per-atom magnetic moment vectors and constraint masks in extxyz and verify round-trip integrity.
-
-### DFT boundary
-
-Do not implement constrained VASP here.
-
-Phase 6 only guarantees that the selected candidate later contains all scientific information needed by the DFT adapter:
-
-- candidate identity;
-- requested local moment vectors;
-- constraint mask;
-- magnetic provenance.
+A count/limit for magnetic expansion of defect outputs may be configured independently from the number of defect structures.
 
 ---
 
-## 19. Workstream N — generation/selection boundary
+## 18. Magnetic candidate identity
 
-The generation phase must leave a coherent boundary for Phase 7.
+### 18.1 Preserve structure identity
 
-### Relevant current files
+The existing `StructureIdentity` remains the identity of physical species/cell/PBC/positions.
 
-- `src/nepflow/stages/selection/persistence.py`
-- `src/nepflow/stages/selection/artifacts.py`
-- `src/nepflow/stages/selection/stage.py`
+Magnetic state shall not be inserted into `structure-v1`.
 
-### Required compatibility changes
+### 18.2 Candidate identity
 
-Version the selection input/artifact identity contract so candidate uniqueness is based on `candidate_id`, not `structure_id`.
+Magnetically distinct states of the same geometry need a selection/DFT acquisition identity distinct from `structure_id`.
 
-Selection records must preserve both:
+Phase 6 shall introduce one authoritative candidate identity in `domain/identities.py`.
 
-- candidate_id;
-- underlying structure_id.
+For non-magnetic ordinary structures, candidate identity may deliberately reduce to structure identity under the defined schema.
 
-Existing non-magnetic projects remain representable.
+For an explicit magnetic state, candidate identity includes:
 
-Do not implement the Phase 7 entropy algorithm here.
+- structure identity;
+- magnetic-state identity.
 
-Until a selected representation can distinguish magnetic states, the selection stage must fail explicitly when asked to run a structural-only selector over a pool containing multiple magnetic states of the same geometry. It must not silently choose among descriptor-identical FM/AFM candidates.
+The exact schema shall be versioned.
 
-Phase 7 then implements the magnetic-aware information-entropy representation and acquisition algorithm.
+### 18.3 Selection boundary
 
----
+The current selection persistence explicitly assumes candidate `structure_id` values are unique.
 
-## 20. Workstream O — GenerationStage orchestration cleanup
+Before magnetic candidates are enabled in production, the generation-selection boundary must use candidate identity while preserving underlying structure identity.
 
-### Relevant current files
+This is a compatibility change to the existing boundary, not a replacement selection architecture.
 
-- `src/nepflow/stages/generation/stage.py`
-- `src/nepflow/stages/generation/models.py`
-- `src/nepflow/application/composition.py`
-
-### Target responsibility
-
-`GenerationStage` remains a thin injected orchestrator.
-
-It should coordinate services conceptually equivalent to:
-
-- composition planner;
-- seed sources/configurational generators;
-- unit planner/budget allocator;
-- transformation executor;
-- admissibility pipeline;
-- deduplicator;
-- magnetic expander;
-- run finalizer/reporter;
-- StateStore.
-
-It shall not contain the scientific implementation of these services.
-
-`application/composition.py` constructs configured implementations and injects them.
-
-Break up any method that begins to own multiple scientific phases. Do not create a new monolithic "GenerationEngine" that merely moves the current orchestration into another oversized class.
+Phase 7 remains responsible for magnetic-aware information representation.
 
 ---
 
-## 21. Test plan
+## 19. Candidate validation
 
-Tests shall mirror the new ownership boundaries.
+### 19.1 Ownership
 
-### Unit tests
+Candidate validation belongs in the existing generation-stage validation responsibility.
 
-Add or expand:
+Start by extending:
 
-```text
-tests/unit/generation/test_composition.py
-tests/unit/generation/test_supercell.py
-tests/unit/generation/test_seed_sources.py
-tests/unit/generation/test_transformations.py
-tests/unit/generation/test_admissibility.py
-tests/unit/generation/test_budgeting.py
-tests/unit/generation/test_deduplication.py
-tests/unit/generation/test_coverage.py
-tests/unit/generation/test_restart_units.py
-tests/unit/generation/magnetism/
-tests/unit/domain/test_identities.py
-tests/unit/state/test_migrations.py
-tests/unit/state/test_store.py
-```
+`src/nepflow/stages/generation/validation.py`
 
-### Required scientific cases
+or one clearly named sibling module if scientific candidate checks make that file too broad.
 
-Cover at minimum:
+Do not create a multi-module validation framework before it is needed.
 
-- arbitrary-order simplex generation;
-- explicit composition requests/exclusions;
-- integer realisability and rejection;
-- geometry-aware supercell choice;
-- topology mapping and propagation;
-- requested/realised defect counts;
-- failed interstitial placement;
-- core vs boundary admissibility;
-- minimum-image distance checks in triclinic cells;
-- exact deduplication with provenance merge;
-- deterministic unit seed derivation;
-- restart from partial unit completion;
-- worker-count invariance;
-- coverage-gap reporting;
-- generation-run fingerprint stability;
-- FM generation;
-- AFM commensurability;
-- multi-orbit AFM;
-- magnetic global-inversion deduplication;
-- candidate identity;
-- extxyz magnetic/topology round trip.
+### 19.2 Core checks
 
-### Integration tests
+Before a generated candidate enters the final pool, check as applicable:
 
-Expand `tests/integration/generation/` to exercise:
+- nonzero atom count;
+- finite cell;
+- finite positions;
+- valid PBC;
+- nonsingular periodic cell;
+- supported species;
+- minimum pair distance;
+- sensible volume per atom;
+- family-specific cell dimensions/aspect ratio;
+- requested/realised composition;
+- requested/realised defect count;
+- family-specific construction requirements.
 
-1. a complete non-magnetic run through final manifest/report creation;
-2. restart after several persisted generation units;
-3. identical candidate set for serial and multi-worker execution;
-4. duplicate provenance merging across two generation paths;
-5. a magnetic-enabled run producing repeated structure IDs but unique candidate IDs;
-6. generation-to-selection boundary validation.
+### 19.3 Family-specific validation
 
-All existing generation regression tests remain green unless a versioned public contract is intentionally replaced.
+A single universal set of geometry thresholds is inappropriate.
+
+For example:
+
+- compressed volume states may intentionally have shorter separations;
+- surfaces contain vacuum and therefore unusual volume-per-atom values;
+- grain boundaries contain locally distorted coordination;
+- liquid snapshots are intentionally disordered.
+
+Shared checks shall therefore be supplemented by family-specific checks.
+
+### 19.4 Failure policy
+
+Validation failures are explicit.
+
+A scientifically different "repair" shall not occur silently.
+
+If a stochastic family supports retry, the retry count and random seed must be explicit and bounded.
 
 ---
 
-## 22. Implementation order
+## 20. Exact deduplication
 
-Implement Phase 6 in the following dependency order:
+### 20.1 Existing state
 
-1. regression tests for the new run/unit/candidate contracts;
-2. generation identities/domain records and StateStore migration;
-3. typed configuration/domain specification;
-4. composition strategies and integer-realisability accounting;
-5. geometry-aware supercell builder and topology provenance;
-6. seed-source separation;
-7. explicit transformation contract and migration of current transformations;
-8. centralized admissibility/rejection/regeneration pipeline;
-9. missing core point-defect transformations;
-10. deterministic generation-unit seeds;
-11. generation budgets and priority classes;
-12. final-candidate exact deduplication/provenance merge;
-13. coverage/report/reproducibility artifacts;
-14. unit-granular restart and streaming finalization;
-15. magnetic state/candidate identity;
-16. FM/AFM expansion;
-17. minimal selection-boundary candidate-ID migration and magnetic guard;
-18. full regression/static validation.
+`deduplicate_base_structures()` currently removes duplicate bases before perturbation and merges source provenance.
 
-Do not implement magnetic expansion before supercell topology, final structural deduplication, and candidate identity foundations exist.
+The final generated candidate artifact is not equivalently deduplicated.
 
----
+### 20.2 Required Phase 6 behaviour
 
-## 23. Recommended issue decomposition
+Phase 6 shall apply exact deduplication to generated candidates before publication/selection.
 
-The phase should be split into focused GitHub issues rather than implemented as one large Codex task.
+For ordinary structural candidates, deduplicate by authoritative structure identity.
 
-A practical issue sequence is:
+For magnetic candidates, deduplicate by candidate identity.
 
-1. Generation run/unit/candidate identities and StateStore migration.
-2. Composition-domain strategies and integer realisability.
-3. Geometry-aware supercell planning.
-4. Parent topology provenance for magnetic ordering.
-5. Seed-source abstraction and user/prior-project seeds.
-6. Transformation protocol and explicit recipes.
-7. Central physical-admissibility pipeline.
-8. Point-defect completeness and bounded regeneration.
-9. Deterministic unit RNG and restart-safe seeds.
-10. Generation budgets and domain priorities.
-11. Final candidate deduplication with provenance merge.
-12. Generation coverage, reports, and run fingerprint.
-13. Fine-grained restart and bounded-memory artifact finalization.
-14. Magnetic domain/candidate identities.
-15. FM/AFM ordering generation.
-16. Generation-selection candidate-ID boundary.
-17. Phase 6 integration/regression closure.
+When two generation paths produce the same candidate:
 
-Each issue should change one stable contract and include focused tests. Avoid mixing schema migration, scientific algorithms, and large orchestration rewrites in one issue.
+- retain one physical candidate;
+- retain all relevant provenance paths;
+- do not turn accidental duplication into implicit training weight.
+
+### 20.3 Structure identity caution
+
+The current `structure-v1` canonicalization groups atoms by element but preserves original order within each element.
+
+Changing that cross-stage identity definition is a separate versioned scientific-data migration.
+
+Phase 6 must not casually change the meaning of `structure-v1` as part of generator development.
+
+If atom-order invariance is required, it shall be designed as a new identity schema with migration/testing across generation, selection and DFT.
 
 ---
 
-## 24. Static validation required for every issue
+## 21. Provenance
 
-Run focused tests first, then the repository gates.
+### 21.1 Existing mechanism
+
+`annotate_generation_provenance()` already records:
+
+- parent structure identity;
+- generator/family;
+- requested composition;
+- realised composition;
+- source database identity;
+- crystal structure;
+- perturbation family;
+- perturbation parameters;
+- random seed;
+- operation ID.
+
+It also writes a serialisable provenance representation into `Atoms.info`.
+
+This is the canonical mechanism to extend.
+
+### 21.2 Required completion
+
+`PerturbationTaskResult` already returns `provenance_records`.
+
+Phase 6 shall ensure generated-candidate provenance is not discarded at coordinator publication.
+
+The final accepted candidates shall be represented in authoritative state with their generation provenance, using the existing `GeneratedStructureRecord`/`StructureProvenance` contracts or a versioned extension where magnetic candidate identity requires it.
+
+Do not create a parallel provenance graph implementation.
+
+### 21.3 New-family provenance
+
+New families must record their scientific parameters.
+
+Examples:
+
+Surface:
+- Miller index;
+- termination;
+- thickness;
+- vacuum.
+
+Grain boundary:
+- rotation/misorientation definition;
+- boundary plane;
+- repeat/grain dimensions;
+- overlap-removal tolerance.
+
+Liquid:
+- method;
+- temperature;
+- trajectory parameters;
+- seed.
+
+Magnetic:
+- moment set;
+- ordering;
+- propagation vector;
+- orbit phases;
+- constraint mask.
+
+---
+
+## 22. Randomness and reproducibility
+
+The current code already follows the project rule that stochastic scientific operations receive explicit RNG/seed state.
+
+Phase 6 shall continue this convention.
+
+The required strengthening is that distinct requested stochastic outputs receive deterministic, reproducible effective seeds.
+
+A generated structure should not depend on process scheduling.
+
+Serial and parallel generation must remain scientifically identical, as the existing integration/unit tests already require.
+
+The implementation may derive child seeds from the project/root seed and stable input indices/identities, but must not introduce Python's process-randomized `hash()`.
+
+Do not create a separate generation-run identity system merely to generate seeds.
+
+---
+
+## 23. Persistence and memory behaviour
+
+### 23.1 Canonical artifact
+
+The existing canonical final candidate path remains:
+
+`structures/generated/generated_structures.xyz`
+
+unless a future versioned artifact contract explicitly changes it.
+
+Phase 6 shall not invent a directory of per-generation-unit authoritative artifacts as the default architecture.
+
+### 23.2 Current I/O defect
+
+`PerturbationCoordinator._flush()` currently:
+
+1. reads the entire existing output file;
+2. appends newly rendered bytes in memory;
+3. atomically rewrites the complete file.
+
+Repeated batches therefore cause increasingly expensive whole-file rewriting.
+
+Phase 6 shall replace this with bounded-memory publication that preserves deterministic ordering and atomic final publication.
+
+Acceptable patterns include:
+
+- write ordered batches to one temporary file, then atomically promote it;
+- write temporary worker/batch shards and assemble them once in deterministic order.
+
+The final artifact remains one canonical extxyz.
+
+### 23.3 Coordinator result
+
+The coordinator may return a small typed result if needed to expose:
+
+- candidate path;
+- counts;
+- provenance records/summary;
+- rejected counts.
+
+Any such result should replace the path-plus-`get_summary()` split only if it makes the current API materially clearer.
+
+Do not add wrappers solely for naming symmetry.
+
+---
+
+## 24. Generation manifest and reporting
+
+The current `GenerationManifest` primarily describes base structures with an optional candidate artifact.
+
+Phase 6 shall make the final generated candidate artifact a first-class part of the manifest.
+
+The manifest should record enough information to verify and reproduce the stage without creating many overlapping authoritative files.
 
 At minimum:
 
-```bash
-python -m pytest tests/unit/generation
-python -m pytest tests/integration/generation
-ruff format --check src tests
-ruff check src tests
-pyright
-```
+- schema version;
+- seed artifact identity where present;
+- candidate artifact identity;
+- accepted candidate count;
+- candidate/structure identities as appropriate;
+- counts by configurational type;
+- counts by derived family;
+- rejection counts/reasons;
+- duplicate count;
+- relevant configuration fingerprint or equivalent reproducibility evidence.
 
-For changes touching shared identities/state/config/selection boundaries also run:
+A human-readable generation report may be added under `reports/`.
 
-```bash
-python -m pytest tests/unit/domain tests/unit/state tests/unit/config tests/unit/selection
-```
-
-Before closing Phase 6 run:
-
-```bash
-python -m pytest
-ruff format --check .
-ruff check .
-pyright
-```
-
-No test may be skipped merely because the new generation path is difficult to reproduce. Live external-service tests remain explicitly marked external under the existing pytest policy.
+Do not create several independent JSON reports containing overlapping versions of the same authoritative facts unless a concrete consumer requires them.
 
 ---
 
-## 25. Phase exit criteria
+## 25. Generation coverage
 
-Phase 6 is complete only when all of the following are true:
+Phase 7 handles descriptor/information-space selection.
 
-- the final candidate dataset, not only seeds, has an authoritative versioned manifest;
-- every accepted candidate has stable structure and candidate identity;
-- every accepted candidate has complete machine-readable provenance;
-- all duplicate generation paths are retained without retaining duplicate physical candidates;
-- all configured mandatory candidates pass explicit admissibility checks;
-- rejected/regenerated attempts have persisted reasons/evidence;
-- requested vs realised composition and defect states are recorded;
-- composition tolerance is enforced;
-- supercell semantics are explicit and geometry-aware;
-- magnetic parent topology survives supported transformations;
-- stochastic outputs are stable across restart and worker count;
-- generation can resume at generation-unit granularity;
-- final artifact assembly is bounded-memory and does not repeatedly rewrite the entire accumulated file;
-- quotas/budgets have explicit scope;
-- coverage metrics and gaps are reported;
-- the generation run has a reproducibility fingerprint;
-- current non-magnetic scientific behavior remains available;
-- FM and commensurate collinear AFM candidates can be generated when enabled;
-- magnetic variants share structure identity but have distinct candidate identities;
-- structural-only selection cannot silently consume an indistinguishable magnetic candidate pool;
-- no enabled generator or validator silently falls back to another scientific behavior;
-- the complete test suite, Ruff, and Pyright pass.
+Phase 6 still needs basic generation-domain coverage reporting so missing requested families are visible.
+
+Useful generation coverage includes:
+
+- compositions requested versus realised;
+- number of bases per configurational type;
+- number of candidates per derived family;
+- source-scope counts;
+- volume/strain ranges actually produced;
+- rattle amplitude distribution;
+- defect concentration/count distribution;
+- surface Miller indices/terminations;
+- grain-boundary types;
+- liquid temperatures/methods;
+- magnetic ordering/moment-set counts;
+- zero-output requested families.
+
+These metrics describe what generation produced.
+
+They shall not calculate NEP descriptors or make information-entropy selection decisions.
 
 ---
 
-## 26. Explicitly deferred work
+## 26. Source applicability configuration
 
-Phase 6 shall leave clean extension points but does not need to implement:
+Phase 6 needs a public way to say which bases feed which derived families.
 
-- grain-boundary generation;
-- dislocation generation;
-- crack/void microstructures beyond simple point/cluster defects;
-- general interface builders;
-- fully physical melt-quench workflows driven by a mature potential;
-- active-learning policy;
-- descriptor-driven adaptive generation;
-- DFT-energy-based candidate pruning;
-- ferrimagnetic/non-collinear/spin-spiral/DLM magnetic generation;
-- constrained magnetic VASP rendering/execution;
-- magnetic MLIP training.
+This should be added to the existing configuration model, not implemented as a second workflow language.
 
-Those features must reuse the same domain, transformation, admissibility, identity, provenance, restart, and reporting contracts rather than creating parallel low-quality paths.
+The exact INI representation may be chosen during implementation, but it shall satisfy:
+
+- typed parsing;
+- explicit values;
+- deterministic defaults;
+- validation against supported configurational/source types;
+- no hidden application rules in scientific functions.
+
+For example, a family may be configured to act on a set of `configurational_type` values or on all eligible bases.
+
+The existing `configurational_type` and `perturbation_type` vocabulary should be reused rather than introducing synonymous metadata.
+
+If the public configuration semantics change materially, bump the config schema and migrate explicitly.
 
 ---
 
-## 27. Final design rule
+## 27. New configuration fields
 
-Phase 6 should end with a generation stage that can answer, with persisted evidence:
+New features should follow the present pattern:
 
-> What candidate domain did the user ask for, exactly what did NEPFlow attempt, which physically admissible unique candidates were produced, which requests failed or were rejected, how complete is the resulting coverage, and can every candidate be reproduced from its stored inputs and provenance?
+1. add immutable fields to `GenerationConfig` or a justified new cross-stage config model;
+2. parse them in focused helpers in `section_parsers.py`;
+3. validate them in `config/validation.py` and generation validation where appropriate;
+4. render documented defaults in `config/creation.py`;
+5. pass validated values through `application/composition.py`;
+6. construct typed `PerturbationSettings`/`PerturbationCounts` or the relevant injected service.
 
-Only after that contract is reliable should Phase 7 optimize which of those candidates receive DFT labels.
+Do not have `surfaces.py`, `grain_boundaries.py`, `liquid.py` or magnetic code read the project config directly.
+
+---
+
+## 28. State and restart
+
+Phase 6 shall use the StateStore and workflow reconciliation already established in Phases 1–5.
+
+Do not create:
+
+- a second generation-run table;
+- another stage-status mechanism;
+- filesystem-only authoritative restart markers.
+
+The current generation stage already reconciles persisted seed artifacts through StateStore events and artifact hashes.
+
+More granular restart may be added later if expensive surface, grain-boundary or liquid generation proves to need it.
+
+It is not a prerequisite for extending generation scientific capability.
+
+The immediate requirement is deterministic rerun: given the same authoritative inputs/configuration, the generation stage must reproduce the same candidates.
+
+---
+
+## 29. Relationship to Phase 7 selection
+
+The final generation output is the candidate population consumed by Phase 7.
+
+Phase 6 must therefore guarantee:
+
+- stable candidate ordering;
+- stable structure/candidate identities;
+- complete provenance;
+- no accidental exact duplicates;
+- magnetic variants are distinguishable by candidate identity;
+- family metadata survives extxyz round trips.
+
+Phase 6 does **not** decide which candidates receive DFT.
+
+It must not add descriptor-based thinning or foundation-model-based FPS simply to reduce the generated pool.
+
+Phase 7 owns information-aware sparse acquisition.
+
+---
+
+## 30. Relationship to ordinary NEP and magnetic MLIPs
+
+Ordinary NEP consumes structure/chemistry, not an explicit local-spin coordinate.
+
+Therefore the ordinary NEP path remains structurally defined.
+
+Magnetic-state generation is enabled only when the downstream potential/data contract can meaningfully consume the explicit magnetic state.
+
+The generation stage may still support magnetic DFT preparation as a separate capability, but it must not produce multiple same-geometry/different-spin training labels for a structure-only model and pretend the model can distinguish them.
+
+The target MLIP capability must therefore gate explicit magnetic candidate generation.
+
+This capability check belongs at configuration/application composition boundaries, not inside the AFM mathematical functions.
+
+---
+
+## 31. Surface, grain-boundary and liquid importance for NEP
+
+Phase 6 shall treat these as substantive scientific generation families, not future architecture placeholders.
+
+For a local-descriptor potential:
+
+- surfaces introduce under-coordinated environments;
+- grain boundaries introduce distorted coordination and local chemistry unavailable in perfect bulk;
+- point defects introduce local coordination/composition changes;
+- liquid/amorphous structures populate highly disordered local environments;
+- rattling fills the neighbourhood around structurally relevant states;
+- elastic/volume configurations constrain mechanical and equation-of-state response.
+
+The candidate pool should therefore achieve **family diversity** rather than maximizing counts within one easy-to-generate bulk perturbation family.
+
+---
+
+## 32. Explicitly deferred generation capabilities
+
+The architecture shall permit later addition of further focused derived-generation modules, for example:
+
+- stacking faults;
+- free surfaces with adsorbates;
+- coherent/incoherent interfaces;
+- dislocations;
+- voids;
+- cracks;
+- precipitate/matrix interfaces;
+- irradiation/cascade-derived structures.
+
+Phase 6 does not need to implement all of them.
+
+When added, each should follow the same established pattern:
+
+- focused scientific owner;
+- typed config/settings;
+- application composition wiring;
+- explicit source scope;
+- provenance;
+- validation;
+- deterministic tests.
+
+No generic future-proof framework shall be added solely in anticipation of these features.
+
+---
+
+## 33. Testing requirements
+
+Tests shall continue to mirror current source ownership.
+
+### 33.1 Existing tests remain authoritative
+
+Current generation tests covering:
+
+- configurational quota semantics;
+- SQS backend failure/no fallback;
+- Materials Project behaviour;
+- generation-stage injection;
+- physical base deduplication;
+- serial/parallel perturbation equivalence;
+- pickleable task/results;
+- provenance;
+- elastic mathematics;
+- perturbation model typing;
+- reproducibility;
+
+must remain green unless a deliberately versioned scientific contract changes.
+
+### 33.2 New focused tests
+
+Add tests beside the existing generation test suite for:
+
+- source applicability/scoping;
+- no unintended family chaining;
+- composition realisation tolerance;
+- improved supercell choice;
+- candidate validation;
+- final exact deduplication/provenance merge;
+- deterministic independent stochastic outputs;
+- requested versus realised defect counts;
+- surface construction/provenance;
+- grain-boundary construction/provenance;
+- liquid fidelity/method provenance;
+- magnetic topology;
+- FM ordering;
+- AFM commensurability and signs;
+- optional magnetic expansion after vacancy/interstitial/substitution/antisite;
+- candidate identity;
+- extxyz round-trip of new metadata;
+- deterministic final output under different worker counts;
+- bounded-memory final artifact publication.
+
+### 33.3 External dependencies
+
+Tests requiring live Materials Project, external HPC, VASP or other external systems remain explicitly separated from ordinary CI.
+
+Scientific construction logic should be unit-testable with local structures and injected/fake backends where appropriate.
+
+---
+
+## 34. Implementation guidance by current owner
+
+This section is normative about ownership but not a GitHub-issue decomposition.
+
+### `stages/generation/stage.py`
+
+Extend only as required to:
+
+- pass the already-built base set into the coordinator;
+- persist the improved final manifest/result;
+- ensure final candidate provenance/state is authoritative.
+
+Do not add surface/GB/magnetic algorithms here.
+
+### `stages/generation/generators/`
+
+Use for:
+
+- existing base/configurational generators;
+- future genuine base/prototype generators.
+
+Do not move ordinary perturbations here.
+
+### `stages/generation/perturbations/models.py`
+
+Extend typed settings/counts and any narrow applicability record required by coordinator orchestration.
+
+Avoid raw dictionaries for stable configuration.
+
+### `stages/generation/perturbations/coordinator.py`
+
+Extend explicit orchestration to:
+
+- respect family source scopes;
+- call new derived families;
+- perform explicitly supported magnetic-after-defect chaining;
+- preserve deterministic ordering;
+- publish candidates efficiently;
+- carry candidate provenance to the stage/state boundary.
+
+Keep it a coordinator rather than a scientific-algorithm owner.
+
+### `stages/generation/perturbations/defects.py`
+
+Extend existing point-defect science.
+
+### `stages/generation/perturbations/liquid.py`
+
+Improve liquid/amorphous generation and fidelity metadata in place.
+
+### `stages/generation/perturbations/surfaces.py`
+
+New focused owner for surface/slab construction.
+
+### `stages/generation/perturbations/grain_boundaries.py`
+
+New focused owner for supported grain-boundary construction.
+
+### `stages/generation/perturbations/magnetism/`
+
+New focused submodule for the magnetic-ordering mathematics and generator if the implementation is too substantial for one file.
+
+### `stages/generation/supercell.py`
+
+Own:
+
+- improved target repeat choice;
+- topology metadata needed by AFM;
+- one authoritative repeat/supercell implementation.
+
+### `stages/generation/provenance.py` and `perturbations/provenance.py`
+
+Extend canonical provenance; do not duplicate it in new generators.
+
+### `config/*`
+
+Extend the existing typed configuration pipeline.
+
+### `application/composition.py`
+
+Construct/inject any new implementation/backend dependencies.
+
+---
+
+## 35. Phase 6 completion criteria
+
+Phase 6 is complete when the generation stage, within the existing dev-branch architecture:
+
+1. retains the current `GenerationStage`, generator protocol, perturbation coordinator and focused-module structure;
+2. can scope each derived family to explicitly configured base/configurational sources;
+3. no longer implies that enabling a family applies it blindly to every base unless explicitly configured;
+4. supports the existing volume, elastic, rattle, liquid and point-defect families with complete provenance and candidate validation;
+5. supports missing core point defects required by the Structure Generation PDD, including substitutions/antisites as implemented;
+6. provides a production-supported surface generator;
+7. provides a production-supported grain-boundary generator;
+8. retains or improves liquid/disordered generation while clearly recording its method/fidelity;
+9. preserves parent topology required by magnetic AFM generation;
+10. provides FM/AFM magnetic generation as a derived submodule when the target MLIP capability permits it;
+11. allows magnetic generation to be explicitly applied after selected vacancy/interstitial/substitution/antisite outputs;
+12. does not automatically create magnetic versions of ordinary strain/rattle/liquid candidates;
+13. validates generated candidates before final publication;
+14. deduplicates final candidates using the appropriate authoritative identity while preserving provenance;
+15. preserves all accepted candidate provenance into authoritative state;
+16. publishes `generated_structures.xyz` without repeated whole-file rewrites;
+17. produces a final generation manifest/summary sufficient to audit what was requested and generated;
+18. produces deterministic serial/parallel results for stochastic families;
+19. preserves existing no-fallback behaviour;
+20. passes the repository's Ruff, Pyright and pytest gates.
+
+---
+
+## 36. Design rule for all Phase 6 additions
+
+Before adding a new abstraction or package, answer:
+
+1. Does `ConfigurationalGenerator` already own this?
+2. Does the existing derived-generation/`perturbations` pattern already own this?
+3. Does `supercell.py`, provenance, identity, StateStore or application composition already own the shared concern?
+4. Can the feature be added as a focused module/function plus typed settings within those boundaries?
+
+Only introduce a new abstraction when the existing owner cannot represent the feature without violating a responsibility boundary.
+
+The Phase 6 goal is **scientific extension of the generation stage**, not another architectural migration.
