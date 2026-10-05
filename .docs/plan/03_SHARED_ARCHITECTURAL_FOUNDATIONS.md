@@ -1,6 +1,6 @@
 # Phase 3 Implementation Plan — Shared Architectural Foundations
 
-**Workflow position:** 3 of 5  
+**Workflow position:** 3 of 7  
 **Required predecessor:** Phase 2 — Correctness Blockers  
 **Required successor:** Phase 4 — Full Restructuring  
 **Governing documents:** `.docs/MASTER_PDD.md`, `.docs/CODEBASE_ARCHITECTURE_AND_STYLE_PDD.md`  
