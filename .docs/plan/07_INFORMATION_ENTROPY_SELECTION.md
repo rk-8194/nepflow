@@ -1,8 +1,8 @@
 # Phase 7 Product Design and Implementation Plan — Information-Entropy Selection
 
 **Workflow position:** 7 of 7  
-**Required predecessor:** Phase 7 — Generation Stage  
-**Governing documents:** `.docs/MASTER_PDD.md`, `.docs/CODEBASE_ARCHITECTURE_AND_STYLE_PDD.md`, `.docs/SELECTION_PDD.md`  
+**Required predecessor:** Phase 6 — Generation Stage  
+**Governing documents:** `.docs/MASTER_PDD.md`, `.docs/CODEBASE_ARCHITECTURE_AND_STYLE_PDD.md`, `.docs/STRUCTURE_GENERATION_PDD.md`, `.docs/MAGNETIC_ORDERING_GENERATION_PDD.md`, `.docs/SELECTION_PDD.md`, `.docs/plan/06_GENERATION_STAGE.md`  
 **Primary scope:** Add information-entropy selection as a new first-class training-selection algorithm without removing or changing FPS as an available selection algorithm.  
 **Scientific constraint:** The new selector must be data-driven, whole-pool, reproducible, model-independent by default, and must not introduce arbitrary provenance quotas, family weighting, or DFT-cost weighting.
 
@@ -10,16 +10,16 @@
 
 ## 1. Objective
 
-Implement a second selection algorithm for NEPFlow that selects complete atomic structures by maximising the information retained from the full generated candidate pool.
+Implement a second selection algorithm for NEPFlow that selects complete generated candidates—each consisting of a structural geometry and, where enabled, a magnetic state—by maximising the information retained from the full generated candidate pool.
 
 The new algorithm shall:
 
 - treat the complete generated candidate pool as the reference population;
-- represent each structure through its local atomic environments;
+- represent each candidate through its local atomic environments;
 - support structural descriptors and, where available, magnetic descriptors;
 - infer local descriptor-space resolution from the candidate data;
 - construct an adaptive local similarity distribution;
-- select complete structures under a fixed structure-count budget;
+- select complete candidates under a fixed candidate-count budget;
 - optimise a proper information-theoretic objective;
 - exploit submodularity to make greedy whole-structure selection tractable;
 - use sparse local neighbourhoods so the method can scale to millions of atomic environments;
@@ -29,7 +29,7 @@ The new algorithm shall:
 
 The principal scientific problem is:
 
-> Given a finite candidate population (mathcal U) containing many more structures than can be labelled with DFT, choose (K) complete structures whose induced local-environment distribution best represents the full candidate distribution.
+> Given a finite candidate population (mathcal U) containing many more candidates than can be labelled with DFT, choose (K) complete candidates whose induced local-environment distribution best represents the full candidate distribution.
 
 The method is a compression/coverage method for the finite generated population. It is not a model-uncertainty estimator and does not require an already-trained potential.
 
@@ -88,13 +88,13 @@ All existing FPS regression tests must remain green.
 
 ## 4. Selection unit and notation
 
-Let the complete candidate pool contain (M) structures:
+Let the complete candidate pool contain (M) candidates:
 
 [
 mathcal U = {C_1, C_2, ldots, C_M}.
 ]
 
-Structure (C_m) contains (n_m) local atomic environments:
+Candidate (C_m) contains (n_m) local atomic environments:
 
 [
 C_m = {a_{m1}, a_{m2}, ldots, a_{mn_m}}.
@@ -118,7 +118,17 @@ After descriptor preprocessing, the distance-space representation is denoted:
 mathbf z_a in mathbb R^{d'}.
 ]
 
-The default acquisition unit remains the complete structure. Atomic environments define the information geometry, but the selector acquires (C_m), never isolated atoms.
+The default acquisition unit remains the complete candidate. Atomic environments define the information geometry, but the selector acquires (C_m), never isolated atoms.
+
+### 4.1 Candidate identity contract
+
+Phase 7 consumes the Phase 6 candidate contract.
+
+Every pool member has a unique `candidate_id`. Its underlying `structure_id` identifies only physical geometry and therefore may legitimately repeat when several magnetic states share the same species, cell, and coordinates.
+
+Selection persistence, caches, tie-breaking, train/test membership, and final manifests must use `candidate_id` as the unique acquisition identity while retaining `structure_id` for structural provenance.
+
+A structural-only representation may use the same geometry for several candidates, but it must not silently treat magnetically distinct candidates as distinguishable information. When magnetic variants are present, the selected representation must include the required magnetic channels or fail explicitly.
 
 ---
 
@@ -126,12 +136,12 @@ The default acquisition unit remains the complete structure. Atomic environments
 
 The information objective requires a well-defined reference distribution.
 
-Because the DFT acquisition unit is a complete structure, larger structures must not automatically receive more total probability mass merely because they contain more atoms.
+Because the DFT acquisition unit is a complete candidate, candidates with more atoms must not automatically receive more total probability mass merely because they contain more atoms.
 
 Therefore the canonical finite-pool target measure assigns:
 
-1. equal probability mass to every candidate structure;
-2. equal probability mass to every local environment within that structure.
+1. equal probability mass to every candidate;
+2. equal probability mass to every local environment within that candidate.
 
 For environment (i) belonging to structure (C_{m(i)}):
 
