@@ -3,7 +3,7 @@
 **Document status:** Proposed master PDD for magnetic configuration generation  
 **Initial implementation scope:** Non-magnetic, ferromagnetic, and collinear antiferromagnetic configurations  
 **Target branch reviewed:** dev at 3a15614d6beda9015853f2ad3fbf8863f7a21721  
-**Governing documents:** .docs/MASTER_PDD.md, .docs/CODEBASE_ARCHITECTURE_AND_STYLE_PDD.md, .docs/STRUCTURE_GENERATION_PDD.md, .docs/SELECTION_PDD.md, .docs/VASP_PDD.md, .docs/plan/06_INFORMATION_ENTROPY_SELECTION.md  
+**Governing documents:** .docs/MASTER_PDD.md, .docs/CODEBASE_ARCHITECTURE_AND_STYLE_PDD.md, .docs/STRUCTURE_GENERATION_PDD.md, .docs/SELECTION_PDD.md, .docs/VASP_PDD.md, .docs/plan/07_INFORMATION_ENTROPY_SELECTION.md  
 **Primary purpose:** Extend NEPFlow generation so that a structural candidate can be expanded into controlled magnetic configurations before information-entropy selection and DFT labelling.
 
 ---
