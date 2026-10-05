@@ -32,9 +32,10 @@ class FakeStore:
 class FakeGenerator:
     def __init__(self, structures):
         self.structures = structures
+        self.calls = []
 
     def generate(self, composition, crystal_structures, target_n_atoms):
-        del composition, crystal_structures, target_n_atoms
+        self.calls.append((dict(composition), tuple(crystal_structures), target_n_atoms))
         return [structure.copy() for structure in self.structures]
 
 
@@ -72,6 +73,23 @@ def request(tmp_path: Path, store: FakeStore, *, seeds_only: bool = False) -> Ge
         state_store=store,
         seeds_only=seeds_only,
     )
+
+
+def test_stage_retains_injected_generators_and_coordinator(tmp_path: Path) -> None:
+    generator = FakeGenerator([Atoms("Si2", cell=[3, 3, 3], pbc=True)])
+    coordinator = FakeCoordinator()
+    stage = GenerationStage(
+        generators=[("Injected", generator)],
+        coordinator=coordinator,
+    )
+
+    store = FakeStore()
+    stage.run(request=request(tmp_path, store, seeds_only=True))
+
+    assert stage.generators == (("Injected", generator),)
+    assert stage.coordinator is coordinator
+    assert generator.calls
+    assert generator.calls[0][1:] == (("fcc",), 2)
 
 
 def test_stage_deduplicates_physical_structures_and_merges_provenance(tmp_path: Path) -> None:

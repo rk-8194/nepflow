@@ -1,3 +1,4 @@
+import pickle
 import unittest
 from unittest.mock import patch
 
@@ -11,6 +12,7 @@ from ase import Atoms  # noqa: E402
 
 from nepflow.domain.identities import calculate_structure_id  # noqa: E402
 from nepflow.stages.generation.perturbations.coordinator import (  # noqa: E402
+    PerturbationCoordinator,
     execute_perturbation_task,
 )
 from nepflow.stages.generation.perturbations.defects import vacancies  # noqa: E402
@@ -219,6 +221,31 @@ class GenerationReproducibilityTests(unittest.TestCase):
 
         self.assertEqual(settings.random_seed, 1234)
 
+    def test_serial_and_parallel_task_results_keep_base_order(self) -> None:
+        first = self.make_base()
+        second = self.make_base()
+        second.info["seed_id"] = "seed_000008"
+        second.info["source"] = "reproducibility-fixture-second"
+        settings = self.settings(
+            random_seed=1234,
+            n_volume_points=0,
+            elastic_stress_enabled=False,
+        )
+        counts = PerturbationCounts(n_rattled=0, n_vacancies=0, n_interstitials=0)
+
+        serial = PerturbationCoordinator(settings=settings).generate_candidates(
+            [first, second], counts=counts, n_workers=1
+        )
+        parallel = PerturbationCoordinator(settings=settings).generate_candidates(
+            [first, second], counts=counts, n_workers=2
+        )
+
+        self.assert_structures_equal(serial, parallel)
+        self.assertEqual(
+            [item.info["seed_id"] for item in serial],
+            ["seed_000007", "seed_000008"],
+        )
+
     def test_worker_derived_seed_is_recorded_on_stochastic_candidate(self) -> None:
         base = self.make_base()
         child_seed = 9876
@@ -249,11 +276,16 @@ class GenerationReproducibilityTests(unittest.TestCase):
                 )
             )
             results = list(result.candidates)
+            restored = pickle.loads(pickle.dumps(result))
 
         rattled = [atoms for atoms in results if atoms.info["perturbation_type"] == "rattled"]
         self.assertEqual(len(rattled), 1)
         self.assertEqual(rattled[0].info["random_seed"], child_seed)
         self.assertNotEqual(rattled[0].info["random_seed"], 1234)
+        self.assertEqual(
+            [calculate_structure_id(item) for item in restored.candidates],
+            [calculate_structure_id(item) for item in result.candidates],
+        )
 
     def test_stochastic_candidate_records_parent_and_seed_provenance(self) -> None:
         base = self.make_base()
