@@ -1,7 +1,6 @@
 """Regression tests for the migration-only VASP memory reader."""
 
 from pathlib import Path
-from unittest.mock import patch
 
 import pytest
 
@@ -84,16 +83,11 @@ def test_completed_malformed_resource_value_raises_explicit_error(
 def test_unreadable_required_artifact_raises_explicit_error(tmp_path: Path) -> None:
     outcar = _write_record(tmp_path / "unreadable")
     poscar = outcar.parent / "POSCAR"
-    original_read_text = Path.read_text
+    poscar.unlink()
+    poscar.mkdir()
 
-    def read_text(path: Path, *args, **kwargs) -> str:
-        if path == poscar:
-            raise OSError("permission denied")
-        return original_read_text(path, *args, **kwargs)
-
-    with patch.object(Path, "read_text", read_text):
-        with pytest.raises(VaspMemoryParseError, match="POSCAR"):
-            parse_memory_record(outcar, 4)
+    with pytest.raises(VaspMemoryParseError, match="POSCAR"):
+        parse_memory_record(outcar, 4)
 
 
 def test_memory_wrapper_preserves_parser_error_instead_of_using_deleted_local(

@@ -98,4 +98,4 @@ jobs:
         run: python -m pytest --collect-only -q
 
       - name: Run tests
-        run: python -m pytest -ra
+        run: python -m pytest -ra -m "not external"

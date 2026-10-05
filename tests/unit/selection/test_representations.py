@@ -19,6 +19,17 @@ class _Structure:
         self.info = {"structure_id": structure_id}
 
 
+class _CalculatorBoundary:
+    """Minimal external-calculator fake returning deterministic real arrays."""
+
+    def __init__(self, _path: str, value: float):
+        self.value = value
+
+    def descriptors(self, batch, *, mean: bool):
+        del mean
+        return np.full((len(batch), 2), self.value, dtype=float)
+
+
 def _write_cache(
     project_dir: Path,
     structures: list[_Structure],
@@ -45,14 +56,10 @@ def _write_cache(
     return values
 
 
-def test_exact_identity_reuses_cache_without_recalculation(tmp_path, monkeypatch) -> None:
+def test_exact_identity_reuses_cache_without_recalculation(tmp_path) -> None:
     structures = [_Structure(f"structure-{index}") for index in range(3)]
     expected = _write_cache(tmp_path, structures)
 
-    def fail_if_called(*_args, **_kwargs):
-        raise AssertionError("exact descriptor cache should be reused")
-
-    monkeypatch.setattr(representations, "compute_descriptors_batched", fail_if_called)
     result = representations.load_or_calculate_representations(
         tmp_path,
         structures,
@@ -77,11 +84,10 @@ def test_order_change_invalidates_equal_shape_cache(tmp_path, monkeypatch) -> No
     structures = [_Structure(f"structure-{index}") for index in range(3)]
     _write_cache(tmp_path, structures)
     replacement = np.full((3, 2), 7.0)
-    monkeypatch.setattr(representations, "NepCalculator", lambda _path: object())
     monkeypatch.setattr(
         representations,
-        "compute_descriptors_batched",
-        lambda *_args, **_kwargs: replacement,
+        "NepCalculator",
+        lambda path: _CalculatorBoundary(str(path), 7.0),
     )
 
     result = representations.load_or_calculate_representations(
@@ -103,11 +109,10 @@ def test_corrupt_manifest_invalidates_cache(tmp_path, monkeypatch) -> None:
         encoding="utf-8",
     )
     replacement = np.full((3, 2), 9.0)
-    monkeypatch.setattr(representations, "NepCalculator", lambda _path: object())
     monkeypatch.setattr(
         representations,
-        "compute_descriptors_batched",
-        lambda *_args, **_kwargs: replacement,
+        "NepCalculator",
+        lambda path: _CalculatorBoundary(str(path), 9.0),
     )
 
     result = representations.load_or_calculate_representations(

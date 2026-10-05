@@ -1,8 +1,5 @@
-import sys
 import unittest
 from collections import Counter
-from types import ModuleType
-from unittest.mock import patch
 
 import numpy as np
 import pytest
@@ -29,6 +26,20 @@ def make_atoms(symbols: str = "Si4") -> Atoms:
         pbc=True,
     )
     return atoms
+
+
+class SQSBackendBoundary:
+    """Deterministic fake for the injected external SQS backend boundary."""
+
+    def __init__(self, *, fail_on_call: int | None = None) -> None:
+        self.calls: list[dict[str, object]] = []
+        self.fail_on_call = fail_on_call
+
+    def generate(self, **kwargs):
+        self.calls.append(dict(kwargs))
+        if self.fail_on_call == len(self.calls):
+            raise RuntimeError("primary SQS generation unavailable")
+        return make_atoms("Si4")
 
 
 class ConfigurationalGeneratorTests(unittest.TestCase):
@@ -145,27 +156,16 @@ class ConfigurationalGeneratorTests(unittest.TestCase):
         )
 
     def test_sqs_quota_is_per_composition_and_deterministic(self) -> None:
-        fake_icet = ModuleType("icet")
-        fake_icet_tools = ModuleType("icet.tools")
-        fake_structure_generation = ModuleType("icet.tools.structure_generation")
-        fake_icet.ClusterSpace = lambda *args, **kwargs: object()
-        fake_structure_generation.generate_sqs_from_supercells = lambda **kwargs: make_atoms("Si4")
-        with patch.dict(
-            sys.modules,
-            {
-                "icet": fake_icet,
-                "icet.tools": fake_icet_tools,
-                "icet.tools.structure_generation": fake_structure_generation,
-            },
-        ):
-            first = SQSGenerator(
-                n_structures=4,
-                random_seed=7,
-            ).generate(self.composition, self.crystal_structures, target_n_atoms=8)
-            second = SQSGenerator(
-                n_structures=4,
-                random_seed=7,
-            ).generate(self.composition, self.crystal_structures, target_n_atoms=8)
+        first = SQSGenerator(
+            n_structures=4,
+            random_seed=7,
+            backend=SQSBackendBoundary(),
+        ).generate(self.composition, self.crystal_structures, target_n_atoms=8)
+        second = SQSGenerator(
+            n_structures=4,
+            random_seed=7,
+            backend=SQSBackendBoundary(),
+        ).generate(self.composition, self.crystal_structures, target_n_atoms=8)
 
         self.assert_per_composition_quota(first, expected_total=4)
         self.assertEqual(
@@ -174,24 +174,11 @@ class ConfigurationalGeneratorTests(unittest.TestCase):
         )
 
     def test_sqs_success_preserves_sqs_provenance(self) -> None:
-        fake_icet = ModuleType("icet")
-        fake_icet_tools = ModuleType("icet.tools")
-        fake_structure_generation = ModuleType("icet.tools.structure_generation")
-        fake_icet.ClusterSpace = lambda *args, **kwargs: object()
-        fake_structure_generation.generate_sqs_from_supercells = lambda **kwargs: make_atoms("Si4")
-
-        with patch.dict(
-            sys.modules,
-            {
-                "icet": fake_icet,
-                "icet.tools": fake_icet_tools,
-                "icet.tools.structure_generation": fake_structure_generation,
-            },
-        ):
-            results = SQSGenerator(
-                n_structures=1,
-                random_seed=7,
-            ).generate(self.composition, ["bcc"], target_n_atoms=8)
+        results = SQSGenerator(
+            n_structures=1,
+            random_seed=7,
+            backend=SQSBackendBoundary(),
+        ).generate(self.composition, ["bcc"], target_n_atoms=8)
 
         self.assertEqual(len(results), 1)
         self.assertEqual(results[0].info["configurational_type"], "sqs")
@@ -200,83 +187,50 @@ class ConfigurationalGeneratorTests(unittest.TestCase):
         self.assertEqual(results[0].info["source"], "sqs-Si0.5-Ge0.5-bcc-0")
 
     def test_sqs_failure_on_later_slot_does_not_return_partial_results(self) -> None:
-        fake_icet = ModuleType("icet")
-        fake_icet_tools = ModuleType("icet.tools")
-        fake_structure_generation = ModuleType("icet.tools.structure_generation")
-        fake_icet.ClusterSpace = lambda *args, **kwargs: object()
-        calls = []
-
-        def fail_on_second_slot(**kwargs):
-            calls.append(kwargs["random_seed"])
-            if len(calls) == 2:
-                raise RuntimeError("primary SQS generation unavailable")
-            return make_atoms("Si4")
-
-        fake_structure_generation.generate_sqs_from_supercells = fail_on_second_slot
-
-        with patch.dict(
-            sys.modules,
-            {
-                "icet": fake_icet,
-                "icet.tools": fake_icet_tools,
-                "icet.tools.structure_generation": fake_structure_generation,
-            },
+        backend = SQSBackendBoundary(fail_on_call=2)
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "composition.*crystal structure.*fcc.*primary SQS generation unavailable",
         ):
-            with self.assertRaisesRegex(
-                RuntimeError,
-                "composition.*crystal structure.*fcc.*primary SQS generation unavailable",
-            ):
-                SQSGenerator(
-                    n_structures=2,
-                    random_seed=7,
-                ).generate(self.composition, self.crystal_structures, target_n_atoms=8)
+            SQSGenerator(
+                n_structures=2,
+                random_seed=7,
+                backend=backend,
+            ).generate(self.composition, self.crystal_structures, target_n_atoms=8)
 
-        self.assertEqual(calls, [7, 8])
+        self.assertEqual([call["random_seed"] for call in backend.calls], [7, 8])
 
-    def test_unary_sqs_returns_empty_without_importing_icet(self) -> None:
-        generator = SQSGenerator(n_structures=1, random_seed=7)
+    def test_unary_sqs_returns_empty_without_backend_call(self) -> None:
+        generator = SQSGenerator(
+            n_structures=1,
+            random_seed=7,
+            backend=SQSBackendBoundary(fail_on_call=1),
+        )
+        self.assertEqual(generator.generate({"Si": 1.0}, ["bcc"], target_n_atoms=8), [])
 
-        with patch.dict(sys.modules, {"icet": None}):
-            self.assertEqual(
-                generator.generate({"Si": 1.0}, ["bcc"], target_n_atoms=8),
-                [],
-            )
-
-    def test_sqs_generate_fails_fast_when_primary_and_fallback_are_unavailable(
+    def test_sqs_backend_failure_is_not_replaced_with_an_alternative(
         self,
     ) -> None:
-        fake_icet = ModuleType("icet")
-        fake_icet_tools = ModuleType("icet.tools")
-        fake_structure_generation = ModuleType("icet.tools.structure_generation")
-        fake_icet.ClusterSpace = lambda *args, **kwargs: object()
+        generator = SQSGenerator(
+            n_structures=1,
+            random_seed=7,
+            backend=SQSBackendBoundary(fail_on_call=1),
+        )
+        with self.assertRaisesRegex(RuntimeError, "primary SQS generation unavailable"):
+            generator.generate(self.composition, ["bcc"], target_n_atoms=8)
 
-        def fail_primary(**kwargs):
-            raise RuntimeError("primary SQS generation unavailable")
+    def test_sqs_backend_failure_is_wrapped_at_the_generator_boundary(self) -> None:
+        class UnavailableBackend:
+            def generate(self, **kwargs):
+                del kwargs
+                raise ImportError("icet backend unavailable")
 
-        fake_structure_generation.generate_sqs_from_supercells = fail_primary
-        # Deliberately omit any fallback API; the public boundary must report
-        # the primary failure.
-        with patch.dict(
-            sys.modules,
-            {
-                "icet": fake_icet,
-                "icet.tools": fake_icet_tools,
-                "icet.tools.structure_generation": fake_structure_generation,
-            },
-        ):
-            generator = SQSGenerator(
-                n_structures=1,
-                random_seed=7,
+        with self.assertRaisesRegex(RuntimeError, "icet backend unavailable"):
+            SQSGenerator(backend=UnavailableBackend()).generate(
+                self.composition,
+                ["bcc"],
+                target_n_atoms=8,
             )
-            with self.assertRaises(RuntimeError):
-                generator.generate(self.composition, ["bcc"], target_n_atoms=8)
-
-    def test_sqs_generate_fails_fast_when_icet_is_unavailable(self) -> None:
-        generator = SQSGenerator(n_structures=1, random_seed=7)
-
-        with patch.dict(sys.modules, {"icet": None}):
-            with self.assertRaises((ImportError, RuntimeError)):
-                generator.generate(self.composition, ["bcc"], target_n_atoms=8)
 
 
 if __name__ == "__main__":

@@ -1,3 +1,6 @@
+import shutil
+from pathlib import Path
+
 import numpy as np
 import pytest
 from ase import Atoms
@@ -28,8 +31,14 @@ def _labelled_atoms() -> Atoms:
     return atoms
 
 
-def _stress_text() -> str:
-    return "STRESS in cartesian coordinates (kB)\n  1  2  3\n  4  5  6\n  7  8  9\n"
+OUTCAR_FIXTURES = Path(__file__).parents[3] / "fixtures" / "outcar"
+
+
+def _copy_outcar_fixture(directory: Path, name: str = "completed_without_stress") -> Path:
+    directory.mkdir(parents=True, exist_ok=True)
+    destination = directory / "OUTCAR"
+    shutil.copyfile(OUTCAR_FIXTURES / name, destination)
+    return destination
 
 
 def _identity(atoms: Atoms) -> dict[str, str]:
@@ -43,16 +52,14 @@ def _identity(atoms: Atoms) -> dict[str, str]:
 
 
 def test_completion_and_virial_fixture_semantics(tmp_path) -> None:
-    outcar = tmp_path / "OUTCAR"
-    outcar.write_text(_stress_text() + "General timing\n")
+    outcar = _copy_outcar_fixture(tmp_path, "valid_outcar")
     assert outcar_is_complete(outcar)
     expected = -np.arange(1, 10, dtype=float).reshape(3, 3) * 27 / 1602.17663
     np.testing.assert_allclose(parse_virial_from_outcar(outcar, 27), expected)
 
 
 def test_stress_parser_is_shared_with_elastic_consumers(tmp_path) -> None:
-    outcar = tmp_path / "OUTCAR"
-    outcar.write_text(_stress_text())
+    outcar = _copy_outcar_fixture(tmp_path, "valid_outcar")
 
     expected = np.arange(1, 10, dtype=float).reshape(3, 3) / 1602.17663
     np.testing.assert_allclose(parse_stress_from_outcar(outcar), expected)
@@ -75,8 +82,7 @@ def test_performance_parser_preserves_memory_utility_fields() -> None:
 
 
 def test_result_preserves_energy_forces_and_requires_verified_identity(tmp_path) -> None:
-    outcar = tmp_path / "OUTCAR"
-    outcar.write_text(_stress_text() + "General timing\n")
+    outcar = _copy_outcar_fixture(tmp_path, "valid_outcar")
     expected_atoms = _labelled_atoms()
     identity = _identity(expected_atoms)
     evidence = ResolvedVaspOutput(
@@ -99,8 +105,7 @@ def test_result_preserves_energy_forces_and_requires_verified_identity(tmp_path)
 
 
 def test_direct_parse_without_identity_evidence_is_rejected(tmp_path) -> None:
-    outcar = tmp_path / "OUTCAR"
-    outcar.write_text("General timing\n")
+    outcar = _copy_outcar_fixture(tmp_path)
     identity = _identity(_labelled_atoms())
     result = parse_outcar_result(
         outcar,
@@ -112,8 +117,7 @@ def test_direct_parse_without_identity_evidence_is_rejected(tmp_path) -> None:
 
 
 def test_expected_identity_and_matching_sidecar_are_accepted(tmp_path) -> None:
-    outcar = tmp_path / "OUTCAR"
-    outcar.write_text("General timing\n")
+    outcar = _copy_outcar_fixture(tmp_path)
     atoms = _labelled_atoms()
     identity = _identity(atoms)
     write_json(tmp_path / ".vasp_identity", identity)
@@ -129,8 +133,7 @@ def test_expected_identity_and_matching_sidecar_are_accepted(tmp_path) -> None:
 
 
 def test_mismatched_verified_evidence_is_rejected(tmp_path) -> None:
-    outcar = tmp_path / "OUTCAR"
-    outcar.write_text("General timing\n")
+    outcar = _copy_outcar_fixture(tmp_path)
     atoms = _labelled_atoms()
     expected = _identity(atoms)
     observed = dict(expected)
@@ -152,8 +155,7 @@ def test_mismatched_verified_evidence_is_rejected(tmp_path) -> None:
 
 
 def test_parse_without_expected_identity_is_rejected(tmp_path) -> None:
-    outcar = tmp_path / "OUTCAR"
-    outcar.write_text("General timing\n")
+    outcar = _copy_outcar_fixture(tmp_path)
     result = parse_outcar_result(
         outcar,
         _labelled_atoms(),
@@ -163,8 +165,7 @@ def test_parse_without_expected_identity_is_rejected(tmp_path) -> None:
 
 
 def test_required_virial_is_not_replaced_with_an_empty_tensor(tmp_path) -> None:
-    outcar = tmp_path / "OUTCAR"
-    outcar.write_text("General timing\n")
+    outcar = _copy_outcar_fixture(tmp_path)
     result = parse_outcar_result(
         outcar,
         _labelled_atoms(),
@@ -184,8 +185,7 @@ def test_verified_resolution_owns_current_reuse_and_registry_rules(tmp_path) -> 
     atoms = _labelled_atoms()
     identity = _identity(atoms)
     current = tmp_path / "current"
-    current.mkdir()
-    (current / "OUTCAR").write_text("General timing\n")
+    _copy_outcar_fixture(current)
 
     resolved = resolve_verified_output(
         identity,
@@ -205,8 +205,7 @@ def test_verified_resolution_owns_current_reuse_and_registry_rules(tmp_path) -> 
     )
 
     historical = tmp_path / "historical"
-    historical.mkdir()
-    (historical / "OUTCAR").write_text("General timing\n")
+    historical_outcar = _copy_outcar_fixture(historical)
     reused = resolve_verified_output(
         identity,
         current_jobs=[
@@ -223,12 +222,12 @@ def test_verified_resolution_owns_current_reuse_and_registry_rules(tmp_path) -> 
 
     registry = resolve_verified_output(
         identity,
-        registry_evidence=VaspRegistryEvidence(historical / "OUTCAR", identity),
+        registry_evidence=VaspRegistryEvidence(historical_outcar, identity),
     )
     assert registry is not None
     assert registry.verification_source == "completed_registry_key"
     parsed = parse_outcar_result(
-        historical / "OUTCAR",
+        historical_outcar,
         atoms,
         calculation_identity=identity,
         identity_evidence=registry,
@@ -241,7 +240,7 @@ def test_verified_resolution_owns_current_reuse_and_registry_rules(tmp_path) -> 
     assert (
         resolve_verified_output(
             identity,
-            registry_evidence=VaspRegistryEvidence(historical / "OUTCAR", wrong_registry),
+            registry_evidence=VaspRegistryEvidence(historical_outcar, wrong_registry),
         )
         is None
     )

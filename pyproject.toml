@@ -43,3 +43,13 @@ known-first-party = ["nepflow"]
 
 [tool.ruff.format]
 line-ending = "lf"
+
+[tool.pytest.ini_options]
+addopts = "--strict-markers"
+markers = [
+    "external: requires a live external service or executable and is excluded from ordinary CI",
+    "slurm: requires a live SLURM cluster",
+    "vasp: requires a live VASP executable",
+    "gpumd: requires a live GPUMD executable",
+    "materials_project: requires a live Materials Project network request",
+]

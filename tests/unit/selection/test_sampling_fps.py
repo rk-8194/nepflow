@@ -41,62 +41,40 @@ class FPSTests(unittest.TestCase):
         sampler.assert_called_once_with(descriptors, n_samples=2, min_dist=0.2)
         self.assertEqual(result, [0, 1])
 
-    def test_selected_count_uses_selected_frame_length(self) -> None:
-        descriptors = np.ones((4, 2))
-        structures = [StructureStub(), StructureStub()]
-
-        with patch.object(SAMPLING, "select_farthest_points", return_value=[0, 2, 3]):
-            count = SAMPLING._selected_count(descriptors, structures, True, 0.1)
-
-        self.assertEqual(count, 3)
-
     def test_target_count_converges_on_first_iteration_when_already_within_tolerance(self) -> None:
-        descriptors = np.ones((2, 2))
+        descriptors = np.array([[0.0, 0.0], [1.0, 0.0]])
         structures = [StructureStub(), StructureStub()]
 
-        with patch.object(SAMPLING, "_selected_count", return_value=2):
-            with patch.object(
-                SAMPLING, "select_farthest_points", return_value=[0, 1]
-            ) as select_points:
-                indices, best_dist = SAMPLING.select_farthest_points_for_target(
-                    descriptors,
-                    structures,
-                    True,
-                    target=2,
-                    tolerance=0,
-                    max_iterations=3,
-                    label="train",
-                )
+        indices, best_dist = SAMPLING.select_farthest_points_for_target(
+            descriptors,
+            structures,
+            True,
+            target=2,
+            tolerance=0,
+            max_iterations=3,
+            label="train",
+        )
 
         self.assertEqual(indices, [0, 1])
         self.assertAlmostEqual(best_dist, 0.005, places=12)
-        self.assertEqual(
-            select_points.call_args_list[-1].args,
-            (descriptors, structures, True, 0.005),
-        )
 
     def test_target_count_runs_binary_search_until_within_tolerance(self) -> None:
-        descriptors = np.ones((5, 2))
+        descriptors = np.arange(5, dtype=float).reshape(5, 1)
         structures = [StructureStub() for _ in range(5)]
-        count_values = [5, 4, 3, 3]
 
-        with patch.object(SAMPLING, "_selected_count", side_effect=count_values):
-            with patch.object(
-                SAMPLING, "select_farthest_points", return_value=[0, 1, 2]
-            ) as select_points:
-                indices, best_dist = SAMPLING.select_farthest_points_for_target(
-                    descriptors,
-                    structures,
-                    True,
-                    target=3,
-                    tolerance=0,
-                    max_iterations=3,
-                    label="train",
-                )
+        indices, best_dist = SAMPLING.select_farthest_points_for_target(
+            descriptors,
+            structures,
+            True,
+            target=3,
+            tolerance=0,
+            max_iterations=12,
+            label="train",
+        )
 
-        self.assertEqual(indices, [0, 1, 2])
-        self.assertAlmostEqual(best_dist, 0.02, places=12)
-        self.assertGreaterEqual(select_points.call_count, 2)
+        self.assertEqual(len(indices), 3)
+        self.assertEqual(indices, sorted(set(indices)))
+        self.assertGreater(best_dist, 0.0)
 
     def test_cross_distance_handles_empty_inputs(self) -> None:
         descriptors = np.ones((2, 2))

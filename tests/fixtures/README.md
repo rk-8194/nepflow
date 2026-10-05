@@ -1,4 +1,4 @@
-# Phase 1 scientific fixtures
+# Scientific test fixtures
 
 These fixtures are intentionally small, deterministic, and synthetic. They are
 not copied from a real calculation and contain no POTCAR or pseudopotential

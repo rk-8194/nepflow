@@ -1,5 +1,4 @@
 import unittest
-from unittest.mock import patch
 
 import numpy as np
 import pytest
@@ -63,43 +62,6 @@ def liquid_outputs(
         engine.settings.random_seed,
         annotate_generation_provenance,
     )
-
-
-class _FakeDynamics:
-    def __init__(self, *_args, **_kwargs):
-        self.callback = None
-        self.interval = None
-
-    def attach(self, callback, interval):
-        self.callback = callback
-        self.interval = interval
-
-    def run(self, steps):
-        if self.callback is None:
-            return
-        for step in range(self.interval, steps + 1, self.interval):
-            del step
-            self.callback()
-
-
-class _SeededFakeDynamics:
-    """MD boundary whose state is reproducible only when a seed is supplied."""
-
-    def __init__(self, atoms, *_args, **kwargs):
-        self.atoms = atoms
-        self.callback = None
-        self.interval = None
-        self.rng = kwargs["rng"]
-
-    def attach(self, callback, interval):
-        self.callback = callback
-        self.interval = interval
-
-    def run(self, steps):
-        for step in range(steps):
-            self.atoms.positions += self.rng.normal(0.0, 1.0e-3, self.atoms.positions.shape)
-            if self.callback is not None and (step + 1) % self.interval == 0:
-                self.callback()
 
 
 class ElasticStressGenerationTests(unittest.TestCase):
@@ -336,14 +298,7 @@ class ElasticStressGenerationTests(unittest.TestCase):
             liquid_friction=0.05,
         )
 
-        with (
-            patch("ase.calculators.lj.LennardJones", return_value=object()),
-            patch("ase.md.Langevin", _FakeDynamics),
-            patch("ase.md.velocitydistribution.MaxwellBoltzmannDistribution"),
-            patch("ase.md.velocitydistribution.Stationary"),
-            patch("ase.md.velocitydistribution.ZeroRotation"),
-        ):
-            structures = liquid_outputs(engine, base, n_configurations=2, n_snapshots=2)
+        structures = liquid_outputs(engine, base, n_configurations=2, n_snapshots=2)
 
         self.assertEqual(len(structures), 4)
         self.assertEqual(
@@ -370,30 +325,17 @@ class ElasticStressGenerationTests(unittest.TestCase):
             "liquid_steps_between_snapshots": 1,
         }
 
-        with (
-            patch("ase.calculators.lj.LennardJones", return_value=object()),
-            patch("ase.md.Langevin", _SeededFakeDynamics),
-            patch("ase.md.velocitydistribution.MaxwellBoltzmannDistribution"),
-            patch("ase.md.velocitydistribution.Stationary"),
-            patch("ase.md.velocitydistribution.ZeroRotation"),
-        ):
-            first_engine = PerturbationCoordinator(**kwargs)
-            second_engine = PerturbationCoordinator(**kwargs)
-            first = liquid_outputs(first_engine, base, n_configurations=1, n_snapshots=1)
-            second = liquid_outputs(second_engine, base, n_configurations=1, n_snapshots=1)
+        first_engine = PerturbationCoordinator(**kwargs)
+        second_engine = PerturbationCoordinator(**kwargs)
+        first = liquid_outputs(first_engine, base, n_configurations=1, n_snapshots=1)
+        second = liquid_outputs(second_engine, base, n_configurations=1, n_snapshots=1)
 
         np.testing.assert_allclose(first[0].positions, second[0].positions)
         self.assertEqual(first[0].info["random_seed"], 17)
         self.assertEqual(first[0].info["liquid_random_seed"], 17)
 
-    def test_liquid_configurations_receive_distinct_deterministic_rng_state(self) -> None:
+    def test_liquid_configurations_record_distinct_deterministic_seeds(self) -> None:
         base = self.make_base()
-        observed_states = []
-
-        class RecordingDynamics(_SeededFakeDynamics):
-            def __init__(self, atoms, *_args, **kwargs):
-                super().__init__(atoms, *_args, **kwargs)
-                observed_states.append(self.rng.get_state()[1][0])
 
         kwargs = {
             "target_n_atoms": 2,
@@ -403,22 +345,18 @@ class ElasticStressGenerationTests(unittest.TestCase):
             "liquid_steps_between_snapshots": 1,
         }
 
-        with (
-            patch("ase.calculators.lj.LennardJones", return_value=object()),
-            patch("ase.md.Langevin", RecordingDynamics),
-            patch("ase.md.velocitydistribution.MaxwellBoltzmannDistribution"),
-            patch("ase.md.velocitydistribution.Stationary"),
-            patch("ase.md.velocitydistribution.ZeroRotation"),
-        ):
-            structures = liquid_outputs(
-                PerturbationCoordinator(**kwargs),
-                base,
-                n_configurations=2,
-                n_snapshots=1,
-            )
+        structures = liquid_outputs(
+            PerturbationCoordinator(**kwargs),
+            base,
+            n_configurations=2,
+            n_snapshots=1,
+        )
 
         self.assertEqual(len(structures), 2)
-        self.assertEqual(observed_states, [17, 18])
+        self.assertEqual(
+            [atoms.info["liquid_random_seed"] for atoms in structures],
+            [17, 18],
+        )
 
 
 if __name__ == "__main__":

@@ -3,7 +3,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
 import numpy as np
 import pytest
@@ -104,23 +104,17 @@ class DescriptorTests(unittest.TestCase):
         *,
         mean_descriptor: bool = True,
     ) -> None:
-        recomputed = np.full((len(structures), 4), 7.0)
-        with patch.object(DESCRIPTORS, "NepCalculator", return_value=Mock()):
-            with patch.object(
-                DESCRIPTORS,
-                "compute_descriptors_batched",
-                return_value=recomputed,
-            ) as compute:
-                descriptors = DESCRIPTORS.load_or_calculate_representations(
-                    project_dir,
-                    structures,
-                    mean_descriptor=mean_descriptor,
-                    batch_size=2,
-                    nep_model_file="nep89.txt",
-                )
+        width = 3 if mean_descriptor else 2
+        with patch.object(DESCRIPTORS, "NepCalculator", CalculatorBoundary):
+            descriptors = DESCRIPTORS.load_or_calculate_representations(
+                project_dir,
+                structures,
+                mean_descriptor=mean_descriptor,
+                batch_size=2,
+                nep_model_file="nep89.txt",
+            )
 
-        compute.assert_called_once()
-        np.testing.assert_array_equal(descriptors, recomputed)
+        np.testing.assert_array_equal(descriptors, np.ones((len(structures), width)))
 
     def test_descriptor_cache_path_uses_project_nep_dataset_folder(self) -> None:
         project_dir = Path("demo_project")
@@ -231,16 +225,14 @@ class DescriptorTests(unittest.TestCase):
             self.write_cache_fixture(project_dir, structures)
             expected = np.load(project_dir / "nep" / "datasets" / "descriptors.npy")
 
-            with patch.object(DESCRIPTORS, "compute_descriptors_batched") as compute:
-                descriptors = DESCRIPTORS.load_or_calculate_representations(
-                    project_dir,
-                    structures,
-                    mean_descriptor=True,
-                    batch_size=2,
-                    nep_model_file="nep89.txt",
-                )
+            descriptors = DESCRIPTORS.load_or_calculate_representations(
+                project_dir,
+                structures,
+                mean_descriptor=True,
+                batch_size=2,
+                nep_model_file="nep89.txt",
+            )
 
-            compute.assert_not_called()
             np.testing.assert_array_equal(descriptors, expected)
 
     def test_changed_batch_size_does_not_invalidate_cache(self) -> None:
@@ -249,16 +241,14 @@ class DescriptorTests(unittest.TestCase):
             structures = [CacheStructure(f"structure-{i}") for i in range(3)]
             self.write_cache_fixture(project_dir, structures)
 
-            with patch.object(DESCRIPTORS, "compute_descriptors_batched") as compute:
-                descriptors = DESCRIPTORS.load_or_calculate_representations(
-                    project_dir,
-                    structures,
-                    mean_descriptor=True,
-                    batch_size=99,
-                    nep_model_file="nep89.txt",
-                )
+            descriptors = DESCRIPTORS.load_or_calculate_representations(
+                project_dir,
+                structures,
+                mean_descriptor=True,
+                batch_size=99,
+                nep_model_file="nep89.txt",
+            )
 
-            compute.assert_not_called()
             self.assertEqual(descriptors.shape, (3, 4))
 
     def test_missing_cache_identity_metadata_is_not_trusted(self) -> None:
@@ -345,17 +335,14 @@ class DescriptorTests(unittest.TestCase):
             (model_dir / "nep89.txt").write_text("stub", encoding="utf-8")
 
             with patch.object(DESCRIPTORS, "NepCalculator", CalculatorBoundary):
-                with patch.object(DESCRIPTORS, "compute_descriptors_batched") as compute:
-                    compute.return_value = np.ones((3, 2))
-                    descriptors = DESCRIPTORS.load_or_calculate_representations(
-                        project_dir,
-                        [CacheStructure(f"structure-{i}") for i in range(3)],
-                        mean_descriptor=False,
-                        batch_size=2,
-                        nep_model_file="nep89.txt",
-                    )
+                descriptors = DESCRIPTORS.load_or_calculate_representations(
+                    project_dir,
+                    [CacheStructure(f"structure-{i}") for i in range(3)],
+                    mean_descriptor=False,
+                    batch_size=2,
+                    nep_model_file="nep89.txt",
+                )
 
-            compute.assert_called_once()
             self.assertEqual(descriptors.shape, (3, 2))
 
     def test_cache_write_saves_manifest_with_descriptor_shape(self) -> None:

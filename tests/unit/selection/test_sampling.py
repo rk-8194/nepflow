@@ -35,23 +35,17 @@ def test_select_farthest_points_maps_atomic_rows_to_sorted_frames() -> None:
 
 
 def test_target_count_preserves_accepted_binary_search_boundary() -> None:
-    representations = np.ones((2, 2))
+    representations = np.array([[0.0, 0.0], [1.0, 0.0]])
     structures = [_Structure(), _Structure()]
 
-    with patch.object(sampling, "_selected_count", return_value=2):
-        with patch.object(
-            sampling,
-            "select_farthest_points",
-            return_value=[0, 1],
-        ):
-            result = sampling.select_farthest_points_for_target(
-                representations,
-                structures,
-                True,
-                target=2,
-                tolerance=0,
-                max_iterations=3,
-            )
+    result = sampling.select_farthest_points_for_target(
+        representations,
+        structures,
+        True,
+        target=2,
+        tolerance=0,
+        max_iterations=3,
+    )
 
     assert result == ([0, 1], 0.005)
 
