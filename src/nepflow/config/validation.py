@@ -390,9 +390,7 @@ def _validate_surface_settings(config: GenerationConfig) -> None:
         )
     _require_non_negative("generation.surface_max_terminations", config.surface_max_terminations)
     if config.surface_termination_policy not in {"all", "first"}:
-        raise ConfigurationError(
-            "generation.surface_termination_policy must be 'all' or 'first'"
-        )
+        raise ConfigurationError("generation.surface_termination_policy must be 'all' or 'first'")
     if not config.surface_miller_indices:
         if config.surface_enabled or config.n_surfaces:
             raise ConfigurationError(
