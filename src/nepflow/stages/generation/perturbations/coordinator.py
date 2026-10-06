@@ -228,9 +228,7 @@ def execute_perturbation_task(task: PerturbationTask) -> PerturbationTaskResult:
                 seed=task.seed,
             )
         )
-    if task.counts.n_antisites > 0 and family_applies_to_base(
-        "antisite", task.base, settings
-    ):
+    if task.counts.n_antisites > 0 and family_applies_to_base("antisite", task.base, settings):
         output.extend(
             antisites(
                 supercell,
