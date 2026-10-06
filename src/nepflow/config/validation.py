@@ -203,6 +203,16 @@ def validate_config(
         _require_finite_non_negative(
             f"generation.{field_name}", getattr(config.generation, field_name)
         )
+    if config.generation.use_liquid and (
+        config.generation.n_liquid_configurations > 0
+        and config.generation.n_liquid_snapshots > 0
+    ):
+        if config.generation.liquid_timestep_fs <= 0.0:
+            raise ConfigurationError("generation.liquid_timestep_fs must be positive")
+        if config.generation.liquid_steps_between_snapshots <= 0:
+            raise ConfigurationError(
+                "generation.liquid_steps_between_snapshots must be positive"
+            )
     _validate_surface_settings(config.generation)
     _validate_grain_boundary_settings(config.generation)
     _require_range(

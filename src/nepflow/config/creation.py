@@ -106,7 +106,8 @@ n_segregated=3
 n_liquid_configurations=2
 n_liquid_snapshots=5
 
-# Liquid perturbation (ASE Langevin MD with Lennard-Jones)
+# Liquid-like geometry disorder (ASE Langevin + Lennard-Jones; not a
+# material-specific or physically validated liquid trajectory)
 liquid_temperature=3000
 liquid_timestep_fs=1.0
 liquid_equilibration_steps=200

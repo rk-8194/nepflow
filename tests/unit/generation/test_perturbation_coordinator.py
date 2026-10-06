@@ -596,6 +596,26 @@ def test_existing_candidate_family_order_is_locked_before_source_scoping(
             del args, kwargs
             candidate = base_atoms()
             candidate.info["perturbation_type"] = name
+            if name == "liquid":
+                candidate.info.update(
+                    {
+                        "liquid_method": "ase_langevin_lj",
+                        "liquid_fidelity": "geometry_disorder_only_not_material_specific",
+                        "liquid_temperature_k": 3000.0,
+                        "liquid_timestep_fs": 1.0,
+                        "liquid_friction": 0.02,
+                        "liquid_equilibration_steps": 200,
+                        "liquid_steps_between_snapshots": 100,
+                        "liquid_configuration_index": 0,
+                        "liquid_snapshot_index": 0,
+                        "liquid_snapshot_step": 300,
+                        "liquid_effective_child_seed": 1,
+                        "parent_structure_id": calculate_structure_id(candidate),
+                        "source_composition": {"Si": 1.0},
+                        "liquid_source_parent_structure_id": calculate_structure_id(candidate),
+                        "liquid_source_composition": {"Si": 1.0},
+                    }
+                )
             return [candidate]
 
         return generate

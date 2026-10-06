@@ -25,6 +25,12 @@ PERTURBATION_FAMILY_SOURCE_FIELDS = {
     "grain_boundary": "grain_boundary_sources",
 }
 
+# There is intentionally one liquid implementation at present.  Keep its
+# method/fidelity labels in the shared model layer so generation, validation,
+# and downstream provenance consumers agree on stable values.
+LIQUID_METHOD = "ase_langevin_lj"
+LIQUID_FIDELITY = "geometry_disorder_only_not_material_specific"
+
 
 def derive_child_seed(
     base_structure_id: str,
@@ -349,6 +355,8 @@ class PerturbationTaskResult:
 
 
 __all__ = [
+    "LIQUID_FIDELITY",
+    "LIQUID_METHOD",
     "PerturbationCounts",
     "PerturbationSettings",
     "PerturbationTask",

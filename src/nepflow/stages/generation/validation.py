@@ -18,6 +18,9 @@ from nepflow.config.models import (
 )
 from nepflow.errors import ConfigurationError
 
+_LIQUID_METHOD = "ase_langevin_lj"
+_LIQUID_FIDELITY = "geometry_disorder_only_not_material_specific"
+
 
 @dataclass(frozen=True, slots=True)
 class CandidateValidationIssue:
@@ -193,6 +196,10 @@ def _validate_family_state(
     reference: Any,
     family: str,
 ) -> CandidateValidationIssue | None:
+    if family == "liquid":
+        issue = _validate_liquid_state(candidate)
+        if issue is not None:
+            return issue
     if family == "surface":
         issue = _validate_surface_state(candidate)
         if issue is not None:
@@ -358,6 +365,123 @@ def _validate_family_state(
                 "realised_counts": dict(candidate_counts),
             },
         )
+    return None
+
+
+def _validate_liquid_state(candidate: Any) -> CandidateValidationIssue | None:
+    """Validate the reproducibility contract for an ASE liquid snapshot."""
+
+    info = getattr(candidate, "info", {})
+    required = (
+        "liquid_method",
+        "liquid_fidelity",
+        "liquid_temperature_k",
+        "liquid_timestep_fs",
+        "liquid_friction",
+        "liquid_equilibration_steps",
+        "liquid_steps_between_snapshots",
+        "liquid_configuration_index",
+        "liquid_snapshot_index",
+        "liquid_snapshot_step",
+        "liquid_effective_child_seed",
+        "parent_structure_id",
+        "source_composition",
+        "liquid_source_parent_structure_id",
+        "liquid_source_composition",
+    )
+    missing = [key for key in required if key not in info]
+    if missing:
+        return CandidateValidationIssue("missing_liquid_provenance", {"fields": missing})
+    if (
+        info["liquid_method"] != _LIQUID_METHOD
+        or info["liquid_fidelity"] != _LIQUID_FIDELITY
+    ):
+        return CandidateValidationIssue(
+            "invalid_liquid_method",
+            {
+                "method": info["liquid_method"],
+                "fidelity": info["liquid_fidelity"],
+            },
+        )
+    try:
+        temperature = float(info["liquid_temperature_k"])
+        timestep = float(info["liquid_timestep_fs"])
+        friction = float(info["liquid_friction"])
+        equilibration_steps = int(info["liquid_equilibration_steps"])
+        spacing = int(info["liquid_steps_between_snapshots"])
+        configuration_index = int(info["liquid_configuration_index"])
+        snapshot_index = int(info["liquid_snapshot_index"])
+        snapshot_step = int(info["liquid_snapshot_step"])
+        effective_seed = int(info["liquid_effective_child_seed"])
+    except (TypeError, ValueError, OverflowError):
+        return CandidateValidationIssue("invalid_liquid_provenance", {})
+    if (
+        not math.isfinite(temperature)
+        or temperature < 0.0
+        or not math.isfinite(timestep)
+        or timestep <= 0.0
+        or not math.isfinite(friction)
+        or friction < 0.0
+        or equilibration_steps < 0
+        or spacing <= 0
+        or configuration_index < 0
+        or snapshot_index < 0
+        or effective_seed < 0
+        or snapshot_step != equilibration_steps + ((snapshot_index + 1) * spacing)
+    ):
+        return CandidateValidationIssue("invalid_liquid_provenance", {})
+    if (
+        not isinstance(info["liquid_source_parent_structure_id"], str)
+        or not info["liquid_source_parent_structure_id"].strip()
+    ):
+        return CandidateValidationIssue("invalid_liquid_source", {})
+    if info["liquid_source_composition"] is None:
+        return CandidateValidationIssue("invalid_liquid_source", {})
+    if info["source_composition"] is None or not isinstance(
+        info["parent_structure_id"], str
+    ):
+        return CandidateValidationIssue("invalid_liquid_source", {})
+    if "liquid_target_temperature_k" in info:
+        try:
+            target_temperature = float(info["liquid_target_temperature_k"])
+        except (TypeError, ValueError, OverflowError):
+            return CandidateValidationIssue(
+                "invalid_liquid_provenance", {"field": "liquid_target_temperature_k"}
+            )
+        if target_temperature != temperature:
+            return CandidateValidationIssue(
+                "invalid_liquid_provenance", {"field": "liquid_target_temperature_k"}
+            )
+    if "liquid_snapshot_spacing_steps" in info:
+        try:
+            snapshot_spacing = int(info["liquid_snapshot_spacing_steps"])
+        except (TypeError, ValueError, OverflowError):
+            return CandidateValidationIssue(
+                "invalid_liquid_provenance", {"field": "liquid_snapshot_spacing_steps"}
+            )
+        if snapshot_spacing != spacing:
+            return CandidateValidationIssue(
+                "invalid_liquid_provenance", {"field": "liquid_snapshot_spacing_steps"}
+            )
+    if "liquid_trajectory_index" in info:
+        try:
+            trajectory_index = int(info["liquid_trajectory_index"])
+        except (TypeError, ValueError, OverflowError):
+            return CandidateValidationIssue(
+                "invalid_liquid_provenance", {"field": "liquid_trajectory_index"}
+            )
+        if trajectory_index != configuration_index:
+            return CandidateValidationIssue(
+                "invalid_liquid_provenance", {"field": "liquid_trajectory_index"}
+            )
+    for alias in ("liquid_random_seed", "random_seed"):
+        if alias in info:
+            try:
+                alias_seed = int(info[alias])
+            except (TypeError, ValueError, OverflowError):
+                return CandidateValidationIssue("invalid_liquid_seed", {"field": alias})
+            if alias_seed != effective_seed:
+                return CandidateValidationIssue("invalid_liquid_seed", {"field": alias})
     return None
 
 
@@ -584,7 +708,18 @@ def validate_generation_config(config: GenerationConfig) -> GenerationConfig:
             "generation.grain_boundary_min_thickness must be finite and non-negative"
         )
     if not 0.0 <= config.grain_boundary_overlap_tolerance <= 1.0:
-        raise ConfigurationError("generation.grain_boundary_overlap_tolerance must be in [0, 1]")
+        raise ConfigurationError(
+            "generation.grain_boundary_overlap_tolerance must be in [0, 1]"
+        )
+    if config.use_liquid and (
+        config.n_liquid_configurations > 0 and config.n_liquid_snapshots > 0
+    ):
+        if config.liquid_timestep_fs <= 0.0:
+            raise ConfigurationError("generation.liquid_timestep_fs must be positive")
+        if config.liquid_steps_between_snapshots <= 0:
+            raise ConfigurationError(
+                "generation.liquid_steps_between_snapshots must be positive"
+            )
     _validate_source_scopes(config)
     return config
 
