@@ -231,9 +231,10 @@ class GenerationStage:
             n_workers=config.n_workers,
         )
         self._candidate_path = Path(output_path) if output_path is not None else None
-        get_records = getattr(self.coordinator, "get_provenance_records", None)
-        if callable(get_records):
-            self._persist_generated_records(request, get_records() or ())
+        self._persist_generated_records(
+            request,
+            self.coordinator.get_provenance_records(),
+        )
         return dict(self.coordinator.get_summary())
 
     def finalize(self, summary: Mapping[str, Any]) -> None:
