@@ -168,6 +168,24 @@ def _generation_values(config: NepflowConfig) -> dict[str, str]:
         "vacancy_interstitial_sources": ",".join(generation.vacancy_interstitial_sources),
         "n_gas_in_vacancy": str(generation.n_gas_in_vacancy),
         "gas_in_vacancy_sources": ",".join(generation.gas_in_vacancy_sources),
+        "surface_enabled": _bool_text(generation.surface_enabled),
+        "n_surfaces": str(generation.n_surfaces),
+        "surface_sources": ",".join(generation.surface_sources),
+        "surface_miller_indices": ";".join(
+            ",".join(map(str, index)) for index in generation.surface_miller_indices
+        ),
+        "surface_layers": str(generation.surface_layers),
+        "surface_thickness": (
+            "" if generation.surface_thickness is None else str(generation.surface_thickness)
+        ),
+        "surface_vacuum": str(generation.surface_vacuum),
+        "surface_termination_policy": generation.surface_termination_policy,
+        "surface_max_terminations": str(generation.surface_max_terminations),
+        "surface_in_plane_repeat": ",".join(map(str, generation.surface_in_plane_repeat)),
+        "surface_min_in_plane_dimensions": ",".join(
+            map(str, generation.surface_min_in_plane_dimensions)
+        ),
+        "surface_symmetric": _bool_text(generation.surface_symmetric),
         "liquid_sources": ",".join(generation.liquid_sources),
         "rattle_std": str(generation.rattle_std),
         "rattle_std_min": str(generation.rattle_std_min),

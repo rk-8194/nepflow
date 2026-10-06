@@ -43,6 +43,7 @@ from .models import (
     PerturbationTaskResult,
 )
 from .provenance import annotate_generation_provenance
+from .surfaces import surfaces
 from .volume import volume_profile
 
 logger = logging.getLogger(__name__)
@@ -60,6 +61,7 @@ _PERTURBATION_FAMILIES = frozenset(
         "antisite",
         "vacancy_interstitial",
         "gas_in_vacancy",
+        "surface",
     }
 )
 
@@ -272,6 +274,22 @@ def execute_perturbation_task(task: PerturbationTask) -> PerturbationTaskResult:
                 seed=task.seed,
             )
         )
+    if (
+        settings.surface_enabled
+        and task.counts.n_surfaces > 0
+        and family_applies_to_base("surface", task.base, settings)
+    ):
+        output.extend(
+            surfaces(
+                task.base,
+                task.base,
+                task.counts.n_surfaces,
+                settings,
+                None,
+                annotate,
+                seed=task.seed,
+            )
+        )
     accepted: list[Any] = []
     provenance_records: list[Any] = []
     rejected_attempts: list[PerturbationRejection] = []
@@ -422,6 +440,7 @@ class PerturbationCoordinator:
         n_antisites: int = 0,
         n_vacancy_interstitial: int = 0,
         n_gas_in_vacancy: int = 0,
+        n_surfaces: int = 0,
         n_workers: int = 0,
     ) -> Path:
         """Run typed tasks and persist candidates in deterministic base order."""
@@ -451,6 +470,7 @@ class PerturbationCoordinator:
             n_antisites=n_antisites,
             n_vacancy_interstitial=n_vacancy_interstitial,
             n_gas_in_vacancy=n_gas_in_vacancy,
+            n_surfaces=n_surfaces,
         )
         temporary_path: Path | None = None
         file_descriptor: int | None = None

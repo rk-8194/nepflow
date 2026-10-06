@@ -192,6 +192,17 @@ def _build_perturbation_coordinator(context: StageContext) -> PerturbationCoordi
         antisite_sources=generation.antisite_sources,
         vacancy_interstitial_sources=generation.vacancy_interstitial_sources,
         gas_in_vacancy_sources=generation.gas_in_vacancy_sources,
+        surface_enabled=generation.surface_enabled,
+        surface_miller_indices=generation.surface_miller_indices,
+        surface_layers=generation.surface_layers,
+        surface_thickness=generation.surface_thickness,
+        surface_vacuum=generation.surface_vacuum,
+        surface_termination_policy=generation.surface_termination_policy,
+        surface_max_terminations=generation.surface_max_terminations,
+        surface_in_plane_repeat=generation.surface_in_plane_repeat,
+        surface_min_in_plane_dimensions=generation.surface_min_in_plane_dimensions,
+        surface_symmetric=generation.surface_symmetric,
+        surface_sources=generation.surface_sources,
     )
 
 

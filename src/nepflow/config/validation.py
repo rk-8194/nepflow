@@ -163,6 +163,7 @@ def validate_config(
         "n_antisites",
         "n_vacancy_interstitial",
         "n_gas_in_vacancy",
+        "n_surfaces",
         "liquid_equilibration_steps",
         "liquid_steps_between_snapshots",
         "max_gas_occupancy",
@@ -185,10 +186,20 @@ def validate_config(
         "substitution_max",
         "antisite_min",
         "antisite_max",
+        "surface_vacuum",
+        "surface_min_in_plane_dimensions",
     ):
+        if field_name == "surface_min_in_plane_dimensions":
+            values = config.generation.surface_min_in_plane_dimensions
+            if len(values) != 2 or any(not math.isfinite(value) or value < 0.0 for value in values):
+                raise ConfigurationError(
+                    "generation.surface_min_in_plane_dimensions must contain two finite non-negative values"
+                )
+            continue
         _require_finite_non_negative(
             f"generation.{field_name}", getattr(config.generation, field_name)
         )
+    _validate_surface_settings(config.generation)
     _require_range(
         "generation.vacancy", config.generation.vacancy_min, config.generation.vacancy_max
     )
@@ -363,6 +374,43 @@ def _validate_point_defect_settings(config: GenerationConfig) -> None:
                 raise ConfigurationError(
                     f"generation.{field_name} sites must use fractional coordinates in [0, 1)"
                 )
+
+
+def _validate_surface_settings(config: GenerationConfig) -> None:
+    """Validate Miller, slab, termination, and in-plane surface controls."""
+
+    if config.surface_thickness is not None and (
+        not math.isfinite(config.surface_thickness) or config.surface_thickness <= 0.0
+    ):
+        raise ConfigurationError("generation.surface_thickness must be positive and finite")
+    _require_non_negative("generation.surface_layers", config.surface_layers)
+    if config.surface_thickness is None and config.surface_layers <= 0:
+        raise ConfigurationError(
+            "generation.surface_layers must be positive when surface_thickness is not set"
+        )
+    _require_non_negative("generation.surface_max_terminations", config.surface_max_terminations)
+    if config.surface_termination_policy not in {"all", "first"}:
+        raise ConfigurationError(
+            "generation.surface_termination_policy must be 'all' or 'first'"
+        )
+    if not config.surface_miller_indices:
+        if config.surface_enabled or config.n_surfaces:
+            raise ConfigurationError(
+                "generation.surface_miller_indices must contain at least one index"
+            )
+    for index in config.surface_miller_indices:
+        if len(index) != 3 or any(not isinstance(value, int) for value in index):
+            raise ConfigurationError(
+                "generation.surface_miller_indices must contain integer triples"
+            )
+        if not any(index):
+            raise ConfigurationError("generation.surface_miller_indices cannot contain (0, 0, 0)")
+    if len(config.surface_in_plane_repeat) != 2 or any(
+        not isinstance(value, int) or value <= 0 for value in config.surface_in_plane_repeat
+    ):
+        raise ConfigurationError(
+            "generation.surface_in_plane_repeat must contain two positive integers"
+        )
 
 
 def _validate_generation_source_scopes(config: GenerationConfig) -> None:

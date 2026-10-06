@@ -144,6 +144,22 @@ n_vacancy_interstitial=10
 vacancy_interstitial_sources=all
 n_gas_in_vacancy=10
 gas_in_vacancy_sources=all
+surface_enabled=false
+n_surfaces=0
+surface_sources=all
+
+# --- Surface/slab perturbations ---
+# Ordered Miller indices use h,k,l;h,k,l notation.  A blank thickness uses
+# surface_layers; otherwise thickness is the minimum slab-size target in Å.
+surface_miller_indices=1,0,0
+surface_layers=3
+surface_thickness=
+surface_vacuum=10.0
+surface_termination_policy=all
+surface_max_terminations=0
+surface_in_plane_repeat=1,1
+surface_min_in_plane_dimensions=0.0,0.0
+surface_symmetric=false
 liquid_sources=all
 
 # --- Perturbation parameters ---

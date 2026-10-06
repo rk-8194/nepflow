@@ -23,6 +23,7 @@ from .models import (
     PerturbationTaskResult,
     derive_child_seed,
 )
+from .surfaces import SurfaceConstructionError, surfaces
 
 __all__ = [
     "PerturbationCoordinator",
@@ -41,6 +42,8 @@ __all__ = [
     "substitutions",
     "vacancies",
     "vacancy_interstitial",
+    "SurfaceConstructionError",
+    "surfaces",
     "ElasticRecord",
     "fit_elastic_tensor",
     "strain_matrix_to_voigt",

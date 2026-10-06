@@ -21,6 +21,7 @@ PERTURBATION_FAMILY_SOURCE_FIELDS = {
     "antisite": "antisite_sources",
     "vacancy_interstitial": "vacancy_interstitial_sources",
     "gas_in_vacancy": "gas_in_vacancy_sources",
+    "surface": "surface_sources",
 }
 
 
@@ -53,6 +54,7 @@ class PerturbationCounts:
     n_antisites: int = 0
     n_vacancy_interstitial: int = 0
     n_gas_in_vacancy: int = 0
+    n_surfaces: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -115,6 +117,17 @@ class PerturbationSettings:
     antisite_sources: SourceScope = DEFAULT_SOURCE_SCOPE
     vacancy_interstitial_sources: SourceScope = DEFAULT_SOURCE_SCOPE
     gas_in_vacancy_sources: SourceScope = DEFAULT_SOURCE_SCOPE
+    surface_enabled: bool = False
+    surface_miller_indices: tuple[tuple[int, int, int], ...] = ((1, 0, 0),)
+    surface_layers: int = 3
+    surface_thickness: float | None = None
+    surface_vacuum: float = 10.0
+    surface_termination_policy: str = "all"
+    surface_max_terminations: int = 0
+    surface_in_plane_repeat: tuple[int, int] = (1, 1)
+    surface_min_in_plane_dimensions: tuple[float, float] = (0.0, 0.0)
+    surface_symmetric: bool = False
+    surface_sources: SourceScope = DEFAULT_SOURCE_SCOPE
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "vacancy_range", tuple(self.vacancy_range))
@@ -122,6 +135,17 @@ class PerturbationSettings:
         object.__setattr__(self, "substitution_range", tuple(self.substitution_range))
         object.__setattr__(self, "antisite_range", tuple(self.antisite_range))
         object.__setattr__(self, "volume_scale_range", tuple(self.volume_scale_range))
+        object.__setattr__(
+            self,
+            "surface_miller_indices",
+            tuple(tuple(int(value) for value in index) for index in self.surface_miller_indices),
+        )
+        object.__setattr__(self, "surface_in_plane_repeat", tuple(self.surface_in_plane_repeat))
+        object.__setattr__(
+            self,
+            "surface_min_in_plane_dimensions",
+            tuple(self.surface_min_in_plane_dimensions),
+        )
         object.__setattr__(self, "gas_elements", tuple(self.gas_elements or ()))
         object.__setattr__(self, "vacancy_species", tuple(self.vacancy_species or ()))
         object.__setattr__(self, "substitution_pairs", _normalise_pairs(self.substitution_pairs))
@@ -204,6 +228,17 @@ class PerturbationSettings:
             "antisite_sources": list(self.antisite_sources),
             "vacancy_interstitial_sources": list(self.vacancy_interstitial_sources),
             "gas_in_vacancy_sources": list(self.gas_in_vacancy_sources),
+            "surface_enabled": self.surface_enabled,
+            "surface_miller_indices": [list(index) for index in self.surface_miller_indices],
+            "surface_layers": self.surface_layers,
+            "surface_thickness": self.surface_thickness,
+            "surface_vacuum": self.surface_vacuum,
+            "surface_termination_policy": self.surface_termination_policy,
+            "surface_max_terminations": self.surface_max_terminations,
+            "surface_in_plane_repeat": self.surface_in_plane_repeat,
+            "surface_min_in_plane_dimensions": self.surface_min_in_plane_dimensions,
+            "surface_symmetric": self.surface_symmetric,
+            "surface_sources": list(self.surface_sources),
         }
 
     def sources_for_family(self, family: str) -> SourceScope:

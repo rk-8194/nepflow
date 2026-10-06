@@ -31,6 +31,7 @@ GENERATION_SOURCE_SCOPE_FIELDS = (
     "antisite_sources",
     "vacancy_interstitial_sources",
     "gas_in_vacancy_sources",
+    "surface_sources",
 )
 
 
@@ -128,6 +129,18 @@ class GenerationConfig:
     vacancy_interstitial_sources: SourceScope = DEFAULT_SOURCE_SCOPE
     n_gas_in_vacancy: int = 10
     gas_in_vacancy_sources: SourceScope = DEFAULT_SOURCE_SCOPE
+    surface_enabled: bool = False
+    n_surfaces: int = 0
+    surface_sources: SourceScope = DEFAULT_SOURCE_SCOPE
+    surface_miller_indices: tuple[tuple[int, int, int], ...] = ((1, 0, 0),)
+    surface_layers: int = 3
+    surface_thickness: float | None = None
+    surface_vacuum: float = 10.0
+    surface_termination_policy: str = "all"
+    surface_max_terminations: int = 0
+    surface_in_plane_repeat: tuple[int, int] = (1, 1)
+    surface_min_in_plane_dimensions: tuple[float, float] = (0.0, 0.0)
+    surface_symmetric: bool = False
     liquid_sources: SourceScope = DEFAULT_SOURCE_SCOPE
     rattle_std: float = 0.03
     rattle_std_min: float = 0.015

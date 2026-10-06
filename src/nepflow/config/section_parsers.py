@@ -200,6 +200,9 @@ def _parse_generation_modes(values: Mapping[str, str]) -> dict[str, Any]:
             values.get("n_gas_in_vacancy", "10"),
             "generation.n_gas_in_vacancy",
         ),
+        "n_surfaces": _parse_int(
+            values.get("n_surfaces", "0"), "generation.n_surfaces"
+        ),
     }
 
 
@@ -322,6 +325,40 @@ def _parse_generation_perturbations(values: Mapping[str, str]) -> dict[str, Any]
         "crystallographic_interstitial_sites": _parse_interstitial_sites(
             values.get("crystallographic_interstitial_sites", ""),
             "generation.crystallographic_interstitial_sites",
+        ),
+        "surface_enabled": _parse_bool(
+            values.get("surface_enabled", "false"), "generation.surface_enabled"
+        ),
+        "surface_miller_indices": _parse_miller_indices(
+            values.get("surface_miller_indices", "1,0,0"),
+            "generation.surface_miller_indices",
+        ),
+        "surface_layers": _parse_int(
+            values.get("surface_layers", "3"), "generation.surface_layers"
+        ),
+        "surface_thickness": _parse_optional_float(
+            values.get("surface_thickness", ""), "generation.surface_thickness"
+        ),
+        "surface_vacuum": _parse_float(
+            values.get("surface_vacuum", "10.0"), "generation.surface_vacuum"
+        ),
+        "surface_termination_policy": values.get(
+            "surface_termination_policy", "all"
+        ).strip().lower(),
+        "surface_max_terminations": _parse_int(
+            values.get("surface_max_terminations", "0"),
+            "generation.surface_max_terminations",
+        ),
+        "surface_in_plane_repeat": _parse_int_pair(
+            values.get("surface_in_plane_repeat", "1,1"),
+            "generation.surface_in_plane_repeat",
+        ),
+        "surface_min_in_plane_dimensions": _parse_float_pair(
+            values.get("surface_min_in_plane_dimensions", "0.0,0.0"),
+            "generation.surface_min_in_plane_dimensions",
+        ),
+        "surface_symmetric": _parse_bool(
+            values.get("surface_symmetric", "false"), "generation.surface_symmetric"
         ),
     }
 
@@ -641,6 +678,12 @@ def _parse_float(value: str, name: str) -> float:
         raise ConfigurationError(f"{name} must be a float") from exc
 
 
+def _parse_optional_float(value: str, name: str) -> float | None:
+    if not value.strip():
+        return None
+    return _parse_float(value, name)
+
+
 def _parse_bool(value: str, name: str) -> bool:
     normalized = value.strip().lower()
     if normalized in {"1", "yes", "true", "on"}:
@@ -695,6 +738,60 @@ def _parse_interstitial_sites(value: str, name: str) -> tuple[Any, ...]:
         except (TypeError, ValueError) as exc:
             raise ConfigurationError(f"{name} sites must contain numeric coordinates") from exc
     return tuple(result)
+
+
+def _parse_miller_indices(value: str, name: str) -> tuple[tuple[int, int, int], ...]:
+    """Parse ``h,k,l;h,k,l`` or a JSON list of Miller triples."""
+
+    text = value.strip()
+    if not text:
+        return ()
+    try:
+        decoded = json.loads(text)
+    except json.JSONDecodeError:
+        decoded = None
+    if decoded is not None:
+        raw_indices = decoded
+    else:
+        raw_indices = [item for item in text.replace("|", ";").split(";") if item.strip()]
+    if not isinstance(raw_indices, (list, tuple)):
+        raise ConfigurationError(f"{name} must contain Miller-index triples")
+    result: list[tuple[int, int, int]] = []
+    for raw_index in raw_indices:
+        if isinstance(raw_index, str):
+            values = tuple(item for item in raw_index.replace(",", " ").split() if item)
+        elif isinstance(raw_index, (list, tuple)):
+            values = tuple(raw_index)
+        else:
+            raise ConfigurationError(f"{name} must contain Miller-index triples")
+        if len(values) != 3:
+            raise ConfigurationError(f"{name} must contain Miller-index triples")
+        try:
+            index = tuple(int(item) for item in values)
+        except (TypeError, ValueError) as exc:
+            raise ConfigurationError(f"{name} must contain integer Miller indices") from exc
+        result.append(index)  # type: ignore[arg-type]
+    return tuple(result)
+
+
+def _parse_int_pair(value: str, name: str) -> tuple[int, int]:
+    items = tuple(item for item in value.replace(",", " ").split() if item)
+    if len(items) != 2:
+        raise ConfigurationError(f"{name} must contain exactly two integers")
+    try:
+        return int(items[0]), int(items[1])
+    except ValueError as exc:
+        raise ConfigurationError(f"{name} must contain exactly two integers") from exc
+
+
+def _parse_float_pair(value: str, name: str) -> tuple[float, float]:
+    items = tuple(item for item in value.replace(",", " ").split() if item)
+    if len(items) != 2:
+        raise ConfigurationError(f"{name} must contain exactly two floats")
+    try:
+        return float(items[0]), float(items[1])
+    except ValueError as exc:
+        raise ConfigurationError(f"{name} must contain exactly two floats") from exc
 
 
 def _parse_float_list(value: str, name: str) -> tuple[float, ...]:

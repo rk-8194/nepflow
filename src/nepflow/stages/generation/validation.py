@@ -193,6 +193,10 @@ def _validate_family_state(
     reference: Any,
     family: str,
 ) -> CandidateValidationIssue | None:
+    if family == "surface":
+        issue = _validate_surface_state(candidate)
+        if issue is not None:
+            return issue
     try:
         reference_symbols = list(reference.get_chemical_symbols())
     except Exception:
@@ -353,6 +357,50 @@ def _validate_family_state(
     return None
 
 
+def _validate_surface_state(candidate: Any) -> CandidateValidationIssue | None:
+    """Validate surface-specific provenance and two-dimensional periodicity."""
+
+    info = getattr(candidate, "info", {})
+    required = (
+        "parent_structure_id",
+        "surface_miller_index",
+        "surface_termination",
+        "surface_layers",
+        "surface_vacuum",
+        "surface_in_plane_repeat",
+        "surface_stoichiometry_change",
+    )
+    missing = [key for key in required if key not in info]
+    if missing:
+        return CandidateValidationIssue("missing_surface_provenance", {"fields": missing})
+    pbc = _pbc_flags(candidate)
+    if pbc is None or tuple(bool(value) for value in pbc) != (True, True, False):
+        return CandidateValidationIssue(
+            "invalid_surface_pbc",
+            {"expected": [True, True, False], "realised": None if pbc is None else pbc.tolist()},
+        )
+    try:
+        miller = tuple(int(value) for value in info["surface_miller_index"])
+    except (TypeError, ValueError):
+        return CandidateValidationIssue("invalid_surface_miller_index", {})
+    if len(miller) != 3 or not any(miller):
+        return CandidateValidationIssue("invalid_surface_miller_index", {"value": miller})
+    try:
+        vacuum = float(info["surface_vacuum"])
+    except (TypeError, ValueError):
+        return CandidateValidationIssue("invalid_surface_vacuum", {})
+    if not math.isfinite(vacuum) or vacuum <= 0.0:
+        return CandidateValidationIssue("invalid_surface_vacuum", {"value": vacuum})
+    repeat = info["surface_in_plane_repeat"]
+    try:
+        repeat_values = tuple(int(value) for value in repeat)
+    except (TypeError, ValueError):
+        return CandidateValidationIssue("invalid_surface_repeat", {})
+    if len(repeat_values) != 2 or any(value <= 0 for value in repeat_values):
+        return CandidateValidationIssue("invalid_surface_repeat", {"value": repeat})
+    return None
+
+
 def _metadata_integer(info: Any, *keys: str) -> int | None:
     for key in keys:
         if key in info:
@@ -400,6 +448,44 @@ def validate_generation_config(config: GenerationConfig) -> GenerationConfig:
         raise ConfigurationError("generation.composition_tolerance must be in [0, 1]")
     if config.n_workers < 0:
         raise ConfigurationError("generation.n_workers must be non-negative")
+    if config.n_surfaces < 0:
+        raise ConfigurationError("generation.n_surfaces must be non-negative")
+    if config.surface_layers < 0:
+        raise ConfigurationError("generation.surface_layers must be non-negative")
+    if config.surface_thickness is None and config.surface_layers == 0:
+        raise ConfigurationError(
+            "generation.surface_layers must be positive when surface_thickness is not set"
+        )
+    if config.surface_max_terminations < 0:
+        raise ConfigurationError("generation.surface_max_terminations must be non-negative")
+    if config.surface_termination_policy not in {"all", "first"}:
+        raise ConfigurationError(
+            "generation.surface_termination_policy must be 'all' or 'first'"
+        )
+    for index in config.surface_miller_indices:
+        if len(index) != 3 or not any(index):
+            raise ConfigurationError(
+                "generation.surface_miller_indices must contain non-zero triples"
+            )
+    if len(config.surface_in_plane_repeat) != 2 or any(
+        value <= 0 for value in config.surface_in_plane_repeat
+    ):
+        raise ConfigurationError(
+            "generation.surface_in_plane_repeat must contain two positive integers"
+        )
+    if len(config.surface_min_in_plane_dimensions) != 2 or any(
+        not math.isfinite(value) or value < 0.0
+        for value in config.surface_min_in_plane_dimensions
+    ):
+        raise ConfigurationError(
+            "generation.surface_min_in_plane_dimensions must be finite and non-negative"
+        )
+    if config.surface_thickness is not None and (
+        not math.isfinite(config.surface_thickness) or config.surface_thickness <= 0.0
+    ):
+        raise ConfigurationError("generation.surface_thickness must be positive and finite")
+    if not math.isfinite(config.surface_vacuum) or config.surface_vacuum <= 0.0:
+        raise ConfigurationError("generation.surface_vacuum must be positive and finite")
     _validate_source_scopes(config)
     return config
 
