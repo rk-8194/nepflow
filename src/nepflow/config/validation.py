@@ -457,9 +457,7 @@ def _validate_grain_boundary_settings(config: GenerationConfig) -> None:
         "generation.grain_boundary_sigma", config.grain_boundary_sigma, strictly_positive=True
     )
     if not 0.0 <= config.grain_boundary_overlap_tolerance <= 1.0:
-        raise ConfigurationError(
-            "generation.grain_boundary_overlap_tolerance must be in [0, 1]"
-        )
+        raise ConfigurationError("generation.grain_boundary_overlap_tolerance must be in [0, 1]")
 
 
 def _validate_generation_source_scopes(config: GenerationConfig) -> None:
