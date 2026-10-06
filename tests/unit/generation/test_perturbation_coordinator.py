@@ -278,10 +278,10 @@ def test_one_perturbation_task_represents_one_base_structure() -> None:
 
 
 def test_serial_and_parallel_candidates_are_ordered_and_scientifically_equal() -> None:
-    bases = [
-        base_atoms(source="first", seed_id="seed-first"),
-        base_atoms(source="second", seed_id="seed-second"),
-    ]
+    first = base_atoms(source="first", seed_id="seed-first")
+    second = base_atoms(source="second", seed_id="seed-second")
+    second.set_cell(np.diag([12.5, 12.0, 12.0]), scale_atoms=False)
+    bases = [first, second]
     settings = PerturbationSettings(
         target_n_atoms=4,
         random_seed=21,
