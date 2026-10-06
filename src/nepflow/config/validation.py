@@ -2,6 +2,8 @@
 
 import math
 import re
+from collections.abc import Mapping, Sequence
+from typing import Any
 
 from ase.data import chemical_symbols
 
@@ -157,11 +159,14 @@ def validate_config(
         "n_vacancies",
         "n_interstitials",
         "n_gas_interstitials",
+        "n_substitutions",
+        "n_antisites",
         "n_vacancy_interstitial",
         "n_gas_in_vacancy",
         "liquid_equilibration_steps",
         "liquid_steps_between_snapshots",
         "max_gas_occupancy",
+        "interstitial_max_attempts",
     ):
         _require_non_negative(f"generation.{field_name}", getattr(config.generation, field_name))
     for field_name in (
@@ -174,6 +179,12 @@ def validate_config(
         "rattle_d_min",
         "interstitial_d_min",
         "gas_interstitial_d_min",
+        "defect_defect_d_min",
+        "periodic_image_d_min",
+        "substitution_min",
+        "substitution_max",
+        "antisite_min",
+        "antisite_max",
     ):
         _require_finite_non_negative(
             f"generation.{field_name}", getattr(config.generation, field_name)
@@ -186,6 +197,17 @@ def validate_config(
         config.generation.interstitial_min,
         config.generation.interstitial_max,
     )
+    _require_range(
+        "generation.substitution",
+        config.generation.substitution_min,
+        config.generation.substitution_max,
+    )
+    _require_range(
+        "generation.antisite",
+        config.generation.antisite_min,
+        config.generation.antisite_max,
+    )
+    _validate_point_defect_settings(config.generation)
     _require_range(
         "generation.volume_scale",
         config.generation.volume_scale_min,
@@ -295,6 +317,52 @@ def validate_config(
 
 def _is_element_symbol(value: str) -> bool:
     return value in KNOWN_ELEMENT_SYMBOLS
+
+
+def _validate_point_defect_settings(config: GenerationConfig) -> None:
+    """Validate species and crystallographic inputs used by defect families."""
+
+    for field_name in ("vacancy_species",):
+        values = getattr(config, field_name)
+        if any(not _is_element_symbol(value) for value in values):
+            raise ConfigurationError(f"generation.{field_name} contains an invalid element symbol")
+    for field_name in ("substitution_pairs", "antisite_pairs"):
+        pairs = getattr(config, field_name)
+        for pair in pairs:
+            if len(pair) != 2 or any(not _is_element_symbol(value) for value in pair):
+                raise ConfigurationError(
+                    f"generation.{field_name} contains an invalid element pair"
+                )
+            if pair[0] == pair[1]:
+                raise ConfigurationError(
+                    f"generation.{field_name} pairs must contain distinct elements"
+                )
+    for field_name in ("interstitial_sites", "crystallographic_interstitial_sites"):
+        for site in getattr(config, field_name):
+            coordinates: Sequence[Any] | None
+            if isinstance(site, Mapping):
+                raw = site.get("fractional", site.get("position"))
+                coordinates = (
+                    raw if isinstance(raw, Sequence) and not isinstance(raw, str) else None
+                )
+            else:
+                coordinates = (
+                    site if isinstance(site, Sequence) and not isinstance(site, str) else None
+                )
+            if coordinates is None or len(coordinates) != 3:
+                raise ConfigurationError(
+                    f"generation.{field_name} sites must contain three coordinates"
+                )
+            try:
+                values = tuple(float(value) for value in coordinates)
+            except (TypeError, ValueError) as exc:
+                raise ConfigurationError(
+                    f"generation.{field_name} sites must contain numeric coordinates"
+                ) from exc
+            if any(not math.isfinite(value) or not 0.0 <= value < 1.0 for value in values):
+                raise ConfigurationError(
+                    f"generation.{field_name} sites must use fractional coordinates in [0, 1)"
+                )
 
 
 def _validate_generation_source_scopes(config: GenerationConfig) -> None:

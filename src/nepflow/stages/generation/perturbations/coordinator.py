@@ -24,9 +24,11 @@ from nepflow.stages.generation.validation import (
 )
 
 from .defects import (
+    antisites,
     gas_in_vacancy,
     gas_interstitials,
     interstitials,
+    substitutions,
     vacancies,
     vacancy_interstitial,
 )
@@ -54,6 +56,8 @@ _PERTURBATION_FAMILIES = frozenset(
         "vacancy",
         "interstitial",
         "gas_interstitial",
+        "substitution",
+        "antisite",
         "vacancy_interstitial",
         "gas_in_vacancy",
     }
@@ -204,6 +208,34 @@ def execute_perturbation_task(task: PerturbationTask) -> PerturbationTaskResult:
                 supercell,
                 task.base,
                 task.counts.n_gas_interstitials,
+                settings,
+                None,
+                annotate,
+                seed=task.seed,
+            )
+        )
+    if task.counts.n_substitutions > 0 and family_applies_to_base(
+        "substitution", task.base, settings
+    ):
+        output.extend(
+            substitutions(
+                supercell,
+                task.base,
+                task.counts.n_substitutions,
+                settings,
+                None,
+                annotate,
+                seed=task.seed,
+            )
+        )
+    if task.counts.n_antisites > 0 and family_applies_to_base(
+        "antisite", task.base, settings
+    ):
+        output.extend(
+            antisites(
+                supercell,
+                task.base,
+                task.counts.n_antisites,
                 settings,
                 None,
                 annotate,
@@ -388,6 +420,8 @@ class PerturbationCoordinator:
         n_vacancies: int = 10,
         n_interstitials: int = 10,
         n_gas_interstitials: int = 0,
+        n_substitutions: int = 0,
+        n_antisites: int = 0,
         n_vacancy_interstitial: int = 0,
         n_gas_in_vacancy: int = 0,
         n_workers: int = 0,
@@ -415,6 +449,8 @@ class PerturbationCoordinator:
             n_vacancies=n_vacancies,
             n_interstitials=n_interstitials,
             n_gas_interstitials=n_gas_interstitials,
+            n_substitutions=n_substitutions,
+            n_antisites=n_antisites,
             n_vacancy_interstitial=n_vacancy_interstitial,
             n_gas_in_vacancy=n_gas_in_vacancy,
         )

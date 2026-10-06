@@ -188,6 +188,12 @@ def _parse_generation_modes(values: Mapping[str, str]) -> dict[str, Any]:
             values.get("n_gas_interstitials", "10"),
             "generation.n_gas_interstitials",
         ),
+        "n_substitutions": _parse_int(
+            values.get("n_substitutions", "0"), "generation.n_substitutions"
+        ),
+        "n_antisites": _parse_int(
+            values.get("n_antisites", "0"), "generation.n_antisites"
+        ),
         "n_vacancy_interstitial": _parse_int(
             values.get("n_vacancy_interstitial", "10"),
             "generation.n_vacancy_interstitial",
@@ -279,9 +285,49 @@ def _parse_generation_perturbations(values: Mapping[str, str]) -> dict[str, Any]
             values.get("gas_interstitial_d_min", "1.2"),
             "generation.gas_interstitial_d_min",
         ),
+        "defect_defect_d_min": _parse_float(
+            values.get("defect_defect_d_min", "0.0"),
+            "generation.defect_defect_d_min",
+        ),
+        "periodic_image_d_min": _parse_float(
+            values.get("periodic_image_d_min", "0.0"),
+            "generation.periodic_image_d_min",
+        ),
+        "interstitial_max_attempts": _parse_int(
+            values.get("interstitial_max_attempts", "500"),
+            "generation.interstitial_max_attempts",
+        ),
         "max_gas_occupancy": _parse_int(
             values.get("max_gas_occupancy", "3"),
             "generation.max_gas_occupancy",
+        ),
+        "vacancy_species": _parse_symbols(
+            values.get("vacancy_species", ""), "generation.vacancy_species"
+        ),
+        "substitution_pairs": _parse_species_pairs(
+            values.get("substitution_pairs", ""), "generation.substitution_pairs"
+        ),
+        "substitution_min": _parse_float(
+            values.get("substitution_min", "0.0"), "generation.substitution_min"
+        ),
+        "substitution_max": _parse_float(
+            values.get("substitution_max", "0.1"), "generation.substitution_max"
+        ),
+        "antisite_pairs": _parse_species_pairs(
+            values.get("antisite_pairs", ""), "generation.antisite_pairs"
+        ),
+        "antisite_min": _parse_float(
+            values.get("antisite_min", "0.0"), "generation.antisite_min"
+        ),
+        "antisite_max": _parse_float(
+            values.get("antisite_max", "0.1"), "generation.antisite_max"
+        ),
+        "interstitial_sites": _parse_interstitial_sites(
+            values.get("interstitial_sites", ""), "generation.interstitial_sites"
+        ),
+        "crystallographic_interstitial_sites": _parse_interstitial_sites(
+            values.get("crystallographic_interstitial_sites", ""),
+            "generation.crystallographic_interstitial_sites",
         ),
     }
 
@@ -619,6 +665,42 @@ def _parse_list(value: str, name: str) -> tuple[str, ...]:
 
 def _parse_symbols(value: str, name: str) -> tuple[str, ...]:
     return _parse_list(value, name)
+
+
+def _parse_species_pairs(value: str, name: str) -> tuple[tuple[str, str], ...]:
+    if not value.strip():
+        return ()
+    pairs: list[tuple[str, str]] = []
+    for item in value.replace(";", ",").split(","):
+        parts = tuple(part.strip() for part in item.split("->"))
+        if len(parts) != 2 or not all(parts):
+            raise ConfigurationError(f"{name} must use source->target pairs")
+        pairs.append((parts[0], parts[1]))
+    return tuple(pairs)
+
+
+def _parse_interstitial_sites(value: str, name: str) -> tuple[Any, ...]:
+    if not value.strip():
+        return ()
+    try:
+        decoded = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise ConfigurationError(f"{name} must be JSON fractional-coordinate sites") from exc
+    if not isinstance(decoded, list):
+        raise ConfigurationError(f"{name} must be a JSON list of sites")
+    result: list[Any] = []
+    for site in decoded:
+        if isinstance(site, Mapping):
+            coordinates = site.get("fractional", site.get("position"))
+        else:
+            coordinates = site
+        if not isinstance(coordinates, (list, tuple)) or len(coordinates) != 3:
+            raise ConfigurationError(f"{name} sites must contain three coordinates")
+        try:
+            result.append(tuple(float(value) for value in coordinates))
+        except (TypeError, ValueError) as exc:
+            raise ConfigurationError(f"{name} sites must contain numeric coordinates") from exc
+    return tuple(result)
 
 
 def _parse_float_list(value: str, name: str) -> tuple[float, ...]:

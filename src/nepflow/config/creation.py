@@ -136,6 +136,10 @@ n_interstitials=10
 interstitial_sources=all
 n_gas_interstitials=10
 gas_interstitial_sources=all
+n_substitutions=0
+substitution_sources=all
+n_antisites=0
+antisite_sources=all
 n_vacancy_interstitial=10
 vacancy_interstitial_sources=all
 n_gas_in_vacancy=10
@@ -152,11 +156,25 @@ rattle_d_min=1.5
 # Vacancies (fraction of atoms to remove)
 vacancy_min=0.0
 vacancy_max=0.1
+vacancy_species=
 
 # Interstitials (atoms inserted at random valid positions)
 interstitial_d_min=1.65
 interstitial_min=0.05
 interstitial_max=0.1
+interstitial_sites=
+crystallographic_interstitial_sites=
+defect_defect_d_min=0.0
+periodic_image_d_min=0.0
+interstitial_max_attempts=500
+
+# Substitution and antisite defects. Pairs use source->target notation.
+substitution_pairs=
+substitution_min=0.0
+substitution_max=0.1
+antisite_pairs=
+antisite_min=0.0
+antisite_max=0.1
 
 [selection]
 # NEP model file for descriptor computation (in config/nep/ directory)

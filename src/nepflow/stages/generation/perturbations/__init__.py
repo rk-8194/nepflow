@@ -1,6 +1,15 @@
 """Focused perturbation families and their typed coordinator."""
 
 from .coordinator import PerturbationCoordinator, PerturbationTaskError, family_applies_to_base
+from .defects import (
+    antisites,
+    gas_in_vacancy,
+    gas_interstitials,
+    interstitials,
+    substitutions,
+    vacancies,
+    vacancy_interstitial,
+)
 from .elasticity import (
     ElasticRecord,
     fit_elastic_tensor,
@@ -25,6 +34,13 @@ __all__ = [
     "PerturbationTaskResult",
     "derive_child_seed",
     "family_applies_to_base",
+    "antisites",
+    "gas_in_vacancy",
+    "gas_interstitials",
+    "interstitials",
+    "substitutions",
+    "vacancies",
+    "vacancy_interstitial",
     "ElasticRecord",
     "fit_elastic_tensor",
     "strain_matrix_to_voigt",

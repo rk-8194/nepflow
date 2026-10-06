@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from configparser import ConfigParser
 from pathlib import Path
 
@@ -159,6 +160,10 @@ def _generation_values(config: NepflowConfig) -> dict[str, str]:
         "interstitial_sources": ",".join(generation.interstitial_sources),
         "n_gas_interstitials": str(generation.n_gas_interstitials),
         "gas_interstitial_sources": ",".join(generation.gas_interstitial_sources),
+        "n_substitutions": str(generation.n_substitutions),
+        "substitution_sources": ",".join(generation.substitution_sources),
+        "n_antisites": str(generation.n_antisites),
+        "antisite_sources": ",".join(generation.antisite_sources),
         "n_vacancy_interstitial": str(generation.n_vacancy_interstitial),
         "vacancy_interstitial_sources": ",".join(generation.vacancy_interstitial_sources),
         "n_gas_in_vacancy": str(generation.n_gas_in_vacancy),
@@ -170,9 +175,27 @@ def _generation_values(config: NepflowConfig) -> dict[str, str]:
         "rattle_d_min": str(generation.rattle_d_min),
         "vacancy_min": str(generation.vacancy_min),
         "vacancy_max": str(generation.vacancy_max),
+        "vacancy_species": ",".join(generation.vacancy_species),
         "interstitial_d_min": str(generation.interstitial_d_min),
         "interstitial_min": str(generation.interstitial_min),
         "interstitial_max": str(generation.interstitial_max),
+        "interstitial_sites": json.dumps(generation.interstitial_sites),
+        "crystallographic_interstitial_sites": json.dumps(
+            generation.crystallographic_interstitial_sites
+        ),
+        "defect_defect_d_min": str(generation.defect_defect_d_min),
+        "periodic_image_d_min": str(generation.periodic_image_d_min),
+        "interstitial_max_attempts": str(generation.interstitial_max_attempts),
+        "substitution_pairs": ";".join(
+            f"{source}->{target}" for source, target in generation.substitution_pairs
+        ),
+        "substitution_min": str(generation.substitution_min),
+        "substitution_max": str(generation.substitution_max),
+        "antisite_pairs": ";".join(
+            f"{source}->{target}" for source, target in generation.antisite_pairs
+        ),
+        "antisite_min": str(generation.antisite_min),
+        "antisite_max": str(generation.antisite_max),
         "gas_interstitial_d_min": str(generation.gas_interstitial_d_min),
         "max_gas_occupancy": str(generation.max_gas_occupancy),
     }

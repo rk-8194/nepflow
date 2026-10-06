@@ -17,6 +17,8 @@ PERTURBATION_FAMILY_SOURCE_FIELDS = {
     "vacancy": "vacancy_sources",
     "interstitial": "interstitial_sources",
     "gas_interstitial": "gas_interstitial_sources",
+    "substitution": "substitution_sources",
+    "antisite": "antisite_sources",
     "vacancy_interstitial": "vacancy_interstitial_sources",
     "gas_in_vacancy": "gas_in_vacancy_sources",
 }
@@ -47,6 +49,8 @@ class PerturbationCounts:
     n_vacancies: int = 10
     n_interstitials: int = 10
     n_gas_interstitials: int = 0
+    n_substitutions: int = 0
+    n_antisites: int = 0
     n_vacancy_interstitial: int = 0
     n_gas_in_vacancy: int = 0
 
@@ -68,6 +72,9 @@ class PerturbationSettings:
     vacancy_range: tuple[float, float] = (0.0, 0.1)
     interstitial_range: tuple[float, float] = (0.05, 0.1)
     interstitial_d_min: float = 1.65
+    defect_defect_d_min: float = 0.0
+    periodic_image_d_min: float = 0.0
+    interstitial_max_attempts: int = 500
     volume_scale_range: tuple[float, float] = (0.8, 1.2)
     n_volume_points: int = 11
     target_n_atoms: int = 250
@@ -75,6 +82,13 @@ class PerturbationSettings:
     gas_elements: tuple[str, ...] = ()
     gas_interstitial_d_min: float | None = None
     max_gas_occupancy: int = 3
+    vacancy_species: tuple[str, ...] = ()
+    substitution_pairs: tuple[tuple[str, str], ...] = ()
+    antisite_pairs: tuple[tuple[str, str], ...] = ()
+    substitution_range: tuple[float, float] = (0.0, 0.1)
+    antisite_range: tuple[float, float] = (0.0, 0.1)
+    interstitial_sites: tuple[Any, ...] = ()
+    crystallographic_interstitial_sites: tuple[Any, ...] = ()
     elastic_stress_enabled: bool = True
     elastic_strain_amplitudes: tuple[float, ...] = (
         -0.02,
@@ -97,14 +111,28 @@ class PerturbationSettings:
     vacancy_sources: SourceScope = DEFAULT_SOURCE_SCOPE
     interstitial_sources: SourceScope = DEFAULT_SOURCE_SCOPE
     gas_interstitial_sources: SourceScope = DEFAULT_SOURCE_SCOPE
+    substitution_sources: SourceScope = DEFAULT_SOURCE_SCOPE
+    antisite_sources: SourceScope = DEFAULT_SOURCE_SCOPE
     vacancy_interstitial_sources: SourceScope = DEFAULT_SOURCE_SCOPE
     gas_in_vacancy_sources: SourceScope = DEFAULT_SOURCE_SCOPE
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "vacancy_range", tuple(self.vacancy_range))
         object.__setattr__(self, "interstitial_range", tuple(self.interstitial_range))
+        object.__setattr__(self, "substitution_range", tuple(self.substitution_range))
+        object.__setattr__(self, "antisite_range", tuple(self.antisite_range))
         object.__setattr__(self, "volume_scale_range", tuple(self.volume_scale_range))
         object.__setattr__(self, "gas_elements", tuple(self.gas_elements or ()))
+        object.__setattr__(self, "vacancy_species", tuple(self.vacancy_species or ()))
+        object.__setattr__(self, "substitution_pairs", _normalise_pairs(self.substitution_pairs))
+        object.__setattr__(self, "antisite_pairs", _normalise_pairs(self.antisite_pairs))
+        configured_sites = self.crystallographic_interstitial_sites or self.interstitial_sites
+        object.__setattr__(self, "interstitial_sites", tuple(configured_sites or ()))
+        object.__setattr__(
+            self,
+            "crystallographic_interstitial_sites",
+            tuple(configured_sites or ()),
+        )
         amplitudes = self.elastic_strain_amplitudes
         if amplitudes is None:
             amplitudes = (-0.02, -0.01, -0.005, 0.005, 0.01, 0.02)
@@ -140,6 +168,9 @@ class PerturbationSettings:
             "vacancy_range": self.vacancy_range,
             "interstitial_range": self.interstitial_range,
             "interstitial_d_min": self.interstitial_d_min,
+            "defect_defect_d_min": self.defect_defect_d_min,
+            "periodic_image_d_min": self.periodic_image_d_min,
+            "interstitial_max_attempts": self.interstitial_max_attempts,
             "volume_scale_range": self.volume_scale_range,
             "n_volume_points": self.n_volume_points,
             "target_n_atoms": self.target_n_atoms,
@@ -147,6 +178,13 @@ class PerturbationSettings:
             "gas_elements": list(self.gas_elements),
             "gas_interstitial_d_min": self.gas_interstitial_d_min,
             "max_gas_occupancy": self.max_gas_occupancy,
+            "vacancy_species": list(self.vacancy_species),
+            "substitution_pairs": [list(pair) for pair in self.substitution_pairs],
+            "antisite_pairs": [list(pair) for pair in self.antisite_pairs],
+            "substitution_range": self.substitution_range,
+            "antisite_range": self.antisite_range,
+            "interstitial_sites": list(self.interstitial_sites),
+            "crystallographic_interstitial_sites": list(self.crystallographic_interstitial_sites),
             "elastic_stress_enabled": self.elastic_stress_enabled,
             "elastic_strain_amplitudes": list(self.elastic_strain_amplitudes),
             "liquid_enabled": self.liquid_enabled,
@@ -162,6 +200,8 @@ class PerturbationSettings:
             "vacancy_sources": list(self.vacancy_sources),
             "interstitial_sources": list(self.interstitial_sources),
             "gas_interstitial_sources": list(self.gas_interstitial_sources),
+            "substitution_sources": list(self.substitution_sources),
+            "antisite_sources": list(self.antisite_sources),
             "vacancy_interstitial_sources": list(self.vacancy_interstitial_sources),
             "gas_in_vacancy_sources": list(self.gas_in_vacancy_sources),
         }
@@ -173,6 +213,14 @@ class PerturbationSettings:
         if field_name is None:
             raise KeyError(f"Unknown perturbation family: {family}")
         return getattr(self, field_name)
+
+
+def _normalise_pairs(value: Any) -> tuple[tuple[str, str], ...]:
+    """Normalize configured ``(source, target)`` species pairs."""
+
+    if value is None:
+        return ()
+    return tuple((str(pair[0]), str(pair[1])) for pair in value)
 
 
 @dataclass(frozen=True, slots=True)

@@ -27,6 +27,8 @@ GENERATION_SOURCE_SCOPE_FIELDS = (
     "vacancy_sources",
     "interstitial_sources",
     "gas_interstitial_sources",
+    "substitution_sources",
+    "antisite_sources",
     "vacancy_interstitial_sources",
     "gas_in_vacancy_sources",
 )
@@ -118,6 +120,10 @@ class GenerationConfig:
     interstitial_sources: SourceScope = DEFAULT_SOURCE_SCOPE
     n_gas_interstitials: int = 10
     gas_interstitial_sources: SourceScope = DEFAULT_SOURCE_SCOPE
+    n_substitutions: int = 0
+    substitution_sources: SourceScope = DEFAULT_SOURCE_SCOPE
+    n_antisites: int = 0
+    antisite_sources: SourceScope = DEFAULT_SOURCE_SCOPE
     n_vacancy_interstitial: int = 10
     vacancy_interstitial_sources: SourceScope = DEFAULT_SOURCE_SCOPE
     n_gas_in_vacancy: int = 10
@@ -129,9 +135,21 @@ class GenerationConfig:
     rattle_d_min: float = 1.5
     vacancy_min: float = 0.0
     vacancy_max: float = 0.1
+    vacancy_species: tuple[str, ...] = ()
     interstitial_d_min: float = 1.65
     interstitial_min: float = 0.05
     interstitial_max: float = 0.1
+    interstitial_sites: tuple[Any, ...] = ()
+    crystallographic_interstitial_sites: tuple[Any, ...] = ()
+    defect_defect_d_min: float = 0.0
+    periodic_image_d_min: float = 0.0
+    interstitial_max_attempts: int = 500
+    substitution_pairs: tuple[tuple[str, str], ...] = ()
+    substitution_min: float = 0.0
+    substitution_max: float = 0.1
+    antisite_pairs: tuple[tuple[str, str], ...] = ()
+    antisite_min: float = 0.0
+    antisite_max: float = 0.1
     gas_interstitial_d_min: float = 1.2
     max_gas_occupancy: int = 3
 

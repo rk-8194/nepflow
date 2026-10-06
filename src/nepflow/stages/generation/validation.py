@@ -34,6 +34,7 @@ _RELAXED_GEOMETRY_FAMILIES = frozenset(
     {"volume_profile", "liquid", "surface", "grain_boundary", "grain-boundary"}
 )
 _INTERSTITIAL_FAMILIES = frozenset({"interstitial", "gas_interstitial", "vacancy_interstitial"})
+_SUBSTITUTION_FAMILIES = frozenset({"substitution", "antisite"})
 _NEUTRAL_COMPOSITION_FAMILIES = frozenset(
     {"unperturbed", "volume_profile", "elastic_stress", "rattled", "liquid"}
 )
@@ -163,10 +164,13 @@ def _minimum_pair_distance_threshold(settings: Any, family: str) -> float | None
     if family == "rattled":
         return float(settings.rattle_d_min)
     if family in {"interstitial", "vacancy_interstitial"}:
-        return float(settings.interstitial_d_min)
+        return max(float(settings.interstitial_d_min), float(settings.defect_defect_d_min))
     if family in {"gas_interstitial", "gas_in_vacancy"}:
         value = settings.gas_interstitial_d_min
-        return float(settings.interstitial_d_min if value is None else value)
+        return max(
+            float(settings.interstitial_d_min if value is None else value),
+            float(settings.defect_defect_d_min),
+        )
     return float(settings.rattle_d_min)
 
 
@@ -242,6 +246,34 @@ def _validate_family_state(
                 {"requested": requested_gas, "realised": realised_gas},
             )
 
+    requested_substitutions = _metadata_integer(info, "requested_n_substitutions")
+    realised_substitutions = _metadata_integer(info, "realised_n_substitutions", "n_substitutions")
+    if family == "substitution" and requested_substitutions is not None:
+        if realised_substitutions is None:
+            return CandidateValidationIssue(
+                "missing_realised_defect_count",
+                {"requested": requested_substitutions},
+            )
+        if requested_substitutions != realised_substitutions:
+            return CandidateValidationIssue(
+                "partial_defect_realisation",
+                {"requested": requested_substitutions, "realised": realised_substitutions},
+            )
+
+    requested_antisites = _metadata_integer(info, "requested_n_antisites")
+    realised_antisites = _metadata_integer(info, "realised_n_antisites", "n_antisites")
+    if family == "antisite" and requested_antisites is not None:
+        if realised_antisites is None:
+            return CandidateValidationIssue(
+                "missing_realised_defect_count",
+                {"requested": requested_antisites},
+            )
+        if requested_antisites != realised_antisites:
+            return CandidateValidationIssue(
+                "partial_defect_realisation",
+                {"requested": requested_antisites, "realised": realised_antisites},
+            )
+
     expected_count: int | None = None
     if family == "vacancy" and realised_vacancies is not None:
         expected_count = len(reference_symbols) - realised_vacancies
@@ -253,6 +285,8 @@ def _validate_family_state(
     elif family == "gas_in_vacancy":
         if realised_vacancies is not None and realised_gas is not None:
             expected_count = len(reference_symbols) - realised_vacancies + realised_gas
+    elif family in _SUBSTITUTION_FAMILIES:
+        expected_count = len(reference_symbols)
     elif family in _NEUTRAL_COMPOSITION_FAMILIES:
         expected_count = len(reference_symbols)
 
@@ -289,6 +323,30 @@ def _validate_family_state(
             "composition_mismatch",
             {
                 "expected_minimum_counts": dict(reference_counts),
+                "realised_counts": dict(candidate_counts),
+            },
+        )
+    if family == "substitution":
+        source = info.get("source_species")
+        target = info.get("target_species")
+        if isinstance(source, str) and isinstance(target, str):
+            expected_counts = reference_counts.copy()
+            amount = realised_substitutions or 0
+            expected_counts[source] -= amount
+            expected_counts[target] += amount
+            if expected_counts[source] < 0 or candidate_counts != +expected_counts:
+                return CandidateValidationIssue(
+                    "composition_mismatch",
+                    {
+                        "expected_counts": dict(+expected_counts),
+                        "realised_counts": dict(candidate_counts),
+                    },
+                )
+    if family == "antisite" and candidate_counts != reference_counts:
+        return CandidateValidationIssue(
+            "composition_mismatch",
+            {
+                "expected_counts": dict(reference_counts),
                 "realised_counts": dict(candidate_counts),
             },
         )
