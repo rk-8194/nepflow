@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import tempfile
 from collections.abc import Iterable
 from concurrent.futures import ProcessPoolExecutor
 from io import StringIO
@@ -15,7 +16,7 @@ from ase.io import write
 
 from nepflow.config.models import ALL_SOURCES
 from nepflow.domain.identities import annotate_structure_ids, calculate_structure_id
-from nepflow.io.atomic import atomic_write_bytes, atomic_write_text
+from nepflow.domain.structures import GeneratedStructureRecord
 from nepflow.stages.generation.supercell import build_target_supercell
 from nepflow.stages.generation.validation import (
     CandidateValidationIssue,
@@ -326,6 +327,8 @@ class PerturbationCoordinator:
         self._by_type: dict[str, int] = {}
         self._by_config: dict[str, int] = {}
         self._rejected_attempts: list[PerturbationRejection] = []
+        self._provenance_records: tuple[GeneratedStructureRecord, ...] = ()
+        self._duplicate_count = 0
         self._output_file: Path | None = None
 
     def _counts(self, **kwargs: int) -> PerturbationCounts:
@@ -365,11 +368,15 @@ class PerturbationCoordinator:
         if n_workers < 1:
             raise ValueError("n_workers must be non-negative or at least one")
         self._rejected_attempts = []
+        self._provenance_records = ()
+        self._duplicate_count = 0
         results = self._execute(self._tasks(base_structures, counts), n_workers)
         self._rejected_attempts.extend(
             rejection for result in results for rejection in result.rejected_attempts
         )
-        return [candidate for result in results for candidate in result.candidates]
+        candidates, records = self._deduplicate_results(results)
+        self._provenance_records = records
+        return candidates
 
     def process(
         self,
@@ -395,10 +402,12 @@ class PerturbationCoordinator:
         self._by_type = {}
         self._by_config = {}
         self._rejected_attempts = []
+        self._provenance_records = ()
+        self._duplicate_count = 0
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
-        self._output_file = output_dir / "generated_structures.xyz"
-        atomic_write_text(self._output_file, "", encoding="utf-8")
+        output_file = output_dir / "generated_structures.xyz"
+        self._output_file = output_file
         counts = self._counts(
             n_rattled=n_rattled,
             n_liquid_configurations=n_liquid_configurations,
@@ -409,11 +418,101 @@ class PerturbationCoordinator:
             n_vacancy_interstitial=n_vacancy_interstitial,
             n_gas_in_vacancy=n_gas_in_vacancy,
         )
-        for result in self._execute(self._tasks(base_structures, counts), n_workers):
-            self._rejected_attempts.extend(result.rejected_attempts)
-            self._flush(result.candidates)
-        logger.info("Saved %s structures to %s", self._total, self._output_file)
-        return self._output_file
+        temporary_path: Path | None = None
+        file_descriptor: int | None = None
+        try:
+            file_descriptor, temporary_name = tempfile.mkstemp(
+                prefix=f".{output_file.name}.",
+                suffix=".tmp",
+                dir=output_dir,
+            )
+            temporary_path = Path(temporary_name)
+            with os.fdopen(file_descriptor, "wb") as output_handle:
+                file_descriptor = None
+                seen_structure_ids: set[str] = set()
+                seen_operation_ids: set[tuple[str, str]] = set()
+                retained_records: list[GeneratedStructureRecord] = []
+                for result in self._execute(self._tasks(base_structures, counts), n_workers):
+                    self._rejected_attempts.extend(result.rejected_attempts)
+                    batch = self._deduplicate_result(
+                        result,
+                        seen_structure_ids=seen_structure_ids,
+                        seen_operation_ids=seen_operation_ids,
+                        retained_records=retained_records,
+                    )
+                    self._flush(batch, output_handle=output_handle)
+                output_handle.flush()
+                os.fsync(output_handle.fileno())
+            if temporary_path is None:
+                raise RuntimeError("temporary generation artifact was not created")
+            os.replace(temporary_path, output_file)
+            temporary_path = None
+            self._provenance_records = tuple(retained_records)
+        except BaseException:
+            if file_descriptor is not None:
+                try:
+                    os.close(file_descriptor)
+                except OSError:
+                    pass
+            if temporary_path is not None:
+                try:
+                    temporary_path.unlink()
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    pass
+            raise
+        logger.info("Saved %s structures to %s", self._total, output_file)
+        return output_file
+
+    def _deduplicate_results(
+        self,
+        results: Iterable[PerturbationTaskResult],
+    ) -> tuple[list[Any], tuple[GeneratedStructureRecord, ...]]:
+        """Return first representatives and every distinct accepted operation."""
+
+        seen_structure_ids: set[str] = set()
+        seen_operation_ids: set[tuple[str, str]] = set()
+        retained_records: list[GeneratedStructureRecord] = []
+        candidates: list[Any] = []
+        for result in results:
+            candidates.extend(
+                self._deduplicate_result(
+                    result,
+                    seen_structure_ids=seen_structure_ids,
+                    seen_operation_ids=seen_operation_ids,
+                    retained_records=retained_records,
+                )
+            )
+        return candidates, tuple(retained_records)
+
+    def _deduplicate_result(
+        self,
+        result: PerturbationTaskResult,
+        *,
+        seen_structure_ids: set[str],
+        seen_operation_ids: set[tuple[str, str]],
+        retained_records: list[GeneratedStructureRecord],
+    ) -> list[Any]:
+        if len(result.candidates) != len(result.provenance_records):
+            raise ValueError(
+                "Perturbation task result must provide one provenance record per candidate"
+            )
+        representatives: list[Any] = []
+        for candidate, record in zip(result.candidates, result.provenance_records):
+            if not isinstance(record, GeneratedStructureRecord):
+                raise TypeError("Perturbation task provenance must be GeneratedStructureRecord")
+            structure_id = record.structure_id
+            operation_key = (structure_id, record.provenance.operation_id)
+            if operation_key not in seen_operation_ids:
+                retained_records.append(record)
+                seen_operation_ids.add(operation_key)
+            if structure_id in seen_structure_ids:
+                self._duplicate_count += 1
+                continue
+            seen_structure_ids.add(structure_id)
+            representatives.append(candidate)
+        return representatives
 
     def _execute(
         self,
@@ -446,7 +545,7 @@ class PerturbationCoordinator:
                 raise
             raise PerturbationTaskError(task, exc) from exc
 
-    def _flush(self, candidates: Iterable[Any]) -> None:
+    def _flush(self, candidates: Iterable[Any], *, output_handle: Any | None = None) -> None:
         batch = list(candidates)
         if not batch:
             return
@@ -459,14 +558,22 @@ class PerturbationCoordinator:
         annotate_structure_ids(batch)
         rendered = StringIO()
         write(rendered, batch, format="extxyz")
-        existing = self._output_file.read_bytes()
-        atomic_write_bytes(self._output_file, existing + rendered.getvalue().encode("utf-8"))
+        if output_handle is None:
+            with self._output_file.open("ab") as handle:
+                handle.write(rendered.getvalue().encode("utf-8"))
+        else:
+            output_handle.write(rendered.getvalue().encode("utf-8"))
         for candidate in batch:
             family = candidate.info.get("perturbation_type", "unknown")
             configuration = candidate.info.get("configurational_type", "unknown")
             self._total += 1
             self._by_type[family] = self._by_type.get(family, 0) + 1
             self._by_config[configuration] = self._by_config.get(configuration, 0) + 1
+
+    def get_provenance_records(self) -> tuple[GeneratedStructureRecord, ...]:
+        """Return accepted candidate provenance in deterministic operation order."""
+
+        return self._provenance_records
 
     def get_summary(self) -> dict[str, Any]:
         """Return candidate totals grouped by perturbation and configuration."""
@@ -480,6 +587,7 @@ class PerturbationCoordinator:
             "total": self._total,
             "by_type": dict(self._by_type),
             "by_config": dict(self._by_config),
+            "duplicate_count": self._duplicate_count,
             "rejected_count": len(self._rejected_attempts),
             "rejected_reason_counts": rejected_reason_counts,
         }

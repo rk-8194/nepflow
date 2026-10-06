@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from nepflow.config.models import DEFAULT_SOURCE_SCOPE, SourceScope
+from nepflow.domain.structures import GeneratedStructureRecord
 
 PERTURBATION_FAMILY_SOURCE_FIELDS = {
     "volume_profile": "volume_sources",
@@ -230,7 +231,7 @@ class PerturbationTaskResult:
 
     task: PerturbationTask
     candidates: tuple[Any, ...]
-    provenance_records: tuple[Any, ...] = ()
+    provenance_records: tuple[GeneratedStructureRecord, ...] = ()
     rejected_attempts: tuple[PerturbationRejection, ...] = ()
 
     @property

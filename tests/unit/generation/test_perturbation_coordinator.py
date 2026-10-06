@@ -8,6 +8,7 @@ import pytest
 
 pytest.importorskip("ase")
 from ase import Atoms
+from ase.io import read
 
 import nepflow.stages.generation.perturbations.coordinator as coordinator_module
 from nepflow.domain.identities import calculate_structure_id
@@ -316,6 +317,60 @@ def test_serial_and_parallel_candidates_are_ordered_and_scientifically_equal() -
     task = PerturbationCoordinator(settings=settings)._tasks([bases[0]], counts)[0]
     result = execute_perturbation_task(task)
     assert len(result.provenance_records) == len(result.candidates)
+
+
+def test_final_deduplication_keeps_unperturbed_representative_and_all_paths() -> None:
+    base = base_atoms()
+    settings = PerturbationSettings(
+        target_n_atoms=4,
+        random_seed=21,
+        n_volume_points=1,
+        volume_scale_range=(1.0, 1.0),
+        elastic_stress_enabled=False,
+    )
+    counts = PerturbationCounts(n_rattled=0, n_vacancies=0, n_interstitials=0)
+    coordinator = PerturbationCoordinator(settings=settings)
+
+    candidates = coordinator.generate_candidates([base], counts=counts, n_workers=1)
+
+    assert len(candidates) == 1
+    assert candidates[0].info["perturbation_type"] == "unperturbed"
+    assert coordinator.get_summary()["duplicate_count"] == 1
+    assert [record.provenance.operation_id for record in coordinator.get_provenance_records()] == [
+        f"{calculate_structure_id(base)}:unperturbed",
+        f"{calculate_structure_id(base)}:volume:0",
+    ]
+
+
+def test_final_deduplication_counts_published_candidates_and_is_parallel_stable(tmp_path) -> None:
+    base = base_atoms()
+    settings = PerturbationSettings(
+        target_n_atoms=4,
+        random_seed=21,
+        n_volume_points=1,
+        volume_scale_range=(1.0, 1.0),
+        elastic_stress_enabled=False,
+    )
+    kwargs = {
+        "n_rattled": 0,
+        "n_vacancies": 0,
+        "n_interstitials": 0,
+        "n_workers": 1,
+    }
+    serial = PerturbationCoordinator(settings=settings)
+    serial_path = serial.process([base], tmp_path / "serial", **kwargs)
+
+    parallel = PerturbationCoordinator(settings=settings)
+    parallel_kwargs = dict(kwargs, n_workers=2)
+    parallel_path = parallel.process([base], tmp_path / "parallel", **parallel_kwargs)
+
+    assert serial.get_summary()["total"] == 1
+    assert serial.get_summary()["duplicate_count"] == 1
+    assert serial_path.read_bytes() == parallel_path.read_bytes()
+    assert [
+        record.provenance.operation_id for record in serial.get_provenance_records()
+    ] == [record.provenance.operation_id for record in parallel.get_provenance_records()]
+    assert len(read(str(serial_path), index=":")) == 1
 
 
 def test_worker_result_is_pickleable_with_canonical_provenance() -> None:

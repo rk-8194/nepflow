@@ -182,6 +182,56 @@ def test_project_and_structure_writes_are_idempotent(tmp_path) -> None:
         assert store.get_structure("structure-1")["structure_id"] == "structure-1"
 
 
+def test_multiple_structure_provenance_operations_preserve_metadata(tmp_path) -> None:
+    structure = StructureIdentity("structure-1")
+    first = StructureProvenance(
+        parent_structure_id=None,
+        generator="fixture",
+        requested_composition={"Si": 1.0},
+        realised_composition={"Si": 1.0},
+        source_database_id=None,
+        crystal_structure="fcc",
+        perturbation_family="unperturbed",
+        perturbation_parameters={},
+        random_seed=1,
+        operation_id="operation-first",
+        code_version=None,
+        config_fingerprint=None,
+    )
+    second = StructureProvenance(
+        parent_structure_id=None,
+        generator="fixture",
+        requested_composition={"Si": 1.0},
+        realised_composition={"Si": 1.0},
+        source_database_id=None,
+        crystal_structure="fcc",
+        perturbation_family="volume_profile",
+        perturbation_parameters={"volume_scale": 1.0},
+        random_seed=1,
+        operation_id="operation-second",
+        code_version=None,
+        config_fingerprint=None,
+    )
+
+    with StateStore(tmp_path / "state.db") as store:
+        store.upsert_structure(
+            GeneratedStructureRecord(
+                identity=structure,
+                provenance=first,
+                metadata={"representative": "unperturbed"},
+            )
+        )
+        store.append_structure_provenance(structure.structure_id, second)
+        store.upsert_structure(GeneratedStructureRecord(structure, second))
+
+        assert store.get_structure(structure.structure_id)["metadata"] == {
+            "representative": "unperturbed"
+        }
+        assert [
+            row["operation_id"] for row in store.get_structure_provenance(structure.structure_id)
+        ] == ["operation-first", "operation-second"]
+
+
 def test_attempt_history_is_preserved_and_lookup_is_idempotent(tmp_path) -> None:
     calculation = DftCalculationIdentity(
         structure_id="structure-1",

@@ -49,6 +49,8 @@ class PerturbationCoordinator(Protocol):
 
     def get_summary(self) -> Mapping[str, Any]: ...
 
+    def get_provenance_records(self) -> Sequence[GeneratedStructureRecord]: ...
+
 
 @runtime_checkable
 class GasPhaseGenerator(Protocol):
@@ -229,6 +231,9 @@ class GenerationStage:
             n_workers=config.n_workers,
         )
         self._candidate_path = Path(output_path) if output_path is not None else None
+        get_records = getattr(self.coordinator, "get_provenance_records", None)
+        if callable(get_records):
+            self._persist_generated_records(request, get_records() or ())
         return dict(self.coordinator.get_summary())
 
     def finalize(self, summary: Mapping[str, Any]) -> None:
@@ -429,6 +434,32 @@ class GenerationStage:
             store.upsert_structure(
                 GeneratedStructureRecord(identity=identity, provenance=provenance, metadata=info)
             )
+
+    def _persist_generated_records(
+        self,
+        request: GenerationRequest,
+        records: Sequence[GeneratedStructureRecord],
+    ) -> None:
+        """Persist accepted candidate provenance without overwriting metadata."""
+
+        store = request.state_store if request.state_store is not None else self.state_store
+        if store is None:
+            return
+        recorded_structures: set[str] = set()
+        for record in records:
+            if not isinstance(record, GeneratedStructureRecord):
+                raise TypeError("generated provenance must be a GeneratedStructureRecord")
+            if record.structure_id not in recorded_structures:
+                store.upsert_structure(record)
+                recorded_structures.add(record.structure_id)
+                continue
+            append_provenance = getattr(store, "append_structure_provenance", None)
+            if callable(append_provenance):
+                append_provenance(record.structure_id, record.provenance)
+            else:
+                # Keep compatibility with injected stores implementing the older
+                # upsert-only surface; StateStore uses the provenance-only path.
+                store.upsert_structure(record)
 
     def _persist_manifest(self, request: GenerationRequest, manifest: GenerationManifest) -> None:
         store = request.state_store if request.state_store is not None else self.state_store
