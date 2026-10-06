@@ -34,6 +34,7 @@ from .defects import (
 )
 from .displacements import rattled
 from .elastic import elastic_stress_set
+from .grain_boundaries import grain_boundaries
 from .liquid import liquid_snapshots
 from .models import (
     PerturbationCounts,
@@ -62,6 +63,7 @@ _PERTURBATION_FAMILIES = frozenset(
         "vacancy_interstitial",
         "gas_in_vacancy",
         "surface",
+        "grain_boundary",
     }
 )
 
@@ -290,6 +292,22 @@ def execute_perturbation_task(task: PerturbationTask) -> PerturbationTaskResult:
                 seed=task.seed,
             )
         )
+    if (
+        settings.grain_boundary_enabled
+        and task.counts.n_grain_boundaries > 0
+        and family_applies_to_base("grain_boundary", task.base, settings)
+    ):
+        output.extend(
+            grain_boundaries(
+                task.base,
+                task.base,
+                task.counts.n_grain_boundaries,
+                settings,
+                None,
+                annotate,
+                seed=task.seed,
+            )
+        )
     accepted: list[Any] = []
     provenance_records: list[Any] = []
     rejected_attempts: list[PerturbationRejection] = []
@@ -441,6 +459,7 @@ class PerturbationCoordinator:
         n_vacancy_interstitial: int = 0,
         n_gas_in_vacancy: int = 0,
         n_surfaces: int = 0,
+        n_grain_boundaries: int = 0,
         n_workers: int = 0,
     ) -> Path:
         """Run typed tasks and persist candidates in deterministic base order."""
@@ -471,6 +490,7 @@ class PerturbationCoordinator:
             n_vacancy_interstitial=n_vacancy_interstitial,
             n_gas_in_vacancy=n_gas_in_vacancy,
             n_surfaces=n_surfaces,
+            n_grain_boundaries=n_grain_boundaries,
         )
         temporary_path: Path | None = None
         file_descriptor: int | None = None

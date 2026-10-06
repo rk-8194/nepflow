@@ -186,6 +186,20 @@ def _generation_values(config: NepflowConfig) -> dict[str, str]:
             map(str, generation.surface_min_in_plane_dimensions)
         ),
         "surface_symmetric": _bool_text(generation.surface_symmetric),
+        "grain_boundary_enabled": _bool_text(generation.grain_boundary_enabled),
+        "n_grain_boundaries": str(generation.n_grain_boundaries),
+        "grain_boundary_sources": ",".join(generation.grain_boundary_sources),
+        "grain_boundary_rotation_axis": ",".join(
+            map(str, generation.grain_boundary_rotation_axis)
+        ),
+        "grain_boundary_misorientation_angle": str(
+            generation.grain_boundary_misorientation_angle
+        ),
+        "grain_boundary_sigma": str(generation.grain_boundary_sigma),
+        "grain_boundary_plane": ",".join(map(str, generation.grain_boundary_plane)),
+        "grain_boundary_expand_times": str(generation.grain_boundary_expand_times),
+        "grain_boundary_min_thickness": str(generation.grain_boundary_min_thickness),
+        "grain_boundary_overlap_tolerance": str(generation.grain_boundary_overlap_tolerance),
         "liquid_sources": ",".join(generation.liquid_sources),
         "rattle_std": str(generation.rattle_std),
         "rattle_std_min": str(generation.rattle_std_min),

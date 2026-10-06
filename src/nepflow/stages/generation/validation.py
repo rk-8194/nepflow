@@ -197,6 +197,10 @@ def _validate_family_state(
         issue = _validate_surface_state(candidate)
         if issue is not None:
             return issue
+    if family == "grain_boundary":
+        issue = _validate_grain_boundary_state(candidate)
+        if issue is not None:
+            return issue
     try:
         reference_symbols = list(reference.get_chemical_symbols())
     except Exception:
@@ -401,6 +405,76 @@ def _validate_surface_state(candidate: Any) -> CandidateValidationIssue | None:
     return None
 
 
+def _validate_grain_boundary_state(candidate: Any) -> CandidateValidationIssue | None:
+    """Validate relationship, periodicity, and overlap-removal provenance."""
+
+    info = getattr(candidate, "info", {})
+    required = (
+        "parent_structure_id",
+        "grain_boundary_relationship",
+        "grain_boundary_rotation_axis",
+        "grain_boundary_misorientation_angle",
+        "grain_boundary_sigma",
+        "grain_boundary_plane",
+        "grain_boundary_expand_times",
+        "grain_boundary_overlap_tolerance",
+        "grain_boundary_removed_atom_count",
+        "grain_boundary_removed_species",
+        "grain_boundary_cell_lengths",
+    )
+    missing = [key for key in required if key not in info]
+    if missing:
+        return CandidateValidationIssue(
+            "missing_grain_boundary_provenance", {"fields": missing}
+        )
+    pbc = _pbc_flags(candidate)
+    if pbc is None or tuple(bool(value) for value in pbc) != (True, True, True):
+        return CandidateValidationIssue(
+            "invalid_grain_boundary_pbc",
+            {"expected": [True, True, True], "realised": None if pbc is None else pbc.tolist()},
+        )
+    try:
+        axis = tuple(int(value) for value in info["grain_boundary_rotation_axis"])
+        plane = tuple(int(value) for value in info["grain_boundary_plane"])
+        sigma = int(info["grain_boundary_sigma"])
+        angle = float(info["grain_boundary_misorientation_angle"])
+        expand_times = int(info["grain_boundary_expand_times"])
+        tolerance = float(info["grain_boundary_overlap_tolerance"])
+        removed_count = int(info["grain_boundary_removed_atom_count"])
+        cell_lengths = tuple(float(value) for value in info["grain_boundary_cell_lengths"])
+    except (TypeError, ValueError):
+        return CandidateValidationIssue("invalid_grain_boundary_provenance", {})
+    if axis != (0, 0, 1) or plane != (2, 1, 0) or sigma != 5:
+        return CandidateValidationIssue(
+            "unsupported_grain_boundary_relationship",
+            {"axis": axis, "plane": plane, "sigma": sigma},
+        )
+    if not math.isclose(angle, 36.86989764584402, rel_tol=1.0e-9, abs_tol=1.0e-8):
+        return CandidateValidationIssue(
+            "unsupported_grain_boundary_relationship", {"angle": angle}
+        )
+    if expand_times <= 0 or not 0.0 <= tolerance <= 1.0:
+        return CandidateValidationIssue(
+            "invalid_grain_boundary_provenance",
+            {"expand_times": expand_times, "overlap_tolerance": tolerance},
+        )
+    removed_species = info["grain_boundary_removed_species"]
+    if not isinstance(removed_species, dict) or any(
+        not isinstance(value, int) or value < 0 for value in removed_species.values()
+    ):
+        return CandidateValidationIssue("invalid_overlap_removal_accounting", {})
+    if removed_count != sum(removed_species.values()):
+        return CandidateValidationIssue(
+            "invalid_overlap_removal_accounting",
+            {"removed_count": removed_count, "removed_species": removed_species},
+        )
+    if removed_count < 0 or len(cell_lengths) != 3 or any(
+        not math.isfinite(value) or value <= 0.0 for value in cell_lengths
+    ):
+        return CandidateValidationIssue("invalid_grain_boundary_geometry", {})
+    return None
+
+
 def _metadata_integer(info: Any, *keys: str) -> int | None:
     for key in keys:
         if key in info:
@@ -483,6 +557,38 @@ def validate_generation_config(config: GenerationConfig) -> GenerationConfig:
         raise ConfigurationError("generation.surface_thickness must be positive and finite")
     if not math.isfinite(config.surface_vacuum) or config.surface_vacuum <= 0.0:
         raise ConfigurationError("generation.surface_vacuum must be positive and finite")
+    if config.n_grain_boundaries < 0:
+        raise ConfigurationError("generation.n_grain_boundaries must be non-negative")
+    if tuple(config.grain_boundary_rotation_axis) != (0, 0, 1):
+        raise ConfigurationError(
+            "only the supported Sigma-5 [001] grain-boundary axis is available"
+        )
+    if tuple(config.grain_boundary_plane) != (2, 1, 0):
+        raise ConfigurationError(
+            "only the supported Sigma-5 (210) grain-boundary plane is available"
+        )
+    if config.grain_boundary_sigma != 5:
+        raise ConfigurationError("only Sigma 5 grain boundaries are supported")
+    if not math.isclose(
+        config.grain_boundary_misorientation_angle,
+        36.86989764584402,
+        rel_tol=1.0e-9,
+        abs_tol=1.0e-8,
+    ):
+        raise ConfigurationError("unsupported grain-boundary misorientation angle")
+    if config.grain_boundary_expand_times <= 0:
+        raise ConfigurationError("generation.grain_boundary_expand_times must be positive")
+    if (
+        not math.isfinite(config.grain_boundary_min_thickness)
+        or config.grain_boundary_min_thickness < 0.0
+    ):
+        raise ConfigurationError(
+            "generation.grain_boundary_min_thickness must be finite and non-negative"
+        )
+    if not 0.0 <= config.grain_boundary_overlap_tolerance <= 1.0:
+        raise ConfigurationError(
+            "generation.grain_boundary_overlap_tolerance must be in [0, 1]"
+        )
     _validate_source_scopes(config)
     return config
 

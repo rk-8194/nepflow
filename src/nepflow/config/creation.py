@@ -160,6 +160,20 @@ surface_max_terminations=0
 surface_in_plane_repeat=1,1
 surface_min_in_plane_dimensions=0.0,0.0
 surface_symmetric=false
+
+# --- Grain-boundary perturbations ---
+# Supported initial relationship: Sigma 5 [001] symmetric tilt, (210), 36.8699°.
+grain_boundary_enabled=false
+n_grain_boundaries=0
+grain_boundary_sources=all
+grain_boundary_rotation_axis=0,0,1
+grain_boundary_misorientation_angle=36.86989764584402
+grain_boundary_sigma=5
+grain_boundary_plane=2,1,0
+grain_boundary_expand_times=2
+grain_boundary_min_thickness=0.0
+# Pymatgen overlap ratio relative to the bulk nearest-neighbour distance.
+grain_boundary_overlap_tolerance=0.7
 liquid_sources=all
 
 # --- Perturbation parameters ---

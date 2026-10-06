@@ -15,6 +15,7 @@ from .elasticity import (
     fit_elastic_tensor,
     strain_matrix_to_voigt,
 )
+from .grain_boundaries import GrainBoundaryConstructionError, grain_boundaries
 from .models import (
     PerturbationCounts,
     PerturbationRejection,
@@ -44,6 +45,8 @@ __all__ = [
     "vacancy_interstitial",
     "SurfaceConstructionError",
     "surfaces",
+    "GrainBoundaryConstructionError",
+    "grain_boundaries",
     "ElasticRecord",
     "fit_elastic_tensor",
     "strain_matrix_to_voigt",

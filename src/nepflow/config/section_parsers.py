@@ -201,6 +201,10 @@ def _parse_generation_modes(values: Mapping[str, str]) -> dict[str, Any]:
             "generation.n_gas_in_vacancy",
         ),
         "n_surfaces": _parse_int(values.get("n_surfaces", "0"), "generation.n_surfaces"),
+        "n_grain_boundaries": _parse_int(
+            values.get("n_grain_boundaries", "0"),
+            "generation.n_grain_boundaries",
+        ),
     }
 
 
@@ -357,6 +361,38 @@ def _parse_generation_perturbations(values: Mapping[str, str]) -> dict[str, Any]
         ),
         "surface_symmetric": _parse_bool(
             values.get("surface_symmetric", "false"), "generation.surface_symmetric"
+        ),
+        "grain_boundary_enabled": _parse_bool(
+            values.get("grain_boundary_enabled", "false"),
+            "generation.grain_boundary_enabled",
+        ),
+        "grain_boundary_rotation_axis": _parse_single_miller_index(
+            values.get("grain_boundary_rotation_axis", "0,0,1"),
+            "generation.grain_boundary_rotation_axis",
+        ),
+        "grain_boundary_misorientation_angle": _parse_float(
+            values.get("grain_boundary_misorientation_angle", "36.86989764584402"),
+            "generation.grain_boundary_misorientation_angle",
+        ),
+        "grain_boundary_sigma": _parse_int(
+            values.get("grain_boundary_sigma", "5"),
+            "generation.grain_boundary_sigma",
+        ),
+        "grain_boundary_plane": _parse_single_miller_index(
+            values.get("grain_boundary_plane", "2,1,0"),
+            "generation.grain_boundary_plane",
+        ),
+        "grain_boundary_expand_times": _parse_int(
+            values.get("grain_boundary_expand_times", "2"),
+            "generation.grain_boundary_expand_times",
+        ),
+        "grain_boundary_min_thickness": _parse_float(
+            values.get("grain_boundary_min_thickness", "0.0"),
+            "generation.grain_boundary_min_thickness",
+        ),
+        "grain_boundary_overlap_tolerance": _parse_float(
+            values.get("grain_boundary_overlap_tolerance", "0.7"),
+            "generation.grain_boundary_overlap_tolerance",
         ),
     }
 
@@ -770,6 +806,13 @@ def _parse_miller_indices(value: str, name: str) -> tuple[tuple[int, int, int], 
             raise ConfigurationError(f"{name} must contain integer Miller indices") from exc
         result.append(index)  # type: ignore[arg-type]
     return tuple(result)
+
+
+def _parse_single_miller_index(value: str, name: str) -> tuple[int, int, int]:
+    indices = _parse_miller_indices(value, name)
+    if len(indices) != 1:
+        raise ConfigurationError(f"{name} must contain exactly one integer triple")
+    return indices[0]
 
 
 def _parse_int_pair(value: str, name: str) -> tuple[int, int]:

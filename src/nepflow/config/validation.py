@@ -164,6 +164,7 @@ def validate_config(
         "n_vacancy_interstitial",
         "n_gas_in_vacancy",
         "n_surfaces",
+        "n_grain_boundaries",
         "liquid_equilibration_steps",
         "liquid_steps_between_snapshots",
         "max_gas_occupancy",
@@ -188,6 +189,9 @@ def validate_config(
         "antisite_max",
         "surface_vacuum",
         "surface_min_in_plane_dimensions",
+        "grain_boundary_misorientation_angle",
+        "grain_boundary_min_thickness",
+        "grain_boundary_overlap_tolerance",
     ):
         if field_name == "surface_min_in_plane_dimensions":
             values = config.generation.surface_min_in_plane_dimensions
@@ -200,6 +204,7 @@ def validate_config(
             f"generation.{field_name}", getattr(config.generation, field_name)
         )
     _validate_surface_settings(config.generation)
+    _validate_grain_boundary_settings(config.generation)
     _require_range(
         "generation.vacancy", config.generation.vacancy_min, config.generation.vacancy_max
     )
@@ -408,6 +413,52 @@ def _validate_surface_settings(config: GenerationConfig) -> None:
     ):
         raise ConfigurationError(
             "generation.surface_in_plane_repeat must contain two positive integers"
+        )
+
+
+def _validate_grain_boundary_settings(config: GenerationConfig) -> None:
+    """Validate the initial supported Sigma-5 [001] tilt relationship."""
+
+    axis = config.grain_boundary_rotation_axis
+    plane = config.grain_boundary_plane
+    if len(axis) != 3 or any(not isinstance(value, int) for value in axis) or not any(axis):
+        raise ConfigurationError(
+            "generation.grain_boundary_rotation_axis must be a non-zero integer triple"
+        )
+    if len(plane) != 3 or any(not isinstance(value, int) for value in plane) or not any(plane):
+        raise ConfigurationError(
+            "generation.grain_boundary_plane must be a non-zero integer triple"
+        )
+    if tuple(axis) != (0, 0, 1):
+        raise ConfigurationError(
+            "only the supported Sigma-5 [001] grain-boundary axis is available"
+        )
+    if tuple(plane) != (2, 1, 0):
+        raise ConfigurationError(
+            "only the supported Sigma-5 (210) grain-boundary plane is available"
+        )
+    if config.grain_boundary_sigma != 5:
+        raise ConfigurationError("only Sigma 5 grain boundaries are supported")
+    if not math.isclose(
+        config.grain_boundary_misorientation_angle,
+        36.86989764584402,
+        rel_tol=1.0e-9,
+        abs_tol=1.0e-8,
+    ):
+        raise ConfigurationError(
+            "only the 36.86989764584402 degree Sigma-5 misorientation is supported"
+        )
+    _require_non_negative(
+        "generation.grain_boundary_expand_times",
+        config.grain_boundary_expand_times,
+        strictly_positive=True,
+    )
+    _require_non_negative(
+        "generation.grain_boundary_sigma", config.grain_boundary_sigma, strictly_positive=True
+    )
+    if not 0.0 <= config.grain_boundary_overlap_tolerance <= 1.0:
+        raise ConfigurationError(
+            "generation.grain_boundary_overlap_tolerance must be in [0, 1]"
         )
 
 

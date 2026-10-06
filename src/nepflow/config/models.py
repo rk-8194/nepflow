@@ -32,6 +32,7 @@ GENERATION_SOURCE_SCOPE_FIELDS = (
     "vacancy_interstitial_sources",
     "gas_in_vacancy_sources",
     "surface_sources",
+    "grain_boundary_sources",
 )
 
 
@@ -141,6 +142,16 @@ class GenerationConfig:
     surface_in_plane_repeat: tuple[int, int] = (1, 1)
     surface_min_in_plane_dimensions: tuple[float, float] = (0.0, 0.0)
     surface_symmetric: bool = False
+    grain_boundary_enabled: bool = False
+    n_grain_boundaries: int = 0
+    grain_boundary_sources: SourceScope = DEFAULT_SOURCE_SCOPE
+    grain_boundary_rotation_axis: tuple[int, int, int] = (0, 0, 1)
+    grain_boundary_misorientation_angle: float = 36.86989764584402
+    grain_boundary_sigma: int = 5
+    grain_boundary_plane: tuple[int, int, int] = (2, 1, 0)
+    grain_boundary_expand_times: int = 2
+    grain_boundary_min_thickness: float = 0.0
+    grain_boundary_overlap_tolerance: float = 0.7
     liquid_sources: SourceScope = DEFAULT_SOURCE_SCOPE
     rattle_std: float = 0.03
     rattle_std_min: float = 0.015

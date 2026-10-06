@@ -203,6 +203,15 @@ def _build_perturbation_coordinator(context: StageContext) -> PerturbationCoordi
         surface_min_in_plane_dimensions=generation.surface_min_in_plane_dimensions,
         surface_symmetric=generation.surface_symmetric,
         surface_sources=generation.surface_sources,
+        grain_boundary_enabled=generation.grain_boundary_enabled,
+        grain_boundary_rotation_axis=generation.grain_boundary_rotation_axis,
+        grain_boundary_misorientation_angle=generation.grain_boundary_misorientation_angle,
+        grain_boundary_sigma=generation.grain_boundary_sigma,
+        grain_boundary_plane=generation.grain_boundary_plane,
+        grain_boundary_expand_times=generation.grain_boundary_expand_times,
+        grain_boundary_min_thickness=generation.grain_boundary_min_thickness,
+        grain_boundary_overlap_tolerance=generation.grain_boundary_overlap_tolerance,
+        grain_boundary_sources=generation.grain_boundary_sources,
     )
 
 

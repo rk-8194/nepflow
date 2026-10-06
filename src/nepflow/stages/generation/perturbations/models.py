@@ -22,6 +22,7 @@ PERTURBATION_FAMILY_SOURCE_FIELDS = {
     "vacancy_interstitial": "vacancy_interstitial_sources",
     "gas_in_vacancy": "gas_in_vacancy_sources",
     "surface": "surface_sources",
+    "grain_boundary": "grain_boundary_sources",
 }
 
 
@@ -55,6 +56,7 @@ class PerturbationCounts:
     n_vacancy_interstitial: int = 0
     n_gas_in_vacancy: int = 0
     n_surfaces: int = 0
+    n_grain_boundaries: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -128,6 +130,15 @@ class PerturbationSettings:
     surface_min_in_plane_dimensions: tuple[float, float] = (0.0, 0.0)
     surface_symmetric: bool = False
     surface_sources: SourceScope = DEFAULT_SOURCE_SCOPE
+    grain_boundary_enabled: bool = False
+    grain_boundary_rotation_axis: tuple[int, int, int] = (0, 0, 1)
+    grain_boundary_misorientation_angle: float = 36.86989764584402
+    grain_boundary_sigma: int = 5
+    grain_boundary_plane: tuple[int, int, int] = (2, 1, 0)
+    grain_boundary_expand_times: int = 2
+    grain_boundary_min_thickness: float = 0.0
+    grain_boundary_overlap_tolerance: float = 0.7
+    grain_boundary_sources: SourceScope = DEFAULT_SOURCE_SCOPE
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "vacancy_range", tuple(self.vacancy_range))
@@ -141,6 +152,8 @@ class PerturbationSettings:
             tuple(tuple(int(value) for value in index) for index in self.surface_miller_indices),
         )
         object.__setattr__(self, "surface_in_plane_repeat", tuple(self.surface_in_plane_repeat))
+        object.__setattr__(self, "grain_boundary_rotation_axis", tuple(self.grain_boundary_rotation_axis))
+        object.__setattr__(self, "grain_boundary_plane", tuple(self.grain_boundary_plane))
         object.__setattr__(
             self,
             "surface_min_in_plane_dimensions",
@@ -239,6 +252,15 @@ class PerturbationSettings:
             "surface_min_in_plane_dimensions": self.surface_min_in_plane_dimensions,
             "surface_symmetric": self.surface_symmetric,
             "surface_sources": list(self.surface_sources),
+            "grain_boundary_enabled": self.grain_boundary_enabled,
+            "grain_boundary_rotation_axis": self.grain_boundary_rotation_axis,
+            "grain_boundary_misorientation_angle": self.grain_boundary_misorientation_angle,
+            "grain_boundary_sigma": self.grain_boundary_sigma,
+            "grain_boundary_plane": self.grain_boundary_plane,
+            "grain_boundary_expand_times": self.grain_boundary_expand_times,
+            "grain_boundary_min_thickness": self.grain_boundary_min_thickness,
+            "grain_boundary_overlap_tolerance": self.grain_boundary_overlap_tolerance,
+            "grain_boundary_sources": list(self.grain_boundary_sources),
         }
 
     def sources_for_family(self, family: str) -> SourceScope:
