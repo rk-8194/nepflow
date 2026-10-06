@@ -1,6 +1,7 @@
 """Coordinator execution, defect placement, and worker failure contracts."""
 
 import pickle
+from pathlib import Path
 from types import MappingProxyType
 
 import numpy as np
@@ -371,6 +372,105 @@ def test_final_deduplication_counts_published_candidates_and_is_parallel_stable(
         record.provenance.operation_id for record in parallel.get_provenance_records()
     ]
     assert len(read(str(serial_path), index=":")) == 1
+
+
+def test_publication_keeps_task_order_without_reading_prior_batches(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first = base_atoms(source="first", seed_id="seed-first")
+    second = base_atoms(source="second", seed_id="seed-second")
+    second.set_cell(np.diag([12.5, 12.0, 12.0]), scale_atoms=False)
+    settings = PerturbationSettings(
+        target_n_atoms=4,
+        random_seed=21,
+        n_volume_points=0,
+        elastic_stress_enabled=False,
+    )
+
+    def fail_read_bytes(_path: Path) -> bytes:
+        raise AssertionError("publication must not reread the accumulated artifact")
+
+    monkeypatch.setattr(Path, "read_bytes", fail_read_bytes)
+    output_path = PerturbationCoordinator(settings=settings).process(
+        [first, second],
+        tmp_path,
+        n_rattled=0,
+        n_vacancies=0,
+        n_interstitials=0,
+        n_workers=1,
+    )
+    monkeypatch.undo()
+
+    published = read(str(output_path), index=":")
+    assert [item.info["seed_id"] for item in published] == ["seed-first", "seed-second"]
+    assert list(tmp_path.glob(f".{output_path.name}.*.tmp")) == []
+
+
+def test_failed_late_publication_preserves_previous_complete_artifact(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output_path = tmp_path / "generated_structures.xyz"
+    output_path.write_bytes(b"complete-candidate-artifact")
+    first = base_atoms(source="first", seed_id="seed-first")
+    second = base_atoms(source="second", seed_id="seed-second")
+    second.set_cell(np.diag([12.5, 12.0, 12.0]), scale_atoms=False)
+    coordinator = PerturbationCoordinator(
+        settings=PerturbationSettings(
+            target_n_atoms=4,
+            n_volume_points=0,
+            elastic_stress_enabled=False,
+        )
+    )
+    original_flush = coordinator._flush
+    calls = 0
+
+    def fail_on_second_batch(candidates, *, output_handle=None):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("controlled publication failure")
+        return original_flush(candidates, output_handle=output_handle)
+
+    monkeypatch.setattr(coordinator, "_flush", fail_on_second_batch)
+    with pytest.raises(RuntimeError, match="controlled publication failure"):
+        coordinator.process(
+            [first, second],
+            tmp_path,
+            n_rattled=0,
+            n_vacancies=0,
+            n_interstitials=0,
+            n_workers=1,
+        )
+
+    assert output_path.read_bytes() == b"complete-candidate-artifact"
+    assert list(tmp_path.glob(f".{output_path.name}.*.tmp")) == []
+
+
+def test_zero_candidate_publication_is_an_explicit_empty_artifact(tmp_path) -> None:
+    coordinator = PerturbationCoordinator(
+        settings=PerturbationSettings(
+            target_n_atoms=4,
+            n_volume_points=0,
+            elastic_stress_enabled=False,
+        )
+    )
+
+    output_path = coordinator.process(
+        [],
+        tmp_path,
+        n_rattled=0,
+        n_vacancies=0,
+        n_interstitials=0,
+        n_workers=1,
+    )
+
+    assert output_path.is_file()
+    assert output_path.read_bytes() == b""
+    assert coordinator.get_summary()["total"] == 0
+    assert coordinator.get_provenance_records() == ()
+    assert list(tmp_path.glob(f".{output_path.name}.*.tmp")) == []
 
 
 def test_worker_result_is_pickleable_with_canonical_provenance() -> None:
