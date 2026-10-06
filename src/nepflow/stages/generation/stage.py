@@ -235,9 +235,7 @@ class GenerationStage:
             n_vacancy_interstitial=(config.n_vacancy_interstitial if gas else 0),
             n_gas_in_vacancy=(config.n_gas_in_vacancy if gas else 0),
             n_surfaces=(config.n_surfaces if config.surface_enabled else 0),
-            n_grain_boundaries=(
-                config.n_grain_boundaries if config.grain_boundary_enabled else 0
-            ),
+            n_grain_boundaries=(config.n_grain_boundaries if config.grain_boundary_enabled else 0),
             n_workers=config.n_workers,
         )
         self._candidate_path = Path(output_path) if output_path is not None else None
