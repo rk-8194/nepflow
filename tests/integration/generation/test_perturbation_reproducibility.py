@@ -328,6 +328,7 @@ class GenerationReproducibilityTests(unittest.TestCase):
     def test_serial_and_parallel_task_results_keep_base_order(self) -> None:
         first = self.make_base()
         second = self.make_base()
+        second.set_cell(np.diag([20.5, 20.0, 20.0]), scale_atoms=False)
         second.info["seed_id"] = "seed_000008"
         second.info["source"] = "reproducibility-fixture-second"
         settings = self.settings(
