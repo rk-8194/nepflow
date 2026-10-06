@@ -459,9 +459,7 @@ def validate_generation_config(config: GenerationConfig) -> GenerationConfig:
     if config.surface_max_terminations < 0:
         raise ConfigurationError("generation.surface_max_terminations must be non-negative")
     if config.surface_termination_policy not in {"all", "first"}:
-        raise ConfigurationError(
-            "generation.surface_termination_policy must be 'all' or 'first'"
-        )
+        raise ConfigurationError("generation.surface_termination_policy must be 'all' or 'first'")
     for index in config.surface_miller_indices:
         if len(index) != 3 or not any(index):
             raise ConfigurationError(
@@ -474,8 +472,7 @@ def validate_generation_config(config: GenerationConfig) -> GenerationConfig:
             "generation.surface_in_plane_repeat must contain two positive integers"
         )
     if len(config.surface_min_in_plane_dimensions) != 2 or any(
-        not math.isfinite(value) or value < 0.0
-        for value in config.surface_min_in_plane_dimensions
+        not math.isfinite(value) or value < 0.0 for value in config.surface_min_in_plane_dimensions
     ):
         raise ConfigurationError(
             "generation.surface_min_in_plane_dimensions must be finite and non-negative"
