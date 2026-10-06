@@ -392,10 +392,7 @@ def _validate_liquid_state(candidate: Any) -> CandidateValidationIssue | None:
     missing = [key for key in required if key not in info]
     if missing:
         return CandidateValidationIssue("missing_liquid_provenance", {"fields": missing})
-    if (
-        info["liquid_method"] != _LIQUID_METHOD
-        or info["liquid_fidelity"] != _LIQUID_FIDELITY
-    ):
+    if info["liquid_method"] != _LIQUID_METHOD or info["liquid_fidelity"] != _LIQUID_FIDELITY:
         return CandidateValidationIssue(
             "invalid_liquid_method",
             {
@@ -437,9 +434,7 @@ def _validate_liquid_state(candidate: Any) -> CandidateValidationIssue | None:
         return CandidateValidationIssue("invalid_liquid_source", {})
     if info["liquid_source_composition"] is None:
         return CandidateValidationIssue("invalid_liquid_source", {})
-    if info["source_composition"] is None or not isinstance(
-        info["parent_structure_id"], str
-    ):
+    if info["source_composition"] is None or not isinstance(info["parent_structure_id"], str):
         return CandidateValidationIssue("invalid_liquid_source", {})
     if "liquid_target_temperature_k" in info:
         try:
@@ -708,18 +703,12 @@ def validate_generation_config(config: GenerationConfig) -> GenerationConfig:
             "generation.grain_boundary_min_thickness must be finite and non-negative"
         )
     if not 0.0 <= config.grain_boundary_overlap_tolerance <= 1.0:
-        raise ConfigurationError(
-            "generation.grain_boundary_overlap_tolerance must be in [0, 1]"
-        )
-    if config.use_liquid and (
-        config.n_liquid_configurations > 0 and config.n_liquid_snapshots > 0
-    ):
+        raise ConfigurationError("generation.grain_boundary_overlap_tolerance must be in [0, 1]")
+    if config.use_liquid and (config.n_liquid_configurations > 0 and config.n_liquid_snapshots > 0):
         if config.liquid_timestep_fs <= 0.0:
             raise ConfigurationError("generation.liquid_timestep_fs must be positive")
         if config.liquid_steps_between_snapshots <= 0:
-            raise ConfigurationError(
-                "generation.liquid_steps_between_snapshots must be positive"
-            )
+            raise ConfigurationError("generation.liquid_steps_between_snapshots must be positive")
     _validate_source_scopes(config)
     return config
 
