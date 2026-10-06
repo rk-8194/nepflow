@@ -200,9 +200,7 @@ def _parse_generation_modes(values: Mapping[str, str]) -> dict[str, Any]:
             values.get("n_gas_in_vacancy", "10"),
             "generation.n_gas_in_vacancy",
         ),
-        "n_surfaces": _parse_int(
-            values.get("n_surfaces", "0"), "generation.n_surfaces"
-        ),
+        "n_surfaces": _parse_int(values.get("n_surfaces", "0"), "generation.n_surfaces"),
     }
 
 
@@ -342,9 +340,9 @@ def _parse_generation_perturbations(values: Mapping[str, str]) -> dict[str, Any]
         "surface_vacuum": _parse_float(
             values.get("surface_vacuum", "10.0"), "generation.surface_vacuum"
         ),
-        "surface_termination_policy": values.get(
-            "surface_termination_policy", "all"
-        ).strip().lower(),
+        "surface_termination_policy": values.get("surface_termination_policy", "all")
+        .strip()
+        .lower(),
         "surface_max_terminations": _parse_int(
             values.get("surface_max_terminations", "0"),
             "generation.surface_max_terminations",
