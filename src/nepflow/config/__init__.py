@@ -15,7 +15,11 @@ from .loader import (
     load_config,
 )
 from .models import (
+    ALL_SOURCES,
     CONFIG_SCHEMA_VERSION,
+    DEFAULT_SOURCE_SCOPE,
+    GENERATION_SOURCE_SCOPE_FIELDS,
+    SUPPORTED_CONFIGURATIONAL_SOURCES,
     CompositionConfig,
     DftRecoveryConfig,
     GenerationConfig,
@@ -29,6 +33,7 @@ from .models import (
     RootConfig,
     SelectionConfig,
     SlurmConfig,
+    SourceScope,
     ValidationConfig,
     VaspConfig,
 )
@@ -44,10 +49,13 @@ from .validation import (
 
 __all__ = [
     "CANONICAL_CONFIG_NAME",
+    "ALL_SOURCES",
     "CONFIG_SCHEMA_VERSION",
     "ConfigurationError",
     "CompositionConfig",
     "DftRecoveryConfig",
+    "DEFAULT_SOURCE_SCOPE",
+    "GENERATION_SOURCE_SCOPE_FIELDS",
     "GenerationConfig",
     "HpcConfig",
     "MaterialsProjectConfig",
@@ -59,6 +67,8 @@ __all__ = [
     "RootConfig",
     "SelectionConfig",
     "SlurmConfig",
+    "SourceScope",
+    "SUPPORTED_CONFIGURATIONAL_SOURCES",
     "ValidationConfig",
     "VaspConfig",
     "canonical_config_path",

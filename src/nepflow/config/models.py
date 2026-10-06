@@ -7,6 +7,30 @@ from typing import Any
 
 CONFIG_SCHEMA_VERSION = 1
 
+ALL_SOURCES = "all"
+SUPPORTED_CONFIGURATIONAL_SOURCES = frozenset(
+    {
+        "mp_phase",
+        "mp_gas_phase",
+        "random_solid_solution",
+        "sqs",
+        "segregated",
+    }
+)
+SourceScope = tuple[str, ...]
+DEFAULT_SOURCE_SCOPE: SourceScope = (ALL_SOURCES,)
+GENERATION_SOURCE_SCOPE_FIELDS = (
+    "volume_sources",
+    "elastic_sources",
+    "rattle_sources",
+    "liquid_sources",
+    "vacancy_sources",
+    "interstitial_sources",
+    "gas_interstitial_sources",
+    "vacancy_interstitial_sources",
+    "gas_in_vacancy_sources",
+)
+
 
 @dataclass(frozen=True, slots=True)
 class ProjectConfig:
@@ -74,6 +98,7 @@ class GenerationConfig:
     volume_scale_min: float = 0.8
     volume_scale_max: float = 1.2
     n_volume_points: int = 11
+    volume_sources: SourceScope = DEFAULT_SOURCE_SCOPE
     elastic_stress_enabled: bool = True
     elastic_strain_amplitudes: tuple[float, ...] = (
         -0.02,
@@ -83,12 +108,20 @@ class GenerationConfig:
         0.01,
         0.02,
     )
+    elastic_sources: SourceScope = DEFAULT_SOURCE_SCOPE
     n_rattled: int = 10
+    rattle_sources: SourceScope = DEFAULT_SOURCE_SCOPE
     n_vacancies: int = 10
+    vacancy_sources: SourceScope = DEFAULT_SOURCE_SCOPE
     n_interstitials: int = 10
+    interstitial_sources: SourceScope = DEFAULT_SOURCE_SCOPE
     n_gas_interstitials: int = 10
+    gas_interstitial_sources: SourceScope = DEFAULT_SOURCE_SCOPE
     n_vacancy_interstitial: int = 10
+    vacancy_interstitial_sources: SourceScope = DEFAULT_SOURCE_SCOPE
     n_gas_in_vacancy: int = 10
+    gas_in_vacancy_sources: SourceScope = DEFAULT_SOURCE_SCOPE
+    liquid_sources: SourceScope = DEFAULT_SOURCE_SCOPE
     rattle_std: float = 0.03
     rattle_std_min: float = 0.015
     rattle_std_max: float = 0.06

@@ -10,6 +10,9 @@ from typing import Any
 from nepflow.errors import ConfigurationError
 
 from .models import (
+    ALL_SOURCES,
+    GENERATION_SOURCE_SCOPE_FIELDS,
+    SUPPORTED_CONFIGURATIONAL_SOURCES,
     CompositionConfig,
     DftRecoveryConfig,
     GenerationConfig,
@@ -138,6 +141,7 @@ def parse_generation(values: Mapping[str, str]) -> GenerationConfig:
     return GenerationConfig(
         **_parse_generation_modes(values),
         **_parse_generation_liquid(values),
+        **_parse_generation_scopes(values),
         **_parse_generation_perturbations(values),
     )
 
@@ -276,6 +280,33 @@ def _parse_generation_perturbations(values: Mapping[str, str]) -> dict[str, Any]
             "generation.max_gas_occupancy",
         ),
     }
+
+
+def _parse_generation_scopes(values: Mapping[str, str]) -> dict[str, tuple[str, ...]]:
+    return {
+        field_name: _parse_source_scope(values, field_name)
+        for field_name in GENERATION_SOURCE_SCOPE_FIELDS
+    }
+
+
+def _parse_source_scope(values: Mapping[str, str], field_name: str) -> tuple[str, ...]:
+    key = f"generation.{field_name}"
+    raw = values.get(field_name, ALL_SOURCES)
+    if not isinstance(raw, str) or not raw.strip():
+        raise ConfigurationError(f"{key} must explicitly name one or more sources")
+    entries = tuple(item.strip().lower() for item in raw.split(","))
+    if any(not item for item in entries):
+        raise ConfigurationError(f"{key} must be a comma-separated source list")
+    if len(set(entries)) != len(entries):
+        raise ConfigurationError(f"{key} must not contain duplicate sources")
+    if ALL_SOURCES in entries and len(entries) != 1:
+        raise ConfigurationError(f"{key} cannot combine 'all' with named sources")
+    unknown = set(entries) - SUPPORTED_CONFIGURATIONAL_SOURCES - {ALL_SOURCES}
+    if unknown:
+        raise ConfigurationError(
+            f"{key} contains unsupported sources: {', '.join(sorted(unknown))}"
+        )
+    return entries
 
 
 def parse_selection(values: Mapping[str, str]) -> SelectionConfig:

@@ -155,6 +155,7 @@ def _build_perturbation_coordinator(context: StageContext) -> PerturbationCoordi
         interstitial_d_min=generation.interstitial_d_min,
         volume_scale_range=(generation.volume_scale_min, generation.volume_scale_max),
         n_volume_points=generation.n_volume_points,
+        volume_sources=generation.volume_sources,
         target_n_atoms=generation.target_n_atoms,
         random_seed=config.project.random_seed,
         gas_elements=list(composition.gas_elements),
@@ -162,12 +163,20 @@ def _build_perturbation_coordinator(context: StageContext) -> PerturbationCoordi
         max_gas_occupancy=generation.max_gas_occupancy,
         elastic_stress_enabled=generation.elastic_stress_enabled,
         elastic_strain_amplitudes=list(generation.elastic_strain_amplitudes),
+        elastic_sources=generation.elastic_sources,
         liquid_enabled=generation.use_liquid,
         liquid_temperature_k=generation.liquid_temperature,
         liquid_timestep_fs=generation.liquid_timestep_fs,
         liquid_equilibration_steps=generation.liquid_equilibration_steps,
         liquid_steps_between_snapshots=generation.liquid_steps_between_snapshots,
         liquid_friction=generation.liquid_friction,
+        liquid_sources=generation.liquid_sources,
+        rattle_sources=generation.rattle_sources,
+        vacancy_sources=generation.vacancy_sources,
+        interstitial_sources=generation.interstitial_sources,
+        gas_interstitial_sources=generation.gas_interstitial_sources,
+        vacancy_interstitial_sources=generation.vacancy_interstitial_sources,
+        gas_in_vacancy_sources=generation.gas_in_vacancy_sources,
     )
 
 

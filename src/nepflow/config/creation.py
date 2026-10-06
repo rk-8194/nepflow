@@ -115,16 +115,29 @@ liquid_friction=0.02
 volume_scale_min=0.8
 volume_scale_max=1.2
 n_volume_points=11
+# Explicit source scope; "all" preserves the schema-v1 all-base behaviour.
+volume_sources=all
 
 # --- Elastic stress sets ---
 # Deterministic normal, coupled-normal, and shear strain series for elastic constants
 elastic_stress_enabled=true
 elastic_strain_amplitudes=-0.02,-0.01,-0.005,0.005,0.01,0.02
+elastic_sources=all
 
 # --- Perturbation counts (per base structure at equilibrium) ---
 n_rattled=10
+rattle_sources=all
 n_vacancies=10
+vacancy_sources=all
 n_interstitials=10
+interstitial_sources=all
+n_gas_interstitials=10
+gas_interstitial_sources=all
+n_vacancy_interstitial=10
+vacancy_interstitial_sources=all
+n_gas_in_vacancy=10
+gas_in_vacancy_sources=all
+liquid_sources=all
 
 # --- Perturbation parameters ---
 # Rattling (thermal disorder via hiphive MC)

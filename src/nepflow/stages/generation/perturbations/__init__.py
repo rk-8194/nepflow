@@ -1,6 +1,6 @@
 """Focused perturbation families and their typed coordinator."""
 
-from .coordinator import PerturbationCoordinator, PerturbationTaskError
+from .coordinator import PerturbationCoordinator, PerturbationTaskError, family_applies_to_base
 from .elasticity import (
     ElasticRecord,
     fit_elastic_tensor,
@@ -20,6 +20,7 @@ __all__ = [
     "PerturbationTask",
     "PerturbationTaskError",
     "PerturbationTaskResult",
+    "family_applies_to_base",
     "ElasticRecord",
     "fit_elastic_tensor",
     "strain_matrix_to_voigt",

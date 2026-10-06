@@ -7,7 +7,13 @@ from ase.data import chemical_symbols
 
 from nepflow.errors import ConfigurationError
 
-from .models import NepflowConfig
+from .models import (
+    ALL_SOURCES,
+    GENERATION_SOURCE_SCOPE_FIELDS,
+    SUPPORTED_CONFIGURATIONAL_SOURCES,
+    GenerationConfig,
+    NepflowConfig,
+)
 
 ALLOWED_CRYSTAL_STRUCTURES = frozenset({"bcc", "fcc", "hcp", "diamond", "simple_cubic"})
 # Atomic representations do not yet have a structure-level selection result
@@ -130,6 +136,7 @@ def validate_config(
             "generation.crystal_structures contains unsupported values: "
             + ", ".join(sorted(unknown_structures))
         )
+    _validate_generation_source_scopes(config.generation)
     _require_non_negative(
         "generation.target_n_atoms", config.generation.target_n_atoms, strictly_positive=True
     )
@@ -283,6 +290,28 @@ def validate_config(
 
 def _is_element_symbol(value: str) -> bool:
     return value in KNOWN_ELEMENT_SYMBOLS
+
+
+def _validate_generation_source_scopes(config: GenerationConfig) -> None:
+    for field_name in GENERATION_SOURCE_SCOPE_FIELDS:
+        scope = getattr(config, field_name)
+        name = f"generation.{field_name}"
+        if not isinstance(scope, tuple) or not scope:
+            raise ConfigurationError(f"{name} must contain at least one explicit source")
+        if any(not isinstance(source, str) or not source.strip() for source in scope):
+            raise ConfigurationError(f"{name} contains a blank source")
+        normalized = tuple(source.strip().lower() for source in scope)
+        if normalized != scope:
+            raise ConfigurationError(f"{name} must use normalized lowercase source names")
+        if len(set(scope)) != len(scope):
+            raise ConfigurationError(f"{name} must not contain duplicate sources")
+        if ALL_SOURCES in scope and len(scope) != 1:
+            raise ConfigurationError(f"{name} cannot combine 'all' with named sources")
+        unknown = set(scope) - SUPPORTED_CONFIGURATIONAL_SOURCES - {ALL_SOURCES}
+        if unknown:
+            raise ConfigurationError(
+                f"{name} contains unsupported sources: {', '.join(sorted(unknown))}"
+            )
 
 
 def _require_non_negative(

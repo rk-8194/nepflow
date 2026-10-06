@@ -4,7 +4,13 @@ from __future__ import annotations
 
 import math
 
-from nepflow.config.models import CompositionConfig, GenerationConfig
+from nepflow.config.models import (
+    ALL_SOURCES,
+    GENERATION_SOURCE_SCOPE_FIELDS,
+    SUPPORTED_CONFIGURATIONAL_SOURCES,
+    CompositionConfig,
+    GenerationConfig,
+)
 from nepflow.errors import ConfigurationError
 
 
@@ -39,4 +45,27 @@ def validate_generation_config(config: GenerationConfig) -> GenerationConfig:
         raise ConfigurationError("generation.target_n_atoms must be positive")
     if config.n_workers < 0:
         raise ConfigurationError("generation.n_workers must be non-negative")
+    _validate_source_scopes(config)
     return config
+
+
+def _validate_source_scopes(config: GenerationConfig) -> None:
+    for field_name in GENERATION_SOURCE_SCOPE_FIELDS:
+        scope = getattr(config, field_name)
+        name = f"generation.{field_name}"
+        if not isinstance(scope, tuple) or not scope:
+            raise ConfigurationError(f"{name} must contain at least one explicit source")
+        if any(not isinstance(source, str) or not source.strip() for source in scope):
+            raise ConfigurationError(f"{name} contains a blank source")
+        normalized = tuple(source.strip().lower() for source in scope)
+        if normalized != scope:
+            raise ConfigurationError(f"{name} must use normalized lowercase source names")
+        if len(set(scope)) != len(scope):
+            raise ConfigurationError(f"{name} must not contain duplicate sources")
+        if ALL_SOURCES in scope and len(scope) != 1:
+            raise ConfigurationError(f"{name} cannot combine 'all' with named sources")
+        unknown = set(scope) - SUPPORTED_CONFIGURATIONAL_SOURCES - {ALL_SOURCES}
+        if unknown:
+            raise ConfigurationError(
+                f"{name} contains unsupported sources: {', '.join(sorted(unknown))}"
+            )

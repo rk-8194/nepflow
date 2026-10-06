@@ -15,6 +15,7 @@ from nepflow.stages.generation.perturbations.coordinator import (
     PerturbationCoordinator,
     PerturbationTaskError,
     execute_perturbation_task,
+    family_applies_to_base,
 )
 from nepflow.stages.generation.perturbations.defects import (
     gas_in_vacancy,
@@ -24,6 +25,7 @@ from nepflow.stages.generation.perturbations.defects import (
     vacancy_interstitial,
 )
 from nepflow.stages.generation.perturbations.models import (
+    PERTURBATION_FAMILY_SOURCE_FIELDS,
     PerturbationCounts,
     PerturbationSettings,
     PerturbationTask,
@@ -96,6 +98,38 @@ def test_focused_defect_families_remain_independently_callable() -> None:
     assert outputs[2][0].info["n_gas_interstitials"] >= 0
     assert outputs[3][0].info["n_vacancies"] == 1
     assert outputs[4][0].info["n_gas_atoms"] >= 0
+
+
+@pytest.mark.parametrize(
+    ("family", "scope_field"),
+    [
+        ("volume_profile", "volume_sources"),
+        ("elastic_stress", "elastic_sources"),
+        ("rattled", "rattle_sources"),
+        ("liquid", "liquid_sources"),
+        ("vacancy", "vacancy_sources"),
+        ("interstitial", "interstitial_sources"),
+        ("gas_interstitial", "gas_interstitial_sources"),
+        ("vacancy_interstitial", "vacancy_interstitial_sources"),
+        ("gas_in_vacancy", "gas_in_vacancy_sources"),
+    ],
+)
+def test_each_family_runs_only_on_its_configured_source(family: str, scope_field: str) -> None:
+    settings = PerturbationSettings(**{scope_field: ("mp_phase",)})
+
+    assert family_applies_to_base(family, scoped_base("mp_phase"), settings)
+    assert not family_applies_to_base(family, scoped_base("sqs"), settings)
+
+
+def test_all_source_scope_requires_a_configurational_type() -> None:
+    base = base_atoms()
+    del base.info["configurational_type"]
+
+    assert not family_applies_to_base(
+        "vacancy",
+        base,
+        PerturbationSettings(vacancy_sources=("all",)),
+    )
 
 
 def test_one_perturbation_task_represents_one_base_structure() -> None:
@@ -258,6 +292,7 @@ def test_existing_candidate_family_order_is_locked_before_source_scoping(
                 target_n_atoms=4,
                 gas_elements=("H",),
                 elastic_stress_enabled=True,
+                liquid_enabled=True,
             ),
             counts=PerturbationCounts(
                 n_rattled=1,
@@ -285,7 +320,7 @@ def _source_scoped_candidates(
     counts: PerturbationCounts,
     family_scopes: dict[str, tuple[str, ...]],
 ) -> list[Atoms]:
-    """Exercise the source-scope API reserved for Phase 6.02."""
+    """Build typed settings for one source-scoped coordinator contract."""
 
     coordinator = PerturbationCoordinator(
         settings=PerturbationSettings(
@@ -293,20 +328,19 @@ def _source_scoped_candidates(
             random_seed=21,
             n_volume_points=0,
             elastic_stress_enabled=False,
+            **{
+                PERTURBATION_FAMILY_SOURCE_FIELDS[family]: scope
+                for family, scope in family_scopes.items()
+            },
         )
     )
     return coordinator.generate_candidates(
         bases,
         counts=counts,
         n_workers=1,
-        family_scopes=family_scopes,
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="Phase 6.02 will add explicit source-scoped perturbation families",
-)
 def test_mp_phase_scoped_family_does_not_run_on_sqs() -> None:
     candidates = _source_scoped_candidates(
         [scoped_base("mp_phase"), scoped_base("sqs")],
@@ -319,10 +353,6 @@ def test_mp_phase_scoped_family_does_not_run_on_sqs() -> None:
     ] == ["mp_phase"], "a family scoped to mp_phase must not run on an sqs base"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="Phase 6.02 will add explicit source-scoped perturbation families",
-)
 def test_sqs_scoped_family_does_not_run_on_random_solid_solution() -> None:
     candidates = _source_scoped_candidates(
         [scoped_base("sqs"), scoped_base("random_solid_solution")],
@@ -335,10 +365,6 @@ def test_sqs_scoped_family_does_not_run_on_random_solid_solution() -> None:
     ] == ["sqs"], "a family scoped to sqs must not run on a random_solid_solution base"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="Phase 6.02 will add explicit source-scoped perturbation families",
-)
 def test_explicit_all_sources_scope_applies_to_every_eligible_base() -> None:
     candidates = _source_scoped_candidates(
         [scoped_base("mp_phase"), scoped_base("sqs"), scoped_base("random_solid_solution")],
@@ -353,10 +379,6 @@ def test_explicit_all_sources_scope_applies_to_every_eligible_base() -> None:
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="Phase 6.02 will add explicit source-scoped perturbation families",
-)
 def test_enabling_two_families_does_not_imply_chaining() -> None:
     base = scoped_base("mp_phase")
     candidates = _source_scoped_candidates(
@@ -375,10 +397,6 @@ def test_enabling_two_families_does_not_imply_chaining() -> None:
     ), "enabling two families must not feed one family's candidates into the other"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="Phase 6.02 will add explicit source-scoped perturbation families",
-)
 def test_filtering_one_family_does_not_reorder_unaffected_candidates() -> None:
     bases = [scoped_base("mp_phase"), scoped_base("sqs")]
     counts = PerturbationCounts(n_rattled=1, n_vacancies=1, n_interstitials=0)

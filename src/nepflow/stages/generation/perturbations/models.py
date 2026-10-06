@@ -5,6 +5,20 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from nepflow.config.models import DEFAULT_SOURCE_SCOPE, SourceScope
+
+PERTURBATION_FAMILY_SOURCE_FIELDS = {
+    "volume_profile": "volume_sources",
+    "elastic_stress": "elastic_sources",
+    "rattled": "rattle_sources",
+    "liquid": "liquid_sources",
+    "vacancy": "vacancy_sources",
+    "interstitial": "interstitial_sources",
+    "gas_interstitial": "gas_interstitial_sources",
+    "vacancy_interstitial": "vacancy_interstitial_sources",
+    "gas_in_vacancy": "gas_in_vacancy_sources",
+}
+
 
 @dataclass(frozen=True, slots=True)
 class PerturbationCounts:
@@ -59,6 +73,15 @@ class PerturbationSettings:
     liquid_equilibration_steps: int = 200
     liquid_steps_between_snapshots: int = 100
     liquid_friction: float = 0.02
+    volume_sources: SourceScope = DEFAULT_SOURCE_SCOPE
+    elastic_sources: SourceScope = DEFAULT_SOURCE_SCOPE
+    rattle_sources: SourceScope = DEFAULT_SOURCE_SCOPE
+    liquid_sources: SourceScope = DEFAULT_SOURCE_SCOPE
+    vacancy_sources: SourceScope = DEFAULT_SOURCE_SCOPE
+    interstitial_sources: SourceScope = DEFAULT_SOURCE_SCOPE
+    gas_interstitial_sources: SourceScope = DEFAULT_SOURCE_SCOPE
+    vacancy_interstitial_sources: SourceScope = DEFAULT_SOURCE_SCOPE
+    gas_in_vacancy_sources: SourceScope = DEFAULT_SOURCE_SCOPE
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "vacancy_range", tuple(self.vacancy_range))
@@ -69,6 +92,13 @@ class PerturbationSettings:
         if amplitudes is None:
             amplitudes = (-0.02, -0.01, -0.005, 0.005, 0.01, 0.02)
         object.__setattr__(self, "elastic_strain_amplitudes", tuple(amplitudes))
+        for field_name in PERTURBATION_FAMILY_SOURCE_FIELDS.values():
+            scope = getattr(self, field_name)
+            if isinstance(scope, str):
+                normalized_scope = (scope.strip().lower(),)
+            else:
+                normalized_scope = tuple(scope)
+            object.__setattr__(self, field_name, normalized_scope)
         if self.rattle_std_min is not None and self.rattle_std_max is not None:
             minimum = self.rattle_std_min
             maximum = self.rattle_std_max
@@ -108,7 +138,24 @@ class PerturbationSettings:
             "liquid_equilibration_steps": self.liquid_equilibration_steps,
             "liquid_steps_between_snapshots": self.liquid_steps_between_snapshots,
             "liquid_friction": self.liquid_friction,
+            "volume_sources": list(self.volume_sources),
+            "elastic_sources": list(self.elastic_sources),
+            "rattle_sources": list(self.rattle_sources),
+            "liquid_sources": list(self.liquid_sources),
+            "vacancy_sources": list(self.vacancy_sources),
+            "interstitial_sources": list(self.interstitial_sources),
+            "gas_interstitial_sources": list(self.gas_interstitial_sources),
+            "vacancy_interstitial_sources": list(self.vacancy_interstitial_sources),
+            "gas_in_vacancy_sources": list(self.gas_in_vacancy_sources),
         }
+
+    def sources_for_family(self, family: str) -> SourceScope:
+        """Return the explicit source scope configured for one family."""
+
+        field_name = PERTURBATION_FAMILY_SOURCE_FIELDS.get(family)
+        if field_name is None:
+            raise KeyError(f"Unknown perturbation family: {family}")
+        return getattr(self, field_name)
 
 
 @dataclass(frozen=True, slots=True)
@@ -142,4 +189,5 @@ __all__ = [
     "PerturbationSettings",
     "PerturbationTask",
     "PerturbationTaskResult",
+    "PERTURBATION_FAMILY_SOURCE_FIELDS",
 ]

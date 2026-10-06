@@ -45,6 +45,45 @@ def test_loader_builds_immutable_typed_root_and_applies_defaults(tmp_path: Path)
         config.project = config.project
 
 
+def test_generation_source_scope_defaults_are_explicit_and_stable(tmp_path: Path) -> None:
+    config = load_config(write_config(tmp_path))
+    scope_fields = (
+        "volume_sources",
+        "elastic_sources",
+        "rattle_sources",
+        "liquid_sources",
+        "vacancy_sources",
+        "interstitial_sources",
+        "gas_interstitial_sources",
+        "vacancy_interstitial_sources",
+        "gas_in_vacancy_sources",
+    )
+
+    assert all(getattr(config.generation, field) == ("all",) for field in scope_fields)
+    effective_generation = config.effective_mapping()["generation"]
+    assert all(effective_generation[field] == ["all"] for field in scope_fields)
+
+
+def test_generation_source_scope_round_trip_preserves_effective_mapping(tmp_path: Path) -> None:
+    first_text = BASE_CONFIG.replace(
+        "[generation]",
+        "[generation]\nvolume_sources = mp_phase, mp_gas_phase\nrattle_sources = sqs",
+        1,
+    )
+    second_text = BASE_CONFIG.replace(
+        "[generation]",
+        "[generation]\nvolume_sources = MP_PHASE,MP_GAS_PHASE\nrattle_sources=sqs",
+        1,
+    )
+
+    first = load_config(write_config(tmp_path, first_text))
+    second = load_config(write_config(tmp_path, second_text))
+
+    assert first.generation.volume_sources == ("mp_phase", "mp_gas_phase")
+    assert first.generation.rattle_sources == ("sqs",)
+    assert first.effective_mapping() == second.effective_mapping()
+
+
 def test_config_path_resolution_is_canonical_and_deterministic(tmp_path: Path) -> None:
     project_dir = tmp_path / "project_demo"
     canonical = project_dir / "config" / "project.config"
@@ -82,6 +121,27 @@ def test_loader_rejects_bad_types(tmp_path: Path, key: str, value: str) -> None:
     text = BASE_CONFIG.replace(f"{key} = {defaults[key]}", f"{key} = {value}")
 
     with pytest.raises(ConfigurationError):
+        load_config(write_config(tmp_path, text))
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "unknown_source",
+        "",
+        "all,mp_phase",
+        "mp_phase,mp_phase",
+        "mp_phase,,sqs",
+    ],
+)
+def test_loader_rejects_invalid_generation_source_scopes(tmp_path: Path, value: str) -> None:
+    text = BASE_CONFIG.replace(
+        "[generation]",
+        f"[generation]\nvacancy_sources = {value}",
+        1,
+    )
+
+    with pytest.raises(ConfigurationError, match="generation.vacancy_sources"):
         load_config(write_config(tmp_path, text))
 
 

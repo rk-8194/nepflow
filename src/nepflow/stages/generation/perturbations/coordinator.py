@@ -4,14 +4,16 @@ from __future__ import annotations
 
 import logging
 import os
+from collections.abc import Iterable
 from concurrent.futures import ProcessPoolExecutor
 from io import StringIO
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 import numpy as np
 from ase.io import write
 
+from nepflow.config.models import ALL_SOURCES
 from nepflow.domain.identities import annotate_structure_ids, calculate_structure_id
 from nepflow.io.atomic import atomic_write_bytes, atomic_write_text
 from nepflow.stages.generation.supercell import build_target_supercell
@@ -62,6 +64,21 @@ class PerturbationTaskError(RuntimeError):
         super().__init__(
             f"Perturbation task failed for base={task.base_structure_id}, seed={task.seed}: {cause}"
         )
+
+
+def family_applies_to_base(
+    family: str,
+    base: Any,
+    settings: PerturbationSettings,
+) -> bool:
+    """Return whether one derived family may use the supplied base source."""
+
+    scope = settings.sources_for_family(family)
+    source = getattr(base, "info", {}).get("configurational_type")
+    if not isinstance(source, str) or not source.strip():
+        return False
+    normalized_source = source.strip().lower()
+    return ALL_SOURCES in scope or normalized_source in scope
 
 
 def execute_perturbation_task(task: PerturbationTask) -> PerturbationTaskResult:
@@ -124,45 +141,68 @@ def execute_perturbation_task(task: PerturbationTask) -> PerturbationTaskResult:
         operation_id="unperturbed",
     )
     output.append(equilibrium)
-    output.extend(volume_profile(supercell, task.base, settings, annotate))
-    output.extend(elastic_stress_set(supercell, task.base, settings, annotate))
-    output.extend(
-        rattled(supercell, task.base, task.counts.n_rattled, settings, task.seed, annotate)
-    )
-    output.extend(
-        liquid_snapshots(
-            supercell,
-            task.base,
-            task.counts.n_liquid_configurations,
-            task.counts.n_liquid_snapshots,
-            settings,
-            task.seed,
-            annotate,
+    if settings.n_volume_points > 0 and family_applies_to_base(
+        "volume_profile", task.base, settings
+    ):
+        output.extend(volume_profile(supercell, task.base, settings, annotate))
+    if (
+        settings.elastic_stress_enabled
+        and settings.elastic_strain_amplitudes
+        and family_applies_to_base("elastic_stress", task.base, settings)
+    ):
+        output.extend(elastic_stress_set(supercell, task.base, settings, annotate))
+    if task.counts.n_rattled > 0 and family_applies_to_base("rattled", task.base, settings):
+        output.extend(
+            rattled(supercell, task.base, task.counts.n_rattled, settings, task.seed, annotate)
         )
-    )
-    output.extend(
-        vacancies(
-            supercell,
-            task.base,
-            task.counts.n_vacancies,
-            settings,
-            rng,
-            annotate,
-            seed=task.seed,
+    if (
+        settings.liquid_enabled
+        and task.counts.n_liquid_configurations > 0
+        and task.counts.n_liquid_snapshots > 0
+        and family_applies_to_base("liquid", task.base, settings)
+    ):
+        output.extend(
+            liquid_snapshots(
+                supercell,
+                task.base,
+                task.counts.n_liquid_configurations,
+                task.counts.n_liquid_snapshots,
+                settings,
+                task.seed,
+                annotate,
+            )
         )
-    )
-    output.extend(
-        interstitials(
-            supercell,
-            task.base,
-            task.counts.n_interstitials,
-            settings,
-            rng,
-            annotate,
-            seed=task.seed,
+    if task.counts.n_vacancies > 0 and family_applies_to_base("vacancy", task.base, settings):
+        output.extend(
+            vacancies(
+                supercell,
+                task.base,
+                task.counts.n_vacancies,
+                settings,
+                rng,
+                annotate,
+                seed=task.seed,
+            )
         )
-    )
-    if settings.gas_elements:
+    if task.counts.n_interstitials > 0 and family_applies_to_base(
+        "interstitial", task.base, settings
+    ):
+        output.extend(
+            interstitials(
+                supercell,
+                task.base,
+                task.counts.n_interstitials,
+                settings,
+                rng,
+                annotate,
+                seed=task.seed,
+            )
+        )
+    if (
+        settings.gas_elements
+        and task.counts.n_gas_interstitials > 0
+        and family_applies_to_base("gas_interstitial", task.base, settings)
+    ):
         output.extend(
             gas_interstitials(
                 supercell,
@@ -174,6 +214,11 @@ def execute_perturbation_task(task: PerturbationTask) -> PerturbationTaskResult:
                 seed=task.seed,
             )
         )
+    if (
+        settings.gas_elements
+        and task.counts.n_vacancy_interstitial > 0
+        and family_applies_to_base("vacancy_interstitial", task.base, settings)
+    ):
         output.extend(
             vacancy_interstitial(
                 supercell,
@@ -185,6 +230,11 @@ def execute_perturbation_task(task: PerturbationTask) -> PerturbationTaskResult:
                 seed=task.seed,
             )
         )
+    if (
+        settings.gas_elements
+        and task.counts.n_gas_in_vacancy > 0
+        and family_applies_to_base("gas_in_vacancy", task.base, settings)
+    ):
         output.extend(
             gas_in_vacancy(
                 supercell,
@@ -220,15 +270,19 @@ class PerturbationCoordinator:
         return PerturbationCounts(**kwargs)
 
     def _tasks(
-        self, base_structures: Iterable[Any], counts: PerturbationCounts
+        self,
+        base_structures: Iterable[Any],
+        counts: PerturbationCounts,
+        settings: PerturbationSettings | None = None,
     ) -> list[PerturbationTask]:
         bases = list(base_structures)
         seeds = self.rng.randint(0, 2**31, size=len(bases)).tolist()
+        task_settings = settings or self.settings
         return [
             PerturbationTask(
                 base=base,
                 base_structure_id=calculate_structure_id(base),
-                settings=self.settings,
+                settings=task_settings,
                 counts=counts,
                 seed=int(seeds[index]),
             )
@@ -362,4 +416,5 @@ __all__ = [
     "PerturbationCoordinator",
     "PerturbationTaskError",
     "execute_perturbation_task",
+    "family_applies_to_base",
 ]
