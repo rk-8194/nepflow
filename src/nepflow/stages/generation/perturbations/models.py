@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 from typing import Any
 
@@ -18,6 +19,21 @@ PERTURBATION_FAMILY_SOURCE_FIELDS = {
     "vacancy_interstitial": "vacancy_interstitial_sources",
     "gas_in_vacancy": "gas_in_vacancy_sources",
 }
+
+
+def derive_child_seed(
+    base_structure_id: str,
+    root_seed: int,
+    family: str,
+    slot: int | str = 0,
+) -> int:
+    """Derive a stable 32-bit seed for one family/output slot."""
+
+    payload = "\x00".join(
+        (str(base_structure_id), str(int(root_seed)), str(family), str(slot))
+    ).encode("utf-8")
+    digest = hashlib.sha256(payload).digest()
+    return int.from_bytes(digest[:8], byteorder="big") % (2**32)
 
 
 @dataclass(frozen=True, slots=True)
@@ -190,4 +206,5 @@ __all__ = [
     "PerturbationTask",
     "PerturbationTaskResult",
     "PERTURBATION_FAMILY_SOURCE_FIELDS",
+    "derive_child_seed",
 ]

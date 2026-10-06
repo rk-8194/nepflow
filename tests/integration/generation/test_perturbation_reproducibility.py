@@ -21,6 +21,7 @@ from nepflow.stages.generation.perturbations.models import (  # noqa: E402
     PerturbationCounts,
     PerturbationSettings,
     PerturbationTask,
+    derive_child_seed,
 )
 from nepflow.stages.generation.perturbations.provenance import (  # noqa: E402
     annotate_generation_provenance,
@@ -159,7 +160,110 @@ class GenerationReproducibilityTests(unittest.TestCase):
                 base, base, 1, self.settings(random_seed=22), 22, annotate_generation_provenance
             )
 
-        self.assertEqual(received_seeds, [21, 22])
+        base_id = calculate_structure_id(base)
+        self.assertEqual(
+            received_seeds,
+            [
+                derive_child_seed(base_id, 21, "rattled", 0),
+                derive_child_seed(base_id, 22, "rattled", 0),
+            ],
+        )
+
+    def test_rattle_slots_receive_distinct_child_seeds(self) -> None:
+        base = self.make_base()
+        received_seeds = []
+
+        def fake_primary_rattling(atoms, n_structures, rattle_std, d_min, **kwargs):
+            del d_min, rattle_std
+            received_seeds.append(kwargs["seed"])
+            return [atoms.copy() for _ in range(n_structures)]
+
+        with patch(
+            "hiphive.structure_generation.generate_mc_rattled_structures",
+            side_effect=fake_primary_rattling,
+        ):
+            outputs = rattled(
+                base,
+                base,
+                3,
+                self.settings(random_seed=21),
+                21,
+                annotate_generation_provenance,
+            )
+
+        expected = [
+            derive_child_seed(calculate_structure_id(base), 21, "rattled", index)
+            for index in range(3)
+        ]
+        self.assertEqual(received_seeds, expected)
+        self.assertEqual([item.info["random_seed"] for item in outputs], expected)
+        self.assertEqual(len(set(received_seeds)), 3)
+
+    def test_unrelated_family_does_not_change_rattled_output(self) -> None:
+        base = self.make_base()
+
+        def fake_primary_rattling(atoms, n_structures, rattle_std, d_min, **kwargs):
+            del d_min
+            rng = np.random.RandomState(kwargs["seed"])
+            outputs = []
+            for _ in range(n_structures):
+                rattled_atoms = atoms.copy()
+                rattled_atoms.positions += rng.normal(
+                    0.0, rattle_std, rattled_atoms.positions.shape
+                )
+                outputs.append(rattled_atoms)
+            return outputs
+
+        settings = self.settings(
+            random_seed=1234,
+            n_volume_points=0,
+            elastic_stress_enabled=False,
+            rattle_std=0.03,
+            vacancy_range=(0.25, 0.25),
+        )
+        task_kwargs = {
+            "base": base,
+            "base_structure_id": calculate_structure_id(base),
+            "settings": settings,
+            "seed": 5678,
+        }
+
+        with patch(
+            "hiphive.structure_generation.generate_mc_rattled_structures",
+            side_effect=fake_primary_rattling,
+        ):
+            without_vacancies = execute_perturbation_task(
+                PerturbationTask(
+                    **task_kwargs,
+                    counts=PerturbationCounts(
+                        n_rattled=1,
+                        n_vacancies=0,
+                        n_interstitials=0,
+                    ),
+                )
+            )
+            with_vacancies = execute_perturbation_task(
+                PerturbationTask(
+                    **task_kwargs,
+                    counts=PerturbationCounts(
+                        n_rattled=1,
+                        n_vacancies=1,
+                        n_interstitials=0,
+                    ),
+                )
+            )
+
+        first_rattled = [
+            item
+            for item in without_vacancies.candidates
+            if item.info["perturbation_type"] == "rattled"
+        ]
+        second_rattled = [
+            item
+            for item in with_vacancies.candidates
+            if item.info["perturbation_type"] == "rattled"
+        ]
+        self.assert_structures_equal(first_rattled, second_rattled)
 
     def test_stochastic_vacancy_choices_repeat_with_same_seed(self) -> None:
         base = self.make_base()
@@ -249,9 +353,11 @@ class GenerationReproducibilityTests(unittest.TestCase):
     def test_worker_derived_seed_is_recorded_on_stochastic_candidate(self) -> None:
         base = self.make_base()
         child_seed = 9876
+        received_seeds = []
 
         def fake_primary_rattling(atoms, n_structures, rattle_std, d_min, **kwargs):
-            del d_min, rattle_std, kwargs
+            del d_min, rattle_std
+            received_seeds.append(kwargs["seed"])
             return [atoms.copy() for _ in range(n_structures)]
 
         with patch(
@@ -280,7 +386,10 @@ class GenerationReproducibilityTests(unittest.TestCase):
 
         rattled = [atoms for atoms in results if atoms.info["perturbation_type"] == "rattled"]
         self.assertEqual(len(rattled), 1)
-        self.assertEqual(rattled[0].info["random_seed"], child_seed)
+        expected_seed = derive_child_seed(calculate_structure_id(base), child_seed, "rattled", 0)
+        self.assertEqual(received_seeds, [expected_seed])
+        self.assertEqual(rattled[0].info["random_seed"], expected_seed)
+        self.assertNotEqual(rattled[0].info["random_seed"], child_seed)
         self.assertNotEqual(rattled[0].info["random_seed"], 1234)
         self.assertEqual(
             [calculate_structure_id(item) for item in restored.candidates],
@@ -303,7 +412,10 @@ class GenerationReproducibilityTests(unittest.TestCase):
         self.assertEqual(candidate.info["source"], base.info["source"])
         self.assertEqual(candidate.info["perturbation_type"], "vacancy")
         self.assertEqual(candidate.info["n_vacancies"], 4)
-        self.assertEqual(candidate.info["random_seed"], 1234)
+        self.assertEqual(
+            candidate.info["random_seed"],
+            derive_child_seed(calculate_structure_id(base), 1234, "vacancy", 0),
+        )
 
 
 if __name__ == "__main__":

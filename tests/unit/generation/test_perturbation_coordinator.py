@@ -29,6 +29,7 @@ from nepflow.stages.generation.perturbations.models import (
     PerturbationCounts,
     PerturbationSettings,
     PerturbationTask,
+    derive_child_seed,
 )
 from nepflow.stages.generation.perturbations.provenance import (
     annotate_generation_provenance,
@@ -57,6 +58,24 @@ def scoped_base(source: str) -> Atoms:
     atoms = base_atoms(source=source, seed_id=f"seed-{source}")
     atoms.info["configurational_type"] = source
     return atoms
+
+
+def test_child_seed_derivation_is_stable_and_namespaced() -> None:
+    base_id = calculate_structure_id(base_atoms())
+
+    assert derive_child_seed(base_id, 17, "vacancy", 0) == derive_child_seed(
+        base_id, 17, "vacancy", 0
+    )
+    assert derive_child_seed(base_id, 17, "vacancy", 0) != derive_child_seed(
+        base_id, 17, "vacancy", 1
+    )
+    assert derive_child_seed(base_id, 17, "vacancy", 0) != derive_child_seed(
+        base_id, 17, "interstitial", 0
+    )
+    assert derive_child_seed(base_id, 17, "vacancy", 0) != derive_child_seed(
+        base_id, 18, "vacancy", 0
+    )
+    assert 0 <= derive_child_seed(base_id, 17, "vacancy", 0) < 2**32
 
 
 def test_focused_defect_families_remain_independently_callable() -> None:
@@ -92,7 +111,16 @@ def test_focused_defect_families_remain_independently_callable() -> None:
     ]
 
     assert all(len(result) == 1 for result in outputs)
-    assert [result[0].info["random_seed"] for result in outputs] == [17] * 5
+    assert [result[0].info["random_seed"] for result in outputs] == [
+        derive_child_seed(calculate_structure_id(base), 17, family, 0)
+        for family in (
+            "vacancy",
+            "interstitial",
+            "gas_interstitial",
+            "vacancy_interstitial",
+            "gas_in_vacancy",
+        )
+    ]
     assert outputs[0][0].info["n_vacancies"] == 1
     assert outputs[1][0].info["n_interstitials"] >= 0
     assert outputs[2][0].info["n_gas_interstitials"] >= 0

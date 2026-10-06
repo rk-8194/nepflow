@@ -8,7 +8,9 @@ from typing import Any
 import numpy as np
 from ase import Atom
 
-from .models import PerturbationSettings
+from nepflow.domain.identities import calculate_structure_id
+
+from .models import PerturbationSettings, derive_child_seed
 
 Annotate = Callable[..., Any]
 
@@ -23,30 +25,35 @@ def vacancies(
     base: Any,
     n: int,
     settings: PerturbationSettings,
-    rng: np.random.RandomState,
+    rng: np.random.RandomState | None,
     annotate: Annotate,
     *,
     seed: int | None = None,
 ) -> list[Any]:
-    """Generate vacancy structures using the supplied seeded RNG.
+    """Generate vacancy structures with one deterministic RNG per slot.
 
     ``vacancy_range`` is a fraction of the periodic supercell atom count; at
     least one atom is removed while retaining one atom.  Candidate provenance
     records the realized count and no input structure is mutated.
     """
+    del rng
+    base_structure_id = calculate_structure_id(base)
+    root_seed = settings.random_seed if seed is None else int(seed)
     output: list[Any] = []
     for index in range(n):
+        child_seed = derive_child_seed(base_structure_id, root_seed, "vacancy", index)
+        slot_rng = np.random.RandomState(child_seed)
         vacancy = supercell.copy()
-        fraction = rng.uniform(*settings.vacancy_range)
+        fraction = slot_rng.uniform(*settings.vacancy_range)
         n_remove = max(1, int(fraction * len(vacancy)))
         n_remove = min(n_remove, len(vacancy) - 1)
-        keep = sorted(rng.choice(len(vacancy), size=len(vacancy) - n_remove, replace=False))
+        keep = sorted(slot_rng.choice(len(vacancy), size=len(vacancy) - n_remove, replace=False))
         vacancy = vacancy[keep]
         annotate(
             vacancy,
             base,
             "vacancy",
-            random_seed=seed,
+            random_seed=child_seed,
             parameters={"n_vacancies": n_remove},
             operation_id=f"vacancy:{index}",
         )
@@ -59,7 +66,7 @@ def interstitials(
     base: Any,
     n: int,
     settings: PerturbationSettings,
-    rng: np.random.RandomState,
+    rng: np.random.RandomState | None,
     annotate: Annotate,
     *,
     seed: int | None = None,
@@ -67,8 +74,8 @@ def interstitials(
     """Generate host interstitials at least ``d_min`` Angstrom apart.
 
     Positions are sampled in fractional coordinates and wrapped through the
-    supplied periodic cell.  ``rng`` is the sole random source and failures to
-    find a site are recorded by omitting that attempted insertion.
+    supplied periodic cell.  Each slot has its own deterministic random source;
+    failures to find a site are recorded by omitting that attempted insertion.
     """
     elements = base.info.get("elements", sorted(set(supercell.get_chemical_symbols())))
     if isinstance(elements, str):
@@ -93,7 +100,7 @@ def gas_interstitials(
     base: Any,
     n: int,
     settings: PerturbationSettings,
-    rng: np.random.RandomState,
+    rng: np.random.RandomState | None,
     annotate: Annotate,
     *,
     seed: int | None = None,
@@ -121,7 +128,7 @@ def vacancy_interstitial(
     base: Any,
     n: int,
     settings: PerturbationSettings,
-    rng: np.random.RandomState,
+    rng: np.random.RandomState | None,
     annotate: Annotate,
     *,
     seed: int | None = None,
@@ -133,23 +140,28 @@ def vacancy_interstitial(
     all_elements = list(all_elements) + [
         element for element in settings.gas_elements if element not in all_elements
     ]
+    del rng
+    base_structure_id = calculate_structure_id(base)
+    root_seed = settings.random_seed if seed is None else int(seed)
     cell = np.array(supercell.cell)
     inv_cell = np.linalg.inv(cell)
     output: list[Any] = []
     for index in range(n):
+        child_seed = derive_child_seed(base_structure_id, root_seed, "vacancy_interstitial", index)
+        slot_rng = np.random.RandomState(child_seed)
         vacancy = supercell.copy()
-        fraction = rng.uniform(*settings.vacancy_range)
+        fraction = slot_rng.uniform(*settings.vacancy_range)
         n_remove = max(1, int(fraction * len(vacancy)))
         n_remove = min(n_remove, len(vacancy) - 1)
-        keep = sorted(rng.choice(len(vacancy), size=len(vacancy) - n_remove, replace=False))
+        keep = sorted(slot_rng.choice(len(vacancy), size=len(vacancy) - n_remove, replace=False))
         vacancy = vacancy[keep]
         positions = vacancy.get_positions().copy()
         new_positions: list[np.ndarray] = []
         new_symbols: list[str] = []
-        fraction = rng.uniform(*settings.interstitial_range)
+        fraction = slot_rng.uniform(*settings.interstitial_range)
         n_add = max(1, int(fraction * len(supercell)))
         for _ in range(n_add):
-            element = all_elements[rng.randint(len(all_elements))]
+            element = all_elements[slot_rng.randint(len(all_elements))]
             d_min = (
                 _gas_interstitial_distance(settings)
                 if element in settings.gas_elements
@@ -159,7 +171,7 @@ def vacancy_interstitial(
                 positions,
                 cell,
                 inv_cell,
-                rng,
+                slot_rng,
                 max_attempts=500,
                 d_min=d_min,
             )
@@ -173,7 +185,7 @@ def vacancy_interstitial(
             vacancy,
             base,
             "vacancy_interstitial",
-            random_seed=seed,
+            random_seed=child_seed,
             parameters={
                 "n_vacancies": n_remove,
                 "n_interstitials": len(new_positions),
@@ -189,7 +201,7 @@ def gas_in_vacancy(
     base: Any,
     n: int,
     settings: PerturbationSettings,
-    rng: np.random.RandomState,
+    rng: np.random.RandomState | None,
     annotate: Annotate,
     *,
     seed: int | None = None,
@@ -201,24 +213,29 @@ def gas_in_vacancy(
     """
     if not settings.gas_elements:
         return []
+    del rng
+    base_structure_id = calculate_structure_id(base)
+    root_seed = settings.random_seed if seed is None else int(seed)
     cell = np.array(supercell.cell)
     inv_cell = np.linalg.inv(cell)
     output: list[Any] = []
     for index in range(n):
+        child_seed = derive_child_seed(base_structure_id, root_seed, "gas_in_vacancy", index)
+        slot_rng = np.random.RandomState(child_seed)
         vacancy = supercell.copy()
         n_atoms = len(vacancy)
-        vacancy_index = rng.randint(n_atoms)
+        vacancy_index = slot_rng.randint(n_atoms)
         vacancy_position = vacancy.get_positions()[vacancy_index].copy()
         vacancy_element = vacancy.get_chemical_symbols()[vacancy_index]
         vacancy = vacancy[[item for item in range(n_atoms) if item != vacancy_index]]
-        n_gas = rng.randint(1, settings.max_gas_occupancy + 1)
+        n_gas = slot_rng.randint(1, settings.max_gas_occupancy + 1)
         remaining_positions = vacancy.get_positions().copy()
         placed = 0
         gas_species: list[str] = []
         for gas_index in range(n_gas):
-            gas_element = settings.gas_elements[rng.randint(len(settings.gas_elements))]
+            gas_element = settings.gas_elements[slot_rng.randint(len(settings.gas_elements))]
             if gas_index == 0:
-                offset = rng.normal(scale=0.1, size=3)
+                offset = slot_rng.normal(scale=0.1, size=3)
                 candidate = vacancy_position + offset
                 fractional = candidate @ inv_cell
                 fractional -= np.floor(fractional)
@@ -236,7 +253,7 @@ def gas_in_vacancy(
                     remaining_positions,
                     cell,
                     inv_cell,
-                    rng,
+                    slot_rng,
                     radius=2.5,
                     d_min=_gas_interstitial_distance(settings),
                     max_attempts=500,
@@ -250,7 +267,7 @@ def gas_in_vacancy(
             vacancy,
             base,
             "gas_in_vacancy",
-            random_seed=seed,
+            random_seed=child_seed,
             parameters={
                 "n_gas_atoms": placed,
                 "vacancy_element": vacancy_element,
@@ -323,7 +340,7 @@ def _insert_interstitials(
     base: Any,
     n: int,
     settings: PerturbationSettings,
-    rng: np.random.RandomState,
+    rng: np.random.RandomState | None,
     elements: Sequence[str],
     d_min: float,
     family: str,
@@ -332,27 +349,32 @@ def _insert_interstitials(
     *,
     seed: int | None = None,
 ) -> list[Any]:
+    del rng
+    base_structure_id = calculate_structure_id(base)
+    root_seed = settings.random_seed if seed is None else int(seed)
     cell = np.array(supercell.cell)
     inv_cell = np.linalg.inv(cell)
     output: list[Any] = []
     for index in range(n):
+        child_seed = derive_child_seed(base_structure_id, root_seed, family, index)
+        slot_rng = np.random.RandomState(child_seed)
         positions = supercell.get_positions().copy()
         new_positions: list[np.ndarray] = []
         new_symbols: list[str] = []
-        fraction = rng.uniform(*settings.interstitial_range)
+        fraction = slot_rng.uniform(*settings.interstitial_range)
         n_add = max(1, int(fraction * len(supercell)))
         for _ in range(n_add):
             position = find_interstitial_site(
                 positions,
                 cell,
                 inv_cell,
-                rng,
+                slot_rng,
                 max_attempts=500,
                 d_min=d_min,
             )
             if position is not None:
                 new_positions.append(position)
-                new_symbols.append(elements[rng.randint(len(elements))])
+                new_symbols.append(elements[slot_rng.randint(len(elements))])
                 positions = np.vstack([positions, position])
         result = supercell.copy()
         for position, symbol in zip(new_positions, new_symbols):
@@ -361,7 +383,7 @@ def _insert_interstitials(
             result,
             base,
             family,
-            random_seed=seed,
+            random_seed=child_seed,
             parameters={count_key: len(new_positions)},
             operation_id=f"{family}:{index}",
         )

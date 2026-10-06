@@ -5,7 +5,9 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any
 
-from .models import PerturbationSettings
+from nepflow.domain.identities import calculate_structure_id
+
+from .models import PerturbationSettings, derive_child_seed
 
 Annotate = Callable[..., Any]
 
@@ -41,22 +43,26 @@ def rattled(
 ) -> list[Any]:
     """Generate HipHive rattled structures with a minimum distance in Angstroms.
 
-    ``supercell`` is treated as a periodic ASE-like cell and ``seed`` is passed
-    to HipHive for reproducibility.  HipHive failure raises ``RuntimeError``;
-    Gaussian substitution would not be scientifically equivalent.
+    ``supercell`` is treated as a periodic ASE-like cell.  Each rattle slot
+    receives a deterministic child seed derived from the base, root seed, and
+    slot before it is passed to HipHive.  HipHive failure raises
+    ``RuntimeError``; Gaussian substitution would not be scientifically
+    equivalent.
     """
 
     from hiphive.structure_generation import generate_mc_rattled_structures
 
     output: list[Any] = []
+    base_structure_id = calculate_structure_id(base)
     for index, rattle_std in enumerate(sample_rattle_stds(settings, n)):
+        child_seed = derive_child_seed(base_structure_id, seed, "rattled", index)
         try:
             rattled_structures = generate_mc_rattled_structures(
                 supercell,
                 n_structures=1,
                 rattle_std=rattle_std,
                 d_min=settings.rattle_d_min,
-                seed=int(seed),
+                seed=child_seed,
             )
         except Exception as exc:
             # HipHive is an external generator with version-dependent
@@ -70,7 +76,7 @@ def rattled(
                 structure,
                 base,
                 "rattled",
-                random_seed=seed,
+                random_seed=child_seed,
                 parameters={"rattle_std": float(rattle_std), "rattle_index": index},
                 operation_id=f"rattled:{index}",
             )

@@ -8,7 +8,9 @@ from typing import Any
 
 import numpy as np
 
-from .models import PerturbationSettings
+from nepflow.domain.identities import calculate_structure_id
+
+from .models import PerturbationSettings, derive_child_seed
 
 logger = logging.getLogger(__name__)
 Annotate = Callable[..., Any]
@@ -57,10 +59,16 @@ def liquid_snapshots(
     )
 
     output: list[Any] = []
+    base_structure_id = calculate_structure_id(base)
     for configuration_index in range(n_configurations):
         atoms = supercell.copy()
         atoms.calc = LennardJones()
-        liquid_seed = (int(seed) + configuration_index) % (2**32)
+        liquid_seed = derive_child_seed(
+            base_structure_id,
+            seed,
+            "liquid",
+            configuration_index,
+        )
         liquid_rng = np.random.RandomState(liquid_seed)
         MaxwellBoltzmannDistribution(
             atoms,
@@ -85,7 +93,7 @@ def liquid_snapshots(
                 snapshot,
                 base,
                 "liquid",
-                random_seed=seed,
+                random_seed=liquid_seed,
                 parameters={
                     "liquid_configuration_index": configuration_index,
                     "liquid_snapshot_index": snapshot_index,

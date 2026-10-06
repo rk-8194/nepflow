@@ -11,6 +11,7 @@ from .models import (
     PerturbationSettings,
     PerturbationTask,
     PerturbationTaskResult,
+    derive_child_seed,
 )
 
 __all__ = [
@@ -20,6 +21,7 @@ __all__ = [
     "PerturbationTask",
     "PerturbationTaskError",
     "PerturbationTaskResult",
+    "derive_child_seed",
     "family_applies_to_base",
     "ElasticRecord",
     "fit_elastic_tensor",

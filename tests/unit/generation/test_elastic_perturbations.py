@@ -8,6 +8,7 @@ pytest.importorskip("pymatgen")
 
 from ase import Atoms
 
+from nepflow.domain.identities import calculate_structure_id
 from nepflow.stages.generation.perturbations.coordinator import PerturbationCoordinator
 from nepflow.stages.generation.perturbations.displacements import sample_rattle_stds
 from nepflow.stages.generation.perturbations.elastic import (
@@ -17,7 +18,10 @@ from nepflow.stages.generation.perturbations.elastic import (
     shear_strain_matrix,
 )
 from nepflow.stages.generation.perturbations.liquid import liquid_snapshots
-from nepflow.stages.generation.perturbations.models import PerturbationSettings
+from nepflow.stages.generation.perturbations.models import (
+    PerturbationSettings,
+    derive_child_seed,
+)
 from nepflow.stages.generation.perturbations.provenance import (
     annotate_generation_provenance,
 )
@@ -331,8 +335,9 @@ class ElasticStressGenerationTests(unittest.TestCase):
         second = liquid_outputs(second_engine, base, n_configurations=1, n_snapshots=1)
 
         np.testing.assert_allclose(first[0].positions, second[0].positions)
-        self.assertEqual(first[0].info["random_seed"], 17)
-        self.assertEqual(first[0].info["liquid_random_seed"], 17)
+        expected_seed = derive_child_seed(calculate_structure_id(base), 17, "liquid", 0)
+        self.assertEqual(first[0].info["random_seed"], expected_seed)
+        self.assertEqual(first[0].info["liquid_random_seed"], expected_seed)
 
     def test_liquid_configurations_record_distinct_deterministic_seeds(self) -> None:
         base = self.make_base()
@@ -355,7 +360,14 @@ class ElasticStressGenerationTests(unittest.TestCase):
         self.assertEqual(len(structures), 2)
         self.assertEqual(
             [atoms.info["liquid_random_seed"] for atoms in structures],
-            [17, 18],
+            [
+                derive_child_seed(calculate_structure_id(base), 17, "liquid", index)
+                for index in range(2)
+            ],
+        )
+        self.assertEqual(
+            [atoms.info["random_seed"] for atoms in structures],
+            [atoms.info["liquid_random_seed"] for atoms in structures],
         )
 
 

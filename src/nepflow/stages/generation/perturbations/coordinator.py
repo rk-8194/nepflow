@@ -98,7 +98,6 @@ def execute_perturbation_task(task: PerturbationTask) -> PerturbationTaskResult:
     if supercell is None:
         raise RuntimeError("target supercell construction returned no structure")
 
-    rng = np.random.RandomState(task.seed)
     provenance_records: list[Any] = []
 
     def annotate(
@@ -110,20 +109,11 @@ def execute_perturbation_task(task: PerturbationTask) -> PerturbationTaskResult:
         parameters: dict[str, Any] | None = None,
         operation_id: str | None = None,
     ) -> Any:
-        stochastic = {
-            "rattled",
-            "liquid",
-            "vacancy",
-            "interstitial",
-            "gas_interstitial",
-            "vacancy_interstitial",
-            "gas_in_vacancy",
-        }
         record = annotate_generation_provenance(
             candidate,
             base,
             family,
-            random_seed=(task.seed if family in stochastic else random_seed),
+            random_seed=random_seed,
             parameters=parameters,
             operation_id=(
                 f"{task.base_structure_id}:{operation_id}" if operation_id is not None else None
@@ -179,7 +169,7 @@ def execute_perturbation_task(task: PerturbationTask) -> PerturbationTaskResult:
                 task.base,
                 task.counts.n_vacancies,
                 settings,
-                rng,
+                None,
                 annotate,
                 seed=task.seed,
             )
@@ -193,7 +183,7 @@ def execute_perturbation_task(task: PerturbationTask) -> PerturbationTaskResult:
                 task.base,
                 task.counts.n_interstitials,
                 settings,
-                rng,
+                None,
                 annotate,
                 seed=task.seed,
             )
@@ -209,7 +199,7 @@ def execute_perturbation_task(task: PerturbationTask) -> PerturbationTaskResult:
                 task.base,
                 task.counts.n_gas_interstitials,
                 settings,
-                rng,
+                None,
                 annotate,
                 seed=task.seed,
             )
@@ -225,7 +215,7 @@ def execute_perturbation_task(task: PerturbationTask) -> PerturbationTaskResult:
                 task.base,
                 task.counts.n_vacancy_interstitial,
                 settings,
-                rng,
+                None,
                 annotate,
                 seed=task.seed,
             )
@@ -241,7 +231,7 @@ def execute_perturbation_task(task: PerturbationTask) -> PerturbationTaskResult:
                 task.base,
                 task.counts.n_gas_in_vacancy,
                 settings,
-                rng,
+                None,
                 annotate,
                 seed=task.seed,
             )
