@@ -58,7 +58,7 @@ class FakeSQSBackend:
     def generate(self, *, primitive, max_size, target_concentrations, random_seed):
         del primitive, max_size, target_concentrations
         self.seeds.append(random_seed)
-        return Atoms("Si4", cell=[3, 3, 3], pbc=True)
+        return Atoms("Si2Ge2", cell=[3, 3, 3], pbc=True)
 
 
 def test_sqs_uses_declared_backend_and_records_effective_seed() -> None:

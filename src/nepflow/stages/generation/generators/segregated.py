@@ -11,7 +11,9 @@ from nepflow.stages.generation.supercell import build_target_supercell
 
 from .composition_primitives import (
     allocate_crystal_quota,
+    calculate_composition_realization,
     composition_label,
+    record_composition_metadata,
 )
 
 
@@ -24,10 +26,12 @@ class SegregatedGenerator:
         random_seed: int = 42,
         *,
         rng: np.random.Generator | None = None,
+        composition_tolerance: float = 0.05,
     ) -> None:
         self.n_structures = n_structures
         self.random_seed = random_seed
         self.rng = rng if rng is not None else np.random.default_rng(random_seed)
+        self.composition_tolerance = composition_tolerance
 
     def generate(
         self,
@@ -58,6 +62,8 @@ class SegregatedGenerator:
                 majority_element,
                 crystal_structure,
                 target_n_atoms,
+                composition=composition,
+                composition_tolerance=self.composition_tolerance,
             )
             if supercell is None:
                 raise RuntimeError(f"Segregated generation failed for crystal {crystal_structure}")
@@ -96,18 +102,22 @@ class SegregatedGenerator:
         positions = atoms.get_positions()
         sorted_indices = np.argsort(positions[:, axis_index])
 
+        realization = calculate_composition_realization(composition, n)
         symbols = [""] * n
         offset = 0
         for element in active_elements:
-            count = min(round(composition[element] * n), n - offset)
+            count = realization.counts[element]
             for index in range(count):
                 symbols[sorted_indices[offset + index]] = element
             offset += count
-        for index in range(offset, n):
-            symbols[sorted_indices[index]] = active_elements[-1]
+        if offset != n:
+            raise RuntimeError("segregated composition allocation did not fill the supercell")
 
         atoms.set_chemical_symbols(symbols)
-        atoms.info["actual_composition"] = {
-            element: symbols.count(element) / n for element in active_elements
-        }
+        record_composition_metadata(
+            atoms,
+            composition,
+            tolerance=self.composition_tolerance,
+            require_tolerance=True,
+        )
         return atoms

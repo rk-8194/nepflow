@@ -52,6 +52,7 @@ _ALLOWED_KEYS: dict[str, frozenset[str]] = {
             "elements",
             "crystal_structures",
             "target_n_atoms",
+            "composition_tolerance",
             "n_workers",
             "use_materials_project",
             "use_random_solid_solution",

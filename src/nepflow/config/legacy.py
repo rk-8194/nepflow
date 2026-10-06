@@ -127,6 +127,7 @@ def _generation_values(config: NepflowConfig) -> dict[str, str]:
     return {
         "crystal_structures": ",".join(generation.crystal_structures),
         "target_n_atoms": str(generation.target_n_atoms),
+        "composition_tolerance": str(generation.composition_tolerance),
         "n_workers": str(generation.n_workers),
         "use_materials_project": _bool_text(generation.use_materials_project),
         "use_random_solid_solution": _bool_text(generation.use_random_solid_solution),

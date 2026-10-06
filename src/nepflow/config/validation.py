@@ -140,6 +140,11 @@ def validate_config(
     _require_non_negative(
         "generation.target_n_atoms", config.generation.target_n_atoms, strictly_positive=True
     )
+    if (
+        not math.isfinite(config.generation.composition_tolerance)
+        or not 0.0 <= config.generation.composition_tolerance <= 1.0
+    ):
+        raise ConfigurationError("generation.composition_tolerance must be in [0, 1]")
     _require_non_negative("generation.n_workers", config.generation.n_workers)
     for field_name in (
         "n_random_solid_solution",

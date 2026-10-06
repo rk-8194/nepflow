@@ -335,6 +335,11 @@ def validate_generation_config(config: GenerationConfig) -> GenerationConfig:
         raise ConfigurationError("generation.crystal_structures must not be empty")
     if config.target_n_atoms <= 0:
         raise ConfigurationError("generation.target_n_atoms must be positive")
+    if (
+        not math.isfinite(config.composition_tolerance)
+        or not 0.0 <= config.composition_tolerance <= 1.0
+    ):
+        raise ConfigurationError("generation.composition_tolerance must be in [0, 1]")
     if config.n_workers < 0:
         raise ConfigurationError("generation.n_workers must be non-negative")
     _validate_source_scopes(config)

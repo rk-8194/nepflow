@@ -8,10 +8,15 @@ if TYPE_CHECKING:
     from .base import ConfigurationalGenerator
     from .composition import CompositionGrid
     from .composition_primitives import (
+        CompositionRealization,
         allocate_crystal_quota,
         assign_composition,
+        calculate_composition_realization,
         composition_label,
+        measure_composition_realization,
+        realize_composition,
         realized_composition,
+        record_composition_metadata,
     )
     from .materials_project import MaterialsProjectFetcher, build_materials_project_fetcher
     from .materials_project_generator import MaterialsProjectGenerator
@@ -22,10 +27,15 @@ if TYPE_CHECKING:
 __all__ = [
     "ConfigurationalGenerator",
     "CompositionGrid",
+    "CompositionRealization",
     "allocate_crystal_quota",
     "assign_composition",
+    "calculate_composition_realization",
     "composition_label",
+    "measure_composition_realization",
+    "realize_composition",
     "realized_composition",
+    "record_composition_metadata",
     "IcetSQSBackend",
     "RandomSolidSolutionGenerator",
     "SegregatedGenerator",
@@ -39,10 +49,21 @@ __all__ = [
 _OWNERS = {
     "ConfigurationalGenerator": (".base", "ConfigurationalGenerator"),
     "CompositionGrid": (".composition", "CompositionGrid"),
+    "CompositionRealization": (".composition_primitives", "CompositionRealization"),
     "allocate_crystal_quota": (".composition_primitives", "allocate_crystal_quota"),
     "assign_composition": (".composition_primitives", "assign_composition"),
+    "calculate_composition_realization": (
+        ".composition_primitives",
+        "calculate_composition_realization",
+    ),
     "composition_label": (".composition_primitives", "composition_label"),
+    "measure_composition_realization": (
+        ".composition_primitives",
+        "measure_composition_realization",
+    ),
+    "realize_composition": (".composition_primitives", "realize_composition"),
     "realized_composition": (".composition_primitives", "realized_composition"),
+    "record_composition_metadata": (".composition_primitives", "record_composition_metadata"),
     "IcetSQSBackend": (".sqs", "IcetSQSBackend"),
     "RandomSolidSolutionGenerator": (".random_solution", "RandomSolidSolutionGenerator"),
     "SegregatedGenerator": (".segregated", "SegregatedGenerator"),

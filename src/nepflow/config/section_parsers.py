@@ -155,6 +155,10 @@ def _parse_generation_modes(values: Mapping[str, str]) -> dict[str, Any]:
         "target_n_atoms": _parse_int(
             values.get("target_n_atoms", "128"), "generation.target_n_atoms"
         ),
+        "composition_tolerance": _parse_float(
+            values.get("composition_tolerance", "0.05"),
+            "generation.composition_tolerance",
+        ),
         "n_workers": _parse_int(values.get("n_workers", "0"), "generation.n_workers"),
         "use_materials_project": _parse_bool(
             values.get("use_materials_project", "true"),

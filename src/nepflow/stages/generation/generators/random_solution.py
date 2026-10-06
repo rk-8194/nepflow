@@ -25,10 +25,12 @@ class RandomSolidSolutionGenerator:
         random_seed: int = 42,
         *,
         rng: np.random.Generator | None = None,
+        composition_tolerance: float = 0.05,
     ) -> None:
         self.n_structures = n_structures
         self.random_seed = random_seed
         self.rng = rng if rng is not None else np.random.default_rng(random_seed)
+        self.composition_tolerance = composition_tolerance
 
     def generate(
         self,
@@ -49,13 +51,21 @@ class RandomSolidSolutionGenerator:
                 majority_element,
                 crystal_structure,
                 target_n_atoms,
+                composition=composition,
+                composition_tolerance=self.composition_tolerance,
             )
             if supercell is None:
                 raise RuntimeError(
                     f"Random solid-solution generation failed for crystal {crystal_structure}"
                 )
             for index in range(crystal_quota):
-                assigned = assign_composition(supercell, composition, self.rng)
+                assigned = assign_composition(
+                    supercell,
+                    composition,
+                    self.rng,
+                    tolerance=self.composition_tolerance,
+                    require_tolerance=True,
+                )
                 assigned.info.update(
                     {
                         "composition": dict(composition),

@@ -106,6 +106,7 @@ def _build_random_solid_solution_generator(
     generator = RandomSolidSolutionGenerator(
         n_structures=config.generation.n_random_solid_solution,
         random_seed=config.project.random_seed,
+        composition_tolerance=config.generation.composition_tolerance,
     )
     return "RandomSolidSolution", generator
 
@@ -118,6 +119,7 @@ def _build_sqs_generator(context: StageContext) -> tuple[str, ConfigurationalGen
     generator = SQSGenerator(
         n_structures=config.generation.n_sqs,
         random_seed=config.project.random_seed,
+        composition_tolerance=config.generation.composition_tolerance,
     )
     return "SQS", generator
 
@@ -130,6 +132,7 @@ def _build_segregated_generator(context: StageContext) -> tuple[str, Configurati
     generator = SegregatedGenerator(
         n_structures=config.generation.n_segregated,
         random_seed=config.project.random_seed,
+        composition_tolerance=config.generation.composition_tolerance,
     )
     return "Segregated", generator
 

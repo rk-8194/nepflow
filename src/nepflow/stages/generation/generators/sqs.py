@@ -12,7 +12,7 @@ from nepflow.stages.generation.supercell import build_target_supercell
 from .composition_primitives import (
     allocate_crystal_quota,
     composition_label,
-    realized_composition,
+    record_composition_metadata,
 )
 
 
@@ -82,10 +82,12 @@ class SQSGenerator:
         random_seed: int = 42,
         *,
         backend: SQSBackend | None = None,
+        composition_tolerance: float = 0.05,
     ) -> None:
         self.n_structures = n_structures
         self.random_seed = random_seed
         self.backend = backend
+        self.composition_tolerance = composition_tolerance
 
     def generate(
         self,
@@ -116,6 +118,8 @@ class SQSGenerator:
                     majority_element,
                     crystal_structure,
                     target_n_atoms,
+                    composition=composition,
+                    composition_tolerance=self.composition_tolerance,
                     raise_on_error=True,
                 )
                 if supercell is None:
@@ -155,7 +159,12 @@ class SQSGenerator:
                             "random_seed": slot_seed,
                         }
                     )
-                    sqs_atoms.info["actual_composition"] = realized_composition(sqs_atoms)
+                    record_composition_metadata(
+                        sqs_atoms,
+                        composition,
+                        tolerance=self.composition_tolerance,
+                        require_tolerance=True,
+                    )
                     results.append(sqs_atoms)
                 except Exception as exc:
                     # icet/backend failures are terminal for this requested

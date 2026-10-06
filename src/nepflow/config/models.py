@@ -79,6 +79,7 @@ class GenerationConfig:
 
     crystal_structures: tuple[str, ...] = ("bcc", "fcc", "hcp")
     target_n_atoms: int = 128
+    composition_tolerance: float = 0.05
     n_workers: int = 0
     use_materials_project: bool = True
     use_random_solid_solution: bool = True

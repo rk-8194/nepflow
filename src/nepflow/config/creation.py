@@ -84,6 +84,9 @@ crystal_structures={crystal_structures}
 # Target number of atoms per supercell for DFT calculations
 target_n_atoms={target_n_atoms}
 
+# Maximum allowed absolute atomic-fraction composition error during planning
+composition_tolerance=0.05
+
 # Parallel workers for perturbation generation (0 = auto-detect CPU count, 1 = serial)
 n_workers=0
 

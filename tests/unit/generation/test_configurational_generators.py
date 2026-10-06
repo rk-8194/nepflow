@@ -39,7 +39,7 @@ class SQSBackendBoundary:
         self.calls.append(dict(kwargs))
         if self.fail_on_call == len(self.calls):
             raise RuntimeError("primary SQS generation unavailable")
-        return make_atoms("Si4")
+        return make_atoms("Si2Ge2")
 
 
 class ConfigurationalGeneratorTests(unittest.TestCase):
