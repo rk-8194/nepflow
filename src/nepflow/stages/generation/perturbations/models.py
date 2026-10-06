@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import hashlib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from nepflow.config.models import DEFAULT_SOURCE_SCOPE, SourceScope
@@ -192,12 +192,52 @@ class PerturbationTask:
 
 
 @dataclass(frozen=True, slots=True)
+class PerturbationRejection:
+    """Serializable evidence for one generated candidate that was rejected."""
+
+    parent_structure_id: str
+    family: str
+    operation_id: str
+    reason: str
+    evidence: dict[str, Any] = field(default_factory=dict)
+    slot: int | str | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "evidence", dict(self.evidence))
+
+    @property
+    def base_structure_id(self) -> str:
+        """Return the parent identity under the generation terminology."""
+
+        return self.parent_structure_id
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return JSON-shaped rejection evidence for reports and persistence."""
+
+        return {
+            "parent_structure_id": self.parent_structure_id,
+            "family": self.family,
+            "operation_id": self.operation_id,
+            "slot": self.slot,
+            "reason": self.reason,
+            "evidence": dict(self.evidence),
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class PerturbationTaskResult:
     """Typed result for one worker task."""
 
     task: PerturbationTask
     candidates: tuple[Any, ...]
     provenance_records: tuple[Any, ...] = ()
+    rejected_attempts: tuple[PerturbationRejection, ...] = ()
+
+    @property
+    def rejections(self) -> tuple[PerturbationRejection, ...]:
+        """Compatibility alias for callers that use the shorter term."""
+
+        return self.rejected_attempts
 
 
 __all__ = [
@@ -205,6 +245,7 @@ __all__ = [
     "PerturbationSettings",
     "PerturbationTask",
     "PerturbationTaskResult",
+    "PerturbationRejection",
     "PERTURBATION_FAMILY_SOURCE_FIELDS",
     "derive_child_seed",
 ]

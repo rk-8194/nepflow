@@ -54,7 +54,11 @@ def vacancies(
             base,
             "vacancy",
             random_seed=child_seed,
-            parameters={"n_vacancies": n_remove},
+            parameters={
+                "requested_n_vacancies": n_remove,
+                "realised_n_vacancies": n_remove,
+                "n_vacancies": n_remove,
+            },
             operation_id=f"vacancy:{index}",
         )
         output.append(vacancy)
@@ -187,7 +191,11 @@ def vacancy_interstitial(
             "vacancy_interstitial",
             random_seed=child_seed,
             parameters={
+                "requested_n_vacancies": n_remove,
+                "realised_n_vacancies": n_remove,
                 "n_vacancies": n_remove,
+                "requested_n_interstitials": n_add,
+                "realised_n_interstitials": len(new_positions),
                 "n_interstitials": len(new_positions),
             },
             operation_id=f"vacancy-interstitial:{index}",
@@ -269,7 +277,11 @@ def gas_in_vacancy(
             "gas_in_vacancy",
             random_seed=child_seed,
             parameters={
+                "requested_n_vacancies": 1,
+                "realised_n_vacancies": 1,
                 "n_gas_atoms": placed,
+                "requested_n_gas_atoms": n_gas,
+                "realised_n_gas_atoms": placed,
                 "vacancy_element": vacancy_element,
                 "gas_species": gas_species,
             },
@@ -384,7 +396,11 @@ def _insert_interstitials(
             base,
             family,
             random_seed=child_seed,
-            parameters={count_key: len(new_positions)},
+            parameters={
+                "requested_n_interstitials": n_add,
+                "realised_n_interstitials": len(new_positions),
+                count_key: len(new_positions),
+            },
             operation_id=f"{family}:{index}",
         )
         output.append(result)

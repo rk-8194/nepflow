@@ -8,6 +8,7 @@ from .elasticity import (
 )
 from .models import (
     PerturbationCounts,
+    PerturbationRejection,
     PerturbationSettings,
     PerturbationTask,
     PerturbationTaskResult,
@@ -17,6 +18,7 @@ from .models import (
 __all__ = [
     "PerturbationCoordinator",
     "PerturbationCounts",
+    "PerturbationRejection",
     "PerturbationSettings",
     "PerturbationTask",
     "PerturbationTaskError",

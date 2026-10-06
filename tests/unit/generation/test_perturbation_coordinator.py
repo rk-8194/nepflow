@@ -27,6 +27,7 @@ from nepflow.stages.generation.perturbations.defects import (
 from nepflow.stages.generation.perturbations.models import (
     PERTURBATION_FAMILY_SOURCE_FIELDS,
     PerturbationCounts,
+    PerturbationRejection,
     PerturbationSettings,
     PerturbationTask,
     derive_child_seed,
@@ -34,6 +35,7 @@ from nepflow.stages.generation.perturbations.models import (
 from nepflow.stages.generation.perturbations.provenance import (
     annotate_generation_provenance,
 )
+from nepflow.stages.generation.validation import validate_generated_candidate
 
 
 def base_atoms(*, source: str = "coordinator-fixture", seed_id: str = "seed_000001") -> Atoms:
@@ -76,6 +78,101 @@ def test_child_seed_derivation_is_stable_and_namespaced() -> None:
         base_id, 18, "vacancy", 0
     )
     assert 0 <= derive_child_seed(base_id, 17, "vacancy", 0) < 2**32
+
+
+@pytest.mark.parametrize(
+    ("mutate", "reason"),
+    [
+        (lambda atoms: atoms.positions.__setitem__((0, 0), np.nan), "nonfinite_positions"),
+        (
+            lambda atoms: atoms.positions.__setitem__((1, 1), np.inf),
+            "nonfinite_positions",
+        ),
+        (
+            lambda atoms: atoms.set_cell([[12.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 12.0]]),
+            "singular_periodic_cell",
+        ),
+        (
+            lambda atoms: atoms.positions.__setitem__((1, slice(None)), [2.1, 2.0, 2.0]),
+            "too_close_atoms",
+        ),
+    ],
+)
+def test_generated_candidate_validation_records_geometry_failures(mutate, reason: str) -> None:
+    candidate = base_atoms()
+    mutate(candidate)
+
+    issue = validate_generated_candidate(
+        candidate,
+        base_atoms(),
+        PerturbationSettings(target_n_atoms=4),
+        "unperturbed",
+    )
+
+    assert issue is not None
+    assert issue.reason == reason
+
+
+def test_compressed_volume_state_uses_a_relaxed_geometry_policy() -> None:
+    reference = base_atoms()
+    candidate = reference.copy()
+    candidate.set_cell(reference.cell * 0.2, scale_atoms=True)
+
+    assert (
+        validate_generated_candidate(
+            candidate,
+            reference,
+            PerturbationSettings(target_n_atoms=4),
+            "volume_profile",
+        )
+        is None
+    )
+
+
+def test_partial_interstitial_placement_is_rejected_with_counts() -> None:
+    reference = base_atoms()
+    candidate = reference.copy()
+    candidate.append(Atoms("H", positions=[[8.0, 8.0, 8.0]], cell=reference.cell, pbc=True)[0])
+    candidate.info.update(
+        {
+            "requested_n_interstitials": 2,
+            "realised_n_interstitials": 1,
+            "n_interstitials": 1,
+        }
+    )
+
+    issue = validate_generated_candidate(
+        candidate,
+        reference,
+        PerturbationSettings(target_n_atoms=4, interstitial_d_min=1.0),
+        "interstitial",
+    )
+
+    assert issue is not None
+    assert issue.reason == "partial_interstitial_placement"
+    assert issue.evidence == {"requested": 2, "realised": 1}
+
+
+def test_rejection_record_serializes_and_exposes_base_alias() -> None:
+    rejection = PerturbationRejection(
+        parent_structure_id="base-id",
+        family="interstitial",
+        operation_id="base-id:interstitial:0",
+        slot=0,
+        reason="partial_interstitial_placement",
+        evidence={"requested": 2, "realised": 1},
+    )
+
+    assert rejection.base_structure_id == "base-id"
+    assert rejection.to_dict() == {
+        "parent_structure_id": "base-id",
+        "family": "interstitial",
+        "operation_id": "base-id:interstitial:0",
+        "slot": 0,
+        "reason": "partial_interstitial_placement",
+        "evidence": {"requested": 2, "realised": 1},
+    }
+    assert pickle.loads(pickle.dumps(rejection)) == rejection
 
 
 def test_focused_defect_families_remain_independently_callable() -> None:
@@ -260,6 +357,45 @@ def test_worker_result_is_pickleable_with_canonical_provenance() -> None:
         isinstance(record.provenance.realised_composition, MappingProxyType)
         for record in restored.provenance_records
     )
+
+
+def test_task_result_keeps_accepted_and_rejected_attempts_separate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    base = base_atoms()
+    accepted = base.copy()
+    accepted.info["perturbation_type"] = "rattled"
+    rejected = base.copy()
+    rejected.info["perturbation_type"] = "rattled"
+    rejected.positions[0, 0] = np.nan
+
+    def fake_rattled(*args, **kwargs):
+        del args, kwargs
+        return [accepted, rejected]
+
+    monkeypatch.setattr(coordinator_module, "rattled", fake_rattled)
+    task = PerturbationTask(
+        base=base,
+        base_structure_id=calculate_structure_id(base),
+        settings=PerturbationSettings(
+            target_n_atoms=4,
+            n_volume_points=0,
+            elastic_stress_enabled=False,
+        ),
+        counts=PerturbationCounts(n_rattled=2, n_vacancies=0, n_interstitials=0),
+        seed=21,
+    )
+
+    result = execute_perturbation_task(task)
+
+    assert len(result.candidates) == 1
+    assert len(result.provenance_records) == 1
+    assert len(result.rejected_attempts) == 1
+    assert result.rejected_attempts[0].reason == "nonfinite_positions"
+    restored = pickle.loads(pickle.dumps(result))
+    assert [item.to_dict() for item in restored.rejected_attempts] == [
+        item.to_dict() for item in result.rejected_attempts
+    ]
 
 
 def test_failed_task_identifies_base_and_effective_seed() -> None:

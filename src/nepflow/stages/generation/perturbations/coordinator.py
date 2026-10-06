@@ -17,6 +17,10 @@ from nepflow.config.models import ALL_SOURCES
 from nepflow.domain.identities import annotate_structure_ids, calculate_structure_id
 from nepflow.io.atomic import atomic_write_bytes, atomic_write_text
 from nepflow.stages.generation.supercell import build_target_supercell
+from nepflow.stages.generation.validation import (
+    CandidateValidationIssue,
+    validate_generated_candidate,
+)
 
 from .defects import (
     gas_in_vacancy,
@@ -30,6 +34,7 @@ from .elastic import elastic_stress_set
 from .liquid import liquid_snapshots
 from .models import (
     PerturbationCounts,
+    PerturbationRejection,
     PerturbationSettings,
     PerturbationTask,
     PerturbationTaskResult,
@@ -98,7 +103,7 @@ def execute_perturbation_task(task: PerturbationTask) -> PerturbationTaskResult:
     if supercell is None:
         raise RuntimeError("target supercell construction returned no structure")
 
-    provenance_records: list[Any] = []
+    candidate_records: dict[int, Any] = {}
 
     def annotate(
         candidate: Any,
@@ -119,7 +124,7 @@ def execute_perturbation_task(task: PerturbationTask) -> PerturbationTaskResult:
                 f"{task.base_structure_id}:{operation_id}" if operation_id is not None else None
             ),
         )
-        provenance_records.append(record)
+        candidate_records[id(candidate)] = record
         return record
 
     output: list[Any] = []
@@ -236,11 +241,77 @@ def execute_perturbation_task(task: PerturbationTask) -> PerturbationTaskResult:
                 seed=task.seed,
             )
         )
+    accepted: list[Any] = []
+    provenance_records: list[Any] = []
+    rejected_attempts: list[PerturbationRejection] = []
+    for index, candidate in enumerate(output):
+        family = candidate.info.get("perturbation_type", "unknown")
+        issue: CandidateValidationIssue | None
+        if family not in _PERTURBATION_FAMILIES:
+            issue = CandidateValidationIssue(
+                "unknown_perturbation_family",
+                {"family": family},
+            )
+        else:
+            issue = validate_generated_candidate(candidate, supercell, settings, family)
+
+        record = candidate_records.get(id(candidate))
+        if issue is None and record is None:
+            try:
+                record = annotate_generation_provenance(
+                    candidate,
+                    task.base,
+                    family,
+                    random_seed=candidate.info.get("random_seed"),
+                    operation_id=f"{task.base_structure_id}:{family}:{index}",
+                )
+            except Exception as exc:
+                issue = CandidateValidationIssue(
+                    "provenance_annotation_failed",
+                    {"error": f"{type(exc).__name__}: {exc}"},
+                )
+
+        if issue is None:
+            accepted.append(candidate)
+            if record is not None:
+                provenance_records.append(record)
+            continue
+
+        operation_id = f"{task.base_structure_id}:{family}:{index}"
+        if record is not None:
+            operation_id = str(record.provenance.operation_id)
+        else:
+            provenance = candidate.info.get("generation_provenance", {})
+            if isinstance(provenance, dict) and provenance.get("operation_id"):
+                operation_id = str(provenance["operation_id"])
+        slot: int | str | None = _rejection_slot(operation_id, index)
+        rejected_attempts.append(
+            PerturbationRejection(
+                parent_structure_id=task.base_structure_id,
+                family=str(family),
+                operation_id=operation_id,
+                slot=slot,
+                reason=issue.reason,
+                evidence=issue.evidence,
+            )
+        )
+
     return PerturbationTaskResult(
         task=task,
-        candidates=tuple(output),
+        candidates=tuple(accepted),
         provenance_records=tuple(provenance_records),
+        rejected_attempts=tuple(rejected_attempts),
     )
+
+
+def _rejection_slot(operation_id: str, fallback: int) -> int | str:
+    """Extract the deterministic family slot from an operation identifier."""
+
+    value = operation_id.rsplit(":", 1)[-1]
+    try:
+        return int(value)
+    except ValueError:
+        return value if value else fallback
 
 
 class PerturbationCoordinator:
@@ -254,6 +325,7 @@ class PerturbationCoordinator:
         self._total = 0
         self._by_type: dict[str, int] = {}
         self._by_config: dict[str, int] = {}
+        self._rejected_attempts: list[PerturbationRejection] = []
         self._output_file: Path | None = None
 
     def _counts(self, **kwargs: int) -> PerturbationCounts:
@@ -292,11 +364,12 @@ class PerturbationCoordinator:
             n_workers = max(1, os.cpu_count() or 1)
         if n_workers < 1:
             raise ValueError("n_workers must be non-negative or at least one")
-        return [
-            candidate
-            for result in self._execute(self._tasks(base_structures, counts), n_workers)
-            for candidate in result.candidates
-        ]
+        self._rejected_attempts = []
+        results = self._execute(self._tasks(base_structures, counts), n_workers)
+        self._rejected_attempts.extend(
+            rejection for result in results for rejection in result.rejected_attempts
+        )
+        return [candidate for result in results for candidate in result.candidates]
 
     def process(
         self,
@@ -321,6 +394,7 @@ class PerturbationCoordinator:
         self._total = 0
         self._by_type = {}
         self._by_config = {}
+        self._rejected_attempts = []
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         self._output_file = output_dir / "generated_structures.xyz"
@@ -336,6 +410,7 @@ class PerturbationCoordinator:
             n_gas_in_vacancy=n_gas_in_vacancy,
         )
         for result in self._execute(self._tasks(base_structures, counts), n_workers):
+            self._rejected_attempts.extend(result.rejected_attempts)
             self._flush(result.candidates)
         logger.info("Saved %s structures to %s", self._total, self._output_file)
         return self._output_file
@@ -395,10 +470,18 @@ class PerturbationCoordinator:
 
     def get_summary(self) -> dict[str, Any]:
         """Return candidate totals grouped by perturbation and configuration."""
+
+        rejected_reason_counts: dict[str, int] = {}
+        for rejection in self._rejected_attempts:
+            rejected_reason_counts[rejection.reason] = (
+                rejected_reason_counts.get(rejection.reason, 0) + 1
+            )
         return {
             "total": self._total,
             "by_type": dict(self._by_type),
             "by_config": dict(self._by_config),
+            "rejected_count": len(self._rejected_attempts),
+            "rejected_reason_counts": rejected_reason_counts,
         }
 
 
