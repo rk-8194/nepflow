@@ -164,13 +164,14 @@ def record_composition_metadata(
     realization = measure_composition_realization(atoms, requested)
     if tolerance is not None and (not np.isfinite(tolerance) or not 0.0 <= tolerance <= 1.0):
         raise ValueError("composition tolerance must be in [0, 1]")
-    if require_tolerance and tolerance is None:
-        raise ValueError("a composition tolerance is required for validation")
-    if require_tolerance and realization.max_error > float(tolerance) + 1.0e-12:
-        raise ValueError(
-            "realized composition exceeds tolerance: "
-            f"error={realization.max_error:.6g}, tolerance={float(tolerance):.6g}"
-        )
+    if require_tolerance:
+        if tolerance is None:
+            raise ValueError("a composition tolerance is required for validation")
+        if realization.max_error > tolerance + 1.0e-12:
+            raise ValueError(
+                "realized composition exceeds tolerance: "
+                f"error={realization.max_error:.6g}, tolerance={tolerance:.6g}"
+            )
 
     metadata = atoms.info
     metadata["requested_composition"] = dict(realization.requested)
