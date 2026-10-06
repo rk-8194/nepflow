@@ -191,9 +191,7 @@ def _parse_generation_modes(values: Mapping[str, str]) -> dict[str, Any]:
         "n_substitutions": _parse_int(
             values.get("n_substitutions", "0"), "generation.n_substitutions"
         ),
-        "n_antisites": _parse_int(
-            values.get("n_antisites", "0"), "generation.n_antisites"
-        ),
+        "n_antisites": _parse_int(values.get("n_antisites", "0"), "generation.n_antisites"),
         "n_vacancy_interstitial": _parse_int(
             values.get("n_vacancy_interstitial", "10"),
             "generation.n_vacancy_interstitial",
@@ -316,12 +314,8 @@ def _parse_generation_perturbations(values: Mapping[str, str]) -> dict[str, Any]
         "antisite_pairs": _parse_species_pairs(
             values.get("antisite_pairs", ""), "generation.antisite_pairs"
         ),
-        "antisite_min": _parse_float(
-            values.get("antisite_min", "0.0"), "generation.antisite_min"
-        ),
-        "antisite_max": _parse_float(
-            values.get("antisite_max", "0.1"), "generation.antisite_max"
-        ),
+        "antisite_min": _parse_float(values.get("antisite_min", "0.0"), "generation.antisite_min"),
+        "antisite_max": _parse_float(values.get("antisite_max", "0.1"), "generation.antisite_max"),
         "interstitial_sites": _parse_interstitial_sites(
             values.get("interstitial_sites", ""), "generation.interstitial_sites"
         ),
