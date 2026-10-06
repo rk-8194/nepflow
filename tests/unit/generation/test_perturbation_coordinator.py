@@ -388,9 +388,13 @@ def test_task_result_keeps_accepted_and_rejected_attempts_separate(
 
     result = execute_perturbation_task(task)
 
-    assert len(result.candidates) == 1
-    assert len(result.provenance_records) == 1
+    assert [candidate.info["perturbation_type"] for candidate in result.candidates] == [
+        "unperturbed",
+        "rattled",
+    ]
+    assert len(result.provenance_records) == 2
     assert len(result.rejected_attempts) == 1
+    assert result.rejected_attempts[0].family == "rattled"
     assert result.rejected_attempts[0].reason == "nonfinite_positions"
     restored = pickle.loads(pickle.dumps(result))
     assert [item.to_dict() for item in restored.rejected_attempts] == [
