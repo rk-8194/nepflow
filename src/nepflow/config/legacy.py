@@ -189,12 +189,8 @@ def _generation_values(config: NepflowConfig) -> dict[str, str]:
         "grain_boundary_enabled": _bool_text(generation.grain_boundary_enabled),
         "n_grain_boundaries": str(generation.n_grain_boundaries),
         "grain_boundary_sources": ",".join(generation.grain_boundary_sources),
-        "grain_boundary_rotation_axis": ",".join(
-            map(str, generation.grain_boundary_rotation_axis)
-        ),
-        "grain_boundary_misorientation_angle": str(
-            generation.grain_boundary_misorientation_angle
-        ),
+        "grain_boundary_rotation_axis": ",".join(map(str, generation.grain_boundary_rotation_axis)),
+        "grain_boundary_misorientation_angle": str(generation.grain_boundary_misorientation_angle),
         "grain_boundary_sigma": str(generation.grain_boundary_sigma),
         "grain_boundary_plane": ",".join(map(str, generation.grain_boundary_plane)),
         "grain_boundary_expand_times": str(generation.grain_boundary_expand_times),
