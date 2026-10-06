@@ -58,7 +58,7 @@ def test_integer_realization_is_deterministic_for_binary_and_ternary_fractions()
 
     assert binary.counts == {"Cr": 2, "W": 1}
     assert binary.realized == {"Cr": 2.0 / 3.0, "W": 1.0 / 3.0}
-    assert binary.max_error == 1.0 / 6.0
+    assert binary.max_error == pytest.approx(1.0 / 6.0)
     assert ternary.counts == {"Cr": 3, "W": 3, "Y": 2}
     assert ternary.atom_count == 8
     assert ternary.max_error == pytest.approx(1.0 / 12.0)
