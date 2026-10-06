@@ -152,7 +152,9 @@ class PerturbationSettings:
             tuple(tuple(int(value) for value in index) for index in self.surface_miller_indices),
         )
         object.__setattr__(self, "surface_in_plane_repeat", tuple(self.surface_in_plane_repeat))
-        object.__setattr__(self, "grain_boundary_rotation_axis", tuple(self.grain_boundary_rotation_axis))
+        object.__setattr__(
+            self, "grain_boundary_rotation_axis", tuple(self.grain_boundary_rotation_axis)
+        )
         object.__setattr__(self, "grain_boundary_plane", tuple(self.grain_boundary_plane))
         object.__setattr__(
             self,
