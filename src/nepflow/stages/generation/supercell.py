@@ -264,7 +264,8 @@ def _select_repeat(
             repeat_candidates.update(_factor_repeat_triples(atom_count // n_base))
 
     candidates: list[tuple[tuple[float, ...], tuple[int, int, int]]] = []
-    for repeat in sorted(repeat_candidates):
+    for raw_repeat in sorted(repeat_candidates):
+        repeat = (int(raw_repeat[0]), int(raw_repeat[1]), int(raw_repeat[2]))
         atom_count = n_base * int(np.prod(repeat))
         if composition is None and atom_count < target_n_atoms:
             continue
