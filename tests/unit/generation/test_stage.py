@@ -51,6 +51,9 @@ class FakeCoordinator:
         write(str(path), base_structures)
         return path
 
+    def get_provenance_records(self):
+        return ()
+
     def get_summary(self):
         return self.summary
 
