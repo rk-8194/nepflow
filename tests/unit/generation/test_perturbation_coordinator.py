@@ -367,9 +367,9 @@ def test_final_deduplication_counts_published_candidates_and_is_parallel_stable(
     assert serial.get_summary()["total"] == 1
     assert serial.get_summary()["duplicate_count"] == 1
     assert serial_path.read_bytes() == parallel_path.read_bytes()
-    assert [
-        record.provenance.operation_id for record in serial.get_provenance_records()
-    ] == [record.provenance.operation_id for record in parallel.get_provenance_records()]
+    assert [record.provenance.operation_id for record in serial.get_provenance_records()] == [
+        record.provenance.operation_id for record in parallel.get_provenance_records()
+    ]
     assert len(read(str(serial_path), index=":")) == 1
 
 
