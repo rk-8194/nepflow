@@ -424,9 +424,7 @@ def _validate_grain_boundary_state(candidate: Any) -> CandidateValidationIssue |
     )
     missing = [key for key in required if key not in info]
     if missing:
-        return CandidateValidationIssue(
-            "missing_grain_boundary_provenance", {"fields": missing}
-        )
+        return CandidateValidationIssue("missing_grain_boundary_provenance", {"fields": missing})
     pbc = _pbc_flags(candidate)
     if pbc is None or tuple(bool(value) for value in pbc) != (True, True, True):
         return CandidateValidationIssue(
@@ -450,9 +448,7 @@ def _validate_grain_boundary_state(candidate: Any) -> CandidateValidationIssue |
             {"axis": axis, "plane": plane, "sigma": sigma},
         )
     if not math.isclose(angle, 36.86989764584402, rel_tol=1.0e-9, abs_tol=1.0e-8):
-        return CandidateValidationIssue(
-            "unsupported_grain_boundary_relationship", {"angle": angle}
-        )
+        return CandidateValidationIssue("unsupported_grain_boundary_relationship", {"angle": angle})
     if expand_times <= 0 or not 0.0 <= tolerance <= 1.0:
         return CandidateValidationIssue(
             "invalid_grain_boundary_provenance",
@@ -468,8 +464,10 @@ def _validate_grain_boundary_state(candidate: Any) -> CandidateValidationIssue |
             "invalid_overlap_removal_accounting",
             {"removed_count": removed_count, "removed_species": removed_species},
         )
-    if removed_count < 0 or len(cell_lengths) != 3 or any(
-        not math.isfinite(value) or value <= 0.0 for value in cell_lengths
+    if (
+        removed_count < 0
+        or len(cell_lengths) != 3
+        or any(not math.isfinite(value) or value <= 0.0 for value in cell_lengths)
     ):
         return CandidateValidationIssue("invalid_grain_boundary_geometry", {})
     return None
@@ -586,9 +584,7 @@ def validate_generation_config(config: GenerationConfig) -> GenerationConfig:
             "generation.grain_boundary_min_thickness must be finite and non-negative"
         )
     if not 0.0 <= config.grain_boundary_overlap_tolerance <= 1.0:
-        raise ConfigurationError(
-            "generation.grain_boundary_overlap_tolerance must be in [0, 1]"
-        )
+        raise ConfigurationError("generation.grain_boundary_overlap_tolerance must be in [0, 1]")
     _validate_source_scopes(config)
     return config
 
