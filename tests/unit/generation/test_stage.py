@@ -136,12 +136,8 @@ def test_stage_passes_typed_perturbation_counts_and_persists_candidate(
     assert coordinator.calls[0][2]["n_workers"] == 1
     assert result.manifest.candidate_artifact is not None
     assert result.manifest.candidate_path is not None
-    assert result.manifest.candidate_artifact.path == str(
-        result.manifest.candidate_path.resolve()
-    )
-    assert result.manifest.candidate_artifact.sha256 == sha256_file(
-        result.manifest.candidate_path
-    )
+    assert result.manifest.candidate_artifact.path == str(result.manifest.candidate_path.resolve())
+    assert result.manifest.candidate_artifact.sha256 == sha256_file(result.manifest.candidate_path)
     assert any(event[3] == "candidate_artifact_persisted" for event in store.events)
 
 
