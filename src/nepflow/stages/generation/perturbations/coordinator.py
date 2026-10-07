@@ -15,7 +15,11 @@ import numpy as np
 from ase.io import write
 
 from nepflow.config.models import ALL_SOURCES
-from nepflow.domain.identities import annotate_structure_ids, calculate_structure_id
+from nepflow.domain.identities import (
+    annotate_candidate_id,
+    annotate_structure_ids,
+    calculate_structure_id,
+)
 from nepflow.domain.structures import GeneratedStructureRecord
 from nepflow.stages.generation.supercell import build_target_supercell
 from nepflow.stages.generation.validation import (
@@ -657,6 +661,8 @@ class PerturbationCoordinator:
             if family not in _PERTURBATION_FAMILIES:
                 raise ValueError(f"Unknown perturbation type: {family!r}")
         annotate_structure_ids(batch)
+        for candidate in batch:
+            annotate_candidate_id(candidate)
         rendered = StringIO()
         write(rendered, batch, format="extxyz")
         if output_handle is None:
@@ -680,10 +686,13 @@ class PerturbationCoordinator:
         """Return candidate totals grouped by perturbation and configuration."""
 
         rejected_reason_counts: dict[str, int] = {}
+        rejected_by_family: dict[str, dict[str, int]] = {}
         for rejection in self._rejected_attempts:
             rejected_reason_counts[rejection.reason] = (
                 rejected_reason_counts.get(rejection.reason, 0) + 1
             )
+            family_counts = rejected_by_family.setdefault(rejection.family, {})
+            family_counts[rejection.reason] = family_counts.get(rejection.reason, 0) + 1
         summary = {
             "total": self._total,
             "by_type": dict(self._by_type),
@@ -691,6 +700,7 @@ class PerturbationCoordinator:
             "duplicate_count": self._duplicate_count,
             "rejected_count": len(self._rejected_attempts),
             "rejected_reason_counts": rejected_reason_counts,
+            "rejections_by_family": rejected_by_family,
         }
         if self._magnetic_summary is not None:
             summary["magnetic"] = self._magnetic_summary.to_dict()

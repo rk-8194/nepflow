@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import fields, is_dataclass
 from io import StringIO
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
@@ -11,11 +12,18 @@ from typing import Any, Protocol, runtime_checkable
 from ase.io import read, write
 
 from nepflow.config.models import NepflowConfig
-from nepflow.domain.identities import ArtifactIdentity, StructureIdentity, annotate_structure_ids
+from nepflow.domain.identities import (
+    ArtifactIdentity,
+    StructureIdentity,
+    annotate_structure_ids,
+    calculate_candidate_id,
+    calculate_structure_id,
+)
 from nepflow.domain.structures import GeneratedStructureRecord, StructureProvenance
 from nepflow.errors import ArtifactError
 from nepflow.io.atomic import atomic_write_text
-from nepflow.io.hashing import sha256_file
+from nepflow.io.hashing import sha256_canonical_json, sha256_file
+from nepflow.io.json import write_json
 from nepflow.workflow.controller import StageContext
 
 from .generators.base import ConfigurationalGenerator
@@ -26,6 +34,7 @@ from .provenance import (
     assign_seed_ids,
     deduplicate_base_structures,
 )
+from .reports import build_generation_coverage
 from .validation import validate_composition_config, validate_generation_config
 
 logger = logging.getLogger(__name__)
@@ -118,7 +127,7 @@ class GenerationStage:
             raise RuntimeError("debug generation requires an explicitly injected debug runner")
         bases = list(self.debug_runner(request))
         manifest = self._persist_bases(request, bases)
-        manifest = self._persist_candidate_artifact(request, manifest)
+        manifest = self._persist_candidate_artifact(request, manifest, bases=bases)
         return GenerationResult(
             status="completed" if bases else "empty",
             base_structures=tuple(bases),
@@ -163,17 +172,7 @@ class GenerationStage:
     ) -> GenerationResult:
         summary = self.execute(request, bases)
         self.finalize(summary)
-        manifest = self._persist_candidate_artifact(request, manifest)
-        if resumed:
-            manifest = GenerationManifest(
-                artifact=manifest.artifact,
-                path=manifest.path,
-                structure_ids=manifest.structure_ids,
-                count=manifest.count,
-                resumed=True,
-                candidate_artifact=manifest.candidate_artifact,
-                candidate_path=manifest.candidate_path,
-            )
+        manifest = self._persist_candidate_artifact(request, manifest, bases=bases, summary=summary)
         return GenerationResult(
             status="completed",
             base_structures=tuple(bases),
@@ -292,7 +291,18 @@ class GenerationStage:
     def _load_saved_bases(path: Path) -> list[Any]:
         logger.info("Found existing seeds - loading from %s", path)
         loaded = read(str(path), index=":")
-        return list(loaded) if isinstance(loaded, list) else [loaded]
+        bases = list(loaded) if isinstance(loaded, list) else [loaded]
+        for base in bases:
+            # ASE represents an empty JSON extxyz value as an empty string on
+            # read-back.  Normalize the two merged-provenance collections so
+            # a resumed run renders the same canonical candidate bytes.
+            for key in ("provenance_paths", "provenance_material_ids"):
+                value = base.info.get(key)
+                if (isinstance(value, str) and not value) or (
+                    hasattr(value, "size") and getattr(value, "size", 1) == 0
+                ):
+                    base.info[key] = []
+        return bases
 
     def _persist_bases(
         self,
@@ -323,6 +333,9 @@ class GenerationStage:
         self,
         request: GenerationRequest,
         manifest: GenerationManifest,
+        *,
+        bases: Sequence[Any] | None = None,
+        summary: Mapping[str, Any] | None = None,
     ) -> GenerationManifest:
         candidate_path = self._candidate_path
         if candidate_path is None and not request.debug:
@@ -337,16 +350,82 @@ class GenerationStage:
         if not candidate_path.is_file():
             return manifest
         artifact = ArtifactIdentity.from_file("generation_candidate_structures", candidate_path)
+        candidates = self._load_structures(candidate_path)
+        candidate_ids: list[str] = []
+        candidate_structure_ids: list[str] = []
+        counts_by_config: dict[str, int] = {}
+        counts_by_family: dict[str, int] = {}
+        for candidate in candidates:
+            structure_id = str(
+                candidate.info.get("structure_id") or calculate_structure_id(candidate)
+            )
+            candidate_id = str(
+                candidate.info.get("candidate_id")
+                or calculate_candidate_id(structure_id, candidate.info.get("magnetic_state_id"))
+            )
+            candidate_ids.append(candidate_id)
+            candidate_structure_ids.append(structure_id)
+            config_type = str(candidate.info.get("configurational_type", "unknown"))
+            family = str(candidate.info.get("perturbation_type", "unknown"))
+            counts_by_config[config_type] = counts_by_config.get(config_type, 0) + 1
+            counts_by_family[family] = counts_by_family.get(family, 0) + 1
+
+        base_values = list(bases) if bases is not None else self._load_structures(manifest.path)
+        requested_family_counts = self._requested_family_counts(request, base_values)
+        runtime_summary = summary or {}
+        rejections_by_family = runtime_summary.get("rejections_by_family", {})
+        if not isinstance(rejections_by_family, Mapping):
+            rejections_by_family = {}
+        final_manifest = GenerationManifest(
+            artifact=manifest.artifact,
+            path=manifest.path,
+            structure_ids=manifest.structure_ids,
+            count=manifest.count,
+            resumed=False,
+            candidate_artifact=artifact,
+            candidate_path=candidate_path,
+            candidate_ids=tuple(candidate_ids),
+            candidate_structure_ids=tuple(candidate_structure_ids),
+            accepted_candidate_count=len(candidate_ids),
+            counts_by_configurational_type=counts_by_config,
+            counts_by_perturbation_family=counts_by_family,
+            duplicates_removed=int(runtime_summary.get("duplicate_count", 0)),
+            rejections_by_family=rejections_by_family,
+            rejected_count=int(runtime_summary.get("rejected_count", 0)),
+            requested_family_counts=requested_family_counts,
+            realised_family_counts=counts_by_family,
+            coverage=build_generation_coverage(
+                base_values,
+                candidates,
+                requested_family_counts=requested_family_counts,
+            ),
+            config_fingerprint=self._generation_config_fingerprint(request),
+            manifest_path=self._generation_manifest_path(request, candidate_path),
+        )
         store = request.state_store if request.state_store is not None else self.state_store
+        manifest_path = final_manifest.manifest_path
+        if manifest_path is None:
+            raise RuntimeError("final generation manifest path was not constructed")
+        write_json(manifest_path, final_manifest.to_dict())
+        manifest_artifact = ArtifactIdentity.from_file("generation_manifest", manifest_path)
         if store is not None:
             store.record_artifact(
                 artifact,
                 metadata={
                     "project_name": request.project_name,
-                    "seed_artifact": (
-                        None if manifest.artifact is None else manifest.artifact.to_dict()
-                    ),
-                    "generation_manifest": manifest.to_dict(),
+                    "seed_artifact": None
+                    if manifest.artifact is None
+                    else manifest.artifact.to_dict(),
+                    "generation_manifest": final_manifest.to_dict(),
+                    "manifest_artifact": manifest_artifact.to_dict(),
+                },
+            )
+            store.record_artifact(
+                manifest_artifact,
+                metadata={
+                    "project_name": request.project_name,
+                    "candidate_artifact": artifact.to_dict(),
+                    "generation_manifest": final_manifest.to_dict(),
                 },
             )
             store.append_event(
@@ -356,20 +435,24 @@ class GenerationStage:
                 "candidate_artifact_persisted",
                 {
                     "artifact": artifact.to_dict(),
-                    "seed_artifact": (
-                        None if manifest.artifact is None else manifest.artifact.to_dict()
-                    ),
+                    "seed_artifact": None
+                    if manifest.artifact is None
+                    else manifest.artifact.to_dict(),
+                    "generation_manifest": final_manifest.to_dict(),
                 },
             )
-        return GenerationManifest(
-            artifact=manifest.artifact,
-            path=manifest.path,
-            structure_ids=manifest.structure_ids,
-            count=manifest.count,
-            resumed=manifest.resumed,
-            candidate_artifact=artifact,
-            candidate_path=candidate_path,
-        )
+            store.append_event(
+                f"generation:{request.project_name}:manifest:{manifest_artifact.artifact_id}",
+                "generation",
+                request.project_name,
+                "generation_manifest_persisted",
+                {
+                    "artifact": manifest_artifact.to_dict(),
+                    "candidate_artifact": artifact.to_dict(),
+                    "manifest": final_manifest.to_dict(),
+                },
+            )
+        return final_manifest
 
     def _manifest_for_existing(
         self,
@@ -387,6 +470,113 @@ class GenerationStage:
             resumed=True,
         )
         return manifest
+
+    @staticmethod
+    def _load_structures(path: Path) -> list[Any]:
+        """Read an extxyz artifact as an ordered list without guessing on absence."""
+
+        if not path.is_file() or path.stat().st_size == 0:
+            return []
+        loaded = read(str(path), index=":")
+        return list(loaded) if isinstance(loaded, list) else [loaded]
+
+    @staticmethod
+    def _generation_manifest_path(request: GenerationRequest, candidate_path: Path) -> Path:
+        """Return the single authoritative JSON manifest path for the run."""
+
+        return candidate_path.parent / "generation_manifest.json"
+
+    @staticmethod
+    def _requested_family_counts(
+        request: GenerationRequest,
+        bases: Sequence[Any],
+    ) -> dict[str, int]:
+        """Calculate requested family slots after source-scope filtering."""
+
+        config = request.generation
+        gas_enabled = bool(request.composition.gas_elements)
+        source_fields = {
+            "volume_profile": "volume_sources",
+            "elastic_stress": "elastic_sources",
+            "rattled": "rattle_sources",
+        }
+        counts: dict[str, int] = {}
+        for base in bases:
+            source = str(getattr(base, "info", {}).get("configurational_type", "")).strip().lower()
+
+            def add(family: str, count: int, *, enabled: bool = True) -> None:
+                if count <= 0 or not enabled:
+                    return
+                scope = getattr(config, source_fields.get(family, f"{family}_sources"), ("all",))
+                values = (scope,) if isinstance(scope, str) else tuple(scope)
+                normalized = {str(value).strip().lower() for value in values}
+                if source and ("all" in normalized or source in normalized):
+                    counts[family] = counts.get(family, 0) + int(count)
+
+            counts["unperturbed"] = counts.get("unperturbed", 0) + 1
+            add("volume_profile", config.n_volume_points, enabled=config.n_volume_points > 0)
+            add(
+                "elastic_stress",
+                len(config.elastic_strain_amplitudes),
+                enabled=config.elastic_stress_enabled,
+            )
+            add("rattled", config.n_rattled)
+            add(
+                "liquid",
+                config.n_liquid_configurations * config.n_liquid_snapshots,
+                enabled=config.use_liquid,
+            )
+            add("vacancy", config.n_vacancies)
+            add("interstitial", config.n_interstitials)
+            add("gas_interstitial", config.n_gas_interstitials, enabled=gas_enabled)
+            add("substitution", config.n_substitutions)
+            add("antisite", config.n_antisites)
+            add("vacancy_interstitial", config.n_vacancy_interstitial, enabled=gas_enabled)
+            add("gas_in_vacancy", config.n_gas_in_vacancy, enabled=gas_enabled)
+            add(
+                "surface",
+                config.n_surfaces,
+                enabled=config.surface_enabled,
+            )
+            add(
+                "grain_boundary",
+                config.n_grain_boundaries,
+                enabled=config.grain_boundary_enabled,
+            )
+        return dict(sorted(counts.items()))
+
+    @staticmethod
+    def _generation_config_fingerprint(request: GenerationRequest) -> str:
+        """Fingerprint only deterministic scientific generation inputs."""
+
+        payload = {
+            "composition": GenerationStage._normalise_config_value(request.composition),
+            "generation": GenerationStage._normalise_config_value(request.generation),
+            "magnetism": GenerationStage._normalise_config_value(request.magnetism),
+            "random_seed": int(request.random_seed),
+        }
+        return sha256_canonical_json(payload)
+
+    @staticmethod
+    def _normalise_config_value(value: Any) -> Any:
+        if isinstance(value, Path):
+            return str(value)
+        if isinstance(value, Mapping):
+            return {
+                str(key): GenerationStage._normalise_config_value(item)
+                for key, item in sorted(value.items(), key=lambda item: str(item[0]))
+            }
+        if is_dataclass(value):
+            return {
+                item.name: GenerationStage._normalise_config_value(getattr(value, item.name))
+                for item in fields(value)
+            }
+        if isinstance(value, (tuple, list)):
+            return [GenerationStage._normalise_config_value(item) for item in value]
+        enum_value = getattr(value, "value", None)
+        if enum_value is not None and not isinstance(value, (str, int, float, bool)):
+            return GenerationStage._normalise_config_value(enum_value)
+        return value
 
     def _resolve_seed_path(self, request: GenerationRequest) -> Path | None:
         """Resolve a prior seed artifact through the authoritative event ledger."""
