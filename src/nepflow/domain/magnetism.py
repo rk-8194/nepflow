@@ -342,18 +342,33 @@ class MagneticState:
     target_net_moment: tuple[float, float, float] | None = None
     compensation: float | None = None
     global_spin_inversion_equivalent: bool = True
+    canonical_atom_order: tuple[int, ...] | None = None
     magnetic_state_id: str = field(init=False)
 
     def __post_init__(self) -> None:
+        raw_moments = tuple(_normalise_vector(vector, name="moments") for vector in self.moments)
+        order = (
+            tuple(range(len(raw_moments)))
+            if self.canonical_atom_order is None
+            else tuple(int(index) for index in self.canonical_atom_order)
+        )
+        if sorted(order) != list(range(len(raw_moments))):
+            raise ValueError("canonical_atom_order must be a permutation of the moment rows")
         identity = MagneticStateIdentity.from_components(
-            self.moments,
+            raw_moments,
             self.constraint_mask,
             ordering=self.ordering,
+            atom_order=order,
             propagation_vector=self.propagation_vector,
             orbit_phases=self.orbit_phases,
             global_spin_inversion_equivalent=self.global_spin_inversion_equivalent,
         )
-        total = tuple(sum(vector[axis] for vector in identity.moments) for axis in range(3))
+        # Keep the requested field for transport. Global inversion is an
+        # identity-level equivalence, not permission to change the user's
+        # deterministic +z FM convention or the generated AFM representative.
+        transport_moments = raw_moments
+        transport_mask = tuple(bool(value) for value in self.constraint_mask)
+        total = tuple(sum(vector[axis] for vector in transport_moments) for axis in range(3))
         target = (
             total
             if self.target_net_moment is None
@@ -373,20 +388,22 @@ class MagneticState:
             if not math.isfinite(compensation) or compensation < 0.0:
                 raise ValueError("compensation must be finite and non-negative")
         object.__setattr__(self, "ordering", identity.ordering)
-        object.__setattr__(self, "moments", identity.moments)
-        object.__setattr__(self, "constraint_mask", identity.constraint_mask)
+        object.__setattr__(self, "moments", transport_moments)
+        object.__setattr__(self, "constraint_mask", transport_mask)
         object.__setattr__(self, "propagation_vector", identity.propagation_vector)
         object.__setattr__(self, "orbit_phases", identity.orbit_phases)
+        object.__setattr__(self, "canonical_atom_order", order)
         object.__setattr__(self, "target_net_moment", target)
         object.__setattr__(self, "compensation", compensation)
         object.__setattr__(self, "magnetic_state_id", identity.magnetic_state_id)
 
     @property
     def identity(self) -> MagneticStateIdentity:
-        return MagneticStateIdentity(
+        return MagneticStateIdentity.from_components(
             moments=self.moments,
             constraint_mask=self.constraint_mask,
             ordering=self.ordering,
+            atom_order=self.canonical_atom_order,
             propagation_vector=self.propagation_vector,
             orbit_phases=self.orbit_phases,
             global_spin_inversion_equivalent=self.global_spin_inversion_equivalent,

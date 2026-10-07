@@ -56,6 +56,10 @@ class PerturbationCoordinator(Protocol):
     def get_provenance_records(self) -> Sequence[GeneratedStructureRecord]: ...
 
 
+class MagneticExpander(Protocol):
+    def expand_file(self, path: Path) -> Any: ...
+
+
 @runtime_checkable
 class GasPhaseGenerator(Protocol):
     def generate_gas_phases(
@@ -77,12 +81,14 @@ class GenerationStage:
         *,
         generators: Sequence[tuple[str, ConfigurationalGenerator]],
         coordinator: PerturbationCoordinator | None = None,
+        magnetic_generator: MagneticExpander | None = None,
         state_store: Any = None,
         debug_runner: DebugRunner | None = None,
         logger: logging.Logger | None = None,
     ) -> None:
         self.generators = tuple(generators)
         self.coordinator = coordinator
+        self.magnetic_generator = magnetic_generator
         self.state_store = state_store
         self.debug_runner = debug_runner
         self.logger = logger or logging.getLogger(__name__)
@@ -239,11 +245,24 @@ class GenerationStage:
             n_workers=config.n_workers,
         )
         self._candidate_path = Path(output_path) if output_path is not None else None
+        summary = dict(self.coordinator.get_summary())
+        if request.magnetism.enabled:
+            if self.magnetic_generator is None:
+                raise RuntimeError(
+                    "magnetic generation is enabled but no magnetic generator was injected"
+                )
+            if self._candidate_path is None:
+                raise RuntimeError("magnetic generation requires a candidate artifact path")
+            magnetic_result = self.magnetic_generator.expand_file(self._candidate_path)
+            magnetic_summary = magnetic_result.summary.to_dict()
+            summary["magnetic"] = magnetic_summary
+            summary["magnetic_candidate_count"] = len(magnetic_result.candidates)
+            summary["total"] = len(magnetic_result.candidates)
         self._persist_generated_records(
             request,
             self.coordinator.get_provenance_records(),
         )
-        return dict(self.coordinator.get_summary())
+        return summary
 
     def finalize(self, summary: Mapping[str, Any]) -> None:
         self.logger.info("")

@@ -13,6 +13,7 @@ from nepflow.stages.dft import DftStage
 from nepflow.stages.generation import GenerationStage
 from nepflow.stages.generation.debug import run_debug
 from nepflow.stages.generation.generators.base import ConfigurationalGenerator
+from nepflow.stages.generation.perturbations.magnetism import MagneticGenerator
 from nepflow.stages.generation.stage import PerturbationCoordinator
 from nepflow.stages.selection import SelectionStage
 from nepflow.stages.training import TrainingStage
@@ -47,9 +48,11 @@ def build_generation_stage(
 
     generators = _build_generators(context)
     coordinator = _build_perturbation_coordinator(context)
+    magnetic_generator = MagneticGenerator(config.magnetism) if config.magnetism.enabled else None
     return GenerationStage(
         generators=generators,
         coordinator=coordinator,
+        magnetic_generator=magnetic_generator,
         state_store=context.state_store,
         debug_runner=run_debug,
         logger=logger,
