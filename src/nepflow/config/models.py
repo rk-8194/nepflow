@@ -1,9 +1,11 @@
 """Immutable typed models for the project configuration schema."""
 
 from collections.abc import Mapping
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field, fields, is_dataclass
 from pathlib import Path
 from typing import Any
+
+from nepflow.domain.magnetism import MagneticMomentSet
 
 CONFIG_SCHEMA_VERSION = 1
 
@@ -19,6 +21,14 @@ SUPPORTED_CONFIGURATIONAL_SOURCES = frozenset(
 )
 SourceScope = tuple[str, ...]
 DEFAULT_SOURCE_SCOPE: SourceScope = (ALL_SOURCES,)
+MAGNETIC_DEFECT_FAMILIES = (
+    "vacancy",
+    "interstitial",
+    "substitution",
+    "antisite",
+    "vacancy_interstitial",
+    "gas_in_vacancy",
+)
 GENERATION_SOURCE_SCOPE_FIELDS = (
     "volume_sources",
     "elastic_sources",
@@ -179,6 +189,112 @@ class GenerationConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class MagnetismConfig:
+    """Cross-stage magnetic candidate and downstream capability settings."""
+
+    enabled: bool = False
+    target_potential_magnetic: bool = False
+    include_non_magnetic: bool = True
+    include_ferromagnetic: bool = False
+    include_antiferromagnetic: bool = False
+    moment_sets: tuple[MagneticMomentSet, ...] = ()
+    symmetry_tolerance: float = 1.0e-3
+    phase_tolerance: float = 1.0e-8
+    max_afm_orderings: int = 16
+    unmapped_site_policy: str = "skip_afm"
+    magnetic_sources: SourceScope = DEFAULT_SOURCE_SCOPE
+    defect_families: tuple[str, ...] = ()
+    max_defect_parents: int = 0
+    max_magnetic_variants_per_parent: int = 16
+    max_magnetic_variants_per_defect: int = 16
+
+    def __post_init__(self) -> None:
+        raw_sets = self.moment_sets
+        if isinstance(raw_sets, Mapping):
+            raw_sets = tuple(
+                MagneticMomentSet.from_mapping(str(name), values)
+                for name, values in raw_sets.items()
+            )
+        else:
+            raw_sets = tuple(
+                item
+                if isinstance(item, MagneticMomentSet)
+                else MagneticMomentSet.from_mapping(str(item["name"]), item["moments"])
+                for item in raw_sets
+            )
+        object.__setattr__(self, "moment_sets", tuple(raw_sets))
+        object.__setattr__(
+            self,
+            "magnetic_sources",
+            tuple(str(source).strip().lower() for source in self.magnetic_sources),
+        )
+        object.__setattr__(
+            self,
+            "defect_families",
+            tuple(str(family).strip().lower() for family in self.defect_families),
+        )
+        object.__setattr__(
+            self,
+            "unmapped_site_policy",
+            str(self.unmapped_site_policy).strip().lower(),
+        )
+
+    @property
+    def target_potential_supports_magnetism(self) -> bool:
+        """Readable alias for the target-potential capability guard."""
+
+        return self.target_potential_magnetic
+
+    @property
+    def target_mlip_magnetic(self) -> bool:
+        """Compatibility alias for callers using MLIP terminology."""
+
+        return self.target_potential_magnetic
+
+    @property
+    def target_mlip_supports_magnetism(self) -> bool:
+        """Compatibility alias for the documented target capability name."""
+
+        return self.target_potential_magnetic
+
+    @property
+    def include_nonmagnetic(self) -> bool:
+        """Compatibility alias for the documented non-magnetic switch."""
+
+        return self.include_non_magnetic
+
+    @property
+    def include_fm(self) -> bool:
+        """Compatibility alias for the short FM switch."""
+
+        return self.include_ferromagnetic
+
+    @property
+    def include_afm(self) -> bool:
+        """Compatibility alias for the short AFM switch."""
+
+        return self.include_antiferromagnetic
+
+    @property
+    def max_afm_orderings_per_parent(self) -> int:
+        """Compatibility alias for the AFM parent budget."""
+
+        return self.max_afm_orderings
+
+    @property
+    def unmapped_afm_policy(self) -> str:
+        """Compatibility alias for the documented unmapped-site policy."""
+
+        return self.unmapped_site_policy
+
+    @property
+    def source_scope(self) -> SourceScope:
+        """Readable alias for the magnetic source scope."""
+
+        return self.magnetic_sources
+
+
+@dataclass(frozen=True, slots=True)
 class SelectionConfig:
     """Sparse selection and descriptor controls."""
 
@@ -328,10 +444,13 @@ class NepflowConfig:
         compare=False,
         repr=False,
     )
+    magnetism: MagnetismConfig = field(default_factory=MagnetismConfig)
 
     def effective_mapping(self, *, redact_secrets: bool = True) -> dict[str, object]:
         """Return a deterministic, serializable view of the effective config."""
-        mapping = asdict(self)
+        mapping = _normalize_mapping(self)
+        if not isinstance(mapping, dict):
+            raise TypeError("effective configuration must normalize to a mapping")
         mapping.pop("source_path", None)
         mapping.pop("raw_sections", None)
         if redact_secrets:
@@ -346,13 +465,18 @@ class NepflowConfig:
 
 def _normalize_mapping(value: object) -> object:
     """Normalize dataclass values for deterministic effective-config output."""
+    to_dict = getattr(value, "to_dict", None)
+    if callable(to_dict):
+        return _normalize_mapping(to_dict())
+    if is_dataclass(value):
+        return {item.name: _normalize_mapping(getattr(value, item.name)) for item in fields(value)}
     if isinstance(value, Path):
         return str(value)
     if isinstance(value, tuple):
         return [_normalize_mapping(item) for item in value]
     if isinstance(value, list):
         return [_normalize_mapping(item) for item in value]
-    if isinstance(value, dict):
+    if isinstance(value, Mapping):
         return {str(key): _normalize_mapping(value[key]) for key in sorted(value)}
     return value
 

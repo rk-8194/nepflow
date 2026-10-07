@@ -207,6 +207,26 @@ antisite_pairs=
 antisite_min=0.0
 antisite_max=0.1
 
+[magnetism]
+# Magnetic candidates are opt-in and require a magnetic-capable target MLIP.
+enabled=false
+target_potential_magnetic=false
+include_non_magnetic=true
+include_ferromagnetic=false
+include_antiferromagnetic=false
+# JSON object: {{"set_name":{{"Fe":2.5,"Cr":1.5}}}}
+moment_sets=
+symmetry_tolerance=0.001
+phase_tolerance=1e-8
+max_afm_orderings=16
+unmapped_site_policy=skip_afm
+magnetic_sources=all
+# Comma-separated supported defect families, blank means pristine only.
+defect_families=
+max_defect_parents=0
+max_magnetic_variants_per_parent=16
+max_magnetic_variants_per_defect=16
+
 [selection]
 # NEP model file for descriptor computation (in config/nep/ directory)
 # Download NEP89 from: https://github.com/brucefan1983/GPUMD/tree/master/potentials/nep/nep89_20250409

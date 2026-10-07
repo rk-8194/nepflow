@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from nepflow.errors import ConfigurationError
 
@@ -17,6 +17,8 @@ from .models import (
     DftRecoveryConfig,
     GenerationConfig,
     HpcConfig,
+    MagneticMomentSet,
+    MagnetismConfig,
     NepConfig,
     NepTrainingConfig,
     PathsConfig,
@@ -143,6 +145,101 @@ def parse_generation(values: Mapping[str, str]) -> GenerationConfig:
         **_parse_generation_liquid(values),
         **_parse_generation_scopes(values),
         **_parse_generation_perturbations(values),
+    )
+
+
+def parse_magnetism(values: Mapping[str, str]) -> MagnetismConfig:
+    """Parse the cross-stage magnetic candidate contract."""
+
+    return MagnetismConfig(
+        enabled=_parse_bool(values.get("enabled", "false"), "magnetism.enabled"),
+        target_potential_magnetic=_parse_bool(
+            _first_present(
+                values,
+                "target_potential_magnetic",
+                "target_potential_supports_magnetism",
+                "target_mlip_magnetic",
+                "target_mlip_supports_magnetism",
+                default="false",
+            ),
+            "magnetism.target_potential_magnetic",
+        ),
+        include_non_magnetic=_parse_bool(
+            _first_present(
+                values,
+                "include_non_magnetic",
+                "include_nonmagnetic",
+                "include_nm",
+                default="true",
+            ),
+            "magnetism.include_non_magnetic",
+        ),
+        include_ferromagnetic=_parse_bool(
+            _first_present(values, "include_ferromagnetic", "include_fm", default="false"),
+            "magnetism.include_ferromagnetic",
+        ),
+        include_antiferromagnetic=_parse_bool(
+            _first_present(values, "include_antiferromagnetic", "include_afm", default="false"),
+            "magnetism.include_antiferromagnetic",
+        ),
+        moment_sets=_parse_moment_sets(
+            values.get("moment_sets", values.get("named_moment_sets", "")),
+            "magnetism.moment_sets",
+        ),
+        symmetry_tolerance=_parse_float(
+            values.get("symmetry_tolerance", "0.001"),
+            "magnetism.symmetry_tolerance",
+        ),
+        phase_tolerance=_parse_float(
+            values.get("phase_tolerance", "1e-8"),
+            "magnetism.phase_tolerance",
+        ),
+        max_afm_orderings=_parse_int(
+            _first_present(
+                values,
+                "max_afm_orderings",
+                "max_afm_orderings_per_parent",
+                "max_afm_orderings_per_structure",
+                default="16",
+            ),
+            "magnetism.max_afm_orderings",
+        ),
+        unmapped_site_policy=_normalise_unmapped_policy(
+            _first_present(
+                values,
+                "unmapped_site_policy",
+                "unmapped_afm_policy",
+                default="skip_afm",
+            )
+        ),
+        magnetic_sources=_parse_source_scope(
+            {
+                "magnetic_sources": _first_present(
+                    values,
+                    "magnetic_sources",
+                    "source_scopes",
+                    default=ALL_SOURCES,
+                )
+            },
+            "magnetic_sources",
+            section="magnetism",
+        ),
+        defect_families=_parse_list(
+            values.get("defect_families", ""),
+            "magnetism.defect_families",
+        ),
+        max_defect_parents=_parse_int(
+            values.get("max_defect_parents", "0"),
+            "magnetism.max_defect_parents",
+        ),
+        max_magnetic_variants_per_parent=_parse_int(
+            values.get("max_magnetic_variants_per_parent", "16"),
+            "magnetism.max_magnetic_variants_per_parent",
+        ),
+        max_magnetic_variants_per_defect=_parse_int(
+            values.get("max_magnetic_variants_per_defect", "16"),
+            "magnetism.max_magnetic_variants_per_defect",
+        ),
     )
 
 
@@ -404,8 +501,13 @@ def _parse_generation_scopes(values: Mapping[str, str]) -> dict[str, tuple[str, 
     }
 
 
-def _parse_source_scope(values: Mapping[str, str], field_name: str) -> tuple[str, ...]:
-    key = f"generation.{field_name}"
+def _parse_source_scope(
+    values: Mapping[str, str],
+    field_name: str,
+    *,
+    section: str = "generation",
+) -> tuple[str, ...]:
+    key = f"{section}.{field_name}"
     raw = values.get(field_name, ALL_SOURCES)
     if not isinstance(raw, str) or not raw.strip():
         raise ConfigurationError(f"{key} must explicitly name one or more sources")
@@ -422,6 +524,80 @@ def _parse_source_scope(values: Mapping[str, str], field_name: str) -> tuple[str
             f"{key} contains unsupported sources: {', '.join(sorted(unknown))}"
         )
     return entries
+
+
+def _parse_moment_sets(value: str, name: str) -> tuple[MagneticMomentSet, ...]:
+    """Parse named moment sets from JSON or a compact human form."""
+
+    text = value.strip()
+    if not text:
+        return ()
+    try:
+        decoded = json.loads(text)
+    except json.JSONDecodeError:
+        decoded = None
+    try:
+        if isinstance(decoded, Mapping):
+            if "name" in decoded:
+                raw_sets = [decoded]
+            else:
+                raw_sets = [
+                    {"name": str(set_name), "moments": moments}
+                    for set_name, moments in decoded.items()
+                ]
+        elif isinstance(decoded, list):
+            raw_sets = decoded
+        elif decoded is not None:
+            raise ConfigurationError(f"{name} must be a JSON object or list")
+        else:
+            raw_sets = []
+            for declaration in text.split(";"):
+                set_name, separator, raw_values = declaration.partition("=")
+                if not separator:
+                    set_name, separator, raw_values = declaration.partition(":")
+                if not separator:
+                    raise ConfigurationError(
+                        f"{name} must use JSON or name=Element:value,... declarations"
+                    )
+                moments: dict[str, float] = {}
+                for item in raw_values.split(","):
+                    element, item_separator, magnitude = item.partition(":")
+                    if not item_separator:
+                        element, item_separator, magnitude = item.partition("=")
+                    if not item_separator:
+                        raise ConfigurationError(f"{name} contains an invalid moment entry")
+                    moments[element.strip()] = float(magnitude.strip())
+                raw_sets.append({"name": set_name.strip(), "moments": moments})
+        result: list[MagneticMomentSet] = []
+        for item in raw_sets:
+            if not isinstance(item, Mapping):
+                raise ConfigurationError(f"{name} entries must be named mappings")
+            set_name = cast(object, item.get("name"))
+            moment_values = cast(object, item.get("moments", item.get("element_moments")))
+            if not isinstance(set_name, str) or not isinstance(moment_values, Mapping):
+                raise ConfigurationError(f"{name} entries require name and moments")
+            result.append(MagneticMomentSet.from_mapping(set_name, moment_values))
+        return tuple(result)
+    except (TypeError, ValueError, OverflowError) as exc:
+        if isinstance(exc, ConfigurationError):
+            raise
+        raise ConfigurationError(f"{name} contains an invalid moment set") from exc
+
+
+def _first_present(
+    values: Mapping[str, str],
+    *keys: str,
+    default: str,
+) -> str:
+    present = [values[key] for key in keys if key in values]
+    if len(present) > 1 and len(set(present)) > 1:
+        raise ConfigurationError(f"magnetism aliases {', '.join(keys)} conflict")
+    return present[0] if present else default
+
+
+def _normalise_unmapped_policy(value: str) -> str:
+    policy = value.strip().lower()
+    return "skip_afm" if policy == "omit" else policy
 
 
 def parse_selection(values: Mapping[str, str]) -> SelectionConfig:

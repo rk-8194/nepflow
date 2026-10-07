@@ -526,6 +526,7 @@ class GenerationStage:
             composition=config.composition,
             generation=config.generation,
             random_seed=config.project.random_seed,
+            magnetism=config.magnetism,
             structures_path=config.paths.structures_path,
             state_store=context.state_store,
             seeds_only=context.seeds_only,

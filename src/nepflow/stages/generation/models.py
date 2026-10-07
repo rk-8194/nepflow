@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping
 
-from nepflow.config.models import CompositionConfig, GenerationConfig
+from nepflow.config.models import CompositionConfig, GenerationConfig, MagnetismConfig
 from nepflow.domain.identities import ArtifactIdentity
 
 GENERATION_MANIFEST_SCHEMA = "nepflow.generation_manifest.v1"
@@ -30,6 +30,7 @@ class GenerationRequest:
     state_store: Any = None
     seeds_only: bool = False
     debug: bool = False
+    magnetism: MagnetismConfig = field(default_factory=MagnetismConfig)
 
     @property
     def seeds_file(self) -> Path:

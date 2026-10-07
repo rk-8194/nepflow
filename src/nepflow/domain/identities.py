@@ -17,6 +17,7 @@ from nepflow.io.hashing import sha256_bytes, sha256_canonical_json
 from nepflow.io.json import to_jsonable
 
 STRUCTURE_IDENTITY_SCHEMA = "structure-v1"
+CANDIDATE_IDENTITY_SCHEMA = "candidate-v1"
 ARTIFACT_IDENTITY_SCHEMA = "nepflow.artifact_identity.v1"
 DFT_CALCULATION_IDENTITY_SCHEMA = "nepflow.dft_calculation_identity.v1"
 MODEL_RUN_IDENTITY_SCHEMA = "nepflow.model_run_identity.v1"
@@ -105,6 +106,138 @@ def annotate_structure_ids(structures: list[Any], *, overwrite: bool = True) -> 
 
     for atoms in structures:
         annotate_structure_id(atoms, overwrite=overwrite)
+
+
+def calculate_candidate_id(
+    structure_id: str,
+    magnetic_state_id: str | Any | None = None,
+    *,
+    magnetic_state: str | Any | None = None,
+) -> str:
+    """Return the stable candidate identity for one physical structure.
+
+    A non-magnetic candidate deliberately reuses structure_id so existing
+    selection, storage, and DFT consumers remain compatible. An explicit
+    magnetic state receives a separate versioned identity while retaining the
+    same physical structure ID.
+    """
+
+    if magnetic_state_id is not None and magnetic_state is not None:
+        raise ValueError("provide only one of magnetic_state_id or magnetic_state")
+    if magnetic_state_id is None:
+        magnetic_state_id = magnetic_state
+    structure = str(structure_id).strip()
+    if not structure:
+        raise ValueError("structure_id must not be blank")
+    if magnetic_state_id is None:
+        return structure
+    state = getattr(magnetic_state_id, "magnetic_state_id", magnetic_state_id)
+    state_id = str(state).strip()
+    if not state_id:
+        raise ValueError("magnetic_state_id must not be blank when supplied")
+    payload = {
+        "schema_version": CANDIDATE_IDENTITY_SCHEMA,
+        "structure_id": structure,
+        "magnetic_state_id": state_id,
+    }
+    return "candidate_" + sha256_canonical_json(payload)
+
+
+def calculate_magnetic_state_id(
+    moments: Sequence[Sequence[Any]],
+    constraint_mask: Sequence[Any],
+    **kwargs: Any,
+) -> str:
+    """Compatibility entry point for the cross-stage magnetic identity."""
+
+    from .magnetism import calculate_magnetic_state_id as _calculate_magnetic_state_id
+
+    return _calculate_magnetic_state_id(moments, constraint_mask, **kwargs)
+
+
+def annotate_candidate_id(
+    atoms: Any,
+    *,
+    magnetic_state_id: str | Any | None = None,
+    overwrite: bool = True,
+) -> str:
+    """Attach physical and candidate IDs without changing structure identity."""
+
+    structure_id = calculate_structure_id(atoms)
+    state = magnetic_state_id
+    if state is None:
+        state = getattr(atoms, "info", {}).get("magnetic_state_id")
+    candidate_id = calculate_candidate_id(structure_id, state)
+    info = getattr(atoms, "info", None)
+    if info is None:
+        atoms.info = {}
+        info = atoms.info
+    if overwrite or "structure_id" not in info:
+        info["structure_id"] = structure_id
+        info["structure_id_version"] = STRUCTURE_IDENTITY_SCHEMA
+    if overwrite or "candidate_id" not in info:
+        info["candidate_id"] = candidate_id
+        info["candidate_id_version"] = CANDIDATE_IDENTITY_SCHEMA
+    if state is not None and (overwrite or "magnetic_state_id" not in info):
+        info["magnetic_state_id"] = str(getattr(state, "magnetic_state_id", state))
+    return str(info["candidate_id"])
+
+
+@dataclass(frozen=True)
+class CandidateIdentity:
+    """Versioned identity joining physical and explicit magnetic identity."""
+
+    structure_id: str
+    magnetic_state_id: str | None = None
+    schema_version: str = CANDIDATE_IDENTITY_SCHEMA
+    candidate_id: str = field(init=False)
+
+    def __post_init__(self) -> None:
+        if self.schema_version != CANDIDATE_IDENTITY_SCHEMA:
+            raise ValueError(
+                f"CandidateIdentity schema_version must be {CANDIDATE_IDENTITY_SCHEMA!r}"
+            )
+        structure = str(self.structure_id).strip()
+        if not structure:
+            raise ValueError("structure_id must not be blank")
+        state = None if self.magnetic_state_id is None else str(self.magnetic_state_id).strip()
+        if state == "":
+            raise ValueError("magnetic_state_id must not be blank when supplied")
+        object.__setattr__(self, "structure_id", structure)
+        object.__setattr__(self, "magnetic_state_id", state)
+        object.__setattr__(
+            self,
+            "candidate_id",
+            calculate_candidate_id(structure, state),
+        )
+
+    @classmethod
+    def from_magnetic_state(
+        cls,
+        structure_id: str,
+        magnetic_state: Any,
+    ) -> "CandidateIdentity":
+        return cls(
+            structure_id=structure_id,
+            magnetic_state_id=getattr(magnetic_state, "magnetic_state_id", magnetic_state),
+        )
+
+    @property
+    def is_magnetic(self) -> bool:
+        return self.magnetic_state_id is not None
+
+    def identity_payload(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "structure_id": self.structure_id,
+            "magnetic_state_id": self.magnetic_state_id,
+        }
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "candidate_id": self.candidate_id,
+            **self.identity_payload(),
+        }
 
 
 def _freeze(value: Any) -> Any:

@@ -15,6 +15,7 @@ _CANONICAL_SECTIONS = frozenset(
         "materialsproject",
         "composition",
         "generation",
+        "magnetism",
         "selection",
         "vasp",
         "nep",
@@ -71,6 +72,7 @@ def _section_values(
         "materialsproject": {"api_key": ""},
         "composition": _composition_values(config),
         "generation": _generation_values(config),
+        "magnetism": _magnetism_values(config),
         "selection": _selection_values(config),
         "vasp": _vasp_values(config),
         "nep": {"enabled": _bool_text(config.nep.enabled)},
@@ -226,6 +228,33 @@ def _generation_values(config: NepflowConfig) -> dict[str, str]:
         "antisite_max": str(generation.antisite_max),
         "gas_interstitial_d_min": str(generation.gas_interstitial_d_min),
         "max_gas_occupancy": str(generation.max_gas_occupancy),
+    }
+
+
+def _magnetism_values(config: NepflowConfig) -> dict[str, str]:
+    magnetism = config.magnetism
+    return {
+        "enabled": _bool_text(magnetism.enabled),
+        "target_potential_magnetic": _bool_text(magnetism.target_potential_magnetic),
+        "include_non_magnetic": _bool_text(magnetism.include_non_magnetic),
+        "include_ferromagnetic": _bool_text(magnetism.include_ferromagnetic),
+        "include_antiferromagnetic": _bool_text(magnetism.include_antiferromagnetic),
+        "moment_sets": json.dumps(
+            {
+                moment_set.name: dict(moment_set.element_moments)
+                for moment_set in magnetism.moment_sets
+            },
+            sort_keys=True,
+        ),
+        "symmetry_tolerance": str(magnetism.symmetry_tolerance),
+        "phase_tolerance": str(magnetism.phase_tolerance),
+        "max_afm_orderings": str(magnetism.max_afm_orderings),
+        "unmapped_site_policy": magnetism.unmapped_site_policy,
+        "magnetic_sources": ",".join(magnetism.magnetic_sources),
+        "defect_families": ",".join(magnetism.defect_families),
+        "max_defect_parents": str(magnetism.max_defect_parents),
+        "max_magnetic_variants_per_parent": str(magnetism.max_magnetic_variants_per_parent),
+        "max_magnetic_variants_per_defect": str(magnetism.max_magnetic_variants_per_defect),
     }
 
 

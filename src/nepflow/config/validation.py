@@ -12,6 +12,7 @@ from nepflow.errors import ConfigurationError
 from .models import (
     ALL_SOURCES,
     GENERATION_SOURCE_SCOPE_FIELDS,
+    MAGNETIC_DEFECT_FAMILIES,
     SUPPORTED_CONFIGURATIONAL_SOURCES,
     GenerationConfig,
     NepflowConfig,
@@ -139,6 +140,7 @@ def validate_config(
             + ", ".join(sorted(unknown_structures))
         )
     _validate_generation_source_scopes(config.generation)
+    _validate_magnetism_settings(config)
     _require_non_negative(
         "generation.target_n_atoms", config.generation.target_n_atoms, strictly_positive=True
     )
@@ -487,6 +489,105 @@ def _validate_generation_source_scopes(config: GenerationConfig) -> None:
             raise ConfigurationError(
                 f"{name} contains unsupported sources: {', '.join(sorted(unknown))}"
             )
+
+
+def _validate_magnetism_settings(config: NepflowConfig) -> None:
+    magnetic = config.magnetism
+    if magnetic.enabled and not (
+        magnetic.include_non_magnetic
+        or magnetic.include_ferromagnetic
+        or magnetic.include_antiferromagnetic
+    ):
+        raise ConfigurationError(
+            "magnetism must include at least one of non-magnetic, FM, or AFM ordering"
+        )
+    if not magnetic.enabled and (
+        magnetic.include_ferromagnetic or magnetic.include_antiferromagnetic
+    ):
+        raise ConfigurationError(
+            "magnetism FM/AFM orderings cannot be enabled while magnetism.enabled is false"
+        )
+    if (magnetic.include_ferromagnetic or magnetic.include_antiferromagnetic) and not (
+        magnetic.target_potential_magnetic
+    ):
+        raise ConfigurationError(
+            "magnetism FM/AFM orderings require target-potential magnetic capability"
+        )
+    if magnetic.include_antiferromagnetic and not magnetic.moment_sets:
+        raise ConfigurationError("magnetism.moment_sets is required when AFM ordering is enabled")
+    if magnetic.include_ferromagnetic and not magnetic.moment_sets:
+        raise ConfigurationError("magnetism.moment_sets is required when FM ordering is enabled")
+
+    names = [moment_set.name for moment_set in magnetic.moment_sets]
+    if len(set(names)) != len(names):
+        raise ConfigurationError("magnetism.moment_sets must have unique names")
+    element_sets = {frozenset(moment_set.element_moments) for moment_set in magnetic.moment_sets}
+    if len(element_sets) > 1:
+        raise ConfigurationError("magnetism.moment_sets must define the same complete element set")
+    allowed_elements = set(config.composition.elements) | set(config.composition.gas_elements)
+    for moment_set in magnetic.moment_sets:
+        for element, magnitude in moment_set.element_moments.items():
+            if not _is_element_symbol(element):
+                raise ConfigurationError(
+                    f"magnetism.moment_sets contains an invalid element symbol: {element}"
+                )
+            if allowed_elements and element not in allowed_elements:
+                raise ConfigurationError(
+                    f"magnetism.moment_sets element {element} is absent from composition.elements"
+                )
+            if not math.isfinite(magnitude) or magnitude <= 0.0:
+                raise ConfigurationError(
+                    f"magnetism.moment_sets magnitude for {element} must be finite and positive"
+                )
+
+    if not math.isfinite(magnetic.symmetry_tolerance) or magnetic.symmetry_tolerance <= 0.0:
+        raise ConfigurationError("magnetism.symmetry_tolerance must be finite and positive")
+    if not math.isfinite(magnetic.phase_tolerance) or magnetic.phase_tolerance <= 0.0:
+        raise ConfigurationError("magnetism.phase_tolerance must be finite and positive")
+    for field_name in (
+        "max_afm_orderings",
+        "max_magnetic_variants_per_parent",
+        "max_magnetic_variants_per_defect",
+    ):
+        _require_non_negative(
+            f"magnetism.{field_name}",
+            getattr(magnetic, field_name),
+            strictly_positive=True,
+        )
+    _require_non_negative("magnetism.max_defect_parents", magnetic.max_defect_parents)
+    if magnetic.unmapped_site_policy not in {"skip_afm", "reject", "allow_fm_only"}:
+        raise ConfigurationError(
+            "magnetism.unmapped_site_policy must be 'skip_afm', 'reject', or 'allow_fm_only'"
+        )
+    _validate_magnetic_source_scope(magnetic.magnetic_sources)
+    if len(set(magnetic.defect_families)) != len(magnetic.defect_families):
+        raise ConfigurationError("magnetism.defect_families must not contain duplicates")
+    unknown_families = set(magnetic.defect_families) - set(MAGNETIC_DEFECT_FAMILIES)
+    if unknown_families:
+        raise ConfigurationError(
+            "magnetism.defect_families contains unsupported families: "
+            + ", ".join(sorted(unknown_families))
+        )
+
+
+def _validate_magnetic_source_scope(scope: tuple[str, ...]) -> None:
+    name = "magnetism.magnetic_sources"
+    if not isinstance(scope, tuple) or not scope:
+        raise ConfigurationError(f"{name} must contain at least one explicit source")
+    if any(not isinstance(source, str) or not source.strip() for source in scope):
+        raise ConfigurationError(f"{name} contains a blank source")
+    normalized = tuple(source.strip().lower() for source in scope)
+    if normalized != scope:
+        raise ConfigurationError(f"{name} must use normalized lowercase source names")
+    if len(set(scope)) != len(scope):
+        raise ConfigurationError(f"{name} must not contain duplicate sources")
+    if ALL_SOURCES in scope and len(scope) != 1:
+        raise ConfigurationError(f"{name} cannot combine 'all' with named sources")
+    unknown = set(scope) - SUPPORTED_CONFIGURATIONAL_SOURCES - {ALL_SOURCES}
+    if unknown:
+        raise ConfigurationError(
+            f"{name} contains unsupported sources: {', '.join(sorted(unknown))}"
+        )
 
 
 def _require_non_negative(
