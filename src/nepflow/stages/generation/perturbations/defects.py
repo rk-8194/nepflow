@@ -10,6 +10,7 @@ from ase import Atom
 
 from nepflow.domain.identities import calculate_structure_id
 
+from ..supercell import mark_added_atoms_mapped, mark_added_atoms_unmapped
 from .models import PerturbationSettings, derive_child_seed
 
 Annotate = Callable[..., Any]
@@ -401,7 +402,9 @@ def vacancy_interstitial(
         requested_interstitials, requested_interstitial_concentration = _requested_count(
             settings.interstitial_range, len(supercell), slot_rng
         )
-        configured_sites = _configured_interstitial_positions(settings, cell)
+        configured_sites = _configured_interstitial_site_records(settings, cell)
+        topology_start = len(vacancy)
+        topology_rows: list[Mapping[str, Any] | None] = []
         for insertion_index in range(requested_interstitials):
             element = all_elements[slot_rng.randint(len(all_elements))]
             d_min = (
@@ -425,9 +428,15 @@ def vacancy_interstitial(
                 continue
             new_positions.append(position)
             new_symbols.append(element)
+            topology_rows.append(
+                configured_sites[insertion_index][1]
+                if configured_sites and insertion_index < len(configured_sites)
+                else None
+            )
             defect_positions = np.vstack([defect_positions, position])
         for position, symbol in zip(new_positions, new_symbols):
             vacancy.append(Atom(symbol=symbol, position=position))
+        mark_added_atoms_mapped(vacancy, topology_start, topology_rows)
         parameters: dict[str, Any] = {}
         parameters.update(
             _count_parameters(
@@ -488,6 +497,7 @@ def gas_in_vacancy(
         vacancy_position = vacancy.get_positions()[vacancy_index].copy()
         vacancy_element = vacancy.get_chemical_symbols()[vacancy_index]
         vacancy = vacancy[[item for item in range(n_atoms) if item != vacancy_index]]
+        topology_start = len(vacancy)
         requested_gas = slot_rng.randint(1, settings.max_gas_occupancy + 1)
         remaining_positions = vacancy.get_positions().copy()
         defect_positions = np.empty((0, 3), dtype=float)
@@ -535,6 +545,7 @@ def gas_in_vacancy(
                 defect_positions = np.vstack([defect_positions, position])
                 placed += 1
                 gas_species.append(gas_element)
+        mark_added_atoms_unmapped(vacancy, topology_start)
         parameters = {
             "requested_n_vacancies": 1,
             "realised_n_vacancies": 1,
@@ -656,7 +667,7 @@ def _insert_interstitials(
     base_structure_id = calculate_structure_id(base)
     root_seed = settings.random_seed if seed is None else int(seed)
     cell, inv_cell = _cell_arrays(supercell)
-    configured_sites = _configured_interstitial_positions(settings, cell)
+    configured_sites = _configured_interstitial_site_records(settings, cell)
     output: list[Any] = []
     for index in range(n):
         child_seed = derive_child_seed(base_structure_id, root_seed, family, index)
@@ -665,6 +676,7 @@ def _insert_interstitials(
         defect_positions = np.empty((0, 3), dtype=float)
         new_positions: list[np.ndarray] = []
         new_symbols: list[str] = []
+        topology_rows: list[Mapping[str, Any] | None] = []
         requested, requested_concentration = _requested_count(
             settings.interstitial_range, len(supercell), slot_rng
         )
@@ -685,10 +697,17 @@ def _insert_interstitials(
                 continue
             new_positions.append(position)
             new_symbols.append(str(elements[int(slot_rng.randint(len(elements)))]))
+            topology_rows.append(
+                configured_sites[insertion_index][1]
+                if configured_sites and insertion_index < len(configured_sites)
+                else None
+            )
             defect_positions = np.vstack([defect_positions, position])
         result = supercell.copy()
+        topology_start = len(result)
         for position, symbol in zip(new_positions, new_symbols):
             result.append(Atom(symbol=symbol, position=position))
+        mark_added_atoms_mapped(result, topology_start, topology_rows)
         parameters = _count_parameters(
             "interstitials",
             requested,
@@ -724,13 +743,13 @@ def _next_interstitial_position(
     settings: PerturbationSettings,
     d_min: float,
     insertion_index: int,
-    configured_sites: Sequence[np.ndarray] | None = None,
+    configured_sites: Sequence[tuple[np.ndarray, Mapping[str, Any] | None]] | None = None,
     pbc: Any = True,
 ) -> np.ndarray | None:
     if configured_sites:
         if insertion_index >= len(configured_sites):
             return None
-        candidate = configured_sites[insertion_index]
+        candidate = configured_sites[insertion_index][0]
         return (
             candidate
             if _position_is_valid(
@@ -763,7 +782,14 @@ def _configured_interstitial_positions(
     settings: PerturbationSettings,
     cell: np.ndarray,
 ) -> tuple[np.ndarray, ...]:
-    result: list[np.ndarray] = []
+    return tuple(position for position, _ in _configured_interstitial_site_records(settings, cell))
+
+
+def _configured_interstitial_site_records(
+    settings: PerturbationSettings,
+    cell: np.ndarray,
+) -> tuple[tuple[np.ndarray, Mapping[str, Any] | None], ...]:
+    result: list[tuple[np.ndarray, Mapping[str, Any] | None]] = []
     for site in settings.crystallographic_interstitial_sites or settings.interstitial_sites:
         if isinstance(site, Mapping):
             coordinates = site.get("fractional", site.get("position"))
@@ -782,8 +808,44 @@ def _configured_interstitial_positions(
             or np.any(fractional >= 1.0)
         ):
             raise ValueError("interstitial sites must use fractional coordinates in [0, 1)")
-        result.append(fractional @ cell)
+        result.append((fractional @ cell, _interstitial_topology_metadata(site, fractional)))
     return tuple(result)
+
+
+def _interstitial_topology_metadata(
+    site: Mapping[str, Any] | Any,
+    fractional: np.ndarray,
+) -> Mapping[str, Any] | None:
+    if not isinstance(site, Mapping):
+        return None
+    if "parent_site_index" not in site or "parent_orbit_index" not in site:
+        return None
+    translation_value = site.get("parent_cell_translation", site.get("translation", (0, 0, 0)))
+    try:
+        translation = tuple(int(value) for value in translation_value)
+        parent_site_index = int(site["parent_site_index"])
+        parent_orbit_index = int(site["parent_orbit_index"])
+    except (TypeError, ValueError, KeyError, OverflowError) as exc:
+        raise ValueError("mapped interstitial topology metadata is invalid") from exc
+    if len(translation) != 3 or parent_site_index < 0 or parent_orbit_index < 0:
+        raise ValueError("mapped interstitial topology metadata is invalid")
+    unwrapped_value = site.get(
+        "parent_unwrapped_fractional",
+        site.get("unwrapped_parent_fractional", site.get("unwrapped_fractional")),
+    )
+    unwrapped = (
+        np.asarray(unwrapped_value, dtype=float)
+        if unwrapped_value is not None
+        else fractional + np.asarray(translation, dtype=float)
+    )
+    if unwrapped.shape != (3,) or not np.isfinite(unwrapped).all():
+        raise ValueError("mapped interstitial topology coordinates are invalid")
+    return {
+        "parent_site_index": parent_site_index,
+        "parent_orbit_index": parent_orbit_index,
+        "parent_cell_translation": translation,
+        "parent_unwrapped_fractional": unwrapped,
+    }
 
 
 def _cell_arrays(atoms: Any) -> tuple[np.ndarray, np.ndarray]:
