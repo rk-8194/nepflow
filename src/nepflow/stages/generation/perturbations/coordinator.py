@@ -281,16 +281,19 @@ def execute_perturbation_task(task: PerturbationTask) -> PerturbationTaskResult:
                 seed=task.seed,
             )
         )
-    if (
-        settings.surface_enabled
-        and task.counts.n_surfaces > 0
-        and family_applies_to_base("surface", task.base, settings)
-    ):
+    if settings.surface_enabled and family_applies_to_base("surface", task.base, settings):
+        # ``n_surfaces`` is a legacy compatibility input.  Preserve its old
+        # single-orientation behaviour for direct callers, but never let it
+        # truncate a multi-orientation request.  A zero legacy count means
+        # "use the configured surface plan" in the new contract.
+        surface_count: int | None = None
+        if len(settings.surface_miller_indices) == 1 and task.counts.n_surfaces > 0:
+            surface_count = task.counts.n_surfaces
         output.extend(
             surfaces(
                 task.base,
                 task.base,
-                task.counts.n_surfaces,
+                surface_count,
                 settings,
                 None,
                 annotate,
@@ -508,7 +511,10 @@ class PerturbationCoordinator:
             n_antisites=n_antisites,
             n_vacancy_interstitial=n_vacancy_interstitial,
             n_gas_in_vacancy=n_gas_in_vacancy,
-            n_surfaces=n_surfaces,
+            # Surface execution is orientation/termination driven. Retain the
+            # parameter for API compatibility, but do not pass its legacy
+            # global cap into the typed task plan.
+            n_surfaces=0,
             n_grain_boundaries=n_grain_boundaries,
         )
         temporary_path: Path | None = None

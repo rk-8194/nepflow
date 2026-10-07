@@ -9,6 +9,7 @@ from typing import Any
 import numpy as np
 from ase import Atoms
 
+from nepflow.config.models import SUPPORTED_SURFACE_MILLER_INDICES
 from nepflow.domain.identities import calculate_structure_id
 
 from .models import PerturbationSettings, derive_child_seed
@@ -21,7 +22,7 @@ class SurfaceConstructionError(ValueError):
 def surfaces(
     parent: Any,
     base: Any,
-    count: int,
+    count: int | None,
     settings: PerturbationSettings,
     rng: Any,
     annotate: Callable[..., Any],
@@ -31,14 +32,13 @@ def surfaces(
     """Build deterministic, validated slabs for the configured Miller indices.
 
     Pymatgen supplies the crystallographic termination enumeration while ASE
-    remains the canonical output representation.  ``count`` is a global upper
-    bound over the ordered ``(Miller index, termination)`` stream; asking for
-    more candidates than the configured construction can provide is an
-    explicit error rather than a duplicated or substituted surface.
+    remains the canonical output representation. ``count`` is retained as a
+    compatibility limit for direct legacy callers; the configured coordinator
+    passes ``None`` so every requested orientation and termination is emitted.
     """
 
     del rng  # Surface construction is deterministic; the seed is provenance only.
-    if count <= 0:
+    if count is not None and count <= 0:
         return []
     miller_indices = tuple(_normalise_miller(index) for index in settings.surface_miller_indices)
     if not miller_indices:
@@ -47,6 +47,11 @@ def surfaces(
     parent_structure_id = calculate_structure_id(base)
     generated: list[Any] = []
     for miller_index in miller_indices:
+        if miller_index not in SUPPORTED_SURFACE_MILLER_INDICES:
+            raise SurfaceConstructionError(
+                f"unsupported Miller index {miller_index}; automatic surfaces support "
+                "only (1, 0, 0), (1, 1, 0), and (1, 1, 1)"
+            )
         slabs = _enumerate_slabs(parent, miller_index, settings)
         if settings.surface_termination_policy == "first":
             slabs = slabs[:1]
@@ -83,8 +88,11 @@ def surfaces(
                 ),
             )
             generated.append(candidate)
-            if len(generated) == count:
+            if count is not None and len(generated) == count:
                 return generated
+
+    if count is None:
+        return generated
 
     raise SurfaceConstructionError(
         "requested "

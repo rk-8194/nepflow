@@ -14,6 +14,7 @@ from .models import (
     GENERATION_SOURCE_SCOPE_FIELDS,
     MAGNETIC_DEFECT_FAMILIES,
     SUPPORTED_CONFIGURATIONAL_SOURCES,
+    SUPPORTED_SURFACE_MILLER_INDICES,
     GenerationConfig,
     NepflowConfig,
 )
@@ -411,12 +412,21 @@ def _validate_surface_settings(config: GenerationConfig) -> None:
                 "generation.surface_miller_indices must contain at least one index"
             )
     for index in config.surface_miller_indices:
-        if len(index) != 3 or any(not isinstance(value, int) for value in index):
+        if len(index) != 3 or any(type(value) is not int for value in index):
             raise ConfigurationError(
                 "generation.surface_miller_indices must contain integer triples"
             )
         if not any(index):
             raise ConfigurationError("generation.surface_miller_indices cannot contain (0, 0, 0)")
+        if tuple(index) not in SUPPORTED_SURFACE_MILLER_INDICES:
+            supported = ", ".join(
+                f"({h},{k},{miller_l})"
+                for h, k, miller_l in sorted(SUPPORTED_SURFACE_MILLER_INDICES)
+            )
+            raise ConfigurationError(
+                "generation.surface_miller_indices contains unsupported orientation "
+                f"{tuple(index)}; supported orientations are {supported}"
+            )
     if len(config.surface_in_plane_repeat) != 2 or any(
         not isinstance(value, int) or value <= 0 for value in config.surface_in_plane_repeat
     ):

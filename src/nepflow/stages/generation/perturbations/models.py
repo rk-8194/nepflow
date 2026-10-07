@@ -49,7 +49,13 @@ def derive_child_seed(
 
 @dataclass(frozen=True, slots=True)
 class PerturbationCounts:
-    """Per-base candidate counts supplied by the generation configuration."""
+    """Per-base candidate counts supplied by the generation configuration.
+
+    ``n_surfaces`` remains for compatibility with the typed coordinator
+    interface and old callers. The configured process path is
+    orientation/termination driven and does not use this legacy global count
+    as a cap.
+    """
 
     n_rattled: int = 10
     n_liquid_configurations: int = 0

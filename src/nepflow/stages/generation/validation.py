@@ -13,6 +13,7 @@ from nepflow.config.models import (
     ALL_SOURCES,
     GENERATION_SOURCE_SCOPE_FIELDS,
     SUPPORTED_CONFIGURATIONAL_SOURCES,
+    SUPPORTED_SURFACE_MILLER_INDICES,
     CompositionConfig,
     GenerationConfig,
 )
@@ -652,9 +653,14 @@ def validate_generation_config(config: GenerationConfig) -> GenerationConfig:
     if config.surface_termination_policy not in {"all", "first"}:
         raise ConfigurationError("generation.surface_termination_policy must be 'all' or 'first'")
     for index in config.surface_miller_indices:
-        if len(index) != 3 or not any(index):
+        if len(index) != 3 or any(type(value) is not int for value in index) or not any(index):
             raise ConfigurationError(
                 "generation.surface_miller_indices must contain non-zero triples"
+            )
+        if tuple(index) not in SUPPORTED_SURFACE_MILLER_INDICES:
+            raise ConfigurationError(
+                "generation.surface_miller_indices contains unsupported orientation "
+                f"{tuple(index)}"
             )
     if len(config.surface_in_plane_repeat) != 2 or any(
         value <= 0 for value in config.surface_in_plane_repeat

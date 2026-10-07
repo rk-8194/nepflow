@@ -146,6 +146,8 @@ vacancy_interstitial_sources=all
 n_gas_in_vacancy=10
 gas_in_vacancy_sources=all
 surface_enabled=false
+# Deprecated compatibility field; surface multiplicity comes from the
+# requested Miller orientations and termination settings.
 n_surfaces=0
 surface_sources=all
 

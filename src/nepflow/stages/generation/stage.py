@@ -239,7 +239,10 @@ class GenerationStage:
             n_antisites=config.n_antisites,
             n_vacancy_interstitial=(config.n_vacancy_interstitial if gas else 0),
             n_gas_in_vacancy=(config.n_gas_in_vacancy if gas else 0),
-            n_surfaces=(config.n_surfaces if config.surface_enabled else 0),
+            # Surface multiplicity comes from the configured orientations and
+            # termination policy; the deprecated global count is not forwarded
+            # into the scientific execution plan.
+            n_surfaces=0,
             n_grain_boundaries=(config.n_grain_boundaries if config.grain_boundary_enabled else 0),
             n_workers=config.n_workers,
         )
@@ -533,9 +536,15 @@ class GenerationStage:
             add("antisite", config.n_antisites)
             add("vacancy_interstitial", config.n_vacancy_interstitial, enabled=gas_enabled)
             add("gas_in_vacancy", config.n_gas_in_vacancy, enabled=gas_enabled)
+            surface_termination_slots = (
+                config.surface_max_terminations
+                if config.surface_termination_policy != "first"
+                and config.surface_max_terminations > 0
+                else 1
+            )
             add(
                 "surface",
-                config.n_surfaces,
+                len(config.surface_miller_indices) * surface_termination_slots,
                 enabled=config.surface_enabled,
             )
             add(

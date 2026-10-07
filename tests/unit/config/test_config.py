@@ -40,6 +40,8 @@ def test_loader_builds_immutable_typed_root_and_applies_defaults(tmp_path: Path)
     assert config.composition.elements == ("W", "Cr")
     assert config.composition.gas_elements == ("He",)
     assert config.generation.n_gas_interstitials == 10
+    assert config.generation.surface_enabled is False
+    assert config.generation.n_surfaces == 0
     assert config.hpc.vasp_command == "vasp_std"
     with pytest.raises(AttributeError):
         config.project = config.project
@@ -82,6 +84,47 @@ def test_generation_source_scope_round_trip_preserves_effective_mapping(tmp_path
     assert first.generation.volume_sources == ("mp_phase", "mp_gas_phase")
     assert first.generation.rattle_sources == ("sqs",)
     assert first.effective_mapping() == second.effective_mapping()
+
+
+def test_surface_orientation_semantics_round_trip_without_count_reinterpretation(
+    tmp_path: Path,
+) -> None:
+    text = BASE_CONFIG.replace(
+        "[generation]",
+        (
+            "[generation]\n"
+            "surface_enabled = true\n"
+            "n_surfaces = 1\n"
+            "surface_miller_indices = 1,0,0;1,1,0;1,1,1\n"
+            "surface_termination_policy = first"
+        ),
+        1,
+    )
+
+    config = load_config(write_config(tmp_path, text))
+    legacy = load_legacy_config(write_config(tmp_path, text))
+
+    assert config.generation.surface_enabled is True
+    assert config.generation.n_surfaces == 1
+    assert config.generation.surface_miller_indices == (
+        (1, 0, 0),
+        (1, 1, 0),
+        (1, 1, 1),
+    )
+    assert config.generation.surface_termination_policy == "first"
+    assert legacy.get("generation", "n_surfaces") == "1"
+    assert legacy.get("generation", "surface_miller_indices") == "1,0,0;1,1,0;1,1,1"
+
+
+def test_loader_rejects_unsupported_surface_orientation_even_when_disabled(tmp_path: Path) -> None:
+    text = BASE_CONFIG.replace(
+        "[generation]",
+        "[generation]\nsurface_miller_indices = 1,0,1",
+        1,
+    )
+
+    with pytest.raises(ConfigurationError, match="unsupported orientation"):
+        load_config(write_config(tmp_path, text))
 
 
 def test_config_path_resolution_is_canonical_and_deterministic(tmp_path: Path) -> None:

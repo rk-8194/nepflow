@@ -21,6 +21,13 @@ SUPPORTED_CONFIGURATIONAL_SOURCES = frozenset(
 )
 SourceScope = tuple[str, ...]
 DEFAULT_SOURCE_SCOPE: SourceScope = (ALL_SOURCES,)
+SUPPORTED_SURFACE_MILLER_INDICES = frozenset(
+    {
+        (1, 0, 0),
+        (1, 1, 0),
+        (1, 1, 1),
+    }
+)
 MAGNETIC_DEFECT_FAMILIES = (
     "vacancy",
     "interstitial",
@@ -141,6 +148,8 @@ class GenerationConfig:
     n_gas_in_vacancy: int = 10
     gas_in_vacancy_sources: SourceScope = DEFAULT_SOURCE_SCOPE
     surface_enabled: bool = False
+    # Deprecated compatibility field; surface multiplicity is orientation and
+    # termination driven when the surface feature is enabled.
     n_surfaces: int = 0
     surface_sources: SourceScope = DEFAULT_SOURCE_SCOPE
     surface_miller_indices: tuple[tuple[int, int, int], ...] = ((1, 0, 0),)

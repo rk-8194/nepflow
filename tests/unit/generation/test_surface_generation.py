@@ -132,6 +132,66 @@ def test_surface_source_scope_filters_coordinator() -> None:
     assert all(item.info.get("perturbation_type") != "surface" for item in candidates)
 
 
+def test_disabled_surfaces_do_not_invoke_surface_backend(monkeypatch: pytest.MonkeyPatch) -> None:
+    parent = _base()
+    settings = _settings(
+        surface_enabled=False,
+        surface_miller_indices=((1, 0, 0), (1, 1, 0), (1, 1, 1)),
+        n_volume_points=0,
+        elastic_stress_enabled=False,
+        target_n_atoms=2,
+    )
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("disabled surface generation must not call the backend")
+
+    monkeypatch.setattr(
+        "nepflow.stages.generation.perturbations.coordinator.surfaces",
+        fail_if_called,
+    )
+    candidates = PerturbationCoordinator(settings).generate_candidates(
+        [parent],
+        counts=PerturbationCounts(
+            n_rattled=0,
+            n_vacancies=0,
+            n_interstitials=0,
+            n_surfaces=99,
+        ),
+        n_workers=1,
+    )
+
+    assert all(item.info.get("perturbation_type") != "surface" for item in candidates)
+
+
+def test_requested_orientations_are_not_truncated_by_legacy_surface_count() -> None:
+    parent = _base()
+    requested = ((1, 0, 0), (1, 1, 0), (1, 1, 1))
+    settings = _settings(
+        surface_miller_indices=requested,
+        surface_termination_policy="first",
+        n_volume_points=0,
+        elastic_stress_enabled=False,
+        target_n_atoms=2,
+    )
+    candidates = PerturbationCoordinator(settings).generate_candidates(
+        [parent],
+        counts=PerturbationCounts(
+            n_rattled=0,
+            n_vacancies=0,
+            n_interstitials=0,
+            n_surfaces=1,
+        ),
+        n_workers=1,
+    )
+
+    realized = {
+        tuple(item.info["surface_miller_index"])
+        for item in candidates
+        if item.info.get("perturbation_type") == "surface"
+    }
+    assert realized == set(requested)
+
+
 def test_surface_stoichiometry_change_is_recorded_for_non_parent_composition() -> None:
     parent = Atoms(
         "Fe2Ni2",
@@ -172,6 +232,8 @@ def test_invalid_miller_and_impossible_geometry_fail_explicitly() -> None:
 def test_surface_config_validation_rejects_invalid_miller_and_repeat() -> None:
     with pytest.raises(ConfigurationError, match="miller"):
         validate_generation_config(GenerationConfig(surface_miller_indices=((0, 0, 0),)))
+    with pytest.raises(ConfigurationError, match="unsupported orientation"):
+        validate_generation_config(GenerationConfig(surface_miller_indices=((1, 0, 1),)))
     with pytest.raises(ConfigurationError, match="surface_in_plane"):
         validate_generation_config(GenerationConfig(surface_in_plane_repeat=(0, 1)))
 
