@@ -412,7 +412,9 @@ def _validate_surface_settings(config: GenerationConfig) -> None:
                 "generation.surface_miller_indices must contain at least one index"
             )
     for index in config.surface_miller_indices:
-        if len(index) != 3 or any(type(value) is not int for value in index):
+        if len(index) != 3 or any(
+            not isinstance(value, int) or isinstance(value, bool) for value in index
+        ):
             raise ConfigurationError(
                 "generation.surface_miller_indices must contain integer triples"
             )
