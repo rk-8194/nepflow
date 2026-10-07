@@ -246,11 +246,14 @@ class GenerationStage:
         )
         self._candidate_path = Path(output_path) if output_path is not None else None
         summary = dict(self.coordinator.get_summary())
-        if request.magnetism.enabled:
-            if self.magnetic_generator is None:
-                raise RuntimeError(
-                    "magnetic generation is enabled but no magnetic generator was injected"
-                )
+        coordinator_handles_magnetism = (
+            getattr(self.coordinator, "magnetic_generator", None) is not None
+        )
+        if (
+            request.magnetism.enabled
+            and self.magnetic_generator is not None
+            and not coordinator_handles_magnetism
+        ):
             if self._candidate_path is None:
                 raise RuntimeError("magnetic generation requires a candidate artifact path")
             magnetic_result = self.magnetic_generator.expand_file(self._candidate_path)
@@ -258,6 +261,11 @@ class GenerationStage:
             summary["magnetic"] = magnetic_summary
             summary["magnetic_candidate_count"] = len(magnetic_result.candidates)
             summary["total"] = len(magnetic_result.candidates)
+        elif request.magnetism.enabled and not coordinator_handles_magnetism:
+            if self.magnetic_generator is None:
+                raise RuntimeError(
+                    "magnetic generation is enabled but no magnetic generator was injected"
+                )
         self._persist_generated_records(
             request,
             self.coordinator.get_provenance_records(),

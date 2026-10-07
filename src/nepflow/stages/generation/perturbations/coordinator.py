@@ -36,6 +36,7 @@ from .displacements import rattled
 from .elastic import elastic_stress_set
 from .grain_boundaries import grain_boundaries
 from .liquid import liquid_snapshots
+from .magnetism import MagneticGenerationSummary, MagneticGenerator
 from .models import (
     PerturbationCounts,
     PerturbationRejection,
@@ -384,10 +385,17 @@ def _rejection_slot(operation_id: str, fallback: int) -> int | str:
 class PerturbationCoordinator:
     """Enumerate tasks, execute them, and stream ordered candidate results."""
 
-    def __init__(self, settings: PerturbationSettings | None = None, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        settings: PerturbationSettings | None = None,
+        *,
+        magnetic_generator: MagneticGenerator | None = None,
+        **kwargs: Any,
+    ) -> None:
         if settings is not None and kwargs:
             raise TypeError("pass either typed settings or legacy keyword settings")
         self.settings = settings or PerturbationSettings(**kwargs)
+        self.magnetic_generator = magnetic_generator
         self.rng = np.random.RandomState(self.settings.random_seed)
         self._total = 0
         self._by_type: dict[str, int] = {}
@@ -396,6 +404,7 @@ class PerturbationCoordinator:
         self._provenance_records: tuple[GeneratedStructureRecord, ...] = ()
         self._duplicate_count = 0
         self._output_file: Path | None = None
+        self._magnetic_summary: MagneticGenerationSummary | None = None
 
     def _counts(self, **kwargs: int) -> PerturbationCounts:
         return PerturbationCounts(**kwargs)
@@ -436,11 +445,16 @@ class PerturbationCoordinator:
         self._rejected_attempts = []
         self._provenance_records = ()
         self._duplicate_count = 0
+        self._magnetic_summary = None
         results = self._execute(self._tasks(base_structures, counts), n_workers)
         self._rejected_attempts.extend(
             rejection for result in results for rejection in result.rejected_attempts
         )
         candidates, records = self._deduplicate_results(results)
+        if self.magnetic_generator is not None:
+            magnetic_result = self.magnetic_generator.expand_structures(candidates)
+            candidates = list(magnetic_result.candidates)
+            self._magnetic_summary = magnetic_result.summary
         self._provenance_records = records
         return candidates
 
@@ -474,6 +488,7 @@ class PerturbationCoordinator:
         self._rejected_attempts = []
         self._provenance_records = ()
         self._duplicate_count = 0
+        self._magnetic_summary = None
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         output_file = output_dir / "generated_structures.xyz"
@@ -506,6 +521,9 @@ class PerturbationCoordinator:
                 seen_structure_ids: set[str] = set()
                 seen_operation_ids: set[tuple[str, str]] = set()
                 retained_records: list[GeneratedStructureRecord] = []
+                # Defect magnetic limits are run-global, so magnetic mode must
+                # see the complete deterministic structural parent sequence.
+                structural_candidates: list[Any] = []
                 for result in self._execute(self._tasks(base_structures, counts), n_workers):
                     self._rejected_attempts.extend(result.rejected_attempts)
                     batch = self._deduplicate_result(
@@ -514,7 +532,16 @@ class PerturbationCoordinator:
                         seen_operation_ids=seen_operation_ids,
                         retained_records=retained_records,
                     )
-                    self._flush(batch, output_handle=output_handle)
+                    if self.magnetic_generator is None:
+                        self._flush(batch, output_handle=output_handle)
+                    else:
+                        structural_candidates.extend(batch)
+                if self.magnetic_generator is not None:
+                    magnetic_result = self.magnetic_generator.expand_structures(
+                        structural_candidates
+                    )
+                    self._magnetic_summary = magnetic_result.summary
+                    self._flush(magnetic_result.candidates, output_handle=output_handle)
                 output_handle.flush()
                 os.fsync(output_handle.fileno())
             if temporary_path is None:
@@ -657,7 +684,7 @@ class PerturbationCoordinator:
             rejected_reason_counts[rejection.reason] = (
                 rejected_reason_counts.get(rejection.reason, 0) + 1
             )
-        return {
+        summary = {
             "total": self._total,
             "by_type": dict(self._by_type),
             "by_config": dict(self._by_config),
@@ -665,6 +692,9 @@ class PerturbationCoordinator:
             "rejected_count": len(self._rejected_attempts),
             "rejected_reason_counts": rejected_reason_counts,
         }
+        if self._magnetic_summary is not None:
+            summary["magnetic"] = self._magnetic_summary.to_dict()
+        return summary
 
 
 __all__ = [

@@ -48,11 +48,9 @@ def build_generation_stage(
 
     generators = _build_generators(context)
     coordinator = _build_perturbation_coordinator(context)
-    magnetic_generator = MagneticGenerator(config.magnetism) if config.magnetism.enabled else None
     return GenerationStage(
         generators=generators,
         coordinator=coordinator,
-        magnetic_generator=magnetic_generator,
         state_store=context.state_store,
         debug_runner=run_debug,
         logger=logger,
@@ -152,6 +150,9 @@ def _build_perturbation_coordinator(context: StageContext) -> PerturbationCoordi
     )
 
     return ConcreteCoordinator(
+        magnetic_generator=(
+            MagneticGenerator(config.magnetism) if config.magnetism.enabled else None
+        ),
         rattle_std=generation.rattle_std,
         rattle_std_min=generation.rattle_std_min,
         rattle_std_max=generation.rattle_std_max,
