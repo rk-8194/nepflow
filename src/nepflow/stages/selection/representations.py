@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import time
+from collections.abc import Sequence
 from io import BytesIO
 from pathlib import Path
 from typing import Any
@@ -102,6 +103,32 @@ def structure_identity(structure: object) -> str:
     """Return the canonical identity used to match descriptor structures."""
 
     return _structure_identity(structure)
+
+
+def validate_candidate_representation_identity(
+    candidate_ids: Sequence[str],
+    structure_ids: Sequence[str],
+) -> None:
+    """Reject state-distinct candidates that the current descriptors cannot distinguish.
+
+    NepTrainKit descriptors are structurally grounded in this phase.  A
+    repeated physical structure with multiple candidate IDs therefore cannot
+    be sampled safely until a magnetic-aware representation exists in Phase 7.
+    """
+
+    if len(candidate_ids) != len(structure_ids):
+        raise StateError("Candidate and structure identity counts do not match")
+    if len(set(candidate_ids)) != len(candidate_ids):
+        raise StateError("Selection candidate IDs are not unique")
+    by_structure: dict[str, set[str]] = {}
+    for candidate_id, structure_id in zip(candidate_ids, structure_ids):
+        by_structure.setdefault(str(structure_id), set()).add(str(candidate_id))
+    conflicts = [structure_id for structure_id, values in by_structure.items() if len(values) > 1]
+    if conflicts:
+        raise StateError(
+            "Selection cannot sample multiple candidate IDs sharing a structural-only "
+            f"representation: structure_id={conflicts[0]}"
+        )
 
 
 def _model_identity(model_path: Path, model_filename: str) -> dict[str, str]:
@@ -249,6 +276,8 @@ def load_or_calculate_representations(
     mean_descriptor: bool,
     batch_size: int,
     nep_model_file: str,
+    candidate_ids: Sequence[str] | None = None,
+    candidate_structure_ids: Sequence[str] | None = None,
 ) -> np.ndarray:
     """Load or calculate identity-matched NEP representations.
 
@@ -263,8 +292,13 @@ def load_or_calculate_representations(
 
     descriptor_cache = descriptor_cache_path(project_dir)
     nep_model_path = project_dir / "config" / "nep" / nep_model_file
-    model = _model_identity(nep_model_path, nep_model_file)
     structure_ids = [_structure_identity(structure) for structure in structures]
+    if candidate_ids is not None:
+        validate_candidate_representation_identity(
+            candidate_ids,
+            structure_ids if candidate_structure_ids is None else candidate_structure_ids,
+        )
+    model = _model_identity(nep_model_path, nep_model_file)
     manifest_path = descriptor_manifest_path(project_dir)
 
     descriptors = _load_valid_cached_descriptors(
@@ -351,4 +385,5 @@ __all__ = [
     "descriptor_manifest_path",
     "load_or_calculate_representations",
     "structure_identity",
+    "validate_candidate_representation_identity",
 ]

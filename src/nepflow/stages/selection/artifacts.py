@@ -8,19 +8,19 @@ from pathlib import Path
 
 from ase.io import write as ase_write
 
-from nepflow.domain.identities import calculate_structure_id
+from nepflow.domain.identities import CANDIDATE_IDENTITY_SCHEMA, STRUCTURE_IDENTITY_SCHEMA
 from nepflow.errors import ArtifactError
 from nepflow.io.atomic import atomic_write_bytes, atomic_write_text
 from nepflow.io.hashing import sha256_file
 from nepflow.io.json import read_json_object, write_json
 
+from .persistence import candidate_ids as ordered_candidate_ids
+from .persistence import structure_ids as ordered_structure_ids
+
 logger = logging.getLogger(__name__)
-SELECTION_ARTIFACT_SCHEMA = "nepflow.selection_artifact.v1"
+SELECTION_ARTIFACT_SCHEMA = "nepflow.selection_artifact.v2"
+LEGACY_SELECTION_ARTIFACT_SCHEMA = "nepflow.selection_artifact.v1"
 SELECTION_MANIFEST_FILENAME = "selection_manifest.json"
-
-
-def _structure_id(structure: object) -> str:
-    return calculate_structure_id(structure)
 
 
 def write_selected_structures(
@@ -28,10 +28,31 @@ def write_selected_structures(
     ase_structures: list,
     train_indices: list[int],
     test_indices: list[int],
+    candidate_ids: list[str] | None = None,
+    structure_ids: list[str] | None = None,
 ) -> tuple[Path, Path]:
     """Write selected train/test structures using the established paths."""
 
     project_dir = Path(project_dir)
+    all_candidate_ids = (
+        ordered_candidate_ids(ase_structures) if candidate_ids is None else list(candidate_ids)
+    )
+    all_structure_ids = (
+        ordered_structure_ids(ase_structures) if structure_ids is None else list(structure_ids)
+    )
+    if len(all_candidate_ids) != len(ase_structures) or len(all_structure_ids) != len(
+        ase_structures
+    ):
+        raise ArtifactError("Selection artifact identity counts do not match structures")
+    if len(set(all_candidate_ids)) != len(all_candidate_ids):
+        raise ArtifactError("Selection artifact candidate IDs are not unique")
+    if all(
+        candidate_id == structure_id
+        for candidate_id, structure_id in zip(all_candidate_ids, all_structure_ids)
+    ):
+        artifact_schema = LEGACY_SELECTION_ARTIFACT_SCHEMA
+    else:
+        artifact_schema = SELECTION_ARTIFACT_SCHEMA
     selected_dir = project_dir / "structures" / "selected"
     selected_dir.mkdir(parents=True, exist_ok=True)
 
@@ -43,6 +64,19 @@ def write_selected_structures(
         ase_write(rendered, structures, format="extxyz")
         atomic_write_text(path, rendered.getvalue(), encoding="utf-8")
 
+    def selected_structures(indices: list[int]) -> list:
+        result = []
+        for index in indices:
+            if index < 0 or index >= len(ase_structures):
+                raise ArtifactError(f"Selection artifact index is out of range: {index}")
+            structure = ase_structures[index].copy()
+            structure.info["structure_id"] = all_structure_ids[index]
+            structure.info["structure_id_version"] = STRUCTURE_IDENTITY_SCHEMA
+            structure.info["candidate_id"] = all_candidate_ids[index]
+            structure.info["candidate_id_version"] = CANDIDATE_IDENTITY_SCHEMA
+            result.append(structure)
+        return result
+
     train_path = selected_dir / "train.xyz"
     test_path = selected_dir / "test.xyz"
     manifest_path = selected_dir / SELECTION_MANIFEST_FILENAME
@@ -51,22 +85,21 @@ def write_selected_structures(
         for path in (train_path, test_path, manifest_path)
     }
     try:
-        write_extxyz(train_path, [ase_structures[index] for index in train_indices])
+        write_extxyz(train_path, selected_structures(train_indices))
         logger.info("  Training set saved to %s", train_path)
 
-        write_extxyz(test_path, [ase_structures[index] for index in test_indices])
+        write_extxyz(test_path, selected_structures(test_indices))
         logger.info("  Test set saved to %s", test_path)
 
         write_json(
             manifest_path,
             {
-                "schema_version": SELECTION_ARTIFACT_SCHEMA,
-                "train_structure_ids": [
-                    _structure_id(ase_structures[index]) for index in train_indices
-                ],
-                "test_structure_ids": [
-                    _structure_id(ase_structures[index]) for index in test_indices
-                ],
+                "schema_version": artifact_schema,
+                "candidate_identity_schema": CANDIDATE_IDENTITY_SCHEMA,
+                "train_candidate_ids": [all_candidate_ids[index] for index in train_indices],
+                "test_candidate_ids": [all_candidate_ids[index] for index in test_indices],
+                "train_structure_ids": [all_structure_ids[index] for index in train_indices],
+                "test_structure_ids": [all_structure_ids[index] for index in test_indices],
                 "artifacts": {
                     "train.xyz": {
                         "path": "train.xyz",
@@ -95,10 +128,16 @@ def read_selection_manifest(project_dir: Path) -> dict:
     selected_dir = Path(project_dir) / "structures" / "selected"
     path = selected_dir / SELECTION_MANIFEST_FILENAME
     manifest = read_json_object(path, error_type=ArtifactError)
-    if manifest.get("schema_version") != SELECTION_ARTIFACT_SCHEMA:
+    if manifest.get("schema_version") not in {
+        SELECTION_ARTIFACT_SCHEMA,
+        LEGACY_SELECTION_ARTIFACT_SCHEMA,
+    }:
         raise ArtifactError(
             f"Unsupported selection artifact schema: {manifest.get('schema_version')!r}"
         )
+    identity_schema = manifest.get("candidate_identity_schema")
+    if identity_schema is not None and identity_schema != CANDIDATE_IDENTITY_SCHEMA:
+        raise ArtifactError(f"Unsupported candidate identity schema: {identity_schema!r}")
     artifacts = manifest.get("artifacts")
     if not isinstance(artifacts, dict):
         raise ArtifactError(f"Selection artifact manifest is malformed: {path}")
@@ -106,6 +145,22 @@ def read_selection_manifest(project_dir: Path) -> dict:
         values = manifest.get(key)
         if not isinstance(values, list) or not all(isinstance(value, str) for value in values):
             raise ArtifactError(f"Selection artifact manifest is malformed: {path}")
+    for key in ("train_candidate_ids", "test_candidate_ids"):
+        values = manifest.get(key)
+        if values is None and manifest.get("schema_version") == LEGACY_SELECTION_ARTIFACT_SCHEMA:
+            continue
+        if not isinstance(values, list) or not all(isinstance(value, str) for value in values):
+            raise ArtifactError(f"Selection artifact manifest is malformed: {path}")
+    train_candidate_ids = manifest.get("train_candidate_ids")
+    test_candidate_ids = manifest.get("test_candidate_ids")
+    if train_candidate_ids is None:
+        train_candidate_ids = manifest["train_structure_ids"]
+        manifest["train_candidate_ids"] = list(train_candidate_ids)
+    if test_candidate_ids is None:
+        test_candidate_ids = manifest["test_structure_ids"]
+        manifest["test_candidate_ids"] = list(test_candidate_ids)
+    if set(train_candidate_ids) & set(test_candidate_ids):
+        raise ArtifactError(f"Selection artifact train/test candidate IDs overlap: {path}")
     for filename in ("train.xyz", "test.xyz"):
         record = artifacts.get(filename)
         artifact_path = selected_dir / filename
@@ -121,6 +176,7 @@ def read_selection_manifest(project_dir: Path) -> dict:
 
 __all__ = [
     "SELECTION_ARTIFACT_SCHEMA",
+    "LEGACY_SELECTION_ARTIFACT_SCHEMA",
     "SELECTION_MANIFEST_FILENAME",
     "read_selection_manifest",
     "write_selected_structures",

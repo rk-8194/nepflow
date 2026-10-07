@@ -18,15 +18,20 @@ from nepflow.workflow.controller import StageContext
 from .artifacts import write_selected_structures
 from .debug import run_debug_selection
 from .models import SelectionResult
+from .persistence import candidate_ids as ordered_candidate_ids
 from .persistence import (
+    legacy_selection_run_id,
     persist_selection_result,
     restore_selection_result,
     selection_policy,
     selection_run_id,
-    structure_ids,
 )
+from .persistence import structure_ids as ordered_structure_ids
 from .reports import plot_descriptor_space
-from .representations import load_or_calculate_representations
+from .representations import (
+    load_or_calculate_representations,
+    validate_candidate_representation_identity,
+)
 from .sampling import calculate_composition_coverage_metrics, composition_projection_bins
 from .strategy import (
     find_elastic_stress_indices,
@@ -95,7 +100,8 @@ class SelectionStage:
         else:
             result = self.execute(settings, prepared, context=active)
 
-        candidate_ids = structure_ids(prepared["ase_structures"])
+        candidate_identity_ids = ordered_candidate_ids(prepared["ase_structures"])
+        physical_structure_ids = ordered_structure_ids(prepared["ase_structures"])
         coverage_metrics = {}
         if settings.composition_aware_fps:
             candidate_bins = {
@@ -112,8 +118,9 @@ class SelectionStage:
             active.project_name,
             str(active.project_dir),
             settings,
-            candidate_ids,
+            candidate_identity_ids,
             result,
+            candidate_structure_ids=physical_structure_ids,
             coverage_metrics=coverage_metrics,
             started_at=started_at,
         )
@@ -173,21 +180,36 @@ class SelectionStage:
             if active is not None
             else Path(prepared["generated_path"]).parents[2]
         )
+        candidate_identity_ids = ordered_candidate_ids(prepared["ase_structures"])
+        physical_structure_ids = ordered_structure_ids(prepared["ase_structures"])
+        validate_candidate_representation_identity(
+            candidate_identity_ids,
+            physical_structure_ids,
+        )
         representations = load_or_calculate_representations(
             project_dir,
             prepared["structures"],
             mean_descriptor=settings.descriptor_type == "structure",
             batch_size=settings.batch_size,
             nep_model_file=settings.nep_model_file,
+            candidate_ids=candidate_identity_ids,
+            candidate_structure_ids=physical_structure_ids,
         )
         logger.info("  Descriptor shape: %s", representations.shape)
         logger.info("  Descriptor type: %s", settings.descriptor_type)
 
-        candidate_ids = structure_ids(prepared["ase_structures"])
         if active is not None and active.state_store is not None:
             existing = active.state_store.get_selection_run(
-                selection_run_id(active.project_name, candidate_ids, settings)
+                selection_run_id(active.project_name, candidate_identity_ids, settings)
             )
+            if existing is None:
+                existing = active.state_store.get_selection_run(
+                    legacy_selection_run_id(
+                        active.project_name,
+                        candidate_identity_ids,
+                        settings,
+                    )
+                )
             if existing is not None:
                 if existing.get("status") != "completed":
                     raise StateError(
@@ -199,11 +221,12 @@ class SelectionStage:
                     "policy"
                 ) != selection_policy(settings):
                     raise StateError("Persisted selection policy does not match current input")
-                logger.info("  Reconciled completed selection by structure identity")
+                logger.info("  Reconciled completed selection by candidate identity")
                 return restore_selection_result(
                     existing,
                     representations,
-                    candidate_ids,
+                    candidate_identity_ids,
+                    candidate_structure_ids=physical_structure_ids,
                 )
 
         seed_indices: list[int] = []
@@ -287,6 +310,8 @@ class SelectionStage:
             prepared["ase_structures"],
             result.train_indices,
             result.test_indices,
+            candidate_ids=ordered_candidate_ids(prepared["ase_structures"]),
+            structure_ids=ordered_structure_ids(prepared["ase_structures"]),
         )
 
         total = len(prepared["structures"])
