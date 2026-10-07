@@ -96,7 +96,7 @@ class MagneticGenerator:
                     ordering=MagneticOrdering.NONMAGNETIC,
                     moment_set_name=None,
                     moments=np.zeros((len(atoms), 3), dtype=float),
-                    constraint_mask=np.zeros(len(atoms), dtype=bool),
+                    constraint_mask=np.zeros(len(atoms), dtype=bool).tolist(),
                     propagation_vector=None,
                     orbit_phases=None,
                     topology=topology,
@@ -123,14 +123,18 @@ class MagneticGenerator:
                         )
                     )
                     continue
-                moments = self._moments_for_signs(atoms, moment_set, np.where(mask, 1, 0))
+                moments = self._moments_for_signs(
+                    atoms,
+                    moment_set,
+                    np.where(mask, 1, 0).tolist(),
+                )
                 candidates.append(
                     self._materialize_state(
                         atoms,
                         ordering=MagneticOrdering.FERROMAGNETIC,
                         moment_set_name=moment_set.name,
                         moments=moments,
-                        constraint_mask=mask,
+                        constraint_mask=mask.tolist(),
                         propagation_vector=None,
                         orbit_phases=None,
                         topology=topology,
@@ -180,7 +184,7 @@ class MagneticGenerator:
                 for q in half_grid_propagation_vectors():
                     if not is_commensurate(
                         q,
-                        topology.transformation,
+                        topology.transformation.tolist(),
                         tolerance=self.config.phase_tolerance,
                     ):
                         diagnostics.append(
@@ -199,7 +203,7 @@ class MagneticGenerator:
                             topology,
                             q,
                             phases,
-                            magnetic_mask=mapped_mask,
+                            magnetic_mask=mapped_mask.tolist(),
                             phase_tolerance=self.config.phase_tolerance,
                         )
                         if signs is None:
@@ -226,7 +230,7 @@ class MagneticGenerator:
                                 ordering=MagneticOrdering.ANTIFERROMAGNETIC,
                                 moment_set_name=moment_set.name,
                                 moments=moments,
-                                constraint_mask=mask,
+                                constraint_mask=mask.tolist(),
                                 propagation_vector=q,
                                 orbit_phases=phases,
                                 topology=topology,
