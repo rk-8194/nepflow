@@ -180,10 +180,11 @@ class ConfigurationalGeneratorTests(unittest.TestCase):
         )
 
     def test_sqs_success_preserves_sqs_provenance(self) -> None:
+        backend = SQSBackendBoundary()
         results = SQSGenerator(
             n_structures=1,
             random_seed=7,
-            backend=SQSBackendBoundary(),
+            backend=backend,
         ).generate(self.composition, ["bcc"], target_n_atoms=8)
 
         self.assertEqual(len(results), 1)
