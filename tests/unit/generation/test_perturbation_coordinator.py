@@ -103,6 +103,7 @@ class PerturbationExecutionHarness:
 
     def __init__(self) -> None:
         self.worker_counts: list[int] = []
+        self.start_methods: list[str | None] = []
         self.submitted_task_ids: list[str] = []
         self.resolved_task_ids: list[str] = []
         self.in_flight_count = 0
@@ -111,8 +112,9 @@ class PerturbationExecutionHarness:
         self.cancelled_task_ids: list[str] = []
         self.shutdown_calls: list[tuple[bool, bool]] = []
 
-    def executor_factory(self, *, max_workers: int):
+    def executor_factory(self, *, max_workers: int, mp_context=None):
         self.worker_counts.append(max_workers)
+        self.start_methods.append(None if mp_context is None else mp_context.get_start_method())
         return self
 
     def __enter__(self):
@@ -157,6 +159,27 @@ class _GlobalDefectLimitMagneticHarness:
                 seen_defect_parents += 1
             expanded.append(materialized)
         return MagneticGenerationResult(tuple(expanded), MagneticGenerationSummary())
+
+
+def test_process_pool_uses_documented_safe_context(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, object] = {}
+
+    def capture_pool(*, max_workers: int, mp_context) -> object:
+        captured["max_workers"] = max_workers
+        captured["mp_context"] = mp_context
+        return object()
+
+    monkeypatch.setattr(coordinator_module, "ProcessPoolExecutor", capture_pool)
+    context = coordinator_module._safe_multiprocessing_context()
+
+    coordinator_module._create_process_pool(max_workers=2, context=context)
+
+    assert captured == {
+        "max_workers": 2,
+        "mp_context": context,
+    }
+    assert context.get_start_method() == coordinator_module._safe_multiprocessing_start_method()
+    assert context.get_start_method() != "fork"
 
 
 def test_child_seed_derivation_is_stable_and_namespaced() -> None:
@@ -458,6 +481,36 @@ def test_serial_and_parallel_candidates_are_ordered_and_scientifically_equal() -
     assert len(result.provenance_records) == len(result.candidates)
 
 
+def test_real_safe_process_pool_runs_mp_phase_families_after_parent_preparation() -> None:
+    """Native-library preparation in the parent must not poison workers."""
+
+    base = scoped_base("mp_phase")
+    settings = PerturbationSettings(
+        target_n_atoms=4,
+        random_seed=21,
+        n_volume_points=2,
+        volume_sources=("mp_phase",),
+        elastic_stress_enabled=True,
+        elastic_strain_amplitudes=(0.01,),
+        elastic_sources=("mp_phase",),
+    )
+    counts = PerturbationCounts(n_rattled=0, n_vacancies=0, n_interstitials=0)
+    coordinator = PerturbationCoordinator(settings=settings)
+
+    tasks = list(coordinator._tasks([base], counts))
+    results = list(coordinator._execute(tasks, n_workers=2))
+
+    assert results[0].task.family == "unperturbed"
+    assert results[0].candidates[0].info["perturbation_type"] == "unperturbed"
+    assert results[0].provenance_records[0].provenance.perturbation_family == "unperturbed"
+    assert [result.task.family for result in results] == [
+        "unperturbed",
+        "volume_profile",
+        "elastic_stress",
+        "elastic_stress",
+    ]
+
+
 def test_serial_and_parallel_publication_lock_scopes_seeds_and_extxyz_bytes(tmp_path) -> None:
     """The bounded-streaming work must preserve this complete scientific baseline."""
 
@@ -599,7 +652,12 @@ def test_parallel_collector_tracks_completed_later_tasks_before_slow_head(
         return original_execute(task)
 
     monkeypatch.setattr(coordinator_module, "execute_perturbation_task", controlled_worker)
-    monkeypatch.setattr(coordinator_module, "ProcessPoolExecutor", ThreadPoolExecutor)
+
+    def thread_executor_factory(*, max_workers: int, mp_context):
+        del mp_context
+        return ThreadPoolExecutor(max_workers=max_workers)
+
+    monkeypatch.setattr(coordinator_module, "ProcessPoolExecutor", thread_executor_factory)
 
     with caplog.at_level(logging.INFO, logger=coordinator_module.__name__):
         results = list(coordinator._execute(tasks, n_workers=2))

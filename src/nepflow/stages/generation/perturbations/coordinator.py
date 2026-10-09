@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import math
+import multiprocessing as mp
 import os
 import tempfile
 from collections import deque
@@ -12,7 +13,6 @@ from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import dataclass, replace
 from io import StringIO
-from multiprocessing import Manager
 from pathlib import Path
 from queue import Empty as QueueEmpty
 from queue import Full as QueueFull
@@ -65,6 +65,8 @@ from .volume import volume_profile
 logger = logging.getLogger(__name__)
 _AUTO_WORKER_CAP = 8
 _HEARTBEAT_INTERVAL_SECONDS = 30.0
+_SAFE_POSIX_START_METHOD = "forkserver"
+_SAFE_WINDOWS_START_METHOD = "spawn"
 _FAMILY_ORDER = (
     "unperturbed",
     "volume_profile",
@@ -81,6 +83,41 @@ _FAMILY_ORDER = (
     "surface",
     "grain_boundary",
 )
+
+
+def _safe_multiprocessing_start_method() -> str:
+    """Return the explicit native-library-safe worker start policy.
+
+    POSIX workers use ``forkserver`` so they are not forked from the parent
+    after NumPy, Pymatgen, Spglib, or another threaded native library has
+    initialized.  Windows has no forkserver context, so it uses its explicit
+    safe equivalent, ``spawn``.  These are platform choices, not a fallback
+    chain: an unavailable selected context is reported to the caller.
+    """
+
+    return _SAFE_WINDOWS_START_METHOD if os.name == "nt" else _SAFE_POSIX_START_METHOD
+
+
+def _safe_multiprocessing_context() -> Any:
+    """Return the configured worker context or fail without falling back."""
+
+    start_method = _safe_multiprocessing_start_method()
+    try:
+        return mp.get_context(start_method)
+    except (ValueError, RuntimeError) as exc:
+        raise RuntimeError(
+            "NEPFlow perturbation workers require the explicit "
+            f"multiprocessing start method {start_method!r}, which is unavailable "
+            "on this platform"
+        ) from exc
+
+
+def _create_process_pool(*, max_workers: int, context: Any) -> Any:
+    """Construct the perturbation pool with an explicit safe context."""
+
+    return ProcessPoolExecutor(max_workers=max_workers, mp_context=context)
+
+
 # Publication order is intentionally base-major, then this family order, then
 # ascending half-open slot windows. It is part of the extxyz/provenance contract.
 _PERTURBATION_FAMILIES = frozenset(_FAMILY_ORDER)
@@ -1464,18 +1501,20 @@ class PerturbationCoordinator:
         ready_tasks: dict[int, tuple[PerturbationTask, float]] = {}
         exhausted = False
         submitted_count = 0
-        manager: Any | None = None
+        manager: Any = None
         progress_queue: Any
 
-        # Manager queues are pickleable under both fork and spawn. The queue
-        # itself is bounded and worker writes are nonblocking, so a chatty or
-        # disconnected worker cannot deadlock the process pool.
-        manager = Manager()
-        progress_queue = manager.Queue(maxsize=max(32, submission_window * 4))
+        # Use the same explicit safe context for the manager and worker pool.
+        # The queue itself is bounded and worker writes are nonblocking, so a
+        # chatty or disconnected worker cannot deadlock the process pool.
+        context = _safe_multiprocessing_context()
         try:
-            pool = ProcessPoolExecutor(max_workers=n_workers)
+            manager = context.Manager()
+            progress_queue = manager.Queue(maxsize=max(32, submission_window * 4))
+            pool = _create_process_pool(max_workers=n_workers, context=context)
         except BaseException:
-            manager.shutdown()
+            if manager is not None:
+                manager.shutdown()
             raise
 
         def fill_submission_window() -> None:
