@@ -305,7 +305,7 @@ class _ProgressTracker:
         )
         elapsed = monotonic() - self.started_at
         total_label = "?" if self.total is None else str(self.total)
-        logger.info(
+        logger.debug(
             "Perturbations progress (%s): %s/%s tasks finished (%.1f%%); %s active; "
             "submitted=%s; %s in flight; %s published; %s finished awaiting order; "
             "failed=%s; elapsed=%.1fs",
@@ -321,7 +321,7 @@ class _ProgressTracker:
             self.failed,
             elapsed,
         )
-        logger.info(
+        logger.debug(
             "Candidates progress: produced=%s validated=%s accepted=%s rejected=%s "
             "duplicates=%s written=%s",
             self.produced,
@@ -344,7 +344,7 @@ class _ProgressTracker:
                 if current.last_event_at is None
                 else f"{monotonic() - current.last_event_at:.1f}s ago"
             )
-            logger.info(
+            logger.debug(
                 "Active perturbation: task=%s %s phase=%s progress=%s elapsed=%.1fs "
                 "last_progress=%s",
                 current.index,
@@ -355,7 +355,7 @@ class _ProgressTracker:
                 last_update,
             )
         if head is not None and head.status != "completed":
-            logger.info(
+            logger.debug(
                 "Ordered publication blocked by task=%s (%s); %s later task(s) finished; "
                 "elapsed=%.1fs",
                 head.index,
@@ -805,7 +805,15 @@ def _generate_family_batch(task: PerturbationTask, supercell: Any, annotate: Any
     if family == "vacancy":
         assert size is not None
         return vacancies(
-            supercell, base, size, settings, None, annotate, seed=task.seed, slot_start=start
+            supercell,
+            base,
+            size,
+            settings,
+            None,
+            annotate,
+            seed=task.seed,
+            slot_start=start,
+            slot_stop=stop,
         )
     if family == "interstitial":
         assert size is not None
@@ -1318,14 +1326,11 @@ class PerturbationCoordinator:
                 # Defect magnetic limits are run-global, so magnetic mode must
                 # see the complete deterministic structural parent sequence.
                 structural_candidates: list[Any] = []
-                for task_index, result in enumerate(
-                    self._execute(
-                        self._tasks(base_structures, counts),
-                        n_workers,
-                        total_tasks=batch_task_count,
-                        progress_tracker=progress_tracker,
-                    ),
-                    start=1,
+                for result in self._execute(
+                    self._tasks(base_structures, counts),
+                    n_workers,
+                    total_tasks=batch_task_count,
+                    progress_tracker=progress_tracker,
                 ):
                     self._rejected_attempts.extend(result.rejected_attempts)
                     duplicates_before = self._duplicate_count
@@ -1340,27 +1345,17 @@ class PerturbationCoordinator:
                     else:
                         structural_candidates.extend(batch)
                     duplicates = self._duplicate_count - duplicates_before
-                    written = len(batch) if self.magnetic_generator is None else 0
                     progress_tracker.published_result(
                         result.task,
-                        written=written,
+                        written=len(batch),
                         duplicates=duplicates,
                     )
-                    elapsed = self._task_elapsed_seconds.pop(result.task.progress_key, 0.0)
-                    source = result.task.base.info.get("configurational_type", "unknown")
                     logger.info(
-                        "Perturbation task %s/%s complete: source=%s base=%s accepted=%s "
-                        "published=%s duplicates=%s rejected=%s elapsed=%.1fs workers=%s",
-                        task_index,
+                        "Perturbation %s/%s complete: %s; total structures=%s",
+                        progress_tracker.published,
                         batch_task_count,
-                        source,
-                        result.task.base_structure_id,
-                        len(result.candidates),
-                        written,
-                        duplicates,
-                        len(result.rejected_attempts),
-                        elapsed,
-                        n_workers,
+                        result.task.family or "all",
+                        progress_tracker.written,
                     )
                     progress_tracker.snapshot(reason="publication")
                 if self.magnetic_generator is not None:
@@ -1585,7 +1580,7 @@ class PerturbationCoordinator:
                         head = tracker.states.get(task.progress_key)
                         source = task.base.info.get("configurational_type", "unknown")
                         stop = "?" if task.slot_stop is None else str(task.slot_stop)
-                        logger.info(
+                        logger.debug(
                             "Waiting for ordered task %s (source=%s base=%s family=%s "
                             "slots=%s:%s) after %.1fs; %s task(s) remain in the bounded window",
                             task_index,

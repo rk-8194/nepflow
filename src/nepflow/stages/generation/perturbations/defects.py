@@ -81,10 +81,22 @@ def vacancies(
     *,
     seed: int | None = None,
     slot_start: int = 0,
+    slot_stop: int | None = None,
 ) -> list[Any]:
     """Generate species-restricted vacancy structures with deterministic slots."""
 
     del rng
+    if slot_start < 0:
+        raise ValueError("vacancy slot_start must be non-negative")
+    if slot_stop is not None:
+        if slot_stop < slot_start:
+            raise ValueError("vacancy slot window is invalid")
+        expected_count = slot_stop - slot_start
+        if n != expected_count:
+            raise ValueError(
+                "vacancy count does not match the requested slot window: "
+                f"n={n}, slots={slot_start}:{slot_stop}"
+            )
     base_structure_id = calculate_structure_id(base)
     root_seed = settings.random_seed if seed is None else int(seed)
     symbols = np.asarray(supercell.get_chemical_symbols())

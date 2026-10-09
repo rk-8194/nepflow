@@ -9,6 +9,9 @@ pytest.importorskip("ase")
 from ase import Atoms
 from ase.io import read, write
 
+from nepflow.domain.identities import calculate_structure_id
+from nepflow.stages.generation.generators.segregated import SegregatedGenerator
+from nepflow.stages.generation.perturbations.coordinator import PerturbationCoordinator
 from nepflow.stages.generation.perturbations.defects import (
     antisites,
     find_interstitial_site,
@@ -16,7 +19,7 @@ from nepflow.stages.generation.perturbations.defects import (
     substitutions,
     vacancies,
 )
-from nepflow.stages.generation.perturbations.models import PerturbationSettings
+from nepflow.stages.generation.perturbations.models import PerturbationSettings, derive_child_seed
 from nepflow.stages.generation.perturbations.provenance import (
     annotate_generation_provenance,
 )
@@ -42,6 +45,56 @@ def _base() -> Atoms:
 
 def _annotate(candidate, base, family, **kwargs):
     return annotate_generation_provenance(candidate, base, family, **kwargs)
+
+
+def _prepared_segregated_base() -> tuple[Atoms, Atoms, PerturbationSettings]:
+    base = SegregatedGenerator(n_structures=1, random_seed=42).generate(
+        {"Si": 0.5, "Ge": 0.5}, ["bcc"], target_n_atoms=128
+    )[0]
+    settings = PerturbationSettings(
+        target_n_atoms=128,
+        random_seed=1572714583,
+        vacancy_range=(0.01, 0.01),
+    )
+    prepared = PerturbationCoordinator(settings=settings)._prepare_base_supercell(base, settings)
+    return base, prepared, settings
+
+
+def _assert_same_structure_and_provenance(left: Atoms, right: Atoms) -> None:
+    assert calculate_structure_id(left) == calculate_structure_id(right)
+    np.testing.assert_array_equal(left.numbers, right.numbers)
+    np.testing.assert_allclose(left.positions, right.positions)
+    np.testing.assert_allclose(left.cell.array, right.cell.array)
+    assert left.info == right.info
+
+
+def test_segregated_vacancy_slot_windows_are_continuous_and_deterministic() -> None:
+    base, prepared, settings = _prepared_segregated_base()
+    seed = 1572714583
+
+    full = vacancies(prepared, base, 10, settings, None, _annotate, seed=seed, slot_start=0)
+    first = vacancies(prepared, base, 8, settings, None, _annotate, seed=seed, slot_start=0)
+    second = vacancies(
+        prepared,
+        base,
+        2,
+        settings,
+        None,
+        _annotate,
+        seed=seed,
+        slot_start=8,
+        slot_stop=10,
+    )
+
+    for expected, actual in zip(full, first + second):
+        _assert_same_structure_and_provenance(expected, actual)
+    assert [item.info["random_seed"] for item in second] == [
+        derive_child_seed(calculate_structure_id(base), seed, "vacancy", slot) for slot in (8, 9)
+    ]
+    assert [item.info["generation_provenance"]["operation_id"] for item in second] == [
+        "vacancy:8",
+        "vacancy:9",
+    ]
 
 
 def test_species_restricted_vacancy_and_impossible_species_failure() -> None:

@@ -16,6 +16,7 @@ from ase.io import read
 
 import nepflow.stages.generation.perturbations.coordinator as coordinator_module
 from nepflow.domain.identities import calculate_structure_id
+from nepflow.stages.generation.generators.segregated import SegregatedGenerator
 from nepflow.stages.generation.perturbations.coordinator import (
     PerturbationCoordinator,
     PerturbationTaskError,
@@ -45,6 +46,34 @@ from nepflow.stages.generation.perturbations.provenance import (
     annotate_generation_provenance,
 )
 from nepflow.stages.generation.validation import validate_generated_candidate
+
+
+@pytest.fixture(autouse=True)
+def fast_coordinator_generation_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
+) -> None:
+    """Keep orchestration tests out of the real symmetry/topology boundary."""
+
+    if request.node.get_closest_marker("real_generation_boundary") is not None:
+        return
+
+    def prepare(base, settings):
+        del settings
+        return base.copy()
+
+    monkeypatch.setattr(
+        PerturbationCoordinator,
+        "_prepare_base_supercell",
+        staticmethod(prepare),
+    )
+    monkeypatch.setattr(coordinator_module, "require_parent_topology", lambda _atoms: None)
+
+    def thread_executor_factory(*, max_workers: int, mp_context):
+        del mp_context
+        return ThreadPoolExecutor(max_workers=max_workers)
+
+    monkeypatch.setattr(coordinator_module, "ProcessPoolExecutor", thread_executor_factory)
 
 
 def base_atoms(*, source: str = "coordinator-fixture", seed_id: str = "seed_000001") -> Atoms:
@@ -418,25 +447,66 @@ def test_parent_supercell_is_prepared_once_for_all_family_batches(
     )
     counts = PerturbationCounts(n_rattled=9, n_vacancies=9, n_interstitials=0)
     coordinator = PerturbationCoordinator(settings=settings)
-    original_build = coordinator_module.build_target_supercell
-    build_calls = 0
+    prepare_calls = 0
 
-    def record_build(*args, **kwargs):
-        nonlocal build_calls
-        build_calls += 1
-        return original_build(*args, **kwargs)
+    def record_prepare(parent, task_settings):
+        nonlocal prepare_calls
+        del task_settings
+        prepare_calls += 1
+        return parent.copy()
 
-    monkeypatch.setattr(coordinator_module, "build_target_supercell", record_build)
+    monkeypatch.setattr(coordinator, "_prepare_base_supercell", record_prepare)
     tasks = list(coordinator._tasks([base], counts))
 
     assert len(tasks) > 2
-    assert build_calls == 1
+    assert prepare_calls == 1
     assert all(task.prepared_supercell is tasks[0].prepared_supercell for task in tasks)
 
     results = list(coordinator._execute(tasks, n_workers=n_workers))
     assert [result.task.task_key for result in results] == [task.task_key for task in tasks]
     assert results[0].candidates[0].info["perturbation_type"] == "unperturbed"
     assert results[0].provenance_records[0].provenance.perturbation_family == "unperturbed"
+
+
+@pytest.mark.real_generation_boundary
+def test_segregated_vacancy_batches_complete_and_match_serial_parallel() -> None:
+    """Non-zero vacancy windows retain their scientific slot contract."""
+
+    base = SegregatedGenerator(n_structures=1, random_seed=42).generate(
+        {"Si": 0.5, "Ge": 0.5}, ["bcc"], target_n_atoms=128
+    )[0]
+    settings = PerturbationSettings(
+        target_n_atoms=128,
+        random_seed=1572714583,
+        vacancy_range=(0.01, 0.01),
+        n_volume_points=0,
+        elastic_stress_enabled=False,
+    )
+    counts = PerturbationCounts(n_rattled=0, n_vacancies=10, n_interstitials=0)
+    coordinator = PerturbationCoordinator(settings=settings)
+    tasks = [task for task in coordinator._tasks([base], counts) if task.family == "vacancy"]
+
+    assert [(task.slot_start, task.slot_stop) for task in tasks] == [(0, 8), (8, 10)]
+    results = [execute_perturbation_task(task) for task in tasks]
+    assert [len(result.candidates) for result in results] == [8, 2]
+    assert [
+        candidate.info["generation_provenance"]["operation_id"]
+        for result in results
+        for candidate in result.candidates
+    ] == [f"{tasks[0].base_structure_id}:vacancy:{slot}" for slot in range(10)]
+
+    serial = PerturbationCoordinator(settings=settings).generate_candidates(
+        [base], counts=counts, n_workers=1
+    )
+    parallel = PerturbationCoordinator(settings=settings).generate_candidates(
+        [base], counts=counts, n_workers=2
+    )
+    assert len(serial) == len(parallel) == 11
+    for left, right in zip(serial, parallel):
+        np.testing.assert_array_equal(left.numbers, right.numbers)
+        np.testing.assert_allclose(left.positions, right.positions)
+        np.testing.assert_allclose(left.cell.array, right.cell.array)
+        assert left.info == right.info
 
 
 def test_serial_and_parallel_candidates_are_ordered_and_scientifically_equal() -> None:
@@ -481,6 +551,7 @@ def test_serial_and_parallel_candidates_are_ordered_and_scientifically_equal() -
     assert len(result.provenance_records) == len(result.candidates)
 
 
+@pytest.mark.real_generation_boundary
 def test_real_safe_process_pool_runs_mp_phase_families_after_parent_preparation() -> None:
     """Native-library preparation in the parent must not poison workers."""
 
@@ -659,13 +730,16 @@ def test_parallel_collector_tracks_completed_later_tasks_before_slow_head(
 
     monkeypatch.setattr(coordinator_module, "ProcessPoolExecutor", thread_executor_factory)
 
-    with caplog.at_level(logging.INFO, logger=coordinator_module.__name__):
+    with caplog.at_level(logging.DEBUG, logger=coordinator_module.__name__):
         results = list(coordinator._execute(tasks, n_workers=2))
 
     assert [result.task.base_structure_id for result in results] == [
         task.base_structure_id for task in tasks
     ]
-    assert any("finished awaiting order" in record.getMessage() for record in caplog.records)
+    assert any(
+        record.levelno == logging.DEBUG and "finished awaiting order" in record.getMessage()
+        for record in caplog.records
+    )
 
 
 @pytest.mark.parametrize("n_workers", (1, 2))
@@ -762,7 +836,7 @@ def test_auto_workers_respect_cpu_allocation_cap_and_runnable_tasks(
     assert PerturbationCoordinator._effective_worker_count(12, 2) == 2
 
 
-def test_process_logs_start_and_published_task_progress(
+def test_process_logs_one_concise_line_per_published_task(
     tmp_path, caplog: pytest.LogCaptureFixture
 ) -> None:
     coordinator = PerturbationCoordinator(
@@ -773,9 +847,15 @@ def test_process_logs_start_and_published_task_progress(
         )
     )
 
+    second = base_atoms(source="second", seed_id="seed-second")
+    second.set_cell(np.diag([12.5, 12.0, 12.0]), scale_atoms=False)
+
     with caplog.at_level(logging.INFO, logger=coordinator_module.__name__):
         coordinator.process(
-            [base_atoms()],
+            [
+                base_atoms(source="first", seed_id="seed-first"),
+                second,
+            ],
             tmp_path,
             n_rattled=0,
             n_vacancies=0,
@@ -783,12 +863,81 @@ def test_process_logs_start_and_published_task_progress(
             n_workers=1,
         )
 
-    messages = [record.getMessage() for record in caplog.records]
-    assert any("Starting perturbations: tasks=1, workers=1" in message for message in messages)
-    assert any(
-        "Perturbation task 1/1 complete:" in message and "published=1" in message
+    messages = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == coordinator_module.__name__ and record.levelno == logging.INFO
+    ]
+    progress = [message for message in messages if message.startswith("Perturbation ")]
+    assert progress == [
+        "Perturbation 1/2 complete: unperturbed; total structures=1",
+        "Perturbation 2/2 complete: unperturbed; total structures=2",
+    ]
+    assert not any(
+        any(
+            marker in message
+            for marker in (
+                "Perturbations progress",
+                "Candidates progress",
+                "Active perturbation",
+                "Ordered publication blocked",
+            )
+        )
         for message in messages
     )
+
+
+def test_process_logs_publications_in_canonical_order_when_workers_finish_out_of_order(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    bases = [base_atoms(source=f"base-{index}", seed_id=f"seed-{index}") for index in range(3)]
+    for index, base in enumerate(bases):
+        base.set_cell(np.diag([12.0 + index, 12.0, 12.0]), scale_atoms=False)
+    coordinator = PerturbationCoordinator(
+        settings=PerturbationSettings(
+            target_n_atoms=4,
+            n_volume_points=0,
+            elastic_stress_enabled=False,
+        )
+    )
+    original_execute = coordinator_module.execute_perturbation_task
+
+    def controlled_worker(task):
+        if task.base.info["source"] == "base-0":
+            time.sleep(0.15)
+        return original_execute(task)
+
+    def thread_executor_factory(*, max_workers: int, mp_context):
+        del mp_context
+        return ThreadPoolExecutor(max_workers=max_workers)
+
+    monkeypatch.setattr(coordinator_module, "execute_perturbation_task", controlled_worker)
+    monkeypatch.setattr(coordinator_module, "ProcessPoolExecutor", thread_executor_factory)
+
+    with caplog.at_level(logging.INFO, logger=coordinator_module.__name__):
+        coordinator.process(
+            bases,
+            tmp_path,
+            n_rattled=0,
+            n_vacancies=0,
+            n_interstitials=0,
+            n_workers=2,
+        )
+
+    progress = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == coordinator_module.__name__
+        and record.levelno == logging.INFO
+        and record.getMessage().startswith("Perturbation ")
+    ]
+    assert progress == [
+        "Perturbation 1/3 complete: unperturbed; total structures=1",
+        "Perturbation 2/3 complete: unperturbed; total structures=2",
+        "Perturbation 3/3 complete: unperturbed; total structures=3",
+    ]
 
 
 def test_ordered_wait_logs_a_heartbeat_for_the_blocking_task(
@@ -820,7 +969,7 @@ def test_ordered_wait_logs_a_heartbeat_for_the_blocking_task(
     monkeypatch.setattr(coordinator_module, "ProcessPoolExecutor", harness.executor_factory)
     monkeypatch.setattr(coordinator, "_resolve_future", resolve_after_one_heartbeat)
 
-    with caplog.at_level(logging.INFO, logger=coordinator_module.__name__):
+    with caplog.at_level(logging.DEBUG, logger=coordinator_module.__name__):
         coordinator.process(
             [first, second],
             tmp_path,
@@ -830,7 +979,14 @@ def test_ordered_wait_logs_a_heartbeat_for_the_blocking_task(
             n_workers=2,
         )
 
-    assert any("Waiting for ordered task 1" in record.getMessage() for record in caplog.records)
+    assert any(
+        record.levelno == logging.DEBUG and "Waiting for ordered task 1" in record.getMessage()
+        for record in caplog.records
+    )
+    assert not any(
+        record.levelno == logging.INFO and "Waiting for ordered task 1" in record.getMessage()
+        for record in caplog.records
+    )
 
 
 def test_parallel_failure_cancels_pending_futures_with_task_context(
@@ -865,7 +1021,10 @@ def test_parallel_failure_cancels_pending_futures_with_task_context(
 
     with pytest.raises(
         PerturbationTaskError,
-        match=f"base={tasks[1].base_structure_id}, seed={tasks[1].seed}",
+        match=(
+            f"base={tasks[1].base_structure_id}, seed={tasks[1].seed}: .*"
+            f"family={tasks[1].family}, slots={tasks[1].slot_start}:{tasks[1].slot_stop}"
+        ),
     ):
         list(coordinator._execute(tasks, n_workers=2))
 

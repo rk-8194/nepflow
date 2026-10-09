@@ -48,6 +48,7 @@ line-ending = "lf"
 addopts = '--strict-markers -m "not external"'
 markers = [
     "external: requires a live external service or executable and is excluded from ordinary CI",
+    "real_generation_boundary: exercises real supercell/topology or process startup behaviour",
     "slurm: requires a live SLURM cluster",
     "vasp: requires a live VASP executable",
     "gpumd: requires a live GPUMD executable",

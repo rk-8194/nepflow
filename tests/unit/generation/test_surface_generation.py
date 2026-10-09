@@ -12,6 +12,7 @@ pytest.importorskip("pymatgen")
 from ase import Atoms
 from ase.build import bulk
 
+import nepflow.stages.generation.perturbations.coordinator as coordinator_module
 from nepflow.config.models import GenerationConfig
 from nepflow.errors import ConfigurationError
 from nepflow.stages.generation.perturbations.coordinator import PerturbationCoordinator
@@ -58,6 +59,61 @@ def _settings(**overrides) -> PerturbationSettings:
     }
     values.update(overrides)
     return PerturbationSettings(**values)
+
+
+def _mock_coordinator_surface_boundary(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Replace real slab construction in coordinator-only tests."""
+
+    def fake_surfaces(
+        parent,
+        base,
+        count,
+        settings,
+        rng,
+        annotate,
+        *,
+        seed=None,
+        slot_start=0,
+        slot_stop=None,
+    ):
+        del count, rng, seed
+        stop = len(settings.surface_miller_indices) if slot_stop is None else slot_stop
+        output = []
+        for slot in range(slot_start, min(stop, len(settings.surface_miller_indices))):
+            candidate = parent.copy()
+            candidate.set_cell(candidate.cell * (1.0 + 0.01 * (slot + 1)), scale_atoms=True)
+            miller = tuple(settings.surface_miller_indices[slot])
+            candidate.info["surface_miller_index"] = miller
+            annotate(
+                candidate,
+                base,
+                "surface",
+                parameters={"surface_miller_index": miller},
+                operation_id=f"surface:{slot}",
+            )
+            output.append(candidate)
+        return output
+
+    def thread_executor_factory(*, max_workers: int, mp_context):
+        del mp_context
+        from concurrent.futures import ThreadPoolExecutor
+
+        return ThreadPoolExecutor(max_workers=max_workers)
+
+    monkeypatch.setattr(
+        coordinator_module,
+        "build_target_supercell",
+        lambda parent, target_n_atoms: parent.copy(),
+    )
+    monkeypatch.setattr(coordinator_module, "require_parent_topology", lambda _atoms: None)
+    monkeypatch.setattr(
+        coordinator_module,
+        "surface_slot_count",
+        lambda _parent, settings: len(settings.surface_miller_indices),
+    )
+    monkeypatch.setattr(coordinator_module, "surfaces", fake_surfaces)
+    monkeypatch.setattr(coordinator_module, "validate_generated_candidate", lambda *args: None)
+    monkeypatch.setattr(coordinator_module, "ProcessPoolExecutor", thread_executor_factory)
 
 
 def test_bcc_surface_has_low_index_termination_and_provenance() -> None:
@@ -212,7 +268,8 @@ def test_termination_order_is_deterministic_and_policy_limits_it() -> None:
     assert limited[0].info["surface_termination"] == "termination_0"
 
 
-def test_surface_source_scope_filters_coordinator() -> None:
+def test_surface_source_scope_filters_coordinator(monkeypatch: pytest.MonkeyPatch) -> None:
+    _mock_coordinator_surface_boundary(monkeypatch)
     parent = _base()
     settings = _settings(surface_sources=("sqs",), n_volume_points=0, elastic_stress_enabled=False)
     coordinator = PerturbationCoordinator(settings)
@@ -224,6 +281,7 @@ def test_surface_source_scope_filters_coordinator() -> None:
 
 
 def test_disabled_surfaces_do_not_invoke_surface_backend(monkeypatch: pytest.MonkeyPatch) -> None:
+    _mock_coordinator_surface_boundary(monkeypatch)
     parent = _base()
     settings = _settings(
         surface_enabled=False,
@@ -254,7 +312,10 @@ def test_disabled_surfaces_do_not_invoke_surface_backend(monkeypatch: pytest.Mon
     assert all(item.info.get("perturbation_type") != "surface" for item in candidates)
 
 
-def test_requested_orientations_are_not_truncated_by_legacy_surface_count() -> None:
+def test_requested_orientations_are_not_truncated_by_legacy_surface_count(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _mock_coordinator_surface_boundary(monkeypatch)
     parent = _base()
     requested = ((1, 0, 0), (1, 1, 0), (1, 1, 1))
     settings = _settings(
@@ -440,7 +501,11 @@ def test_surface_config_validation_rejects_invalid_miller_and_repeat() -> None:
         )
 
 
-def test_surface_coordinator_serial_and_parallel_are_reproducible(tmp_path: Path) -> None:
+def test_surface_coordinator_serial_and_parallel_are_reproducible(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _mock_coordinator_surface_boundary(monkeypatch)
     parent = _base()
     settings = _settings(
         n_volume_points=0,
