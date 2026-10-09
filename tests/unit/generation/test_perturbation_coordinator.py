@@ -618,7 +618,9 @@ def test_auto_workers_respect_cpu_allocation_cap_and_runnable_tasks(
     assert PerturbationCoordinator._effective_worker_count(12, 2) == 2
 
 
-def test_process_logs_start_and_published_task_progress(tmp_path, caplog: pytest.LogCaptureFixture) -> None:
+def test_process_logs_start_and_published_task_progress(
+    tmp_path, caplog: pytest.LogCaptureFixture
+) -> None:
     coordinator = PerturbationCoordinator(
         settings=PerturbationSettings(
             target_n_atoms=4,
