@@ -639,6 +639,7 @@ class GenerationStage:
         store = request.state_store if request.state_store is not None else self.state_store
         if store is None:
             return
+        config_fingerprint = self._generation_config_fingerprint(request)
         for base in bases:
             identity = StructureIdentity.from_atoms(base)
             info = dict(base.info)
@@ -668,9 +669,12 @@ class GenerationStage:
                 random_seed=(
                     int(info["random_seed"]) if info.get("random_seed") is not None else None
                 ),
-                operation_id=f"generation:{request.project_name}:{info.get('seed_id', identity.structure_id)}",
+                operation_id=(
+                    f"generation:{request.project_name}:{config_fingerprint}:"
+                    f"{info.get('seed_id', identity.structure_id)}"
+                ),
                 code_version=None,
-                config_fingerprint=None,
+                config_fingerprint=config_fingerprint,
             )
             store.upsert_structure(
                 GeneratedStructureRecord(identity=identity, provenance=provenance, metadata=info)

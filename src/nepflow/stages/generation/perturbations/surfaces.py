@@ -89,6 +89,8 @@ def surfaces(
     annotate: Callable[..., Any],
     *,
     seed: int | None = None,
+    slot_start: int = 0,
+    slot_stop: int | None = None,
 ) -> list[Any]:
     """Build deterministic, validated slabs for the configured Miller indices.
 
@@ -108,6 +110,7 @@ def surfaces(
     reference_cell = _establish_reference_basis(parent)
     parent_structure_id = calculate_structure_id(base)
     generated: list[Any] = []
+    slot = 0
     for miller_index in miller_indices:
         if miller_index not in SUPPORTED_SURFACE_MILLER_INDICES:
             raise SurfaceConstructionError(
@@ -124,6 +127,11 @@ def surfaces(
                 f"no supported termination was constructed for Miller index {miller_index}"
             )
         for termination_index, plan in enumerate(planned):
+            if slot < slot_start:
+                slot += 1
+                continue
+            if slot_stop is not None and slot >= slot_stop:
+                return generated
             candidate = plan.candidate
             parameters = _surface_parameters(
                 candidate,
@@ -152,6 +160,7 @@ def surfaces(
                 ),
             )
             generated.append(candidate)
+            slot += 1
             if count is not None and len(generated) == count:
                 return generated
 
@@ -163,6 +172,27 @@ def surfaces(
         f"{count} surfaces, but only {len(generated)} configured Miller/termination "
         "candidates were constructible"
     )
+
+
+def surface_slot_count(parent: Any, settings: PerturbationSettings) -> int:
+    """Return the deterministic number of configured surface slots.
+
+    Planning is intentionally repeated at the coordinator boundary so surface
+    batches can be keyed before workers are submitted. The planner is bounded
+    by the configured repeat limits; it does not retain a global slab cache.
+    """
+
+    total = 0
+    for miller_index in tuple(
+        _normalise_miller(index) for index in settings.surface_miller_indices
+    ):
+        planned = _plan_surface_terminations(parent, miller_index, settings)
+        if settings.surface_termination_policy == "first":
+            planned = planned[:1]
+        if settings.surface_max_terminations > 0:
+            planned = planned[: settings.surface_max_terminations]
+        total += len(planned)
+    return total
 
 
 def _plan_surface_terminations(
@@ -887,5 +917,6 @@ __all__ = [
     "SurfacePlanningMeasurement",
     "measure_surface_bulk_core",
     "measure_surface_geometry",
+    "surface_slot_count",
     "surfaces",
 ]

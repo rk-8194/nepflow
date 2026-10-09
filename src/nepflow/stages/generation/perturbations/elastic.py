@@ -61,6 +61,9 @@ def elastic_stress_set(
     base: Any,
     settings: PerturbationSettings,
     annotate: Annotate,
+    *,
+    slot_start: int = 0,
+    slot_stop: int | None = None,
 ) -> list[Any]:
     """Generate enabled strain modes from a periodic cell.
 
@@ -85,11 +88,18 @@ def elastic_stress_set(
     )
 
     output: list[Any] = []
+    slot = 0
+    end = slot_stop
     for amplitude in settings.elastic_strain_amplitudes:
         value = float(amplitude)
         if value == 0.0:
             continue
         for mode, matrix_factory, axes in modes:
+            if slot < slot_start:
+                slot += 1
+                continue
+            if end is not None and slot >= end:
+                return output
             matrix = matrix_factory(value, *axes)
             strained = supercell.copy()
             strained.set_cell(matrix @ strained.cell[:], scale_atoms=True)
@@ -105,6 +115,7 @@ def elastic_stress_set(
                 operation_id=f"elastic:{mode}:{value}",
             )
             output.append(strained)
+            slot += 1
     return output
 
 

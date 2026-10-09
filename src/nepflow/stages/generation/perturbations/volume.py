@@ -17,6 +17,9 @@ def volume_profile(
     base: Any,
     settings: PerturbationSettings,
     annotate: Annotate,
+    *,
+    slot_start: int = 0,
+    slot_stop: int | None = None,
 ) -> list[Any]:
     """Generate an isotropic volume profile in configured order.
 
@@ -30,8 +33,12 @@ def volume_profile(
         settings.volume_scale_range[1],
         settings.n_volume_points,
     )
+    end = (
+        settings.n_volume_points if slot_stop is None else min(slot_stop, settings.n_volume_points)
+    )
     output: list[Any] = []
-    for index, scale_factor in enumerate(scale_factors):
+    for index in range(slot_start, end):
+        scale_factor = scale_factors[index]
         scaled = supercell.copy()
         linear_scale = float(scale_factor) ** (1.0 / 3.0)
         scaled.set_cell(supercell.cell * linear_scale, scale_atoms=True)

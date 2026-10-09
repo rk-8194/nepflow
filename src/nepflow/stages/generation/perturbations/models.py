@@ -320,12 +320,16 @@ def _normalise_pairs(value: Any) -> tuple[tuple[str, str], ...]:
 
 @dataclass(frozen=True, slots=True)
 class PerturbationTask:
-    """A complete deterministic unit of worker execution.
+    """A deterministic unit of worker execution.
 
     ``Atoms`` is deliberately retained as the scientific input rather than a
     path or an implicit positional tuple.  ASE structures are pickleable, so
     this record is serializable for ``ProcessPoolExecutor`` while preserving
     the exact base identity and effective seed.
+
+    ``family`` and the half-open slot window identify a bounded family batch.
+    They are optional for compatibility with callers that still submit one
+    complete base task directly to :func:`execute_perturbation_task`.
     """
 
     base: Any
@@ -333,6 +337,15 @@ class PerturbationTask:
     settings: PerturbationSettings
     counts: PerturbationCounts
     seed: int
+    family: str | None = None
+    slot_start: int = 0
+    slot_stop: int | None = None
+
+    @property
+    def task_key(self) -> tuple[str, str, int, int | None]:
+        """Return the stable base/family/slot identity used for ordering."""
+
+        return (self.base_structure_id, self.family or "all", self.slot_start, self.slot_stop)
 
 
 @dataclass(frozen=True, slots=True)

@@ -40,6 +40,9 @@ def liquid_snapshots(
     settings: PerturbationSettings,
     seed: int,
     annotate: Annotate,
+    *,
+    slot_start: int = 0,
+    slot_stop: int | None = None,
 ) -> list[Any]:
     """Run seeded ASE Langevin/Lennard-Jones trajectories.
 
@@ -76,6 +79,8 @@ def liquid_snapshots(
         settings.liquid_temperature_k,
     )
 
+    total_slots = n_configurations * n_snapshots
+    selected_stop = total_slots if slot_stop is None else min(slot_stop, total_slots)
     output: list[Any] = []
     for configuration_index in range(n_configurations):
         liquid_seed = derive_child_seed(
@@ -118,6 +123,7 @@ def liquid_snapshots(
 
         snapshots: list[Any] = []
         for snapshot_index in range(n_snapshots):
+            slot = (configuration_index * n_snapshots) + snapshot_index
             try:
                 dynamics.run(settings.liquid_steps_between_snapshots)
             except Exception as exc:
@@ -130,6 +136,8 @@ def liquid_snapshots(
             snapshot_step = settings.liquid_equilibration_steps + (
                 (snapshot_index + 1) * settings.liquid_steps_between_snapshots
             )
+            if slot < slot_start or slot >= selected_stop:
+                continue
             snapshot = atoms.copy()
             parameters = _provenance_parameters(
                 source_parent_id=source_parent_id,
@@ -158,7 +166,7 @@ def liquid_snapshots(
             )
         output.extend(snapshots)
 
-    expected_count = n_configurations * n_snapshots
+    expected_count = max(0, selected_stop - slot_start)
     if len(output) != expected_count:
         raise LiquidGenerationError(
             f"ASE liquid generation produced {len(output)} snapshots; expected {expected_count}"

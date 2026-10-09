@@ -356,7 +356,12 @@ def test_one_perturbation_task_represents_one_base_structure() -> None:
     first = base_atoms(source="first", seed_id="seed-first")
     second = base_atoms(source="second", seed_id="seed-second")
     coordinator = PerturbationCoordinator(
-        settings=PerturbationSettings(target_n_atoms=4, random_seed=21)
+        settings=PerturbationSettings(
+            target_n_atoms=4,
+            random_seed=21,
+            n_volume_points=0,
+            elastic_stress_enabled=False,
+        )
     )
     counts = PerturbationCounts(n_rattled=0, n_vacancies=0, n_interstitials=0)
 
@@ -368,7 +373,8 @@ def test_one_perturbation_task_represents_one_base_structure() -> None:
         calculate_structure_id(first),
         calculate_structure_id(second),
     ]
-    assert all(not isinstance(task.base, (list, tuple)) for task in tasks)
+    assert all(task.family == "unperturbed" for task in tasks)
+    assert all(task.task_key[2:] == (0, 1) for task in tasks)
 
 
 def test_serial_and_parallel_candidates_are_ordered_and_scientifically_equal() -> None:
@@ -408,7 +414,7 @@ def test_serial_and_parallel_candidates_are_ordered_and_scientifically_equal() -
         "seed-second",
     ]
 
-    task = next(PerturbationCoordinator(settings=settings)._tasks([bases[0]], counts))
+    task = next(PerturbationCoordinator(settings=settings)._legacy_tasks([bases[0]], counts))
     result = execute_perturbation_task(task)
     assert len(result.provenance_records) == len(result.candidates)
 
@@ -463,11 +469,13 @@ def test_serial_and_parallel_publication_lock_scopes_seeds_and_extxyz_bytes(tmp_
         ("seed-sqs", "unperturbed"),
         ("seed-sqs", "rattled"),
     ]
+    expected_vacancy = next(task for task in expected_tasks if task.family == "vacancy")
+    expected_rattle = next(task for task in expected_tasks if task.family == "rattled")
     assert [record.provenance.random_seed for record in serial.get_provenance_records()] == [
         None,
-        derive_child_seed(expected_tasks[0].base_structure_id, expected_tasks[0].seed, "vacancy"),
+        derive_child_seed(expected_vacancy.base_structure_id, expected_vacancy.seed, "vacancy"),
         None,
-        derive_child_seed(expected_tasks[1].base_structure_id, expected_tasks[1].seed, "rattled"),
+        derive_child_seed(expected_rattle.base_structure_id, expected_rattle.seed, "rattled"),
     ]
     assert [record.to_dict() for record in serial.get_provenance_records()] == [
         record.to_dict() for record in parallel.get_provenance_records()
@@ -1016,7 +1024,7 @@ def test_worker_result_is_pickleable_with_canonical_provenance() -> None:
         n_vacancies=1,
         n_interstitials=0,
     )
-    task = next(PerturbationCoordinator(settings=settings)._tasks([base], counts))
+    task = next(PerturbationCoordinator(settings=settings)._legacy_tasks([base], counts))
 
     result = execute_perturbation_task(task)
     restored = pickle.loads(pickle.dumps(result))
@@ -1335,3 +1343,53 @@ def test_filtering_one_family_does_not_reorder_unaffected_candidates() -> None:
     assert unaffected_order(filtered) == unaffected_order(unfiltered), (
         "filtering one family must not reorder unaffected candidates"
     )
+
+
+def test_family_slot_batches_bound_worker_payload_and_preserve_child_slots(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Large requested families are transported as deterministic bounded windows."""
+
+    base = base_atoms()
+    settings = PerturbationSettings(
+        target_n_atoms=4,
+        n_volume_points=0,
+        elastic_stress_enabled=False,
+        rattle_sources=("all",),
+    )
+    counts = PerturbationCounts(n_rattled=19, n_vacancies=0, n_interstitials=0)
+
+    def fake_rattled(supercell, source, n, family_settings, seed, annotate, **kwargs):
+        del family_settings
+        start = kwargs["slot_start"]
+        output = []
+        for slot in range(start, start + n):
+            candidate = supercell.copy()
+            candidate.info["perturbation_type"] = "rattled"
+            annotate(
+                candidate,
+                source,
+                "rattled",
+                random_seed=derive_child_seed(
+                    calculate_structure_id(source), seed, "rattled", slot
+                ),
+                operation_id=f"rattled:{slot}",
+            )
+            output.append(candidate)
+        return output
+
+    monkeypatch.setattr(coordinator_module, "rattled", fake_rattled)
+    coordinator = PerturbationCoordinator(settings=settings)
+    tasks = [task for task in coordinator._tasks([base], counts) if task.family == "rattled"]
+
+    assert [(task.slot_start, task.slot_stop) for task in tasks] == [
+        (0, 8),
+        (8, 16),
+        (16, 19),
+    ]
+    results = [execute_perturbation_task(task) for task in tasks]
+    assert max(len(result.candidates) for result in results) == 8
+    assert [item.info["random_seed"] for result in results for item in result.candidates] == [
+        derive_child_seed(calculate_structure_id(base), tasks[0].seed, "rattled", slot)
+        for slot in range(19)
+    ]

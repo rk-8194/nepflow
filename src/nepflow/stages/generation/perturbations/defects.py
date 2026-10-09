@@ -80,6 +80,7 @@ def vacancies(
     annotate: Annotate,
     *,
     seed: int | None = None,
+    slot_start: int = 0,
 ) -> list[Any]:
     """Generate species-restricted vacancy structures with deterministic slots."""
 
@@ -100,7 +101,7 @@ def vacancies(
         raise ValueError("cannot realize a vacancy while retaining one atom")
 
     output: list[Any] = []
-    for index in range(n):
+    for index in range(slot_start, slot_start + n):
         child_seed = derive_child_seed(base_structure_id, root_seed, "vacancy", index)
         slot_rng = np.random.RandomState(child_seed)
         requested, requested_concentration = _requested_count(
@@ -159,6 +160,7 @@ def substitutions(
     annotate: Annotate,
     *,
     seed: int | None = None,
+    slot_start: int = 0,
 ) -> list[Any]:
     """Replace source species with configured target species."""
 
@@ -169,7 +171,7 @@ def substitutions(
     root_seed = settings.random_seed if seed is None else int(seed)
     symbols = np.asarray(supercell.get_chemical_symbols())
     output: list[Any] = []
-    for index in range(n):
+    for index in range(slot_start, slot_start + n):
         source, target = settings.substitution_pairs[index % len(settings.substitution_pairs)]
         child_seed = derive_child_seed(base_structure_id, root_seed, "substitution", index)
         slot_rng = np.random.RandomState(child_seed)
@@ -220,6 +222,7 @@ def antisites(
     annotate: Annotate,
     *,
     seed: int | None = None,
+    slot_start: int = 0,
 ) -> list[Any]:
     """Exchange equal numbers of two configured species."""
 
@@ -230,7 +233,7 @@ def antisites(
     root_seed = settings.random_seed if seed is None else int(seed)
     symbols = np.asarray(supercell.get_chemical_symbols())
     output: list[Any] = []
-    for index in range(n):
+    for index in range(slot_start, slot_start + n):
         first, second = settings.antisite_pairs[index % len(settings.antisite_pairs)]
         child_seed = derive_child_seed(base_structure_id, root_seed, "antisite", index)
         slot_rng = np.random.RandomState(child_seed)
@@ -286,6 +289,7 @@ def interstitials(
     annotate: Annotate,
     *,
     seed: int | None = None,
+    slot_start: int = 0,
 ) -> list[Any]:
     """Generate host interstitials at valid random or configured sites."""
 
@@ -304,6 +308,7 @@ def interstitials(
         "n_interstitials",
         annotate,
         seed=seed,
+        slot_start=slot_start,
     )
 
 
@@ -316,6 +321,7 @@ def gas_interstitials(
     annotate: Annotate,
     *,
     seed: int | None = None,
+    slot_start: int = 0,
 ) -> list[Any]:
     """Generate gas-species interstitials with the configured cutoff."""
 
@@ -333,6 +339,7 @@ def gas_interstitials(
         "n_gas_interstitials",
         annotate,
         seed=seed,
+        slot_start=slot_start,
     )
 
 
@@ -345,6 +352,7 @@ def vacancy_interstitial(
     annotate: Annotate,
     *,
     seed: int | None = None,
+    slot_start: int = 0,
 ) -> list[Any]:
     """Generate combined vacancy/interstitial structures in a periodic cell."""
 
@@ -359,7 +367,7 @@ def vacancy_interstitial(
     root_seed = settings.random_seed if seed is None else int(seed)
     cell, inv_cell = _cell_arrays(supercell)
     output: list[Any] = []
-    for index in range(n):
+    for index in range(slot_start, slot_start + n):
         child_seed = derive_child_seed(base_structure_id, root_seed, "vacancy_interstitial", index)
         slot_rng = np.random.RandomState(child_seed)
         vacancy = supercell.copy()
@@ -478,6 +486,7 @@ def gas_in_vacancy(
     annotate: Annotate,
     *,
     seed: int | None = None,
+    slot_start: int = 0,
 ) -> list[Any]:
     """Place configured gas species around a vacancy within the cell."""
 
@@ -488,7 +497,7 @@ def gas_in_vacancy(
     root_seed = settings.random_seed if seed is None else int(seed)
     cell, inv_cell = _cell_arrays(supercell)
     output: list[Any] = []
-    for index in range(n):
+    for index in range(slot_start, slot_start + n):
         child_seed = derive_child_seed(base_structure_id, root_seed, "gas_in_vacancy", index)
         slot_rng = np.random.RandomState(child_seed)
         vacancy = supercell.copy()
@@ -660,6 +669,7 @@ def _insert_interstitials(
     annotate: Annotate,
     *,
     seed: int | None = None,
+    slot_start: int = 0,
 ) -> list[Any]:
     del rng
     if not elements:
@@ -669,7 +679,7 @@ def _insert_interstitials(
     cell, inv_cell = _cell_arrays(supercell)
     configured_sites = _configured_interstitial_site_records(settings, cell)
     output: list[Any] = []
-    for index in range(n):
+    for index in range(slot_start, slot_start + n):
         child_seed = derive_child_seed(base_structure_id, root_seed, family, index)
         slot_rng = np.random.RandomState(child_seed)
         positions = supercell.get_positions().copy()

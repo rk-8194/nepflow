@@ -40,6 +40,9 @@ def rattled(
     settings: PerturbationSettings,
     seed: int,
     annotate: Annotate,
+    *,
+    slot_start: int = 0,
+    total_count: int | None = None,
 ) -> list[Any]:
     """Generate HipHive rattled structures with a minimum distance in Angstroms.
 
@@ -52,9 +55,13 @@ def rattled(
 
     from hiphive.structure_generation import generate_mc_rattled_structures
 
+    total = n if total_count is None else total_count
     output: list[Any] = []
     base_structure_id = calculate_structure_id(base)
-    for index, rattle_std in enumerate(sample_rattle_stds(settings, n)):
+    for index, rattle_std in enumerate(
+        sample_rattle_stds(settings, total)[slot_start : slot_start + n],
+        start=slot_start,
+    ):
         child_seed = derive_child_seed(base_structure_id, seed, "rattled", index)
         try:
             rattled_structures = generate_mc_rattled_structures(

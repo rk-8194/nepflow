@@ -9,9 +9,11 @@ from ase import Atoms
 from ase.io import write
 
 from nepflow.config.models import CompositionConfig, GenerationConfig
+from nepflow.domain.identities import calculate_structure_id
 from nepflow.io.hashing import sha256_file
 from nepflow.stages.generation.models import GenerationRequest
 from nepflow.stages.generation.stage import GenerationStage
+from nepflow.state.store import StateStore
 
 
 class FakeStore:
@@ -158,3 +160,40 @@ def test_stage_preserves_requested_and_realized_compositions(tmp_path: Path) -> 
         "Si": 0.75,
         "Ge": 0.25,
     }
+
+
+def test_base_provenance_operation_is_namespaced_by_generation_configuration(
+    tmp_path: Path,
+) -> None:
+    first = Atoms("Si2", cell=[3, 3, 3], pbc=True)
+    first.info["seed_id"] = "seed_000000"
+    second = first.copy()
+    second.set_cell([4, 4, 4], scale_atoms=True)
+    stage = GenerationStage(generators=(), coordinator=FakeCoordinator())
+
+    with StateStore(tmp_path / "state.db") as store:
+        first_request = GenerationRequest(
+            project_name="demo",
+            project_dir=tmp_path,
+            composition=CompositionConfig(elements=("Si",)),
+            generation=GenerationConfig(target_n_atoms=2),
+            random_seed=7,
+            state_store=store,
+        )
+        changed_request = GenerationRequest(
+            project_name="demo",
+            project_dir=tmp_path,
+            composition=CompositionConfig(elements=("Si",)),
+            generation=GenerationConfig(target_n_atoms=4),
+            random_seed=7,
+            state_store=store,
+        )
+
+        stage._persist_structure_records(first_request, [first])
+        stage._persist_structure_records(changed_request, [second])
+
+        first_provenance = store.get_structure_provenance(calculate_structure_id(first))
+        second_provenance = store.get_structure_provenance(calculate_structure_id(second))
+
+    assert first_provenance[0]["operation_id"] != second_provenance[0]["operation_id"]
+    assert first_provenance[0]["config_fingerprint"] != second_provenance[0]["config_fingerprint"]

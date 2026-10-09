@@ -53,41 +53,50 @@ from .models import (
     PerturbationTaskResult,
 )
 from .provenance import annotate_generation_provenance
-from .surfaces import surfaces
+from .surfaces import surface_slot_count, surfaces
 from .volume import volume_profile
 
 logger = logging.getLogger(__name__)
 _AUTO_WORKER_CAP = 8
 _HEARTBEAT_INTERVAL_SECONDS = 30.0
-_PERTURBATION_FAMILIES = frozenset(
-    {
-        "unperturbed",
-        "volume_profile",
-        "elastic_stress",
-        "rattled",
-        "liquid",
-        "vacancy",
-        "interstitial",
-        "gas_interstitial",
-        "substitution",
-        "antisite",
-        "vacancy_interstitial",
-        "gas_in_vacancy",
-        "surface",
-        "grain_boundary",
-    }
+_FAMILY_ORDER = (
+    "unperturbed",
+    "volume_profile",
+    "elastic_stress",
+    "rattled",
+    "liquid",
+    "vacancy",
+    "interstitial",
+    "gas_interstitial",
+    "substitution",
+    "antisite",
+    "vacancy_interstitial",
+    "gas_in_vacancy",
+    "surface",
+    "grain_boundary",
 )
+# Publication order is intentionally base-major, then this family order, then
+# ascending half-open slot windows. It is part of the extxyz/provenance contract.
+_PERTURBATION_FAMILIES = frozenset(_FAMILY_ORDER)
+_SLOT_BATCH_SIZE = 8
 
 
 class PerturbationTaskError(RuntimeError):
-    """A worker failure attributed to one exact base and effective seed."""
+    """A worker failure attributed to one exact base, family, and seed."""
 
     def __init__(self, task: PerturbationTask, cause: BaseException) -> None:
         self.base_structure_id = task.base_structure_id
         self.seed = task.seed
+        self.family = task.family
+        self.slot_start = task.slot_start
+        self.slot_stop = task.slot_stop
         self.cause = cause
+        batch = ""
+        if task.family is not None:
+            batch = f" (family={task.family}, slots={task.slot_start}:{task.slot_stop})"
         super().__init__(
-            f"Perturbation task failed for base={task.base_structure_id}, seed={task.seed}: {cause}"
+            f"Perturbation task failed for base={task.base_structure_id}, seed={task.seed}: "
+            f"{cause}{batch}"
         )
 
 
@@ -108,6 +117,9 @@ def family_applies_to_base(
 
 def execute_perturbation_task(task: PerturbationTask) -> PerturbationTaskResult:
     """Execute one complete task; this function is process-pool picklable."""
+
+    if task.family is not None:
+        return _execute_perturbation_batch(task)
 
     actual_base_id = calculate_structure_id(task.base)
     if actual_base_id != task.base_structure_id:
@@ -385,6 +397,238 @@ def execute_perturbation_task(task: PerturbationTask) -> PerturbationTaskResult:
     )
 
 
+def _execute_perturbation_batch(task: PerturbationTask) -> PerturbationTaskResult:
+    """Execute one bounded family/slot window for a base structure.
+
+    A target supercell is reconstructed once per submitted batch and shared by
+    every candidate in that batch. This keeps mutable scientific state local to
+    the worker and bounds memory without introducing a process-global atom
+    cache. The deterministic task key, rather than completion order, controls
+    all child seeds and publication order.
+    """
+
+    if task.family not in _PERTURBATION_FAMILIES:
+        raise ValueError(f"unknown perturbation family: {task.family!r}")
+    actual_base_id = calculate_structure_id(task.base)
+    if actual_base_id != task.base_structure_id:
+        raise ValueError(
+            "Perturbation task base identity mismatch: "
+            f"expected {task.base_structure_id}, got {actual_base_id}"
+        )
+    if task.slot_start < 0 or task.slot_stop is not None and task.slot_stop < task.slot_start:
+        raise ValueError("perturbation batch slot window is invalid")
+
+    settings = task.settings
+    supercell = build_target_supercell(task.base, target_n_atoms=settings.target_n_atoms)
+    if supercell is None:
+        raise RuntimeError("target supercell construction returned no structure")
+
+    candidate_records: dict[int, Any] = {}
+
+    def annotate(
+        candidate: Any,
+        base: Any,
+        family: str,
+        *,
+        random_seed: int | None = None,
+        parameters: dict[str, Any] | None = None,
+        operation_id: str | None = None,
+    ) -> Any:
+        record = annotate_generation_provenance(
+            candidate,
+            base,
+            family,
+            random_seed=random_seed,
+            parameters=parameters,
+            operation_id=(
+                f"{task.base_structure_id}:{operation_id}" if operation_id is not None else None
+            ),
+        )
+        candidate_records[id(candidate)] = record
+        return record
+
+    output = _generate_family_batch(task, supercell, annotate)
+    return _validate_batch_candidates(task, supercell, output, candidate_records)
+
+
+def _generate_family_batch(task: PerturbationTask, supercell: Any, annotate: Any) -> list[Any]:
+    """Dispatch a bounded family window while retaining canonical family APIs."""
+
+    family = task.family
+    assert family is not None
+    start = task.slot_start
+    stop = task.slot_stop
+    size = None if stop is None else max(0, stop - start)
+    settings = task.settings
+    base = task.base
+    if size == 0:
+        return []
+    if family == "unperturbed":
+        if start != 0:
+            return []
+        candidate = supercell.copy()
+        annotate(candidate, base, family, operation_id="unperturbed")
+        return [candidate]
+    if family == "volume_profile":
+        return volume_profile(supercell, base, settings, annotate, slot_start=start, slot_stop=stop)
+    if family == "elastic_stress":
+        return elastic_stress_set(
+            supercell, base, settings, annotate, slot_start=start, slot_stop=stop
+        )
+    if family == "rattled":
+        assert size is not None
+        return rattled(
+            supercell,
+            base,
+            size,
+            settings,
+            task.seed,
+            annotate,
+            slot_start=start,
+            total_count=task.counts.n_rattled,
+        )
+    if family == "liquid":
+        assert size is not None
+        return liquid_snapshots(
+            supercell,
+            base,
+            task.counts.n_liquid_configurations,
+            task.counts.n_liquid_snapshots,
+            settings,
+            task.seed,
+            annotate,
+            slot_start=start,
+            slot_stop=stop,
+        )
+    if family == "vacancy":
+        assert size is not None
+        return vacancies(
+            supercell, base, size, settings, None, annotate, seed=task.seed, slot_start=start
+        )
+    if family == "interstitial":
+        assert size is not None
+        return interstitials(
+            supercell, base, size, settings, None, annotate, seed=task.seed, slot_start=start
+        )
+    if family == "gas_interstitial":
+        assert size is not None
+        return gas_interstitials(
+            supercell, base, size, settings, None, annotate, seed=task.seed, slot_start=start
+        )
+    if family == "substitution":
+        assert size is not None
+        return substitutions(
+            supercell, base, size, settings, None, annotate, seed=task.seed, slot_start=start
+        )
+    if family == "antisite":
+        assert size is not None
+        return antisites(
+            supercell, base, size, settings, None, annotate, seed=task.seed, slot_start=start
+        )
+    if family == "vacancy_interstitial":
+        assert size is not None
+        return vacancy_interstitial(
+            supercell, base, size, settings, None, annotate, seed=task.seed, slot_start=start
+        )
+    if family == "gas_in_vacancy":
+        assert size is not None
+        return gas_in_vacancy(
+            supercell, base, size, settings, None, annotate, seed=task.seed, slot_start=start
+        )
+    if family == "surface":
+        return surfaces(
+            base,
+            base,
+            None,
+            settings,
+            None,
+            annotate,
+            seed=task.seed,
+            slot_start=start,
+            slot_stop=stop,
+        )
+    if family == "grain_boundary":
+        if start != 0:
+            return []
+        return grain_boundaries(
+            base,
+            base,
+            1,
+            settings,
+            None,
+            annotate,
+            seed=task.seed,
+        )
+    raise AssertionError(f"unhandled perturbation family: {family}")
+
+
+def _validate_batch_candidates(
+    task: PerturbationTask,
+    supercell: Any,
+    output: list[Any],
+    candidate_records: dict[int, Any],
+) -> PerturbationTaskResult:
+    """Validate and retain only this batch's accepted candidates."""
+
+    accepted: list[Any] = []
+    provenance_records: list[Any] = []
+    rejected_attempts: list[PerturbationRejection] = []
+    for local_index, candidate in enumerate(output):
+        family = candidate.info.get("perturbation_type", "unknown")
+        if family not in _PERTURBATION_FAMILIES:
+            issue = CandidateValidationIssue("unknown_perturbation_family", {"family": family})
+        else:
+            issue = validate_generated_candidate(candidate, supercell, task.settings, family)
+
+        record = candidate_records.get(id(candidate))
+        if issue is None and record is None:
+            try:
+                record = annotate_generation_provenance(
+                    candidate,
+                    task.base,
+                    family,
+                    random_seed=candidate.info.get("random_seed"),
+                    operation_id=(
+                        f"{task.base_structure_id}:{family}:{task.slot_start + local_index}"
+                    ),
+                )
+            except Exception as exc:
+                issue = CandidateValidationIssue(
+                    "provenance_annotation_failed",
+                    {"error": f"{type(exc).__name__}: {exc}"},
+                )
+
+        if issue is None:
+            accepted.append(candidate)
+            if record is not None:
+                provenance_records.append(record)
+            continue
+
+        operation_id = f"{task.base_structure_id}:{family}:{task.slot_start + local_index}"
+        if record is not None:
+            operation_id = str(record.provenance.operation_id)
+        else:
+            provenance = candidate.info.get("generation_provenance", {})
+            if isinstance(provenance, dict) and provenance.get("operation_id"):
+                operation_id = str(provenance["operation_id"])
+        rejected_attempts.append(
+            PerturbationRejection(
+                parent_structure_id=task.base_structure_id,
+                family=str(family),
+                operation_id=operation_id,
+                slot=_rejection_slot(operation_id, task.slot_start + local_index),
+                reason=issue.reason,
+                evidence=issue.evidence,
+            )
+        )
+    return PerturbationTaskResult(
+        task=task,
+        candidates=tuple(accepted),
+        provenance_records=tuple(provenance_records),
+        rejected_attempts=tuple(rejected_attempts),
+    )
+
+
 def _rejection_slot(operation_id: str, fallback: int) -> int | str:
     """Extract the deterministic family slot from an operation identifier."""
 
@@ -469,43 +713,32 @@ class PerturbationCoordinator:
         counts: PerturbationCounts,
         settings: PerturbationSettings,
     ) -> tuple[str, ...]:
-        """Return the enabled task-family plan for operational logging only."""
+        """Return families in the canonical publication order."""
 
-        families = ["unperturbed"]
-        if settings.n_volume_points > 0:
-            families.append("volume_profile")
-        if settings.elastic_stress_enabled and settings.elastic_strain_amplitudes:
-            families.append("elastic_stress")
-        if counts.n_rattled > 0:
-            families.append("rattled")
-        if settings.liquid_enabled and counts.n_liquid_configurations > 0:
-            families.append("liquid")
-        for family, count in (
-            ("vacancy", counts.n_vacancies),
-            ("interstitial", counts.n_interstitials),
-            ("gas_interstitial", counts.n_gas_interstitials),
-            ("substitution", counts.n_substitutions),
-            ("antisite", counts.n_antisites),
-            ("vacancy_interstitial", counts.n_vacancy_interstitial),
-            ("gas_in_vacancy", counts.n_gas_in_vacancy),
-            ("grain_boundary", counts.n_grain_boundaries),
-        ):
-            if count > 0:
-                families.append(family)
-        if settings.surface_enabled:
-            families.append("surface")
-        return tuple(families)
+        return tuple(
+            family
+            for family in _FAMILY_ORDER
+            if family == "unperturbed"
+            or family == "surface"
+            and settings.surface_enabled
+            or PerturbationCoordinator._family_slot_count(family, counts, settings) > 0
+        )
 
     def _counts(self, **kwargs: int) -> PerturbationCounts:
         return PerturbationCounts(**kwargs)
 
-    def _tasks(
+    def _legacy_tasks(
         self,
         base_structures: Iterable[Any],
         counts: PerturbationCounts,
         settings: PerturbationSettings | None = None,
     ) -> Iterator[PerturbationTask]:
-        """Yield tasks in canonical base order with their stable RNG seeds."""
+        """Yield legacy complete-base tasks for direct callers.
+
+        The coordinator's process paths use :meth:`_tasks`. Keeping this
+        complete-task view preserves the pre-batching helper contract and the
+        public ``execute_perturbation_task`` compatibility path.
+        """
 
         task_settings = settings or self.settings
         for base in base_structures:
@@ -517,6 +750,111 @@ class PerturbationCoordinator:
                 seed=int(self.rng.randint(0, 2**31)),
             )
 
+    def _tasks(
+        self,
+        base_structures: Iterable[Any],
+        counts: PerturbationCounts,
+        settings: PerturbationSettings | None = None,
+    ) -> Iterator[PerturbationTask]:
+        """Yield canonical base/family/slot-window tasks for workers."""
+
+        yield from self._batch_tasks(base_structures, counts, settings)
+
+    @staticmethod
+    def _family_slot_count(
+        family: str,
+        counts: PerturbationCounts,
+        settings: PerturbationSettings,
+        base: Any | None = None,
+    ) -> int:
+        """Return the deterministic number of output slots for one family."""
+
+        if family == "unperturbed":
+            return 1
+        if family == "volume_profile":
+            return settings.n_volume_points
+        if family == "elastic_stress":
+            if not settings.elastic_stress_enabled:
+                return 0
+            return sum(9 for value in settings.elastic_strain_amplitudes if float(value) != 0.0)
+        if family == "rattled":
+            return counts.n_rattled
+        if family == "liquid":
+            if not settings.liquid_enabled:
+                return 0
+            return counts.n_liquid_configurations * counts.n_liquid_snapshots
+        if family == "vacancy":
+            return counts.n_vacancies
+        if family == "interstitial":
+            return counts.n_interstitials
+        if family == "gas_interstitial":
+            return counts.n_gas_interstitials if settings.gas_elements else 0
+        if family == "substitution":
+            return counts.n_substitutions
+        if family == "antisite":
+            return counts.n_antisites
+        if family == "vacancy_interstitial":
+            return counts.n_vacancy_interstitial if settings.gas_elements else 0
+        if family == "gas_in_vacancy":
+            return counts.n_gas_in_vacancy if settings.gas_elements else 0
+        if family == "surface":
+            if not settings.surface_enabled or base is None:
+                return 0
+            return surface_slot_count(base, settings)
+        if family == "grain_boundary":
+            return min(1, counts.n_grain_boundaries)
+        raise KeyError(f"Unknown perturbation family: {family}")
+
+    def _batch_tasks(
+        self,
+        base_structures: Iterable[Any],
+        counts: PerturbationCounts,
+        settings: PerturbationSettings | None = None,
+    ) -> Iterator[PerturbationTask]:
+        """Yield base-major, family-major bounded slot-window tasks."""
+
+        task_settings = settings or self.settings
+        for base in base_structures:
+            base_structure_id = calculate_structure_id(base)
+            seed = int(self.rng.randint(0, 2**31))
+            for family in _FAMILY_ORDER:
+                if family != "unperturbed" and not family_applies_to_base(
+                    family, base, task_settings
+                ):
+                    continue
+                total_slots = self._family_slot_count(family, counts, task_settings, base)
+                for slot_start in range(0, total_slots, _SLOT_BATCH_SIZE):
+                    yield PerturbationTask(
+                        base=base,
+                        base_structure_id=base_structure_id,
+                        settings=task_settings,
+                        counts=counts,
+                        seed=seed,
+                        family=family,
+                        slot_start=slot_start,
+                        slot_stop=min(slot_start + _SLOT_BATCH_SIZE, total_slots),
+                    )
+
+    def _batch_task_count(
+        self,
+        base_structures: Iterable[Any],
+        counts: PerturbationCounts,
+        settings: PerturbationSettings | None = None,
+    ) -> int:
+        """Count bounded tasks without materialising candidate structures."""
+
+        task_settings = settings or self.settings
+        total = 0
+        for base in base_structures:
+            for family in _FAMILY_ORDER:
+                if family != "unperturbed" and not family_applies_to_base(
+                    family, base, task_settings
+                ):
+                    continue
+                slots = self._family_slot_count(family, counts, task_settings, base)
+                total += (slots + _SLOT_BATCH_SIZE - 1) // _SLOT_BATCH_SIZE
+        return total
+
     def generate_candidates(
         self,
         base_structures: list[Any],
@@ -526,7 +864,10 @@ class PerturbationCoordinator:
     ) -> list[Any]:
         """Generate candidates without persistence, preserving task order."""
 
-        n_workers = self._effective_worker_count(n_workers, len(base_structures))
+        n_workers = self._effective_worker_count(
+            n_workers,
+            self._batch_task_count(base_structures, counts),
+        )
         self._rejected_attempts = []
         self._provenance_records = ()
         self._duplicate_count = 0
@@ -566,19 +907,6 @@ class PerturbationCoordinator:
     ) -> Path:
         """Run typed tasks and persist candidates in deterministic base order."""
 
-        n_workers = self._effective_worker_count(n_workers, len(base_structures))
-        self._total = 0
-        self._by_type = {}
-        self._by_config = {}
-        self._rejected_attempts = []
-        self._provenance_records = ()
-        self._duplicate_count = 0
-        self._magnetic_summary = None
-        self._task_elapsed_seconds = {}
-        output_dir = Path(output_dir)
-        output_dir.mkdir(parents=True, exist_ok=True)
-        output_file = output_dir / "generated_structures.xyz"
-        self._output_file = output_file
         counts = self._counts(
             n_rattled=n_rattled,
             n_liquid_configurations=n_liquid_configurations,
@@ -596,13 +924,27 @@ class PerturbationCoordinator:
             n_surfaces=0,
             n_grain_boundaries=n_grain_boundaries,
         )
+        batch_task_count = self._batch_task_count(base_structures, counts)
+        n_workers = self._effective_worker_count(n_workers, batch_task_count)
+        self._total = 0
+        self._by_type = {}
+        self._by_config = {}
+        self._rejected_attempts = []
+        self._provenance_records = ()
+        self._duplicate_count = 0
+        self._magnetic_summary = None
+        self._task_elapsed_seconds = {}
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        output_file = output_dir / "generated_structures.xyz"
+        self._output_file = output_file
         atom_counts = [len(base) for base in base_structures]
         atom_count_summary = "0" if not atom_counts else f"{min(atom_counts)}-{max(atom_counts)}"
         family_plan = ", ".join(self._planned_families(counts, self.settings))
         logger.info(
             "Starting perturbations: tasks=%s, workers=%s, submission_window=%s, "
             "base_atoms=%s, families=%s, output=%s",
-            len(base_structures),
+            batch_task_count,
             n_workers,
             1 if n_workers == 1 else 2 * n_workers,
             atom_count_summary,
@@ -651,7 +993,7 @@ class PerturbationCoordinator:
                         "Perturbation task %s/%s complete: source=%s base=%s accepted=%s "
                         "published=%s duplicates=%s rejected=%s elapsed=%.1fs workers=%s",
                         task_index,
-                        len(base_structures),
+                        batch_task_count,
                         source,
                         result.task.base_structure_id,
                         len(result.candidates),
