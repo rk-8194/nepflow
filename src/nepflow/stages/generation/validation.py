@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
+from ase.neighborlist import neighbor_list
 
 from nepflow.config.models import (
     ALL_SOURCES,
@@ -39,6 +40,19 @@ class CandidateValidationIssue:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "evidence", dict(self.evidence))
+
+
+@dataclass(frozen=True, slots=True)
+class _PairDistanceSearchResult:
+    """Outcome of a bounded pair-distance search.
+
+    ``distance=None`` with ``available=True`` means that no distinct atom pair
+    lies within the search cutoff. It is a valid result, not an unavailable
+    distance measurement.
+    """
+
+    distance: float | None
+    available: bool
 
 
 _RELAXED_GEOMETRY_FAMILIES = frozenset(
@@ -126,8 +140,9 @@ def validate_generated_candidate(
             return issue
 
     minimum_distance = _minimum_pair_distance_threshold(settings, family)
-    measured_distance = _minimum_pair_distance(candidate, pbc)
-    if len(candidate) >= 2 and measured_distance is None:
+    distance_search = _bounded_pair_distance_search(candidate, pbc, minimum_distance)
+    measured_distance = distance_search.distance
+    if len(candidate) >= 2 and not distance_search.available:
         return CandidateValidationIssue("pair_distance_unavailable", {})
     if measured_distance is not None and measured_distance <= 1.0e-12:
         return CandidateValidationIssue(
@@ -186,17 +201,55 @@ def _minimum_pair_distance_threshold(settings: Any, family: str) -> float | None
 
 
 def _minimum_pair_distance(candidate: Any, pbc: np.ndarray) -> float | None:
+    """Return a bounded-search minimum, retaining the legacy helper shape."""
+
+    result = _bounded_pair_distance_search(candidate, pbc, None)
+    return result.distance if result.available else None
+
+
+def _bounded_pair_distance_search(
+    candidate: Any,
+    pbc: np.ndarray,
+    threshold: float | None,
+) -> _PairDistanceSearchResult:
+    """Search only the periodic neighbour list needed for this validation.
+
+    ASE's neighbour-list cell bins avoid constructing an ``N x N`` distance
+    matrix. The cutoff is advanced by one representable float so pairs exactly
+    on the configured boundary are discovered; the validation comparison still
+    uses the original strict threshold, preserving the previous acceptance
+    contract. A relaxed family searches only for the overlap guard.
+    """
+
     if len(candidate) < 2:
-        return None
+        return _PairDistanceSearchResult(None, True)
+    overlap_threshold = 1.0e-12
+    cutoff = overlap_threshold
+    if threshold is not None:
+        try:
+            numeric_threshold = float(threshold)
+        except (TypeError, ValueError, OverflowError):
+            return _PairDistanceSearchResult(None, False)
+        if not math.isfinite(numeric_threshold):
+            return _PairDistanceSearchResult(None, False)
+        cutoff = max(cutoff, numeric_threshold)
+    search_cutoff = float(np.nextafter(cutoff, np.inf))
     try:
-        distances = np.asarray(candidate.get_all_distances(mic=bool(np.any(pbc))), dtype=float)
-        upper = distances[np.triu_indices(len(candidate), k=1)]
+        indices, neighbours, distances = neighbor_list(
+            "ijd",
+            candidate,
+            search_cutoff,
+            self_interaction=False,
+        )
+        del indices, neighbours
+        values = np.asarray(distances, dtype=float)
     except Exception:
-        return None
-    if upper.size == 0:
-        return None
-    minimum = float(np.min(upper))
-    return minimum if np.isfinite(minimum) else None
+        return _PairDistanceSearchResult(None, False)
+    if values.ndim != 1 or not np.isfinite(values).all():
+        return _PairDistanceSearchResult(None, False)
+    if values.size == 0:
+        return _PairDistanceSearchResult(None, True)
+    return _PairDistanceSearchResult(float(np.min(values)), True)
 
 
 def _validate_family_state(

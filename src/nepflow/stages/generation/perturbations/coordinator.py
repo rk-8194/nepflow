@@ -800,7 +800,10 @@ class PerturbationCoordinator:
         if family == "surface":
             if not settings.surface_enabled or base is None:
                 return 0
-            return surface_slot_count(base, settings)
+            total = surface_slot_count(base, settings)
+            if len(settings.surface_miller_indices) == 1 and counts.n_surfaces > 0:
+                return min(counts.n_surfaces, total)
+            return total
         if family == "grain_boundary":
             return min(1, counts.n_grain_boundaries)
         raise KeyError(f"Unknown perturbation family: {family}")
@@ -918,10 +921,9 @@ class PerturbationCoordinator:
             n_antisites=n_antisites,
             n_vacancy_interstitial=n_vacancy_interstitial,
             n_gas_in_vacancy=n_gas_in_vacancy,
-            # Surface execution is orientation/termination driven. Retain the
-            # parameter for API compatibility, but do not pass its legacy
-            # global cap into the typed task plan.
-            n_surfaces=0,
+            # A positive legacy cap applies only to the single-orientation
+            # compatibility path; multi-orientation plans remain uncapped.
+            n_surfaces=n_surfaces,
             n_grain_boundaries=n_grain_boundaries,
         )
         batch_task_count = self._batch_task_count(base_structures, counts)
