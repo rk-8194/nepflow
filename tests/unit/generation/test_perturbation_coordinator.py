@@ -2,6 +2,8 @@
 
 import logging
 import pickle
+import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import MappingProxyType
 
@@ -377,6 +379,43 @@ def test_one_perturbation_task_represents_one_base_structure() -> None:
     assert all(task.task_key[2:] == (0, 1) for task in tasks)
 
 
+@pytest.mark.parametrize("n_workers", (1, 2))
+def test_parent_supercell_is_prepared_once_for_all_family_batches(
+    monkeypatch: pytest.MonkeyPatch,
+    n_workers: int,
+) -> None:
+    """A no-topology parent is prepared once before family batching."""
+
+    base = scoped_base("mp_phase")
+    settings = PerturbationSettings(
+        target_n_atoms=4,
+        random_seed=21,
+        n_volume_points=0,
+        elastic_stress_enabled=False,
+    )
+    counts = PerturbationCounts(n_rattled=9, n_vacancies=9, n_interstitials=0)
+    coordinator = PerturbationCoordinator(settings=settings)
+    original_build = coordinator_module.build_target_supercell
+    build_calls = 0
+
+    def record_build(*args, **kwargs):
+        nonlocal build_calls
+        build_calls += 1
+        return original_build(*args, **kwargs)
+
+    monkeypatch.setattr(coordinator_module, "build_target_supercell", record_build)
+    tasks = list(coordinator._tasks([base], counts))
+
+    assert len(tasks) > 2
+    assert build_calls == 1
+    assert all(task.prepared_supercell is tasks[0].prepared_supercell for task in tasks)
+
+    results = list(coordinator._execute(tasks, n_workers=n_workers))
+    assert [result.task.task_key for result in results] == [task.task_key for task in tasks]
+    assert results[0].candidates[0].info["perturbation_type"] == "unperturbed"
+    assert results[0].provenance_records[0].provenance.perturbation_family == "unperturbed"
+
+
 def test_serial_and_parallel_candidates_are_ordered_and_scientifically_equal() -> None:
     first = base_atoms(source="first", seed_id="seed-first")
     second = base_atoms(source="second", seed_id="seed-second")
@@ -530,6 +569,45 @@ def test_execution_harness_bounds_parallel_window_and_preserves_result_order(
     assert harness.first_result_submission_count == 4
     assert harness.first_result_submission_count < len(tasks)
     assert harness.shutdown_calls == [(True, False)]
+
+
+def test_parallel_collector_tracks_completed_later_tasks_before_slow_head(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Completed futures behind a slow head are buffered and reported."""
+
+    settings = PerturbationSettings(
+        target_n_atoms=4,
+        random_seed=21,
+        n_volume_points=0,
+        elastic_stress_enabled=False,
+    )
+    coordinator = PerturbationCoordinator(settings=settings)
+    bases = [base_atoms(source=f"base-{index}") for index in range(3)]
+    tasks = list(
+        coordinator._tasks(
+            bases,
+            PerturbationCounts(n_rattled=0, n_vacancies=0, n_interstitials=0),
+        )
+    )
+    original_execute = coordinator_module.execute_perturbation_task
+
+    def controlled_worker(task):
+        if task.base.info["source"] == "base-0":
+            time.sleep(0.15)
+        return original_execute(task)
+
+    monkeypatch.setattr(coordinator_module, "execute_perturbation_task", controlled_worker)
+    monkeypatch.setattr(coordinator_module, "ProcessPoolExecutor", ThreadPoolExecutor)
+
+    with caplog.at_level(logging.INFO, logger=coordinator_module.__name__):
+        results = list(coordinator._execute(tasks, n_workers=2))
+
+    assert [result.task.base_structure_id for result in results] == [
+        task.base_structure_id for task in tasks
+    ]
+    assert any("finished awaiting order" in record.getMessage() for record in caplog.records)
 
 
 @pytest.mark.parametrize("n_workers", (1, 2))

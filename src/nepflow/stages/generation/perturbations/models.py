@@ -341,6 +341,10 @@ class PerturbationTask:
     family: str | None = None
     slot_start: int = 0
     slot_stop: int | None = None
+    # Prepared once by the parent coordinator for batched execution.  Workers
+    # copy this context before any family mutates it; it is not part of task
+    # identity or scientific provenance.
+    prepared_supercell: Any = field(default=None, compare=False, repr=False)
     # This is populated only by the parent coordinator.  It is intentionally
     # excluded from identity/equality: the scientific task contract is the
     # base/family/slot tuple, while the queue is an execution detail.

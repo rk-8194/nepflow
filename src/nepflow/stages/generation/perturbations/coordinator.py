@@ -30,7 +30,7 @@ from nepflow.domain.identities import (
     calculate_structure_id,
 )
 from nepflow.domain.structures import GeneratedStructureRecord
-from nepflow.stages.generation.supercell import build_target_supercell
+from nepflow.stages.generation.supercell import build_target_supercell, require_parent_topology
 from nepflow.stages.generation.validation import (
     CandidateValidationIssue,
     validate_generated_candidate,
@@ -659,9 +659,15 @@ def _execute_perturbation_batch(task: PerturbationTask) -> PerturbationTaskResul
         raise ValueError("perturbation batch slot window is invalid")
 
     settings = task.settings
-    supercell = build_target_supercell(task.base, target_n_atoms=settings.target_n_atoms)
-    if supercell is None:
-        raise RuntimeError("target supercell construction returned no structure")
+    if task.prepared_supercell is None:
+        # Preserve the direct/manual task compatibility path. Coordinator
+        # batches always carry a parent-prepared context from _batch_tasks.
+        supercell = build_target_supercell(task.base, target_n_atoms=settings.target_n_atoms)
+        if supercell is None:
+            raise RuntimeError("target supercell construction returned no structure")
+    else:
+        supercell = task.prepared_supercell.copy()
+        require_parent_topology(supercell)
 
     candidate_records: dict[int, Any] = {}
 
@@ -1088,6 +1094,19 @@ class PerturbationCoordinator:
             return min(1, counts.n_grain_boundaries)
         raise KeyError(f"Unknown perturbation family: {family}")
 
+    @staticmethod
+    def _prepare_base_supercell(
+        base: Any,
+        settings: PerturbationSettings,
+    ) -> Any:
+        """Prepare one validated mutable-worker context for one source base."""
+
+        prepared = build_target_supercell(base, target_n_atoms=settings.target_n_atoms)
+        if prepared is None:
+            raise RuntimeError("target supercell construction returned no structure")
+        require_parent_topology(prepared)
+        return prepared
+
     def _batch_tasks(
         self,
         base_structures: Iterable[Any],
@@ -1100,6 +1119,7 @@ class PerturbationCoordinator:
         for base_ordinal, base in enumerate(base_structures):
             base_structure_id = calculate_structure_id(base)
             seed = int(self.rng.randint(0, 2**31))
+            prepared_supercell = self._prepare_base_supercell(base, task_settings)
             for family in _FAMILY_ORDER:
                 if family != "unperturbed" and not family_applies_to_base(
                     family, base, task_settings
@@ -1117,6 +1137,7 @@ class PerturbationCoordinator:
                         family=family,
                         slot_start=slot_start,
                         slot_stop=min(slot_start + _SLOT_BATCH_SIZE, total_slots),
+                        prepared_supercell=prepared_supercell,
                     )
 
     def _batch_task_count(
@@ -1451,7 +1472,11 @@ class PerturbationCoordinator:
         # disconnected worker cannot deadlock the process pool.
         manager = Manager()
         progress_queue = manager.Queue(maxsize=max(32, submission_window * 4))
-        pool = ProcessPoolExecutor(max_workers=n_workers)
+        try:
+            pool = ProcessPoolExecutor(max_workers=n_workers)
+        except BaseException:
+            manager.shutdown()
+            raise
 
         def fill_submission_window() -> None:
             nonlocal exhausted, submitted_count
@@ -1461,15 +1486,16 @@ class PerturbationCoordinator:
                 except StopIteration:
                     exhausted = True
                     return
-                submitted_count += 1
                 worker_task = replace(task, progress_queue=progress_queue)
-                pending[submitted_count] = (
-                    task,
-                    pool.submit(execute_perturbation_task, worker_task),
-                    monotonic(),
-                )
-                publication_order.append(submitted_count)
-                tracker.register(submitted_count, task)
+                task_index = submitted_count + 1
+                try:
+                    future = pool.submit(execute_perturbation_task, worker_task)
+                except Exception as exc:
+                    raise PerturbationTaskError(task, exc) from exc
+                submitted_count = task_index
+                pending[task_index] = (task, future, monotonic())
+                publication_order.append(task_index)
+                tracker.register(task_index, task)
 
         def cancel_pending() -> None:
             for _task, future, _started_at in pending.values():
@@ -1551,11 +1577,17 @@ class PerturbationCoordinator:
 
                 if pending:
                     futures = [future for _task, future, _started_at in pending.values()]
-                    done, _not_done = wait(
-                        futures,
-                        timeout=_HEARTBEAT_INTERVAL_SECONDS,
-                        return_when=FIRST_COMPLETED,
-                    )
+                    try:
+                        done, _not_done = wait(
+                            futures,
+                            timeout=_HEARTBEAT_INTERVAL_SECONDS,
+                            return_when=FIRST_COMPLETED,
+                        )
+                    except Exception as exc:
+                        head_entry = pending.get(publication_order[0])
+                        if head_entry is not None:
+                            raise PerturbationTaskError(head_entry[0], exc) from exc
+                        raise
                     self._drain_progress_events(progress_queue, tracker)
                     if not done:
                         head_task = pending.get(publication_order[0])
@@ -1594,10 +1626,10 @@ class PerturbationCoordinator:
                     yield from publish_ready()
         except BaseException:
             cancel_pending()
-            pool.shutdown(wait=False, cancel_futures=True)
+            self._shutdown_pool(pool, terminate_running=True)
             raise
         else:
-            pool.shutdown(wait=True)
+            self._shutdown_pool(pool, terminate_running=False)
         finally:
             if manager is not None:
                 manager.shutdown()
@@ -1613,6 +1645,54 @@ class PerturbationCoordinator:
                 return
             if isinstance(event, PerturbationProgressEvent):
                 tracker.event(event)
+
+    @staticmethod
+    def _shutdown_pool(pool: Any, *, terminate_running: bool) -> None:
+        """Shut down a process pool, terminating active workers on failure.
+
+        Python 3.11--3.13 do not expose the public worker-termination methods
+        added later.  The private process handles are the only compatible
+        fallback; they are used only during failure/interruption cleanup.
+        """
+
+        if not terminate_running:
+            pool.shutdown(wait=True, cancel_futures=False)
+            return
+
+        terminate_workers = getattr(pool, "terminate_workers", None)
+        if callable(terminate_workers):
+            terminate_workers()
+            return
+
+        processes = getattr(pool, "_processes", None)
+        if not isinstance(processes, dict):
+            # Test doubles and alternate executors may not expose process
+            # handles; retain their normal cancellation contract.
+            pool.shutdown(wait=False, cancel_futures=True)
+            return
+
+        workers = list(processes.values())
+        for worker in workers:
+            try:
+                if worker.is_alive():
+                    worker.terminate()
+            except (OSError, AttributeError):
+                continue
+        for worker in workers:
+            try:
+                worker.join(timeout=5.0)
+            except (OSError, AttributeError):
+                continue
+        for worker in workers:
+            try:
+                if worker.is_alive():
+                    kill = getattr(worker, "kill", None)
+                    if callable(kill):
+                        kill()
+                    worker.join(timeout=5.0)
+            except (OSError, AttributeError):
+                continue
+        pool.shutdown(wait=True, cancel_futures=True)
 
     @staticmethod
     def _execute_one(task: PerturbationTask) -> PerturbationTaskResult:
