@@ -114,9 +114,11 @@ def test_no_allowed_repeat_fails_explicitly() -> None:
 
 
 class BalancedSQSBackend:
-    def generate(self, *, primitive, max_size, target_concentrations, random_seed):
-        del primitive, max_size, target_concentrations, random_seed
-        return Atoms("W2Cr2", cell=np.eye(3) * 3.0, pbc=True)
+    def generate(self, *, primitive, supercells, target_concentrations, random_seed):
+        del primitive, random_seed
+        result = supercells[0].copy()
+        result.set_chemical_symbols(["W"] * 4 + ["Cr"] * 4)
+        return result
 
 
 def test_random_sqs_and_segregated_preserve_realization_metadata() -> None:
@@ -145,4 +147,4 @@ def test_random_sqs_and_segregated_preserve_realization_metadata() -> None:
 
     assert len(random) == 8
     assert len(segregated) == 8
-    assert len(sqs) == 4
+    assert len(sqs) == 8

@@ -1,7 +1,6 @@
 import unittest
 from collections import Counter
 
-import numpy as np
 import pytest
 
 pytest.importorskip("ase")
@@ -10,22 +9,13 @@ from ase import Atoms  # noqa: E402
 
 from nepflow.stages.generation.generators.composition_primitives import (  # noqa: E402
     allocate_crystal_quota,
+    calculate_composition_realization,
 )
 from nepflow.stages.generation.generators.random_solution import (  # noqa: E402
     RandomSolidSolutionGenerator,
 )
 from nepflow.stages.generation.generators.segregated import SegregatedGenerator  # noqa: E402
 from nepflow.stages.generation.generators.sqs import SQSGenerator  # noqa: E402
-
-
-def make_atoms(symbols: str = "Si4") -> Atoms:
-    atoms = Atoms(
-        symbols,
-        positions=np.arange(3 * len(Atoms(symbols))).reshape((-1, 3)).astype(float),
-        cell=np.eye(3) * 3.0,
-        pbc=True,
-    )
-    return atoms
 
 
 class SQSBackendBoundary:
@@ -35,11 +25,27 @@ class SQSBackendBoundary:
         self.calls: list[dict[str, object]] = []
         self.fail_on_call = fail_on_call
 
-    def generate(self, **kwargs):
-        self.calls.append(dict(kwargs))
+    def generate(self, *, primitive, supercells, target_concentrations, random_seed):
+        del primitive
+        self.calls.append(
+            {
+                "supercells": tuple(supercells),
+                "target_concentrations": dict(target_concentrations),
+                "random_seed": random_seed,
+            }
+        )
         if self.fail_on_call == len(self.calls):
             raise RuntimeError("primary SQS generation unavailable")
-        return make_atoms("Si2Ge2")
+        result = supercells[0].copy()
+        realization = calculate_composition_realization(target_concentrations, len(result))
+        result.set_chemical_symbols(
+            [
+                element
+                for element, count in realization.counts.items()
+                for _ in range(count)
+            ]
+        )
+        return result
 
 
 class ConfigurationalGeneratorTests(unittest.TestCase):
@@ -185,6 +191,7 @@ class ConfigurationalGeneratorTests(unittest.TestCase):
         self.assertEqual(results[0].info["composition"], self.composition)
         self.assertEqual(results[0].info["crystal_structure"], "bcc")
         self.assertEqual(results[0].info["source"], "sqs-Si0.5-Ge0.5-bcc-0")
+        self.assertEqual(len(backend.calls[0]["supercells"][0]), 8)
 
     def test_sqs_failure_on_later_slot_does_not_return_partial_results(self) -> None:
         backend = SQSBackendBoundary(fail_on_call=2)
@@ -221,8 +228,8 @@ class ConfigurationalGeneratorTests(unittest.TestCase):
 
     def test_sqs_backend_failure_is_wrapped_at_the_generator_boundary(self) -> None:
         class UnavailableBackend:
-            def generate(self, **kwargs):
-                del kwargs
+            def generate(self, *, primitive, supercells, target_concentrations, random_seed):
+                del primitive, supercells, target_concentrations, random_seed
                 raise ImportError("icet backend unavailable")
 
         with self.assertRaisesRegex(RuntimeError, "icet backend unavailable"):

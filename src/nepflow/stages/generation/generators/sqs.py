@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from typing import Any, Protocol
 
+import numpy as np
 from ase.build import bulk
 
 from nepflow.stages.generation.supercell import build_target_supercell
@@ -25,7 +26,7 @@ class SQSBackend(Protocol):
         self,
         *,
         primitive: Any,
-        max_size: int,
+        supercells: Sequence[Any],
         target_concentrations: Mapping[str, float],
         random_seed: int,
     ) -> Any: ...
@@ -34,9 +35,18 @@ class SQSBackend(Protocol):
 class IcetSQSBackend:
     """Adapter around the declared icet SQS API."""
 
-    def __init__(self, cluster_space_factory: Any, generator: Any) -> None:
+    def __init__(
+        self,
+        cluster_space_factory: Any,
+        generator: Any,
+        *,
+        n_steps: int = 5000,
+    ) -> None:
+        if n_steps <= 0:
+            raise ValueError("SQS n_steps must be positive")
         self.cluster_space_factory = cluster_space_factory
         self.generator = generator
+        self.n_steps = n_steps
 
     @classmethod
     def from_environment(cls) -> "IcetSQSBackend":
@@ -54,21 +64,23 @@ class IcetSQSBackend:
         self,
         *,
         primitive: Any,
-        max_size: int,
+        supercells: Sequence[Any],
         target_concentrations: Mapping[str, float],
         random_seed: int,
     ) -> Any:
         active_elements = sorted(target_concentrations)
+        candidates = _validated_supercells(primitive, supercells)
+        chemical_symbols = [list(active_elements) for _ in range(len(primitive))]
         cluster_space = self.cluster_space_factory(
             primitive,
             cutoffs=[6.0],
-            chemical_symbols=[active_elements],
+            chemical_symbols=chemical_symbols,
         )
         return self.generator(
             cluster_space=cluster_space,
-            max_size=max_size,
+            supercells=list(candidates),
             target_concentrations=dict(target_concentrations),
-            n_steps=5000,
+            n_steps=self.n_steps,
             random_seed=random_seed,
         )
 
@@ -114,9 +126,9 @@ class SQSGenerator:
             if crystal_quota == 0:
                 continue
             try:
+                primitive = _sqs_primitive(majority_element, crystal_structure)
                 supercell = build_target_supercell(
-                    majority_element,
-                    crystal_structure,
+                    primitive,
                     target_n_atoms,
                     composition=composition,
                     composition_tolerance=self.composition_tolerance,
@@ -136,14 +148,9 @@ class SQSGenerator:
             for crystal_slot in range(crystal_quota):
                 slot_seed = self.random_seed + output_slot
                 try:
-                    primitive = (
-                        bulk(majority_element, "hcp", a=3.0, c=3.0 * 1.633)
-                        if crystal_structure == "hcp"
-                        else bulk(majority_element, crystal_structure, a=3.0)
-                    )
                     sqs_atoms = backend.generate(
                         primitive=primitive,
-                        max_size=len(supercell),
+                        supercells=(supercell,),
                         target_concentrations=target_concentrations,
                         random_seed=slot_seed,
                     )
@@ -176,3 +183,53 @@ class SQSGenerator:
                     ) from exc
                 output_slot += 1
         return results
+
+
+def _sqs_primitive(element: str, crystal_structure: str) -> Any:
+    """Build the exact parent primitive used by the supercell planner."""
+
+    if crystal_structure == "hcp":
+        return bulk(element, "hcp", a=3.0, c=3.0 * 1.633)
+    return bulk(element, crystal_structure, a=3.0)
+
+
+def _validated_supercells(primitive: Any, supercells: Sequence[Any]) -> tuple[Any, ...]:
+    """Validate that every icet candidate is an integer repeat of ``primitive``."""
+
+    candidates = tuple(supercells)
+    if not candidates:
+        raise SQSGenerationError("SQS generation requires at least one planned supercell")
+    if len(primitive) <= 0:
+        raise SQSGenerationError("SQS primitive must contain at least one site")
+    try:
+        primitive_cell = np.asarray(primitive.cell.array, dtype=float)
+        inverse_primitive_cell = np.linalg.inv(primitive_cell)
+        primitive_pbc = tuple(bool(value) for value in primitive.pbc)
+    except (AttributeError, TypeError, ValueError, np.linalg.LinAlgError) as exc:
+        raise SQSGenerationError("SQS primitive has invalid lattice geometry") from exc
+    if primitive_cell.shape != (3, 3) or not np.isfinite(primitive_cell).all():
+        raise SQSGenerationError("SQS primitive has invalid lattice geometry")
+
+    for supercell in candidates:
+        try:
+            supercell_cell = np.asarray(supercell.cell.array, dtype=float)
+            supercell_pbc = tuple(bool(value) for value in supercell.pbc)
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise SQSGenerationError("SQS supercell has invalid lattice geometry") from exc
+        if (
+            len(supercell) <= 0
+            or supercell_cell.shape != (3, 3)
+            or not np.isfinite(supercell_cell).all()
+            or supercell_pbc != primitive_pbc
+        ):
+            raise SQSGenerationError("SQS supercell is incompatible with its primitive")
+        transformation = supercell_cell @ inverse_primitive_cell
+        rounded_transformation = np.rint(transformation)
+        if not np.allclose(
+            transformation, rounded_transformation, rtol=0.0, atol=1.0e-8
+        ):
+            raise SQSGenerationError("SQS supercell is not an integer repeat of its primitive")
+        multiplicity = abs(int(round(float(np.linalg.det(rounded_transformation)))))
+        if multiplicity <= 0 or len(supercell) != len(primitive) * multiplicity:
+            raise SQSGenerationError("SQS supercell site count is incompatible with its primitive")
+    return candidates
