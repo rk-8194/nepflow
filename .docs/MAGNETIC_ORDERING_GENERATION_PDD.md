@@ -2,7 +2,7 @@
 
 **Document status:** Proposed master PDD for magnetic configuration generation  
 **Initial implementation scope:** Non-magnetic, ferromagnetic, and collinear antiferromagnetic configurations  
-**Target branch reviewed:** dev at 3a15614d6beda9015853f2ad3fbf8863f7a21721  
+**Target branch reviewed:** dev at 9ed162659af0ca0f381c93e76b309ef3bf788a8a  
 **Governing documents:** .docs/MASTER_PDD.md, .docs/CODEBASE_ARCHITECTURE_AND_STYLE_PDD.md, .docs/STRUCTURE_GENERATION_PDD.md, .docs/SELECTION_PDD.md, .docs/VASP_PDD.md, .docs/plan/07_INFORMATION_ENTROPY_SELECTION.md  
 **Primary purpose:** Extend NEPFlow generation so that a structural candidate can be expanded into controlled magnetic configurations before information-entropy selection and DFT labelling.
 
@@ -1172,39 +1172,175 @@ The VASP backend must not calculate identity from the shared template INCAR and 
 
 ---
 
-## 24. Recommended configuration model
+## 24. Canonical configuration model
 
-Magnetism should be a first-class root configuration section rather than being mixed into structural GenerationConfig.
+Magnetism shall be a first-class root configuration section rather than being mixed into structural `GenerationConfig`.
 
-Conceptually:
+The canonical project-config vocabulary is:
 
     [magnetism]
-    enabled=true
-    include_nonmagnetic=true
-    include_ferromagnetic=true
-    include_antiferromagnetic=true
+    enabled=false
+    target_potential_magnetic=false
+    include_non_magnetic=true
+    include_ferromagnetic=false
+    include_antiferromagnetic=false
+
+    moment_sets=
     symmetry_tolerance=0.001
     phase_tolerance=1e-8
-    max_afm_orderings_per_structure=16
-    unmapped_afm_policy=omit
+    max_afm_orderings=16
+    unmapped_site_policy=skip_afm
+    magnetic_sources=all
 
-    moment_sets=[
-      {"name":"low","moments":{"Fe":2.5,"Cr":1.5}},
-      {"name":"nominal","moments":{"Fe":3.5,"Cr":2.5}},
-      {"name":"high","moments":{"Fe":4.5,"Cr":3.5}}
-    ]
+    defect_families=
+    max_defect_parents=0
+    max_magnetic_variants_per_parent=16
+    max_magnetic_variants_per_defect=16
 
-The exact textual syntax should follow the existing configuration parser conventions rather than introducing a second ad-hoc parser.
+These names are normative for newly rendered `project.config` files and documentation. Compatibility aliases may remain in the parser for existing projects, but new documentation and templates shall not introduce alternative spellings.
 
-Typed models are required.
+In particular, the canonical names are:
 
-Suggested domain/config records:
+- `include_non_magnetic`, not `include_nonmagnetic`;
+- `max_afm_orderings`, not `max_afm_orderings_per_structure`;
+- `unmapped_site_policy`, not `unmapped_afm_policy`.
 
-- MagnetismConfig;
-- MagneticMomentSetConfig;
-- MagneticOrdering enum;
-- MagneticState;
-- MagneticGenerationSummary.
+The parser may continue to accept documented historical aliases where necessary, but aliases are a compatibility boundary rather than a second configuration vocabulary.
+
+### 24.1 Activation and target-potential capability
+
+`enabled` controls whether magnetic candidate expansion is active.
+
+`target_potential_magnetic` is an explicit capability declaration for the intended downstream potential/training workflow. FM or AFM generation shall not be enabled unless this capability is true.
+
+The default project template shall remain conservative:
+
+    enabled=false
+    target_potential_magnetic=false
+    include_non_magnetic=true
+    include_ferromagnetic=false
+    include_antiferromagnetic=false
+
+Turning on `enabled` alone therefore does not silently create FM or AFM candidates.
+
+### 24.2 Moment-set configuration
+
+`moment_sets` is the explicit named local-moment hypothesis configuration defined in Section 6.
+
+The default project template shall leave:
+
+    moment_sets=
+
+blank.
+
+This is intentional. NEPFlow shall not invent generic magnetic moments for the configured elements. The initial design explicitly prohibits hidden chemistry inference, oxidation-state inference, or guessed local moments.
+
+The generated config shall nevertheless contain commented examples showing the required named-set syntax, for example:
+
+    # Example only; choose scientifically justified values for the project:
+    # moment_sets={"low":{"Fe":2.5,"Cr":1.5},"nominal":{"Fe":3.5,"Cr":2.5},"high":{"Fe":4.5,"Cr":3.5}}
+
+These values are illustrative only and shall never be activated automatically.
+
+When FM or AFM generation is requested, validation shall require at least one valid named moment set.
+
+### 24.3 AFM enumeration controls
+
+The canonical defaults are:
+
+    symmetry_tolerance=0.001
+    phase_tolerance=1e-8
+    max_afm_orderings=16
+    unmapped_site_policy=skip_afm
+
+`symmetry_tolerance` controls the crystallographic/topology symmetry boundary used by magnetic ordering support.
+
+`phase_tolerance` controls the numerical tolerance used when validating whether a candidate half-grid propagation phase is compatible with the initial real two-sign collinear model.
+
+`max_afm_orderings` is the explicit maximum number of retained AFM states per structural parent after deterministic enumeration and exact magnetic-state deduplication. Truncation shall be recorded in diagnostics and shall never be silent.
+
+`unmapped_site_policy` controls what happens when a magnetic atom cannot be assigned an AFM sign from preserved parent topology. Version-1 supported policies are:
+
+- `skip_afm`: omit AFM variants for that structural parent while retaining otherwise valid magnetic paths;
+- `allow_fm_only`: explicitly permit only the topology-independent FM path for that unsupported AFM parent;
+- `reject`: fail the magnetic-expansion unit rather than accept incomplete AFM coverage.
+
+The default is `skip_afm`. This is the canonical spelling of the earlier conceptual PDD policy `omit`.
+
+No policy may guess a sign for an unmapped magnetic site.
+
+### 24.4 Structural source scope
+
+`magnetic_sources` controls which configurational-source families are eligible for magnetic expansion.
+
+The default is:
+
+    magnetic_sources=all
+
+This means all supported configurational sources are eligible subject to the structural-family rules below.
+
+The value uses the same normalized source-scope vocabulary as structural generation. `all` shall not be combined with named sources.
+
+### 24.5 Pristine and defect-family scope
+
+Magnetic expansion of defected structures is opt-in by defect family.
+
+The default is:
+
+    defect_families=
+
+A blank value means **pristine/unperturbed structural parents only**. It does not mean "all defect families".
+
+When populated, `defect_families` shall contain only explicitly supported point-defect families, currently including the supported vacancy/interstitial/substitution/antisite-derived families defined by the typed configuration model.
+
+This separation is intentional:
+
+- `magnetic_sources` controls the configurational source from which a structural parent originated;
+- `defect_families` controls which derived defect perturbation families are additionally eligible for magnetic expansion.
+
+The two controls shall not be conflated.
+
+### 24.6 Run-global defect-parent budget
+
+`max_defect_parents` limits how many eligible defect structural parents are admitted to magnetic expansion over one generation run.
+
+The default is:
+
+    max_defect_parents=0
+
+For this field only, zero means **no run-global defect-parent cap**.
+
+This does not make defect magnetism active by itself: a blank `defect_families` still means no defect families are eligible.
+
+If a positive value is configured, parent admission shall be deterministic in canonical structural-candidate order. No random replacement policy is permitted.
+
+### 24.7 Per-parent magnetic-variant budgets
+
+The canonical defaults are:
+
+    max_magnetic_variants_per_parent=16
+    max_magnetic_variants_per_defect=16
+
+`max_magnetic_variants_per_parent` bounds the total magnetic variants retained for an eligible pristine/non-defect structural parent after NM/FM/AFM expansion.
+
+`max_magnetic_variants_per_defect` applies the equivalent total-variant budget to eligible defect structural parents.
+
+These budgets are distinct from `max_afm_orderings`:
+
+- `max_afm_orderings` limits only retained AFM states from the AFM enumerator;
+- the per-parent/per-defect variant budgets limit the final magnetic expansion emitted for that structural parent across enabled ordering classes.
+
+All budget truncation shall be deterministic and explicitly reported.
+
+### 24.8 Typed configuration and validation
+
+Typed models are required:
+
+- `MagnetismConfig`;
+- named magnetic moment-set records;
+- magnetic ordering enum;
+- magnetic state/candidate identity records;
+- magnetic generation summary/diagnostics.
 
 Validation shall reject:
 
@@ -1212,12 +1348,33 @@ Validation shall reject:
 - non-finite moment magnitudes;
 - non-positive configured magnetic magnitudes;
 - unknown element symbols;
-- zero/negative candidate budgets;
+- FM/AFM generation without a magnetic-capable target potential;
+- FM/AFM generation without at least one moment set;
+- zero/negative budgets where the field is defined as strictly positive;
+- negative `max_defect_parents`;
 - invalid tolerances;
-- enabled magnetic generation with no moment sets when FM/AFM are requested;
-- unsupported policy values.
+- unsupported unmapped-site policies;
+- unknown configurational source scopes;
+- duplicate or unsupported defect-family names.
 
----
+The special zero-as-unlimited meaning of `max_defect_parents` shall be explicit in both the PDD and generated config comments rather than being an undocumented implementation convention.
+
+### 24.9 Project-template documentation requirement
+
+`render_default_config()` shall expose every canonical `MagnetismConfig` field.
+
+Because magnetic configuration has scientific consequences, the generated `[magnetism]` section shall contain concise comments explaining at minimum:
+
+- magnetism is opt-in;
+- FM/AFM require `target_potential_magnetic=true`;
+- `moment_sets` must be supplied explicitly and example values are not defaults;
+- blank `defect_families` means pristine-only;
+- `max_defect_parents=0` means unlimited eligible defect parents;
+- `max_afm_orderings` is an AFM-only budget;
+- `max_magnetic_variants_per_parent` and `max_magnetic_variants_per_defect` are final per-parent variant budgets;
+- `unmapped_site_policy` controls unsupported AFM topology rather than inventing a fallback sign.
+
+The default template must remain directly loadable and valid with magnetism disabled.
 
 ## 25. Current dev-branch implementation architecture
 
