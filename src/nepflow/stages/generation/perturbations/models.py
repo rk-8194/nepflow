@@ -135,6 +135,7 @@ class PerturbationSettings:
     surface_miller_indices: tuple[tuple[int, int, int], ...] = ((1, 0, 0),)
     surface_layers: int = 3
     surface_thickness: float | None = None
+    # Minimum physical vacuum thickness in Angstrom; never an hkl-plane count.
     surface_vacuum: float = 10.0
     surface_termination_policy: str = "all"
     surface_max_terminations: int = 0

@@ -489,8 +489,18 @@ def _validate_surface_state(candidate: Any) -> CandidateValidationIssue | None:
         "parent_structure_id",
         "surface_miller_index",
         "surface_termination",
+        "surface_termination_identity",
         "surface_layers",
         "surface_vacuum",
+        "surface_requested_vacuum_angstrom",
+        "surface_realized_vacuum_angstrom",
+        "surface_reference_basis",
+        "surface_reference_basis_cell",
+        "surface_parent_to_reference_transformation",
+        "surface_normal",
+        "surface_backend",
+        "surface_backend_version",
+        "surface_planner_version",
         "surface_in_plane_repeat",
         "surface_stoichiometry_change",
     )
@@ -507,14 +517,83 @@ def _validate_surface_state(candidate: Any) -> CandidateValidationIssue | None:
         miller = tuple(int(value) for value in info["surface_miller_index"])
     except (TypeError, ValueError):
         return CandidateValidationIssue("invalid_surface_miller_index", {})
-    if len(miller) != 3 or not any(miller):
+    if len(miller) != 3 or not any(miller) or miller not in SUPPORTED_SURFACE_MILLER_INDICES:
         return CandidateValidationIssue("invalid_surface_miller_index", {"value": miller})
+    if info["surface_reference_basis"] != "parent_stored_cell":
+        return CandidateValidationIssue(
+            "invalid_surface_reference_basis",
+            {"value": info["surface_reference_basis"]},
+        )
+    try:
+        reference_cell = np.asarray(info["surface_reference_basis_cell"], dtype=float)
+        transform = np.asarray(info["surface_parent_to_reference_transformation"], dtype=float)
+    except (TypeError, ValueError):
+        return CandidateValidationIssue("invalid_surface_reference_basis", {})
+    if (
+        reference_cell.shape != (3, 3)
+        or not np.isfinite(reference_cell).all()
+        or abs(float(np.linalg.det(reference_cell))) <= 1.0e-10
+    ):
+        return CandidateValidationIssue("invalid_surface_reference_basis", {})
+    if (
+        transform.shape != (3, 3)
+        or not np.isfinite(transform).all()
+        or not np.allclose(transform, np.eye(3), rtol=0.0, atol=1.0e-12)
+    ):
+        return CandidateValidationIssue("invalid_surface_reference_transformation", {})
     try:
         vacuum = float(info["surface_vacuum"])
+        requested_vacuum = float(info["surface_requested_vacuum_angstrom"])
+        realized_vacuum = float(info["surface_realized_vacuum_angstrom"])
+        normal = np.asarray(info["surface_normal"], dtype=float)
     except (TypeError, ValueError):
-        return CandidateValidationIssue("invalid_surface_vacuum", {})
-    if not math.isfinite(vacuum) or vacuum <= 0.0:
-        return CandidateValidationIssue("invalid_surface_vacuum", {"value": vacuum})
+        return CandidateValidationIssue("invalid_surface_geometry_provenance", {})
+    if (
+        not math.isfinite(requested_vacuum)
+        or requested_vacuum <= 0.0
+        or not math.isfinite(vacuum)
+        or not math.isclose(vacuum, requested_vacuum, rel_tol=1.0e-6, abs_tol=1.0e-6)
+        or not math.isfinite(realized_vacuum)
+        or realized_vacuum + 1.0e-6 < requested_vacuum
+        or normal.shape != (3,)
+        or not np.isfinite(normal).all()
+        or not math.isclose(
+            float(np.linalg.norm(normal)), 1.0, rel_tol=1.0e-6, abs_tol=1.0e-6
+        )
+    ):
+        return CandidateValidationIssue(
+            "invalid_surface_geometry_provenance",
+            {
+                "requested_vacuum": requested_vacuum,
+                "realized_vacuum": realized_vacuum,
+            },
+        )
+    cell = np.asarray(candidate.cell, dtype=float)
+    if cell.shape != (3, 3) or not np.isfinite(cell).all():
+        return CandidateValidationIssue("invalid_surface_geometry", {})
+    cross = np.cross(cell[0], cell[1])
+    area = float(np.linalg.norm(cross))
+    if area <= 1.0e-12:
+        return CandidateValidationIssue("invalid_surface_geometry", {})
+    measured_normal = cross / area
+    projected = np.asarray(candidate.get_positions(), dtype=float) @ measured_normal
+    measured_thickness = float(np.max(projected) - np.min(projected)) if len(projected) else -1.0
+    measured_period = abs(float(np.linalg.det(cell))) / area if cell.shape == (3, 3) else 0.0
+    measured_vacuum = measured_period - measured_thickness
+    if (
+        not math.isfinite(measured_vacuum)
+        or not math.isclose(
+            measured_vacuum, realized_vacuum, rel_tol=1.0e-6, abs_tol=1.0e-6
+        )
+        or abs(float(np.dot(measured_normal, normal))) < 1.0 - 1.0e-6
+    ):
+        return CandidateValidationIssue(
+            "invalid_surface_geometry_measurement",
+            {
+                "measured_vacuum": measured_vacuum,
+                "recorded_vacuum": realized_vacuum,
+            },
+        )
     repeat = info["surface_in_plane_repeat"]
     try:
         repeat_values = tuple(int(value) for value in repeat)

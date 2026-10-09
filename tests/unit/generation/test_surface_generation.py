@@ -96,6 +96,16 @@ def test_non_cubic_parent_vacuum_pbc_and_in_plane_repeat() -> None:
     assert np.linalg.norm(candidate.cell[0]) >= 5.0
     assert np.linalg.norm(candidate.cell[1]) >= 4.0
     assert candidate.info["surface_vacuum"] == 8.0
+    assert candidate.info["surface_reference_basis"] == "parent_stored_cell"
+    np.testing.assert_allclose(candidate.info["surface_reference_basis_cell"], parent.cell.array)
+    np.testing.assert_allclose(
+        candidate.info["surface_parent_to_reference_transformation"], np.eye(3, dtype=int)
+    )
+    assert candidate.info["surface_realized_vacuum_angstrom"] >= 8.0
+    assert np.isclose(
+        candidate.info["surface_realized_vacuum_angstrom"],
+        candidate.info["surface_realized_vacuum"],
+    )
 
 
 def test_termination_order_is_deterministic_and_policy_limits_it() -> None:
@@ -192,6 +202,30 @@ def test_requested_orientations_are_not_truncated_by_legacy_surface_count() -> N
     assert realized == set(requested)
 
 
+def test_layer_based_vacuum_is_physical_angstrom_not_hkl_planes() -> None:
+    parent = _base()
+    requested_vacuum = 10.0
+    candidate = surfaces(
+        parent,
+        parent,
+        1,
+        _settings(
+            surface_miller_indices=((1, 1, 1),),
+            surface_vacuum=requested_vacuum,
+        ),
+        None,
+        _annotate,
+        seed=11,
+    )[0]
+
+    realized_vacuum = candidate.info["surface_realized_vacuum_angstrom"]
+    assert realized_vacuum >= requested_vacuum
+    # For bcc Fe(111), interpreting 10 as ten hkl planes would add roughly
+    # one (111) spacing per unit and produce a materially larger vacuum.
+    assert realized_vacuum < 1.5 * requested_vacuum
+    assert candidate.info["surface_requested_vacuum_angstrom"] == requested_vacuum
+
+
 def test_surface_stoichiometry_change_is_recorded_for_non_parent_composition() -> None:
     parent = Atoms(
         "Fe2Ni2",
@@ -224,6 +258,15 @@ def test_invalid_miller_and_impossible_geometry_fail_explicitly() -> None:
     no_cell = Atoms("Fe", positions=[[0, 0, 0]])
     with pytest.raises(SurfaceConstructionError, match="failed to construct"):
         surfaces(no_cell, no_cell, 1, _settings(), None, _annotate)
+
+    singular_cell = Atoms(
+        "Fe",
+        positions=[[0.0, 0.0, 0.0]],
+        cell=np.zeros((3, 3)),
+        pbc=True,
+    )
+    with pytest.raises(SurfaceConstructionError, match="reference basis"):
+        surfaces(singular_cell, singular_cell, 1, _settings(), None, _annotate)
 
     with pytest.raises(SurfaceConstructionError, match="only"):
         surfaces(parent, parent, 99, _settings(surface_max_terminations=1), None, _annotate)

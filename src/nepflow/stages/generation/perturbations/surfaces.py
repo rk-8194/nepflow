@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import Counter
 from collections.abc import Callable, Iterable
+from importlib.metadata import PackageNotFoundError, version
 from typing import Any
 
 import numpy as np
@@ -17,6 +18,11 @@ from .models import PerturbationSettings, derive_child_seed
 
 class SurfaceConstructionError(ValueError):
     """Raised when a requested surface cannot be constructed exactly."""
+
+
+_SURFACE_PLANNER_VERSION = "phase6-surface-reference-vacuum-v1"
+_SURFACE_BACKEND = "pymatgen.SlabGenerator"
+_IDENTITY_TRANSFORM = ((1, 0, 0), (0, 1, 0), (0, 0, 1))
 
 
 def surfaces(
@@ -44,6 +50,7 @@ def surfaces(
     if not miller_indices:
         raise SurfaceConstructionError("surface_miller_indices must contain at least one index")
 
+    reference_cell = _establish_reference_basis(parent)
     parent_structure_id = calculate_structure_id(base)
     generated: list[Any] = []
     for miller_index in miller_indices:
@@ -66,6 +73,7 @@ def surfaces(
             parameters = _surface_parameters(
                 candidate,
                 base,
+                reference_cell=reference_cell,
                 miller_index=miller_index,
                 termination_index=termination_index,
                 settings=settings,
@@ -117,11 +125,7 @@ def _enumerate_slabs(
                 "surface_layers must be positive when surface_thickness is not set"
             )
         structure = AseAtomsAdaptor.get_structure(parent)
-        minimum_slab_size = (
-            float(settings.surface_thickness)
-            if settings.surface_thickness is not None
-            else float(settings.surface_layers)
-        )
+        minimum_slab_size = _minimum_slab_size_angstrom(structure, miller_index, settings)
         generator = SlabGenerator(
             structure,
             miller_index,
@@ -129,7 +133,9 @@ def _enumerate_slabs(
             min_vacuum_size=float(settings.surface_vacuum),
             center_slab=True,
             primitive=False,
-            in_unit_planes=settings.surface_thickness is None,
+            # Slab depth is converted to Angstroms above.  Vacuum is always
+            # passed independently as a physical Angstrom quantity.
+            in_unit_planes=False,
             reorient_lattice=True,
         )
         slabs = generator.get_slabs(
@@ -148,13 +154,64 @@ def _enumerate_slabs(
 
 
 def _slab_sort_key(slab: Any) -> tuple[Any, ...]:
+    lattice = tuple(
+        float(value)
+        for row in np.round(np.asarray(slab.lattice.matrix, dtype=float), decimals=10)
+        for value in row
+    )
     species = tuple(str(site.specie) for site in slab)
     coordinates = tuple(
         float(value)
         for row in np.round(np.asarray(slab.frac_coords, dtype=float), decimals=10)
         for value in row
     )
-    return species, coordinates
+    return lattice, species, coordinates
+
+
+def _establish_reference_basis(parent: Any) -> np.ndarray:
+    """Return the explicit parent-cell basis used for Miller interpretation."""
+
+    try:
+        cell = np.asarray(parent.cell, dtype=float)
+        pbc = np.asarray(parent.pbc, dtype=bool)
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise SurfaceConstructionError(
+            "failed to construct surface: cannot establish an unambiguous "
+            "parent crystallographic reference basis"
+        ) from exc
+    if cell.shape != (3, 3) or pbc.shape != (3,) or not bool(np.all(pbc)):
+        raise SurfaceConstructionError(
+            "failed to construct surface: parent crystallographic reference basis "
+            "requires a fully periodic 3x3 cell"
+        )
+    if not np.isfinite(cell).all() or abs(float(np.linalg.det(cell))) <= 1.0e-10:
+        raise SurfaceConstructionError(
+            "failed to construct surface: parent crystallographic reference basis "
+            "is singular or non-finite"
+        )
+    return cell
+
+
+def _minimum_slab_size_angstrom(
+    structure: Any,
+    miller_index: tuple[int, int, int],
+    settings: PerturbationSettings,
+) -> float:
+    """Convert the legacy layer control into a physical slab-depth target."""
+
+    if settings.surface_thickness is not None:
+        return float(settings.surface_thickness)
+    try:
+        spacing = float(structure.lattice.d_hkl(miller_index))
+    except (AttributeError, TypeError, ValueError, ZeroDivisionError) as exc:
+        raise SurfaceConstructionError(
+            f"failed to determine physical spacing for Miller index {miller_index}"
+        ) from exc
+    if not np.isfinite(spacing) or spacing <= 0.0:
+        raise SurfaceConstructionError(
+            f"failed to determine physical spacing for Miller index {miller_index}"
+        )
+    return float(settings.surface_layers) * spacing
 
 
 def _canonicalize_slab(
@@ -198,6 +255,7 @@ def _surface_parameters(
     candidate: Atoms,
     base: Any,
     *,
+    reference_cell: np.ndarray,
     miller_index: tuple[int, int, int],
     termination_index: int,
     settings: PerturbationSettings,
@@ -219,22 +277,54 @@ def _surface_parameters(
         for element in elements
         if candidate_counts[element] != parent_counts[element]
     }
-    layer_count = _layer_count(candidate)
+    normal, thickness, normal_period, vacuum, in_plane_area = _surface_geometry(candidate)
+    requested_vacuum = float(settings.surface_vacuum)
+    if not np.isfinite(vacuum) or vacuum + 1.0e-6 < requested_vacuum:
+        raise SurfaceConstructionError(
+            f"realized vacuum {vacuum:.8f} Angstrom is below requested "
+            f"{requested_vacuum:.8f} Angstrom for Miller index {miller_index}"
+        )
+    reference_normal = _surface_normal(reference_cell, miller_index)
+    layer_count = _layer_count(candidate, normal)
+    reference_cell_tuple = tuple(
+        tuple(float(value) for value in row) for row in reference_cell
+    )
+    backend_version = _backend_version()
     return {
         "parent_structure_id": calculate_structure_id(base),
+        "surface_state": "pristine",
         "surface_miller_index": miller_index,
         "miller_index": miller_index,
         "surface_termination": f"termination_{termination_index}",
         "termination": f"termination_{termination_index}",
+        "surface_termination_identity": (
+            f"{_format_miller(miller_index)}:termination_{termination_index}"
+        ),
         "surface_layers": layer_count,
         "surface_requested_layers": int(settings.surface_layers),
         "surface_thickness": settings.surface_thickness,
-        "surface_slab_thickness": _slab_thickness(candidate),
+        "surface_slab_thickness": thickness,
+        "surface_material_thickness": thickness,
+        "surface_half_depth": 0.5 * thickness,
         "surface_dimensions": tuple(
             float(np.linalg.norm(np.asarray(candidate.cell, dtype=float)[index]))
             for index in range(3)
         ),
-        "surface_vacuum": float(settings.surface_vacuum),
+        "surface_in_plane_area": in_plane_area,
+        "surface_normal_period": normal_period,
+        "surface_normal": tuple(float(value) for value in normal),
+        "surface_reference_normal": tuple(float(value) for value in reference_normal),
+        "surface_reference_basis": "parent_stored_cell",
+        "surface_reference_basis_cell": reference_cell_tuple,
+        "surface_reference_cell": reference_cell_tuple,
+        "surface_parent_to_reference_transformation": _IDENTITY_TRANSFORM,
+        "surface_requested_vacuum": requested_vacuum,
+        "surface_requested_vacuum_angstrom": requested_vacuum,
+        # Keep the historical key as the requested value; the realised value
+        # is explicit and independently measured below.
+        "surface_vacuum": requested_vacuum,
+        "surface_realized_vacuum": vacuum,
+        "surface_realized_vacuum_angstrom": vacuum,
         "surface_pbc": (True, True, False),
         "surface_in_plane_repeat": realized_repeat,
         "surface_termination_policy": settings.surface_termination_policy,
@@ -243,12 +333,46 @@ def _surface_parameters(
         "surface_composition_change": composition_delta,
         "surface_atom_count_change": count_delta,
         "surface_stoichiometry_changed": bool(composition_delta),
+        "surface_backend": _SURFACE_BACKEND,
+        "surface_backend_version": backend_version,
+        "surface_planner_version": _SURFACE_PLANNER_VERSION,
     }
 
 
-def _layer_count(candidate: Atoms) -> int:
-    scaled = np.asarray(candidate.get_scaled_positions(wrap=False), dtype=float)
-    values = sorted(float(value) for value in scaled[:, 2])
+def _surface_geometry(candidate: Atoms) -> tuple[np.ndarray, float, float, float, float]:
+    """Measure normal, material thickness, repeat, vacuum, and area."""
+
+    cell = np.asarray(candidate.cell, dtype=float)
+    if cell.shape != (3, 3) or not np.isfinite(cell).all():
+        raise SurfaceConstructionError("constructed slab has an invalid cell")
+    in_plane_cross = np.cross(cell[0], cell[1])
+    in_plane_area = float(np.linalg.norm(in_plane_cross))
+    if in_plane_area <= 1.0e-12:
+        raise SurfaceConstructionError("constructed slab has a degenerate in-plane cell")
+    normal = in_plane_cross / in_plane_area
+    positions = np.asarray(candidate.get_positions(), dtype=float)
+    if positions.ndim != 2 or positions.shape[1] != 3 or len(positions) == 0:
+        raise SurfaceConstructionError("constructed slab has no measurable material extent")
+    projected = positions @ normal
+    thickness = float(np.max(projected) - np.min(projected))
+    normal_period = abs(float(np.linalg.det(cell))) / in_plane_area
+    vacuum = normal_period - thickness
+    return normal, thickness, normal_period, vacuum, in_plane_area
+
+
+def _surface_normal(cell: np.ndarray, miller_index: tuple[int, int, int]) -> np.ndarray:
+    """Return the Cartesian normal for an hkl in a row-vector cell basis."""
+
+    reciprocal = np.linalg.solve(cell, np.asarray(miller_index, dtype=float))
+    norm = float(np.linalg.norm(reciprocal))
+    if not np.isfinite(norm) or norm <= 1.0e-12:
+        raise SurfaceConstructionError("cannot establish a finite surface normal")
+    return reciprocal / norm
+
+
+def _layer_count(candidate: Atoms, normal: np.ndarray) -> int:
+    positions = np.asarray(candidate.get_positions(), dtype=float)
+    values = sorted(float(value) for value in positions @ normal)
     layers: list[float] = []
     for value in values:
         if not layers or abs(value - layers[-1]) > 1.0e-6:
@@ -256,9 +380,11 @@ def _layer_count(candidate: Atoms) -> int:
     return len(layers)
 
 
-def _slab_thickness(candidate: Atoms) -> float:
-    positions = np.asarray(candidate.get_positions(), dtype=float)
-    return float(np.ptp(positions[:, 2])) if len(positions) else 0.0
+def _backend_version() -> str:
+    try:
+        return version("pymatgen")
+    except PackageNotFoundError:
+        return "unknown"
 
 
 def _normalise_miller(index: Iterable[Any]) -> tuple[int, int, int]:
