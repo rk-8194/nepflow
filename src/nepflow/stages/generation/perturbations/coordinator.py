@@ -8,10 +8,15 @@ import os
 import tempfile
 from collections import deque
 from collections.abc import Iterable, Iterator
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from concurrent.futures import TimeoutError as FutureTimeoutError
+from dataclasses import dataclass, replace
 from io import StringIO
+from multiprocessing import Manager
 from pathlib import Path
+from queue import Empty as QueueEmpty
+from queue import Full as QueueFull
+from queue import Queue
 from time import monotonic
 from typing import Any
 
@@ -47,6 +52,7 @@ from .liquid import liquid_snapshots
 from .magnetism import MagneticGenerationSummary, MagneticGenerator
 from .models import (
     PerturbationCounts,
+    PerturbationProgressEvent,
     PerturbationRejection,
     PerturbationSettings,
     PerturbationTask,
@@ -81,6 +87,49 @@ _PERTURBATION_FAMILIES = frozenset(_FAMILY_ORDER)
 _SLOT_BATCH_SIZE = 8
 
 
+def _task_requested_units(task: PerturbationTask) -> int | None:
+    """Return the number of slots represented by a bounded task, when known."""
+
+    if task.slot_stop is None:
+        return None
+    return max(0, task.slot_stop - task.slot_start)
+
+
+def _emit_progress(
+    task: PerturbationTask,
+    phase: str,
+    *,
+    completed_units: int | None = None,
+    requested_units: int | None = None,
+    detail: str | None = None,
+) -> None:
+    """Best-effort, non-blocking worker-to-parent progress reporting."""
+
+    progress_queue = task.progress_queue
+    if progress_queue is None:
+        return
+    event = PerturbationProgressEvent(
+        task_key=task.progress_key,
+        base_ordinal=task.base_ordinal,
+        base_structure_id=task.base_structure_id,
+        family=task.family or "all",
+        slot_start=task.slot_start,
+        slot_stop=task.slot_stop,
+        phase=phase,
+        completed_units=completed_units,
+        requested_units=requested_units,
+        timestamp=monotonic(),
+        worker_pid=os.getpid(),
+        detail=detail,
+    )
+    try:
+        progress_queue.put(event, block=False)
+    except (QueueFull, BrokenPipeError, EOFError, OSError):
+        # Progress must never hold up a scientific worker or turn a completed
+        # result into a failed result when the parent is busy draining events.
+        return
+
+
 class PerturbationTaskError(RuntimeError):
     """A worker failure attributed to one exact base, family, and seed."""
 
@@ -98,6 +147,185 @@ class PerturbationTaskError(RuntimeError):
             f"Perturbation task failed for base={task.base_structure_id}, seed={task.seed}: "
             f"{cause}{batch}"
         )
+
+
+@dataclass(slots=True)
+class _TaskProgressState:
+    """Parent-owned state for one currently bounded in-flight task."""
+
+    index: int
+    task: PerturbationTask
+    status: str = "queued"
+    submitted_at: float = 0.0
+    started_at: float | None = None
+    last_event_at: float | None = None
+    last_phase: str = "queued"
+    completed_units: int | None = None
+    requested_units: int | None = None
+
+
+class _ProgressTracker:
+    """Aggregate bounded-window progress owned by the coordinator process."""
+
+    def __init__(self, total: int | None, workers: int, window: int) -> None:
+        self.total = total
+        self.workers = workers
+        self.window = window
+        self.started_at = monotonic()
+        self.states: dict[tuple[int, str, str, int, int | None], _TaskProgressState] = {}
+        self.submitted = 0
+        self.completed = 0
+        self.failed = 0
+        self.published = 0
+        self.produced = 0
+        self.validated = 0
+        self.accepted = 0
+        self.rejected = 0
+        self.duplicates = 0
+        self.written = 0
+
+    def register(self, index: int, task: PerturbationTask) -> None:
+        now = monotonic()
+        self.states[task.progress_key] = _TaskProgressState(
+            index=index,
+            task=task,
+            status="submitted",
+            submitted_at=now,
+            requested_units=_task_requested_units(task),
+        )
+        self.submitted += 1
+
+    def event(self, event: PerturbationProgressEvent) -> None:
+        state = self.states.get(event.task_key)
+        if state is None:
+            return
+        now = monotonic()
+        state.last_event_at = now
+        state.last_phase = event.phase
+        if event.completed_units is not None:
+            state.completed_units = max(state.completed_units or 0, event.completed_units)
+        if event.requested_units is not None:
+            state.requested_units = event.requested_units
+        if event.phase == "started":
+            state.status = "running"
+            if state.started_at is None:
+                state.started_at = now
+        elif event.phase in {"generating", "validating"}:
+            state.status = "running"
+            if state.started_at is None:
+                state.started_at = now
+
+    def completed_result(self, task: PerturbationTask, result: PerturbationTaskResult) -> None:
+        state = self.states.get(task.progress_key)
+        if state is not None:
+            state.status = "completed"
+            state.last_event_at = monotonic()
+            state.last_phase = "finished"
+            state.completed_units = len(result.candidates) + len(result.rejected_attempts)
+            state.requested_units = state.requested_units or _task_requested_units(task)
+        self.completed += 1
+        self.produced += len(result.candidates) + len(result.rejected_attempts)
+        self.validated += len(result.candidates) + len(result.rejected_attempts)
+        self.accepted += len(result.candidates)
+        self.rejected += len(result.rejected_attempts)
+
+    def failed_result(self, task: PerturbationTask) -> None:
+        state = self.states.get(task.progress_key)
+        if state is not None:
+            state.status = "failed"
+            state.last_event_at = monotonic()
+            state.last_phase = "failed"
+        self.failed += 1
+
+    def published_result(
+        self,
+        task: PerturbationTask,
+        *,
+        written: int,
+        duplicates: int,
+    ) -> None:
+        state = self.states.pop(task.progress_key, None)
+        if state is not None:
+            state.status = "published"
+        self.published += 1
+        self.duplicates += duplicates
+        self.written += written
+
+    def _task_label(self, task: PerturbationTask) -> str:
+        stop = "?" if task.slot_stop is None else str(task.slot_stop)
+        return (
+            f"base={task.base_structure_id} family={task.family or 'all'} "
+            f"slots={task.slot_start}:{stop}"
+        )
+
+    def snapshot(self, *, reason: str, head: _TaskProgressState | None = None) -> None:
+        terminal = self.completed + self.failed
+        percentage = 0.0 if not self.total else 100.0 * terminal / self.total
+        active = [state for state in self.states.values() if state.status == "running"]
+        waiting_for_order = sum(
+            state.status == "completed" and head is not None and state.index > head.index
+            for state in self.states.values()
+        )
+        elapsed = monotonic() - self.started_at
+        total_label = "?" if self.total is None else str(self.total)
+        logger.info(
+            "Perturbations progress (%s): %s/%s tasks finished (%.1f%%); %s active; "
+            "submitted=%s; %s in flight; %s published; %s finished awaiting order; "
+            "failed=%s; elapsed=%.1fs",
+            reason,
+            terminal,
+            total_label,
+            percentage,
+            len(active),
+            self.submitted,
+            len(self.states),
+            self.published,
+            waiting_for_order,
+            self.failed,
+            elapsed,
+        )
+        logger.info(
+            "Candidates progress: produced=%s validated=%s accepted=%s rejected=%s "
+            "duplicates=%s written=%s",
+            self.produced,
+            self.validated,
+            self.accepted,
+            self.rejected,
+            self.duplicates,
+            self.written,
+        )
+        if active:
+            current = max(
+                active,
+                key=lambda state: monotonic() - (state.started_at or state.submitted_at),
+            )
+            progress = "unknown"
+            if current.completed_units is not None and current.requested_units is not None:
+                progress = f"{current.completed_units}/{current.requested_units}"
+            last_update = (
+                "never"
+                if current.last_event_at is None
+                else f"{monotonic() - current.last_event_at:.1f}s ago"
+            )
+            logger.info(
+                "Active perturbation: task=%s %s phase=%s progress=%s elapsed=%.1fs "
+                "last_progress=%s",
+                current.index,
+                self._task_label(current.task),
+                current.last_phase,
+                progress,
+                monotonic() - (current.started_at or current.submitted_at),
+                last_update,
+            )
+        if head is not None and head.status != "completed":
+            logger.info(
+                "Ordered publication blocked by task=%s (%s); %s later task(s) finished; "
+                "elapsed=%.1fs",
+                head.index,
+                self._task_label(head.task),
+                waiting_for_order,
+                monotonic() - (head.started_at or head.submitted_at),
+            )
 
 
 def family_applies_to_base(
@@ -118,6 +346,11 @@ def family_applies_to_base(
 def execute_perturbation_task(task: PerturbationTask) -> PerturbationTaskResult:
     """Execute one complete task; this function is process-pool picklable."""
 
+    _emit_progress(
+        task,
+        "started",
+        requested_units=_task_requested_units(task),
+    )
     if task.family is not None:
         return _execute_perturbation_batch(task)
 
@@ -389,12 +622,19 @@ def execute_perturbation_task(task: PerturbationTask) -> PerturbationTaskResult:
             )
         )
 
-    return PerturbationTaskResult(
+    result = PerturbationTaskResult(
         task=task,
         candidates=tuple(accepted),
         provenance_records=tuple(provenance_records),
         rejected_attempts=tuple(rejected_attempts),
     )
+    _emit_progress(
+        task,
+        "finished",
+        completed_units=len(output),
+        requested_units=_task_requested_units(task),
+    )
+    return result
 
 
 def _execute_perturbation_batch(task: PerturbationTask) -> PerturbationTaskResult:
@@ -447,8 +687,27 @@ def _execute_perturbation_batch(task: PerturbationTask) -> PerturbationTaskResul
         candidate_records[id(candidate)] = record
         return record
 
+    _emit_progress(
+        task,
+        "generating",
+        completed_units=0,
+        requested_units=_task_requested_units(task),
+    )
     output = _generate_family_batch(task, supercell, annotate)
-    return _validate_batch_candidates(task, supercell, output, candidate_records)
+    _emit_progress(
+        task,
+        "generating",
+        completed_units=len(output),
+        requested_units=_task_requested_units(task),
+    )
+    result = _validate_batch_candidates(task, supercell, output, candidate_records)
+    _emit_progress(
+        task,
+        "finished",
+        completed_units=len(output),
+        requested_units=_task_requested_units(task),
+    )
+    return result
 
 
 def _generate_family_batch(task: PerturbationTask, supercell: Any, annotate: Any) -> list[Any]:
@@ -570,6 +829,12 @@ def _validate_batch_candidates(
 ) -> PerturbationTaskResult:
     """Validate and retain only this batch's accepted candidates."""
 
+    _emit_progress(
+        task,
+        "validating",
+        completed_units=0,
+        requested_units=len(output),
+    )
     accepted: list[Any] = []
     provenance_records: list[Any] = []
     rejected_attempts: list[PerturbationRejection] = []
@@ -602,6 +867,12 @@ def _validate_batch_candidates(
             accepted.append(candidate)
             if record is not None:
                 provenance_records.append(record)
+            _emit_progress(
+                task,
+                "validating",
+                completed_units=local_index + 1,
+                requested_units=len(output),
+            )
             continue
 
         operation_id = f"{task.base_structure_id}:{family}:{task.slot_start + local_index}"
@@ -621,6 +892,14 @@ def _validate_batch_candidates(
                 evidence=issue.evidence,
             )
         )
+        _emit_progress(
+            task,
+            "validating",
+            completed_units=local_index + 1,
+            requested_units=len(output),
+        )
+    if not output:
+        _emit_progress(task, "validating", completed_units=0, requested_units=0)
     return PerturbationTaskResult(
         task=task,
         candidates=tuple(accepted),
@@ -662,7 +941,7 @@ class PerturbationCoordinator:
         self._duplicate_count = 0
         self._output_file: Path | None = None
         self._magnetic_summary: MagneticGenerationSummary | None = None
-        self._task_elapsed_seconds: dict[tuple[str, int], float] = {}
+        self._task_elapsed_seconds: dict[tuple[int, str, str, int, int | None], float] = {}
 
     @staticmethod
     def _available_cpu_count() -> int:
@@ -741,13 +1020,14 @@ class PerturbationCoordinator:
         """
 
         task_settings = settings or self.settings
-        for base in base_structures:
+        for base_ordinal, base in enumerate(base_structures):
             yield PerturbationTask(
                 base=base,
                 base_structure_id=calculate_structure_id(base),
                 settings=task_settings,
                 counts=counts,
                 seed=int(self.rng.randint(0, 2**31)),
+                base_ordinal=base_ordinal,
             )
 
     def _tasks(
@@ -817,7 +1097,7 @@ class PerturbationCoordinator:
         """Yield base-major, family-major bounded slot-window tasks."""
 
         task_settings = settings or self.settings
-        for base in base_structures:
+        for base_ordinal, base in enumerate(base_structures):
             base_structure_id = calculate_structure_id(base)
             seed = int(self.rng.randint(0, 2**31))
             for family in _FAMILY_ORDER:
@@ -833,6 +1113,7 @@ class PerturbationCoordinator:
                         settings=task_settings,
                         counts=counts,
                         seed=seed,
+                        base_ordinal=base_ordinal,
                         family=family,
                         slot_start=slot_start,
                         slot_stop=min(slot_start + _SLOT_BATCH_SIZE, total_slots),
@@ -881,6 +1162,9 @@ class PerturbationCoordinator:
             for result in self._execute(self._tasks(base_structures, counts), n_workers):
                 self._rejected_attempts.extend(result.rejected_attempts)
                 yield result
+                # Candidate-only callers do not need to retain historical
+                # timing entries after the result has been consumed.
+                self._task_elapsed_seconds.pop(result.task.progress_key, None)
 
         candidates, records = self._deduplicate_results(results_with_rejections())
         if self.magnetic_generator is not None:
@@ -953,6 +1237,12 @@ class PerturbationCoordinator:
             family_plan,
             output_file,
         )
+        progress_tracker = _ProgressTracker(
+            batch_task_count,
+            n_workers,
+            1 if n_workers == 1 else 2 * n_workers,
+        )
+        progress_tracker.snapshot(reason="initial")
         temporary_path: Path | None = None
         file_descriptor: int | None = None
         try:
@@ -971,7 +1261,12 @@ class PerturbationCoordinator:
                 # see the complete deterministic structural parent sequence.
                 structural_candidates: list[Any] = []
                 for task_index, result in enumerate(
-                    self._execute(self._tasks(base_structures, counts), n_workers),
+                    self._execute(
+                        self._tasks(base_structures, counts),
+                        n_workers,
+                        total_tasks=batch_task_count,
+                        progress_tracker=progress_tracker,
+                    ),
                     start=1,
                 ):
                     self._rejected_attempts.extend(result.rejected_attempts)
@@ -986,10 +1281,14 @@ class PerturbationCoordinator:
                         self._flush(batch, output_handle=output_handle)
                     else:
                         structural_candidates.extend(batch)
-                    elapsed = self._task_elapsed_seconds.pop(
-                        (result.task.base_structure_id, result.task.seed),
-                        0.0,
+                    duplicates = self._duplicate_count - duplicates_before
+                    written = len(batch) if self.magnetic_generator is None else 0
+                    progress_tracker.published_result(
+                        result.task,
+                        written=written,
+                        duplicates=duplicates,
                     )
+                    elapsed = self._task_elapsed_seconds.pop(result.task.progress_key, 0.0)
                     source = result.task.base.info.get("configurational_type", "unknown")
                     logger.info(
                         "Perturbation task %s/%s complete: source=%s base=%s accepted=%s "
@@ -999,18 +1298,20 @@ class PerturbationCoordinator:
                         source,
                         result.task.base_structure_id,
                         len(result.candidates),
-                        len(batch) if self.magnetic_generator is None else 0,
-                        self._duplicate_count - duplicates_before,
+                        written,
+                        duplicates,
                         len(result.rejected_attempts),
                         elapsed,
                         n_workers,
                     )
+                    progress_tracker.snapshot(reason="publication")
                 if self.magnetic_generator is not None:
                     magnetic_result = self.magnetic_generator.expand_structures(
                         structural_candidates
                     )
                     self._magnetic_summary = magnetic_result.summary
                     self._flush(magnetic_result.candidates, output_handle=output_handle)
+                    progress_tracker.written = self._total
                 output_handle.flush()
                 os.fsync(output_handle.fileno())
             if temporary_path is None:
@@ -1088,86 +1389,230 @@ class PerturbationCoordinator:
         self,
         tasks: Iterable[PerturbationTask],
         n_workers: int,
+        *,
+        total_tasks: int | None = None,
+        progress_tracker: _ProgressTracker | None = None,
     ) -> Iterator[PerturbationTaskResult]:
         """Yield worker results in task order using bounded parallel backpressure.
 
         Parallel mode keeps no more than twice the worker count of submitted
-        futures.  Waiting for the earliest submitted future preserves canonical
-        base order without an unbounded completed-result reorder buffer.
+        futures. Every completed future is collected, while the small ready
+        buffer is drained only in canonical task order.
         """
 
+        submission_window = 1 if n_workers == 1 else 2 * n_workers
+        tracker = progress_tracker or _ProgressTracker(
+            total_tasks,
+            n_workers,
+            submission_window,
+        )
+
         if n_workers == 1:
-            for task in tasks:
+            progress_queue: Any = Queue(maxsize=max(32, submission_window * 4))
+            for task_index, task in enumerate(tasks, start=1):
+                worker_task = replace(task, progress_queue=progress_queue)
+                tracker.register(task_index, task)
                 started_at = monotonic()
-                result = self._execute_one(task)
-                self._task_elapsed_seconds[(task.base_structure_id, task.seed)] = (
-                    monotonic() - started_at
-                )
+                try:
+                    result = self._execute_one(worker_task)
+                except BaseException:
+                    self._drain_progress_events(progress_queue, tracker)
+                    tracker.failed_result(task)
+                    tracker.snapshot(reason="failure")
+                    raise
+                self._drain_progress_events(progress_queue, tracker)
+                result = replace(result, task=task)
+                self._task_elapsed_seconds[task.progress_key] = monotonic() - started_at
+                tracker.completed_result(task, result)
+                tracker.snapshot(reason="completion")
                 yield result
+                # process marks publication after writing. Direct callers do
+                # not, so release the bounded tracker entry on resume.
+                if task.progress_key in tracker.states:
+                    tracker.published_result(
+                        task,
+                        written=len(result.candidates),
+                        duplicates=0,
+                    )
             return
 
-        submission_window = 2 * n_workers
         task_iterator = iter(tasks)
-        pending: deque[tuple[int, PerturbationTask, Any, float]] = deque()
+        pending: dict[int, tuple[PerturbationTask, Any, float]] = {}
+        publication_order: deque[int] = deque()
+        ready: dict[int, PerturbationTaskResult] = {}
+        ready_tasks: dict[int, tuple[PerturbationTask, float]] = {}
         exhausted = False
         submitted_count = 0
+        manager: Any | None = None
+        progress_queue: Any
+
+        # Manager queues are pickleable under both fork and spawn. The queue
+        # itself is bounded and worker writes are nonblocking, so a chatty or
+        # disconnected worker cannot deadlock the process pool.
+        manager = Manager()
+        progress_queue = manager.Queue(maxsize=max(32, submission_window * 4))
         pool = ProcessPoolExecutor(max_workers=n_workers)
 
         def fill_submission_window() -> None:
             nonlocal exhausted, submitted_count
-            while len(pending) < submission_window and not exhausted:
+            while len(pending) + len(ready) < submission_window and not exhausted:
                 try:
                     task = next(task_iterator)
                 except StopIteration:
                     exhausted = True
                     return
                 submitted_count += 1
-                pending.append(
-                    (
-                        submitted_count,
-                        task,
-                        pool.submit(execute_perturbation_task, task),
-                        monotonic(),
-                    )
+                worker_task = replace(task, progress_queue=progress_queue)
+                pending[submitted_count] = (
+                    task,
+                    pool.submit(execute_perturbation_task, worker_task),
+                    monotonic(),
                 )
+                publication_order.append(submitted_count)
+                tracker.register(submitted_count, task)
+
+        def cancel_pending() -> None:
+            for _task, future, _started_at in pending.values():
+                future.cancel()
+
+        def publish_ready() -> Iterator[PerturbationTaskResult]:
+            while publication_order and publication_order[0] in ready:
+                task_index = publication_order.popleft()
+                task, _started_at = ready_tasks.pop(task_index)
+                result = ready.pop(task_index)
+                yield result
+                # If the consumer is process(), it has marked the result as
+                # published while this generator was suspended. Other
+                # consumers receive the same bounded-window accounting.
+                if task.progress_key in tracker.states:
+                    tracker.published_result(
+                        task,
+                        written=len(result.candidates),
+                        duplicates=0,
+                    )
+                fill_submission_window()
 
         try:
             fill_submission_window()
-            while pending:
-                task_index, task, future, started_at = pending.popleft()
-                while True:
+            while pending or ready:
+                self._drain_progress_events(progress_queue, tracker)
+
+                # The synchronous harness used by existing unit tests
+                # predates concurrent.futures.Future and intentionally only
+                # resolves work when result() is consumed. Preserve that
+                # compatibility while real futures use FIRST_COMPLETED below.
+                supports_completion_wait = all(
+                    callable(getattr(future, "done", None))
+                    for _task, future, _started_at in pending.values()
+                )
+                if pending and not supports_completion_wait:
+                    task_index = publication_order[0]
+                    task, future, started_at = pending.pop(task_index)
                     try:
                         result = self._resolve_future(
                             task,
                             future,
                             timeout=_HEARTBEAT_INTERVAL_SECONDS,
                         )
-                        break
                     except FutureTimeoutError:
+                        pending[task_index] = (task, future, started_at)
+                        self._drain_progress_events(progress_queue, tracker)
+                        head = tracker.states.get(task.progress_key)
                         source = task.base.info.get("configurational_type", "unknown")
-                        family_plan = ", ".join(self._planned_families(task.counts, task.settings))
+                        stop = "?" if task.slot_stop is None else str(task.slot_stop)
                         logger.info(
-                            "Waiting for ordered task %s (source=%s base=%s families=%s) "
-                            "after %.1fs; %s task(s) remain in the bounded window",
+                            "Waiting for ordered task %s (source=%s base=%s family=%s "
+                            "slots=%s:%s) after %.1fs; %s task(s) remain in the bounded window",
                             task_index,
                             source,
                             task.base_structure_id,
-                            family_plan,
+                            task.family or "all",
+                            task.slot_start,
+                            stop,
                             monotonic() - started_at,
-                            len(pending) + 1,
+                            len(pending) + len(ready),
                         )
-                self._task_elapsed_seconds[(task.base_structure_id, task.seed)] = (
-                    monotonic() - started_at
-                )
-                yield result
-                fill_submission_window()
+                        tracker.snapshot(reason="heartbeat", head=head)
+                        continue
+                    except BaseException:
+                        tracker.failed_result(task)
+                        tracker.snapshot(reason="failure")
+                        raise
+                    ready_tasks[task_index] = (task, started_at)
+                    result = replace(result, task=task)
+                    self._task_elapsed_seconds[task.progress_key] = monotonic() - started_at
+                    tracker.completed_result(task, result)
+                    tracker.snapshot(
+                        reason="completion", head=tracker.states.get(task.progress_key)
+                    )
+                    ready[task_index] = result
+                    yield from publish_ready()
+                    continue
+
+                if pending:
+                    futures = [future for _task, future, _started_at in pending.values()]
+                    done, _not_done = wait(
+                        futures,
+                        timeout=_HEARTBEAT_INTERVAL_SECONDS,
+                        return_when=FIRST_COMPLETED,
+                    )
+                    self._drain_progress_events(progress_queue, tracker)
+                    if not done:
+                        head_task = pending.get(publication_order[0])
+                        head = (
+                            None
+                            if head_task is None
+                            else tracker.states.get(head_task[0].progress_key)
+                        )
+                        tracker.snapshot(reason="heartbeat", head=head)
+                        continue
+                    future_to_index = {
+                        future: task_index
+                        for task_index, (_task, future, _started_at) in pending.items()
+                    }
+                    for future in done:
+                        task_index = future_to_index[future]
+                        task, _future, started_at = pending.pop(task_index)
+                        try:
+                            result = self._resolve_future(task, future)
+                        except BaseException:
+                            tracker.failed_result(task)
+                            tracker.snapshot(reason="failure")
+                            raise
+                        result = replace(result, task=task)
+                        ready_tasks[task_index] = (task, started_at)
+                        self._task_elapsed_seconds[task.progress_key] = monotonic() - started_at
+                        tracker.completed_result(task, result)
+                        ready[task_index] = result
+                        self._drain_progress_events(progress_queue, tracker)
+                        head_state = None
+                        if publication_order:
+                            head_entry = pending.get(publication_order[0])
+                            if head_entry is not None:
+                                head_state = tracker.states.get(head_entry[0].progress_key)
+                        tracker.snapshot(reason="completion", head=head_state)
+                    yield from publish_ready()
         except BaseException:
-            for _task_index, _task, future, _started_at in pending:
-                future.cancel()
+            cancel_pending()
             pool.shutdown(wait=False, cancel_futures=True)
             raise
         else:
             pool.shutdown(wait=True)
+        finally:
+            if manager is not None:
+                manager.shutdown()
+
+    @staticmethod
+    def _drain_progress_events(progress_queue: Any, tracker: _ProgressTracker) -> None:
+        """Drain only currently available bounded progress notifications."""
+
+        while True:
+            try:
+                event = progress_queue.get_nowait()
+            except (QueueEmpty, EOFError, OSError):
+                return
+            if isinstance(event, PerturbationProgressEvent):
+                tracker.event(event)
 
     @staticmethod
     def _execute_one(task: PerturbationTask) -> PerturbationTaskResult:

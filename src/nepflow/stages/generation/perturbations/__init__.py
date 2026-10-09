@@ -25,6 +25,7 @@ from .elasticity import (
 from .grain_boundaries import GrainBoundaryConstructionError, grain_boundaries
 from .models import (
     PerturbationCounts,
+    PerturbationProgressEvent,
     PerturbationRejection,
     PerturbationSettings,
     PerturbationTask,
@@ -36,6 +37,7 @@ from .surfaces import SurfaceConstructionError, surfaces
 __all__ = [
     "PerturbationCoordinator",
     "PerturbationCounts",
+    "PerturbationProgressEvent",
     "PerturbationRejection",
     "PerturbationSettings",
     "PerturbationTask",
