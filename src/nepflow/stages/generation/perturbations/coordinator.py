@@ -452,6 +452,7 @@ class PerturbationCoordinator:
         self._provenance_records = ()
         self._duplicate_count = 0
         self._magnetic_summary = None
+
         def results_with_rejections() -> Iterator[PerturbationTaskResult]:
             for result in self._execute(self._tasks(base_structures, counts), n_workers):
                 self._rejected_attempts.extend(result.rejected_attempts)

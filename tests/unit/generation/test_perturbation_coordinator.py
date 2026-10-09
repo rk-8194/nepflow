@@ -454,8 +454,7 @@ def test_serial_and_parallel_publication_lock_scopes_seeds_and_extxyz_bytes(tmp_
     assert serial_path.read_bytes() == parallel_path.read_bytes()
     serial_candidates = read(str(serial_path), index=":")
     assert [
-        (item.info["seed_id"], item.info["perturbation_type"])
-        for item in serial_candidates
+        (item.info["seed_id"], item.info["perturbation_type"]) for item in serial_candidates
     ] == [
         ("seed-mp", "unperturbed"),
         ("seed-mp", "vacancy"),
@@ -471,15 +470,19 @@ def test_serial_and_parallel_publication_lock_scopes_seeds_and_extxyz_bytes(tmp_
     assert [record.to_dict() for record in serial.get_provenance_records()] == [
         record.to_dict() for record in parallel.get_provenance_records()
     ]
-    assert serial.get_summary() == parallel.get_summary() == {
-        "total": 4,
-        "by_type": {"unperturbed": 2, "vacancy": 1, "rattled": 1},
-        "by_config": {"mp_phase": 2, "sqs": 2},
-        "duplicate_count": 0,
-        "rejected_count": 0,
-        "rejected_reason_counts": {},
-        "rejections_by_family": {},
-    }
+    assert (
+        serial.get_summary()
+        == parallel.get_summary()
+        == {
+            "total": 4,
+            "by_type": {"unperturbed": 2, "vacancy": 1, "rattled": 1},
+            "by_config": {"mp_phase": 2, "sqs": 2},
+            "duplicate_count": 0,
+            "rejected_count": 0,
+            "rejected_reason_counts": {},
+            "rejections_by_family": {},
+        }
+    )
 
 
 def test_execution_harness_bounds_parallel_window_and_preserves_result_order(
@@ -541,7 +544,9 @@ def test_process_flushes_first_result_before_later_task_completes(
 
     def controlled_worker(task):
         if task.base.info["source"] == "second":
-            assert first_result_flushed, "the first result must flush before the later task finishes"
+            assert first_result_flushed, (
+                "the first result must flush before the later task finishes"
+            )
         return original_execute(task)
 
     def record_flush(candidates, *, output_handle=None):

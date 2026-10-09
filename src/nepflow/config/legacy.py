@@ -197,9 +197,7 @@ def _generation_values(config: NepflowConfig) -> dict[str, str]:
         "surface_target_tolerance": str(generation.surface_target_tolerance),
         "surface_max_n_atoms": str(generation.surface_max_n_atoms),
         "surface_in_plane_repeat": ",".join(map(str, generation.surface_in_plane_repeat)),
-        "surface_max_in_plane_repeat": ",".join(
-            map(str, generation.surface_max_in_plane_repeat)
-        ),
+        "surface_max_in_plane_repeat": ",".join(map(str, generation.surface_max_in_plane_repeat)),
         "surface_max_normal_repeat": str(generation.surface_max_normal_repeat),
         "surface_min_in_plane_dimensions": ",".join(
             map(str, generation.surface_min_in_plane_dimensions)

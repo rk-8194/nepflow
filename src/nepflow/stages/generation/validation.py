@@ -614,9 +614,7 @@ def _validate_surface_state(
         )
         or not math.isfinite(realized_vacuum)
         or not math.isfinite(realized_vacuum_alias)
-        or not math.isclose(
-            realized_vacuum_alias, realized_vacuum, rel_tol=1.0e-6, abs_tol=1.0e-6
-        )
+        or not math.isclose(realized_vacuum_alias, realized_vacuum, rel_tol=1.0e-6, abs_tol=1.0e-6)
         or realized_vacuum + 1.0e-6 < requested_vacuum
         or normal.shape != (3,)
         or not np.isfinite(normal).all()
@@ -802,9 +800,7 @@ def _validate_surface_state(
     expected_delta = abs(len(candidate) - target_atoms) / target_atoms
     dimensions = (*geometry.in_plane_lengths, geometry.material_thickness)
     expected_shape_score = max(dimensions) / min(dimensions) - 1.0
-    expected_excess_vacuum = max(
-        0.0, geometry.realized_vacuum - float(settings.surface_vacuum)
-    )
+    expected_excess_vacuum = max(0.0, geometry.realized_vacuum - float(settings.surface_vacuum))
     expected_band = expected_delta <= float(settings.surface_target_tolerance) + 1.0e-12
     expected_repeat = stored_planner_repeat
     expected_tie_break = (
@@ -833,9 +829,8 @@ def _validate_surface_state(
             rtol=1.0e-6,
             atol=1.0e-6,
         )
-        and stored_max_in_plane == tuple(
-            int(value) for value in settings.surface_max_in_plane_repeat
-        )
+        and stored_max_in_plane
+        == tuple(int(value) for value in settings.surface_max_in_plane_repeat)
         and stored_max_normal == int(settings.surface_max_normal_repeat)
         and len(expected_repeat) == 3
         and all(value > 0 for value in expected_repeat)
@@ -850,9 +845,7 @@ def _validate_surface_state(
         and len(candidate) <= int(settings.surface_max_n_atoms)
         and math.isclose(stored_atom_delta, expected_delta, rel_tol=1.0e-6, abs_tol=1.0e-6)
         and stored_target_band == expected_band
-        and math.isclose(
-            stored_shape_score, expected_shape_score, rel_tol=1.0e-6, abs_tol=1.0e-6
-        )
+        and math.isclose(stored_shape_score, expected_shape_score, rel_tol=1.0e-6, abs_tol=1.0e-6)
         and math.isclose(
             stored_excess_vacuum,
             expected_excess_vacuum,

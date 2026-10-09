@@ -247,19 +247,13 @@ def _plan_surface_terminations(
                             repeat=(first_repeat, second_repeat),
                         )
                         geometry = measure_surface_geometry(candidate)
-                        if geometry.realized_vacuum + 1.0e-6 < float(
-                            settings.surface_vacuum
-                        ):
+                        if geometry.realized_vacuum + 1.0e-6 < float(settings.surface_vacuum):
                             rejected["vacuum"] += 1
                             continue
-                        if geometry.half_depth + 1.0e-6 < float(
-                            settings.surface_min_half_depth
-                        ):
+                        if geometry.half_depth + 1.0e-6 < float(settings.surface_min_half_depth):
                             rejected["material_depth"] += 1
                             continue
-                        bulk_core = measure_surface_bulk_core(
-                            candidate, parent, geometry, settings
-                        )
+                        bulk_core = measure_surface_bulk_core(candidate, parent, geometry, settings)
                         if bulk_core.bulk_core_atom_count < int(
                             settings.surface_min_bulk_core_atoms
                         ):
@@ -315,9 +309,10 @@ def _plan_surface_terminations(
                         )
                     )
         if not accepted:
-            evidence = ", ".join(
-                f"{reason}={count}" for reason, count in sorted(rejected.items())
-            ) or "no candidates evaluated"
+            evidence = (
+                ", ".join(f"{reason}={count}" for reason, count in sorted(rejected.items()))
+                or "no candidates evaluated"
+            )
             raise SurfaceConstructionError(
                 f"no valid planned slab for Miller index {miller_index}, "
                 f"termination_{termination_index}; {evidence}"
