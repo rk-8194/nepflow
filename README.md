@@ -109,6 +109,22 @@ NEPFlow will continue from the stage stored in the project directory.
 
 Run `nepflow --help` to see the full CLI help.
 
+## Generation workers and progress
+
+Perturbation generation logs its task plan before work begins, then records
+each ordered task publication. A `Waiting for ordered task` heartbeat means a
+task has not returned; it may be CPU-bound slow work or a stalled external
+dependency. It identifies the base and family plan preventing later completed
+tasks from being published out of order. It is not a success message and does
+not mean a partial artifact has been promoted.
+
+`generation.n_workers=1` is serial and is the best choice for debugging or a
+small WSL machine. `0` selects automatic parallelism, bounded by the detected
+CPU allocation (including affinity, cgroups, and SLURM values where exposed),
+the runnable task count, and a conservative cap of eight workers. On HPC,
+request CPUs from the scheduler first and leave `n_workers=0`, or explicitly
+set a lower worker count when each structure needs substantial memory.
+
 ## Project Layout
 
 Each project lives under `projects/project_<name>/` and typically contains:

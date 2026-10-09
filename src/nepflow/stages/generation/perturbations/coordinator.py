@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 import tempfile
 from collections import deque
 from collections.abc import Iterable, Iterator
 from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from io import StringIO
 from pathlib import Path
+from time import monotonic
 from typing import Any
 
 import numpy as np
@@ -54,6 +57,8 @@ from .surfaces import surfaces
 from .volume import volume_profile
 
 logger = logging.getLogger(__name__)
+_AUTO_WORKER_CAP = 8
+_HEARTBEAT_INTERVAL_SECONDS = 30.0
 _PERTURBATION_FAMILIES = frozenset(
     {
         "unperturbed",
@@ -413,6 +418,83 @@ class PerturbationCoordinator:
         self._duplicate_count = 0
         self._output_file: Path | None = None
         self._magnetic_summary: MagneticGenerationSummary | None = None
+        self._task_elapsed_seconds: dict[tuple[str, int], float] = {}
+
+    @staticmethod
+    def _available_cpu_count() -> int:
+        """Return the smallest reliable local CPU allocation visible to the process."""
+
+        limits = [max(1, os.cpu_count() or 1)]
+        try:
+            limits.append(max(1, len(os.sched_getaffinity(0))))
+        except (AttributeError, OSError):
+            pass
+        for variable in ("SLURM_CPUS_PER_TASK", "SLURM_CPUS_ON_NODE", "SLURM_JOB_CPUS_PER_NODE"):
+            value = os.environ.get(variable, "").split("(", 1)[0].strip()
+            if value.isdigit() and int(value) > 0:
+                limits.append(int(value))
+        for quota_path, period_path in (
+            ("/sys/fs/cgroup/cpu.max", None),
+            ("/sys/fs/cgroup/cpu/cpu.cfs_quota_us", "/sys/fs/cgroup/cpu/cpu.cfs_period_us"),
+        ):
+            try:
+                if period_path is None:
+                    quota, period = Path(quota_path).read_text(encoding="utf-8").split()[:2]
+                    if quota == "max":
+                        continue
+                else:
+                    quota = Path(quota_path).read_text(encoding="utf-8").strip()
+                    period = Path(period_path).read_text(encoding="utf-8").strip()
+                quota_value = int(quota)
+                period_value = int(period)
+                if quota_value > 0 and period_value > 0:
+                    limits.append(max(1, math.floor(quota_value / period_value)))
+            except (OSError, ValueError, IndexError):
+                continue
+        return min(limits)
+
+    @classmethod
+    def _effective_worker_count(cls, requested_workers: int, task_count: int) -> int:
+        """Apply the documented auto-worker allocation and runnable-task bounds."""
+
+        if requested_workers < 0:
+            raise ValueError("n_workers must be non-negative or at least one")
+        runnable_tasks = max(1, task_count)
+        if requested_workers == 0:
+            return min(cls._available_cpu_count(), _AUTO_WORKER_CAP, runnable_tasks)
+        return min(requested_workers, runnable_tasks)
+
+    @staticmethod
+    def _planned_families(
+        counts: PerturbationCounts,
+        settings: PerturbationSettings,
+    ) -> tuple[str, ...]:
+        """Return the enabled task-family plan for operational logging only."""
+
+        families = ["unperturbed"]
+        if settings.n_volume_points > 0:
+            families.append("volume_profile")
+        if settings.elastic_stress_enabled and settings.elastic_strain_amplitudes:
+            families.append("elastic_stress")
+        if counts.n_rattled > 0:
+            families.append("rattled")
+        if settings.liquid_enabled and counts.n_liquid_configurations > 0:
+            families.append("liquid")
+        for family, count in (
+            ("vacancy", counts.n_vacancies),
+            ("interstitial", counts.n_interstitials),
+            ("gas_interstitial", counts.n_gas_interstitials),
+            ("substitution", counts.n_substitutions),
+            ("antisite", counts.n_antisites),
+            ("vacancy_interstitial", counts.n_vacancy_interstitial),
+            ("gas_in_vacancy", counts.n_gas_in_vacancy),
+            ("grain_boundary", counts.n_grain_boundaries),
+        ):
+            if count > 0:
+                families.append(family)
+        if settings.surface_enabled:
+            families.append("surface")
+        return tuple(families)
 
     def _counts(self, **kwargs: int) -> PerturbationCounts:
         return PerturbationCounts(**kwargs)
@@ -444,14 +526,12 @@ class PerturbationCoordinator:
     ) -> list[Any]:
         """Generate candidates without persistence, preserving task order."""
 
-        if n_workers == 0:
-            n_workers = max(1, os.cpu_count() or 1)
-        if n_workers < 1:
-            raise ValueError("n_workers must be non-negative or at least one")
+        n_workers = self._effective_worker_count(n_workers, len(base_structures))
         self._rejected_attempts = []
         self._provenance_records = ()
         self._duplicate_count = 0
         self._magnetic_summary = None
+        self._task_elapsed_seconds = {}
 
         def results_with_rejections() -> Iterator[PerturbationTaskResult]:
             for result in self._execute(self._tasks(base_structures, counts), n_workers):
@@ -486,10 +566,7 @@ class PerturbationCoordinator:
     ) -> Path:
         """Run typed tasks and persist candidates in deterministic base order."""
 
-        if n_workers == 0:
-            n_workers = max(1, os.cpu_count() or 1)
-        if n_workers < 1:
-            raise ValueError("n_workers must be non-negative or at least one")
+        n_workers = self._effective_worker_count(n_workers, len(base_structures))
         self._total = 0
         self._by_type = {}
         self._by_config = {}
@@ -497,6 +574,7 @@ class PerturbationCoordinator:
         self._provenance_records = ()
         self._duplicate_count = 0
         self._magnetic_summary = None
+        self._task_elapsed_seconds = {}
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         output_file = output_dir / "generated_structures.xyz"
@@ -518,6 +596,19 @@ class PerturbationCoordinator:
             n_surfaces=0,
             n_grain_boundaries=n_grain_boundaries,
         )
+        atom_counts = [len(base) for base in base_structures]
+        atom_count_summary = "0" if not atom_counts else f"{min(atom_counts)}-{max(atom_counts)}"
+        family_plan = ", ".join(self._planned_families(counts, self.settings))
+        logger.info(
+            "Starting perturbations: tasks=%s, workers=%s, submission_window=%s, "
+            "base_atoms=%s, families=%s, output=%s",
+            len(base_structures),
+            n_workers,
+            1 if n_workers == 1 else 2 * n_workers,
+            atom_count_summary,
+            family_plan,
+            output_file,
+        )
         temporary_path: Path | None = None
         file_descriptor: int | None = None
         try:
@@ -535,8 +626,12 @@ class PerturbationCoordinator:
                 # Defect magnetic limits are run-global, so magnetic mode must
                 # see the complete deterministic structural parent sequence.
                 structural_candidates: list[Any] = []
-                for result in self._execute(self._tasks(base_structures, counts), n_workers):
+                for task_index, result in enumerate(
+                    self._execute(self._tasks(base_structures, counts), n_workers),
+                    start=1,
+                ):
                     self._rejected_attempts.extend(result.rejected_attempts)
+                    duplicates_before = self._duplicate_count
                     batch = self._deduplicate_result(
                         result,
                         seen_structure_ids=seen_structure_ids,
@@ -547,6 +642,25 @@ class PerturbationCoordinator:
                         self._flush(batch, output_handle=output_handle)
                     else:
                         structural_candidates.extend(batch)
+                    elapsed = self._task_elapsed_seconds.pop(
+                        (result.task.base_structure_id, result.task.seed),
+                        0.0,
+                    )
+                    source = result.task.base.info.get("configurational_type", "unknown")
+                    logger.info(
+                        "Perturbation task %s/%s complete: source=%s base=%s accepted=%s "
+                        "published=%s duplicates=%s rejected=%s elapsed=%.1fs workers=%s",
+                        task_index,
+                        len(base_structures),
+                        source,
+                        result.task.base_structure_id,
+                        len(result.candidates),
+                        len(batch) if self.magnetic_generator is None else 0,
+                        self._duplicate_count - duplicates_before,
+                        len(result.rejected_attempts),
+                        elapsed,
+                        n_workers,
+                    )
                 if self.magnetic_generator is not None:
                     magnetic_result = self.magnetic_generator.expand_structures(
                         structural_candidates
@@ -640,33 +754,71 @@ class PerturbationCoordinator:
 
         if n_workers == 1:
             for task in tasks:
-                yield self._execute_one(task)
+                started_at = monotonic()
+                result = self._execute_one(task)
+                self._task_elapsed_seconds[(task.base_structure_id, task.seed)] = (
+                    monotonic() - started_at
+                )
+                yield result
             return
 
         submission_window = 2 * n_workers
         task_iterator = iter(tasks)
-        pending: deque[tuple[PerturbationTask, Any]] = deque()
+        pending: deque[tuple[int, PerturbationTask, Any, float]] = deque()
         exhausted = False
+        submitted_count = 0
         pool = ProcessPoolExecutor(max_workers=n_workers)
 
         def fill_submission_window() -> None:
-            nonlocal exhausted
+            nonlocal exhausted, submitted_count
             while len(pending) < submission_window and not exhausted:
                 try:
                     task = next(task_iterator)
                 except StopIteration:
                     exhausted = True
                     return
-                pending.append((task, pool.submit(execute_perturbation_task, task)))
+                submitted_count += 1
+                pending.append(
+                    (
+                        submitted_count,
+                        task,
+                        pool.submit(execute_perturbation_task, task),
+                        monotonic(),
+                    )
+                )
 
         try:
             fill_submission_window()
             while pending:
-                task, future = pending.popleft()
-                yield self._resolve_future(task, future)
+                task_index, task, future, started_at = pending.popleft()
+                while True:
+                    try:
+                        result = self._resolve_future(
+                            task,
+                            future,
+                            timeout=_HEARTBEAT_INTERVAL_SECONDS,
+                        )
+                        break
+                    except FutureTimeoutError:
+                        source = task.base.info.get("configurational_type", "unknown")
+                        family_plan = ", ".join(self._planned_families(task.counts, task.settings))
+                        logger.info(
+                            "Waiting for ordered task %s (source=%s base=%s families=%s) "
+                            "after %.1fs; %s task(s) remain in the bounded window",
+                            task_index,
+                            source,
+                            task.base_structure_id,
+                            family_plan,
+                            monotonic() - started_at,
+                            len(pending) + 1,
+                        )
+                self._task_elapsed_seconds[(task.base_structure_id, task.seed)] = (
+                    monotonic() - started_at
+                )
+                yield result
                 fill_submission_window()
         except BaseException:
-            for _task, future in pending:
+            for _task_index, _task, future, _started_at in pending:
                 future.cancel()
             pool.shutdown(wait=False, cancel_futures=True)
             raise
@@ -683,9 +835,16 @@ class PerturbationCoordinator:
             raise PerturbationTaskError(task, exc) from exc
 
     @staticmethod
-    def _resolve_future(task: PerturbationTask, future: Any) -> PerturbationTaskResult:
+    def _resolve_future(
+        task: PerturbationTask,
+        future: Any,
+        *,
+        timeout: float | None = None,
+    ) -> PerturbationTaskResult:
         try:
-            return future.result()
+            return future.result(timeout=timeout)
+        except FutureTimeoutError:
+            raise
         except Exception as exc:
             # Future implementations may wrap arbitrary worker exceptions;
             # normalize them once without treating the task as successful.

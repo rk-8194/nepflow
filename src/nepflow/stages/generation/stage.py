@@ -226,6 +226,12 @@ class GenerationStage:
         gas = bool(request.composition.gas_elements)
         self.logger.info("")
         self.logger.info("Step 3: Applying perturbations")
+        self.logger.info(
+            "  Perturbation request: bases=%s, requested_workers=%s, target_atoms=%s",
+            len(bases),
+            config.n_workers,
+            config.target_n_atoms,
+        )
         output_path = self.coordinator.process(
             bases,
             output_dir=request.project_dir / request.structures_path / "generated",

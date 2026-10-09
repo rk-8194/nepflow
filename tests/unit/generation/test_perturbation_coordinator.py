@@ -1,5 +1,6 @@
 """Coordinator execution, defect placement, and worker failure contracts."""
 
+import logging
 import pickle
 from pathlib import Path
 from types import MappingProxyType
@@ -76,7 +77,8 @@ class _HarnessFuture:
         self._function = function
         self._task = task
 
-    def result(self):
+    def result(self, timeout: float | None = None):
+        del timeout
         if self._harness.first_result_submission_count is None:
             self._harness.first_result_submission_count = len(self._harness.submitted_task_ids)
         try:
@@ -599,6 +601,90 @@ def test_auto_workers_uses_the_same_bounded_parallel_window(
     assert len(candidates) == len(bases)
     assert harness.worker_counts == [2]
     assert harness.peak_in_flight_count <= 4
+
+
+def test_auto_workers_respect_cpu_allocation_cap_and_runnable_tasks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        PerturbationCoordinator,
+        "_available_cpu_count",
+        staticmethod(lambda: 12),
+    )
+
+    assert PerturbationCoordinator._effective_worker_count(0, 100) == 8
+    assert PerturbationCoordinator._effective_worker_count(0, 3) == 3
+    assert PerturbationCoordinator._effective_worker_count(1, 100) == 1
+    assert PerturbationCoordinator._effective_worker_count(12, 2) == 2
+
+
+def test_process_logs_start_and_published_task_progress(tmp_path, caplog: pytest.LogCaptureFixture) -> None:
+    coordinator = PerturbationCoordinator(
+        settings=PerturbationSettings(
+            target_n_atoms=4,
+            n_volume_points=0,
+            elastic_stress_enabled=False,
+        )
+    )
+
+    with caplog.at_level(logging.INFO, logger=coordinator_module.__name__):
+        coordinator.process(
+            [base_atoms()],
+            tmp_path,
+            n_rattled=0,
+            n_vacancies=0,
+            n_interstitials=0,
+            n_workers=1,
+        )
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("Starting perturbations: tasks=1, workers=1" in message for message in messages)
+    assert any(
+        "Perturbation task 1/1 complete:" in message and "published=1" in message
+        for message in messages
+    )
+
+
+def test_ordered_wait_logs_a_heartbeat_for_the_blocking_task(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    first = base_atoms(source="first")
+    second = base_atoms(source="second")
+    second.set_cell(np.diag([12.5, 12.0, 12.0]), scale_atoms=False)
+    coordinator = PerturbationCoordinator(
+        settings=PerturbationSettings(
+            target_n_atoms=4,
+            n_volume_points=0,
+            elastic_stress_enabled=False,
+        )
+    )
+    harness = PerturbationExecutionHarness()
+    original_resolve = coordinator._resolve_future
+    timed_out = False
+
+    def resolve_after_one_heartbeat(task, future, *, timeout=None):
+        nonlocal timed_out
+        if not timed_out:
+            timed_out = True
+            raise coordinator_module.FutureTimeoutError()
+        return original_resolve(task, future, timeout=timeout)
+
+    monkeypatch.setattr(coordinator_module, "ProcessPoolExecutor", harness.executor_factory)
+    monkeypatch.setattr(coordinator, "_resolve_future", resolve_after_one_heartbeat)
+
+    with caplog.at_level(logging.INFO, logger=coordinator_module.__name__):
+        coordinator.process(
+            [first, second],
+            tmp_path,
+            n_rattled=0,
+            n_vacancies=0,
+            n_interstitials=0,
+            n_workers=2,
+        )
+
+    assert any("Waiting for ordered task 1" in record.getMessage() for record in caplog.records)
 
 
 def test_parallel_failure_cancels_pending_futures_with_task_context(
