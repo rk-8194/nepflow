@@ -340,9 +340,7 @@ def _surface_parameters(
         )
     reference_normal = _surface_normal(reference_cell, miller_index)
     layer_count = _layer_count(candidate, np.asarray(geometry.normal, dtype=float))
-    reference_cell_tuple = tuple(
-        tuple(float(value) for value in row) for row in reference_cell
-    )
+    reference_cell_tuple = tuple(tuple(float(value) for value in row) for row in reference_cell)
     backend_version = _backend_version()
     return {
         "parent_structure_id": calculate_structure_id(base),
@@ -415,11 +413,7 @@ def measure_surface_geometry(candidate: Atoms) -> SurfaceGeometryMeasurement:
     second_length = float(np.linalg.norm(second))
     in_plane_cross = np.cross(first, second)
     in_plane_area = float(np.linalg.norm(in_plane_cross))
-    if (
-        first_length <= 1.0e-12
-        or second_length <= 1.0e-12
-        or in_plane_area <= 1.0e-12
-    ):
+    if first_length <= 1.0e-12 or second_length <= 1.0e-12 or in_plane_area <= 1.0e-12:
         raise SurfaceConstructionError("constructed slab has a degenerate in-plane cell")
     normal = in_plane_cross / in_plane_area
     positions = np.asarray(candidate.get_positions(), dtype=float)
@@ -522,9 +516,7 @@ def _species_resolved_environments(
         ) from exc
     environments: list[dict[str, list[float]]] = [dict() for _ in symbols]
     for index, neighbour, distance in zip(indices, neighbours, distances):
-        environments[int(index)].setdefault(symbols[int(neighbour)], []).append(
-            float(distance)
-        )
+        environments[int(index)].setdefault(symbols[int(neighbour)], []).append(float(distance))
     return tuple(
         tuple(
             (species, tuple(sorted(distances)))
@@ -539,17 +531,13 @@ def _environments_match(
     parent: tuple[tuple[str, tuple[float, ...]], ...],
     tolerance: float,
 ) -> bool:
-    if tuple(species for species, _ in candidate) != tuple(
-        species for species, _ in parent
-    ):
+    if tuple(species for species, _ in candidate) != tuple(species for species, _ in parent):
         return False
     return all(
         len(candidate_distances) == len(parent_distances)
         and all(
             abs(candidate_distance - parent_distance) <= tolerance
-            for candidate_distance, parent_distance in zip(
-                candidate_distances, parent_distances
-            )
+            for candidate_distance, parent_distance in zip(candidate_distances, parent_distances)
         )
         for (_, candidate_distances), (_, parent_distances) in zip(candidate, parent)
     )

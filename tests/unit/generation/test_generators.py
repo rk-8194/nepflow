@@ -85,7 +85,9 @@ def test_sqs_uses_declared_backend_and_records_effective_seed() -> None:
 
     assert backend.seeds == [11, 12]
     assert [item.info["random_seed"] for item in results] == [11, 12]
-    assert all(len(supercells) == 1 and len(supercells[0]) == 8 for supercells in backend.supercells)
+    assert all(
+        len(supercells) == 1 and len(supercells[0]) == 8 for supercells in backend.supercells
+    )
 
 
 def test_sqs_backend_failure_is_explicit_and_never_falls_back() -> None:

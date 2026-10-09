@@ -850,10 +850,7 @@ def validate_generation_config(config: GenerationConfig) -> GenerationConfig:
         raise ConfigurationError(
             "generation.surface_layers must be positive when surface_thickness is not set"
         )
-    if (
-        not math.isfinite(config.surface_min_half_depth)
-        or config.surface_min_half_depth <= 0.0
-    ):
+    if not math.isfinite(config.surface_min_half_depth) or config.surface_min_half_depth <= 0.0:
         raise ConfigurationError("generation.surface_min_half_depth must be positive and finite")
     if (
         not math.isfinite(config.surface_bulk_environment_radius)
