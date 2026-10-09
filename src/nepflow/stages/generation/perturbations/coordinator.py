@@ -14,9 +14,6 @@ from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import dataclass, replace
 from io import StringIO
 from pathlib import Path
-from queue import Empty as QueueEmpty
-from queue import Full as QueueFull
-from queue import Queue
 from time import monotonic
 from typing import Any
 
@@ -52,7 +49,6 @@ from .liquid import liquid_snapshots
 from .magnetism import MagneticGenerationSummary, MagneticGenerator
 from .models import (
     PerturbationCounts,
-    PerturbationProgressEvent,
     PerturbationRejection,
     PerturbationSettings,
     PerturbationTask,
@@ -124,49 +120,6 @@ _PERTURBATION_FAMILIES = frozenset(_FAMILY_ORDER)
 _SLOT_BATCH_SIZE = 8
 
 
-def _task_requested_units(task: PerturbationTask) -> int | None:
-    """Return the number of slots represented by a bounded task, when known."""
-
-    if task.slot_stop is None:
-        return None
-    return max(0, task.slot_stop - task.slot_start)
-
-
-def _emit_progress(
-    task: PerturbationTask,
-    phase: str,
-    *,
-    completed_units: int | None = None,
-    requested_units: int | None = None,
-    detail: str | None = None,
-) -> None:
-    """Best-effort, non-blocking worker-to-parent progress reporting."""
-
-    progress_queue = task.progress_queue
-    if progress_queue is None:
-        return
-    event = PerturbationProgressEvent(
-        task_key=task.progress_key,
-        base_ordinal=task.base_ordinal,
-        base_structure_id=task.base_structure_id,
-        family=task.family or "all",
-        slot_start=task.slot_start,
-        slot_stop=task.slot_stop,
-        phase=phase,
-        completed_units=completed_units,
-        requested_units=requested_units,
-        timestamp=monotonic(),
-        worker_pid=os.getpid(),
-        detail=detail,
-    )
-    try:
-        progress_queue.put(event, block=False)
-    except (QueueFull, BrokenPipeError, EOFError, OSError):
-        # Progress must never hold up a scientific worker or turn a completed
-        # result into a failed result when the parent is busy draining events.
-        return
-
-
 class PerturbationTaskError(RuntimeError):
     """A worker failure attributed to one exact base, family, and seed."""
 
@@ -194,11 +147,6 @@ class _TaskProgressState:
     task: PerturbationTask
     status: str = "queued"
     submitted_at: float = 0.0
-    started_at: float | None = None
-    last_event_at: float | None = None
-    last_phase: str = "queued"
-    completed_units: int | None = None
-    requested_units: int | None = None
 
 
 class _ProgressTracker:
@@ -228,38 +176,13 @@ class _ProgressTracker:
             task=task,
             status="submitted",
             submitted_at=now,
-            requested_units=_task_requested_units(task),
         )
         self.submitted += 1
-
-    def event(self, event: PerturbationProgressEvent) -> None:
-        state = self.states.get(event.task_key)
-        if state is None:
-            return
-        now = monotonic()
-        state.last_event_at = now
-        state.last_phase = event.phase
-        if event.completed_units is not None:
-            state.completed_units = max(state.completed_units or 0, event.completed_units)
-        if event.requested_units is not None:
-            state.requested_units = event.requested_units
-        if event.phase == "started":
-            state.status = "running"
-            if state.started_at is None:
-                state.started_at = now
-        elif event.phase in {"generating", "validating"}:
-            state.status = "running"
-            if state.started_at is None:
-                state.started_at = now
 
     def completed_result(self, task: PerturbationTask, result: PerturbationTaskResult) -> None:
         state = self.states.get(task.progress_key)
         if state is not None:
             state.status = "completed"
-            state.last_event_at = monotonic()
-            state.last_phase = "finished"
-            state.completed_units = len(result.candidates) + len(result.rejected_attempts)
-            state.requested_units = state.requested_units or _task_requested_units(task)
         self.completed += 1
         self.produced += len(result.candidates) + len(result.rejected_attempts)
         self.validated += len(result.candidates) + len(result.rejected_attempts)
@@ -270,8 +193,6 @@ class _ProgressTracker:
         state = self.states.get(task.progress_key)
         if state is not None:
             state.status = "failed"
-            state.last_event_at = monotonic()
-            state.last_phase = "failed"
         self.failed += 1
 
     def published_result(
@@ -298,7 +219,6 @@ class _ProgressTracker:
     def snapshot(self, *, reason: str, head: _TaskProgressState | None = None) -> None:
         terminal = self.completed + self.failed
         percentage = 0.0 if not self.total else 100.0 * terminal / self.total
-        active = [state for state in self.states.values() if state.status == "running"]
         waiting_for_order = sum(
             state.status == "completed" and head is not None and state.index > head.index
             for state in self.states.values()
@@ -306,14 +226,13 @@ class _ProgressTracker:
         elapsed = monotonic() - self.started_at
         total_label = "?" if self.total is None else str(self.total)
         logger.debug(
-            "Perturbations progress (%s): %s/%s tasks finished (%.1f%%); %s active; "
-            "submitted=%s; %s in flight; %s published; %s finished awaiting order; "
+            "Perturbations progress (%s): %s/%s tasks finished (%.1f%%); "
+            "submitted=%s; %s pending; %s published; %s ready awaiting order; "
             "failed=%s; elapsed=%.1fs",
             reason,
             terminal,
             total_label,
             percentage,
-            len(active),
             self.submitted,
             len(self.states),
             self.published,
@@ -331,29 +250,6 @@ class _ProgressTracker:
             self.duplicates,
             self.written,
         )
-        if active:
-            current = max(
-                active,
-                key=lambda state: monotonic() - (state.started_at or state.submitted_at),
-            )
-            progress = "unknown"
-            if current.completed_units is not None and current.requested_units is not None:
-                progress = f"{current.completed_units}/{current.requested_units}"
-            last_update = (
-                "never"
-                if current.last_event_at is None
-                else f"{monotonic() - current.last_event_at:.1f}s ago"
-            )
-            logger.debug(
-                "Active perturbation: task=%s %s phase=%s progress=%s elapsed=%.1fs "
-                "last_progress=%s",
-                current.index,
-                self._task_label(current.task),
-                current.last_phase,
-                progress,
-                monotonic() - (current.started_at or current.submitted_at),
-                last_update,
-            )
         if head is not None and head.status != "completed":
             logger.debug(
                 "Ordered publication blocked by task=%s (%s); %s later task(s) finished; "
@@ -361,7 +257,7 @@ class _ProgressTracker:
                 head.index,
                 self._task_label(head.task),
                 waiting_for_order,
-                monotonic() - (head.started_at or head.submitted_at),
+                monotonic() - head.submitted_at,
             )
 
 
@@ -383,11 +279,6 @@ def family_applies_to_base(
 def execute_perturbation_task(task: PerturbationTask) -> PerturbationTaskResult:
     """Execute one complete task; this function is process-pool picklable."""
 
-    _emit_progress(
-        task,
-        "started",
-        requested_units=_task_requested_units(task),
-    )
     if task.family is not None:
         return _execute_perturbation_batch(task)
 
@@ -665,12 +556,6 @@ def execute_perturbation_task(task: PerturbationTask) -> PerturbationTaskResult:
         provenance_records=tuple(provenance_records),
         rejected_attempts=tuple(rejected_attempts),
     )
-    _emit_progress(
-        task,
-        "finished",
-        completed_units=len(output),
-        requested_units=_task_requested_units(task),
-    )
     return result
 
 
@@ -730,27 +615,8 @@ def _execute_perturbation_batch(task: PerturbationTask) -> PerturbationTaskResul
         candidate_records[id(candidate)] = record
         return record
 
-    _emit_progress(
-        task,
-        "generating",
-        completed_units=0,
-        requested_units=_task_requested_units(task),
-    )
     output = _generate_family_batch(task, supercell, annotate)
-    _emit_progress(
-        task,
-        "generating",
-        completed_units=len(output),
-        requested_units=_task_requested_units(task),
-    )
-    result = _validate_batch_candidates(task, supercell, output, candidate_records)
-    _emit_progress(
-        task,
-        "finished",
-        completed_units=len(output),
-        requested_units=_task_requested_units(task),
-    )
-    return result
+    return _validate_batch_candidates(task, supercell, output, candidate_records)
 
 
 def _generate_family_batch(task: PerturbationTask, supercell: Any, annotate: Any) -> list[Any]:
@@ -880,12 +746,6 @@ def _validate_batch_candidates(
 ) -> PerturbationTaskResult:
     """Validate and retain only this batch's accepted candidates."""
 
-    _emit_progress(
-        task,
-        "validating",
-        completed_units=0,
-        requested_units=len(output),
-    )
     accepted: list[Any] = []
     provenance_records: list[Any] = []
     rejected_attempts: list[PerturbationRejection] = []
@@ -918,12 +778,6 @@ def _validate_batch_candidates(
             accepted.append(candidate)
             if record is not None:
                 provenance_records.append(record)
-            _emit_progress(
-                task,
-                "validating",
-                completed_units=local_index + 1,
-                requested_units=len(output),
-            )
             continue
 
         operation_id = f"{task.base_structure_id}:{family}:{task.slot_start + local_index}"
@@ -943,14 +797,6 @@ def _validate_batch_candidates(
                 evidence=issue.evidence,
             )
         )
-        _emit_progress(
-            task,
-            "validating",
-            completed_units=local_index + 1,
-            requested_units=len(output),
-        )
-    if not output:
-        _emit_progress(task, "validating", completed_units=0, requested_units=0)
     return PerturbationTaskResult(
         task=task,
         candidates=tuple(accepted),
@@ -1140,6 +986,37 @@ class PerturbationCoordinator:
         raise KeyError(f"Unknown perturbation family: {family}")
 
     @staticmethod
+    def _family_slot_windows(
+        family: str,
+        counts: PerturbationCounts,
+        settings: PerturbationSettings,
+        base: Any | None = None,
+    ) -> tuple[tuple[int, int], ...]:
+        """Return canonical bounded windows for one family.
+
+        Liquid snapshots are statefully coupled within each trajectory, so a
+        trajectory is the smallest executable window even when it exceeds the
+        generic slot batch size.
+        """
+
+        total_slots = PerturbationCoordinator._family_slot_count(family, counts, settings, base)
+        if total_slots <= 0:
+            return ()
+        if family == "liquid":
+            snapshots = counts.n_liquid_snapshots
+            return tuple(
+                (
+                    configuration * snapshots,
+                    (configuration + 1) * snapshots,
+                )
+                for configuration in range(counts.n_liquid_configurations)
+            )
+        return tuple(
+            (slot_start, min(slot_start + _SLOT_BATCH_SIZE, total_slots))
+            for slot_start in range(0, total_slots, _SLOT_BATCH_SIZE)
+        )
+
+    @staticmethod
     def _prepare_base_supercell(
         base: Any,
         settings: PerturbationSettings,
@@ -1170,8 +1047,9 @@ class PerturbationCoordinator:
                     family, base, task_settings
                 ):
                     continue
-                total_slots = self._family_slot_count(family, counts, task_settings, base)
-                for slot_start in range(0, total_slots, _SLOT_BATCH_SIZE):
+                for slot_start, slot_stop in self._family_slot_windows(
+                    family, counts, task_settings, base
+                ):
                     yield PerturbationTask(
                         base=base,
                         base_structure_id=base_structure_id,
@@ -1181,7 +1059,7 @@ class PerturbationCoordinator:
                         base_ordinal=base_ordinal,
                         family=family,
                         slot_start=slot_start,
-                        slot_stop=min(slot_start + _SLOT_BATCH_SIZE, total_slots),
+                        slot_stop=slot_stop,
                         prepared_supercell=prepared_supercell,
                     )
 
@@ -1201,8 +1079,7 @@ class PerturbationCoordinator:
                     family, base, task_settings
                 ):
                     continue
-                slots = self._family_slot_count(family, counts, task_settings, base)
-                total += (slots + _SLOT_BATCH_SIZE - 1) // _SLOT_BATCH_SIZE
+                total += len(self._family_slot_windows(family, counts, task_settings, base))
         return total
 
     def generate_candidates(
@@ -1234,9 +1111,9 @@ class PerturbationCoordinator:
 
         candidates, records = self._deduplicate_results(results_with_rejections())
         if self.magnetic_generator is not None:
-            magnetic_result = self.magnetic_generator.expand_structures(candidates)
-            candidates = list(magnetic_result.candidates)
-            self._magnetic_summary = magnetic_result.summary
+            magnetic_stream = self.magnetic_generator.expansion_stream()
+            candidates = list(magnetic_stream.expand(candidates))
+            self._magnetic_summary = magnetic_stream.summary
         self._provenance_records = records
         return candidates
 
@@ -1323,9 +1200,11 @@ class PerturbationCoordinator:
                 seen_structure_ids: set[str] = set()
                 seen_operation_ids: set[tuple[str, str]] = set()
                 retained_records: list[GeneratedStructureRecord] = []
-                # Defect magnetic limits are run-global, so magnetic mode must
-                # see the complete deterministic structural parent sequence.
-                structural_candidates: list[Any] = []
+                magnetic_stream = (
+                    self.magnetic_generator.expansion_stream()
+                    if self.magnetic_generator is not None
+                    else None
+                )
                 for result in self._execute(
                     self._tasks(base_structures, counts),
                     n_workers,
@@ -1343,7 +1222,11 @@ class PerturbationCoordinator:
                     if self.magnetic_generator is None:
                         self._flush(batch, output_handle=output_handle)
                     else:
-                        structural_candidates.extend(batch)
+                        assert magnetic_stream is not None
+                        self._flush(
+                            magnetic_stream.expand(batch),
+                            output_handle=output_handle,
+                        )
                     duplicates = self._duplicate_count - duplicates_before
                     progress_tracker.published_result(
                         result.task,
@@ -1358,12 +1241,8 @@ class PerturbationCoordinator:
                         progress_tracker.written,
                     )
                     progress_tracker.snapshot(reason="publication")
-                if self.magnetic_generator is not None:
-                    magnetic_result = self.magnetic_generator.expand_structures(
-                        structural_candidates
-                    )
-                    self._magnetic_summary = magnetic_result.summary
-                    self._flush(magnetic_result.candidates, output_handle=output_handle)
+                if magnetic_stream is not None:
+                    self._magnetic_summary = magnetic_stream.summary
                     progress_tracker.written = self._total
                 output_handle.flush()
                 os.fsync(output_handle.fileno())
@@ -1461,19 +1340,15 @@ class PerturbationCoordinator:
         )
 
         if n_workers == 1:
-            progress_queue: Any = Queue(maxsize=max(32, submission_window * 4))
             for task_index, task in enumerate(tasks, start=1):
-                worker_task = replace(task, progress_queue=progress_queue)
                 tracker.register(task_index, task)
                 started_at = monotonic()
                 try:
-                    result = self._execute_one(worker_task)
+                    result = self._execute_one(task)
                 except BaseException:
-                    self._drain_progress_events(progress_queue, tracker)
                     tracker.failed_result(task)
                     tracker.snapshot(reason="failure")
                     raise
-                self._drain_progress_events(progress_queue, tracker)
                 result = replace(result, task=task)
                 self._task_elapsed_seconds[task.progress_key] = monotonic() - started_at
                 tracker.completed_result(task, result)
@@ -1496,21 +1371,10 @@ class PerturbationCoordinator:
         ready_tasks: dict[int, tuple[PerturbationTask, float]] = {}
         exhausted = False
         submitted_count = 0
-        manager: Any = None
-        progress_queue: Any
 
-        # Use the same explicit safe context for the manager and worker pool.
-        # The queue itself is bounded and worker writes are nonblocking, so a
-        # chatty or disconnected worker cannot deadlock the process pool.
+        # Use the same explicit safe context for every scientific worker.
         context = _safe_multiprocessing_context()
-        try:
-            manager = context.Manager()
-            progress_queue = manager.Queue(maxsize=max(32, submission_window * 4))
-            pool = _create_process_pool(max_workers=n_workers, context=context)
-        except BaseException:
-            if manager is not None:
-                manager.shutdown()
-            raise
+        pool = _create_process_pool(max_workers=n_workers, context=context)
 
         def fill_submission_window() -> None:
             nonlocal exhausted, submitted_count
@@ -1520,10 +1384,9 @@ class PerturbationCoordinator:
                 except StopIteration:
                     exhausted = True
                     return
-                worker_task = replace(task, progress_queue=progress_queue)
                 task_index = submitted_count + 1
                 try:
-                    future = pool.submit(execute_perturbation_task, worker_task)
+                    future = pool.submit(execute_perturbation_task, task)
                 except Exception as exc:
                     raise PerturbationTaskError(task, exc) from exc
                 submitted_count = task_index
@@ -1555,8 +1418,6 @@ class PerturbationCoordinator:
         try:
             fill_submission_window()
             while pending or ready:
-                self._drain_progress_events(progress_queue, tracker)
-
                 # The synchronous harness used by existing unit tests
                 # predates concurrent.futures.Future and intentionally only
                 # resolves work when result() is consumed. Preserve that
@@ -1576,7 +1437,6 @@ class PerturbationCoordinator:
                         )
                     except FutureTimeoutError:
                         pending[task_index] = (task, future, started_at)
-                        self._drain_progress_events(progress_queue, tracker)
                         head = tracker.states.get(task.progress_key)
                         source = task.base.info.get("configurational_type", "unknown")
                         stop = "?" if task.slot_stop is None else str(task.slot_stop)
@@ -1622,7 +1482,6 @@ class PerturbationCoordinator:
                         if head_entry is not None:
                             raise PerturbationTaskError(head_entry[0], exc) from exc
                         raise
-                    self._drain_progress_events(progress_queue, tracker)
                     if not done:
                         head_task = pending.get(publication_order[0])
                         head = (
@@ -1650,7 +1509,6 @@ class PerturbationCoordinator:
                         self._task_elapsed_seconds[task.progress_key] = monotonic() - started_at
                         tracker.completed_result(task, result)
                         ready[task_index] = result
-                        self._drain_progress_events(progress_queue, tracker)
                         head_state = None
                         if publication_order:
                             head_entry = pending.get(publication_order[0])
@@ -1664,21 +1522,6 @@ class PerturbationCoordinator:
             raise
         else:
             self._shutdown_pool(pool, terminate_running=False)
-        finally:
-            if manager is not None:
-                manager.shutdown()
-
-    @staticmethod
-    def _drain_progress_events(progress_queue: Any, tracker: _ProgressTracker) -> None:
-        """Drain only currently available bounded progress notifications."""
-
-        while True:
-            try:
-                event = progress_queue.get_nowait()
-            except (QueueEmpty, EOFError, OSError):
-                return
-            if isinstance(event, PerturbationProgressEvent):
-                tracker.event(event)
 
     @staticmethod
     def _shutdown_pool(pool: Any, *, terminate_running: bool) -> None:

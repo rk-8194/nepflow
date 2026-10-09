@@ -9,6 +9,7 @@ pytest.importorskip("ase")
 from ase import Atoms
 from ase import md as ase_md
 
+import nepflow.stages.generation.perturbations.liquid as liquid_module
 from nepflow.domain.identities import calculate_structure_id
 from nepflow.stages.generation.perturbations.coordinator import (
     PerturbationCoordinator,
@@ -113,6 +114,95 @@ def test_exact_count_and_post_equilibration_snapshot_ordering() -> None:
     assert [item.info["liquid_snapshot_index"] for item in outputs] == [0, 1, 2, 0, 1, 2]
     assert [item.info["liquid_snapshot_step"] for item in outputs] == [5, 8, 11, 5, 8, 11]
     assert all(item.info["liquid_snapshot_step"] > 2 for item in outputs)
+
+
+def test_trajectory_aligned_windows_match_complete_liquid_sequence() -> None:
+    base = base_atoms()
+    full = generate(base, n_configurations=2, n_snapshots=5, seed=31)
+    configured = settings(random_seed=31)
+    first = liquid_snapshots(
+        base,
+        base,
+        2,
+        5,
+        configured,
+        31,
+        annotate_generation_provenance,
+        slot_start=0,
+        slot_stop=5,
+    )
+    second = liquid_snapshots(
+        base,
+        base,
+        2,
+        5,
+        configured,
+        31,
+        annotate_generation_provenance,
+        slot_start=5,
+        slot_stop=10,
+    )
+
+    assert len(first) == len(second) == 5
+    batched = first + second
+    assert [item.info["liquid_configuration_index"] for item in first] == [0] * 5
+    assert [item.info["liquid_configuration_index"] for item in second] == [1] * 5
+    for expected, actual in zip(full, batched):
+        np.testing.assert_array_equal(expected.numbers, actual.numbers)
+        np.testing.assert_array_equal(expected.positions, actual.positions)
+        np.testing.assert_array_equal(expected.cell.array, actual.cell.array)
+        assert expected.info == actual.info
+
+
+def test_aligned_window_executes_only_owned_trajectory(monkeypatch: pytest.MonkeyPatch) -> None:
+    real_langevin = ase_md.Langevin
+    setup_calls = 0
+    trajectory_indices: list[int] = []
+
+    def counting_langevin(*args, **kwargs):
+        nonlocal setup_calls
+        setup_calls += 1
+        return real_langevin(*args, **kwargs)
+
+    real_seed = liquid_module.derive_child_seed
+
+    def tracking_seed(source_parent_id, seed, family, configuration_index):
+        trajectory_indices.append(configuration_index)
+        return real_seed(source_parent_id, seed, family, configuration_index)
+
+    monkeypatch.setattr(ase_md, "Langevin", counting_langevin)
+    monkeypatch.setattr(liquid_module, "derive_child_seed", tracking_seed)
+
+    outputs = liquid_snapshots(
+        base_atoms(),
+        base_atoms(),
+        2,
+        5,
+        settings(),
+        17,
+        annotate_generation_provenance,
+        slot_start=5,
+        slot_stop=10,
+    )
+
+    assert len(outputs) == 5
+    assert setup_calls == 1
+    assert trajectory_indices == [1]
+
+
+def test_split_liquid_window_fails_with_alignment_error() -> None:
+    with pytest.raises(LiquidGenerationError, match="align to complete trajectory boundaries"):
+        liquid_snapshots(
+            base_atoms(),
+            base_atoms(),
+            2,
+            5,
+            settings(),
+            17,
+            annotate_generation_provenance,
+            slot_start=8,
+            slot_stop=10,
+        )
 
 
 def test_same_seed_is_reproducible_and_trajectory_seeds_are_distinct() -> None:

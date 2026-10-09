@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import AbstractContextManager
 from dataclasses import fields, is_dataclass
 from io import StringIO
 from pathlib import Path
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, Protocol, cast, runtime_checkable
 
 from ase.io import read, write
 
@@ -20,7 +21,7 @@ from nepflow.domain.identities import (
     calculate_structure_id,
 )
 from nepflow.domain.structures import GeneratedStructureRecord, StructureProvenance
-from nepflow.errors import ArtifactError
+from nepflow.errors import ArtifactError, StateError
 from nepflow.io.atomic import atomic_write_text
 from nepflow.io.hashing import sha256_canonical_json, sha256_file
 from nepflow.io.json import write_json
@@ -28,7 +29,12 @@ from nepflow.workflow.controller import StageContext
 
 from .generators.base import ConfigurationalGenerator
 from .generators.composition import CompositionGrid
-from .models import GenerationManifest, GenerationRequest, GenerationResult
+from .models import (
+    GenerationExecutionMode,
+    GenerationManifest,
+    GenerationRequest,
+    GenerationResult,
+)
 from .provenance import (
     annotate_base_structures,
     assign_seed_ids,
@@ -126,7 +132,7 @@ class GenerationStage:
         if self.debug_runner is None:
             raise RuntimeError("debug generation requires an explicitly injected debug runner")
         bases = list(self.debug_runner(request))
-        manifest = self._persist_bases(request, bases)
+        bases, manifest = self._persist_bases(request, bases)
         manifest = self._persist_candidate_artifact(request, manifest, bases=bases)
         return GenerationResult(
             status="completed" if bases else "empty",
@@ -136,15 +142,21 @@ class GenerationStage:
         )
 
     def _run_standard(self, request: GenerationRequest) -> GenerationResult:
+        self.logger.info("Generation execution: %s", request.execution_mode.value)
         resumed = False
-        seed_path = self._resolve_seed_path(request)
-        if not request.seeds_only and seed_path is not None and seed_path.is_file():
-            bases = self._load_saved_bases(seed_path)
-            manifest = self._manifest_for_existing(request, seed_path, bases)
-            resumed = True
-        else:
+        if request.execution_mode is GenerationExecutionMode.RESTART:
             bases = self.prepare(request)
-            manifest = self._persist_bases(request, bases)
+            bases, manifest = self._persist_bases(request, bases)
+        else:
+            seed_path = self._resolve_seed_path(request)
+            if not request.seeds_only and seed_path is not None and seed_path.is_file():
+                self.logger.info("Resuming generation from seed artifact: %s", seed_path)
+                bases = self._load_saved_bases(seed_path)
+                manifest = self._manifest_for_existing(request, seed_path, bases)
+                resumed = True
+            else:
+                bases = self.prepare(request)
+                bases, manifest = self._persist_bases(request, bases)
 
         if not bases:
             return GenerationResult(
@@ -297,7 +309,7 @@ class GenerationStage:
         return bases
 
     @staticmethod
-    def _load_saved_bases(path: Path) -> list[Any]:
+    def _read_saved_bases(path: Path) -> list[Any]:
         logger.info("Found existing seeds - loading from %s", path)
         loaded = read(str(path), index=":")
         bases = list(loaded) if isinstance(loaded, list) else [loaded]
@@ -313,30 +325,60 @@ class GenerationStage:
                     base.info[key] = []
         return bases
 
+    @staticmethod
+    def _validate_saved_base_identities(path: Path, bases: list[Any]) -> None:
+        """Reject persisted seed artifacts whose metadata disagrees with geometry."""
+
+        for base in bases:
+            canonical_id = calculate_structure_id(base)
+            embedded_id = base.info.get("structure_id")
+            if embedded_id != canonical_id:
+                raise StateError(
+                    "Persisted generation seed artifact is incompatible with the "
+                    "current persistence/identity contract: "
+                    f"canonical structure_id {canonical_id} differs from embedded "
+                    f"structure_id {embedded_id!r} in {path}"
+                )
+
+    @classmethod
+    def _load_saved_bases(cls, path: Path) -> list[Any]:
+        """Load seed structures and verify their persisted canonical identities."""
+
+        bases = cls._read_saved_bases(path)
+        cls._validate_saved_base_identities(path, bases)
+        return bases
+
+    @staticmethod
+    def _write_seed_artifact(path: Path, bases: list[Any]) -> None:
+        rendered = StringIO()
+        write(rendered, bases, format="extxyz")
+        atomic_write_text(path, rendered.getvalue(), encoding="utf-8")
+
     def _persist_bases(
         self,
         request: GenerationRequest,
         bases: list[Any],
-    ) -> GenerationManifest:
+    ) -> tuple[list[Any], GenerationManifest]:
         path = request.seeds_file
         if bases:
             path.parent.mkdir(parents=True, exist_ok=True)
-            annotate_structure_ids(bases)
-            rendered = StringIO()
-            write(rendered, bases, format="extxyz")
-            atomic_write_text(path, rendered.getvalue(), encoding="utf-8")
+            self._write_seed_artifact(path, bases)
+            canonical_bases = self._read_saved_bases(path)
+            annotate_structure_ids(canonical_bases)
+            self._write_seed_artifact(path, canonical_bases)
+            canonical_bases = self._load_saved_bases(path)
             self.logger.info("  Saved seeds to %s", path)
             artifact = ArtifactIdentity.from_file("generation_seed_structures", path)
-            self._persist_structure_records(request, bases)
+            self._persist_structure_records(request, canonical_bases)
             manifest = GenerationManifest(
                 artifact=artifact,
                 path=path,
-                structure_ids=tuple(str(base.info["structure_id"]) for base in bases),
-                count=len(bases),
+                structure_ids=tuple(str(base.info["structure_id"]) for base in canonical_bases),
+                count=len(canonical_bases),
             )
             self._persist_manifest(request, manifest)
-            return manifest
-        return GenerationManifest(artifact=None, path=path, structure_ids=tuple(), count=0)
+            return canonical_bases, manifest
+        return [], GenerationManifest(artifact=None, path=path, structure_ids=tuple(), count=0)
 
     def _persist_candidate_artifact(
         self,
@@ -470,7 +512,7 @@ class GenerationStage:
         bases: list[Any],
     ) -> GenerationManifest:
         artifact = ArtifactIdentity.from_file("generation_seed_structures", seed_path)
-        annotate_structure_ids(bases)
+        self._reconcile_resumed_base_records(request, bases)
         manifest = GenerationManifest(
             artifact=artifact,
             path=seed_path,
@@ -479,6 +521,54 @@ class GenerationStage:
             resumed=True,
         )
         return manifest
+
+    def _reconcile_resumed_base_records(
+        self,
+        request: GenerationRequest,
+        bases: list[Any],
+    ) -> None:
+        """Ensure every resumed perturbation parent exists in the ledger."""
+
+        store = request.state_store if request.state_store is not None else self.state_store
+        if not bases:
+            return
+        identities: list[tuple[Any, StructureIdentity]] = []
+        for base in bases:
+            identity = StructureIdentity.from_atoms(base)
+            annotated_id = base.info.get("structure_id")
+            if annotated_id is not None and str(annotated_id) != identity.structure_id:
+                raise StateError(
+                    "Resumed seed structure identity conflict: "
+                    f"{identity.structure_id} is annotated as {annotated_id}"
+                )
+            base.info["structure_id"] = identity.structure_id
+            identities.append((base, identity))
+        if store is None:
+            return
+        get_structure = getattr(store, "get_structure", None)
+        if not callable(get_structure):
+            raise StateError("Resumed generation requires a structure ledger lookup")
+
+        missing: list[Any] = []
+        for base, identity in identities:
+            stored = get_structure(identity.structure_id)
+            if stored is None:
+                missing.append(base)
+                continue
+            if not isinstance(stored, Mapping):
+                raise StateError(
+                    f"Resumed seed structure ledger row is malformed: {identity.structure_id}"
+                )
+            stored_schema = stored.get("identity_schema")
+            if stored_schema != identity.schema_version:
+                raise StateError(
+                    "Resumed seed structure identity schema conflict: "
+                    f"{identity.structure_id} has {stored_schema!r}, "
+                    f"expected {identity.schema_version!r}"
+                )
+
+        if missing:
+            self._persist_structure_records(request, missing)
 
     @staticmethod
     def _load_structures(path: Path) -> list[Any]:
@@ -639,46 +729,50 @@ class GenerationStage:
         store = request.state_store if request.state_store is not None else self.state_store
         if store is None:
             return
-        config_fingerprint = self._generation_config_fingerprint(request)
         for base in bases:
-            identity = StructureIdentity.from_atoms(base)
-            info = dict(base.info)
-            provenance = StructureProvenance(
-                parent_structure_id=None,
-                generator=str(
-                    info.get("generator") or info.get("configurational_type") or "generation"
-                ),
-                requested_composition=info.get("composition"),
-                realised_composition=info.get("actual_composition"),
-                source_database_id=(
-                    str(info["material_id"])
-                    if info.get("material_id") is not None
-                    else (
-                        str(info["provenance_material_ids"][0])
-                        if info.get("provenance_material_ids")
-                        else None
-                    )
-                ),
-                crystal_structure=(
-                    None
-                    if info.get("crystal_structure") is None
-                    else str(info.get("crystal_structure"))
-                ),
-                perturbation_family=info.get("configurational_type"),
-                perturbation_parameters=None,
-                random_seed=(
-                    int(info["random_seed"]) if info.get("random_seed") is not None else None
-                ),
-                operation_id=(
-                    f"generation:{request.project_name}:{config_fingerprint}:"
-                    f"{info.get('seed_id', identity.structure_id)}"
-                ),
-                code_version=None,
-                config_fingerprint=config_fingerprint,
-            )
-            store.upsert_structure(
-                GeneratedStructureRecord(identity=identity, provenance=provenance, metadata=info)
-            )
+            store.upsert_structure(self._base_structure_record(request, base))
+
+    @classmethod
+    def _base_structure_record(
+        cls,
+        request: GenerationRequest,
+        base: Any,
+    ) -> GeneratedStructureRecord:
+        identity = StructureIdentity.from_atoms(base)
+        info = dict(base.info)
+        config_fingerprint = cls._generation_config_fingerprint(request)
+        provenance = StructureProvenance(
+            parent_structure_id=None,
+            generator=str(
+                info.get("generator") or info.get("configurational_type") or "generation"
+            ),
+            requested_composition=info.get("composition"),
+            realised_composition=info.get("actual_composition"),
+            source_database_id=(
+                str(info["material_id"])
+                if info.get("material_id") is not None
+                else (
+                    str(info["provenance_material_ids"][0])
+                    if info.get("provenance_material_ids")
+                    else None
+                )
+            ),
+            crystal_structure=(
+                None
+                if info.get("crystal_structure") is None
+                else str(info.get("crystal_structure"))
+            ),
+            perturbation_family=info.get("configurational_type"),
+            perturbation_parameters=None,
+            random_seed=(int(info["random_seed"]) if info.get("random_seed") is not None else None),
+            operation_id=(
+                f"generation:{request.project_name}:{config_fingerprint}:"
+                f"{info.get('seed_id', identity.structure_id)}"
+            ),
+            code_version=None,
+            config_fingerprint=config_fingerprint,
+        )
+        return GeneratedStructureRecord(identity=identity, provenance=provenance, metadata=info)
 
     def _persist_generated_records(
         self,
@@ -690,21 +784,47 @@ class GenerationStage:
         store = request.state_store if request.state_store is not None else self.state_store
         if store is None:
             return
-        recorded_structures: set[str] = set()
-        for record in records:
-            if not isinstance(record, GeneratedStructureRecord):
-                raise TypeError("generated provenance must be a GeneratedStructureRecord")
-            if record.structure_id not in recorded_structures:
-                store.upsert_structure(record)
-                recorded_structures.add(record.structure_id)
-                continue
-            append_provenance = getattr(store, "append_structure_provenance", None)
-            if callable(append_provenance):
-                append_provenance(record.structure_id, record.provenance)
-            else:
-                # Keep compatibility with injected stores implementing the older
-                # upsert-only surface; StateStore uses the provenance-only path.
-                store.upsert_structure(record)
+        records = tuple(records)
+        record_count = len(records)
+        self.logger.info(
+            "Persisting %s generated structure records to state ledger",
+            record_count,
+        )
+
+        def persist_batch() -> None:
+            recorded_structures: set[str] = set()
+            for record in records:
+                if not isinstance(record, GeneratedStructureRecord):
+                    raise TypeError("generated provenance must be a GeneratedStructureRecord")
+                parent_id = record.provenance.parent_structure_id
+                if parent_id is not None:
+                    get_structure = getattr(store, "get_structure", None)
+                    if callable(get_structure) and get_structure(parent_id) is None:
+                        raise StateError(
+                            "Cannot persist generated structure provenance: "
+                            f"parent structure {parent_id} is absent from the ledger"
+                        )
+                if record.structure_id not in recorded_structures:
+                    store.upsert_structure(record)
+                    recorded_structures.add(record.structure_id)
+                    continue
+                append_provenance = getattr(store, "append_structure_provenance", None)
+                if callable(append_provenance):
+                    append_provenance(record.structure_id, record.provenance)
+                else:
+                    # Keep compatibility with injected stores implementing the older
+                    # upsert-only surface; StateStore uses the provenance-only path.
+                    store.upsert_structure(record)
+
+        transaction = getattr(store, "transaction", None)
+        if callable(transaction):
+            with cast(AbstractContextManager[Any], transaction()):
+                persist_batch()
+        else:
+            # Keep compatibility with lightweight injected stores that predate the
+            # transactional StateStore surface.
+            persist_batch()
+        self.logger.info("Persisted %s generated structure records", record_count)
 
     def _persist_manifest(self, request: GenerationRequest, manifest: GenerationManifest) -> None:
         store = request.state_store if request.state_store is not None else self.state_store
@@ -767,6 +887,9 @@ class GenerationStage:
             state_store=context.state_store,
             seeds_only=context.seeds_only,
             debug=context.debug,
+            execution_mode=GenerationExecutionMode.from_context_mode(
+                context.options.get("mode", "resume")
+            ),
         )
 
     @staticmethod

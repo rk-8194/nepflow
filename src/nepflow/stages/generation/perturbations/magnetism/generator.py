@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Iterator, Sequence
 from pathlib import Path
 from typing import cast
 
@@ -45,6 +45,74 @@ class MagneticGenerationError(RuntimeError):
 
 class UnsupportedMagneticTopologyError(MagneticGenerationError):
     """Raised when policy requires complete AFM topology coverage."""
+
+
+class MagneticExpansionStream:
+    """Stateful ordered expansion of structural candidates.
+
+    One stream owns the run-global magnetic budgets and diagnostics.  It emits
+    each parent expansion as soon as that parent is consumed, so callers can
+    publish bounded structural batches without changing scientific ordering.
+    """
+
+    def __init__(self, generator: "MagneticGenerator") -> None:
+        self.generator = generator
+        self._diagnostics: list[MagneticGenerationDiagnostic] = []
+        self._total_available_afm = 0
+        self._retained_afm = 0
+        self._budget_truncated = False
+        self._defect_parents = 0
+
+    @property
+    def summary(self) -> MagneticGenerationSummary:
+        """Return aggregate diagnostics and budgets observed so far."""
+
+        summary = MagneticGenerationSummary(
+            total_available_afm=self._total_available_afm,
+            retained_afm=self._retained_afm,
+            budget_truncated=self._budget_truncated,
+            diagnostics=tuple(self._diagnostics),
+        )
+        self.generator._last_summary = summary
+        return summary
+
+    def expand(self, structures: Iterable[Atoms]) -> Iterator[Atoms]:
+        """Expand structural candidates in input order without run accumulation."""
+
+        for structure in structures:
+            yield from self._expand_one(structure)
+
+    def _expand_one(self, structure: Atoms) -> Iterator[Atoms]:
+        config = self.generator.config
+        family = str(structure.info.get("perturbation_type", "unperturbed")).strip().lower()
+        selected = family == "unperturbed" or family in config.defect_families
+        source = str(structure.info.get("configurational_type", "")).strip().lower()
+        if selected and not (
+            ALL_SOURCES in config.magnetic_sources or source in config.magnetic_sources
+        ):
+            selected = False
+        if selected and family in MAGNETIC_DEFECT_FAMILIES:
+            if config.max_defect_parents and self._defect_parents >= config.max_defect_parents:
+                selected = False
+            else:
+                self._defect_parents += 1
+        if not selected:
+            preserved = structure.copy()
+            annotate_candidate_id(preserved)
+            yield preserved
+            return
+
+        variant_limit = (
+            config.max_magnetic_variants_per_defect
+            if family in MAGNETIC_DEFECT_FAMILIES
+            else config.max_magnetic_variants_per_parent
+        )
+        result = self.generator.generate_result(structure, variant_limit=variant_limit)
+        self._diagnostics.extend(result.summary.diagnostics)
+        self._total_available_afm += result.summary.total_available_afm
+        self._retained_afm += result.summary.retained_afm
+        self._budget_truncated = self._budget_truncated or result.summary.budget_truncated
+        yield from result.candidates
 
 
 class MagneticGenerator:
@@ -325,54 +393,16 @@ class MagneticGenerator:
         unchanged. This is the Phase 6 boundary that prevents magnetic logic
         from becoming a universal postprocessor.
         """
-
-        expanded: list[Atoms] = []
-        diagnostics: list[MagneticGenerationDiagnostic] = []
-        total_available_afm = 0
-        retained_afm = 0
-        budget_truncated = False
-        defect_parents = 0
-        for structure in structures:
-            family = str(structure.info.get("perturbation_type", "unperturbed")).strip().lower()
-            selected = family == "unperturbed" or family in self.config.defect_families
-            source = str(structure.info.get("configurational_type", "")).strip().lower()
-            if selected and not (
-                ALL_SOURCES in self.config.magnetic_sources
-                or source in self.config.magnetic_sources
-            ):
-                selected = False
-            if selected and family in MAGNETIC_DEFECT_FAMILIES:
-                if (
-                    self.config.max_defect_parents
-                    and defect_parents >= self.config.max_defect_parents
-                ):
-                    selected = False
-                else:
-                    defect_parents += 1
-            if not selected:
-                preserved = structure.copy()
-                annotate_candidate_id(preserved)
-                expanded.append(preserved)
-                continue
-            variant_limit = (
-                self.config.max_magnetic_variants_per_defect
-                if family in MAGNETIC_DEFECT_FAMILIES
-                else self.config.max_magnetic_variants_per_parent
-            )
-            result = self.generate_result(structure, variant_limit=variant_limit)
-            expanded.extend(result.candidates)
-            diagnostics.extend(result.summary.diagnostics)
-            total_available_afm += result.summary.total_available_afm
-            retained_afm += result.summary.retained_afm
-            budget_truncated = budget_truncated or result.summary.budget_truncated
-        summary = MagneticGenerationSummary(
-            total_available_afm=total_available_afm,
-            retained_afm=retained_afm,
-            budget_truncated=budget_truncated,
-            diagnostics=tuple(diagnostics),
-        )
+        stream = self.expansion_stream()
+        expanded = list(stream.expand(structures))
+        summary = stream.summary
         self._last_summary = summary
         return MagneticGenerationResult(tuple(expanded), summary)
+
+    def expansion_stream(self) -> MagneticExpansionStream:
+        """Create one stateful stream for a complete ordered expansion run."""
+
+        return MagneticExpansionStream(self)
 
     def expand_file(
         self, path: Path, *, output_path: Path | None = None
@@ -547,6 +577,7 @@ __all__ = [
     "MAGNETIC_GENERATOR_VERSION",
     "MagneticGenerationError",
     "MagneticCandidateGenerator",
+    "MagneticExpansionStream",
     "MagneticGenerator",
     "MagneticTopologyError",
     "UnsupportedMagneticTopologyError",

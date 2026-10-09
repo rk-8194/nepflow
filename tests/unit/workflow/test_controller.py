@@ -230,3 +230,46 @@ def test_state_write_failure_rolls_back_previous_authority(tmp_path: Path) -> No
 
     assert controller.current_stage() is WorkflowStage.GENERATE
     assert controller.project_file.read_text(encoding="utf-8") == "generate"
+
+
+def test_explicit_generate_override_passes_restart_mode(tmp_path: Path) -> None:
+    controller = make_controller(tmp_path, "generate")
+    contexts = []
+
+    def generate(context):
+        contexts.append(context)
+        return StageRunResult(
+            stage=WorkflowStage.GENERATE,
+            status=StageRunState.COMPLETED,
+            advanced_to=WorkflowStage.SELECT,
+            completed=True,
+        )
+
+    controller.stage_registry.register(WorkflowStage.GENERATE, generate)
+    controller.stage_override = "generate"
+
+    controller.run()
+
+    assert len(contexts) == 1
+    assert contexts[0].options["mode"] == "restart"
+
+
+def test_current_generate_without_override_passes_resume_mode(tmp_path: Path) -> None:
+    controller = make_controller(tmp_path, "generate")
+    contexts = []
+
+    def generate(context):
+        contexts.append(context)
+        return StageRunResult(
+            stage=WorkflowStage.GENERATE,
+            status=StageRunState.COMPLETED,
+            advanced_to=WorkflowStage.SELECT,
+            completed=True,
+        )
+
+    controller.stage_registry.register(WorkflowStage.GENERATE, generate)
+
+    controller.run()
+
+    assert len(contexts) == 1
+    assert contexts[0].options["mode"] == "resume"

@@ -31,7 +31,6 @@ from nepflow.stages.generation.perturbations.defects import (
     vacancy_interstitial,
 )
 from nepflow.stages.generation.perturbations.magnetism.models import (
-    MagneticGenerationResult,
     MagneticGenerationSummary,
 )
 from nepflow.stages.generation.perturbations.models import (
@@ -170,24 +169,33 @@ class _GlobalDefectLimitMagneticHarness:
         self.max_defect_parents = max_defect_parents
         self.calls: list[list[tuple[str, str]]] = []
 
-    def expand_structures(self, structures):
-        candidates = list(structures)
-        self.calls.append(
-            [
-                (str(item.info["seed_id"]), str(item.info["perturbation_type"]))
-                for item in candidates
-            ]
-        )
+    def expansion_stream(self):
+        harness = self
         seen_defect_parents = 0
-        expanded = []
-        for candidate in candidates:
-            materialized = candidate.copy()
-            if materialized.info["perturbation_type"] == "vacancy":
-                if seen_defect_parents < self.max_defect_parents:
-                    materialized.info["magnetic_ordering"] = "afm"
-                seen_defect_parents += 1
-            expanded.append(materialized)
-        return MagneticGenerationResult(tuple(expanded), MagneticGenerationSummary())
+
+        class Stream:
+            @property
+            def summary(self):
+                return MagneticGenerationSummary()
+
+            def expand(self, structures):
+                nonlocal seen_defect_parents
+                candidates = list(structures)
+                harness.calls.append(
+                    [
+                        (str(item.info["seed_id"]), str(item.info["perturbation_type"]))
+                        for item in candidates
+                    ]
+                )
+                for candidate in candidates:
+                    materialized = candidate.copy()
+                    if materialized.info["perturbation_type"] == "vacancy":
+                        if seen_defect_parents < harness.max_defect_parents:
+                            materialized.info["magnetic_ordering"] = "afm"
+                        seen_defect_parents += 1
+                    yield materialized
+
+        return Stream()
 
 
 def test_process_pool_uses_documented_safe_context(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -737,9 +745,55 @@ def test_parallel_collector_tracks_completed_later_tasks_before_slow_head(
         task.base_structure_id for task in tasks
     ]
     assert any(
-        record.levelno == logging.DEBUG and "finished awaiting order" in record.getMessage()
+        record.levelno == logging.DEBUG and "ready awaiting order" in record.getMessage()
         for record in caplog.records
     )
+
+
+def test_parallel_execution_has_no_manager_or_task_progress_transport(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    base = base_atoms()
+    settings = PerturbationSettings(
+        target_n_atoms=4,
+        n_volume_points=0,
+        elastic_stress_enabled=False,
+    )
+    counts = PerturbationCounts(n_rattled=0, n_vacancies=2, n_interstitials=0)
+    submitted: list[PerturbationTask] = []
+
+    class ContextWithoutManager:
+        def Manager(self):
+            raise AssertionError("progress Manager must not be constructed")
+
+    class RecordingExecutor:
+        def __init__(self, max_workers: int) -> None:
+            self._executor = ThreadPoolExecutor(max_workers=max_workers)
+
+        def submit(self, function, task):
+            submitted.append(task)
+            assert not hasattr(task, "progress_queue")
+            return self._executor.submit(function, task)
+
+        def shutdown(self, **kwargs):
+            return self._executor.shutdown(**kwargs)
+
+    monkeypatch.setattr(
+        coordinator_module,
+        "_safe_multiprocessing_context",
+        lambda: ContextWithoutManager(),
+    )
+    monkeypatch.setattr(
+        coordinator_module,
+        "_create_process_pool",
+        lambda *, max_workers, context: RecordingExecutor(max_workers),
+    )
+
+    coordinator = PerturbationCoordinator(settings=settings)
+    tasks = list(coordinator._tasks([base], counts))
+    results = list(coordinator._execute(tasks, n_workers=2))
+
+    assert len(results) == len(submitted) == len(tasks)
 
 
 @pytest.mark.parametrize("n_workers", (1, 2))
@@ -1079,14 +1133,13 @@ def test_magnetic_harness_receives_global_ordered_defect_parents(tmp_path) -> No
         n_workers=1,
     )
 
-    assert magnetic.calls == [
-        [
-            ("seed-first", "unperturbed"),
-            ("seed-first", "vacancy"),
-            ("seed-second", "unperturbed"),
-            ("seed-second", "vacancy"),
-        ]
+    assert [item for call in magnetic.calls for item in call] == [
+        ("seed-first", "unperturbed"),
+        ("seed-first", "vacancy"),
+        ("seed-second", "unperturbed"),
+        ("seed-second", "vacancy"),
     ]
+    assert len(magnetic.calls) == 4
     vacancies = [
         item
         for item in read(str(output_path), index=":")
@@ -1688,3 +1741,109 @@ def test_family_slot_batches_bound_worker_payload_and_preserve_child_slots(
         derive_child_seed(calculate_structure_id(base), tasks[0].seed, "rattled", slot)
         for slot in range(19)
     ]
+
+
+@pytest.mark.parametrize(
+    ("n_configurations", "n_snapshots", "expected_windows"),
+    [
+        (1, 1, [(0, 1)]),
+        (2, 3, [(0, 3), (3, 6)]),
+        (2, 5, [(0, 5), (5, 10)]),
+        (1, 9, [(0, 9)]),
+    ],
+)
+def test_liquid_batches_are_trajectory_aligned(
+    n_configurations: int,
+    n_snapshots: int,
+    expected_windows: list[tuple[int, int]],
+) -> None:
+    base = base_atoms(source="mp_phase")
+    settings = PerturbationSettings(
+        target_n_atoms=4,
+        n_volume_points=0,
+        elastic_stress_enabled=False,
+        liquid_enabled=True,
+        liquid_equilibration_steps=0,
+        liquid_steps_between_snapshots=1,
+    )
+    counts = PerturbationCounts(
+        n_rattled=0,
+        n_liquid_configurations=n_configurations,
+        n_liquid_snapshots=n_snapshots,
+        n_vacancies=0,
+        n_interstitials=0,
+    )
+    coordinator = PerturbationCoordinator(settings=settings)
+
+    tasks = [task for task in coordinator._tasks([base], counts) if task.family == "liquid"]
+
+    assert [(task.slot_start, task.slot_stop) for task in tasks] == expected_windows
+    assert coordinator._batch_task_count([base], counts) == 1 + len(expected_windows)
+
+    if n_configurations == 2 and n_snapshots == 5:
+        results = [execute_perturbation_task(task) for task in tasks]
+        assert [len(result.candidates) for result in results] == [5, 5]
+        assert [
+            candidate.info["liquid_configuration_index"]
+            for result in results
+            for candidate in result.candidates
+        ] == [0] * 5 + [1] * 5
+
+
+def test_rattled_and_vacancy_second_batches_complete_without_progress_ipc(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    base = base_atoms()
+    settings = PerturbationSettings(
+        target_n_atoms=4,
+        n_volume_points=0,
+        elastic_stress_enabled=False,
+        rattle_sources=("all",),
+        vacancy_sources=("all",),
+    )
+    counts = PerturbationCounts(n_rattled=10, n_vacancies=10, n_interstitials=0)
+
+    def fake_family(family):
+        def generate(supercell, source, n, family_settings, rng, annotate, **kwargs):
+            del family_settings
+            start = kwargs["slot_start"]
+            root_seed = rng if rng is not None else kwargs.get("seed", 0)
+            output = []
+            for slot in range(start, start + n):
+                candidate = supercell.copy()
+                candidate.info["perturbation_type"] = family
+                annotate(
+                    candidate,
+                    source,
+                    family,
+                    random_seed=derive_child_seed(
+                        calculate_structure_id(source), root_seed, family, slot
+                    ),
+                    operation_id=f"{family}:{slot}",
+                )
+                output.append(candidate)
+            return output
+
+        return generate
+
+    monkeypatch.setattr(coordinator_module, "rattled", fake_family("rattled"))
+    monkeypatch.setattr(coordinator_module, "vacancies", fake_family("vacancy"))
+    monkeypatch.setattr(coordinator_module, "validate_generated_candidate", lambda *args: None)
+
+    coordinator = PerturbationCoordinator(settings=settings)
+    tasks = list(coordinator._tasks([base], counts))
+    family_tasks = {
+        family: [task for task in tasks if task.family == family]
+        for family in ("rattled", "vacancy")
+    }
+
+    assert {
+        family: [(task.slot_start, task.slot_stop) for task in family_batches]
+        for family, family_batches in family_tasks.items()
+    } == {
+        "rattled": [(0, 8), (8, 10)],
+        "vacancy": [(0, 8), (8, 10)],
+    }
+    for family_batches in family_tasks.values():
+        results = [execute_perturbation_task(task) for task in family_batches]
+        assert [len(result.candidates) for result in results] == [8, 2]

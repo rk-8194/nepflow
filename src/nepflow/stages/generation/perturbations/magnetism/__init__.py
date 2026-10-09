@@ -2,6 +2,7 @@
 
 from .generator import (
     MagneticCandidateGenerator,
+    MagneticExpansionStream,
     MagneticGenerationError,
     MagneticGenerator,
     MagneticTopologyError,
@@ -24,6 +25,7 @@ from .topology import ParentTopology, read_parent_topology
 __all__ = [
     "MagneticGenerationDiagnostic",
     "MagneticCandidateGenerator",
+    "MagneticExpansionStream",
     "MagneticGenerationError",
     "MagneticGenerationResult",
     "MagneticGenerationSummary",

@@ -425,7 +425,11 @@ class WorkflowController:
                 f"Project '{self.project_name}' is not initialized; run the initialization stage first"
             )
 
+        explicit_generate_restart = False
         if self.stage_override is not None:
+            explicit_generate_restart = (
+                WorkflowStage.from_legacy(self.stage_override) is WorkflowStage.GENERATE
+            )
             self.transition_to(self.stage_override)
 
         stage = self.current_stage()
@@ -442,7 +446,10 @@ class WorkflowController:
             return
 
         self._check_deadline()
-        self._execute_stage(stage)
+        self._execute_stage(
+            stage,
+            mode="restart" if explicit_generate_restart else "resume",
+        )
 
 
 __all__ = [

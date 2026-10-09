@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -10,6 +11,31 @@ from nepflow.config.models import CompositionConfig, GenerationConfig, Magnetism
 from nepflow.domain.identities import ArtifactIdentity
 
 GENERATION_MANIFEST_SCHEMA = "nepflow.generation_manifest.v2"
+
+
+class GenerationExecutionMode(str, Enum):
+    """Execution intent supplied to the generation stage."""
+
+    RESTART = "restart"
+    RESUME = "resume"
+
+    @classmethod
+    def from_context_mode(cls, value: object) -> "GenerationExecutionMode":
+        """Translate controller context modes into generation intent."""
+
+        if isinstance(value, cls):
+            return value
+        mode = "resume" if value is None else str(value).strip().lower()
+        if mode in {"restart", "local", "debug"}:
+            return cls.RESTART
+        if mode in {"resume", "normal"}:
+            return cls.RESUME
+        raise ValueError(f"Unsupported generation execution mode: {value!r}")
+
+
+# Keep the domain terminology available to callers that refer to this as an
+# execution intent rather than an execution mode.
+GenerationExecutionIntent = GenerationExecutionMode
 
 
 @dataclass(frozen=True, slots=True)
@@ -30,7 +56,14 @@ class GenerationRequest:
     state_store: Any = None
     seeds_only: bool = False
     debug: bool = False
+    execution_mode: GenerationExecutionMode = GenerationExecutionMode.RESUME
     magnetism: MagnetismConfig = field(default_factory=MagnetismConfig)
+
+    @property
+    def execution_intent(self) -> GenerationExecutionMode:
+        """Compatibility spelling for the generation execution mode."""
+
+        return self.execution_mode
 
     @property
     def seeds_file(self) -> Path:

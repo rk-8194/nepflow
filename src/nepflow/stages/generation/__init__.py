@@ -8,6 +8,8 @@ if TYPE_CHECKING:
     from .generators.composition import CompositionGrid
     from .models import (
         GENERATION_MANIFEST_SCHEMA,
+        GenerationExecutionIntent,
+        GenerationExecutionMode,
         GenerationManifest,
         GenerationRequest,
         GenerationResult,
@@ -23,6 +25,8 @@ if TYPE_CHECKING:
 __all__ = [
     "GenerationManifest",
     "GENERATION_MANIFEST_SCHEMA",
+    "GenerationExecutionIntent",
+    "GenerationExecutionMode",
     "GenerationRequest",
     "GenerationResult",
     "GenerationStage",
@@ -37,6 +41,8 @@ __all__ = [
 def __getattr__(name: str):
     if name in {
         "GENERATION_MANIFEST_SCHEMA",
+        "GenerationExecutionIntent",
+        "GenerationExecutionMode",
         "GenerationManifest",
         "GenerationRequest",
         "GenerationResult",

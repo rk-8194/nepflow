@@ -345,10 +345,6 @@ class PerturbationTask:
     # copy this context before any family mutates it; it is not part of task
     # identity or scientific provenance.
     prepared_supercell: Any = field(default=None, compare=False, repr=False)
-    # This is populated only by the parent coordinator.  It is intentionally
-    # excluded from identity/equality: the scientific task contract is the
-    # base/family/slot tuple, while the queue is an execution detail.
-    progress_queue: Any = field(default=None, compare=False, repr=False)
 
     @property
     def task_key(self) -> tuple[str, str, int, int | None]:
@@ -367,29 +363,6 @@ class PerturbationTask:
             self.slot_start,
             self.slot_stop,
         )
-
-
-@dataclass(frozen=True, slots=True)
-class PerturbationProgressEvent:
-    """A bounded, process-safe worker progress notification.
-
-    Counts are only populated when the worker has a confirmed scientific
-    milestone.  In particular, a generator that is one indivisible operation
-    reports a running phase rather than an invented percentage.
-    """
-
-    task_key: tuple[int, str, str, int, int | None]
-    base_ordinal: int
-    base_structure_id: str
-    family: str
-    slot_start: int
-    slot_stop: int | None
-    phase: str
-    completed_units: int | None = None
-    requested_units: int | None = None
-    timestamp: float = 0.0
-    worker_pid: int | None = None
-    detail: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -445,7 +418,6 @@ __all__ = [
     "LIQUID_FIDELITY",
     "LIQUID_METHOD",
     "PerturbationCounts",
-    "PerturbationProgressEvent",
     "PerturbationSettings",
     "PerturbationTask",
     "PerturbationTaskResult",

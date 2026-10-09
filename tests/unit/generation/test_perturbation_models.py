@@ -38,6 +38,34 @@ def test_worker_task_is_pickle_serializable_and_carries_exact_identity() -> None
     assert restored.counts.n_rattled == 2
     assert restored.seed == 101
     assert restored.base.get_chemical_symbols() == ["Si", "Si"]
+    assert not hasattr(restored, "progress_queue")
+
+
+def test_bounded_worker_task_has_no_progress_event_transport() -> None:
+    base = Atoms("Si2", cell=np.eye(3) * 3.0, pbc=True)
+    prepared = base.copy()
+    task = PerturbationTask(
+        base=base,
+        base_structure_id=calculate_structure_id(base),
+        settings=PerturbationSettings(random_seed=7),
+        counts=PerturbationCounts(n_vacancies=10),
+        seed=101,
+        family="vacancy",
+        slot_start=8,
+        slot_stop=10,
+        prepared_supercell=prepared,
+    )
+
+    restored = pickle.loads(pickle.dumps(task))
+
+    assert restored.prepared_supercell is not None
+    assert restored.family == "vacancy"
+    assert (restored.slot_start, restored.slot_stop) == (8, 10)
+    assert not hasattr(restored, "progress_queue")
+
+    import nepflow.stages.generation.perturbations.models as models_module
+
+    assert not hasattr(models_module, "PerturbationProgressEvent")
 
 
 def test_target_supercell_preserves_species_cell_and_pbc() -> None:
