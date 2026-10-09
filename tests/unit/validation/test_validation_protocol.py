@@ -11,7 +11,7 @@ from ase.io import write as ase_write
 from nepflow.domain.datasets import DatasetIdentity, TrainingDatasetManifest
 from nepflow.domain.identities import ArtifactIdentity, ModelRunIdentity, StructureIdentity
 from nepflow.domain.models import ModelArtifactMetadata, ModelRunRecord
-from nepflow.errors import MlipError, ValidationError
+from nepflow.errors import MlipError, StateError, ValidationError
 from nepflow.mlip.gpumd import GpumdBackend
 from nepflow.mlip.nep.artifacts import create_model_run_manifest, update_model_run_status
 from nepflow.mlip.simulation import StaticPredictionRequest
@@ -26,6 +26,7 @@ from nepflow.stages.validation.protocols import (
     ValidationCaseSpec,
     ValidationPreparation,
 )
+from nepflow.stages.validation.resolution import _reference_from_record
 from nepflow.state.store import StateStore
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -91,6 +92,15 @@ def _materialize_authoritative_project(root: Path) -> tuple[str, Path]:
             model_run_id=manifest["model_run_id"],
         )
     return manifest["model_run_id"], dataset_path
+
+
+@pytest.mark.parametrize("pbc", ([True, False], [True, 1, False]))
+def test_authoritative_record_rejects_malformed_pbc(pbc: list[bool | int]) -> None:
+    record = _record()
+    record["pbc"] = pbc
+
+    with pytest.raises(StateError, match="invalid periodic boundary conditions"):
+        _reference_from_record(record)
 
 
 def test_resolution_and_case_schema_keep_exact_model_dataset_association(tmp_path: Path) -> None:

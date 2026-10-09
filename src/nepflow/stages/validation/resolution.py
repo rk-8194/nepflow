@@ -88,12 +88,19 @@ def _reference_from_record(record: Mapping[str, Any]) -> ValidationReference:
     forces = record.get("forces")
     if positions is None or cell is None or energy is None or forces is None:
         raise StateError(f"Authoritative validation record is missing labels: {structure_id}")
+    pbc = record.get("pbc", (True, True, True))
+    if (
+        not isinstance(pbc, (list, tuple))
+        or len(pbc) != 3
+        or not all(isinstance(value, bool) for value in pbc)
+    ):
+        raise StateError("Validation record has invalid periodic boundary conditions")
     return ValidationReference(
         structure=StructureIdentity(structure_id),
         species=tuple(str(value) for value in record.get("species", ())),
         positions_angstrom=np.asarray(positions, dtype=float),
         cell_angstrom=np.asarray(cell, dtype=float),
-        pbc=tuple(record.get("pbc", (True, True, True))),
+        pbc=(pbc[0], pbc[1], pbc[2]),
         energy_ev=float(energy),
         forces_ev_per_angstrom=np.asarray(forces, dtype=float),
         virial_ev=(
