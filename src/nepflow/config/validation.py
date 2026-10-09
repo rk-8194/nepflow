@@ -403,6 +403,28 @@ def _validate_surface_settings(config: GenerationConfig) -> None:
         raise ConfigurationError(
             "generation.surface_layers must be positive when surface_thickness is not set"
         )
+    if (
+        not math.isfinite(config.surface_min_half_depth)
+        or config.surface_min_half_depth <= 0.0
+    ):
+        raise ConfigurationError("generation.surface_min_half_depth must be positive and finite")
+    if (
+        not math.isfinite(config.surface_bulk_environment_radius)
+        or config.surface_bulk_environment_radius <= 0.0
+    ):
+        raise ConfigurationError(
+            "generation.surface_bulk_environment_radius must be positive and finite"
+        )
+    if config.surface_min_bulk_core_atoms <= 0:
+        raise ConfigurationError("generation.surface_min_bulk_core_atoms must be positive")
+    if (
+        not math.isfinite(config.surface_bulk_environment_distance_tolerance)
+        or config.surface_bulk_environment_distance_tolerance < 0.0
+    ):
+        raise ConfigurationError(
+            "generation.surface_bulk_environment_distance_tolerance must be finite and "
+            "non-negative"
+        )
     _require_non_negative("generation.surface_max_terminations", config.surface_max_terminations)
     if config.surface_termination_policy not in {"all", "first"}:
         raise ConfigurationError("generation.surface_termination_policy must be 'all' or 'first'")

@@ -441,6 +441,21 @@ def _parse_generation_perturbations(values: Mapping[str, str]) -> dict[str, Any]
         "surface_vacuum": _parse_float(
             values.get("surface_vacuum", "10.0"), "generation.surface_vacuum"
         ),
+        "surface_min_half_depth": _parse_float(
+            values.get("surface_min_half_depth", "6.0"), "generation.surface_min_half_depth"
+        ),
+        "surface_bulk_environment_radius": _parse_float(
+            values.get("surface_bulk_environment_radius", "5.0"),
+            "generation.surface_bulk_environment_radius",
+        ),
+        "surface_min_bulk_core_atoms": _parse_int(
+            values.get("surface_min_bulk_core_atoms", "1"),
+            "generation.surface_min_bulk_core_atoms",
+        ),
+        "surface_bulk_environment_distance_tolerance": _parse_float(
+            values.get("surface_bulk_environment_distance_tolerance", "0.05"),
+            "generation.surface_bulk_environment_distance_tolerance",
+        ),
         "surface_termination_policy": values.get("surface_termination_policy", "all")
         .strip()
         .lower(),

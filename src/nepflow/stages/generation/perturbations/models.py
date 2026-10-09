@@ -137,6 +137,10 @@ class PerturbationSettings:
     surface_thickness: float | None = None
     # Minimum physical vacuum thickness in Angstrom; never an hkl-plane count.
     surface_vacuum: float = 10.0
+    surface_min_half_depth: float = 6.0
+    surface_bulk_environment_radius: float = 5.0
+    surface_min_bulk_core_atoms: int = 1
+    surface_bulk_environment_distance_tolerance: float = 0.05
     surface_termination_policy: str = "all"
     surface_max_terminations: int = 0
     surface_in_plane_repeat: tuple[int, int] = (1, 1)
@@ -261,6 +265,12 @@ class PerturbationSettings:
             "surface_layers": self.surface_layers,
             "surface_thickness": self.surface_thickness,
             "surface_vacuum": self.surface_vacuum,
+            "surface_min_half_depth": self.surface_min_half_depth,
+            "surface_bulk_environment_radius": self.surface_bulk_environment_radius,
+            "surface_min_bulk_core_atoms": self.surface_min_bulk_core_atoms,
+            "surface_bulk_environment_distance_tolerance": (
+                self.surface_bulk_environment_distance_tolerance
+            ),
             "surface_termination_policy": self.surface_termination_policy,
             "surface_max_terminations": self.surface_max_terminations,
             "surface_in_plane_repeat": self.surface_in_plane_repeat,

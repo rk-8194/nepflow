@@ -19,6 +19,12 @@ from nepflow.config.models import (
 )
 from nepflow.errors import ConfigurationError
 
+from .perturbations.surfaces import (
+    SurfaceConstructionError,
+    measure_surface_bulk_core,
+    measure_surface_geometry,
+)
+
 _LIQUID_METHOD = "ase_langevin_lj"
 _LIQUID_FIDELITY = "geometry_disorder_only_not_material_specific"
 
@@ -114,7 +120,7 @@ def validate_generated_candidate(
         return CandidateValidationIssue("invalid_species", {"symbols": invalid_symbols})
 
     if reference is not None:
-        issue = _validate_family_state(candidate, reference, family)
+        issue = _validate_family_state(candidate, reference, settings, family)
         if issue is not None:
             return issue
 
@@ -195,6 +201,7 @@ def _minimum_pair_distance(candidate: Any, pbc: np.ndarray) -> float | None:
 def _validate_family_state(
     candidate: Any,
     reference: Any,
+    settings: Any,
     family: str,
 ) -> CandidateValidationIssue | None:
     if family == "liquid":
@@ -202,7 +209,7 @@ def _validate_family_state(
         if issue is not None:
             return issue
     if family == "surface":
-        issue = _validate_surface_state(candidate)
+        issue = _validate_surface_state(candidate, reference, settings)
         if issue is not None:
             return issue
     if family == "grain_boundary":
@@ -481,7 +488,11 @@ def _validate_liquid_state(candidate: Any) -> CandidateValidationIssue | None:
     return None
 
 
-def _validate_surface_state(candidate: Any) -> CandidateValidationIssue | None:
+def _validate_surface_state(
+    candidate: Any,
+    reference: Any,
+    settings: Any,
+) -> CandidateValidationIssue | None:
     """Validate surface-specific provenance and two-dimensional periodicity."""
 
     info = getattr(candidate, "info", {})
@@ -494,6 +505,21 @@ def _validate_surface_state(candidate: Any) -> CandidateValidationIssue | None:
         "surface_vacuum",
         "surface_requested_vacuum_angstrom",
         "surface_realized_vacuum_angstrom",
+        "surface_material_thickness",
+        "surface_half_depth",
+        "surface_min_half_depth",
+        "surface_in_plane_lengths",
+        "surface_in_plane_angle_degrees",
+        "surface_in_plane_area",
+        "surface_shortest_in_plane_translation",
+        "surface_projected_coordinates",
+        "surface_normal_period",
+        "surface_bulk_environment_radius",
+        "surface_bulk_environment_distance_tolerance",
+        "surface_min_bulk_core_atoms",
+        "surface_bulk_core_eligible_atom_count",
+        "surface_bulk_core_atom_count",
+        "surface_bulk_core_atom_indices",
         "surface_reference_basis",
         "surface_reference_basis_cell",
         "surface_parent_to_reference_transformation",
@@ -588,6 +614,107 @@ def _validate_surface_state(candidate: Any) -> CandidateValidationIssue | None:
             {
                 "measured_vacuum": measured_vacuum,
                 "recorded_vacuum": realized_vacuum,
+            },
+        )
+    try:
+        geometry = measure_surface_geometry(candidate)
+        bulk_core = measure_surface_bulk_core(candidate, reference, geometry, settings)
+    except SurfaceConstructionError as exc:
+        return CandidateValidationIssue("invalid_surface_geometry", {"error": str(exc)})
+    if geometry.realized_vacuum + 1.0e-6 < requested_vacuum:
+        return CandidateValidationIssue(
+            "insufficient_surface_vacuum",
+            {
+                "requested_vacuum": requested_vacuum,
+                "realized_vacuum": geometry.realized_vacuum,
+            },
+        )
+    if geometry.half_depth + 1.0e-6 < float(settings.surface_min_half_depth):
+        return CandidateValidationIssue(
+            "insufficient_surface_depth",
+            {
+                "minimum_half_depth": float(settings.surface_min_half_depth),
+                "realized_half_depth": geometry.half_depth,
+            },
+        )
+    if bulk_core.bulk_core_atom_count < int(settings.surface_min_bulk_core_atoms):
+        return CandidateValidationIssue(
+            "insufficient_surface_bulk_core",
+            {
+                "required_bulk_core_atoms": int(settings.surface_min_bulk_core_atoms),
+                "realized_bulk_core_atoms": bulk_core.bulk_core_atom_count,
+                "eligible_bulk_core_atoms": bulk_core.eligible_atom_count,
+            },
+        )
+    try:
+        stored_lengths = tuple(float(value) for value in info["surface_in_plane_lengths"])
+        stored_angle = float(info["surface_in_plane_angle_degrees"])
+        stored_area = float(info["surface_in_plane_area"])
+        stored_shortest = float(info["surface_shortest_in_plane_translation"])
+        stored_projections = tuple(float(value) for value in info["surface_projected_coordinates"])
+        stored_period = float(info["surface_normal_period"])
+        stored_thickness = float(info["surface_material_thickness"])
+        stored_half_depth = float(info["surface_half_depth"])
+        stored_min_half_depth = float(info["surface_min_half_depth"])
+        stored_radius = float(info["surface_bulk_environment_radius"])
+        stored_tolerance = float(info["surface_bulk_environment_distance_tolerance"])
+        stored_min_core = int(info["surface_min_bulk_core_atoms"])
+        stored_eligible = int(info["surface_bulk_core_eligible_atom_count"])
+        stored_core = int(info["surface_bulk_core_atom_count"])
+        stored_core_indices = tuple(int(value) for value in info["surface_bulk_core_atom_indices"])
+    except (TypeError, ValueError):
+        return CandidateValidationIssue("invalid_surface_geometry_provenance", {})
+    geometry_matches = (
+        len(stored_lengths) == 2
+        and np.allclose(stored_lengths, geometry.in_plane_lengths, rtol=1.0e-6, atol=1.0e-6)
+        and math.isclose(
+            stored_angle,
+            geometry.in_plane_angle_degrees,
+            rel_tol=1.0e-6,
+            abs_tol=1.0e-6,
+        )
+        and math.isclose(stored_area, geometry.in_plane_area, rel_tol=1.0e-6, abs_tol=1.0e-6)
+        and math.isclose(
+            stored_shortest,
+            geometry.shortest_in_plane_translation,
+            rel_tol=1.0e-6,
+            abs_tol=1.0e-6,
+        )
+        and len(stored_projections) == len(geometry.projected_coordinates)
+        and np.allclose(
+            stored_projections,
+            geometry.projected_coordinates,
+            rtol=1.0e-6,
+            atol=1.0e-6,
+        )
+        and math.isclose(stored_period, geometry.normal_period, rel_tol=1.0e-6, abs_tol=1.0e-6)
+        and math.isclose(
+            stored_thickness, geometry.material_thickness, rel_tol=1.0e-6, abs_tol=1.0e-6
+        )
+        and math.isclose(stored_half_depth, geometry.half_depth, rel_tol=1.0e-6, abs_tol=1.0e-6)
+        and math.isclose(
+            stored_min_half_depth,
+            float(settings.surface_min_half_depth),
+            rel_tol=1.0e-6,
+            abs_tol=1.0e-6,
+        )
+        and math.isclose(
+            stored_radius, bulk_core.environment_radius, rel_tol=1.0e-6, abs_tol=1.0e-6
+        )
+        and math.isclose(
+            stored_tolerance, bulk_core.distance_tolerance, rel_tol=1.0e-6, abs_tol=1.0e-6
+        )
+        and stored_min_core == int(settings.surface_min_bulk_core_atoms)
+        and stored_eligible == bulk_core.eligible_atom_count
+        and stored_core == bulk_core.bulk_core_atom_count
+        and stored_core_indices == bulk_core.bulk_core_atom_indices
+    )
+    if not geometry_matches:
+        return CandidateValidationIssue(
+            "surface_geometry_provenance_mismatch",
+            {
+                "realized_thickness": geometry.material_thickness,
+                "realized_bulk_core_atoms": bulk_core.bulk_core_atom_count,
             },
         )
     repeat = info["surface_in_plane_repeat"]
@@ -722,6 +849,27 @@ def validate_generation_config(config: GenerationConfig) -> GenerationConfig:
     if config.surface_thickness is None and config.surface_layers == 0:
         raise ConfigurationError(
             "generation.surface_layers must be positive when surface_thickness is not set"
+        )
+    if (
+        not math.isfinite(config.surface_min_half_depth)
+        or config.surface_min_half_depth <= 0.0
+    ):
+        raise ConfigurationError("generation.surface_min_half_depth must be positive and finite")
+    if (
+        not math.isfinite(config.surface_bulk_environment_radius)
+        or config.surface_bulk_environment_radius <= 0.0
+    ):
+        raise ConfigurationError(
+            "generation.surface_bulk_environment_radius must be positive and finite"
+        )
+    if config.surface_min_bulk_core_atoms <= 0:
+        raise ConfigurationError("generation.surface_min_bulk_core_atoms must be positive")
+    if (
+        not math.isfinite(config.surface_bulk_environment_distance_tolerance)
+        or config.surface_bulk_environment_distance_tolerance < 0.0
+    ):
+        raise ConfigurationError(
+            "generation.surface_bulk_environment_distance_tolerance must be finite and non-negative"
         )
     if config.surface_max_terminations < 0:
         raise ConfigurationError("generation.surface_max_terminations must be non-negative")

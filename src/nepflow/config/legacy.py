@@ -181,6 +181,12 @@ def _generation_values(config: NepflowConfig) -> dict[str, str]:
             "" if generation.surface_thickness is None else str(generation.surface_thickness)
         ),
         "surface_vacuum": str(generation.surface_vacuum),
+        "surface_min_half_depth": str(generation.surface_min_half_depth),
+        "surface_bulk_environment_radius": str(generation.surface_bulk_environment_radius),
+        "surface_min_bulk_core_atoms": str(generation.surface_min_bulk_core_atoms),
+        "surface_bulk_environment_distance_tolerance": str(
+            generation.surface_bulk_environment_distance_tolerance
+        ),
         "surface_termination_policy": generation.surface_termination_policy,
         "surface_max_terminations": str(generation.surface_max_terminations),
         "surface_in_plane_repeat": ",".join(map(str, generation.surface_in_plane_repeat)),

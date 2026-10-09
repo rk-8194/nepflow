@@ -157,6 +157,10 @@ class GenerationConfig:
     surface_thickness: float | None = None
     # Minimum physical vacuum thickness in Angstrom; never an hkl-plane count.
     surface_vacuum: float = 10.0
+    surface_min_half_depth: float = 6.0
+    surface_bulk_environment_radius: float = 5.0
+    surface_min_bulk_core_atoms: int = 1
+    surface_bulk_environment_distance_tolerance: float = 0.05
     surface_termination_policy: str = "all"
     surface_max_terminations: int = 0
     surface_in_plane_repeat: tuple[int, int] = (1, 1)

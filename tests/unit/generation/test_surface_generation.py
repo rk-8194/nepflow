@@ -24,6 +24,7 @@ from nepflow.stages.generation.perturbations.provenance import (
 )
 from nepflow.stages.generation.perturbations.surfaces import (
     SurfaceConstructionError,
+    measure_surface_geometry,
     surfaces,
 )
 from nepflow.stages.generation.validation import (
@@ -72,7 +73,34 @@ def test_bcc_surface_has_low_index_termination_and_provenance() -> None:
     assert candidate.info["surface_termination"] == "termination_0"
     assert candidate.info["surface_layers"] > 0
     assert candidate.info["surface_stoichiometry_change"] == {}
+    assert candidate.info["surface_half_depth"] >= 6.0
+    assert candidate.info["surface_bulk_core_atom_count"] >= 1
     assert validate_generated_candidate(candidate, parent, _settings(), "surface") is None
+
+
+def test_surface_geometry_uses_the_actual_oblique_surface_normal() -> None:
+    first = np.asarray([2.0, 0.0, 1.0])
+    second = np.asarray([0.0, 3.0, 1.0])
+    normal = np.cross(first, second)
+    normal /= np.linalg.norm(normal)
+    third = 12.0 * normal + 0.25 * first
+    candidate = Atoms(
+        "Fe2",
+        positions=[2.0 * normal, 6.0 * normal],
+        cell=np.asarray([first, second, third]),
+        pbc=(True, True, False),
+    )
+
+    geometry = measure_surface_geometry(candidate)
+
+    assert geometry.material_thickness == pytest.approx(4.0)
+    assert geometry.material_thickness != pytest.approx(
+        abs(candidate.positions[1, 2] - candidate.positions[0, 2])
+    )
+    assert geometry.half_depth == pytest.approx(2.0)
+    assert geometry.in_plane_area == pytest.approx(7.0)
+    assert geometry.shortest_in_plane_translation == pytest.approx(np.sqrt(5.0))
+    assert geometry.realized_vacuum == pytest.approx(8.0)
 
 
 def test_non_cubic_parent_vacuum_pbc_and_in_plane_repeat() -> None:
@@ -226,6 +254,45 @@ def test_layer_based_vacuum_is_physical_angstrom_not_hkl_planes() -> None:
     assert candidate.info["surface_requested_vacuum_angstrom"] == requested_vacuum
 
 
+def test_surface_validation_rejects_insufficient_depth_and_tampered_measurements() -> None:
+    parent = _base()
+    settings = _settings()
+    candidate = surfaces(parent, parent, 1, settings, None, _annotate, seed=23)[0]
+
+    too_deep_requirement = _settings(
+        surface_min_half_depth=candidate.info["surface_half_depth"] + 1.0
+    )
+    issue = validate_generated_candidate(candidate, parent, too_deep_requirement, "surface")
+    assert issue is not None
+    assert issue.reason == "insufficient_surface_depth"
+
+    no_core_requirement = _settings(
+        surface_bulk_environment_radius=candidate.info["surface_half_depth"] + 1.0
+    )
+    issue = validate_generated_candidate(candidate, parent, no_core_requirement, "surface")
+    assert issue is not None
+    assert issue.reason == "insufficient_surface_bulk_core"
+
+    tampered = candidate.copy()
+    tampered.info = dict(candidate.info)
+    tampered.info["surface_in_plane_area"] += 1.0
+    issue = validate_generated_candidate(tampered, parent, settings, "surface")
+    assert issue is not None
+    assert issue.reason == "surface_geometry_provenance_mismatch"
+
+
+def test_multicomponent_oxide_surface_records_species_aware_bulk_core() -> None:
+    parent = bulk("MgO", "rocksalt", a=4.2, cubic=True)
+    parent.info.update({"configurational_type": "mp_phase", "composition": ["Mg", "O"]})
+    settings = _settings(surface_miller_indices=((1, 0, 0),))
+
+    candidate = surfaces(parent, parent, 1, settings, None, _annotate, seed=29)[0]
+
+    assert candidate.info["surface_bulk_core_atom_count"] >= 1
+    assert candidate.info["surface_bulk_core_eligible_atom_count"] >= 1
+    assert validate_generated_candidate(candidate, parent, settings, "surface") is None
+
+
 def test_surface_stoichiometry_change_is_recorded_for_non_parent_composition() -> None:
     parent = Atoms(
         "Fe2Ni2",
@@ -279,6 +346,10 @@ def test_surface_config_validation_rejects_invalid_miller_and_repeat() -> None:
         validate_generation_config(GenerationConfig(surface_miller_indices=((1, 0, 1),)))
     with pytest.raises(ConfigurationError, match="surface_in_plane"):
         validate_generation_config(GenerationConfig(surface_in_plane_repeat=(0, 1)))
+    with pytest.raises(ConfigurationError, match="surface_min_half_depth"):
+        validate_generation_config(GenerationConfig(surface_min_half_depth=0.0))
+    with pytest.raises(ConfigurationError, match="surface_min_bulk_core_atoms"):
+        validate_generation_config(GenerationConfig(surface_min_bulk_core_atoms=0))
 
 
 def test_surface_coordinator_serial_and_parallel_are_reproducible(tmp_path: Path) -> None:

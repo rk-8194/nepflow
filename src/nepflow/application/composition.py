@@ -201,6 +201,12 @@ def _build_perturbation_coordinator(context: StageContext) -> PerturbationCoordi
         surface_layers=generation.surface_layers,
         surface_thickness=generation.surface_thickness,
         surface_vacuum=generation.surface_vacuum,
+        surface_min_half_depth=generation.surface_min_half_depth,
+        surface_bulk_environment_radius=generation.surface_bulk_environment_radius,
+        surface_min_bulk_core_atoms=generation.surface_min_bulk_core_atoms,
+        surface_bulk_environment_distance_tolerance=(
+            generation.surface_bulk_environment_distance_tolerance
+        ),
         surface_termination_policy=generation.surface_termination_policy,
         surface_max_terminations=generation.surface_max_terminations,
         surface_in_plane_repeat=generation.surface_in_plane_repeat,

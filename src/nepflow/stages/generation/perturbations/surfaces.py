@@ -4,11 +4,13 @@ from __future__ import annotations
 
 from collections import Counter
 from collections.abc import Callable, Iterable
+from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError, version
 from typing import Any
 
 import numpy as np
 from ase import Atoms
+from ase.neighborlist import neighbor_list
 
 from nepflow.config.models import SUPPORTED_SURFACE_MILLER_INDICES
 from nepflow.domain.identities import calculate_structure_id
@@ -23,6 +25,33 @@ class SurfaceConstructionError(ValueError):
 _SURFACE_PLANNER_VERSION = "phase6-surface-reference-vacuum-v1"
 _SURFACE_BACKEND = "pymatgen.SlabGenerator"
 _IDENTITY_TRANSFORM = ((1, 0, 0), (0, 1, 0), (0, 0, 1))
+
+
+@dataclass(frozen=True, slots=True)
+class SurfaceGeometryMeasurement:
+    """Measured geometry for one realised surface slab."""
+
+    normal: tuple[float, float, float]
+    projected_coordinates: tuple[float, ...]
+    material_thickness: float
+    half_depth: float
+    normal_period: float
+    realized_vacuum: float
+    in_plane_lengths: tuple[float, float]
+    in_plane_angle_degrees: float
+    in_plane_area: float
+    shortest_in_plane_translation: float
+
+
+@dataclass(frozen=True, slots=True)
+class SurfaceBulkCoreMeasurement:
+    """Surface-owned evidence for the initial local bulk-core contract."""
+
+    environment_radius: float
+    distance_tolerance: float
+    eligible_atom_count: int
+    bulk_core_atom_count: int
+    bulk_core_atom_indices: tuple[int, ...]
 
 
 def surfaces(
@@ -199,8 +228,6 @@ def _minimum_slab_size_angstrom(
 ) -> float:
     """Convert the legacy layer control into a physical slab-depth target."""
 
-    if settings.surface_thickness is not None:
-        return float(settings.surface_thickness)
     try:
         spacing = float(structure.lattice.d_hkl(miller_index))
     except (AttributeError, TypeError, ValueError, ZeroDivisionError) as exc:
@@ -211,7 +238,18 @@ def _minimum_slab_size_angstrom(
         raise SurfaceConstructionError(
             f"failed to determine physical spacing for Miller index {miller_index}"
         )
-    return float(settings.surface_layers) * spacing
+    if settings.surface_thickness is not None:
+        layer_depth = float(settings.surface_thickness)
+    else:
+        layer_depth = float(settings.surface_layers) * spacing
+    required_material_depth = 2.0 * max(
+        float(settings.surface_min_half_depth),
+        float(settings.surface_bulk_environment_radius),
+    )
+    # SlabGenerator plans a repeat length while the realised material extent
+    # is measured between outermost atomic centres.  Reserve one interplanar
+    # spacing so termination cannot consume the configured physical depth.
+    return max(layer_depth, required_material_depth + spacing)
 
 
 def _canonicalize_slab(
@@ -277,16 +315,34 @@ def _surface_parameters(
         for element in elements
         if candidate_counts[element] != parent_counts[element]
     }
-    normal, thickness, normal_period, vacuum, in_plane_area = _surface_geometry(candidate)
+    geometry = measure_surface_geometry(candidate)
     requested_vacuum = float(settings.surface_vacuum)
-    if not np.isfinite(vacuum) or vacuum + 1.0e-6 < requested_vacuum:
+    if (
+        not np.isfinite(geometry.realized_vacuum)
+        or geometry.realized_vacuum + 1.0e-6 < requested_vacuum
+    ):
         raise SurfaceConstructionError(
-            f"realized vacuum {vacuum:.8f} Angstrom is below requested "
+            f"realized vacuum {geometry.realized_vacuum:.8f} Angstrom is below requested "
             f"{requested_vacuum:.8f} Angstrom for Miller index {miller_index}"
         )
+    if geometry.half_depth + 1.0e-6 < float(settings.surface_min_half_depth):
+        raise SurfaceConstructionError(
+            f"realized half-depth {geometry.half_depth:.8f} Angstrom is below requested "
+            f"{float(settings.surface_min_half_depth):.8f} Angstrom for Miller index "
+            f"{miller_index}"
+        )
+    bulk_core = measure_surface_bulk_core(candidate, base, geometry, settings)
+    if bulk_core.bulk_core_atom_count < int(settings.surface_min_bulk_core_atoms):
+        raise SurfaceConstructionError(
+            "realized slab has insufficient bulk-like core atoms: "
+            f"required={int(settings.surface_min_bulk_core_atoms)}, "
+            f"realized={bulk_core.bulk_core_atom_count}"
+        )
     reference_normal = _surface_normal(reference_cell, miller_index)
-    layer_count = _layer_count(candidate, normal)
-    reference_cell_tuple = tuple(tuple(float(value) for value in row) for row in reference_cell)
+    layer_count = _layer_count(candidate, np.asarray(geometry.normal, dtype=float))
+    reference_cell_tuple = tuple(
+        tuple(float(value) for value in row) for row in reference_cell
+    )
     backend_version = _backend_version()
     return {
         "parent_structure_id": calculate_structure_id(base),
@@ -301,16 +357,21 @@ def _surface_parameters(
         "surface_layers": layer_count,
         "surface_requested_layers": int(settings.surface_layers),
         "surface_thickness": settings.surface_thickness,
-        "surface_slab_thickness": thickness,
-        "surface_material_thickness": thickness,
-        "surface_half_depth": 0.5 * thickness,
+        "surface_slab_thickness": geometry.material_thickness,
+        "surface_material_thickness": geometry.material_thickness,
+        "surface_half_depth": geometry.half_depth,
+        "surface_min_half_depth": float(settings.surface_min_half_depth),
         "surface_dimensions": tuple(
             float(np.linalg.norm(np.asarray(candidate.cell, dtype=float)[index]))
             for index in range(3)
         ),
-        "surface_in_plane_area": in_plane_area,
-        "surface_normal_period": normal_period,
-        "surface_normal": tuple(float(value) for value in normal),
+        "surface_in_plane_lengths": geometry.in_plane_lengths,
+        "surface_in_plane_angle_degrees": geometry.in_plane_angle_degrees,
+        "surface_in_plane_area": geometry.in_plane_area,
+        "surface_shortest_in_plane_translation": geometry.shortest_in_plane_translation,
+        "surface_projected_coordinates": geometry.projected_coordinates,
+        "surface_normal_period": geometry.normal_period,
+        "surface_normal": geometry.normal,
         "surface_reference_normal": tuple(float(value) for value in reference_normal),
         "surface_reference_basis": "parent_stored_cell",
         "surface_reference_basis_cell": reference_cell_tuple,
@@ -321,8 +382,14 @@ def _surface_parameters(
         # Keep the historical key as the requested value; the realised value
         # is explicit and independently measured below.
         "surface_vacuum": requested_vacuum,
-        "surface_realized_vacuum": vacuum,
-        "surface_realized_vacuum_angstrom": vacuum,
+        "surface_realized_vacuum": geometry.realized_vacuum,
+        "surface_realized_vacuum_angstrom": geometry.realized_vacuum,
+        "surface_bulk_environment_radius": bulk_core.environment_radius,
+        "surface_bulk_environment_distance_tolerance": bulk_core.distance_tolerance,
+        "surface_min_bulk_core_atoms": int(settings.surface_min_bulk_core_atoms),
+        "surface_bulk_core_eligible_atom_count": bulk_core.eligible_atom_count,
+        "surface_bulk_core_atom_count": bulk_core.bulk_core_atom_count,
+        "surface_bulk_core_atom_indices": bulk_core.bulk_core_atom_indices,
         "surface_pbc": (True, True, False),
         "surface_in_plane_repeat": realized_repeat,
         "surface_termination_policy": settings.surface_termination_policy,
@@ -337,25 +404,175 @@ def _surface_parameters(
     }
 
 
-def _surface_geometry(candidate: Atoms) -> tuple[np.ndarray, float, float, float, float]:
-    """Measure normal, material thickness, repeat, vacuum, and area."""
+def measure_surface_geometry(candidate: Atoms) -> SurfaceGeometryMeasurement:
+    """Measure realised geometry in the actual surface-normal coordinate system."""
 
     cell = np.asarray(candidate.cell, dtype=float)
     if cell.shape != (3, 3) or not np.isfinite(cell).all():
         raise SurfaceConstructionError("constructed slab has an invalid cell")
-    in_plane_cross = np.cross(cell[0], cell[1])
+    first, second = cell[0], cell[1]
+    first_length = float(np.linalg.norm(first))
+    second_length = float(np.linalg.norm(second))
+    in_plane_cross = np.cross(first, second)
     in_plane_area = float(np.linalg.norm(in_plane_cross))
-    if in_plane_area <= 1.0e-12:
+    if (
+        first_length <= 1.0e-12
+        or second_length <= 1.0e-12
+        or in_plane_area <= 1.0e-12
+    ):
         raise SurfaceConstructionError("constructed slab has a degenerate in-plane cell")
     normal = in_plane_cross / in_plane_area
     positions = np.asarray(candidate.get_positions(), dtype=float)
     if positions.ndim != 2 or positions.shape[1] != 3 or len(positions) == 0:
         raise SurfaceConstructionError("constructed slab has no measurable material extent")
     projected = positions @ normal
-    thickness = float(np.max(projected) - np.min(projected))
+    if not np.isfinite(projected).all():
+        raise SurfaceConstructionError("constructed slab has non-finite projected coordinates")
+    material_thickness = float(np.max(projected) - np.min(projected))
     normal_period = abs(float(np.linalg.det(cell))) / in_plane_area
-    vacuum = normal_period - thickness
-    return normal, thickness, normal_period, vacuum, in_plane_area
+    realized_vacuum = normal_period - material_thickness
+    cosine = float(np.dot(first, second) / (first_length * second_length))
+    in_plane_angle = float(np.degrees(np.arccos(np.clip(cosine, -1.0, 1.0))))
+    shortest_translation = _shortest_in_plane_translation(first, second)
+    values = (
+        material_thickness,
+        normal_period,
+        realized_vacuum,
+        in_plane_angle,
+        shortest_translation,
+    )
+    if not all(np.isfinite(value) for value in values) or shortest_translation <= 1.0e-12:
+        raise SurfaceConstructionError("constructed slab has invalid surface geometry")
+    return SurfaceGeometryMeasurement(
+        normal=(float(normal[0]), float(normal[1]), float(normal[2])),
+        projected_coordinates=tuple(float(value) for value in projected),
+        material_thickness=material_thickness,
+        half_depth=0.5 * material_thickness,
+        normal_period=normal_period,
+        realized_vacuum=realized_vacuum,
+        in_plane_lengths=(first_length, second_length),
+        in_plane_angle_degrees=in_plane_angle,
+        in_plane_area=in_plane_area,
+        shortest_in_plane_translation=shortest_translation,
+    )
+
+
+def measure_surface_bulk_core(
+    candidate: Atoms,
+    parent: Any,
+    geometry: SurfaceGeometryMeasurement,
+    settings: PerturbationSettings,
+) -> SurfaceBulkCoreMeasurement:
+    """Measure eligible parent-equivalent interior atoms for one surface slab."""
+
+    radius = float(settings.surface_bulk_environment_radius)
+    tolerance = float(settings.surface_bulk_environment_distance_tolerance)
+    if not np.isfinite(radius) or radius <= 0.0:
+        raise SurfaceConstructionError("surface bulk-environment radius must be positive")
+    if not np.isfinite(tolerance) or tolerance < 0.0:
+        raise SurfaceConstructionError(
+            "surface bulk-environment distance tolerance must be non-negative"
+        )
+    parent_environments = _species_resolved_environments(parent, radius)
+    candidate_environments = _species_resolved_environments(candidate, radius)
+    candidate_symbols = tuple(candidate.get_chemical_symbols())
+    parent_symbols = tuple(parent.get_chemical_symbols())
+    projections = np.asarray(geometry.projected_coordinates, dtype=float)
+    lower = float(np.min(projections))
+    upper = float(np.max(projections))
+    eligible_indices = tuple(
+        index
+        for index, coordinate in enumerate(projections)
+        if min(float(coordinate) - lower, upper - float(coordinate)) + 1.0e-8 >= radius
+    )
+    core_indices = tuple(
+        index
+        for index in eligible_indices
+        if any(
+            candidate_symbols[index] == parent_symbols[parent_index]
+            and _environments_match(
+                candidate_environments[index], parent_environments[parent_index], tolerance
+            )
+            for parent_index in range(len(parent_symbols))
+        )
+    )
+    return SurfaceBulkCoreMeasurement(
+        environment_radius=radius,
+        distance_tolerance=tolerance,
+        eligible_atom_count=len(eligible_indices),
+        bulk_core_atom_count=len(core_indices),
+        bulk_core_atom_indices=core_indices,
+    )
+
+
+def _species_resolved_environments(
+    atoms: Any,
+    radius: float,
+) -> tuple[tuple[tuple[str, tuple[float, ...]], ...], ...]:
+    """Return sorted species-resolved neighbour distances for every atom."""
+
+    try:
+        indices, neighbours, distances = neighbor_list(
+            "ijd", atoms, cutoff=radius, self_interaction=False
+        )
+        symbols = tuple(atoms.get_chemical_symbols())
+    except Exception as exc:
+        raise SurfaceConstructionError(
+            f"failed to measure local bulk environments: {type(exc).__name__}: {exc}"
+        ) from exc
+    environments: list[dict[str, list[float]]] = [dict() for _ in symbols]
+    for index, neighbour, distance in zip(indices, neighbours, distances):
+        environments[int(index)].setdefault(symbols[int(neighbour)], []).append(
+            float(distance)
+        )
+    return tuple(
+        tuple(
+            (species, tuple(sorted(distances)))
+            for species, distances in sorted(environment.items())
+        )
+        for environment in environments
+    )
+
+
+def _environments_match(
+    candidate: tuple[tuple[str, tuple[float, ...]], ...],
+    parent: tuple[tuple[str, tuple[float, ...]], ...],
+    tolerance: float,
+) -> bool:
+    if tuple(species for species, _ in candidate) != tuple(
+        species for species, _ in parent
+    ):
+        return False
+    return all(
+        len(candidate_distances) == len(parent_distances)
+        and all(
+            abs(candidate_distance - parent_distance) <= tolerance
+            for candidate_distance, parent_distance in zip(
+                candidate_distances, parent_distances
+            )
+        )
+        for (_, candidate_distances), (_, parent_distances) in zip(candidate, parent)
+    )
+
+
+def _shortest_in_plane_translation(first: np.ndarray, second: np.ndarray) -> float:
+    """Return the shortest non-zero vector in the two-dimensional cell lattice."""
+
+    shortest, other = np.array(first, copy=True), np.array(second, copy=True)
+    for _ in range(64):
+        shortest_norm = float(np.dot(shortest, shortest))
+        other_norm = float(np.dot(other, other))
+        if shortest_norm <= 1.0e-24 or other_norm <= 1.0e-24:
+            raise SurfaceConstructionError("constructed slab has a degenerate in-plane lattice")
+        if other_norm < shortest_norm:
+            shortest, other = other, shortest
+            continue
+        coefficient = int(np.rint(float(np.dot(shortest, other) / shortest_norm)))
+        reduced = other - coefficient * shortest
+        if float(np.dot(reduced, reduced)) >= other_norm - 1.0e-12:
+            return float(np.sqrt(shortest_norm))
+        other = reduced
+    raise SurfaceConstructionError("failed to reduce in-plane lattice translations")
 
 
 def _surface_normal(cell: np.ndarray, miller_index: tuple[int, int, int]) -> np.ndarray:
@@ -404,4 +621,11 @@ def _format_miller(index: tuple[int, int, int]) -> str:
     return ",".join(str(value) for value in index)
 
 
-__all__ = ["SurfaceConstructionError", "surfaces"]
+__all__ = [
+    "SurfaceBulkCoreMeasurement",
+    "SurfaceConstructionError",
+    "SurfaceGeometryMeasurement",
+    "measure_surface_bulk_core",
+    "measure_surface_geometry",
+    "surfaces",
+]
