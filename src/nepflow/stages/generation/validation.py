@@ -557,9 +557,7 @@ def _validate_surface_state(candidate: Any) -> CandidateValidationIssue | None:
         or realized_vacuum + 1.0e-6 < requested_vacuum
         or normal.shape != (3,)
         or not np.isfinite(normal).all()
-        or not math.isclose(
-            float(np.linalg.norm(normal)), 1.0, rel_tol=1.0e-6, abs_tol=1.0e-6
-        )
+        or not math.isclose(float(np.linalg.norm(normal)), 1.0, rel_tol=1.0e-6, abs_tol=1.0e-6)
     ):
         return CandidateValidationIssue(
             "invalid_surface_geometry_provenance",
@@ -582,9 +580,7 @@ def _validate_surface_state(candidate: Any) -> CandidateValidationIssue | None:
     measured_vacuum = measured_period - measured_thickness
     if (
         not math.isfinite(measured_vacuum)
-        or not math.isclose(
-            measured_vacuum, realized_vacuum, rel_tol=1.0e-6, abs_tol=1.0e-6
-        )
+        or not math.isclose(measured_vacuum, realized_vacuum, rel_tol=1.0e-6, abs_tol=1.0e-6)
         or abs(float(np.dot(measured_normal, normal))) < 1.0 - 1.0e-6
     ):
         return CandidateValidationIssue(

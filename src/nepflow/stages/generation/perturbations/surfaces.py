@@ -286,9 +286,7 @@ def _surface_parameters(
         )
     reference_normal = _surface_normal(reference_cell, miller_index)
     layer_count = _layer_count(candidate, normal)
-    reference_cell_tuple = tuple(
-        tuple(float(value) for value in row) for row in reference_cell
-    )
+    reference_cell_tuple = tuple(tuple(float(value) for value in row) for row in reference_cell)
     backend_version = _backend_version()
     return {
         "parent_structure_id": calculate_structure_id(base),
