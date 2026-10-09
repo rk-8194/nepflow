@@ -225,9 +225,7 @@ def _validated_supercells(primitive: Any, supercells: Sequence[Any]) -> tuple[An
             raise SQSGenerationError("SQS supercell is incompatible with its primitive")
         transformation = supercell_cell @ inverse_primitive_cell
         rounded_transformation = np.rint(transformation)
-        if not np.allclose(
-            transformation, rounded_transformation, rtol=0.0, atol=1.0e-8
-        ):
+        if not np.allclose(transformation, rounded_transformation, rtol=0.0, atol=1.0e-8):
             raise SQSGenerationError("SQS supercell is not an integer repeat of its primitive")
         multiplicity = abs(int(round(float(np.linalg.det(rounded_transformation)))))
         if multiplicity <= 0 or len(supercell) != len(primitive) * multiplicity:

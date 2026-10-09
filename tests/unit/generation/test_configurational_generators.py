@@ -39,11 +39,7 @@ class SQSBackendBoundary:
         result = supercells[0].copy()
         realization = calculate_composition_realization(target_concentrations, len(result))
         result.set_chemical_symbols(
-            [
-                element
-                for element, count in realization.counts.items()
-                for _ in range(count)
-            ]
+            [element for element, count in realization.counts.items() for _ in range(count)]
         )
         return result
 

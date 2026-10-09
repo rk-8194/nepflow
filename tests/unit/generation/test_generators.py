@@ -70,11 +70,7 @@ class FakeSQSBackend:
         self.supercells.append(tuple(supercells))
         result = supercells[0].copy()
         realization = calculate_composition_realization(target_concentrations, len(result))
-        symbols = [
-            element
-            for element, count in realization.counts.items()
-            for _ in range(count)
-        ]
+        symbols = [element for element, count in realization.counts.items() for _ in range(count)]
         result.set_chemical_symbols(symbols)
         return result
 
@@ -89,10 +85,7 @@ def test_sqs_uses_declared_backend_and_records_effective_seed() -> None:
 
     assert backend.seeds == [11, 12]
     assert [item.info["random_seed"] for item in results] == [11, 12]
-    assert all(
-        len(supercells) == 1 and len(supercells[0]) == 8
-        for supercells in backend.supercells
-    )
+    assert all(len(supercells) == 1 and len(supercells[0]) == 8 for supercells in backend.supercells)
 
 
 def test_sqs_backend_failure_is_explicit_and_never_falls_back() -> None:
