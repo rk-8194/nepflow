@@ -78,6 +78,59 @@ def test_bcc_surface_has_low_index_termination_and_provenance() -> None:
     assert validate_generated_candidate(candidate, parent, _settings(), "surface") is None
 
 
+def test_surface_planner_records_target_band_and_repeat_decision() -> None:
+    parent = _base()
+    settings = _settings(
+        target_n_atoms=32,
+        surface_target_n_atoms=32,
+        surface_target_tolerance=1.0,
+        surface_max_n_atoms=128,
+        surface_max_in_plane_repeat=(3, 3),
+        surface_max_normal_repeat=8,
+    )
+
+    candidate = surfaces(parent, parent, 1, settings, None, _annotate, seed=18)[0]
+    info = candidate.info
+
+    assert info["surface_target_n_atoms"] == 32
+    assert info["surface_target_tolerance"] == pytest.approx(1.0)
+    assert info["surface_realized_atom_count"] == len(candidate)
+    assert len(info["surface_planner_repeat"]) == 3
+    assert info["surface_in_plane_repeat"] == info["surface_planner_repeat"][:2]
+    assert info["surface_target_band"] is True
+    assert validate_generated_candidate(candidate, parent, settings, "surface") is None
+
+
+def test_surface_planner_fails_with_explicit_atom_limit_evidence() -> None:
+    parent = _base()
+    settings = _settings(
+        target_n_atoms=32,
+        surface_max_n_atoms=1,
+        surface_max_in_plane_repeat=(1, 1),
+        surface_max_normal_repeat=1,
+    )
+
+    with pytest.raises(SurfaceConstructionError, match="atom_limit"):
+        surfaces(parent, parent, 1, settings, None, _annotate, seed=19)
+
+
+def test_surface_planner_accepts_nearest_physical_candidate_outside_target_band() -> None:
+    parent = _base()
+    settings = _settings(
+        surface_target_n_atoms=1,
+        surface_target_tolerance=0.0,
+        surface_max_n_atoms=64,
+        surface_max_in_plane_repeat=(2, 2),
+        surface_max_normal_repeat=6,
+    )
+
+    candidate = surfaces(parent, parent, 1, settings, None, _annotate, seed=20)[0]
+
+    assert candidate.info["surface_realized_atom_count"] > 1
+    assert candidate.info["surface_target_band"] is False
+    assert validate_generated_candidate(candidate, parent, settings, "surface") is None
+
+
 def test_surface_geometry_uses_the_actual_oblique_surface_normal() -> None:
     first = np.asarray([2.0, 0.0, 1.0])
     second = np.asarray([0.0, 3.0, 1.0])
@@ -281,6 +334,35 @@ def test_surface_validation_rejects_insufficient_depth_and_tampered_measurements
     assert issue.reason == "surface_geometry_provenance_mismatch"
 
 
+def test_surface_validation_rejects_tampered_normal_and_duplicate_geometry_fields() -> None:
+    parent = _base()
+    settings = _settings()
+    candidate = surfaces(parent, parent, 1, settings, None, _annotate, seed=24)[0]
+
+    tampered_normal = candidate.copy()
+    tampered_normal.info = dict(candidate.info)
+    tampered_normal.info["surface_normal"] = tuple(
+        -value for value in candidate.info["surface_normal"]
+    )
+    issue = validate_generated_candidate(tampered_normal, parent, settings, "surface")
+    assert issue is not None
+    assert issue.reason == "surface_geometry_provenance_mismatch"
+
+    tampered_vacuum = candidate.copy()
+    tampered_vacuum.info = dict(candidate.info)
+    tampered_vacuum.info["surface_realized_vacuum"] += 1.0
+    issue = validate_generated_candidate(tampered_vacuum, parent, settings, "surface")
+    assert issue is not None
+    assert issue.reason == "invalid_surface_geometry_provenance"
+
+    tampered_depth = candidate.copy()
+    tampered_depth.info = dict(candidate.info)
+    tampered_depth.info["surface_slab_thickness"] += 1.0
+    issue = validate_generated_candidate(tampered_depth, parent, settings, "surface")
+    assert issue is not None
+    assert issue.reason == "surface_geometry_provenance_mismatch"
+
+
 def test_multicomponent_oxide_surface_records_species_aware_bulk_core() -> None:
     parent = bulk("MgO", "rocksalt", a=4.2, cubic=True)
     parent.info.update({"configurational_type": "mp_phase", "composition": ["Mg", "O"]})
@@ -350,6 +432,12 @@ def test_surface_config_validation_rejects_invalid_miller_and_repeat() -> None:
         validate_generation_config(GenerationConfig(surface_min_half_depth=0.0))
     with pytest.raises(ConfigurationError, match="surface_min_bulk_core_atoms"):
         validate_generation_config(GenerationConfig(surface_min_bulk_core_atoms=0))
+    with pytest.raises(ConfigurationError, match="surface_target_tolerance"):
+        validate_generation_config(GenerationConfig(surface_target_tolerance=-0.1))
+    with pytest.raises(ConfigurationError, match="surface_max_in_plane_repeat"):
+        validate_generation_config(
+            GenerationConfig(surface_in_plane_repeat=(2, 1), surface_max_in_plane_repeat=(1, 1))
+        )
 
 
 def test_surface_coordinator_serial_and_parallel_are_reproducible(tmp_path: Path) -> None:

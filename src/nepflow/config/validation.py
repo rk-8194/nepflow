@@ -421,6 +421,16 @@ def _validate_surface_settings(config: GenerationConfig) -> None:
         raise ConfigurationError(
             "generation.surface_bulk_environment_distance_tolerance must be finite and non-negative"
         )
+    if config.surface_target_n_atoms is not None and (
+        isinstance(config.surface_target_n_atoms, bool) or config.surface_target_n_atoms <= 0
+    ):
+        raise ConfigurationError("generation.surface_target_n_atoms must be positive when set")
+    if not math.isfinite(config.surface_target_tolerance) or config.surface_target_tolerance < 0.0:
+        raise ConfigurationError(
+            "generation.surface_target_tolerance must be finite and non-negative"
+        )
+    if config.surface_max_n_atoms <= 0:
+        raise ConfigurationError("generation.surface_max_n_atoms must be positive")
     _require_non_negative("generation.surface_max_terminations", config.surface_max_terminations)
     if config.surface_termination_policy not in {"all", "first"}:
         raise ConfigurationError("generation.surface_termination_policy must be 'all' or 'first'")
@@ -453,6 +463,21 @@ def _validate_surface_settings(config: GenerationConfig) -> None:
         raise ConfigurationError(
             "generation.surface_in_plane_repeat must contain two positive integers"
         )
+    if len(config.surface_max_in_plane_repeat) != 2 or any(
+        not isinstance(value, int) or value <= 0 for value in config.surface_max_in_plane_repeat
+    ):
+        raise ConfigurationError(
+            "generation.surface_max_in_plane_repeat must contain two positive integers"
+        )
+    if any(
+        lower > upper
+        for lower, upper in zip(config.surface_in_plane_repeat, config.surface_max_in_plane_repeat)
+    ):
+        raise ConfigurationError(
+            "generation.surface_max_in_plane_repeat must not be below surface_in_plane_repeat"
+        )
+    if config.surface_max_normal_repeat <= 0:
+        raise ConfigurationError("generation.surface_max_normal_repeat must be positive")
 
 
 def _validate_grain_boundary_settings(config: GenerationConfig) -> None:

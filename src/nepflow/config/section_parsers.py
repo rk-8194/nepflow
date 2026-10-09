@@ -463,9 +463,27 @@ def _parse_generation_perturbations(values: Mapping[str, str]) -> dict[str, Any]
             values.get("surface_max_terminations", "0"),
             "generation.surface_max_terminations",
         ),
+        "surface_target_n_atoms": _parse_optional_int(
+            values.get("surface_target_n_atoms", ""), "generation.surface_target_n_atoms"
+        ),
+        "surface_target_tolerance": _parse_float(
+            values.get("surface_target_tolerance", "0.20"),
+            "generation.surface_target_tolerance",
+        ),
+        "surface_max_n_atoms": _parse_int(
+            values.get("surface_max_n_atoms", "512"), "generation.surface_max_n_atoms"
+        ),
         "surface_in_plane_repeat": _parse_int_pair(
             values.get("surface_in_plane_repeat", "1,1"),
             "generation.surface_in_plane_repeat",
+        ),
+        "surface_max_in_plane_repeat": _parse_int_pair(
+            values.get("surface_max_in_plane_repeat", "4,4"),
+            "generation.surface_max_in_plane_repeat",
+        ),
+        "surface_max_normal_repeat": _parse_int(
+            values.get("surface_max_normal_repeat", "16"),
+            "generation.surface_max_normal_repeat",
         ),
         "surface_min_in_plane_dimensions": _parse_float_pair(
             values.get("surface_min_in_plane_dimensions", "0.0,0.0"),
@@ -907,6 +925,12 @@ def _parse_optional_float(value: str, name: str) -> float | None:
     if not value.strip():
         return None
     return _parse_float(value, name)
+
+
+def _parse_optional_int(value: str, name: str) -> int | None:
+    if not value.strip():
+        return None
+    return _parse_int(value, name)
 
 
 def _parse_bool(value: str, name: str) -> bool:

@@ -96,6 +96,11 @@ def test_surface_orientation_semantics_round_trip_without_count_reinterpretation
             "surface_enabled = true\n"
             "n_surfaces = 1\n"
             "surface_miller_indices = 1,0,0;1,1,0;1,1,1\n"
+            "surface_target_n_atoms = 96\n"
+            "surface_target_tolerance = 0.15\n"
+            "surface_max_n_atoms = 192\n"
+            "surface_max_in_plane_repeat = 3,4\n"
+            "surface_max_normal_repeat = 12\n"
             "surface_termination_policy = first"
         ),
         1,
@@ -112,8 +117,15 @@ def test_surface_orientation_semantics_round_trip_without_count_reinterpretation
         (1, 1, 1),
     )
     assert config.generation.surface_termination_policy == "first"
+    assert config.generation.surface_target_n_atoms == 96
+    assert config.generation.surface_target_tolerance == pytest.approx(0.15)
+    assert config.generation.surface_max_n_atoms == 192
+    assert config.generation.surface_max_in_plane_repeat == (3, 4)
+    assert config.generation.surface_max_normal_repeat == 12
     assert legacy.get("generation", "n_surfaces") == "1"
     assert legacy.get("generation", "surface_miller_indices") == "1,0,0;1,1,0;1,1,1"
+    assert legacy.get("generation", "surface_target_n_atoms") == "96"
+    assert legacy.get("generation", "surface_max_in_plane_repeat") == "3,4"
 
 
 def test_loader_rejects_unsupported_surface_orientation_even_when_disabled(tmp_path: Path) -> None:

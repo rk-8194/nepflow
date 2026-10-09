@@ -22,7 +22,7 @@ class SurfaceConstructionError(ValueError):
     """Raised when a requested surface cannot be constructed exactly."""
 
 
-_SURFACE_PLANNER_VERSION = "phase6-surface-reference-vacuum-v1"
+_SURFACE_PLANNER_VERSION = "phase6-surface-target-planner-v1"
 _SURFACE_BACKEND = "pymatgen.SlabGenerator"
 _IDENTITY_TRANSFORM = ((1, 0, 0), (0, 1, 0), (0, 0, 1))
 
@@ -52,6 +52,32 @@ class SurfaceBulkCoreMeasurement:
     eligible_atom_count: int
     bulk_core_atom_count: int
     bulk_core_atom_indices: tuple[int, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class SurfacePlanningMeasurement:
+    """Immutable planner evidence persisted with a selected slab."""
+
+    target_n_atoms: int
+    target_tolerance: float
+    max_n_atoms: int
+    max_in_plane_repeat: tuple[int, int]
+    max_normal_repeat: int
+    repeat: tuple[int, int, int]
+    realized_atom_count: int
+    atom_count_delta: float
+    within_target_band: bool
+    material_shape_score: float
+    excess_vacuum: float
+    tie_break: tuple[float, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _PlannedSurface:
+    """One candidate that survived all hard physical constraints."""
+
+    candidate: Atoms
+    measurement: SurfacePlanningMeasurement
 
 
 def surfaces(
@@ -88,25 +114,26 @@ def surfaces(
                 f"unsupported Miller index {miller_index}; automatic surfaces support "
                 "only (1, 0, 0), (1, 1, 0), and (1, 1, 1)"
             )
-        slabs = _enumerate_slabs(parent, miller_index, settings)
+        planned = _plan_surface_terminations(parent, miller_index, settings)
         if settings.surface_termination_policy == "first":
-            slabs = slabs[:1]
+            planned = planned[:1]
         if settings.surface_max_terminations > 0:
-            slabs = slabs[: settings.surface_max_terminations]
-        if not slabs:
+            planned = planned[: settings.surface_max_terminations]
+        if not planned:
             raise SurfaceConstructionError(
                 f"no supported termination was constructed for Miller index {miller_index}"
             )
-        for termination_index, slab in enumerate(slabs):
-            candidate, realized_repeat = _canonicalize_slab(slab, settings)
+        for termination_index, plan in enumerate(planned):
+            candidate = plan.candidate
             parameters = _surface_parameters(
                 candidate,
+                parent,
                 base,
                 reference_cell=reference_cell,
                 miller_index=miller_index,
                 termination_index=termination_index,
                 settings=settings,
-                realized_repeat=realized_repeat,
+                planning=plan.measurement,
             )
             child_seed = derive_child_seed(
                 parent_structure_id,
@@ -138,10 +165,184 @@ def surfaces(
     )
 
 
+def _plan_surface_terminations(
+    parent: Any,
+    miller_index: tuple[int, int, int],
+    settings: PerturbationSettings,
+) -> list[_PlannedSurface]:
+    """Search bounded integer repeats and select one plan per termination."""
+
+    target_override = settings.surface_target_n_atoms
+    target = int(settings.target_n_atoms if target_override is None else target_override)
+    max_atoms = int(settings.surface_max_n_atoms)
+    tolerance = float(settings.surface_target_tolerance)
+    max_in_plane_values = tuple(int(value) for value in settings.surface_max_in_plane_repeat)
+    max_normal = int(settings.surface_max_normal_repeat)
+    if target <= 0 or max_atoms <= 0 or tolerance < 0.0:
+        raise SurfaceConstructionError("surface planner target and bounds must be positive")
+    if len(max_in_plane_values) != 2 or any(value <= 0 for value in max_in_plane_values):
+        raise SurfaceConstructionError("surface planner in-plane bounds must be positive")
+    max_in_plane = (max_in_plane_values[0], max_in_plane_values[1])
+    if max_normal <= 0:
+        raise SurfaceConstructionError("surface planner normal bound must be positive")
+
+    spacing = _surface_spacing(parent, miller_index)
+    explicit_thickness = (
+        0.0 if settings.surface_thickness is None else float(settings.surface_thickness)
+    )
+    seed_slabs = _enumerate_slabs(
+        parent,
+        miller_index,
+        settings,
+        minimum_slab_size=max(spacing, explicit_thickness),
+    )
+    if not seed_slabs:
+        raise SurfaceConstructionError(
+            f"no supported termination was constructed for Miller index {miller_index}"
+        )
+    termination_limit = len(seed_slabs)
+    if settings.surface_termination_policy == "first":
+        termination_limit = 1
+    if settings.surface_max_terminations > 0:
+        termination_limit = min(termination_limit, settings.surface_max_terminations)
+
+    planned: list[_PlannedSurface] = []
+    for termination_index in range(termination_limit):
+        accepted: list[_PlannedSurface] = []
+        rejected: Counter[str] = Counter()
+        for normal_repeat in range(1, max_normal + 1):
+            minimum_slab_size = max(explicit_thickness, spacing * normal_repeat)
+            try:
+                slabs = _enumerate_slabs(
+                    parent,
+                    miller_index,
+                    settings,
+                    minimum_slab_size=minimum_slab_size,
+                )
+            except SurfaceConstructionError:
+                rejected["construction"] += 1
+                continue
+            if termination_index >= len(slabs):
+                rejected["termination"] += 1
+                continue
+            slab = slabs[termination_index]
+            try:
+                lower = _minimum_in_plane_repeat(slab, settings)
+            except SurfaceConstructionError:
+                rejected["in_plane_geometry"] += 1
+                continue
+            if any(lower[index] > max_in_plane[index] for index in (0, 1)):
+                rejected["in_plane_bounds"] += 1
+                continue
+            for first_repeat in range(lower[0], max_in_plane[0] + 1):
+                for second_repeat in range(lower[1], max_in_plane[1] + 1):
+                    expected_atoms = len(slab) * first_repeat * second_repeat
+                    if expected_atoms > max_atoms:
+                        rejected["atom_limit"] += 1
+                        continue
+                    try:
+                        candidate, realized_repeat = _canonicalize_slab(
+                            slab,
+                            settings,
+                            repeat=(first_repeat, second_repeat),
+                        )
+                        geometry = measure_surface_geometry(candidate)
+                        if geometry.realized_vacuum + 1.0e-6 < float(
+                            settings.surface_vacuum
+                        ):
+                            rejected["vacuum"] += 1
+                            continue
+                        if geometry.half_depth + 1.0e-6 < float(
+                            settings.surface_min_half_depth
+                        ):
+                            rejected["material_depth"] += 1
+                            continue
+                        bulk_core = measure_surface_bulk_core(
+                            candidate, parent, geometry, settings
+                        )
+                        if bulk_core.bulk_core_atom_count < int(
+                            settings.surface_min_bulk_core_atoms
+                        ):
+                            rejected["bulk_core"] += 1
+                            continue
+                    except SurfaceConstructionError:
+                        rejected["measurement"] += 1
+                        continue
+                    realized_atoms = len(candidate)
+                    if realized_atoms > max_atoms:
+                        rejected["atom_limit"] += 1
+                        continue
+                    delta = abs(realized_atoms - target) / target
+                    dimensions = (*geometry.in_plane_lengths, geometry.material_thickness)
+                    minimum_dimension = min(dimensions)
+                    if minimum_dimension <= 1.0e-12:
+                        rejected["shape"] += 1
+                        continue
+                    shape_score = max(dimensions) / minimum_dimension - 1.0
+                    excess_vacuum = max(
+                        0.0, geometry.realized_vacuum - float(settings.surface_vacuum)
+                    )
+                    within_band = delta <= tolerance + 1.0e-12
+                    tie_break = (
+                        shape_score,
+                        float(realized_atoms),
+                        excess_vacuum,
+                        float(realized_repeat[0]),
+                        float(realized_repeat[1]),
+                        float(normal_repeat),
+                    )
+                    accepted.append(
+                        _PlannedSurface(
+                            candidate=candidate,
+                            measurement=SurfacePlanningMeasurement(
+                                target_n_atoms=int(target),
+                                target_tolerance=tolerance,
+                                max_n_atoms=max_atoms,
+                                max_in_plane_repeat=max_in_plane,
+                                max_normal_repeat=max_normal,
+                                repeat=(
+                                    realized_repeat[0],
+                                    realized_repeat[1],
+                                    normal_repeat,
+                                ),
+                                realized_atom_count=realized_atoms,
+                                atom_count_delta=delta,
+                                within_target_band=within_band,
+                                material_shape_score=shape_score,
+                                excess_vacuum=excess_vacuum,
+                                tie_break=tie_break,
+                            ),
+                        )
+                    )
+        if not accepted:
+            evidence = ", ".join(
+                f"{reason}={count}" for reason, count in sorted(rejected.items())
+            ) or "no candidates evaluated"
+            raise SurfaceConstructionError(
+                f"no valid planned slab for Miller index {miller_index}, "
+                f"termination_{termination_index}; {evidence}"
+            )
+        in_band = [item for item in accepted if item.measurement.within_target_band]
+        if in_band:
+            selected = min(in_band, key=lambda item: item.measurement.tie_break)
+        else:
+            selected = min(
+                accepted,
+                key=lambda item: (
+                    item.measurement.atom_count_delta,
+                    *item.measurement.tie_break,
+                ),
+            )
+        planned.append(selected)
+    return planned
+
+
 def _enumerate_slabs(
     parent: Any,
     miller_index: tuple[int, int, int],
     settings: PerturbationSettings,
+    *,
+    minimum_slab_size: float | None = None,
 ) -> list[Any]:
     """Construct and deterministically order all supported terminations."""
 
@@ -149,12 +350,11 @@ def _enumerate_slabs(
         from pymatgen.core.surface import SlabGenerator
         from pymatgen.io.ase import AseAtomsAdaptor
 
-        if settings.surface_thickness is None and settings.surface_layers <= 0:
-            raise SurfaceConstructionError(
-                "surface_layers must be positive when surface_thickness is not set"
-            )
         structure = AseAtomsAdaptor.get_structure(parent)
-        minimum_slab_size = _minimum_slab_size_angstrom(structure, miller_index, settings)
+        if minimum_slab_size is None:
+            minimum_slab_size = _minimum_slab_size_angstrom(structure, miller_index, settings)
+        if not np.isfinite(minimum_slab_size) or minimum_slab_size <= 0.0:
+            raise SurfaceConstructionError("surface planner slab size must be positive and finite")
         generator = SlabGenerator(
             structure,
             miller_index,
@@ -221,6 +421,25 @@ def _establish_reference_basis(parent: Any) -> np.ndarray:
     return cell
 
 
+def _surface_spacing(parent: Any, miller_index: tuple[int, int, int]) -> float:
+    """Return the physical spacing used by the bounded normal-repeat search."""
+
+    try:
+        from pymatgen.io.ase import AseAtomsAdaptor
+
+        structure = AseAtomsAdaptor.get_structure(parent)
+        spacing = float(structure.lattice.d_hkl(miller_index))
+    except (AttributeError, TypeError, ValueError, ZeroDivisionError) as exc:
+        raise SurfaceConstructionError(
+            f"failed to determine physical spacing for Miller index {miller_index}"
+        ) from exc
+    if not np.isfinite(spacing) or spacing <= 0.0:
+        raise SurfaceConstructionError(
+            f"failed to determine physical spacing for Miller index {miller_index}"
+        )
+    return spacing
+
+
 def _minimum_slab_size_angstrom(
     structure: Any,
     miller_index: tuple[int, int, int],
@@ -255,6 +474,8 @@ def _minimum_slab_size_angstrom(
 def _canonicalize_slab(
     slab: Any,
     settings: PerturbationSettings,
+    *,
+    repeat: tuple[int, int] | None = None,
 ) -> tuple[Atoms, tuple[int, int]]:
     try:
         from pymatgen.io.ase import AseAtomsAdaptor
@@ -265,11 +486,43 @@ def _canonicalize_slab(
             f"failed to convert constructed slab to ASE: {type(exc).__name__}: {exc}"
         ) from exc
     candidate.set_pbc((True, True, False))
-    repeat = _required_repeat(candidate, settings)
-    if repeat != (1, 1):
-        candidate = candidate.repeat((*repeat, 1))
+    realized_repeat = _required_repeat(candidate, settings) if repeat is None else repeat
+    if len(realized_repeat) != 2 or any(value <= 0 for value in realized_repeat):
+        raise SurfaceConstructionError("surface in-plane repeats must be positive")
+    if realized_repeat != (1, 1):
+        candidate = candidate.repeat((*realized_repeat, 1))
     candidate.set_pbc((True, True, False))
-    return candidate, repeat
+    return candidate, realized_repeat
+
+
+def _minimum_in_plane_repeat(
+    slab: Any,
+    settings: PerturbationSettings,
+) -> tuple[int, int]:
+    """Combine expert minimum repeats and physical lateral-size minimums."""
+
+    try:
+        cell = np.asarray(slab.lattice.matrix, dtype=float)
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise SurfaceConstructionError("constructed slab has no measurable in-plane cell") from exc
+    if cell.shape != (3, 3) or not np.isfinite(cell).all():
+        raise SurfaceConstructionError("constructed slab has an invalid in-plane cell")
+    lengths = [float(np.linalg.norm(cell[index])) for index in (0, 1)]
+    if any(length <= 1.0e-12 for length in lengths):
+        raise SurfaceConstructionError("constructed slab has a degenerate in-plane cell")
+    minimums = tuple(float(value) for value in settings.surface_min_in_plane_dimensions)
+    configured = tuple(int(value) for value in settings.surface_in_plane_repeat)
+    if len(minimums) != 2 or len(configured) != 2:
+        raise SurfaceConstructionError("surface in-plane controls must contain two values")
+    return tuple(
+        max(
+            configured[index],
+            int(np.ceil(minimums[index] / lengths[index]))
+            if minimums[index] > 0.0
+            else configured[index],
+        )
+        for index in (0, 1)
+    )  # type: ignore[return-value]
 
 
 def _required_repeat(candidate: Any, settings: PerturbationSettings) -> tuple[int, int]:
@@ -291,13 +544,14 @@ def _required_repeat(candidate: Any, settings: PerturbationSettings) -> tuple[in
 
 def _surface_parameters(
     candidate: Atoms,
+    parent: Any,
     base: Any,
     *,
     reference_cell: np.ndarray,
     miller_index: tuple[int, int, int],
     termination_index: int,
     settings: PerturbationSettings,
-    realized_repeat: tuple[int, int],
+    planning: SurfacePlanningMeasurement,
 ) -> dict[str, Any]:
     parent_counts = Counter(base.get_chemical_symbols())
     candidate_counts = Counter(candidate.get_chemical_symbols())
@@ -331,7 +585,10 @@ def _surface_parameters(
             f"{float(settings.surface_min_half_depth):.8f} Angstrom for Miller index "
             f"{miller_index}"
         )
-    bulk_core = measure_surface_bulk_core(candidate, base, geometry, settings)
+    # ``parent`` is the structure from which the slab was built and is the
+    # authoritative bulk reference for the local-environment comparison.
+    # ``base`` remains the lineage/composition reference used by provenance.
+    bulk_core = measure_surface_bulk_core(candidate, parent, geometry, settings)
     if bulk_core.bulk_core_atom_count < int(settings.surface_min_bulk_core_atoms):
         raise SurfaceConstructionError(
             "realized slab has insufficient bulk-like core atoms: "
@@ -389,9 +646,28 @@ def _surface_parameters(
         "surface_bulk_core_atom_count": bulk_core.bulk_core_atom_count,
         "surface_bulk_core_atom_indices": bulk_core.bulk_core_atom_indices,
         "surface_pbc": (True, True, False),
-        "surface_in_plane_repeat": realized_repeat,
+        "surface_in_plane_repeat": planning.repeat[:2],
         "surface_termination_policy": settings.surface_termination_policy,
         "surface_symmetric": bool(settings.surface_symmetric),
+        "surface_target_n_atoms": planning.target_n_atoms,
+        "surface_target_tolerance": planning.target_tolerance,
+        "surface_max_n_atoms": planning.max_n_atoms,
+        "surface_planner_min_in_plane_repeat": tuple(
+            int(value) for value in settings.surface_in_plane_repeat
+        ),
+        "surface_planner_min_in_plane_dimensions": tuple(
+            float(value) for value in settings.surface_min_in_plane_dimensions
+        ),
+        "surface_max_in_plane_repeat": planning.max_in_plane_repeat,
+        "surface_max_normal_repeat": planning.max_normal_repeat,
+        "surface_planner_repeat": planning.repeat,
+        "surface_normal_repeat": planning.repeat[2],
+        "surface_realized_atom_count": planning.realized_atom_count,
+        "surface_atom_count_delta": planning.atom_count_delta,
+        "surface_target_band": planning.within_target_band,
+        "surface_material_shape_score": planning.material_shape_score,
+        "surface_excess_vacuum": planning.excess_vacuum,
+        "surface_planner_tie_break": planning.tie_break,
         "surface_stoichiometry_change": composition_delta,
         "surface_composition_change": composition_delta,
         "surface_atom_count_change": count_delta,
@@ -613,6 +889,7 @@ __all__ = [
     "SurfaceBulkCoreMeasurement",
     "SurfaceConstructionError",
     "SurfaceGeometryMeasurement",
+    "SurfacePlanningMeasurement",
     "measure_surface_bulk_core",
     "measure_surface_geometry",
     "surfaces",

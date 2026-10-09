@@ -163,7 +163,14 @@ class GenerationConfig:
     surface_bulk_environment_distance_tolerance: float = 0.05
     surface_termination_policy: str = "all"
     surface_max_terminations: int = 0
+    # Surface planning controls.  The global target remains the default when
+    # ``surface_target_n_atoms`` is unset.
+    surface_target_n_atoms: int | None = None
+    surface_target_tolerance: float = 0.20
+    surface_max_n_atoms: int = 512
     surface_in_plane_repeat: tuple[int, int] = (1, 1)
+    surface_max_in_plane_repeat: tuple[int, int] = (4, 4)
+    surface_max_normal_repeat: int = 16
     surface_min_in_plane_dimensions: tuple[float, float] = (0.0, 0.0)
     surface_symmetric: bool = False
     grain_boundary_enabled: bool = False

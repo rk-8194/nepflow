@@ -164,7 +164,14 @@ surface_min_bulk_core_atoms=1
 surface_bulk_environment_distance_tolerance=0.05
 surface_termination_policy=all
 surface_max_terminations=0
+# Surface planning target defaults to generation.target_n_atoms when blank.
+surface_target_n_atoms=
+surface_target_tolerance=0.20
+surface_max_n_atoms=512
+# Existing repeat is an expert minimum; the planner searches up to these bounds.
 surface_in_plane_repeat=1,1
+surface_max_in_plane_repeat=4,4
+surface_max_normal_repeat=16
 surface_min_in_plane_dimensions=0.0,0.0
 surface_symmetric=false
 

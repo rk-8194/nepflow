@@ -20,6 +20,7 @@ from nepflow.config.models import (
 from nepflow.errors import ConfigurationError
 
 from .perturbations.surfaces import (
+    _SURFACE_PLANNER_VERSION,
     SurfaceConstructionError,
     measure_surface_bulk_core,
     measure_surface_geometry,
@@ -503,8 +504,11 @@ def _validate_surface_state(
         "surface_termination_identity",
         "surface_layers",
         "surface_vacuum",
+        "surface_requested_vacuum",
         "surface_requested_vacuum_angstrom",
+        "surface_realized_vacuum",
         "surface_realized_vacuum_angstrom",
+        "surface_slab_thickness",
         "surface_material_thickness",
         "surface_half_depth",
         "surface_min_half_depth",
@@ -524,6 +528,21 @@ def _validate_surface_state(
         "surface_reference_basis_cell",
         "surface_parent_to_reference_transformation",
         "surface_normal",
+        "surface_target_n_atoms",
+        "surface_target_tolerance",
+        "surface_max_n_atoms",
+        "surface_planner_min_in_plane_repeat",
+        "surface_planner_min_in_plane_dimensions",
+        "surface_max_in_plane_repeat",
+        "surface_max_normal_repeat",
+        "surface_planner_repeat",
+        "surface_normal_repeat",
+        "surface_realized_atom_count",
+        "surface_atom_count_delta",
+        "surface_target_band",
+        "surface_material_shape_score",
+        "surface_excess_vacuum",
+        "surface_planner_tie_break",
         "surface_backend",
         "surface_backend_version",
         "surface_planner_version",
@@ -533,6 +552,11 @@ def _validate_surface_state(
     missing = [key for key in required if key not in info]
     if missing:
         return CandidateValidationIssue("missing_surface_provenance", {"fields": missing})
+    if info["surface_planner_version"] != _SURFACE_PLANNER_VERSION:
+        return CandidateValidationIssue(
+            "unsupported_surface_planner_version",
+            {"value": info["surface_planner_version"]},
+        )
     pbc = _pbc_flags(candidate)
     if pbc is None or tuple(bool(value) for value in pbc) != (True, True, False):
         return CandidateValidationIssue(
@@ -569,7 +593,9 @@ def _validate_surface_state(
         return CandidateValidationIssue("invalid_surface_reference_transformation", {})
     try:
         vacuum = float(info["surface_vacuum"])
+        requested_vacuum_alias = float(info["surface_requested_vacuum"])
         requested_vacuum = float(info["surface_requested_vacuum_angstrom"])
+        realized_vacuum_alias = float(info["surface_realized_vacuum"])
         realized_vacuum = float(info["surface_realized_vacuum_angstrom"])
         normal = np.asarray(info["surface_normal"], dtype=float)
     except (TypeError, ValueError):
@@ -579,7 +605,18 @@ def _validate_surface_state(
         or requested_vacuum <= 0.0
         or not math.isfinite(vacuum)
         or not math.isclose(vacuum, requested_vacuum, rel_tol=1.0e-6, abs_tol=1.0e-6)
+        or not math.isfinite(requested_vacuum_alias)
+        or not math.isclose(
+            requested_vacuum_alias, requested_vacuum, rel_tol=1.0e-6, abs_tol=1.0e-6
+        )
+        or not math.isclose(
+            requested_vacuum, float(settings.surface_vacuum), rel_tol=1.0e-6, abs_tol=1.0e-6
+        )
         or not math.isfinite(realized_vacuum)
+        or not math.isfinite(realized_vacuum_alias)
+        or not math.isclose(
+            realized_vacuum_alias, realized_vacuum, rel_tol=1.0e-6, abs_tol=1.0e-6
+        )
         or realized_vacuum + 1.0e-6 < requested_vacuum
         or normal.shape != (3,)
         or not np.isfinite(normal).all()
@@ -646,6 +683,14 @@ def _validate_surface_state(
                 "eligible_bulk_core_atoms": bulk_core.eligible_atom_count,
             },
         )
+    if len(candidate) > int(settings.surface_max_n_atoms):
+        return CandidateValidationIssue(
+            "surface_atom_count_limit",
+            {
+                "maximum_atom_count": int(settings.surface_max_n_atoms),
+                "realized_atom_count": len(candidate),
+            },
+        )
     try:
         stored_lengths = tuple(float(value) for value in info["surface_in_plane_lengths"])
         stored_angle = float(info["surface_in_plane_angle_degrees"])
@@ -653,6 +698,8 @@ def _validate_surface_state(
         stored_shortest = float(info["surface_shortest_in_plane_translation"])
         stored_projections = tuple(float(value) for value in info["surface_projected_coordinates"])
         stored_period = float(info["surface_normal_period"])
+        stored_normal = tuple(float(value) for value in info["surface_normal"])
+        stored_slab_thickness = float(info["surface_slab_thickness"])
         stored_thickness = float(info["surface_material_thickness"])
         stored_half_depth = float(info["surface_half_depth"])
         stored_min_half_depth = float(info["surface_min_half_depth"])
@@ -662,10 +709,32 @@ def _validate_surface_state(
         stored_eligible = int(info["surface_bulk_core_eligible_atom_count"])
         stored_core = int(info["surface_bulk_core_atom_count"])
         stored_core_indices = tuple(int(value) for value in info["surface_bulk_core_atom_indices"])
+        stored_in_plane_repeat = tuple(int(value) for value in info["surface_in_plane_repeat"])
+        stored_target = int(info["surface_target_n_atoms"])
+        stored_target_tolerance = float(info["surface_target_tolerance"])
+        stored_max_atoms = int(info["surface_max_n_atoms"])
+        stored_min_in_plane = tuple(
+            int(value) for value in info["surface_planner_min_in_plane_repeat"]
+        )
+        stored_min_dimensions = tuple(
+            float(value) for value in info["surface_planner_min_in_plane_dimensions"]
+        )
+        stored_max_in_plane = tuple(int(value) for value in info["surface_max_in_plane_repeat"])
+        stored_max_normal = int(info["surface_max_normal_repeat"])
+        stored_planner_repeat = tuple(int(value) for value in info["surface_planner_repeat"])
+        stored_normal_repeat = int(info["surface_normal_repeat"])
+        stored_realized_atoms = int(info["surface_realized_atom_count"])
+        stored_atom_delta = float(info["surface_atom_count_delta"])
+        stored_target_band = bool(info["surface_target_band"])
+        stored_shape_score = float(info["surface_material_shape_score"])
+        stored_excess_vacuum = float(info["surface_excess_vacuum"])
+        stored_tie_break = tuple(float(value) for value in info["surface_planner_tie_break"])
     except (TypeError, ValueError):
         return CandidateValidationIssue("invalid_surface_geometry_provenance", {})
     geometry_matches = (
-        len(stored_lengths) == 2
+        len(stored_normal) == 3
+        and np.allclose(stored_normal, geometry.normal, rtol=1.0e-6, atol=1.0e-6)
+        and len(stored_lengths) == 2
         and np.allclose(stored_lengths, geometry.in_plane_lengths, rtol=1.0e-6, atol=1.0e-6)
         and math.isclose(
             stored_angle,
@@ -688,6 +757,12 @@ def _validate_surface_state(
             atol=1.0e-6,
         )
         and math.isclose(stored_period, geometry.normal_period, rel_tol=1.0e-6, abs_tol=1.0e-6)
+        and math.isclose(
+            stored_slab_thickness,
+            geometry.material_thickness,
+            rel_tol=1.0e-6,
+            abs_tol=1.0e-6,
+        )
         and math.isclose(
             stored_thickness, geometry.material_thickness, rel_tol=1.0e-6, abs_tol=1.0e-6
         )
@@ -717,13 +792,87 @@ def _validate_surface_state(
                 "realized_bulk_core_atoms": bulk_core.bulk_core_atom_count,
             },
         )
-    repeat = info["surface_in_plane_repeat"]
-    try:
-        repeat_values = tuple(int(value) for value in repeat)
-    except (TypeError, ValueError):
-        return CandidateValidationIssue("invalid_surface_repeat", {})
-    if len(repeat_values) != 2 or any(value <= 0 for value in repeat_values):
-        return CandidateValidationIssue("invalid_surface_repeat", {"value": repeat})
+    target_atoms = (
+        int(settings.target_n_atoms)
+        if settings.surface_target_n_atoms is None
+        else int(settings.surface_target_n_atoms)
+    )
+    if target_atoms <= 0:
+        return CandidateValidationIssue("surface_planner_provenance_mismatch", {})
+    expected_delta = abs(len(candidate) - target_atoms) / target_atoms
+    dimensions = (*geometry.in_plane_lengths, geometry.material_thickness)
+    expected_shape_score = max(dimensions) / min(dimensions) - 1.0
+    expected_excess_vacuum = max(
+        0.0, geometry.realized_vacuum - float(settings.surface_vacuum)
+    )
+    expected_band = expected_delta <= float(settings.surface_target_tolerance) + 1.0e-12
+    expected_repeat = stored_planner_repeat
+    expected_tie_break = (
+        expected_shape_score,
+        float(len(candidate)),
+        expected_excess_vacuum,
+        float(expected_repeat[0]) if len(expected_repeat) > 0 else -1.0,
+        float(expected_repeat[1]) if len(expected_repeat) > 1 else -1.0,
+        float(expected_repeat[2]) if len(expected_repeat) > 2 else -1.0,
+    )
+    planner_matches = (
+        target_atoms > 0
+        and stored_target == target_atoms
+        and math.isclose(
+            stored_target_tolerance,
+            float(settings.surface_target_tolerance),
+            rel_tol=1.0e-6,
+            abs_tol=1.0e-6,
+        )
+        and stored_max_atoms == int(settings.surface_max_n_atoms)
+        and stored_min_in_plane == tuple(int(value) for value in settings.surface_in_plane_repeat)
+        and len(stored_min_dimensions) == 2
+        and np.allclose(
+            stored_min_dimensions,
+            tuple(float(value) for value in settings.surface_min_in_plane_dimensions),
+            rtol=1.0e-6,
+            atol=1.0e-6,
+        )
+        and stored_max_in_plane == tuple(
+            int(value) for value in settings.surface_max_in_plane_repeat
+        )
+        and stored_max_normal == int(settings.surface_max_normal_repeat)
+        and len(expected_repeat) == 3
+        and all(value > 0 for value in expected_repeat)
+        and stored_normal_repeat == expected_repeat[2]
+        and expected_repeat[0] >= int(settings.surface_in_plane_repeat[0])
+        and expected_repeat[1] >= int(settings.surface_in_plane_repeat[1])
+        and expected_repeat[0] <= int(settings.surface_max_in_plane_repeat[0])
+        and expected_repeat[1] <= int(settings.surface_max_in_plane_repeat[1])
+        and expected_repeat[2] <= int(settings.surface_max_normal_repeat)
+        and stored_in_plane_repeat == expected_repeat[:2]
+        and stored_realized_atoms == len(candidate)
+        and len(candidate) <= int(settings.surface_max_n_atoms)
+        and math.isclose(stored_atom_delta, expected_delta, rel_tol=1.0e-6, abs_tol=1.0e-6)
+        and stored_target_band == expected_band
+        and math.isclose(
+            stored_shape_score, expected_shape_score, rel_tol=1.0e-6, abs_tol=1.0e-6
+        )
+        and math.isclose(
+            stored_excess_vacuum,
+            expected_excess_vacuum,
+            rel_tol=1.0e-6,
+            abs_tol=1.0e-6,
+        )
+        and len(stored_tie_break) == len(expected_tie_break)
+        and np.allclose(stored_tie_break, expected_tie_break, rtol=1.0e-6, atol=1.0e-6)
+    )
+    if not planner_matches:
+        return CandidateValidationIssue(
+            "surface_planner_provenance_mismatch",
+            {
+                "realized_atom_count": len(candidate),
+                "target_atom_count": target_atoms,
+                "atom_count_delta": expected_delta,
+            },
+        )
+    if len(stored_in_plane_repeat) != 2 or any(value <= 0 for value in stored_in_plane_repeat):
+        return CandidateValidationIssue("invalid_surface_repeat", {"value": stored_in_plane_repeat})
     return None
 
 
@@ -868,6 +1017,16 @@ def validate_generation_config(config: GenerationConfig) -> GenerationConfig:
         raise ConfigurationError(
             "generation.surface_bulk_environment_distance_tolerance must be finite and non-negative"
         )
+    if config.surface_target_n_atoms is not None and (
+        isinstance(config.surface_target_n_atoms, bool) or config.surface_target_n_atoms <= 0
+    ):
+        raise ConfigurationError("generation.surface_target_n_atoms must be positive when set")
+    if not math.isfinite(config.surface_target_tolerance) or config.surface_target_tolerance < 0.0:
+        raise ConfigurationError(
+            "generation.surface_target_tolerance must be finite and non-negative"
+        )
+    if config.surface_max_n_atoms <= 0:
+        raise ConfigurationError("generation.surface_max_n_atoms must be positive")
     if config.surface_max_terminations < 0:
         raise ConfigurationError("generation.surface_max_terminations must be non-negative")
     if config.surface_termination_policy not in {"all", "first"}:
@@ -891,6 +1050,21 @@ def validate_generation_config(config: GenerationConfig) -> GenerationConfig:
         raise ConfigurationError(
             "generation.surface_in_plane_repeat must contain two positive integers"
         )
+    if len(config.surface_max_in_plane_repeat) != 2 or any(
+        value <= 0 for value in config.surface_max_in_plane_repeat
+    ):
+        raise ConfigurationError(
+            "generation.surface_max_in_plane_repeat must contain two positive integers"
+        )
+    if any(
+        lower > upper
+        for lower, upper in zip(config.surface_in_plane_repeat, config.surface_max_in_plane_repeat)
+    ):
+        raise ConfigurationError(
+            "generation.surface_max_in_plane_repeat must not be below surface_in_plane_repeat"
+        )
+    if config.surface_max_normal_repeat <= 0:
+        raise ConfigurationError("generation.surface_max_normal_repeat must be positive")
     if len(config.surface_min_in_plane_dimensions) != 2 or any(
         not math.isfinite(value) or value < 0.0 for value in config.surface_min_in_plane_dimensions
     ):

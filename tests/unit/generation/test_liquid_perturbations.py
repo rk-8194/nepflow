@@ -172,7 +172,7 @@ def test_source_scope_filters_liquid_candidates_before_generation() -> None:
         n_grain_boundaries=0,
     )
 
-    task = PerturbationCoordinator(settings=configured)._tasks([base], counts)[0]
+    task = next(PerturbationCoordinator(settings=configured)._tasks([base], counts))
     result = execute_perturbation_task(task)
 
     assert [candidate.info["perturbation_type"] for candidate in result.candidates] == [

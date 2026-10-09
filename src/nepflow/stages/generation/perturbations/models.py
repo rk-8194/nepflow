@@ -143,7 +143,12 @@ class PerturbationSettings:
     surface_bulk_environment_distance_tolerance: float = 0.05
     surface_termination_policy: str = "all"
     surface_max_terminations: int = 0
+    surface_target_n_atoms: int | None = None
+    surface_target_tolerance: float = 0.20
+    surface_max_n_atoms: int = 512
     surface_in_plane_repeat: tuple[int, int] = (1, 1)
+    surface_max_in_plane_repeat: tuple[int, int] = (4, 4)
+    surface_max_normal_repeat: int = 16
     surface_min_in_plane_dimensions: tuple[float, float] = (0.0, 0.0)
     surface_symmetric: bool = False
     surface_sources: SourceScope = DEFAULT_SOURCE_SCOPE
@@ -169,6 +174,9 @@ class PerturbationSettings:
             tuple(tuple(int(value) for value in index) for index in self.surface_miller_indices),
         )
         object.__setattr__(self, "surface_in_plane_repeat", tuple(self.surface_in_plane_repeat))
+        object.__setattr__(
+            self, "surface_max_in_plane_repeat", tuple(self.surface_max_in_plane_repeat)
+        )
         object.__setattr__(
             self, "grain_boundary_rotation_axis", tuple(self.grain_boundary_rotation_axis)
         )
@@ -273,7 +281,12 @@ class PerturbationSettings:
             ),
             "surface_termination_policy": self.surface_termination_policy,
             "surface_max_terminations": self.surface_max_terminations,
+            "surface_target_n_atoms": self.surface_target_n_atoms,
+            "surface_target_tolerance": self.surface_target_tolerance,
+            "surface_max_n_atoms": self.surface_max_n_atoms,
             "surface_in_plane_repeat": self.surface_in_plane_repeat,
+            "surface_max_in_plane_repeat": self.surface_max_in_plane_repeat,
+            "surface_max_normal_repeat": self.surface_max_normal_repeat,
             "surface_min_in_plane_dimensions": self.surface_min_in_plane_dimensions,
             "surface_symmetric": self.surface_symmetric,
             "surface_sources": list(self.surface_sources),

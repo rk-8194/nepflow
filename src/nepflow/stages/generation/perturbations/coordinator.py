@@ -5,7 +5,8 @@ from __future__ import annotations
 import logging
 import os
 import tempfile
-from collections.abc import Iterable
+from collections import deque
+from collections.abc import Iterable, Iterator
 from concurrent.futures import ProcessPoolExecutor
 from io import StringIO
 from pathlib import Path
@@ -421,20 +422,18 @@ class PerturbationCoordinator:
         base_structures: Iterable[Any],
         counts: PerturbationCounts,
         settings: PerturbationSettings | None = None,
-    ) -> list[PerturbationTask]:
-        bases = list(base_structures)
-        seeds = self.rng.randint(0, 2**31, size=len(bases)).tolist()
+    ) -> Iterator[PerturbationTask]:
+        """Yield tasks in canonical base order with their stable RNG seeds."""
+
         task_settings = settings or self.settings
-        return [
-            PerturbationTask(
+        for base in base_structures:
+            yield PerturbationTask(
                 base=base,
                 base_structure_id=calculate_structure_id(base),
                 settings=task_settings,
                 counts=counts,
-                seed=int(seeds[index]),
+                seed=int(self.rng.randint(0, 2**31)),
             )
-            for index, base in enumerate(bases)
-        ]
 
     def generate_candidates(
         self,
@@ -453,11 +452,12 @@ class PerturbationCoordinator:
         self._provenance_records = ()
         self._duplicate_count = 0
         self._magnetic_summary = None
-        results = self._execute(self._tasks(base_structures, counts), n_workers)
-        self._rejected_attempts.extend(
-            rejection for result in results for rejection in result.rejected_attempts
-        )
-        candidates, records = self._deduplicate_results(results)
+        def results_with_rejections() -> Iterator[PerturbationTaskResult]:
+            for result in self._execute(self._tasks(base_structures, counts), n_workers):
+                self._rejected_attempts.extend(result.rejected_attempts)
+                yield result
+
+        candidates, records = self._deduplicate_results(results_with_rejections())
         if self.magnetic_generator is not None:
             magnetic_result = self.magnetic_generator.expand_structures(candidates)
             candidates = list(magnetic_result.candidates)
@@ -627,14 +627,50 @@ class PerturbationCoordinator:
 
     def _execute(
         self,
-        tasks: list[PerturbationTask],
+        tasks: Iterable[PerturbationTask],
         n_workers: int,
-    ) -> list[PerturbationTaskResult]:
+    ) -> Iterator[PerturbationTaskResult]:
+        """Yield worker results in task order using bounded parallel backpressure.
+
+        Parallel mode keeps no more than twice the worker count of submitted
+        futures.  Waiting for the earliest submitted future preserves canonical
+        base order without an unbounded completed-result reorder buffer.
+        """
+
         if n_workers == 1:
-            return [self._execute_one(task) for task in tasks]
-        with ProcessPoolExecutor(max_workers=n_workers) as pool:
-            futures = [pool.submit(execute_perturbation_task, task) for task in tasks]
-            return [self._resolve_future(task, future) for task, future in zip(tasks, futures)]
+            for task in tasks:
+                yield self._execute_one(task)
+            return
+
+        submission_window = 2 * n_workers
+        task_iterator = iter(tasks)
+        pending: deque[tuple[PerturbationTask, Any]] = deque()
+        exhausted = False
+        pool = ProcessPoolExecutor(max_workers=n_workers)
+
+        def fill_submission_window() -> None:
+            nonlocal exhausted
+            while len(pending) < submission_window and not exhausted:
+                try:
+                    task = next(task_iterator)
+                except StopIteration:
+                    exhausted = True
+                    return
+                pending.append((task, pool.submit(execute_perturbation_task, task)))
+
+        try:
+            fill_submission_window()
+            while pending:
+                task, future = pending.popleft()
+                yield self._resolve_future(task, future)
+                fill_submission_window()
+        except BaseException:
+            for _task, future in pending:
+                future.cancel()
+            pool.shutdown(wait=False, cancel_futures=True)
+            raise
+        else:
+            pool.shutdown(wait=True)
 
     @staticmethod
     def _execute_one(task: PerturbationTask) -> PerturbationTaskResult:
