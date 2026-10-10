@@ -277,6 +277,8 @@ class SelectionStage:
                 backend=entropy.bandwidth.backend,
                 metric=entropy.bandwidth.metric,
                 chunk_size=entropy.bandwidth.chunk_size,
+                max_neighbour_entries=entropy.bandwidth.max_neighbour_entries,
+                max_index_bytes=entropy.bandwidth.max_index_bytes,
             )
             for limit_name in ("max_edges", "max_entries"):
                 limit = getattr(entropy, limit_name)

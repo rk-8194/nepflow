@@ -15,8 +15,13 @@ import numpy as np
 from nepflow.io.hashing import sha256_canonical_json
 
 from .models import (
+    INDEXED_NEIGHBOUR_BACKEND_ID,
+    INDEXED_NEIGHBOUR_BACKEND_VERSION,
     KERNEL_FAMILY,
     KERNEL_VERSION,
+    NEIGHBOUR_BACKEND_ID,
+    NEIGHBOUR_BACKEND_VERSION,
+    NEIGHBOUR_METRIC,
     SPARSE_CANDIDATE_CONTRIBUTION_SCHEMA_VERSION,
     SPARSE_KERNEL_GRAPH_SCHEMA_VERSION,
     SPARSE_NUMERICAL_TOLERANCE,
@@ -27,7 +32,12 @@ from .models import (
     SparseAtomicKernelGraph,
     SparseCandidateContributions,
 )
-from .neighbours import _validate_chunk_size, _validate_descriptors
+from .neighbours import (
+    IndexedCPUNeighbourIndex,
+    _validate_chunk_size,
+    _validate_descriptors,
+    build_neighbour_index,
+)
 
 SourceProgressCallback = Callable[[int, int], None]
 
@@ -119,29 +129,121 @@ def _distance_block(
     return distances
 
 
+class _KernelSupportProvider:
+    """Exact compact-support queries shared by normalisation and graph passes."""
+
+    def __init__(
+        self,
+        descriptors: np.ndarray,
+        *,
+        backend: str,
+        chunk_size: int,
+        index: IndexedCPUNeighbourIndex | None = None,
+    ) -> None:
+        self.descriptors = _validate_descriptors(descriptors)
+        self.backend = backend
+        self.chunk_size = _validate_chunk_size(chunk_size)
+        if backend == INDEXED_NEIGHBOUR_BACKEND_ID:
+            self.index = (
+                index
+                if index is not None
+                else build_neighbour_index(
+                    self.descriptors,
+                    backend=backend,
+                )
+            )
+            if not isinstance(self.index, IndexedCPUNeighbourIndex):
+                raise ValueError("indexed exact kernel support requires its indexed CPU backend")
+            if not np.array_equal(self.index.descriptors, self.descriptors):
+                raise ValueError("indexed kernel support index belongs to different descriptors")
+        elif backend == NEIGHBOUR_BACKEND_ID:
+            if index is not None:
+                raise ValueError("exact_cpu kernel support does not accept an indexed index")
+            self.index = None
+        else:
+            raise ValueError(f"configured neighbour backend is unavailable: {backend!r}")
+        self.distance_evaluations = 0
+        self.index_queries = 0
+        self.radius_queries = 0
+        self.support_entries = 0
+        self._normaliser_cache: dict[tuple[int, float], float] = {}
+
+    def support(self, source_index: int, radius: float) -> tuple[np.ndarray, np.ndarray]:
+        scale = float(radius)
+        if self.index is not None:
+            self.index_queries += 1
+            self.radius_queries += 1
+            target_indices, distances = self.index.radius_support(source_index, scale)
+            self.support_entries += int(target_indices.shape[0])
+            return target_indices, distances
+        target_parts: list[np.ndarray] = []
+        distance_parts: list[np.ndarray] = []
+        for start in range(0, self.descriptors.shape[0], self.chunk_size):
+            stop = min(start + self.chunk_size, self.descriptors.shape[0])
+            distances = _distance_block(self.descriptors, source_index, start, stop)
+            self.distance_evaluations += stop - start
+            positive = distances < scale
+            if np.any(positive):
+                target_parts.append(np.arange(start, stop, dtype=np.int64)[positive])
+                distance_parts.append(distances[positive])
+        if not target_parts:
+            raise ValueError(f"source kernel support is empty for source {source_index}")
+        targets = np.concatenate(target_parts)
+        distances = np.concatenate(distance_parts)
+        self.support_entries += int(targets.shape[0])
+        return targets, distances
+
+    def normaliser(
+        self,
+        source_index: int,
+        radius: float,
+        target_indices: np.ndarray | None = None,
+        distances: np.ndarray | None = None,
+    ) -> float:
+        key = (int(source_index), float(radius))
+        cached = self._normaliser_cache.get(key)
+        if cached is not None:
+            return cached
+        if target_indices is None or distances is None:
+            target_indices, distances = self.support(source_index, radius)
+        del target_indices
+        raw = np.asarray(wendland_kernel(distances / float(radius)), dtype=np.float64)
+        total = float(np.sum(raw, dtype=np.float64))
+        if not math.isfinite(total) or total <= 0.0:
+            raise ValueError(f"source kernel normaliser is invalid for source {source_index}")
+        self._normaliser_cache[key] = total
+        return total
+
+
 def source_normalisers(
     descriptors: np.ndarray,
     bandwidths: np.ndarray,
     *,
     chunk_size: int = 1024,
+    backend: str = NEIGHBOUR_BACKEND_ID,
+    index: IndexedCPUNeighbourIndex | None = None,
+    support_provider: _KernelSupportProvider | None = None,
 ) -> np.ndarray:
-    """Return ``Z_b`` using every target row and no target probability weights."""
+    """Return ``Z_b`` over the complete exact compact-kernel support."""
 
     values = _validate_descriptors(descriptors)
     scales = _validate_bandwidths(bandwidths, values.shape[0])
     block = _validate_chunk_size(chunk_size)
+    provider = support_provider or _KernelSupportProvider(
+        values,
+        backend=backend,
+        chunk_size=block,
+        index=index,
+    )
     normalisers = np.empty(values.shape[0], dtype=np.float64)
     for source_index, scale in enumerate(scales):
-        raw_values = np.empty(values.shape[0], dtype=np.float64)
-        for start in range(0, values.shape[0], block):
-            stop = min(start + block, values.shape[0])
-            distances = _distance_block(values, source_index, start, stop)
-            raw = np.asarray(wendland_kernel(distances / scale), dtype=np.float64)
-            raw_values[start:stop] = raw
-        total = float(np.sum(raw_values, dtype=np.float64))
-        if not math.isfinite(total) or total <= 0.0:
-            raise ValueError(f"source kernel normaliser is invalid for source {source_index}")
-        normalisers[source_index] = total
+        targets, distances = provider.support(source_index, float(scale))
+        normalisers[source_index] = provider.normaliser(
+            source_index,
+            float(scale),
+            targets,
+            distances,
+        )
     normalisers.setflags(write=False)
     return normalisers
 
@@ -152,6 +254,9 @@ def iter_normalized_kernel_columns(
     *,
     chunk_size: int = 1024,
     progress_callback: SourceProgressCallback | None = None,
+    backend: str = NEIGHBOUR_BACKEND_ID,
+    index: IndexedCPUNeighbourIndex | None = None,
+    support_provider: _KernelSupportProvider | None = None,
 ) -> Iterator[NormalizedKernelColumn]:
     """Yield positive normalized source columns using bounded workspaces.
 
@@ -164,20 +269,28 @@ def iter_normalized_kernel_columns(
     block = _validate_chunk_size(chunk_size)
     if progress_callback is not None and not callable(progress_callback):
         raise TypeError("progress_callback must be callable")
-    normalisers = source_normalisers(values, scales, chunk_size=block)
+    provider = support_provider or _KernelSupportProvider(
+        values,
+        backend=backend,
+        chunk_size=block,
+        index=index,
+    )
     for source_index, scale in enumerate(scales):
-        normaliser = normalisers[source_index]
-        column_total = 0.0
-        for start in range(0, values.shape[0], block):
-            stop = min(start + block, values.shape[0])
-            distances = _distance_block(values, source_index, start, stop)
-            raw = np.asarray(wendland_kernel(distances / scale), dtype=np.float64)
-            positive = raw > 0.0
-            if not np.any(positive):
-                continue
-            target_indices = np.arange(start, stop, dtype=np.int64)[positive]
-            normalized = raw[positive] / normaliser
-            column_total += float(np.sum(normalized, dtype=np.float64))
+        target_indices, distances = provider.support(source_index, float(scale))
+        normaliser = provider.normaliser(
+            source_index,
+            float(scale),
+            target_indices,
+            distances,
+        )
+        raw = np.asarray(wendland_kernel(distances / scale), dtype=np.float64)
+        positive = raw > 0.0
+        if not np.all(positive):
+            target_indices = target_indices[positive]
+            raw = raw[positive]
+        normalized = raw / normaliser
+        column_total = float(np.sum(normalized, dtype=np.float64))
+        if target_indices.size:
             yield NormalizedKernelColumn(source_index, target_indices, normalized)
         if not math.isclose(column_total, 1.0, rel_tol=0.0, abs_tol=1.0e-12):
             raise ValueError(f"normalized source kernel column {source_index} does not sum to one")
@@ -225,6 +338,8 @@ def evaluate_leave_one_out_objective(
     *,
     chunk_size: int = 1024,
     progress_callback: SourceProgressCallback | None = None,
+    backend: str = NEIGHBOUR_BACKEND_ID,
+    index: IndexedCPUNeighbourIndex | None = None,
 ) -> LeaveOneOutObjective:
     """Evaluate the exact source-normalized finite-pool LOO objective."""
 
@@ -250,6 +365,8 @@ def evaluate_leave_one_out_objective(
         _validate_bandwidths(bandwidths, values.shape[0]),
         chunk_size=chunk_size,
         progress_callback=progress_callback,
+        backend=backend,
+        index=index,
     ):
         non_source = column.target_indices != column.source_index
         if np.any(non_source):
@@ -333,8 +450,23 @@ def _validate_sparse_graph_inputs(
         raise ValueError("frozen bandwidth count must equal the atomic row count")
     if not np.all(np.isfinite(frozen.bandwidths)) or np.any(frozen.bandwidths <= 0.0):
         raise ValueError("frozen bandwidths must be finite and strictly positive")
-    if frozen.backend != "exact_cpu" or frozen.metric != "euclidean":
-        raise ValueError("sparse kernel construction requires the exact Euclidean backend")
+    if frozen.backend not in {NEIGHBOUR_BACKEND_ID, INDEXED_NEIGHBOUR_BACKEND_ID}:
+        raise ValueError(
+            "sparse kernel construction requires a supported exact neighbour backend; "
+            f"received {frozen.backend!r}"
+        )
+    expected_version = (
+        NEIGHBOUR_BACKEND_VERSION
+        if frozen.backend == NEIGHBOUR_BACKEND_ID
+        else INDEXED_NEIGHBOUR_BACKEND_VERSION
+    )
+    if frozen.backend_version != expected_version:
+        raise ValueError(
+            "sparse kernel construction requires the configured backend version; "
+            f"received {frozen.backend_version!r}, expected {expected_version!r}"
+        )
+    if frozen.metric != NEIGHBOUR_METRIC:
+        raise ValueError("sparse kernel construction requires the exact Euclidean metric")
     candidate_ids = tuple(pool.candidate_ids)
     if not candidate_ids or len(set(candidate_ids)) != len(candidate_ids):
         raise ValueError("entropy pool candidate IDs must be non-empty and unique")
@@ -366,6 +498,8 @@ def _graph_fingerprint(
         "transform": pool.transform_fingerprint,
         "bandwidth": bandwidths.fingerprint,
         "neighbour_backend": bandwidths.backend,
+        "neighbour_backend_version": bandwidths.backend_version,
+        "neighbour_backend_fingerprint": bandwidths.backend_fingerprint,
         "metric": bandwidths.metric,
         "kernel_family": KERNEL_FAMILY,
         "kernel_version": KERNEL_VERSION,
@@ -453,6 +587,18 @@ def build_sparse_atomic_kernel_graph(
         block,
     )
     edge_counts = np.zeros(n_rows, dtype=np.int64)
+    support_provider = _KernelSupportProvider(
+        values,
+        backend=frozen.backend,
+        chunk_size=block,
+    )
+    if (
+        frozen.backend == INDEXED_NEIGHBOUR_BACKEND_ID
+        and frozen.backend_fingerprint
+        and support_provider.index is not None
+        and frozen.backend_fingerprint != support_provider.index.fingerprint
+    ):
+        raise ValueError("frozen bandwidths have a mismatched indexed backend fingerprint")
     next_percent = [1]
 
     def report_source_progress(completed: int, total: int) -> None:
@@ -466,6 +612,8 @@ def build_sparse_atomic_kernel_graph(
             frozen.bandwidths,
             chunk_size=block,
             progress_callback=report_source_progress,
+            backend=frozen.backend,
+            support_provider=support_provider,
         ):
             edge_counts[column.source_index] += np.int64(column.target_indices.shape[0])
         edge_count = int(np.sum(edge_counts, dtype=np.int64))
@@ -475,10 +623,16 @@ def build_sparse_atomic_kernel_graph(
                 f"N={n_rows}, required_edges={edge_count}, max_edges={edge_limit}"
             )
         required_bytes = 8 * (n_rows + 1 + edge_count + edge_count + n_rows)
-        if byte_limit is not None and required_bytes > byte_limit:
+        estimated_peak_bytes = (
+            required_bytes + support_provider.index.index_bytes
+            if support_provider.index is not None
+            else required_bytes + 8 * (block + n_rows)
+        )
+        if byte_limit is not None and estimated_peak_bytes > byte_limit:
             raise ValueError(
                 "sparse atomic kernel graph exceeds max_graph_bytes: "
-                f"N={n_rows}, required_bytes={required_bytes}, max_graph_bytes={byte_limit}"
+                f"N={n_rows}, E={edge_count}, required_bytes={required_bytes}, "
+                f"estimated_peak_bytes={estimated_peak_bytes}, max_graph_bytes={byte_limit}"
             )
 
         source_indptr = np.empty(n_rows + 1, dtype=np.int64)
@@ -491,6 +645,8 @@ def build_sparse_atomic_kernel_graph(
             values,
             frozen.bandwidths,
             chunk_size=block,
+            backend=frozen.backend,
+            support_provider=support_provider,
         ):
             start = int(positions[column.source_index])
             stop = start + column.target_indices.shape[0]
@@ -649,67 +805,82 @@ def aggregate_candidate_contributions(
         byte_limit if byte_limit is not None else "unbounded",
     )
     try:
-        last_source = np.full(candidate_count, -1, dtype=np.int64)
-        for source_index, candidate_index in enumerate(graph.row_candidate_indices):
-            last_source[int(candidate_index)] = source_index
-        if np.any(last_source < 0):
-            missing = graph.candidate_ids[int(np.flatnonzero(last_source < 0)[0])]
-            raise ValueError(f"candidate {missing!r} owns no source rows")
         source_counts = np.bincount(
             graph.row_candidate_indices,
             minlength=candidate_count,
         ).astype(np.int64)
-        accumulators: list[dict[int, float]] = [dict() for _ in range(candidate_count)]
-        entry_count = 0
+        if np.any(source_counts < 1):
+            missing = graph.candidate_ids[int(np.flatnonzero(source_counts < 1)[0])]
+            raise ValueError(f"candidate {missing!r} owns no source rows")
+        source_order = np.argsort(graph.row_candidate_indices, kind="stable")
+        candidate_offsets = np.empty(candidate_count + 1, dtype=np.int64)
+        candidate_offsets[0] = 0
+        np.cumsum(source_counts, dtype=np.int64, out=candidate_offsets[1:])
+
+        def estimated_peak_bytes(entry_count: int) -> int:
+            final_arrays = 8 * (candidate_count + 1 + entry_count + entry_count + candidate_count)
+            # CPython dict entries retain boxed integer keys and float values;
+            # 72 bytes per live entry is deliberately conservative for the
+            # temporary single-candidate accumulator and table slack.
+            accumulator = 128 + 72 * entry_count
+            return int(graph.array_bytes + source_order.nbytes + final_arrays + accumulator)
+
+        support_counts = np.zeros(candidate_count, dtype=np.int64)
         completed_candidates = 0
         next_percent = [1]
-        for source_index, candidate_index_value in enumerate(graph.row_candidate_indices):
-            candidate_index = int(candidate_index_value)
-            start = int(graph.source_indptr[source_index])
-            stop = int(graph.source_indptr[source_index + 1])
-            accumulator = accumulators[candidate_index]
-            for edge_index in range(start, stop):
-                target = int(graph.target_indices[edge_index])
-                weight = float(graph.values[edge_index])
-                if target in accumulator:
-                    accumulator[target] += weight
-                else:
-                    entry_count += 1
-                    if entry_count > entry_limit:
+
+        def accumulate_candidate(candidate_index: int) -> dict[int, float]:
+            accumulator: dict[int, float] = {}
+            start_source = int(candidate_offsets[candidate_index])
+            stop_source = int(candidate_offsets[candidate_index + 1])
+            for position in range(start_source, stop_source):
+                source_index = int(source_order[position])
+                start_edge = int(graph.source_indptr[source_index])
+                stop_edge = int(graph.source_indptr[source_index + 1])
+                for edge_index in range(start_edge, stop_edge):
+                    target = int(graph.target_indices[edge_index])
+                    weight = float(graph.values[edge_index])
+                    if target in accumulator:
+                        accumulator[target] += weight
+                        continue
+                    prospective_count = len(accumulator) + 1
+                    if prospective_count > entry_limit:
                         raise ValueError(
                             "sparse candidate contributions exceed max_entries: "
                             f"M={candidate_count}, required_entries>{entry_limit}, "
                             f"max_entries={entry_limit}"
                         )
                     if byte_limit is not None:
-                        estimated_bytes = 8 * (
-                            candidate_count + 1 + entry_count + entry_count + candidate_count
-                        )
+                        estimated_bytes = estimated_peak_bytes(prospective_count)
                         if estimated_bytes > byte_limit:
                             raise ValueError(
                                 "sparse candidate contributions exceed max_graph_bytes: "
-                                f"M={candidate_count}, required_bytes>={estimated_bytes}, "
+                                f"M={candidate_count}, required_entries>={prospective_count}, "
+                                f"estimated_peak_bytes={estimated_bytes}, "
                                 f"max_graph_bytes={byte_limit}"
                             )
                     accumulator[target] = weight
-            if source_index == int(last_source[candidate_index]):
-                completed_candidates += 1
-                _report_candidate_progress(
-                    completed_candidates,
-                    candidate_count,
-                    started,
-                    next_percent,
-                    graph.candidate_ids[candidate_index],
-                )
-                if progress_callback is not None:
-                    progress_callback(completed_candidates, candidate_count)
+            return accumulator
+
+        # Preflight one candidate at a time.  This avoids M simultaneously
+        # live Python dictionaries while preserving source/target reduction
+        # order and determining the final CSR allocation before writing it.
+        for candidate_index in range(candidate_count):
+            accumulator = accumulate_candidate(candidate_index)
+            support_counts[candidate_index] = len(accumulator)
+            completed_candidates += 1
+            _report_candidate_progress(
+                completed_candidates,
+                candidate_count,
+                started,
+                next_percent,
+                graph.candidate_ids[candidate_index],
+            )
+            if progress_callback is not None:
+                progress_callback(completed_candidates, candidate_count)
 
         candidate_indptr = np.empty(candidate_count + 1, dtype=np.int64)
         candidate_indptr[0] = 0
-        support_counts = np.asarray(
-            [len(accumulator) for accumulator in accumulators],
-            dtype=np.int64,
-        )
         np.cumsum(support_counts, dtype=np.int64, out=candidate_indptr[1:])
         entry_count = int(candidate_indptr[-1])
         if entry_count > entry_limit:
@@ -718,15 +889,18 @@ def aggregate_candidate_contributions(
                 f"M={candidate_count}, required_entries={entry_count}, max_entries={entry_limit}"
             )
         required_bytes = 8 * (candidate_count + 1 + entry_count + entry_count + candidate_count)
-        if byte_limit is not None and required_bytes > byte_limit:
+        estimated_peak = estimated_peak_bytes(entry_count)
+        if byte_limit is not None and estimated_peak > byte_limit:
             raise ValueError(
                 "sparse candidate contributions exceed max_graph_bytes: "
                 f"M={candidate_count}, required_bytes={required_bytes}, "
+                f"estimated_peak_bytes={estimated_peak}, "
                 f"max_graph_bytes={byte_limit}"
             )
         target_indices = np.empty(entry_count, dtype=np.int64)
         contribution_values = np.empty(entry_count, dtype=np.float64)
-        for candidate_index, accumulator in enumerate(accumulators):
+        for candidate_index in range(candidate_count):
+            accumulator = accumulate_candidate(candidate_index)
             start = int(candidate_indptr[candidate_index])
             for offset, target in enumerate(sorted(accumulator)):
                 value = accumulator[target] / float(source_counts[candidate_index])

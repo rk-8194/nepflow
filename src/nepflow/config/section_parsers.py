@@ -673,11 +673,19 @@ def parse_selection(values: Mapping[str, str]) -> SelectionConfig:
             value("entropy_bandwidth_c_candidates", "1.5,2.0,4.0,8.0", "c_candidates"),
             "selection.entropy_bandwidth_c_candidates",
         ),
-        backend=value("entropy_bandwidth_backend", "exact_cpu", "neighbour_backend"),
+        backend=value("entropy_bandwidth_backend", "exact_indexed_cpu", "neighbour_backend"),
         metric=value("entropy_bandwidth_metric", "euclidean", "neighbour_metric"),
         chunk_size=_parse_int(
             value("entropy_bandwidth_chunk_size", "1024", "bandwidth_chunk_size"),
             "selection.entropy_bandwidth_chunk_size",
+        ),
+        max_neighbour_entries=_parse_int(
+            value("entropy_bandwidth_max_neighbour_entries", "1000000"),
+            "selection.entropy_bandwidth_max_neighbour_entries",
+        ),
+        max_index_bytes=_parse_optional_int(
+            value("entropy_bandwidth_max_index_bytes", ""),
+            "selection.entropy_bandwidth_max_index_bytes",
         ),
     )
     entropy = EntropySelectionConfig(

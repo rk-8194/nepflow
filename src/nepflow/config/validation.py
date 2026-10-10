@@ -291,12 +291,24 @@ def validate_config(
     bandwidth = entropy.bandwidth
     if bandwidth.mode not in {"automatic", "manual"}:
         raise ConfigurationError("selection.entropy.bandwidth.mode must be automatic or manual")
-    if bandwidth.backend != "exact_cpu":
-        raise ConfigurationError("selection.entropy.bandwidth.backend only supports exact_cpu")
+    if bandwidth.backend not in {"exact_cpu", "exact_indexed_cpu"}:
+        raise ConfigurationError(
+            "selection.entropy.bandwidth.backend must be exact_cpu or exact_indexed_cpu"
+        )
     if bandwidth.metric != "euclidean":
         raise ConfigurationError("selection.entropy.bandwidth.metric only supports euclidean")
     if not isinstance(bandwidth.chunk_size, int) or bandwidth.chunk_size < 1:
         raise ConfigurationError("selection.entropy.bandwidth.chunk_size must be positive")
+    if not isinstance(bandwidth.max_neighbour_entries, int) or bandwidth.max_neighbour_entries < 1:
+        raise ConfigurationError(
+            "selection.entropy.bandwidth.max_neighbour_entries must be positive"
+        )
+    if bandwidth.max_index_bytes is not None and (
+        not isinstance(bandwidth.max_index_bytes, int) or bandwidth.max_index_bytes < 1
+    ):
+        raise ConfigurationError(
+            "selection.entropy.bandwidth.max_index_bytes must be positive when provided"
+        )
     if tuple(sorted(set(bandwidth.k_candidates))) != tuple(bandwidth.k_candidates) or any(
         value < 1 for value in bandwidth.k_candidates
     ):

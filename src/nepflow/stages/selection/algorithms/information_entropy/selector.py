@@ -817,6 +817,10 @@ class InformationEntropySelectionAlgorithm:
                 backend=str(bandwidth.backend),
                 metric=str(bandwidth.metric),
                 chunk_size=int(bandwidth.chunk_size),
+                max_neighbour_entries=int(bandwidth.max_neighbour_entries),
+                max_index_bytes=(
+                    None if bandwidth.max_index_bytes is None else int(bandwidth.max_index_bytes)
+                ),
             )
         return EntropyBandwidthSettings()
 

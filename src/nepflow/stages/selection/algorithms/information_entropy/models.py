@@ -10,6 +10,9 @@ import numpy as np
 
 NEIGHBOUR_BACKEND_ID = "exact_cpu"
 NEIGHBOUR_BACKEND_VERSION = "exact-cpu-v1"
+INDEXED_NEIGHBOUR_BACKEND_ID = "exact_indexed_cpu"
+INDEXED_NEIGHBOUR_BACKEND_VERSION = "exact-indexed-cpu-v1"
+DEFAULT_NEIGHBOUR_BACKEND_ID = INDEXED_NEIGHBOUR_BACKEND_ID
 NEIGHBOUR_METRIC = "euclidean"
 NEIGHBOUR_DISTINCT_POLICY = "exact-coordinate-location-v1"
 BANDWIDTH_SCHEMA_VERSION = "entropy-bandwidth-v1"
@@ -70,15 +73,17 @@ class EntropyBandwidthSettings:
     c: float | None = None
     k_candidates: tuple[int, ...] = (1, 2, 4, 8)
     c_candidates: tuple[float, ...] = (1.5, 2.0, 4.0, 8.0)
-    backend: str = NEIGHBOUR_BACKEND_ID
+    backend: str = DEFAULT_NEIGHBOUR_BACKEND_ID
     metric: str = NEIGHBOUR_METRIC
     chunk_size: int = 1024
+    max_neighbour_entries: int = 1_000_000
+    max_index_bytes: int | None = None
 
     def __post_init__(self) -> None:
         mode = str(self.mode).strip().lower()
         if mode not in {"manual", "automatic"}:
             raise ValueError("bandwidth mode must be 'manual' or 'automatic'")
-        if self.backend != NEIGHBOUR_BACKEND_ID:
+        if self.backend not in {NEIGHBOUR_BACKEND_ID, INDEXED_NEIGHBOUR_BACKEND_ID}:
             raise ValueError(f"unsupported neighbour backend: {self.backend!r}")
         if self.metric != NEIGHBOUR_METRIC:
             raise ValueError(f"unsupported neighbour metric: {self.metric!r}")
@@ -86,6 +91,18 @@ class EntropyBandwidthSettings:
             raise ValueError("chunk_size must be a positive integer")
         if self.chunk_size < 1:
             raise ValueError("chunk_size must be a positive integer")
+        if (
+            isinstance(self.max_neighbour_entries, bool)
+            or not isinstance(self.max_neighbour_entries, (int, np.integer))
+            or int(self.max_neighbour_entries) < 1
+        ):
+            raise ValueError("max_neighbour_entries must be a positive integer")
+        if self.max_index_bytes is not None and (
+            isinstance(self.max_index_bytes, bool)
+            or not isinstance(self.max_index_bytes, (int, np.integer))
+            or int(self.max_index_bytes) < 1
+        ):
+            raise ValueError("max_index_bytes must be a positive integer when provided")
         k_candidates = _validate_ordered_integer_domain(self.k_candidates, "k_candidates")
         c_candidates = _validate_ordered_float_domain(self.c_candidates, "c_candidates")
         if mode == "manual":
@@ -99,6 +116,9 @@ class EntropyBandwidthSettings:
         object.__setattr__(self, "k_candidates", k_candidates)
         object.__setattr__(self, "c_candidates", c_candidates)
         object.__setattr__(self, "chunk_size", int(self.chunk_size))
+        object.__setattr__(self, "max_neighbour_entries", int(self.max_neighbour_entries))
+        if self.max_index_bytes is not None:
+            object.__setattr__(self, "max_index_bytes", int(self.max_index_bytes))
 
 
 def _validate_positive_integer(value: Any, name: str) -> int:
@@ -208,6 +228,8 @@ class FrozenBandwidths:
     backend: str = NEIGHBOUR_BACKEND_ID
     metric: str = NEIGHBOUR_METRIC
     schema_version: str = BANDWIDTH_SCHEMA_VERSION
+    backend_version: str = NEIGHBOUR_BACKEND_VERSION
+    backend_fingerprint: str = ""
 
     @property
     def h(self) -> np.ndarray:
@@ -224,6 +246,18 @@ class FrozenBandwidths:
         _validate_positive_float(self.c, "c")
         if not self.neighbour_fingerprint or not self.pool_fingerprint:
             raise ValueError("bandwidth identities must not be blank")
+        expected_backend_version = (
+            INDEXED_NEIGHBOUR_BACKEND_VERSION
+            if self.backend == INDEXED_NEIGHBOUR_BACKEND_ID
+            else NEIGHBOUR_BACKEND_VERSION
+        )
+        if self.backend not in {NEIGHBOUR_BACKEND_ID, INDEXED_NEIGHBOUR_BACKEND_ID}:
+            raise ValueError(f"unsupported neighbour backend: {self.backend!r}")
+        if self.backend_version != expected_backend_version:
+            raise ValueError(
+                "bandwidth backend version does not match its configured backend: "
+                f"{self.backend!r} requires {expected_backend_version!r}"
+            )
         object.__setattr__(self, "radii", radii)
         object.__setattr__(self, "bandwidths", bandwidths)
         object.__setattr__(self, "k", int(self.k))
@@ -259,6 +293,9 @@ class BandwidthCalibrationResult:
     pool_fingerprint: str
     calibration_fingerprint: str
     loo_probabilities: np.ndarray | None = None
+    backend: str = NEIGHBOUR_BACKEND_ID
+    backend_version: str = NEIGHBOUR_BACKEND_VERSION
+    backend_fingerprint: str = ""
 
     @property
     def k(self) -> int:
@@ -299,6 +336,14 @@ class BandwidthCalibrationResult:
             raise ValueError("calibration mode must be manual or automatic")
         if self.evaluation_count != len(self.attempts):
             raise ValueError("evaluation_count must equal the number of attempts")
+        if self.pool_fingerprint != self.selected.pool_fingerprint:
+            raise ValueError("calibration pool identity must match selected bandwidths")
+        if (
+            self.backend != self.selected.backend
+            or self.backend_version != self.selected.backend_version
+            or self.backend_fingerprint != self.selected.backend_fingerprint
+        ):
+            raise ValueError("calibration backend identity must match selected bandwidths")
         if self.loo_probabilities is not None:
             values = np.array(self.loo_probabilities, dtype=np.float64, copy=True)
             if values.ndim != 1 or not np.all(np.isfinite(values)) or np.any(values <= 0.0):
@@ -1338,6 +1383,9 @@ __all__ = [
     "KERNEL_VERSION",
     "NEIGHBOUR_BACKEND_ID",
     "NEIGHBOUR_BACKEND_VERSION",
+    "INDEXED_NEIGHBOUR_BACKEND_ID",
+    "INDEXED_NEIGHBOUR_BACKEND_VERSION",
+    "DEFAULT_NEIGHBOUR_BACKEND_ID",
     "NEIGHBOUR_DISTINCT_POLICY",
     "NEIGHBOUR_METRIC",
     "SPARSE_CANDIDATE_CONTRIBUTION_SCHEMA_VERSION",

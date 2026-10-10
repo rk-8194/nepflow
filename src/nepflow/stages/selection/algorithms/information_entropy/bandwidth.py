@@ -20,15 +20,21 @@ from .models import (
     BANDWIDTH_SCHEMA_VERSION,
     CALIBRATION_OPTIMIZER_ID,
     CALIBRATION_OPTIMIZER_VERSION,
+    DEFAULT_NEIGHBOUR_BACKEND_ID,
     KERNEL_FAMILY,
     KERNEL_VERSION,
+    NEIGHBOUR_METRIC,
     BandwidthCalibrationResult,
     CalibrationAttempt,
     EntropyBandwidthSettings,
     EntropyPool,
     FrozenBandwidths,
 )
-from .neighbours import ExactNeighbourResult, compute_exact_neighbours
+from .neighbours import (
+    ExactNeighbourResult,
+    build_neighbour_index,
+    compute_neighbours,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -319,6 +325,8 @@ def _freeze_from_neighbours(
         "transform": pool.transform_fingerprint,
         "neighbour": neighbours.fingerprint,
         "backend": neighbours.backend,
+        "backend_version": neighbours.backend_version,
+        "backend_fingerprint": neighbours.backend_fingerprint,
         "metric": neighbours.metric,
         "k": neighbours.k,
         "c": scale,
@@ -334,6 +342,8 @@ def _freeze_from_neighbours(
         fingerprint=sha256_canonical_json(identity),
         backend=neighbours.backend,
         metric=neighbours.metric,
+        backend_version=neighbours.backend_version,
+        backend_fingerprint=neighbours.backend_fingerprint,
     )
 
 
@@ -348,6 +358,9 @@ def calculate_frozen_bandwidths(
     transform_fingerprint: str | None = None,
     representation_fingerprint: str | None = None,
     chunk_size: int = 1024,
+    backend: str = DEFAULT_NEIGHBOUR_BACKEND_ID,
+    max_neighbour_entries: int = 1_000_000,
+    max_index_bytes: int | None = None,
 ) -> FrozenBandwidths:
     """Calculate and freeze exact full-pool ``r_k`` and ``h=c*r_k``."""
 
@@ -363,9 +376,17 @@ def calculate_frozen_bandwidths(
             representation_fingerprint=representation_fingerprint,
         )
     )
-    neighbours = compute_exact_neighbours(
+    index = build_neighbour_index(
+        pool.descriptors,
+        backend=backend,
+        max_index_bytes=max_index_bytes,
+    )
+    neighbours = compute_neighbours(
         pool.descriptors,
         k,
+        backend=backend,
+        index=index,
+        max_neighbour_entries=max_neighbour_entries,
         chunk_size=chunk_size,
         representation_fingerprint=pool.representation_fingerprint,
         row_ids=_pool_row_ids(pool),
@@ -390,6 +411,8 @@ def _settings_from_arguments(
     backend: str,
     metric: str,
     chunk_size: int,
+    max_neighbour_entries: int,
+    max_index_bytes: int | None,
 ) -> EntropyBandwidthSettings:
     if settings is not None:
         if any(value is not None for value in (mode, k, c, k_candidates, c_candidates)):
@@ -406,6 +429,8 @@ def _settings_from_arguments(
             backend=backend,
             metric=metric,
             chunk_size=chunk_size,
+            max_neighbour_entries=max_neighbour_entries,
+            max_index_bytes=max_index_bytes,
         )
     return EntropyBandwidthSettings(
         mode=selected_mode,
@@ -414,6 +439,8 @@ def _settings_from_arguments(
         backend=backend,
         metric=metric,
         chunk_size=chunk_size,
+        max_neighbour_entries=max_neighbour_entries,
+        max_index_bytes=max_index_bytes,
     )
 
 
@@ -442,9 +469,11 @@ def calibrate_bandwidth(
     c: float | None = None,
     k_candidates: Sequence[int] | None = None,
     c_candidates: Sequence[float] | None = None,
-    backend: str = "exact_cpu",
-    metric: str = "euclidean",
+    backend: str = DEFAULT_NEIGHBOUR_BACKEND_ID,
+    metric: str = NEIGHBOUR_METRIC,
     chunk_size: int = 1024,
+    max_neighbour_entries: int = 1_000_000,
+    max_index_bytes: int | None = None,
 ) -> BandwidthCalibrationResult:
     """Run deterministic manual or bounded-grid finite-pool calibration."""
 
@@ -470,9 +499,17 @@ def calibrate_bandwidth(
         backend=backend,
         metric=metric,
         chunk_size=chunk_size,
+        max_neighbour_entries=max_neighbour_entries,
+        max_index_bytes=max_index_bytes,
     )
     if pool.descriptors.shape[0] < 2:
         raise BandwidthCalibrationError("leave-one-out calibration requires at least two rows")
+
+    index = build_neighbour_index(
+        pool.descriptors,
+        backend=selected_settings.backend,
+        max_index_bytes=selected_settings.max_index_bytes,
+    )
 
     if selected_settings.mode == "manual":
         if selected_settings.k is None or selected_settings.c is None:
@@ -589,10 +626,13 @@ def calibrate_bandwidth(
         try:
             neighbours = radii_by_k.get(candidate_k)
             if neighbours is None:
-                neighbours = compute_exact_neighbours(
+                neighbours = compute_neighbours(
                     pool.descriptors,
                     candidate_k,
+                    backend=selected_settings.backend,
+                    index=index,
                     chunk_size=selected_settings.chunk_size,
+                    max_neighbour_entries=selected_settings.max_neighbour_entries,
                     representation_fingerprint=pool.representation_fingerprint,
                     row_ids=_pool_row_ids(pool),
                 )
@@ -617,6 +657,8 @@ def calibrate_bandwidth(
                     frozen.bandwidths,
                     chunk_size=selected_settings.chunk_size,
                     progress_callback=source_progress_logger(candidate_k, float(candidate_c)),
+                    backend=selected_settings.backend,
+                    index=index,
                 )
                 if not objective.valid or objective.objective is None:
                     record_attempt(
@@ -699,6 +741,9 @@ def calibrate_bandwidth(
         "row_candidate_indices": pool.row_candidate_indices.tolist(),
         "probabilities": pool.probabilities.tolist(),
         "transform": pool.transform_fingerprint,
+        "neighbour_backend": selected_settings.backend,
+        "neighbour_backend_version": selected_bandwidths.backend_version,
+        "neighbour_backend_fingerprint": selected_bandwidths.backend_fingerprint,
         "kernel_family": KERNEL_FAMILY,
         "kernel_version": KERNEL_VERSION,
         "normalization": "source-column-all-targets-including-self",
@@ -738,6 +783,9 @@ def calibrate_bandwidth(
         pool_fingerprint=pool.fingerprint,
         calibration_fingerprint=sha256_canonical_json(calibration_payload),
         loo_probabilities=loo_probabilities,
+        backend=selected_bandwidths.backend,
+        backend_version=selected_bandwidths.backend_version,
+        backend_fingerprint=selected_bandwidths.backend_fingerprint,
     )
 
 

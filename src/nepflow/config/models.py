@@ -333,9 +333,11 @@ class EntropyBandwidthConfig:
     c: float | None = None
     k_candidates: tuple[int, ...] = (1, 2, 4, 8)
     c_candidates: tuple[float, ...] = (1.5, 2.0, 4.0, 8.0)
-    backend: str = "exact_cpu"
+    backend: str = "exact_indexed_cpu"
     metric: str = "euclidean"
     chunk_size: int = 1024
+    max_neighbour_entries: int = 1_000_000
+    max_index_bytes: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
