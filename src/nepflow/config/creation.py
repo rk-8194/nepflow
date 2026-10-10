@@ -303,6 +303,31 @@ local_magnetic_mode=structural
 local_descriptor_workers=0
 background_mass=1e-12
 
+# Information-entropy training selector (inactive when algorithm=fps)
+entropy_beta=1.0
+entropy_optimizer_method=lazy_greedy
+entropy_local_cutoff=5.0
+entropy_local_radial_bins=8
+entropy_local_angular_bins=8
+entropy_local_radial_sigma=
+entropy_local_angular_sigma=
+entropy_local_species=
+entropy_whitening_tolerance=1e-12
+entropy_whitening_regularization=1e-12
+entropy_whitening_singular_policy=regularize
+entropy_bandwidth_mode=automatic
+entropy_bandwidth_k=
+entropy_bandwidth_c=
+entropy_bandwidth_k_candidates=1,2,4,8
+entropy_bandwidth_c_candidates=1.5,2.0,4.0,8.0
+entropy_bandwidth_backend=exact_cpu
+entropy_bandwidth_metric=euclidean
+entropy_bandwidth_chunk_size=1024
+entropy_max_edges=1000000
+entropy_max_graph_bytes=
+entropy_max_entries=1000000
+entropy_max_contribution_bytes=
+
 [vasp]
 enabled=true
 

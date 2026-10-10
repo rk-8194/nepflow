@@ -1,10 +1,4 @@
-"""Deterministic complete-candidate information-entropy selection.
-
-The direct ``full_greedy`` and ``lazy_greedy`` entry points in this module own
-Phase 7's sparse objective orchestration.  ``InformationEntropySelectionAlgorithm``
-below remains the provisional stage-facing dense implementation until the
-explicit stage integration work in #135.
-"""
+"""Deterministic complete-candidate information-entropy selection."""
 
 from __future__ import annotations
 
@@ -21,14 +15,16 @@ import numpy as np
 from nepflow.stages.selection.representations import LocalEnvironmentRepresentation
 
 from ..base import SelectionAlgorithmRequest, SelectionAlgorithmResult
+from .bandwidth import build_entropy_pool, calibrate_bandwidth
+from .kernels import aggregate_candidate_contributions, build_sparse_atomic_kernel_graph
 from .models import (
+    EntropyBandwidthSettings,
     EntropyObjectiveState,
     EntropyPool,
     EntropySelectionHistory,
     EntropySelectionPerformance,
     EntropySelectionResult,
     EntropySelectionStep,
-    InformationEntropyConfig,
     SparseCandidateContributions,
 )
 from .objective import (
@@ -787,38 +783,48 @@ select_lazy_greedy = lazy_greedy
 
 
 class InformationEntropySelectionAlgorithm:
-    """Provisional stage-facing dense selector; not the Phase 7 optimizer.
+    """Registry adapter for the single production sparse entropy pipeline.
 
-    The local representation is supplied through the request options.  The
-    algorithm acquires complete candidates; local rows are only the reference
-    population used to calculate the objective.
+    Representation calculation remains owned by ``SelectionStage``.  This
+    adapter owns the remaining finite-pool scientific sequence and delegates
+    greedy acquisition to the same public ``lazy_greedy``/``full_greedy``
+    implementations used by the reference tests.
     """
 
     algorithm_id = "information_entropy"
-    algorithm_version = "information-entropy-v1"
+    algorithm_version = "information-entropy-wendland-v1"
 
     @staticmethod
-    def _configuration(options: Mapping[str, Any]) -> InformationEntropyConfig:
-        config = options.get("information_entropy_config")
-        if isinstance(config, InformationEntropyConfig):
-            return config
-        if isinstance(config, Mapping):
-            return InformationEntropyConfig(**dict(config))
-        return InformationEntropyConfig(
-            background_mass=float(options.get("background_mass", 1.0e-12)),
-            kernel_scale=float(options.get("kernel_scale", 1.0)),
-        )
-
-    @staticmethod
-    def _local_rows(request: SelectionAlgorithmRequest) -> tuple[np.ndarray, tuple[int, ...]]:
-        local = request.options.get("local_representation")
-        if not isinstance(local, LocalEnvironmentRepresentation):
-            raise ValueError(
-                "information-entropy selection requires a local environment representation"
+    def _bandwidth_settings(options: Mapping[str, Any]) -> EntropyBandwidthSettings:
+        supplied = options.get("entropy_bandwidth")
+        if isinstance(supplied, EntropyBandwidthSettings):
+            return supplied
+        if supplied is not None:
+            if not isinstance(supplied, Mapping):
+                raise TypeError("entropy_bandwidth must be EntropyBandwidthSettings or a mapping")
+            return EntropyBandwidthSettings(**dict(supplied))
+        entropy = options.get("entropy_config")
+        bandwidth = getattr(entropy, "bandwidth", None)
+        if isinstance(bandwidth, EntropyBandwidthSettings):
+            return bandwidth
+        if bandwidth is not None:
+            return EntropyBandwidthSettings(
+                mode=str(bandwidth.mode),
+                k=bandwidth.k,
+                c=bandwidth.c,
+                k_candidates=tuple(bandwidth.k_candidates),
+                c_candidates=tuple(bandwidth.c_candidates),
+                backend=str(bandwidth.backend),
+                metric=str(bandwidth.metric),
+                chunk_size=int(bandwidth.chunk_size),
             )
-        row_values = np.asarray(local.descriptors, dtype=np.float64)
-        row_candidates = tuple(request.candidate_ids.index(row.candidate_id) for row in local.rows)
-        return row_values, row_candidates
+        return EntropyBandwidthSettings()
+
+    @staticmethod
+    def _entropy_value(options: Mapping[str, Any], name: str, default: Any) -> Any:
+        entropy = options.get("entropy_config")
+        value = getattr(entropy, name, default)
+        return options.get(name, value)
 
     def select(self, request: SelectionAlgorithmRequest) -> SelectionAlgorithmResult:
         if request.algorithm_id != self.algorithm_id:
@@ -826,81 +832,81 @@ class InformationEntropySelectionAlgorithm:
                 f"Request algorithm {request.algorithm_id!r} does not match information entropy"
             )
         candidate_count = len(request.candidate_ids)
-        anchors = tuple(sorted(set(request.anchor_indices)))
-        if len(anchors) > request.target_count:
+        if request.target_count > candidate_count:
+            raise ValueError(
+                "information-entropy target_train_count exceeds available candidates: "
+                f"requested K={request.target_count}, available M={candidate_count}"
+            )
+        anchors = tuple(request.anchor_ids)
+        if len(set(anchors)) > request.target_count:
             raise ValueError("anchor count exceeds information-entropy target count")
-        if candidate_count == 0:
-            return SelectionAlgorithmResult(
-                self.algorithm_id,
-                self.algorithm_version,
-                (),
-                (),
+        local = request.options.get("local_representation")
+        if not isinstance(local, LocalEnvironmentRepresentation):
+            raise ValueError(
+                "information-entropy selection requires a local environment representation"
             )
-        if request.target_count >= candidate_count:
-            selected = tuple(range(candidate_count))
-            return SelectionAlgorithmResult(
-                self.algorithm_id,
-                self.algorithm_version,
-                selected,
-                tuple(request.candidate_ids[index] for index in selected),
-            )
-
-        config = self._configuration(request.options)
-        rows, row_candidates = self._local_rows(request)
-        if rows.ndim != 2 or rows.shape[0] == 0 or not np.all(np.isfinite(rows)):
-            raise ValueError("information-entropy local rows must be finite and non-empty")
-        row_counts = np.bincount(row_candidates, minlength=candidate_count).astype(np.float64)
-        if np.any(row_counts == 0.0):
-            raise ValueError("every candidate must own at least one local environment")
-        target_weights = np.asarray(
-            [1.0 / (candidate_count * row_counts[candidate]) for candidate in row_candidates],
-            dtype=np.float64,
+        pool = build_entropy_pool(local)
+        if tuple(pool.candidate_ids) != request.candidate_ids:
+            raise ValueError("local representation candidate order does not match selection input")
+        bandwidth_settings = self._bandwidth_settings(request.options)
+        calibration = calibrate_bandwidth(pool, bandwidth_settings)
+        logger = LOGGER
+        logger.info(
+            "Entropy bandwidth calibrated: k=%d, c=%.17g, LOO objective=%s",
+            calibration.selected.k,
+            calibration.selected.c,
+            calibration.objective if calibration.objective is not None else "n/a",
         )
-        distances = np.sum((rows[:, None, :] - rows[None, :, :]) ** 2, axis=2)
-        similarities = np.exp(-distances / (2.0 * config.kernel_scale**2))
-        candidate_kernels = np.empty((candidate_count, rows.shape[0]), dtype=np.float64)
-        for candidate in range(candidate_count):
-            source = np.flatnonzero(np.asarray(row_candidates) == candidate)
-            kernel = np.mean(similarities[:, source], axis=1)
-            normalization = float(np.sum(kernel * target_weights))
-            candidate_kernels[candidate] = kernel / max(normalization, config.background_mass)
-
-        support = np.full(rows.shape[0], config.background_mass, dtype=np.float64)
-        selected = list(anchors)
-        for candidate in anchors:
-            support += candidate_kernels[candidate]
-        remaining = set(range(candidate_count)) - set(selected)
-        objective_history: list[float] = [float(np.sum(target_weights * np.log(support)))]
-        while len(selected) < request.target_count and remaining:
-            best_candidate = min(remaining, key=lambda index: request.candidate_ids[index])
-            best_gain = -np.inf
-            best_objective = -np.inf
-            for candidate in sorted(remaining, key=lambda index: request.candidate_ids[index]):
-                trial_support = support + candidate_kernels[candidate]
-                objective = float(np.sum(target_weights * np.log(trial_support)))
-                gain = objective - objective_history[-1]
-                if gain > best_gain:
-                    best_candidate = candidate
-                    best_gain = gain
-                    best_objective = objective
-            selected.append(best_candidate)
-            remaining.remove(best_candidate)
-            support += candidate_kernels[best_candidate]
-            objective_history.append(best_objective)
-
-        selected = tuple(sorted(selected))
+        bandwidth = calibration.selected
+        graph = build_sparse_atomic_kernel_graph(
+            pool,
+            bandwidth,
+            chunk_size=bandwidth_settings.chunk_size,
+            max_edges=int(self._entropy_value(request.options, "max_edges", 1_000_000)),
+            max_graph_bytes=self._entropy_value(request.options, "max_graph_bytes", None),
+        )
+        contributions = aggregate_candidate_contributions(
+            graph,
+            max_entries=int(self._entropy_value(request.options, "max_entries", 1_000_000)),
+            max_graph_bytes=self._entropy_value(request.options, "max_contribution_bytes", None)
+            or self._entropy_value(request.options, "max_graph_bytes", None),
+        )
+        method = str(self._entropy_value(request.options, "optimizer_method", "lazy_greedy"))
+        optimizer = full_greedy if method == "full_greedy" else lazy_greedy
+        if method not in {"full_greedy", "lazy_greedy"}:
+            raise ValueError(f"unsupported information-entropy optimizer method: {method!r}")
+        supplied_provenance = request.options.get("candidate_structure_ids")
+        structure_provenance = (
+            {
+                candidate_id: str(supplied_provenance[candidate_id])
+                for candidate_id in request.candidate_ids
+            }
+            if isinstance(supplied_provenance, Mapping)
+            else None
+        )
+        entropy_result = optimizer(
+            pool,
+            contributions,
+            beta=float(self._entropy_value(request.options, "beta", 1.0)),
+            K=request.target_count,
+            anchors=anchors,
+            candidate_structure_ids=structure_provenance,
+        )
+        diagnostics = {
+            "entropy_result": entropy_result,
+            "calibration": calibration,
+            "graph": graph,
+            "contributions": contributions,
+            "pool": pool,
+        }
         return SelectionAlgorithmResult(
             algorithm_id=self.algorithm_id,
             algorithm_version=self.algorithm_version,
-            selected_indices=selected,
-            selected_candidate_ids=tuple(request.candidate_ids[index] for index in selected),
-            diagnostics=(
-                {
-                    "objective_history": tuple(objective_history),
-                    "local_row_count": int(rows.shape[0]),
-                    "background_mass": config.background_mass,
-                },
-            ),
+            selected_indices=entropy_result.selected_indices,
+            selected_candidate_ids=entropy_result.selected_candidate_ids,
+            diagnostics=(diagnostics,),
+            minimum_distance=None,
+            algorithm_result=entropy_result,
         )
 
 

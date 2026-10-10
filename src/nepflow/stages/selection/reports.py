@@ -15,6 +15,8 @@ def plot_descriptor_space(
     train_indices: list[int],
     test_indices: list[int],
     output_path: Path,
+    *,
+    descriptor_label: str = "descriptor",
 ) -> None:
     """Write the accepted PCA train/test/unselected descriptor plot."""
 
@@ -61,7 +63,7 @@ def plot_descriptor_space(
     variance = pca.explained_variance_ratio_
     ax.set_xlabel(f"PC1 ({variance[0] * 100:.1f}%)")
     ax.set_ylabel(f"PC2 ({variance[1] * 100:.1f}%)")
-    ax.set_title("NEP Descriptor Space - Train/Test Selection")
+    ax.set_title(f"{descriptor_label} - Train/Test Selection")
     ax.legend()
     fig.tight_layout()
     output_path.parent.mkdir(parents=True, exist_ok=True)

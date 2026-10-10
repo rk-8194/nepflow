@@ -319,6 +319,48 @@ class MagnetismConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class EntropyBandwidthConfig:
+    """Configuration-owned representation of the entropy bandwidth profile.
+
+    The selection implementation converts this small configuration record to
+    ``EntropyBandwidthSettings`` at the stage boundary.  Keeping the config
+    model independent of the stage package avoids a config/selection import
+    cycle while retaining the exact ``automatic``/``manual`` contract.
+    """
+
+    mode: str = "automatic"
+    k: int | None = None
+    c: float | None = None
+    k_candidates: tuple[int, ...] = (1, 2, 4, 8)
+    c_candidates: tuple[float, ...] = (1.5, 2.0, 4.0, 8.0)
+    backend: str = "exact_cpu"
+    metric: str = "euclidean"
+    chunk_size: int = 1024
+
+
+@dataclass(frozen=True, slots=True)
+class EntropySelectionConfig:
+    """Scientific settings for the potential-independent entropy selector."""
+
+    beta: float = 1.0
+    optimizer_method: str = "lazy_greedy"
+    local_cutoff: float = 5.0
+    local_radial_bins: int = 8
+    local_angular_bins: int = 8
+    local_radial_sigma: float | None = None
+    local_angular_sigma: float | None = None
+    local_species: tuple[str, ...] = ()
+    whitening_tolerance: float = 1.0e-12
+    whitening_regularization: float = 1.0e-12
+    whitening_singular_policy: str = "regularize"
+    bandwidth: EntropyBandwidthConfig = field(default_factory=EntropyBandwidthConfig)
+    max_edges: int = 1_000_000
+    max_graph_bytes: int | None = None
+    max_entries: int = 1_000_000
+    max_contribution_bytes: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class SelectionConfig:
     """Sparse selection and descriptor controls."""
 
@@ -342,6 +384,7 @@ class SelectionConfig:
     local_magnetic_mode: str = "structural"
     local_descriptor_workers: int = 0
     background_mass: float = 1.0e-12
+    entropy: EntropySelectionConfig = field(default_factory=EntropySelectionConfig)
 
 
 @dataclass(frozen=True, slots=True)

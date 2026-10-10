@@ -30,6 +30,10 @@ def write_selected_structures(
     test_indices: list[int],
     candidate_ids: list[str] | None = None,
     structure_ids: list[str] | None = None,
+    *,
+    algorithm_id: str = "fps",
+    train_anchor_indices: list[int] | None = None,
+    train_acquisition_order: list[str] | None = None,
 ) -> tuple[Path, Path]:
     """Write selected train/test structures using the established paths."""
 
@@ -100,6 +104,12 @@ def write_selected_structures(
                 "test_candidate_ids": [all_candidate_ids[index] for index in test_indices],
                 "train_structure_ids": [all_structure_ids[index] for index in train_indices],
                 "test_structure_ids": [all_structure_ids[index] for index in test_indices],
+                "algorithm_id": algorithm_id,
+                "train_anchor_count": len(set(train_anchor_indices or [])),
+                "train_anchor_candidate_ids": [
+                    all_candidate_ids[index] for index in sorted(set(train_anchor_indices or []))
+                ],
+                "train_acquisition_order": list(train_acquisition_order or []),
                 "artifacts": {
                     "train.xyz": {
                         "path": "train.xyz",

@@ -92,7 +92,29 @@ def _validate_id_sequence(values: Sequence[str], *, label: str, unique: bool = F
 def selection_policy(settings: SelectionConfig) -> dict[str, Any]:
     """Serialize the complete typed selection policy used for a run."""
 
-    return to_jsonable(asdict(settings))
+    values = asdict(settings)
+    if settings.algorithm == "information_entropy":
+        # These settings belong to the independent NEP/FPS peer or are purely
+        # operational for entropy.  They must not invalidate a scientific
+        # entropy run when changed without changing its values.
+        for name in (
+            "nep_model_file",
+            "composition_aware_fps",
+            "composition_aware_fps_frontier_fraction",
+            "composition_aware_fps_ternary_weight",
+            "composition_aware_fps_adaptive_retries",
+            "composition_aware_fps_descriptor_floor_fraction",
+            "batch_size",
+            "local_descriptor_workers",
+            "background_mass",
+        ):
+            values.pop(name, None)
+        entropy_values = values.get("entropy")
+        if isinstance(entropy_values, dict):
+            entropy_values.pop("bandwidth", {}).pop("chunk_size", None)
+    elif settings.algorithm == "fps":
+        values.pop("entropy", None)
+    return to_jsonable(values)
 
 
 def candidate_set_fingerprint(candidate_ids: Sequence[str]) -> str:
@@ -151,7 +173,9 @@ def legacy_selection_run_id(
     return _selection_run_id(LEGACY_SELECTION_RUN_SCHEMA, project_id, candidate_ids, settings)
 
 
-def _persistable_number(value: float) -> float | None:
+def _persistable_number(value: float | None) -> float | None:
+    if value is None:
+        return None
     return float(value) if math.isfinite(float(value)) else None
 
 
@@ -188,13 +212,51 @@ def selection_parameters(
         "train_seed_count": result.train_seed_count,
         "train_single_element_elastic_count": result.train_single_element_elastic_count,
         "train_elastic_count": result.train_elastic_count,
+        "train_min_dist_applicable": result.train_min_dist_applicable,
+        "train_fps_count_applicable": result.train_fps_count_applicable,
     }
+    entropy_record: dict[str, Any] | None = None
+    if result.algorithm_id == "information_entropy":
+        entropy_record = {
+            "algorithm_id": result.algorithm_id,
+            "algorithm_version": result.algorithm_version,
+            "optimizer_method": result.train_entropy_provenance.get("greedy_method", "lazy_greedy"),
+            "optimizer_version": result.train_entropy_provenance.get(
+                "greedy_method_version", result.algorithm_version
+            ),
+            "beta": result.train_entropy_provenance.get("beta"),
+            "selected_bandwidth": {
+                "k": result.train_entropy_provenance.get("selected_k"),
+                "c": result.train_entropy_provenance.get("selected_c"),
+            },
+            "calibration_fingerprint": result.train_entropy_provenance.get(
+                "calibration_fingerprint"
+            ),
+            "transform_fingerprint": result.train_entropy_provenance.get("transform_fingerprint"),
+            "representation_fingerprint": result.train_entropy_provenance.get(
+                "representation_fingerprint"
+            ),
+            "budget": len(result.train_indices),
+            "acquisition_order": list(result.train_acquisition_order),
+            "objective": result.train_entropy_objective,
+            "cross_entropy": result.train_entropy_cross_entropy,
+            "forward_kl": result.train_entropy_forward_kl,
+            "pool_fingerprint": result.train_entropy_pool_fingerprint,
+            "graph_fingerprint": result.train_entropy_graph_fingerprint,
+            "contributions_fingerprint": result.train_entropy_contributions_fingerprint,
+            "state_fingerprint": result.train_entropy_state_fingerprint,
+            "history": result.train_entropy_history,
+            "provenance": to_jsonable(result.train_entropy_provenance),
+        }
     return {
         "schema_version": SELECTION_RUN_SCHEMA,
         "candidate_set_fingerprint": candidate_set_fingerprint(ordered_candidate_ids),
         "candidate_ids": ordered_candidate_ids,
         "candidate_structure_ids": ordered_structure_ids,
         "policy": selection_policy(settings),
+        "full_configuration": to_jsonable(asdict(settings)),
+        "algorithm_id": result.algorithm_id,
+        "algorithm_version": result.algorithm_version,
         "selected_candidate_ids": {
             "train": ids(result.train_indices, ordered_candidate_ids),
             "test": ids(result.test_indices, ordered_candidate_ids),
@@ -218,6 +280,7 @@ def selection_parameters(
             "elastic": ids(result.elastic_indices, ordered_structure_ids),
         },
         "metrics": metrics,
+        "entropy": entropy_record,
         "coverage_metrics": to_jsonable(coverage_metrics or {}),
     }
 
@@ -248,7 +311,7 @@ def persist_selection_result(
         selection_run_id(project_id, candidate_ids, settings),
         project_id,
         status="completed",
-        method="composition_aware_fps" if settings.composition_aware_fps else "fps",
+        method=result.algorithm_id,
         parameters=selection_parameters(
             settings,
             candidate_ids,
@@ -296,6 +359,16 @@ def restore_selection_result(
     if schema not in {SELECTION_RUN_SCHEMA, LEGACY_SELECTION_RUN_SCHEMA}:
         raise StateError(f"Unsupported persisted selection schema: {schema!r}")
     current_candidate_ids = _validate_id_sequence(candidate_ids, label="candidate", unique=True)
+    entropy_record: Mapping[str, Any] | None = None
+    persisted_algorithm = str(parameters.get("algorithm_id", "fps" if record.get("method") else ""))
+    if persisted_algorithm == "information_entropy":
+        entropy_record = parameters.get("entropy")
+        if not isinstance(entropy_record, Mapping):
+            raise StateError(
+                "Persisted information-entropy record is not a sparse entropy selection"
+            )
+    elif record.get("method") == "information_entropy":
+        raise StateError("Persisted information-entropy record has no algorithm identity")
     current_structure_ids = (
         None
         if candidate_structure_ids is None
@@ -326,6 +399,13 @@ def restore_selection_result(
     )
     if sorted(persisted_candidates) != sorted(current_candidate_ids):
         raise StateError("Persisted selection candidate identity does not match current input")
+    if (
+        persisted_algorithm == "information_entropy"
+        and persisted_candidates != current_candidate_ids
+    ):
+        raise StateError(
+            "Persisted entropy selection requires the original ordered candidate mapping"
+        )
     persisted_structures = parameters.get("candidate_structure_ids")
     if persisted_structures is None:
         persisted_structures = persisted_candidates
@@ -416,14 +496,29 @@ def restore_selection_result(
         "elastic anchor",
     )
 
-    def metric(name: str, default: float) -> float:
+    def metric(name: str, default: float | None) -> float | None:
         value = metrics.get(name)
         return default if value is None else float(value)
+
+    entropy_values: Mapping[str, Any] = (
+        entropy_record if persisted_algorithm == "information_entropy" and entropy_record else {}
+    )
+    acquisition_order = entropy_values.get("acquisition_order", ())
+    if not isinstance(acquisition_order, list):
+        acquisition_order = []
+    history = entropy_values.get("history", [])
+    if not isinstance(history, list):
+        history = []
+    provenance = entropy_values.get("provenance", {})
+    if not isinstance(provenance, Mapping):
+        provenance = {}
 
     return SelectionResult(
         descriptors=descriptors,
         train_indices=train_indices,
-        train_min_dist=metric("train_min_dist", 0.0),
+        train_min_dist=metric(
+            "train_min_dist", None if persisted_algorithm == "information_entropy" else 0.0
+        ),
         train_seed_count=int(metrics.get("train_seed_count", len(seed_indices))),
         train_single_element_elastic_count=int(
             metrics.get("train_single_element_elastic_count", len(single_indices))
@@ -436,12 +531,30 @@ def restore_selection_result(
         ),
         train_fps_count=int(metrics.get("train_fps_count", 0)),
         test_indices=test_indices,
-        test_min_dist=metric("test_min_dist", 0.0),
-        min_train_test_dist=metric("min_train_test_dist", math.inf),
-        mean_train_test_dist=metric("mean_train_test_dist", math.inf),
+        test_min_dist=float(metric("test_min_dist", 0.0) or 0.0),
+        min_train_test_dist=float(metric("min_train_test_dist", math.inf) or math.inf),
+        mean_train_test_dist=float(metric("mean_train_test_dist", math.inf) or math.inf),
         seed_indices=seed_indices,
         single_element_elastic_indices=single_indices,
         elastic_indices=elastic_indices,
+        algorithm_id=persisted_algorithm,
+        algorithm_version=str(parameters.get("algorithm_version", "selection-request-v1")),
+        train_acquisition_order=[str(value) for value in acquisition_order],
+        train_entropy_objective=entropy_values.get("objective"),
+        train_entropy_cross_entropy=entropy_values.get("cross_entropy"),
+        train_entropy_forward_kl=entropy_values.get("forward_kl"),
+        train_entropy_pool_fingerprint=entropy_values.get("pool_fingerprint"),
+        train_entropy_graph_fingerprint=entropy_values.get("graph_fingerprint"),
+        train_entropy_contributions_fingerprint=entropy_values.get("contributions_fingerprint"),
+        train_entropy_state_fingerprint=entropy_values.get("state_fingerprint"),
+        train_entropy_history=[dict(value) for value in history if isinstance(value, Mapping)],
+        train_entropy_provenance=provenance,
+        train_min_dist_applicable=bool(
+            metrics.get("train_min_dist_applicable", persisted_algorithm != "information_entropy")
+        ),
+        train_fps_count_applicable=bool(
+            metrics.get("train_fps_count_applicable", persisted_algorithm != "information_entropy")
+        ),
     )
 
 

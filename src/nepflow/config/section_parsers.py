@@ -15,6 +15,8 @@ from .models import (
     SUPPORTED_CONFIGURATIONAL_SOURCES,
     CompositionConfig,
     DftRecoveryConfig,
+    EntropyBandwidthConfig,
+    EntropySelectionConfig,
     GenerationConfig,
     HpcConfig,
     MagneticMomentSet,
@@ -644,6 +646,101 @@ def _normalise_unmapped_policy(value: str) -> str:
 def parse_selection(values: Mapping[str, str]) -> SelectionConfig:
     """Parse selection and descriptor settings."""
 
+    def value(name: str, default: str, *aliases: str) -> str:
+        for key in (name, *aliases):
+            if key in values:
+                return values[key]
+        return default
+
+    def int_domain(raw: str, name: str) -> tuple[int, ...]:
+        return tuple(_parse_int(item, name) for item in _parse_list(raw, name))
+
+    bandwidth = EntropyBandwidthConfig(
+        mode=value("entropy_bandwidth_mode", "automatic", "bandwidth_mode"),
+        k=_parse_optional_int(
+            value("entropy_bandwidth_k", "", "bandwidth_k"),
+            "selection.entropy_bandwidth_k",
+        ),
+        c=_parse_optional_float(
+            value("entropy_bandwidth_c", "", "bandwidth_c"),
+            "selection.entropy_bandwidth_c",
+        ),
+        k_candidates=int_domain(
+            value("entropy_bandwidth_k_candidates", "1,2,4,8", "k_candidates"),
+            "selection.entropy_bandwidth_k_candidates",
+        ),
+        c_candidates=_parse_float_list(
+            value("entropy_bandwidth_c_candidates", "1.5,2.0,4.0,8.0", "c_candidates"),
+            "selection.entropy_bandwidth_c_candidates",
+        ),
+        backend=value("entropy_bandwidth_backend", "exact_cpu", "neighbour_backend"),
+        metric=value("entropy_bandwidth_metric", "euclidean", "neighbour_metric"),
+        chunk_size=_parse_int(
+            value("entropy_bandwidth_chunk_size", "1024", "bandwidth_chunk_size"),
+            "selection.entropy_bandwidth_chunk_size",
+        ),
+    )
+    entropy = EntropySelectionConfig(
+        beta=_parse_float(value("entropy_beta", "1.0", "beta"), "selection.entropy_beta"),
+        optimizer_method=value("entropy_optimizer_method", "lazy_greedy", "optimizer_method")
+        .strip()
+        .lower(),
+        local_cutoff=_parse_float(
+            value("entropy_local_cutoff", "5.0", "local_cutoff"),
+            "selection.entropy_local_cutoff",
+        ),
+        local_radial_bins=_parse_int(
+            value("entropy_local_radial_bins", "8", "local_radial_bins"),
+            "selection.entropy_local_radial_bins",
+        ),
+        local_angular_bins=_parse_int(
+            value("entropy_local_angular_bins", "8", "local_angular_bins"),
+            "selection.entropy_local_angular_bins",
+        ),
+        local_radial_sigma=_parse_optional_float(
+            value("entropy_local_radial_sigma", "", "local_radial_sigma"),
+            "selection.entropy_local_radial_sigma",
+        ),
+        local_angular_sigma=_parse_optional_float(
+            value("entropy_local_angular_sigma", "", "local_angular_sigma"),
+            "selection.entropy_local_angular_sigma",
+        ),
+        local_species=_parse_list(
+            value("entropy_local_species", "", "local_species"),
+            "selection.entropy_local_species",
+        ),
+        whitening_tolerance=_parse_float(
+            value("entropy_whitening_tolerance", "1e-12", "whitening_tolerance"),
+            "selection.entropy_whitening_tolerance",
+        ),
+        whitening_regularization=_parse_float(
+            value("entropy_whitening_regularization", "1e-12", "whitening_regularization"),
+            "selection.entropy_whitening_regularization",
+        ),
+        whitening_singular_policy=value(
+            "entropy_whitening_singular_policy", "regularize", "whitening_singular_policy"
+        )
+        .strip()
+        .lower(),
+        bandwidth=bandwidth,
+        max_edges=_parse_int(
+            value("entropy_max_edges", "1000000", "max_edges"),
+            "selection.entropy_max_edges",
+        ),
+        max_graph_bytes=_parse_optional_int(
+            value("entropy_max_graph_bytes", "", "max_graph_bytes"),
+            "selection.entropy_max_graph_bytes",
+        ),
+        max_entries=_parse_int(
+            value("entropy_max_entries", "1000000", "max_entries"),
+            "selection.entropy_max_entries",
+        ),
+        max_contribution_bytes=_parse_optional_int(
+            value("entropy_max_contribution_bytes", "", "max_contribution_bytes"),
+            "selection.entropy_max_contribution_bytes",
+        ),
+    )
+
     return SelectionConfig(
         algorithm=values.get("algorithm", "information_entropy").strip().lower(),
         nep_model_file=values.get("nep_model_file", "nep89.txt").strip(),
@@ -706,6 +803,7 @@ def parse_selection(values: Mapping[str, str]) -> SelectionConfig:
         background_mass=_parse_float(
             values.get("background_mass", "1e-12"), "selection.background_mass"
         ),
+        entropy=entropy,
     )
 
 

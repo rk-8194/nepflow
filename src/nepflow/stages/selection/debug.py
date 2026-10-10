@@ -78,6 +78,8 @@ def run_debug_selection(
         seed_indices=[],
         single_element_elastic_indices=[],
         elastic_indices=[],
+        algorithm_id="debug",
+        algorithm_version="debug-selection-v1",
     )
 
 

@@ -258,6 +258,70 @@ def validate_config(
         raise ConfigurationError(
             "selection.algorithm must be one of: " + ", ".join(sorted(ALLOWED_SELECTION_ALGORITHMS))
         )
+    entropy = config.selection.entropy
+    if not math.isfinite(entropy.beta) or entropy.beta <= 0.0:
+        raise ConfigurationError("selection.entropy.beta must be finite and positive")
+    if entropy.optimizer_method not in {"lazy_greedy", "full_greedy"}:
+        raise ConfigurationError(
+            "selection.entropy.optimizer_method must be lazy_greedy or full_greedy"
+        )
+    for field_name in ("local_cutoff", "whitening_tolerance"):
+        value = getattr(entropy, field_name)
+        if not math.isfinite(value) or value <= 0.0:
+            raise ConfigurationError(f"selection.entropy.{field_name} must be finite and positive")
+    if not isinstance(entropy.local_radial_bins, int) or entropy.local_radial_bins < 1:
+        raise ConfigurationError("selection.entropy.local_radial_bins must be positive")
+    if not isinstance(entropy.local_angular_bins, int) or entropy.local_angular_bins < 1:
+        raise ConfigurationError("selection.entropy.local_angular_bins must be positive")
+    if (
+        not math.isfinite(entropy.whitening_regularization)
+        or entropy.whitening_regularization < 0.0
+    ):
+        raise ConfigurationError(
+            "selection.entropy.whitening_regularization must be finite and non-negative"
+        )
+    if entropy.whitening_singular_policy not in {"drop", "regularize", "reject"}:
+        raise ConfigurationError(
+            "selection.entropy.whitening_singular_policy must be drop, regularize, or reject"
+        )
+    for field_name in ("local_radial_sigma", "local_angular_sigma"):
+        value = getattr(entropy, field_name)
+        if value is not None and (not math.isfinite(value) or value <= 0.0):
+            raise ConfigurationError(f"selection.entropy.{field_name} must be finite and positive")
+    bandwidth = entropy.bandwidth
+    if bandwidth.mode not in {"automatic", "manual"}:
+        raise ConfigurationError("selection.entropy.bandwidth.mode must be automatic or manual")
+    if bandwidth.backend != "exact_cpu":
+        raise ConfigurationError("selection.entropy.bandwidth.backend only supports exact_cpu")
+    if bandwidth.metric != "euclidean":
+        raise ConfigurationError("selection.entropy.bandwidth.metric only supports euclidean")
+    if not isinstance(bandwidth.chunk_size, int) or bandwidth.chunk_size < 1:
+        raise ConfigurationError("selection.entropy.bandwidth.chunk_size must be positive")
+    if tuple(sorted(set(bandwidth.k_candidates))) != tuple(bandwidth.k_candidates) or any(
+        value < 1 for value in bandwidth.k_candidates
+    ):
+        raise ConfigurationError("selection.entropy.bandwidth.k_candidates must be increasing")
+    if tuple(sorted(set(bandwidth.c_candidates))) != tuple(bandwidth.c_candidates) or any(
+        value <= 0.0 or not math.isfinite(value) for value in bandwidth.c_candidates
+    ):
+        raise ConfigurationError("selection.entropy.bandwidth.c_candidates must be increasing")
+    if bandwidth.mode == "manual":
+        if bandwidth.k is None or bandwidth.k < 1:
+            raise ConfigurationError("manual entropy bandwidth requires positive k")
+        if bandwidth.c is None or not math.isfinite(bandwidth.c) or bandwidth.c <= 0.0:
+            raise ConfigurationError("manual entropy bandwidth requires positive c")
+    elif bandwidth.k is not None or bandwidth.c is not None:
+        raise ConfigurationError("automatic entropy bandwidth cannot specify manual k or c")
+    for field_name in ("max_edges", "max_entries"):
+        value = getattr(entropy, field_name)
+        if not isinstance(value, int) or value < 1:
+            raise ConfigurationError(f"selection.entropy.{field_name} must be positive")
+    for field_name in ("max_graph_bytes", "max_contribution_bytes"):
+        value = getattr(entropy, field_name)
+        if value is not None and (not isinstance(value, int) or value < 1):
+            raise ConfigurationError(f"selection.entropy.{field_name} must be positive")
+    if any(not str(species).strip() for species in entropy.local_species):
+        raise ConfigurationError("selection.entropy.local_species must not contain blanks")
     if config.selection.local_magnetic_mode not in ALLOWED_LOCAL_MAGNETIC_MODES:
         raise ConfigurationError(
             "selection.local_magnetic_mode must be one of: "

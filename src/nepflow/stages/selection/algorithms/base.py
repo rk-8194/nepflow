@@ -45,7 +45,8 @@ class SelectionAlgorithmResult:
     selected_indices: tuple[int, ...]
     selected_candidate_ids: tuple[str, ...]
     diagnostics: tuple[Mapping[str, Any], ...] = ()
-    minimum_distance: float = 0.0
+    minimum_distance: float | None = None
+    algorithm_result: Any | None = None
 
     def __post_init__(self) -> None:
         if len(self.selected_indices) != len(self.selected_candidate_ids):

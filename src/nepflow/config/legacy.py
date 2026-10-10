@@ -308,6 +308,45 @@ def _selection_values(config: NepflowConfig) -> dict[str, str]:
         "local_magnetic_mode": selection.local_magnetic_mode,
         "local_descriptor_workers": str(selection.local_descriptor_workers),
         "background_mass": str(selection.background_mass),
+        "entropy_beta": str(selection.entropy.beta),
+        "entropy_optimizer_method": selection.entropy.optimizer_method,
+        "entropy_local_cutoff": str(selection.entropy.local_cutoff),
+        "entropy_local_radial_bins": str(selection.entropy.local_radial_bins),
+        "entropy_local_angular_bins": str(selection.entropy.local_angular_bins),
+        "entropy_local_radial_sigma": ""
+        if selection.entropy.local_radial_sigma is None
+        else str(selection.entropy.local_radial_sigma),
+        "entropy_local_angular_sigma": ""
+        if selection.entropy.local_angular_sigma is None
+        else str(selection.entropy.local_angular_sigma),
+        "entropy_local_species": ",".join(selection.entropy.local_species),
+        "entropy_whitening_tolerance": str(selection.entropy.whitening_tolerance),
+        "entropy_whitening_regularization": str(selection.entropy.whitening_regularization),
+        "entropy_whitening_singular_policy": selection.entropy.whitening_singular_policy,
+        "entropy_bandwidth_mode": selection.entropy.bandwidth.mode,
+        "entropy_bandwidth_k": ""
+        if selection.entropy.bandwidth.k is None
+        else str(selection.entropy.bandwidth.k),
+        "entropy_bandwidth_c": ""
+        if selection.entropy.bandwidth.c is None
+        else str(selection.entropy.bandwidth.c),
+        "entropy_bandwidth_k_candidates": ",".join(
+            str(value) for value in selection.entropy.bandwidth.k_candidates
+        ),
+        "entropy_bandwidth_c_candidates": ",".join(
+            str(value) for value in selection.entropy.bandwidth.c_candidates
+        ),
+        "entropy_bandwidth_backend": selection.entropy.bandwidth.backend,
+        "entropy_bandwidth_metric": selection.entropy.bandwidth.metric,
+        "entropy_bandwidth_chunk_size": str(selection.entropy.bandwidth.chunk_size),
+        "entropy_max_edges": str(selection.entropy.max_edges),
+        "entropy_max_graph_bytes": ""
+        if selection.entropy.max_graph_bytes is None
+        else str(selection.entropy.max_graph_bytes),
+        "entropy_max_entries": str(selection.entropy.max_entries),
+        "entropy_max_contribution_bytes": ""
+        if selection.entropy.max_contribution_bytes is None
+        else str(selection.entropy.max_contribution_bytes),
     }
 
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -16,6 +17,7 @@ from nepflow.errors import ValidationError
 from .algorithms import (
     AlgorithmRegistry,
     SelectionAlgorithmRequest,
+    SelectionAlgorithmResult,
     dispatch_selection_algorithm,
 )
 from .sampling import (
@@ -24,6 +26,21 @@ from .sampling import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class TrainingSelection:
+    """Algorithm-neutral training selection with the typed algorithm result."""
+
+    indices: list[int]
+    minimum_distance: float | None
+    algorithm_result: SelectionAlgorithmResult
+
+    def __iter__(self):
+        """Retain the historic ``indices, minimum_distance`` unpacking API."""
+
+        yield self.indices
+        yield self.minimum_distance
 
 
 def setting(settings: SelectionConfig | Mapping[str, Any], name: str) -> Any:
@@ -89,6 +106,7 @@ def _algorithm_options(
         "target_tolerance": _setting_or_default(settings, "target_tolerance", 50),
         "local_representation": local_representation,
         "background_mass": _setting_or_default(settings, "background_mass", 1.0e-12),
+        "entropy_config": getattr(settings, "entropy", None),
     }
 
 
@@ -105,7 +123,8 @@ def select_training_set(
     algorithm_id: str = "information_entropy",
     algorithm_registry: AlgorithmRegistry | None = None,
     local_representation: Any | None = None,
-) -> tuple[list[int], float]:
+    candidate_structure_ids: Sequence[str] | None = None,
+) -> TrainingSelection:
     """Dispatch one training-selection algorithm with mandatory anchors."""
 
     logger.info("")
@@ -157,6 +176,12 @@ def select_training_set(
         composition_aware=composition_aware,
         local_representation=local_representation,
     )
+    if candidate_structure_ids is not None:
+        if len(candidate_structure_ids) != len(ordered_candidate_ids):
+            raise ValueError("candidate structure IDs must match the candidate count")
+        options["candidate_structure_ids"] = dict(
+            zip(ordered_candidate_ids, map(str, candidate_structure_ids))
+        )
     request = SelectionAlgorithmRequest(
         candidate_ids=ordered_candidate_ids,
         candidate_structures=structures,
@@ -171,13 +196,19 @@ def select_training_set(
     result = dispatch_selection_algorithm(request, registry=algorithm_registry)
     selected = list(result.selected_indices)
     minimum = result.minimum_distance
-
-    logger.info(
-        "  Training set: %d structures (min_distance=%.6f)",
-        len(selected),
-        minimum,
-    )
-    return selected, minimum
+    if minimum is None:
+        logger.info(
+            "  Training set: %d structures (%s; entropy objective diagnostics recorded)",
+            len(selected),
+            algorithm_id,
+        )
+    else:
+        logger.info(
+            "  Training set: %d structures (min_distance=%.6f)",
+            len(selected),
+            minimum,
+        )
+    return TrainingSelection(selected, minimum, result)
 
 
 def select_plain_fps_training_set(
@@ -203,6 +234,8 @@ def select_plain_fps_training_set(
         options=_algorithm_options(settings),
     )
     result = dispatch_selection_algorithm(request)
+    if result.minimum_distance is None:
+        raise ValueError("FPS selection did not provide a minimum distance")
     return [remaining_indices[index] for index in result.selected_indices], result.minimum_distance
 
 
@@ -236,6 +269,8 @@ def select_composition_aware_training_set(
         options=options,
     )
     result = dispatch_selection_algorithm(request)
+    if result.minimum_distance is None:
+        raise ValueError("FPS selection did not provide a minimum distance")
     return list(result.selected_indices), result.minimum_distance
 
 
@@ -453,6 +488,7 @@ def find_single_element_elastic_stress_indices(reference_ase: list) -> list[int]
 
 
 __all__ = [
+    "TrainingSelection",
     "find_elastic_stress_indices",
     "find_single_element_elastic_stress_indices",
     "is_elastic_stress",

@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import logging
+import math
 import time
+from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -15,6 +17,7 @@ from nepflow.config.models import NepflowConfig, SelectionConfig
 from nepflow.errors import StateError
 from nepflow.workflow.controller import StageContext
 
+from .algorithms.information_entropy import EntropyBandwidthSettings, build_entropy_pool
 from .artifacts import write_selected_structures
 from .debug import run_debug_selection
 from .models import SelectionResult
@@ -37,6 +40,7 @@ from .representations import (
 )
 from .sampling import calculate_composition_coverage_metrics, composition_projection_bins
 from .strategy import (
+    TrainingSelection,
     find_elastic_stress_indices,
     find_single_element_elastic_stress_indices,
     resolve_seed_indices,
@@ -211,13 +215,91 @@ class SelectionStage:
         )
         candidate_identity_ids = ordered_candidate_ids(prepared["ase_structures"])
         physical_structure_ids = ordered_structure_ids(prepared["ase_structures"])
+        candidate_count = len(candidate_identity_ids)
+        if settings.algorithm == "information_entropy" and settings.target_train_count == 0:
+            raise ValueError(
+                "information-entropy production selection does not permit an empty training set; "
+                "K=0 is only a mathematical optimizer no-op"
+            )
+        if (
+            settings.algorithm == "information_entropy"
+            and settings.target_train_count > candidate_count
+        ):
+            raise ValueError(
+                "information-entropy target_train_count exceeds available candidates: "
+                f"requested K={settings.target_train_count}, available M={candidate_count}"
+            )
+
+        seed_indices: list[int] = []
+        if settings.include_seed_structures:
+            seed_indices = resolve_seed_indices(project_dir, prepared["ase_structures"])
+            logger.info("  Seed anchors enabled: %d structures", len(seed_indices))
+        single_element_elastic_indices: list[int] = []
+        if settings.include_single_element_elastic_stress_structures:
+            single_element_elastic_indices = find_single_element_elastic_stress_indices(
+                prepared["ase_structures"]
+            )
+        elastic_indices: list[int] = []
+        if settings.include_elastic_stress_structures:
+            elastic_indices = find_elastic_stress_indices(prepared["ase_structures"])
+        anchor_indices = sorted(
+            set(seed_indices + single_element_elastic_indices + elastic_indices)
+        )
+        if len(anchor_indices) > settings.target_train_count:
+            raise ValueError(
+                "Preselected anchor count exceeds target_train_count: "
+                f"unique anchors={len(anchor_indices)}, "
+                f"target_train_count={settings.target_train_count}"
+            )
+        if (
+            settings.algorithm == "information_entropy"
+            and settings.target_train_count == candidate_count
+        ):
+            logger.warning(
+                "Entropy selection budget K=M=%d selects all candidates; no holdout remains",
+                candidate_count,
+            )
         local_representation: LocalEnvironmentRepresentation | None = None
         if settings.algorithm == "information_entropy":
+            entropy = settings.entropy
+            if not math.isfinite(entropy.beta) or entropy.beta <= 0.0:
+                raise ValueError("selection.entropy.beta must be finite and positive")
+            if entropy.optimizer_method not in {"lazy_greedy", "full_greedy"}:
+                raise ValueError(
+                    "selection.entropy.optimizer_method must be lazy_greedy or full_greedy"
+                )
+            EntropyBandwidthSettings(
+                mode=entropy.bandwidth.mode,
+                k=entropy.bandwidth.k,
+                c=entropy.bandwidth.c,
+                k_candidates=entropy.bandwidth.k_candidates,
+                c_candidates=entropy.bandwidth.c_candidates,
+                backend=entropy.bandwidth.backend,
+                metric=entropy.bandwidth.metric,
+                chunk_size=entropy.bandwidth.chunk_size,
+            )
+            for limit_name in ("max_edges", "max_entries"):
+                limit = getattr(entropy, limit_name)
+                if not isinstance(limit, int) or limit < 1:
+                    raise ValueError(f"selection.entropy.{limit_name} must be positive")
+            for limit_name in ("max_graph_bytes", "max_contribution_bytes"):
+                limit = getattr(entropy, limit_name)
+                if limit is not None and (not isinstance(limit, int) or limit < 1):
+                    raise ValueError(f"selection.entropy.{limit_name} must be positive")
             local_representation = load_or_calculate_local_representations(
                 project_dir,
                 prepared["ase_structures"],
                 config=LocalRepresentationConfig(
                     magnetic_mode=settings.local_magnetic_mode,
+                    cutoff=entropy.local_cutoff,
+                    radial_bins=entropy.local_radial_bins,
+                    angular_bins=entropy.local_angular_bins,
+                    radial_sigma=entropy.local_radial_sigma,
+                    angular_sigma=entropy.local_angular_sigma,
+                    species=entropy.local_species,
+                    whitening_tolerance=entropy.whitening_tolerance,
+                    whitening_regularization=entropy.whitening_regularization,
+                    whitening_singular_policy=entropy.whitening_singular_policy,
                 ),
                 local_descriptor_workers=settings.local_descriptor_workers,
                 candidate_ids=candidate_identity_ids,
@@ -226,6 +308,14 @@ class SelectionStage:
             representations = _aggregate_local_representations(
                 local_representation,
                 candidate_identity_ids,
+            )
+            logger.info(
+                "  Entropy local representation complete: N=%d atomic rows, d'=%d; "
+                "candidate-mean plotting/test descriptors: M=%d, d'=%d",
+                len(local_representation.rows),
+                local_representation.descriptors.shape[1],
+                representations.shape[0],
+                representations.shape[1],
             )
         else:
             validate_candidate_representation_identity(
@@ -242,13 +332,16 @@ class SelectionStage:
                 candidate_structure_ids=physical_structure_ids,
             )
         logger.info("  Descriptor shape: %s", representations.shape)
-        logger.info("  Descriptor type: %s", settings.descriptor_type)
+        if settings.algorithm == "information_entropy":
+            logger.info("  Descriptor type: candidate-mean local (plot/test FPS policy only)")
+        else:
+            logger.info("  Descriptor type: %s", settings.descriptor_type)
 
         if active is not None and active.state_store is not None:
             existing = active.state_store.get_selection_run(
                 selection_run_id(active.project_name, candidate_identity_ids, settings)
             )
-            if existing is None:
+            if existing is None and settings.algorithm == "fps":
                 existing = active.state_store.get_selection_run(
                     legacy_selection_run_id(
                         active.project_name,
@@ -267,6 +360,29 @@ class SelectionStage:
                     "policy"
                 ) != selection_policy(settings):
                     raise StateError("Persisted selection policy does not match current input")
+                if settings.algorithm == "information_entropy":
+                    persisted_algorithm = persisted_parameters.get("algorithm_id")
+                    if persisted_algorithm is None:
+                        raise StateError(
+                            "Persisted selection has no algorithm identity; refusing to reuse it"
+                        )
+                    if persisted_algorithm == "information_entropy":
+                        entropy_record = persisted_parameters.get("entropy")
+                        if not isinstance(entropy_record, dict):
+                            raise StateError(
+                                "Persisted information-entropy record is not a sparse entropy selection"
+                            )
+                        if persisted_parameters.get("candidate_ids") != candidate_identity_ids:
+                            raise StateError(
+                                "Persisted entropy selection requires the original ordered candidates"
+                            )
+                        if local_representation is None:
+                            raise StateError("Entropy representation is unavailable for restore")
+                        current_pool = build_entropy_pool(local_representation)
+                        if entropy_record.get("pool_fingerprint") != current_pool.fingerprint:
+                            raise StateError(
+                                "Persisted entropy selection fingerprint does not match current representation"
+                            )
                 logger.info("  Reconciled completed selection by candidate identity")
                 return restore_selection_result(
                     existing,
@@ -275,28 +391,7 @@ class SelectionStage:
                     candidate_structure_ids=physical_structure_ids,
                 )
 
-        seed_indices: list[int] = []
-        if settings.include_seed_structures:
-            seed_indices = resolve_seed_indices(
-                project_dir,
-                prepared["ase_structures"],
-            )
-            logger.info("  Seed anchors enabled: %d structures", len(seed_indices))
-
-        single_element_elastic_indices: list[int] = []
-        if settings.include_single_element_elastic_stress_structures:
-            single_element_elastic_indices = find_single_element_elastic_stress_indices(
-                prepared["ase_structures"]
-            )
-
-        elastic_indices: list[int] = []
-        if settings.include_elastic_stress_structures:
-            elastic_indices = find_elastic_stress_indices(prepared["ase_structures"])
-
-        anchor_indices = sorted(
-            set(seed_indices + single_element_elastic_indices + elastic_indices)
-        )
-        train_indices, train_min_dist = select_training_set(
+        training: Any = select_training_set(
             representations,
             prepared["structures"],
             settings,
@@ -307,7 +402,15 @@ class SelectionStage:
             candidate_ids=candidate_identity_ids,
             algorithm_id=settings.algorithm,
             local_representation=local_representation,
+            candidate_structure_ids=physical_structure_ids,
         )
+        if isinstance(training, TrainingSelection):
+            train_indices = training.indices
+            train_min_dist = training.minimum_distance
+            algorithm_result = training.algorithm_result
+        else:  # Compatibility with injected legacy strategy doubles.
+            train_indices, train_min_dist = training
+            algorithm_result = None
         test_selection = select_test_set(
             representations,
             prepared["structures"],
@@ -315,6 +418,45 @@ class SelectionStage:
             settings,
         )
 
+        entropy_result = getattr(algorithm_result, "algorithm_result", None)
+        entropy_history = []
+        train_acquisition_order: list[str] = []
+        train_entropy_values: dict[str, Any] = {}
+        entropy_provenance: dict[str, Any] = {}
+        if entropy_result is not None and algorithm_result is not None:
+            train_acquisition_order = list(entropy_result.acquisition_order)
+            entropy_history = [dict(asdict(step)) for step in entropy_result.history.steps]
+            train_entropy_values = {
+                "train_entropy_objective": entropy_result.final_objective,
+                "train_entropy_cross_entropy": entropy_result.final_cross_entropy,
+                "train_entropy_forward_kl": entropy_result.final_forward_kl,
+                "train_entropy_pool_fingerprint": entropy_result.pool_fingerprint,
+                "train_entropy_graph_fingerprint": entropy_result.graph_fingerprint,
+                "train_entropy_contributions_fingerprint": entropy_result.contributions_fingerprint,
+                "train_entropy_state_fingerprint": entropy_result.state_fingerprint,
+            }
+            diagnostics = algorithm_result.diagnostics[0] if algorithm_result.diagnostics else {}
+            calibration = diagnostics.get("calibration")
+            graph = diagnostics.get("graph")
+            contributions = diagnostics.get("contributions")
+            pool = diagnostics.get("pool")
+            entropy_provenance = {
+                "greedy_method": entropy_result.method,
+                "greedy_method_version": entropy_result.method_version,
+                "beta": entropy_result.beta,
+                "pool_fingerprint": entropy_result.pool_fingerprint,
+                "transform_fingerprint": getattr(pool, "transform_fingerprint", None),
+                "representation_fingerprint": getattr(pool, "representation_fingerprint", None),
+                "calibration_fingerprint": getattr(calibration, "calibration_fingerprint", None),
+                "selected_k": getattr(calibration, "k", None),
+                "selected_c": getattr(calibration, "c", None),
+                "graph_fingerprint": entropy_result.graph_fingerprint,
+                "graph_edge_count": getattr(graph, "edge_count", None),
+                "graph_array_bytes": getattr(graph, "array_bytes", None),
+                "contributions_fingerprint": entropy_result.contributions_fingerprint,
+                "contribution_entry_count": getattr(contributions, "entry_count", None),
+                "contribution_array_bytes": getattr(contributions, "array_bytes", None),
+            }
         return SelectionResult(
             descriptors=representations,
             train_indices=train_indices,
@@ -331,6 +473,22 @@ class SelectionStage:
             seed_indices=seed_indices,
             single_element_elastic_indices=single_element_elastic_indices,
             elastic_indices=elastic_indices,
+            algorithm_id=(
+                algorithm_result.algorithm_id
+                if algorithm_result is not None
+                else settings.algorithm
+            ),
+            algorithm_version=(
+                algorithm_result.algorithm_version
+                if algorithm_result is not None
+                else "selection-request-v1"
+            ),
+            train_acquisition_order=train_acquisition_order,
+            train_entropy_history=entropy_history,
+            train_entropy_provenance=entropy_provenance,
+            train_min_dist_applicable=settings.algorithm == "fps",
+            train_fps_count_applicable=settings.algorithm == "fps",
+            **train_entropy_values,
         )
 
     def finalize(
@@ -350,6 +508,11 @@ class SelectionStage:
             result.train_indices,
             result.test_indices,
             active.project_dir / "reports" / "descriptor_space.png",
+            descriptor_label=(
+                "Whitened local candidate-mean representation"
+                if result.algorithm_id == "information_entropy"
+                else "NEP descriptor space"
+            ),
         )
 
         logger.info("")
@@ -361,28 +524,51 @@ class SelectionStage:
             result.test_indices,
             candidate_ids=ordered_candidate_ids(prepared["ase_structures"]),
             structure_ids=ordered_structure_ids(prepared["ase_structures"]),
+            algorithm_id=result.algorithm_id,
+            train_anchor_indices=(
+                result.seed_indices + result.single_element_elastic_indices + result.elastic_indices
+            ),
+            train_acquisition_order=result.train_acquisition_order,
         )
 
         total = len(prepared["structures"])
         logger.info("")
         logger.info("Selection complete from %d candidates:", total)
-        logger.info(
-            "  Training: %d structures (%d seed anchors, %d single-element "
-            "elastic anchors, %d elastic anchors, %d unique anchors, %d "
-            "FPS-selected; FPS min_distance=%.6f)",
-            len(result.train_indices),
-            result.train_seed_count,
-            result.train_single_element_elastic_count,
-            result.train_elastic_count,
-            result.train_anchor_count,
-            result.train_fps_count,
-            result.train_min_dist,
-        )
-        logger.info(
-            "  Test:     %d structures (FPS min_distance=%.6f)",
-            len(result.test_indices),
-            result.test_min_dist,
-        )
+        if result.algorithm_id == "information_entropy":
+            logger.info(
+                "  Training: %d structures via information_entropy (%d seed anchors, "
+                "%d single-element elastic anchors, %d elastic anchors, %d unique anchors; "
+                "F=%.6f, cross_entropy=%.6f, forward_KL=%.6f)",
+                len(result.train_indices),
+                result.train_seed_count,
+                result.train_single_element_elastic_count,
+                result.train_elastic_count,
+                result.train_anchor_count,
+                result.train_entropy_objective,
+                result.train_entropy_cross_entropy,
+                result.train_entropy_forward_kl,
+            )
+        else:
+            logger.info(
+                "  Training: %d structures (%d seed anchors, %d single-element "
+                "elastic anchors, %d elastic anchors, %d unique anchors, %d "
+                "FPS-selected; FPS min_distance=%.6f)",
+                len(result.train_indices),
+                result.train_seed_count,
+                result.train_single_element_elastic_count,
+                result.train_elastic_count,
+                result.train_anchor_count,
+                result.train_fps_count,
+                result.train_min_dist,
+            )
+        if result.test_indices:
+            logger.info(
+                "  Test:     %d structures (independent FPS policy; min_distance=%.6f)",
+                len(result.test_indices),
+                result.test_min_dist,
+            )
+        else:
+            logger.info("  Test:     0 structures (no eligible candidates remain)")
         logger.info(
             "  Train<->test nearest-neighbour distance - min: %.6f, mean: %.6f",
             result.min_train_test_dist,
