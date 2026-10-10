@@ -5,11 +5,12 @@ from __future__ import annotations
 import math
 from dataclasses import asdict
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from nepflow.config.models import SelectionConfig
 from nepflow.domain.identities import calculate_candidate_id, calculate_structure_id
-from nepflow.errors import StateError
+from nepflow.errors import ArtifactError, StateError
 from nepflow.io.hashing import sha256_canonical_json
 from nepflow.io.json import to_jsonable
 from nepflow.state import StateStore
@@ -107,12 +108,22 @@ def selection_policy(settings: SelectionConfig) -> dict[str, Any]:
             "composition_aware_fps_descriptor_floor_fraction",
             "batch_size",
             "local_descriptor_workers",
+            "max_local_descriptor_inflight_bytes",
             "background_mass",
         ):
             values.pop(name, None)
         entropy_values = values.get("entropy")
         if isinstance(entropy_values, dict):
             entropy_values.pop("bandwidth", {}).pop("chunk_size", None)
+            for name in (
+                "max_edges",
+                "max_graph_bytes",
+                "max_graph_spool_bytes",
+                "max_entries",
+                "max_contribution_bytes",
+                "max_contribution_spool_bytes",
+            ):
+                entropy_values.pop(name, None)
     elif settings.algorithm == "fps":
         values.pop("entropy", None)
     return to_jsonable(values)
@@ -187,6 +198,7 @@ def selection_parameters(
     coverage_metrics: Mapping[str, Any] | None = None,
     *,
     candidate_structure_ids: Sequence[str] | None = None,
+    diagnostics_artifact_dir: Path | None = None,
 ) -> dict[str, Any]:
     """Return the complete scientific selection record payload."""
 
@@ -218,6 +230,17 @@ def selection_parameters(
     }
     entropy_record: dict[str, Any] | None = None
     if result.algorithm_id == "information_entropy":
+        diagnostics_manifest = (
+            None
+            if result.entropy_diagnostics is None
+            else result.entropy_diagnostics.to_manifest(diagnostics_artifact_dir)
+        )
+        if diagnostics_manifest is not None and diagnostics_artifact_dir is not None:
+            numeric_artifact = diagnostics_manifest.get("objective", {}).get("numeric_arrays")
+            if isinstance(numeric_artifact, dict) and isinstance(numeric_artifact.get("path"), str):
+                numeric_artifact["path"] = str(
+                    (Path(diagnostics_artifact_dir) / numeric_artifact["path"]).resolve()
+                )
         entropy_record = {
             "algorithm_id": result.algorithm_id,
             "algorithm_version": result.algorithm_version,
@@ -248,11 +271,7 @@ def selection_parameters(
             "state_fingerprint": result.train_entropy_state_fingerprint,
             "history": result.train_entropy_history,
             "provenance": to_jsonable(result.train_entropy_provenance),
-            "diagnostics": (
-                None
-                if result.entropy_diagnostics is None
-                else result.entropy_diagnostics.to_manifest()
-            ),
+            "diagnostics": diagnostics_manifest,
         }
     return {
         "schema_version": SELECTION_RUN_SCHEMA,
@@ -324,6 +343,7 @@ def persist_selection_result(
             result,
             coverage_metrics,
             candidate_structure_ids=candidate_structure_ids,
+            diagnostics_artifact_dir=Path(project_dir) / "structures" / "selected",
         ),
         started_at=started_at or now,
         completed_at=completed_at or now,
@@ -527,7 +547,7 @@ def restore_selection_result(
             )
         try:
             entropy_diagnostics = EntropyScientificDiagnostics.from_manifest(diagnostics_manifest)
-        except (KeyError, TypeError, ValueError) as exc:
+        except (ArtifactError, KeyError, TypeError, ValueError) as exc:
             raise StateError("Persisted information-entropy diagnostics failed validation") from exc
         if entropy_diagnostics.candidate_ids != tuple(persisted_candidates):
             raise StateError("Persisted entropy diagnostics candidate identity does not match run")

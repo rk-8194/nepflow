@@ -307,6 +307,9 @@ def _selection_values(config: NepflowConfig) -> dict[str, str]:
         "test_pool_factor": str(selection.test_pool_factor),
         "local_magnetic_mode": selection.local_magnetic_mode,
         "local_descriptor_workers": str(selection.local_descriptor_workers),
+        "max_local_descriptor_inflight_bytes": str(
+            selection.max_local_descriptor_inflight_bytes
+        ),
         "background_mass": str(selection.background_mass),
         "entropy_beta": str(selection.entropy.beta),
         "entropy_optimizer_method": selection.entropy.optimizer_method,
@@ -358,10 +361,16 @@ def _selection_values(config: NepflowConfig) -> dict[str, str]:
         "entropy_max_graph_bytes": ""
         if selection.entropy.max_graph_bytes is None
         else str(selection.entropy.max_graph_bytes),
+        "entropy_max_graph_spool_bytes": ""
+        if selection.entropy.max_graph_spool_bytes is None
+        else str(selection.entropy.max_graph_spool_bytes),
         "entropy_max_entries": str(selection.entropy.max_entries),
         "entropy_max_contribution_bytes": ""
         if selection.entropy.max_contribution_bytes is None
         else str(selection.entropy.max_contribution_bytes),
+        "entropy_max_contribution_spool_bytes": ""
+        if selection.entropy.max_contribution_spool_bytes is None
+        else str(selection.entropy.max_contribution_spool_bytes),
     }
 
 

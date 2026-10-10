@@ -361,8 +361,10 @@ class EntropySelectionConfig:
     bandwidth: EntropyBandwidthConfig = field(default_factory=EntropyBandwidthConfig)
     max_edges: int = 1_000_000
     max_graph_bytes: int | None = None
+    max_graph_spool_bytes: int | None = None
     max_entries: int = 1_000_000
     max_contribution_bytes: int | None = None
+    max_contribution_spool_bytes: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -388,6 +390,7 @@ class SelectionConfig:
     test_pool_factor: float = 0.5
     local_magnetic_mode: str = "structural"
     local_descriptor_workers: int = 0
+    max_local_descriptor_inflight_bytes: int = 512 * 1024 * 1024
     background_mass: float = 1.0e-12
     entropy: EntropySelectionConfig = field(default_factory=EntropySelectionConfig)
 

@@ -761,6 +761,10 @@ def parse_selection(values: Mapping[str, str]) -> SelectionConfig:
             value("entropy_max_graph_bytes", "", "max_graph_bytes"),
             "selection.entropy_max_graph_bytes",
         ),
+        max_graph_spool_bytes=_parse_optional_int(
+            value("entropy_max_graph_spool_bytes", "", "max_graph_spool_bytes"),
+            "selection.entropy_max_graph_spool_bytes",
+        ),
         max_entries=_parse_int(
             value("entropy_max_entries", "1000000", "max_entries"),
             "selection.entropy_max_entries",
@@ -768,6 +772,14 @@ def parse_selection(values: Mapping[str, str]) -> SelectionConfig:
         max_contribution_bytes=_parse_optional_int(
             value("entropy_max_contribution_bytes", "", "max_contribution_bytes"),
             "selection.entropy_max_contribution_bytes",
+        ),
+        max_contribution_spool_bytes=_parse_optional_int(
+            value(
+                "entropy_max_contribution_spool_bytes",
+                "",
+                "max_contribution_spool_bytes",
+            ),
+            "selection.entropy_max_contribution_spool_bytes",
         ),
     )
 
@@ -829,6 +841,10 @@ def parse_selection(values: Mapping[str, str]) -> SelectionConfig:
         local_descriptor_workers=_parse_int(
             values.get("local_descriptor_workers", "0"),
             "selection.local_descriptor_workers",
+        ),
+        max_local_descriptor_inflight_bytes=_parse_int(
+            values.get("max_local_descriptor_inflight_bytes", str(512 * 1024 * 1024)),
+            "selection.max_local_descriptor_inflight_bytes",
         ),
         background_mass=_parse_float(
             values.get("background_mass", "1e-12"), "selection.background_mass"

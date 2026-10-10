@@ -301,6 +301,7 @@ local_magnetic_mode=structural
 # Local descriptor execution: 0=automatic (affinity/scheduler-aware, capped at 8),
 # 1=serial, or an explicit process count within the allocated CPUs.
 local_descriptor_workers=0
+max_local_descriptor_inflight_bytes=536870912
 background_mass=1e-12
 
 # Information-entropy training selector (inactive when algorithm=fps)
@@ -330,8 +331,10 @@ entropy_bandwidth_max_calibration_work_bytes=536870912
 entropy_bandwidth_calibration_batch_size=
 entropy_max_edges=1000000
 entropy_max_graph_bytes=
+entropy_max_graph_spool_bytes=
 entropy_max_entries=1000000
 entropy_max_contribution_bytes=
+entropy_max_contribution_spool_bytes=
 
 [vasp]
 enabled=true

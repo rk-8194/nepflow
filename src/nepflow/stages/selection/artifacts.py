@@ -97,6 +97,47 @@ def write_selected_structures(
         write_extxyz(test_path, selected_structures(test_indices))
         logger.info("  Test set saved to %s", test_path)
 
+        diagnostics_payload = None if entropy_diagnostics is None else dict(entropy_diagnostics)
+        if isinstance(diagnostics_payload, dict):
+            objective_payload = diagnostics_payload.get("objective")
+            if isinstance(objective_payload, Mapping):
+                objective_payload = dict(objective_payload)
+                numeric_payload = objective_payload.get("numeric_arrays")
+                if isinstance(numeric_payload, Mapping):
+                    numeric_payload = dict(numeric_payload)
+                    numeric_path = numeric_payload.get("path")
+                    if isinstance(numeric_path, str) and Path(numeric_path).is_absolute():
+                        numeric_payload["path"] = Path(numeric_path).name
+                    objective_payload["numeric_arrays"] = numeric_payload
+                diagnostics_payload["objective"] = objective_payload
+        artifact_records: dict[str, Any] = {
+            "train.xyz": {
+                "path": "train.xyz",
+                "sha256": sha256_file(train_path, required=True),
+            },
+            "test.xyz": {
+                "path": "test.xyz",
+                "sha256": sha256_file(test_path, required=True),
+            },
+        }
+        if diagnostics_payload is not None:
+            objective = diagnostics_payload.get("objective")
+            numeric = objective.get("numeric_arrays") if isinstance(objective, Mapping) else None
+            numeric_path = numeric.get("path") if isinstance(numeric, Mapping) else None
+            if (
+                isinstance(numeric, Mapping)
+                and numeric.get("storage") == "file"
+                and isinstance(numeric_path, str)
+            ):
+                diagnostic_path = selected_dir / numeric_path
+                if not diagnostic_path.is_file():
+                    raise ArtifactError(
+                        f"Selection entropy diagnostics numeric artifact is missing: {diagnostic_path}"
+                    )
+                artifact_records[Path(numeric_path).name] = {
+                    "path": Path(numeric_path).name,
+                    "sha256": sha256_file(diagnostic_path, required=True),
+                }
         write_json(
             manifest_path,
             {
@@ -113,18 +154,9 @@ def write_selected_structures(
                 ],
                 "train_acquisition_order": list(train_acquisition_order or []),
                 "entropy_diagnostics": (
-                    None if entropy_diagnostics is None else dict(entropy_diagnostics)
+                    diagnostics_payload
                 ),
-                "artifacts": {
-                    "train.xyz": {
-                        "path": "train.xyz",
-                        "sha256": sha256_file(train_path, required=True),
-                    },
-                    "test.xyz": {
-                        "path": "test.xyz",
-                        "sha256": sha256_file(test_path, required=True),
-                    },
-                },
+                "artifacts": artifact_records,
             },
         )
     except BaseException:
@@ -183,7 +215,10 @@ def read_selection_manifest(project_dir: Path) -> dict:
         try:
             from .algorithms.information_entropy.diagnostics import EntropyScientificDiagnostics
 
-            record = EntropyScientificDiagnostics.from_manifest(diagnostics)
+            record = EntropyScientificDiagnostics.from_manifest(
+                diagnostics,
+                artifact_root=selected_dir,
+            )
         except (KeyError, TypeError, ValueError) as exc:
             raise ArtifactError(f"Selection entropy diagnostics are malformed: {path}") from exc
         if tuple(record.selected_candidate_ids) != tuple(train_candidate_ids):
@@ -204,6 +239,30 @@ def read_selection_manifest(project_dir: Path) -> dict:
             or sha256_file(artifact_path, required=True) != record.get("sha256")
         ):
             raise ArtifactError(f"Selection artifact changed or is missing: {artifact_path}")
+    diagnostics = manifest.get("entropy_diagnostics")
+    if isinstance(diagnostics, Mapping):
+        objective = diagnostics.get("objective")
+        numeric = objective.get("numeric_arrays") if isinstance(objective, Mapping) else None
+        if isinstance(numeric, Mapping) and numeric.get("storage") == "file":
+            name = numeric.get("path")
+            if not isinstance(name, str) or Path(name).is_absolute():
+                raise ArtifactError(f"Selection entropy diagnostics artifact path is malformed: {path}")
+            diagnostic_path = selected_dir / name
+            try:
+                diagnostic_path.resolve().relative_to(selected_dir.resolve())
+            except ValueError as exc:
+                raise ArtifactError(
+                    f"Selection entropy diagnostics artifact path escapes the artifact directory: {path}"
+                ) from exc
+            record = artifacts.get(Path(name).name)
+            if (
+                not diagnostic_path.is_file()
+                or not isinstance(record, Mapping)
+                or record.get("sha256") != sha256_file(diagnostic_path, required=True)
+            ):
+                raise ArtifactError(
+                    f"Selection entropy diagnostics artifact changed or is missing: {diagnostic_path}"
+                )
     return manifest
 
 

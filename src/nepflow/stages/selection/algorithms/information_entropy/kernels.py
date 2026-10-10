@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import math
+import tempfile
 import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
@@ -49,6 +50,48 @@ SourceProgressCallback = Callable[[int, int], None]
 BatchSourceProgressCallback = Callable[[int, int], None]
 
 logger = logging.getLogger(__name__)
+
+
+_EDGE_SPOOL_DTYPE = np.dtype(([("target", "<i8"), ("value", "<f8")]))
+_EDGE_SPOOL_HEADER = b"NEPFLOW-EXACT-EDGE-SPOOL\0v1\0target-i64-value-f64\0"
+_EDGE_SPOOL_RECORD_BYTES = int(_EDGE_SPOOL_DTYPE.itemsize)
+
+
+def _validate_spool_limit(value: int | None, name: str) -> int | None:
+    if value is None:
+        return None
+    return _validate_sparse_limit(value, name)
+
+
+def _spool_write_header(handle: Any) -> Any:
+    handle.write(_EDGE_SPOOL_HEADER)
+    digest = hashlib.sha256()
+    digest.update(_EDGE_SPOOL_HEADER)
+    return digest
+
+
+def _spool_write_records(handle: Any, digest: Any, records: np.ndarray) -> None:
+    raw = memoryview(np.ascontiguousarray(records, dtype=_EDGE_SPOOL_DTYPE)).cast("B")
+    digest.update(raw)
+    handle.write(raw)
+
+
+def _spool_read_records(
+    handle: Any,
+    digest: Any,
+    count: int,
+    *,
+    chunk_records: int = 65_536,
+) -> Iterator[np.ndarray]:
+    remaining = count
+    while remaining:
+        raw = handle.read(min(remaining, chunk_records) * _EDGE_SPOOL_RECORD_BYTES)
+        expected = min(remaining, chunk_records) * _EDGE_SPOOL_RECORD_BYTES
+        if len(raw) != expected:
+            raise ValueError("exact edge spool is truncated")
+        digest.update(raw)
+        yield np.frombuffer(raw, dtype=_EDGE_SPOOL_DTYPE)
+        remaining -= min(remaining, chunk_records)
 
 
 def _validate_bandwidths(bandwidths: Any, row_count: int) -> np.ndarray:
@@ -830,6 +873,7 @@ def build_sparse_atomic_kernel_graph(
     chunk_size: int = 1024,
     max_edges: int = _DEFAULT_SPARSE_EDGE_LIMIT,
     max_graph_bytes: int | None = None,
+    max_spool_bytes: int | None = None,
     progress_callback: SourceProgressCallback | None = None,
     max_radius_query_bytes: int = DEFAULT_RADIUS_QUERY_BYTES,
 ) -> SparseAtomicKernelGraph:
@@ -845,12 +889,20 @@ def build_sparse_atomic_kernel_graph(
         if max_graph_bytes is None
         else _validate_sparse_limit(max_graph_bytes, "max_graph_bytes")
     )
+    spool_limit = _validate_spool_limit(max_spool_bytes, "max_spool_bytes")
+    spool_limit = (
+        spool_limit
+        if spool_limit is not None
+        else len(_EDGE_SPOOL_HEADER) + edge_limit * _EDGE_SPOOL_RECORD_BYTES
+    )
+    if spool_limit < len(_EDGE_SPOOL_HEADER):
+        raise ValueError("max_spool_bytes is too small for the exact edge spool header")
     n_rows = values.shape[0]
     candidate_count = len(pool.candidate_ids)
     started = time.perf_counter()
     logger.info(
         "Sparse atomic kernel graph started: N=%d, M=%d, schema=%s, kernel=%s/%s, "
-        "max_edges=%d, max_graph_bytes=%s, chunk_size=%d",
+        "max_edges=%d, max_graph_bytes=%s, max_spool_bytes=%d, chunk_size=%d",
         n_rows,
         candidate_count,
         SPARSE_KERNEL_GRAPH_SCHEMA_VERSION,
@@ -858,6 +910,7 @@ def build_sparse_atomic_kernel_graph(
         KERNEL_VERSION,
         edge_limit,
         byte_limit if byte_limit is not None else "unbounded",
+        spool_limit,
         block,
     )
     edge_counts = np.zeros(n_rows, dtype=np.int64)
@@ -875,6 +928,21 @@ def build_sparse_atomic_kernel_graph(
     ):
         raise ValueError("frozen bandwidths have a mismatched indexed backend fingerprint")
     next_percent = [1]
+    peak_estimated_bytes = 0
+    materialized_spool_bytes = 0
+    fixed_peak_bytes = 8 * (n_rows + 1 + n_rows)
+    fixed_peak_bytes += (
+        support_provider.index.index_bytes
+        if support_provider.index is not None
+        else 8 * (block + n_rows)
+    )
+    if byte_limit is not None and fixed_peak_bytes > byte_limit:
+        raise ValueError(
+            "sparse atomic kernel graph exceeds max_graph_bytes before source enumeration: "
+            f"N={n_rows}, E=0, source=0, mean_support=0, max_support=0, "
+            f"estimated_bytes={fixed_peak_bytes}, max_graph_bytes={byte_limit}"
+        )
+    peak_estimated_bytes = fixed_peak_bytes
 
     def report_source_progress(completed: int, total: int) -> None:
         _report_graph_progress(completed, total, edge_counts, started, next_percent)
@@ -882,56 +950,116 @@ def build_sparse_atomic_kernel_graph(
             progress_callback(completed, total)
 
     try:
-        for column in iter_normalized_kernel_columns(
-            values,
-            frozen.bandwidths,
-            chunk_size=block,
-            progress_callback=report_source_progress,
-            backend=frozen.backend,
-            support_provider=support_provider,
-            max_radius_query_bytes=max_radius_query_bytes,
-        ):
-            edge_counts[column.source_index] += np.int64(column.target_indices.shape[0])
-        edge_count = int(np.sum(edge_counts, dtype=np.int64))
-        if edge_count > edge_limit:
-            raise ValueError(
-                "sparse atomic kernel graph exceeds max_edges: "
-                f"N={n_rows}, required_edges={edge_count}, max_edges={edge_limit}"
-            )
-        required_bytes = 8 * (n_rows + 1 + edge_count + edge_count + n_rows)
-        estimated_peak_bytes = (
-            required_bytes + support_provider.index.index_bytes
-            if support_provider.index is not None
-            else required_bytes + 8 * (block + n_rows)
-        )
-        if byte_limit is not None and estimated_peak_bytes > byte_limit:
-            raise ValueError(
-                "sparse atomic kernel graph exceeds max_graph_bytes: "
-                f"N={n_rows}, E={edge_count}, required_bytes={required_bytes}, "
-                f"estimated_peak_bytes={estimated_peak_bytes}, max_graph_bytes={byte_limit}"
-            )
-
-        source_indptr = np.empty(n_rows + 1, dtype=np.int64)
-        source_indptr[0] = 0
-        np.cumsum(edge_counts, dtype=np.int64, out=source_indptr[1:])
-        target_indices = np.empty(edge_count, dtype=np.int64)
-        edge_values = np.empty(edge_count, dtype=np.float64)
-        positions = source_indptr[:-1].copy()
-        for column in iter_normalized_kernel_columns(
-            values,
-            frozen.bandwidths,
-            chunk_size=block,
-            backend=frozen.backend,
-            support_provider=support_provider,
-            max_radius_query_bytes=max_radius_query_bytes,
-        ):
-            start = int(positions[column.source_index])
-            stop = start + column.target_indices.shape[0]
-            target_indices[start:stop] = column.target_indices
-            edge_values[start:stop] = column.values
-            positions[column.source_index] = stop
-        if not np.array_equal(positions, source_indptr[:-1] + edge_counts):
-            raise ValueError("sparse graph edge preflight disagreed with graph construction")
+        with tempfile.TemporaryFile(mode="w+b") as spool:
+            spool_digest = _spool_write_header(spool)
+            spool_bytes = len(_EDGE_SPOOL_HEADER)
+            edge_count = 0
+            max_support = 0
+            for column in iter_normalized_kernel_columns(
+                values,
+                frozen.bandwidths,
+                chunk_size=block,
+                progress_callback=report_source_progress,
+                backend=frozen.backend,
+                support_provider=support_provider,
+                max_radius_query_bytes=max_radius_query_bytes,
+            ):
+                support = int(column.target_indices.shape[0])
+                source_index = int(column.source_index)
+                if support == 0 or np.any(np.diff(column.target_indices) <= 0):
+                    raise ValueError(
+                        f"sparse graph source {source_index} does not have strictly ascending support"
+                    )
+                prospective_edges = edge_count + support
+                max_support = max(max_support, support)
+                mean_support = prospective_edges / float(source_index + 1)
+                if prospective_edges > edge_limit:
+                    raise ValueError(
+                        "sparse atomic kernel graph exceeds max_edges during source enumeration: "
+                        f"N={n_rows}, E={prospective_edges}, required_edges={prospective_edges}, "
+                        f"source={source_index}, "
+                        f"mean_support={mean_support:.6g}, max_support={max_support}, "
+                        f"estimated_bytes={8 * (n_rows + 1 + n_rows + 2 * prospective_edges)}, "
+                        f"max_edges={edge_limit}"
+                    )
+                prospective_spool_bytes = spool_bytes + support * _EDGE_SPOOL_RECORD_BYTES
+                if prospective_spool_bytes > spool_limit:
+                    raise ValueError(
+                        "sparse atomic kernel graph exact spool exceeds max_spool_bytes during "
+                        f"source enumeration: N={n_rows}, E={prospective_edges}, source={source_index}, "
+                        f"spool_bytes={prospective_spool_bytes}, max_spool_bytes={spool_limit}"
+                    )
+                required_bytes = 8 * (n_rows + 1 + n_rows + 2 * prospective_edges)
+                estimated_peak_bytes = (
+                    required_bytes + support_provider.index.index_bytes
+                    if support_provider.index is not None
+                    else required_bytes + 8 * (block + n_rows)
+                )
+                estimated_peak_bytes += support * _EDGE_SPOOL_RECORD_BYTES
+                if byte_limit is not None and estimated_peak_bytes > byte_limit:
+                    raise ValueError(
+                        "sparse atomic kernel graph exceeds max_graph_bytes during source "
+                        f"enumeration: N={n_rows}, E={prospective_edges}, source={source_index}, "
+                        f"mean_support={mean_support:.6g}, max_support={max_support}, "
+                        f"estimated_bytes={estimated_peak_bytes}, max_graph_bytes={byte_limit}"
+                    )
+                peak_estimated_bytes = max(peak_estimated_bytes, estimated_peak_bytes)
+                records = np.empty(support, dtype=_EDGE_SPOOL_DTYPE)
+                records["target"] = column.target_indices
+                records["value"] = column.values
+                _spool_write_records(spool, spool_digest, records)
+                edge_counts[source_index] = support
+                edge_count = prospective_edges
+                spool_bytes = prospective_spool_bytes
+                materialized_spool_bytes = spool_bytes
+            if int(np.sum(edge_counts, dtype=np.int64)) != edge_count:
+                raise ValueError("sparse graph source enumeration produced inconsistent edge counts")
+            spool.flush()
+            spool.seek(0)
+            if spool.read(len(_EDGE_SPOOL_HEADER)) != _EDGE_SPOOL_HEADER:
+                raise ValueError("exact edge spool has an invalid version header")
+            source_indptr = np.empty(n_rows + 1, dtype=np.int64)
+            source_indptr[0] = 0
+            np.cumsum(edge_counts, dtype=np.int64, out=source_indptr[1:])
+            target_indices = np.empty(edge_count, dtype=np.int64)
+            edge_values = np.empty(edge_count, dtype=np.float64)
+            positions = source_indptr[:-1].copy()
+            read_digest = hashlib.sha256()
+            read_digest.update(_EDGE_SPOOL_HEADER)
+            source_cursor = 0
+            edge_cursor = 0
+            for records in _spool_read_records(spool, read_digest, edge_count):
+                count = records.shape[0]
+                # The spool is source-major and each source's position is known
+                # from edge_counts; populate by consuming source-sized slices.
+                offset = 0
+                while offset < count:
+                    while (
+                        source_cursor < n_rows
+                        and edge_cursor >= int(source_indptr[source_cursor + 1])
+                    ):
+                        source_cursor += 1
+                    if source_cursor >= n_rows:
+                        raise ValueError("exact edge spool contains too many records")
+                    source_index = source_cursor
+                    source_stop = int(source_indptr[source_index + 1])
+                    take = min(count - offset, source_stop - int(positions[source_index]))
+                    source_start = int(positions[source_index])
+                    target_indices[source_start : source_start + take] = records["target"][
+                        offset : offset + take
+                    ]
+                    edge_values[source_start : source_start + take] = records["value"][
+                        offset : offset + take
+                    ]
+                    positions[source_index] += take
+                    edge_cursor += take
+                    offset += take
+            if spool.read(1):
+                raise ValueError("exact edge spool contains trailing records")
+            if read_digest.digest() != spool_digest.digest():
+                raise ValueError("exact edge spool checksum validation failed")
+            if not np.array_equal(positions, source_indptr[1:]):
+                raise ValueError("exact edge spool did not populate every source row")
         graph_fingerprint = _graph_fingerprint(
             pool,
             frozen,
@@ -958,12 +1086,15 @@ def build_sparse_atomic_kernel_graph(
     support_sizes = graph.support_sizes
     logger.info(
         "Sparse atomic kernel graph completed: edges=%d, mean support=%.3f, "
-        "max support=%d, density=%.6g, array_bytes=%d, elapsed=%.3fs, budgets=satisfied",
+        "max support=%d, density=%.6g, final_csr_bytes=%d, peak_estimated_bytes=%d, "
+        "spool_bytes=%d, elapsed=%.3fs, budgets=satisfied",
         graph.edge_count,
         float(np.mean(support_sizes)),
         int(np.max(support_sizes)),
         graph.density,
         graph.array_bytes,
+        peak_estimated_bytes,
+        materialized_spool_bytes,
         elapsed,
     )
     return graph
@@ -1058,6 +1189,7 @@ def aggregate_candidate_contributions(
     *,
     max_entries: int = _DEFAULT_SPARSE_EDGE_LIMIT,
     max_graph_bytes: int | None = None,
+    max_spool_bytes: int | None = None,
     progress_callback: SourceProgressCallback | None = None,
 ) -> SparseCandidateContributions:
     """Aggregate source-major graph columns into normalized candidate rows."""
@@ -1073,13 +1205,16 @@ def aggregate_candidate_contributions(
         raise TypeError("progress_callback must be callable")
     candidate_count = len(graph.candidate_ids)
     started = time.perf_counter()
+    aggregate_peak_bytes = 0
+    aggregate_spool_bytes = 0
     logger.info(
         "Sparse candidate contribution aggregation started: M=%d, schema=%s, "
-        "max_entries=%d, max_graph_bytes=%s",
+        "max_entries=%d, max_graph_bytes=%s, max_spool_bytes=%s",
         candidate_count,
         SPARSE_CANDIDATE_CONTRIBUTION_SCHEMA_VERSION,
         entry_limit,
         byte_limit if byte_limit is not None else "unbounded",
+        max_spool_bytes if max_spool_bytes is not None else "derived-from-max_entries",
     )
     try:
         source_counts = np.bincount(
@@ -1099,106 +1234,146 @@ def aggregate_candidate_contributions(
             # CPython dict entries retain boxed integer keys and float values;
             # 72 bytes per live entry is deliberately conservative for the
             # temporary single-candidate accumulator and table slack.
-            accumulator = 128 + 72 * entry_count
+            accumulator = 128 + 72 * entry_count + 16 * entry_count
             return int(graph.array_bytes + source_order.nbytes + final_arrays + accumulator)
 
         support_counts = np.zeros(candidate_count, dtype=np.int64)
         completed_candidates = 0
         next_percent = [1]
+        spool_limit = _validate_spool_limit(max_spool_bytes, "max_spool_bytes")
+        spool_limit = (
+            spool_limit
+            if spool_limit is not None
+            else len(_EDGE_SPOOL_HEADER) + entry_limit * _EDGE_SPOOL_RECORD_BYTES
+        )
+        if spool_limit < len(_EDGE_SPOOL_HEADER):
+            raise ValueError("max_spool_bytes is too small for the candidate contribution spool header")
 
-        def accumulate_candidate(candidate_index: int) -> dict[int, float]:
-            accumulator: dict[int, float] = {}
-            start_source = int(candidate_offsets[candidate_index])
-            stop_source = int(candidate_offsets[candidate_index + 1])
-            for position in range(start_source, stop_source):
-                source_index = int(source_order[position])
-                start_edge = int(graph.source_indptr[source_index])
-                stop_edge = int(graph.source_indptr[source_index + 1])
-                for edge_index in range(start_edge, stop_edge):
-                    target = int(graph.target_indices[edge_index])
-                    weight = float(graph.values[edge_index])
-                    if target in accumulator:
-                        accumulator[target] += weight
-                        continue
-                    prospective_count = len(accumulator) + 1
-                    if prospective_count > entry_limit:
-                        raise ValueError(
-                            "sparse candidate contributions exceed max_entries: "
-                            f"M={candidate_count}, required_entries>{entry_limit}, "
-                            f"max_entries={entry_limit}"
-                        )
-                    if byte_limit is not None:
-                        estimated_bytes = estimated_peak_bytes(prospective_count)
-                        if estimated_bytes > byte_limit:
+        # One graph walk per candidate is enough.  The normalized, sorted
+        # candidate rows are streamed to a bounded scratch spool while the
+        # exact final CSR size is learned.  The second pass below reads bytes,
+        # never re-enters the graph or repeats Python hash/reduction work.
+        with tempfile.TemporaryFile(mode="w+b") as spool:
+            spool_digest = _spool_write_header(spool)
+            spool_bytes = len(_EDGE_SPOOL_HEADER)
+            for candidate_index in range(candidate_count):
+                accumulator: dict[int, float] = {}
+                start_source = int(candidate_offsets[candidate_index])
+                stop_source = int(candidate_offsets[candidate_index + 1])
+                for position in range(start_source, stop_source):
+                    source_index = int(source_order[position])
+                    start_edge = int(graph.source_indptr[source_index])
+                    stop_edge = int(graph.source_indptr[source_index + 1])
+                    for edge_index in range(start_edge, stop_edge):
+                        target = int(graph.target_indices[edge_index])
+                        weight = float(graph.values[edge_index])
+                        if target in accumulator:
+                            accumulator[target] += weight
+                            continue
+                        prospective_count = len(accumulator) + 1
+                        if prospective_count > entry_limit:
                             raise ValueError(
-                                "sparse candidate contributions exceed max_graph_bytes: "
-                                f"M={candidate_count}, required_entries>={prospective_count}, "
-                                f"estimated_peak_bytes={estimated_bytes}, "
-                                f"max_graph_bytes={byte_limit}"
+                                "sparse candidate contributions exceed max_entries: "
+                                f"M={candidate_count}, required_entries>{entry_limit}, "
+                                f"max_entries={entry_limit}"
                             )
-                    accumulator[target] = weight
-            return accumulator
-
-        # Preflight one candidate at a time.  This avoids M simultaneously
-        # live Python dictionaries while preserving source/target reduction
-        # order and determining the final CSR allocation before writing it.
-        for candidate_index in range(candidate_count):
-            accumulator = accumulate_candidate(candidate_index)
-            support_counts[candidate_index] = len(accumulator)
-            completed_candidates += 1
-            _report_candidate_progress(
-                completed_candidates,
-                candidate_count,
-                started,
-                next_percent,
-                graph.candidate_ids[candidate_index],
-            )
-            if progress_callback is not None:
-                progress_callback(completed_candidates, candidate_count)
-
-        candidate_indptr = np.empty(candidate_count + 1, dtype=np.int64)
-        candidate_indptr[0] = 0
-        np.cumsum(support_counts, dtype=np.int64, out=candidate_indptr[1:])
-        entry_count = int(candidate_indptr[-1])
-        if entry_count > entry_limit:
-            raise ValueError(
-                "sparse candidate contributions exceed max_entries: "
-                f"M={candidate_count}, required_entries={entry_count}, max_entries={entry_limit}"
-            )
-        required_bytes = 8 * (candidate_count + 1 + entry_count + entry_count + candidate_count)
-        estimated_peak = estimated_peak_bytes(entry_count)
-        if byte_limit is not None and estimated_peak > byte_limit:
-            raise ValueError(
-                "sparse candidate contributions exceed max_graph_bytes: "
-                f"M={candidate_count}, required_bytes={required_bytes}, "
-                f"estimated_peak_bytes={estimated_peak}, "
-                f"max_graph_bytes={byte_limit}"
-            )
-        target_indices = np.empty(entry_count, dtype=np.int64)
-        contribution_values = np.empty(entry_count, dtype=np.float64)
-        for candidate_index in range(candidate_count):
-            accumulator = accumulate_candidate(candidate_index)
-            start = int(candidate_indptr[candidate_index])
-            for offset, target in enumerate(sorted(accumulator)):
-                value = accumulator[target] / float(source_counts[candidate_index])
-                if not math.isfinite(value) or value <= 0.0:
-                    raise ValueError("candidate contribution is non-finite or non-positive")
-                target_indices[start + offset] = target
-                contribution_values[start + offset] = value
-            if not math.isclose(
-                float(
-                    np.sum(
-                        contribution_values[start : int(candidate_indptr[candidate_index + 1])],
-                        dtype=np.float64,
-                    )
-                ),
-                1.0,
-                rel_tol=0.0,
-                abs_tol=SPARSE_NUMERICAL_TOLERANCE,
-            ):
-                raise ValueError(
-                    f"candidate {graph.candidate_ids[candidate_index]!r} contribution is not normalized"
+                        estimated_bytes = estimated_peak_bytes(prospective_count)
+                        aggregate_peak_bytes = max(aggregate_peak_bytes, estimated_bytes)
+                        if byte_limit is not None:
+                            if estimated_bytes > byte_limit:
+                                raise ValueError(
+                                    "sparse candidate contributions exceed max_graph_bytes: "
+                                    f"M={candidate_count}, required_entries>={prospective_count}, "
+                                    f"estimated_peak_bytes={estimated_bytes}, "
+                                    f"max_graph_bytes={byte_limit}"
+                                )
+                        accumulator[target] = weight
+                support = len(accumulator)
+                support_counts[candidate_index] = support
+                completed_entries = int(
+                    np.sum(support_counts[: candidate_index + 1], dtype=np.int64)
                 )
+                if completed_entries > entry_limit:
+                    raise ValueError(
+                        "sparse candidate contributions exceed max_entries: "
+                        f"M={candidate_count}, required_entries={completed_entries}, "
+                        f"max_entries={entry_limit}"
+                    )
+                targets = sorted(accumulator)
+                records = np.empty(support, dtype=_EDGE_SPOOL_DTYPE)
+                records["target"] = targets
+                records["value"] = [
+                    accumulator[target] / float(source_counts[candidate_index])
+                    for target in targets
+                ]
+                if not np.all(np.isfinite(records["value"])) or np.any(records["value"] <= 0.0):
+                    raise ValueError("candidate contribution is non-finite or non-positive")
+                if not math.isclose(
+                    float(np.sum(records["value"], dtype=np.float64)),
+                    1.0,
+                    rel_tol=0.0,
+                    abs_tol=SPARSE_NUMERICAL_TOLERANCE,
+                ):
+                    raise ValueError(
+                        f"candidate {graph.candidate_ids[candidate_index]!r} contribution is not normalized"
+                    )
+                prospective_spool_bytes = spool_bytes + support * _EDGE_SPOOL_RECORD_BYTES
+                if prospective_spool_bytes > spool_limit:
+                    raise ValueError(
+                        "sparse candidate contributions exact spool exceeds its bounded capacity: "
+                        f"M={candidate_count}, Q={completed_entries}, "
+                        f"candidate={graph.candidate_ids[candidate_index]!r}, "
+                        f"spool_bytes={prospective_spool_bytes}, max_spool_bytes={spool_limit}"
+                    )
+                _spool_write_records(spool, spool_digest, records)
+                spool_bytes = prospective_spool_bytes
+                aggregate_spool_bytes = spool_bytes
+                completed_candidates += 1
+                _report_candidate_progress(
+                    completed_candidates,
+                    candidate_count,
+                    started,
+                    next_percent,
+                    graph.candidate_ids[candidate_index],
+                )
+                if progress_callback is not None:
+                    progress_callback(completed_candidates, candidate_count)
+
+            candidate_indptr = np.empty(candidate_count + 1, dtype=np.int64)
+            candidate_indptr[0] = 0
+            np.cumsum(support_counts, dtype=np.int64, out=candidate_indptr[1:])
+            entry_count = int(candidate_indptr[-1])
+            if entry_count > entry_limit:
+                raise ValueError(
+                    "sparse candidate contributions exceed max_entries: "
+                    f"M={candidate_count}, required_entries={entry_count}, max_entries={entry_limit}"
+                )
+            required_bytes = 8 * (candidate_count + 1 + entry_count + entry_count + candidate_count)
+            estimated_peak = estimated_peak_bytes(entry_count)
+            aggregate_peak_bytes = max(aggregate_peak_bytes, estimated_peak)
+            if byte_limit is not None and estimated_peak > byte_limit:
+                raise ValueError(
+                    "sparse candidate contributions exceed max_graph_bytes: "
+                    f"M={candidate_count}, required_bytes={required_bytes}, "
+                    f"estimated_peak_bytes={estimated_peak}, max_graph_bytes={byte_limit}"
+                )
+            target_indices = np.empty(entry_count, dtype=np.int64)
+            contribution_values = np.empty(entry_count, dtype=np.float64)
+            spool.seek(0)
+            if spool.read(len(_EDGE_SPOOL_HEADER)) != _EDGE_SPOOL_HEADER:
+                raise ValueError("candidate contribution spool has an invalid version header")
+            read_digest = hashlib.sha256()
+            read_digest.update(_EDGE_SPOOL_HEADER)
+            entry_cursor = 0
+            for records in _spool_read_records(spool, read_digest, entry_count):
+                count = records.shape[0]
+                target_indices[entry_cursor : entry_cursor + count] = records["target"]
+                contribution_values[entry_cursor : entry_cursor + count] = records["value"]
+                entry_cursor += count
+            if spool.read(1):
+                raise ValueError("candidate contribution spool contains trailing records")
+            if read_digest.digest() != spool_digest.digest() or entry_cursor != entry_count:
+                raise ValueError("candidate contribution spool checksum validation failed")
         contribution_fingerprint = _candidate_fingerprint(
             graph,
             candidate_indptr,
@@ -1225,11 +1400,14 @@ def aggregate_candidate_contributions(
     support_sizes = contributions.support_sizes
     logger.info(
         "Sparse candidate contribution aggregation completed: entries=%d, mean support=%.3f, "
-        "max support=%d, array_bytes=%d, elapsed=%.3fs",
+        "max support=%d, final_csr_bytes=%d, peak_estimated_bytes=%d, spool_bytes=%d, "
+        "elapsed=%.3fs",
         contributions.entry_count,
         float(np.mean(support_sizes)),
         int(np.max(support_sizes)),
         contributions.array_bytes,
+        aggregate_peak_bytes,
+        aggregate_spool_bytes,
         elapsed,
     )
     return contributions

@@ -875,6 +875,7 @@ class InformationEntropySelectionAlgorithm:
             chunk_size=bandwidth_settings.chunk_size,
             max_edges=int(self._entropy_value(request.options, "max_edges", 1_000_000)),
             max_graph_bytes=self._entropy_value(request.options, "max_graph_bytes", None),
+            max_spool_bytes=self._entropy_value(request.options, "max_graph_spool_bytes", None),
             max_radius_query_bytes=bandwidth_settings.radius_query_bytes,
         )
         contributions = aggregate_candidate_contributions(
@@ -882,6 +883,9 @@ class InformationEntropySelectionAlgorithm:
             max_entries=int(self._entropy_value(request.options, "max_entries", 1_000_000)),
             max_graph_bytes=self._entropy_value(request.options, "max_contribution_bytes", None)
             or self._entropy_value(request.options, "max_graph_bytes", None),
+            max_spool_bytes=self._entropy_value(
+                request.options, "max_contribution_spool_bytes", None
+            ),
         )
         method = str(self._entropy_value(request.options, "optimizer_method", "lazy_greedy"))
         optimizer = full_greedy if method == "full_greedy" else lazy_greedy

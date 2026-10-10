@@ -9,14 +9,18 @@ cannot change a run fingerprint.
 
 from __future__ import annotations
 
+import base64
 import json
 import math
 from dataclasses import asdict, dataclass, field
+from io import BytesIO
+from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 import numpy as np
 
-from nepflow.io.hashing import sha256_bytes, sha256_canonical_json
+from nepflow.io.atomic import atomic_write_stream
+from nepflow.io.hashing import sha256_bytes, sha256_canonical_json, sha256_file
 
 from .models import (
     SPARSE_NUMERICAL_TOLERANCE,
@@ -30,7 +34,8 @@ from .models import (
     SparseCandidateContributions,
 )
 
-DIAGNOSTICS_SCHEMA_VERSION = "entropy-scientific-diagnostics-v1"
+DIAGNOSTICS_SCHEMA_VERSION = "entropy-scientific-diagnostics-v2"
+DIAGNOSTICS_ARRAY_ARTIFACT_SCHEMA = "entropy-diagnostic-arrays-v1"
 DIAGNOSTICS_NUMERICAL_TOLERANCE = SPARSE_NUMERICAL_TOLERANCE
 QUANTILE_CONVENTION = "weighted-inverse-empirical-cdf-stable-value-row-index-v1"
 
@@ -70,14 +75,113 @@ def _finite(value: Any, *, name: str) -> float:
     return result
 
 
-def _tuple_floats(values: Sequence[Any], *, name: str) -> tuple[float, ...]:
-    result = tuple(_finite(value, name=name) for value in values)
+def _tuple_floats(values: Sequence[Any], *, name: str) -> np.ndarray:
+    result = np.asarray([_finite(value, name=name) for value in values], dtype=np.float64)
+    result.setflags(write=False)
     return result
 
 
 def _array_digest(values: Sequence[Any], *, dtype: str = "<f8") -> str:
     array = np.asarray(values, dtype=np.dtype(dtype))
     return sha256_bytes(np.ascontiguousarray(array).tobytes())
+
+
+def _diagnostic_array_metadata(array: np.ndarray) -> dict[str, Any]:
+    return {
+        "dtype": array.dtype.str,
+        "shape": list(array.shape),
+        "sha256": _array_digest(array),
+    }
+
+
+def _inline_diagnostic_arrays(
+    probabilities: np.ndarray,
+    final_q: np.ndarray,
+    row_ids: Sequence[str],
+) -> dict[str, Any]:
+    buffer = BytesIO()
+    np.savez(buffer, p=probabilities, q=final_q)
+    payload = buffer.getvalue()
+    return {
+        "schema": DIAGNOSTICS_ARRAY_ARTIFACT_SCHEMA,
+        "storage": "inline",
+        "encoding": "base64",
+        "payload": base64.b64encode(payload).decode("ascii"),
+        "sha256": sha256_bytes(payload),
+        "row_count": int(probabilities.shape[0]),
+        "row_ids_sha256": sha256_canonical_json(list(row_ids)),
+        "arrays": {
+            "p": _diagnostic_array_metadata(probabilities),
+            "q": _diagnostic_array_metadata(final_q),
+        },
+    }
+
+
+def _load_diagnostic_arrays(
+    artifact: Mapping[str, Any],
+    row_ids: Sequence[str],
+    *,
+    artifact_root: Path | None,
+) -> tuple[np.ndarray, np.ndarray]:
+    if artifact.get("schema") != DIAGNOSTICS_ARRAY_ARTIFACT_SCHEMA:
+        raise ValueError("unsupported entropy diagnostics numeric artifact schema")
+    storage = artifact.get("storage")
+    if storage == "inline":
+        if artifact.get("encoding") != "base64" or not isinstance(artifact.get("payload"), str):
+            raise ValueError("entropy diagnostics inline numeric artifact is malformed")
+        try:
+            payload = base64.b64decode(artifact["payload"], validate=True)
+        except (ValueError, TypeError) as exc:
+            raise ValueError("entropy diagnostics inline numeric artifact is not valid base64") from exc
+    elif storage == "file":
+        path_value = artifact.get("path")
+        if not isinstance(path_value, str) or not path_value.strip():
+            raise ValueError("entropy diagnostics numeric artifact path is missing")
+        path = Path(path_value)
+        if not path.is_absolute():
+            if artifact_root is None:
+                raise ValueError(
+                    "entropy diagnostics numeric artifact requires its artifact root for restore"
+                )
+            path = Path(artifact_root) / path
+        if not path.is_file() or sha256_file(path, required=True) != artifact.get("sha256"):
+            raise ValueError("entropy diagnostics numeric artifact is missing or corrupt")
+        payload = path.read_bytes()
+    else:
+        raise ValueError("entropy diagnostics numeric artifact storage is unsupported")
+    if sha256_bytes(payload) != artifact.get("sha256"):
+        raise ValueError("entropy diagnostics numeric artifact checksum is invalid")
+    try:
+        with np.load(BytesIO(payload), allow_pickle=False) as archive:
+            probabilities = np.asarray(archive["p"], dtype=np.float64)
+            final_q = np.asarray(archive["q"], dtype=np.float64)
+    except (KeyError, OSError, ValueError, EOFError) as exc:
+        raise ValueError("entropy diagnostics numeric artifact cannot be read") from exc
+    if (
+        probabilities.dtype.str != "<f8"
+        or final_q.dtype.str != "<f8"
+        or probabilities.ndim != 1
+        or final_q.shape != probabilities.shape
+        or probabilities.shape[0] != len(row_ids)
+        or artifact.get("row_count") != len(row_ids)
+        or artifact.get("row_ids_sha256") != sha256_canonical_json(list(row_ids))
+    ):
+        raise ValueError("entropy diagnostics numeric artifact row identity or shape is invalid")
+    array_records = artifact.get("arrays")
+    if not isinstance(array_records, Mapping):
+        raise ValueError("entropy diagnostics numeric array metadata is missing")
+    for name, array in (("p", probabilities), ("q", final_q)):
+        record = array_records.get(name)
+        if (
+            not isinstance(record, Mapping)
+            or record.get("dtype") != array.dtype.str
+            or record.get("shape") != list(array.shape)
+            or record.get("sha256") != _array_digest(array)
+        ):
+            raise ValueError(f"entropy diagnostics numeric array {name} is corrupt")
+    probabilities.setflags(write=False)
+    final_q.setflags(write=False)
+    return probabilities, final_q
 
 
 def weighted_quantile(
@@ -430,8 +534,8 @@ class EntropyScientificDiagnostics:
     selected_candidate_ids: tuple[str, ...]
     acquisition_order: tuple[str, ...]
     test_candidate_ids: tuple[str, ...]
-    target_probabilities: tuple[float, ...]
-    final_q: tuple[float, ...]
+    target_probabilities: np.ndarray
+    final_q: np.ndarray
     beta: float
     final_objective: float
     final_cross_entropy: float
@@ -494,7 +598,7 @@ class EntropyScientificDiagnostics:
         final_q = _tuple_floats(self.final_q, name="final q")
         if len(target) != len(rows) or len(final_q) != len(rows):
             raise ValueError("diagnostics p and q arrays must match atomic row count")
-        if any(value <= 0.0 for value in target + final_q):
+        if np.any(target <= 0.0) or np.any(final_q <= 0.0):
             raise ValueError("diagnostics p and q arrays must be strictly positive")
         beta = _finite(self.beta, name="diagnostics beta")
         if beta <= 0.0:
@@ -620,8 +724,9 @@ class EntropyScientificDiagnostics:
             "acquisition_order": list(self.acquisition_order),
             "test_candidate_ids": list(self.test_candidate_ids),
             "selection_history": self._selection_history_manifest(),
-            "p": list(self.target_probabilities),
-            "q": list(self.final_q),
+            "p_sha256": _array_digest(self.target_probabilities),
+            "q_sha256": _array_digest(self.final_q),
+            "numeric_array_shape": [self.atomic_row_count],
             "beta": self.beta,
             "final_objective": self.final_objective,
             "final_cross_entropy": self.final_cross_entropy,
@@ -741,12 +846,43 @@ class EntropyScientificDiagnostics:
     def __getitem__(self, key: str) -> Any:
         return self.to_manifest()[key]
 
-    def to_manifest(self) -> dict[str, Any]:
+    def to_manifest(self, artifact_dir: Path | None = None) -> dict[str, Any]:
         """Return the complete structured diagnostic payload."""
 
         calibration_record = self._calibration_manifest()
         if calibration_record is None:
             raise ValueError("entropy diagnostics require the complete calibration trace")
+        if artifact_dir is None:
+            numeric_artifact = _inline_diagnostic_arrays(
+                self.target_probabilities,
+                self.final_q,
+                self.row_ids,
+            )
+        else:
+            artifact_dir = Path(artifact_dir)
+            artifact_path = artifact_dir / (
+                f"entropy_diagnostic_arrays-{self.scientific_fingerprint}.npz"
+            )
+            artifact_sha256 = atomic_write_stream(
+                artifact_path,
+                lambda handle: np.savez(
+                    handle,
+                    p=self.target_probabilities,
+                    q=self.final_q,
+                ),
+            )
+            numeric_artifact = {
+                "schema": DIAGNOSTICS_ARRAY_ARTIFACT_SCHEMA,
+                "storage": "file",
+                "path": artifact_path.name,
+                "sha256": artifact_sha256,
+                "row_count": self.atomic_row_count,
+                "row_ids_sha256": sha256_canonical_json(list(self.row_ids)),
+                "arrays": {
+                    "p": _diagnostic_array_metadata(self.target_probabilities),
+                    "q": _diagnostic_array_metadata(self.final_q),
+                },
+            }
         return {
             "schema_version": self.schema_version,
             "scientific_fingerprint": self.scientific_fingerprint,
@@ -799,10 +935,7 @@ class EntropyScientificDiagnostics:
             "graph": self.graph.to_manifest(),
             "objective": {
                 "beta": self.beta,
-                "target_probabilities": list(self.target_probabilities),
-                "final_q": list(self.final_q),
-                "target_probability_sha256": _array_digest(self.target_probabilities),
-                "final_q_sha256": _array_digest(self.final_q),
+                "numeric_arrays": numeric_artifact,
                 "objective_F": self.final_objective,
                 "cross_entropy_nats": self.final_cross_entropy,
                 "shannon_entropy_nats": self.final_shannon_entropy,
@@ -823,7 +956,12 @@ class EntropyScientificDiagnostics:
         }
 
     @classmethod
-    def from_manifest(cls, value: Mapping[str, Any]) -> "EntropyScientificDiagnostics":
+    def from_manifest(
+        cls,
+        value: Mapping[str, Any],
+        *,
+        artifact_root: Path | None = None,
+    ) -> "EntropyScientificDiagnostics":
         """Restore a diagnostics record and verify its independent ``p/q`` science."""
 
         try:
@@ -860,12 +998,17 @@ class EntropyScientificDiagnostics:
             or whitening.get("fingerprint") != source["transform"]
         ):
             raise ValueError("entropy diagnostics whitening identity does not match its source")
-        if _array_digest(objective.get("target_probabilities", ())) != objective.get(
-            "target_probability_sha256"
-        ):
-            raise ValueError("entropy diagnostics target probability artifact is corrupt")
-        if _array_digest(objective.get("final_q", ())) != objective.get("final_q_sha256"):
-            raise ValueError("entropy diagnostics final q artifact is corrupt")
+        numeric_artifact = objective.get("numeric_arrays")
+        if not isinstance(numeric_artifact, Mapping):
+            raise ValueError(
+                "legacy JSON-array diagnostics are unsupported; regenerate the completed result "
+                "with the versioned numeric artifact schema"
+            )
+        probabilities, final_q = _load_diagnostic_arrays(
+            numeric_artifact,
+            tuple(identity.get("row_ids", ())),
+            artifact_root=artifact_root,
+        )
         graph = _graph_from_manifest(graph_manifest)
         coverage_values = value.get("coverage", {})
         if not isinstance(coverage_values, Mapping):
@@ -905,8 +1048,8 @@ class EntropyScientificDiagnostics:
             selected_candidate_ids=tuple(identity["selected_candidate_ids"]),
             acquisition_order=tuple(identity["acquisition_order"]),
             test_candidate_ids=tuple(identity["test_candidate_ids"]),
-            target_probabilities=tuple(objective["target_probabilities"]),
-            final_q=tuple(objective["final_q"]),
+            target_probabilities=probabilities,
+            final_q=final_q,
             beta=float(objective["beta"]),
             final_objective=float(objective["objective_F"]),
             final_cross_entropy=float(objective["cross_entropy_nats"]),

@@ -315,6 +315,7 @@ class SelectionStage:
                     whitening_singular_policy=entropy.whitening_singular_policy,
                 ),
                 local_descriptor_workers=settings.local_descriptor_workers,
+                max_local_descriptor_inflight_bytes=settings.max_local_descriptor_inflight_bytes,
                 candidate_ids=candidate_identity_ids,
                 structure_ids=physical_structure_ids,
             )
@@ -570,7 +571,9 @@ class SelectionStage:
             entropy_diagnostics=(
                 None
                 if result.entropy_diagnostics is None
-                else result.entropy_diagnostics.to_manifest()
+                else result.entropy_diagnostics.to_manifest(
+                    active.project_dir / "structures" / "selected"
+                )
             ),
         )
         if result.entropy_diagnostics is not None:

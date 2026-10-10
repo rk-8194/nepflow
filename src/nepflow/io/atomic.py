@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import tempfile
+from collections.abc import Callable
 from pathlib import Path
 
 
@@ -90,4 +91,64 @@ def atomic_write_text(
     atomic_write_bytes(path, text.encode(encoding), durable=durable)
 
 
-__all__ = ["atomic_write_bytes", "atomic_write_text"]
+def atomic_write_stream(
+    path: str | Path,
+    writer: Callable[[object], None],
+    *,
+    durable: bool = True,
+    chunk_size: int = 1024 * 1024,
+) -> str:
+    """Stream an artifact to a same-directory temporary file and publish it.
+
+    The callback receives the open binary file.  The completed temporary file
+    is hashed incrementally before ``os.replace`` publishes it, so callers do
+    not need to construct a second in-memory copy of a large artifact.
+    """
+
+    import hashlib
+
+    if isinstance(chunk_size, bool) or not isinstance(chunk_size, int) or chunk_size < 1:
+        raise ValueError("chunk_size must be a positive integer")
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path: Path | None = None
+    file_descriptor: int | None = None
+    try:
+        file_descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{target.name}.", suffix=".tmp", dir=target.parent
+        )
+        temporary_path = Path(temporary_name)
+        with os.fdopen(file_descriptor, "w+b") as handle:
+            file_descriptor = None
+            writer(handle)
+            handle.flush()
+            if durable:
+                os.fsync(handle.fileno())
+            handle.seek(0)
+            digest = hashlib.sha256()
+            while True:
+                block = handle.read(chunk_size)
+                if not block:
+                    break
+                digest.update(block)
+            handle.seek(0)
+        os.replace(temporary_path, target)
+        temporary_path = None
+        if durable:
+            _sync_directory(target.parent)
+        return digest.hexdigest()
+    except BaseException:
+        if file_descriptor is not None:
+            try:
+                os.close(file_descriptor)
+            except OSError:
+                pass
+        if temporary_path is not None:
+            try:
+                temporary_path.unlink()
+            except OSError:
+                pass
+        raise
+
+
+__all__ = ["atomic_write_bytes", "atomic_write_stream", "atomic_write_text"]

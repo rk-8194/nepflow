@@ -349,7 +349,12 @@ def validate_config(
         value = getattr(entropy, field_name)
         if not isinstance(value, int) or value < 1:
             raise ConfigurationError(f"selection.entropy.{field_name} must be positive")
-    for field_name in ("max_graph_bytes", "max_contribution_bytes"):
+    for field_name in (
+        "max_graph_bytes",
+        "max_graph_spool_bytes",
+        "max_contribution_bytes",
+        "max_contribution_spool_bytes",
+    ):
         value = getattr(entropy, field_name)
         if value is not None and (not isinstance(value, int) or value < 1):
             raise ConfigurationError(f"selection.entropy.{field_name} must be positive")
@@ -364,6 +369,14 @@ def validate_config(
         config.selection.local_descriptor_workers, int
     ):
         raise ConfigurationError("selection.local_descriptor_workers must be an integer")
+    if (
+        isinstance(config.selection.max_local_descriptor_inflight_bytes, bool)
+        or not isinstance(config.selection.max_local_descriptor_inflight_bytes, int)
+        or config.selection.max_local_descriptor_inflight_bytes < 1
+    ):
+        raise ConfigurationError(
+            "selection.max_local_descriptor_inflight_bytes must be a positive integer"
+        )
     if (
         not math.isfinite(config.selection.background_mass)
         or config.selection.background_mass <= 0.0
@@ -382,6 +395,7 @@ def validate_config(
         "max_search_iterations",
         "composition_aware_fps_adaptive_retries",
         "local_descriptor_workers",
+        "max_local_descriptor_inflight_bytes",
     ):
         _require_non_negative(
             f"selection.{field_name}",

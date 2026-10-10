@@ -2,16 +2,17 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import math
 import multiprocessing as mp
 import os
 import sys
+import tempfile
 import time
 from collections.abc import Mapping, Sequence
 from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, wait
 from dataclasses import dataclass, field
-from io import BytesIO
 from multiprocessing.context import BaseContext
 from pathlib import Path
 from typing import Any, cast
@@ -25,7 +26,7 @@ from nepflow.domain.identities import (
     calculate_structure_id,
 )
 from nepflow.errors import StateError
-from nepflow.io.atomic import atomic_write_bytes
+from nepflow.io.atomic import atomic_write_bytes, atomic_write_stream
 from nepflow.io.hashing import sha256_bytes, sha256_canonical_json, sha256_file
 from nepflow.io.json import read_json_object, write_json
 
@@ -262,27 +263,47 @@ def _write_descriptor_cache(
 ) -> None:
     """Atomically write the array, then commit the unchanged manifest last."""
 
-    array_buffer = BytesIO()
-    np.save(array_buffer, descriptors, allow_pickle=False)
-    array_bytes = array_buffer.getvalue()
-    previous_array = descriptor_cache.read_bytes() if descriptor_cache.is_file() else None
-    previous_manifest = manifest_path.read_bytes() if manifest_path.is_file() else None
+    descriptor_cache.parent.mkdir(parents=True, exist_ok=True)
+    staging_fd, staging_name = tempfile.mkstemp(
+        prefix=f".{descriptor_cache.name}.", suffix=".staging", dir=descriptor_cache.parent
+    )
+    os.close(staging_fd)
+    staging_path = Path(staging_name)
+    cache_backup = descriptor_cache.with_name(f".{descriptor_cache.name}.previous")
+    manifest_backup = manifest_path.with_name(f".{manifest_path.name}.previous")
+    cache_had_previous = descriptor_cache.is_file()
+    manifest_had_previous = manifest_path.is_file()
+    cache_backup.unlink(missing_ok=True)
+    manifest_backup.unlink(missing_ok=True)
     try:
-        atomic_write_bytes(descriptor_cache, array_bytes)
+        artifact_sha256 = atomic_write_stream(
+            staging_path,
+            lambda handle: np.save(handle, descriptors, allow_pickle=False),
+        )
         persisted_manifest = dict(manifest)
-        persisted_manifest["artifact_sha256"] = sha256_bytes(array_bytes)
+        persisted_manifest["artifact_sha256"] = artifact_sha256
+        if cache_had_previous:
+            os.replace(descriptor_cache, cache_backup)
+        if manifest_had_previous:
+            os.replace(manifest_path, manifest_backup)
+        os.replace(staging_path, descriptor_cache)
         write_json(manifest_path, persisted_manifest, indent=None)
+        cache_backup.unlink(missing_ok=True)
+        manifest_backup.unlink(missing_ok=True)
     except BaseException:
         # The array and its identity manifest form one reusable cache record.
         # Restore the prior pair if publication of the second member fails.
-        if previous_array is None:
+        staging_path.unlink(missing_ok=True)
+        if cache_backup.is_file():
             descriptor_cache.unlink(missing_ok=True)
-        else:
-            atomic_write_bytes(descriptor_cache, previous_array)
-        if previous_manifest is None:
+            os.replace(cache_backup, descriptor_cache)
+        elif not cache_had_previous:
+            descriptor_cache.unlink(missing_ok=True)
+        if manifest_backup.is_file():
             manifest_path.unlink(missing_ok=True)
-        else:
-            atomic_write_bytes(manifest_path, previous_manifest)
+            os.replace(manifest_backup, manifest_path)
+        elif not manifest_had_previous:
+            manifest_path.unlink(missing_ok=True)
         raise
 
 
@@ -402,7 +423,15 @@ LOCAL_REPRESENTATION_SCHEMA_VERSION = "local-environment-representation-v1"
 LOCAL_REPRESENTATION_BACKEND = "invariant-radial-angular-v1"
 LOCAL_ENVIRONMENT_ORDERING_VERSION = "candidate-order-atom-key-v1"
 LOCAL_PREPROCESSING_VERSION = "full-pool-whitening-v1"
-LOCAL_REPRESENTATION_CACHE_SCHEMA_VERSION = "local-representation-cache-v1"
+LOCAL_REPRESENTATION_CACHE_SCHEMA_VERSION = "local-representation-cache-v2"
+DEFAULT_LOCAL_DESCRIPTOR_INFLIGHT_BYTES = 512 * 1024 * 1024
+
+
+def _sha256_array(value: np.ndarray) -> str:
+    array = np.ascontiguousarray(value)
+    digest = hashlib.sha256()
+    digest.update(memoryview(array).cast("B"))
+    return digest.hexdigest()
 
 
 @dataclass(frozen=True, slots=True)
@@ -998,6 +1027,34 @@ def _resolve_local_descriptor_workers(requested: int, candidate_count: int) -> i
     return min(requested, candidate_count)
 
 
+def _validate_local_descriptor_inflight_bytes(value: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError("max_local_descriptor_inflight_bytes must be a positive integer")
+    return value
+
+
+def _estimate_local_descriptor_task_bytes(
+    candidate: Any,
+    feature_width: int,
+    config: LocalRepresentationConfig,
+    species: Sequence[str],
+) -> int:
+    """Conservatively estimate parent, IPC, worker and result residency."""
+
+    atom_count = len(candidate)
+    payload = 4096 + 128 * atom_count
+    arrays = getattr(candidate, "arrays", {})
+    if isinstance(arrays, Mapping):
+        payload += sum(int(np.asarray(array).nbytes) for array in arrays.values())
+    payload += int(np.asarray(getattr(candidate, "positions", ()), dtype=np.float64).nbytes)
+    payload += int(np.asarray(getattr(candidate, "cell", ()), dtype=np.float64).nbytes)
+    result = atom_count * feature_width * 8
+    atom_order = atom_count * 8
+    neighbour_scratch = atom_count * max(1, atom_count) * 16
+    feature_scratch = atom_count * feature_width * 16 + len(species) * config.radial_bins * 16
+    return int(payload + result + atom_order + neighbour_scratch + feature_scratch)
+
+
 def _local_process_context() -> BaseContext:
     """Use a safe process start method for the current platform."""
 
@@ -1038,12 +1095,17 @@ def _compute_local_raw_descriptors(
     species: tuple[str, ...],
     config: LocalRepresentationConfig,
     local_descriptor_workers: int,
+    *,
+    max_local_descriptor_inflight_bytes: int = DEFAULT_LOCAL_DESCRIPTOR_INFLIGHT_BYTES,
 ) -> tuple[np.ndarray, list[LocalEnvironmentRow]]:
     """Compute raw rows serially or with bounded candidate-level processes."""
 
     worker_count = _resolve_local_descriptor_workers(
         local_descriptor_workers,
         len(candidates),
+    )
+    inflight_limit = _validate_local_descriptor_inflight_bytes(
+        max_local_descriptor_inflight_bytes
     )
     logger.info(
         "Local descriptor workers: %d (effective allocation %d)",
@@ -1056,19 +1118,33 @@ def _compute_local_raw_descriptors(
         dtype=np.float64,
     )
     rows: list[LocalEnvironmentRow] = []
+    base_workspace_bytes = int(raw.nbytes)
+    task_estimates = [
+        _estimate_local_descriptor_task_bytes(candidate, feature_width, config, species)
+        for candidate in candidates
+    ]
+    if base_workspace_bytes >= inflight_limit:
+        raise ValueError(
+            "local descriptor in-flight budget is smaller than the existing raw workspace: "
+            f"workspace_bytes={base_workspace_bytes}, max_local_descriptor_inflight_bytes="
+            f"{inflight_limit}"
+        )
     progress = _LocalDescriptorProgress(len(candidates))
     pending: dict[Future[_LocalDescriptorResult], int] = {}
+    pending_bytes: dict[Future[_LocalDescriptorResult], int] = {}
     ready: dict[int, _LocalDescriptorResult] = {}
+    ready_bytes: dict[int, int] = {}
     next_to_submit = 0
     next_to_publish = 0
     completed = 0
     write_offset = 0
+    inflight_bytes = base_workspace_bytes
 
     def task_for(index: int) -> _LocalDescriptorTask:
         return _LocalDescriptorTask(index, candidates[index], species, config)
 
-    def publish(result: _LocalDescriptorResult) -> None:
-        nonlocal write_offset, next_to_publish
+    def publish(result: _LocalDescriptorResult, estimated_bytes: int) -> None:
+        nonlocal inflight_bytes, write_offset, next_to_publish
         index = result.candidate_index
         candidate = candidates[index]
         expected_atoms = len(candidate)
@@ -1089,17 +1165,32 @@ def _compute_local_raw_descriptors(
         )
         write_offset += expected_atoms
         next_to_publish += 1
+        inflight_bytes -= estimated_bytes
+
+    def admission_error(index: int, estimated_bytes: int) -> ValueError:
+        return ValueError(
+            "local descriptor task exceeds in-flight byte budget before launch: "
+            f"candidate_index={index}, candidate_id={candidate_ids[index]}, "
+            f"atom_count={len(candidates[index])}, estimated_bytes={estimated_bytes}, "
+            f"existing_workspace_bytes={base_workspace_bytes}, "
+            f"max_local_descriptor_inflight_bytes={inflight_limit}"
+        )
 
     if worker_count == 1:
         for index in range(len(candidates)):
+            estimate = task_estimates[index]
+            if base_workspace_bytes + estimate > inflight_limit:
+                raise admission_error(index, estimate)
+            inflight_bytes += estimate
             try:
                 result = _compute_local_descriptor_task(task_for(index))
             except BaseException as exc:
+                inflight_bytes -= estimate
                 raise LocalDescriptorWorkerError(
                     "Local descriptor generation failed for candidate index "
                     f"{index} ({candidate_ids[index]})"
                 ) from exc
-            publish(result)
+            publish(result, estimate)
             completed += 1
             progress.completed(completed)
         return raw, rows
@@ -1112,15 +1203,28 @@ def _compute_local_raw_descriptors(
             initializer=_limit_local_worker_threads,
         )
         bound = max(worker_count, 2 * worker_count)
-        while next_to_submit < len(candidates) and len(pending) + len(ready) < bound:
-            future = executor.submit(_compute_local_descriptor_task, task_for(next_to_submit))
-            pending[future] = next_to_submit
-            next_to_submit += 1
+
+        def submit_available() -> None:
+            nonlocal next_to_submit, inflight_bytes
+            while next_to_submit < len(candidates) and len(pending) + len(ready) < bound:
+                estimate = task_estimates[next_to_submit]
+                if inflight_bytes + estimate > inflight_limit:
+                    if not pending and not ready:
+                        raise admission_error(next_to_submit, estimate)
+                    break
+                future = executor.submit(_compute_local_descriptor_task, task_for(next_to_submit))
+                pending[future] = next_to_submit
+                pending_bytes[future] = estimate
+                inflight_bytes += estimate
+                next_to_submit += 1
+
+        submit_available()
 
         while pending:
             done, _ = wait(tuple(pending), return_when=FIRST_COMPLETED)
             for future in sorted(done, key=lambda item: pending[item]):
                 index = pending.pop(future)
+                estimate = pending_bytes.pop(future)
                 try:
                     result = future.result()
                 except BaseException as exc:
@@ -1134,14 +1238,13 @@ def _compute_local_raw_descriptors(
                         f"{result.candidate_index}, expected {index} ({candidate_ids[index]})"
                     )
                 ready[index] = result
+                ready_bytes[index] = estimate
                 completed += 1
                 progress.completed(completed)
             while next_to_publish in ready:
-                publish(ready.pop(next_to_publish))
-            while next_to_submit < len(candidates) and len(pending) + len(ready) < bound:
-                future = executor.submit(_compute_local_descriptor_task, task_for(next_to_submit))
-                pending[future] = next_to_submit
-                next_to_submit += 1
+                index = next_to_publish
+                publish(ready.pop(index), ready_bytes.pop(index))
+            submit_available()
     except BaseException:
         for future in pending:
             future.cancel()
@@ -1315,6 +1418,7 @@ def build_local_environment_representation(
     candidate_ids: Sequence[str] | None = None,
     structure_ids: Sequence[str] | None = None,
     local_descriptor_workers: int = 0,
+    max_local_descriptor_inflight_bytes: int = DEFAULT_LOCAL_DESCRIPTOR_INFLIGHT_BYTES,
 ) -> LocalEnvironmentRepresentation:
     """Build deterministic local rows and fit whitening on the complete pool."""
 
@@ -1345,6 +1449,7 @@ def build_local_environment_representation(
         all_species,
         settings,
         local_descriptor_workers,
+        max_local_descriptor_inflight_bytes=max_local_descriptor_inflight_bytes,
     )
     if not np.all(np.isfinite(raw)):
         raise ValueError("local representation contains non-finite values")
@@ -1406,45 +1511,80 @@ def _write_local_representation_cache(
     representation: LocalEnvironmentRepresentation,
     identity: dict[str, Any],
 ) -> None:
-    buffer = BytesIO()
-    np.savez(
-        buffer,
-        raw_descriptors=representation.raw_descriptors,
-        descriptors=representation.descriptors,
-        mean=representation.transform.mean,
-        eigenvalues=representation.transform.eigenvalues,
-        eigenvectors=representation.transform.eigenvectors,
-        retained_indices=np.asarray(representation.transform.retained_indices, dtype=np.int64),
-    )
-    artifact = buffer.getvalue()
+    arrays = {
+        "raw_descriptors": np.asarray(representation.raw_descriptors, dtype=np.float64),
+        "descriptors": np.asarray(representation.descriptors, dtype=np.float64),
+        "mean": np.asarray(representation.transform.mean, dtype=np.float64),
+        "eigenvalues": np.asarray(representation.transform.eigenvalues, dtype=np.float64),
+        "eigenvectors": np.asarray(representation.transform.eigenvectors, dtype=np.float64),
+        "retained_indices": np.asarray(representation.transform.retained_indices, dtype=np.int64),
+    }
+    rows_payload = [row.to_dict(index) for index, row in enumerate(representation.rows)]
     persisted = {
         "schema_version": LOCAL_REPRESENTATION_CACHE_SCHEMA_VERSION,
         "identity": identity,
         "transform": representation.transform.to_manifest(),
-        "rows": [row.to_dict(index) for index, row in enumerate(representation.rows)],
+        "rows": rows_payload,
         "shape": {
             "raw": list(representation.raw_descriptors.shape),
             "descriptors": list(representation.descriptors.shape),
         },
         "candidate_ids": list(representation.candidate_ids),
         "structure_ids": list(representation.structure_ids),
-        "artifact_sha256": sha256_bytes(artifact),
+        "artifact": {
+            "format": "npz-stream-v1",
+            "arrays": {
+                name: {
+                    "dtype": array.dtype.str,
+                    "shape": list(array.shape),
+                    "sha256": _sha256_array(array),
+                }
+                for name, array in arrays.items()
+            },
+            "rows_sha256": sha256_canonical_json(rows_payload),
+        },
         "representation_fingerprint": representation.fingerprint,
     }
-    previous_artifact = cache_path.read_bytes() if cache_path.is_file() else None
-    previous_manifest = manifest_path.read_bytes() if manifest_path.is_file() else None
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    staging_fd, staging_name = tempfile.mkstemp(
+        prefix=f".{cache_path.name}.", suffix=".staging", dir=cache_path.parent
+    )
+    os.close(staging_fd)
+    staging_path = Path(staging_name)
+    cache_backup = cache_path.with_name(f".{cache_path.name}.previous")
+    manifest_backup = manifest_path.with_name(f".{manifest_path.name}.previous")
+    cache_had_previous = cache_path.is_file()
+    manifest_had_previous = manifest_path.is_file()
+    cache_backup.unlink(missing_ok=True)
+    manifest_backup.unlink(missing_ok=True)
     try:
-        atomic_write_bytes(cache_path, artifact)
-        write_json(manifest_path, persisted, indent=None)
+        artifact_sha256 = atomic_write_stream(
+            staging_path,
+            lambda handle: np.savez(handle, **arrays),
+        )
+        persisted_manifest = dict(identity)
+        persisted_manifest.update(persisted)
+        persisted_manifest["artifact_sha256"] = artifact_sha256
+        if cache_had_previous:
+            os.replace(cache_path, cache_backup)
+        if manifest_had_previous:
+            os.replace(manifest_path, manifest_backup)
+        os.replace(staging_path, cache_path)
+        write_json(manifest_path, persisted_manifest, indent=None)
+        cache_backup.unlink(missing_ok=True)
+        manifest_backup.unlink(missing_ok=True)
     except BaseException:
-        if previous_artifact is None:
+        staging_path.unlink(missing_ok=True)
+        if cache_backup.is_file():
             cache_path.unlink(missing_ok=True)
-        else:
-            atomic_write_bytes(cache_path, previous_artifact)
-        if previous_manifest is None:
+            os.replace(cache_backup, cache_path)
+        elif not cache_had_previous:
+            cache_path.unlink(missing_ok=True)
+        if manifest_backup.is_file():
             manifest_path.unlink(missing_ok=True)
-        else:
-            atomic_write_bytes(manifest_path, previous_manifest)
+            os.replace(manifest_backup, manifest_path)
+        elif not manifest_had_previous:
+            manifest_path.unlink(missing_ok=True)
         raise
 
 
@@ -1470,13 +1610,38 @@ def _load_local_representation_cache(
             return None
         if manifest.get("artifact_sha256") != sha256_file(cache_path, required=True):
             return None
-        with np.load(cache_path, allow_pickle=False) as arrays:
-            raw = np.asarray(arrays["raw_descriptors"], dtype=np.float64)
-            descriptors = np.asarray(arrays["descriptors"], dtype=np.float64)
-            mean = np.asarray(arrays["mean"], dtype=np.float64)
-            eigenvalues = np.asarray(arrays["eigenvalues"], dtype=np.float64)
-            eigenvectors = np.asarray(arrays["eigenvectors"], dtype=np.float64)
-            retained = tuple(int(value) for value in arrays["retained_indices"].tolist())
+        artifact_manifest = manifest.get("artifact")
+        if (
+            not isinstance(artifact_manifest, dict)
+            or artifact_manifest.get("format") != "npz-stream-v1"
+            or not isinstance(artifact_manifest.get("arrays"), dict)
+        ):
+            return None
+        with np.load(cache_path, allow_pickle=False) as archive:
+            raw = np.asarray(archive["raw_descriptors"], dtype=np.float64)
+            descriptors = np.asarray(archive["descriptors"], dtype=np.float64)
+            mean = np.asarray(archive["mean"], dtype=np.float64)
+            eigenvalues = np.asarray(archive["eigenvalues"], dtype=np.float64)
+            eigenvectors = np.asarray(archive["eigenvectors"], dtype=np.float64)
+            retained_array = np.asarray(archive["retained_indices"], dtype=np.int64)
+            retained = tuple(int(value) for value in retained_array.tolist())
+            loaded_arrays = {
+                "raw_descriptors": raw,
+                "descriptors": descriptors,
+                "mean": mean,
+                "eigenvalues": eigenvalues,
+                "eigenvectors": eigenvectors,
+                "retained_indices": retained_array,
+            }
+        for name, array in loaded_arrays.items():
+            record = artifact_manifest["arrays"].get(name)
+            if (
+                not isinstance(record, dict)
+                or record.get("dtype") != array.dtype.str
+                or record.get("shape") != list(array.shape)
+                or record.get("sha256") != _sha256_array(array)
+            ):
+                return None
         if raw.ndim != 2 or descriptors.ndim != 2 or raw.shape[0] != descriptors.shape[0]:
             return None
         shape = manifest.get("shape")
@@ -1518,6 +1683,8 @@ def _load_local_representation_cache(
             return None
         rows_payload = manifest.get("rows")
         if not isinstance(rows_payload, list) or len(rows_payload) != raw.shape[0]:
+            return None
+        if artifact_manifest.get("rows_sha256") != sha256_canonical_json(rows_payload):
             return None
         rows = tuple(
             LocalEnvironmentRow(
@@ -1571,11 +1738,13 @@ def load_or_calculate_local_representations(
     candidate_ids: Sequence[str] | None = None,
     structure_ids: Sequence[str] | None = None,
     local_descriptor_workers: int = 0,
+    max_local_descriptor_inflight_bytes: int = DEFAULT_LOCAL_DESCRIPTOR_INFLIGHT_BYTES,
 ) -> LocalEnvironmentRepresentation:
     """Load exact-identity local rows or calculate and publish them."""
 
     settings = _coerce_local_representation_config(config)
     _resolve_local_descriptor_workers(local_descriptor_workers, len(candidates))
+    _validate_local_descriptor_inflight_bytes(max_local_descriptor_inflight_bytes)
     ordered_candidate_ids = _local_candidate_ids(candidates, candidate_ids)
     ordered_structure_ids = _local_structure_ids(candidates, structure_ids)
     if settings.magnetic_mode == "structural":
@@ -1618,6 +1787,7 @@ def load_or_calculate_local_representations(
         candidate_ids=ordered_candidate_ids,
         structure_ids=ordered_structure_ids,
         local_descriptor_workers=local_descriptor_workers,
+        max_local_descriptor_inflight_bytes=max_local_descriptor_inflight_bytes,
     )
     identity = _local_identity(
         ordered_candidate_ids,
@@ -1633,6 +1803,7 @@ def load_or_calculate_local_representations(
 
 __all__ = [
     "DESCRIPTOR_CACHE_SCHEMA_VERSION",
+    "DEFAULT_LOCAL_DESCRIPTOR_INFLIGHT_BYTES",
     "LOCAL_ENVIRONMENT_ORDERING_VERSION",
     "LOCAL_PREPROCESSING_VERSION",
     "LOCAL_REPRESENTATION_BACKEND",
