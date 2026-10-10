@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 from io import StringIO
 from pathlib import Path
+from typing import Any, Mapping
 
 from ase.io import write as ase_write
 
@@ -34,6 +35,7 @@ def write_selected_structures(
     algorithm_id: str = "fps",
     train_anchor_indices: list[int] | None = None,
     train_acquisition_order: list[str] | None = None,
+    entropy_diagnostics: Mapping[str, Any] | None = None,
 ) -> tuple[Path, Path]:
     """Write selected train/test structures using the established paths."""
 
@@ -110,6 +112,9 @@ def write_selected_structures(
                     all_candidate_ids[index] for index in sorted(set(train_anchor_indices or []))
                 ],
                 "train_acquisition_order": list(train_acquisition_order or []),
+                "entropy_diagnostics": (
+                    None if entropy_diagnostics is None else dict(entropy_diagnostics)
+                ),
                 "artifacts": {
                     "train.xyz": {
                         "path": "train.xyz",
@@ -171,6 +176,24 @@ def read_selection_manifest(project_dir: Path) -> dict:
         manifest["test_candidate_ids"] = list(test_candidate_ids)
     if set(train_candidate_ids) & set(test_candidate_ids):
         raise ArtifactError(f"Selection artifact train/test candidate IDs overlap: {path}")
+    diagnostics = manifest.get("entropy_diagnostics")
+    if manifest.get("algorithm_id") == "information_entropy" and diagnostics is None:
+        raise ArtifactError(f"Selection entropy diagnostics are missing: {path}")
+    if diagnostics is not None:
+        try:
+            from .algorithms.information_entropy.diagnostics import EntropyScientificDiagnostics
+
+            record = EntropyScientificDiagnostics.from_manifest(diagnostics)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ArtifactError(f"Selection entropy diagnostics are malformed: {path}") from exc
+        if tuple(record.selected_candidate_ids) != tuple(train_candidate_ids):
+            raise ArtifactError(
+                f"Selection entropy diagnostics training IDs disagree with manifest: {path}"
+            )
+        if tuple(record.test_candidate_ids) != tuple(test_candidate_ids):
+            raise ArtifactError(
+                f"Selection entropy diagnostics test IDs disagree with manifest: {path}"
+            )
     for filename in ("train.xyz", "test.xyz"):
         record = artifacts.get(filename)
         artifact_path = selected_dir / filename

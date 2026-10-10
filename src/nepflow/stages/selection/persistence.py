@@ -14,6 +14,7 @@ from nepflow.io.hashing import sha256_canonical_json
 from nepflow.io.json import to_jsonable
 from nepflow.state import StateStore
 
+from .algorithms.information_entropy.diagnostics import EntropyScientificDiagnostics
 from .models import SelectionResult
 
 SELECTION_RUN_SCHEMA = "selection-run-v2"
@@ -247,6 +248,11 @@ def selection_parameters(
             "state_fingerprint": result.train_entropy_state_fingerprint,
             "history": result.train_entropy_history,
             "provenance": to_jsonable(result.train_entropy_provenance),
+            "diagnostics": (
+                None
+                if result.entropy_diagnostics is None
+                else result.entropy_diagnostics.to_manifest()
+            ),
         }
     return {
         "schema_version": SELECTION_RUN_SCHEMA,
@@ -512,6 +518,35 @@ def restore_selection_result(
     provenance = entropy_values.get("provenance", {})
     if not isinstance(provenance, Mapping):
         provenance = {}
+    entropy_diagnostics = None
+    if persisted_algorithm == "information_entropy":
+        diagnostics_manifest = entropy_values.get("diagnostics")
+        if not isinstance(diagnostics_manifest, Mapping):
+            raise StateError(
+                "Persisted information-entropy record has no independently verifiable diagnostics"
+            )
+        try:
+            entropy_diagnostics = EntropyScientificDiagnostics.from_manifest(diagnostics_manifest)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise StateError("Persisted information-entropy diagnostics failed validation") from exc
+        if entropy_diagnostics.candidate_ids != tuple(persisted_candidates):
+            raise StateError("Persisted entropy diagnostics candidate identity does not match run")
+        if entropy_diagnostics.selected_candidate_ids != tuple(train_ids):
+            raise StateError("Persisted entropy diagnostics selected IDs do not match run")
+        if entropy_diagnostics.test_candidate_ids != tuple(test_ids):
+            raise StateError("Persisted entropy diagnostics test IDs do not match run")
+        for persisted_name, diagnostic_value in (
+            ("objective", entropy_diagnostics.final_objective),
+            ("cross_entropy", entropy_diagnostics.final_cross_entropy),
+            ("forward_kl", entropy_diagnostics.final_forward_kl),
+        ):
+            persisted_value = entropy_values.get(persisted_name)
+            if persisted_value is None or not math.isclose(
+                float(persisted_value), diagnostic_value, rel_tol=0.0, abs_tol=1.0e-12
+            ):
+                raise StateError(
+                    f"Persisted entropy {persisted_name} disagrees with independently verified diagnostics"
+                )
 
     return SelectionResult(
         descriptors=descriptors,
@@ -549,6 +584,7 @@ def restore_selection_result(
         train_entropy_state_fingerprint=entropy_values.get("state_fingerprint"),
         train_entropy_history=[dict(value) for value in history if isinstance(value, Mapping)],
         train_entropy_provenance=provenance,
+        entropy_diagnostics=entropy_diagnostics,
         train_min_dist_applicable=bool(
             metrics.get("train_min_dist_applicable", persisted_algorithm != "information_entropy")
         ),

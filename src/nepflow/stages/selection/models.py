@@ -7,6 +7,8 @@ from typing import Any, Mapping
 
 import numpy as np
 
+from .algorithms.information_entropy.diagnostics import EntropyScientificDiagnostics
+
 
 @dataclass(frozen=True, slots=True)
 class SelectionResult:
@@ -39,6 +41,7 @@ class SelectionResult:
     train_entropy_state_fingerprint: str | None = None
     train_entropy_history: list[dict[str, Any]] = field(default_factory=list)
     train_entropy_provenance: Mapping[str, Any] = field(default_factory=dict)
+    entropy_diagnostics: EntropyScientificDiagnostics | None = None
     train_min_dist_applicable: bool = True
     train_fps_count_applicable: bool = True
 
@@ -68,6 +71,9 @@ class SelectionResult:
             "train_entropy_state_fingerprint": self.train_entropy_state_fingerprint,
             "train_entropy_history": self.train_entropy_history,
             "train_entropy_provenance": self.train_entropy_provenance,
+            "entropy_diagnostics": (
+                None if self.entropy_diagnostics is None else self.entropy_diagnostics.to_manifest()
+            ),
             "test_indices": self.test_indices,
             "test_min_dist": self.test_min_dist,
             "min_train_test_dist": self.min_train_test_dist,
@@ -81,6 +87,12 @@ class SelectionResult:
         """Allow read-only mapping access while callers migrate to fields."""
 
         return self.as_mapping()[key]
+
+    @property
+    def train_entropy_diagnostics(self) -> EntropyScientificDiagnostics | None:
+        """Compatibility spelling for the structured entropy closure record."""
+
+        return self.entropy_diagnostics
 
 
 __all__ = ["SelectionResult"]

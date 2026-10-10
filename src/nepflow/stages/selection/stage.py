@@ -17,7 +17,15 @@ from nepflow.config.models import NepflowConfig, SelectionConfig
 from nepflow.errors import StateError
 from nepflow.workflow.controller import StageContext
 
-from .algorithms.information_entropy import EntropyBandwidthSettings, build_entropy_pool
+from .algorithms.information_entropy import (
+    BandwidthCalibrationResult,
+    EntropyBandwidthSettings,
+    EntropyPool,
+    SparseAtomicKernelGraph,
+    SparseCandidateContributions,
+    build_entropy_diagnostics,
+    build_entropy_pool,
+)
 from .artifacts import write_selected_structures
 from .debug import run_debug_selection
 from .models import SelectionResult
@@ -30,7 +38,7 @@ from .persistence import (
     selection_run_id,
 )
 from .persistence import structure_ids as ordered_structure_ids
-from .reports import plot_descriptor_space
+from .reports import plot_descriptor_space, write_diagnostics_report
 from .representations import (
     LocalEnvironmentRepresentation,
     LocalRepresentationConfig,
@@ -425,6 +433,7 @@ class SelectionStage:
         train_acquisition_order: list[str] = []
         train_entropy_values: dict[str, Any] = {}
         entropy_provenance: dict[str, Any] = {}
+        entropy_diagnostics = None
         if entropy_result is not None and algorithm_result is not None:
             train_acquisition_order = list(entropy_result.acquisition_order)
             entropy_history = [dict(asdict(step)) for step in entropy_result.history.steps]
@@ -459,6 +468,29 @@ class SelectionStage:
                 "contribution_entry_count": getattr(contributions, "entry_count", None),
                 "contribution_array_bytes": getattr(contributions, "array_bytes", None),
             }
+            if not isinstance(pool, EntropyPool):
+                raise StateError("Information-entropy selection did not retain its pool")
+            if not isinstance(calibration, BandwidthCalibrationResult):
+                raise StateError("Information-entropy selection did not retain calibration")
+            if not isinstance(graph, SparseAtomicKernelGraph):
+                raise StateError("Information-entropy selection did not retain its graph")
+            if not isinstance(contributions, SparseCandidateContributions):
+                raise StateError("Information-entropy selection did not retain contributions")
+            if not isinstance(local_representation, LocalEnvironmentRepresentation):
+                raise StateError("Information-entropy selection did not retain closure inputs")
+            entropy_diagnostics = build_entropy_diagnostics(
+                pool,
+                calibration,
+                graph,
+                contributions,
+                entropy_result,
+                local_representation,
+                test_candidate_ids=[
+                    candidate_identity_ids[index] for index in test_selection["test_indices"]
+                ],
+                candidates=prepared["ase_structures"],
+                selected_indices=train_indices,
+            )
         return SelectionResult(
             descriptors=representations,
             train_indices=train_indices,
@@ -488,6 +520,7 @@ class SelectionStage:
             train_acquisition_order=train_acquisition_order,
             train_entropy_history=entropy_history,
             train_entropy_provenance=entropy_provenance,
+            entropy_diagnostics=entropy_diagnostics,
             train_min_dist_applicable=settings.algorithm == "fps",
             train_fps_count_applicable=settings.algorithm == "fps",
             **train_entropy_values,
@@ -531,7 +564,17 @@ class SelectionStage:
                 result.seed_indices + result.single_element_elastic_indices + result.elastic_indices
             ),
             train_acquisition_order=result.train_acquisition_order,
+            entropy_diagnostics=(
+                None
+                if result.entropy_diagnostics is None
+                else result.entropy_diagnostics.to_manifest()
+            ),
         )
+        if result.entropy_diagnostics is not None:
+            write_diagnostics_report(
+                result.entropy_diagnostics,
+                active.project_dir / "reports" / "entropy_diagnostics.md",
+            )
 
         total = len(prepared["structures"])
         logger.info("")

@@ -16,7 +16,15 @@ from nepflow.config.models import (
     ProjectConfig,
     SelectionConfig,
 )
-from nepflow.stages.selection.persistence import candidate_ids, structure_ids
+from nepflow.stages.selection.algorithms.information_entropy.diagnostics import (
+    EntropyScientificDiagnostics,
+)
+from nepflow.stages.selection.persistence import (
+    candidate_ids,
+    persist_selection_result,
+    restore_selection_result,
+    structure_ids,
+)
 from nepflow.stages.selection.representations import (
     LocalRepresentationConfig,
     build_local_environment_representation,
@@ -86,6 +94,22 @@ def test_stage_runs_the_sparse_entropy_pipeline_and_keeps_fps_separate(tmp_path:
             ),
         ):
             result = stage.execute(settings, prepared, context=context)
+        record = persist_selection_result(
+            store,
+            "demo",
+            "demo",
+            str(tmp_path),
+            settings,
+            ordered_candidates,
+            result,
+            candidate_structure_ids=ordered_structures,
+        )
+        restored_result = restore_selection_result(
+            record,
+            result.descriptors,
+            ordered_candidates,
+            candidate_structure_ids=ordered_structures,
+        )
 
     local_loader.assert_called_once()
     assert result.algorithm_id == "information_entropy"
@@ -97,6 +121,14 @@ def test_stage_runs_the_sparse_entropy_pipeline_and_keeps_fps_separate(tmp_path:
     assert result.train_entropy_graph_fingerprint
     assert result.train_entropy_contributions_fingerprint
     assert set(result.train_indices).isdisjoint(result.test_indices)
+    assert result.entropy_diagnostics is not None
+    restored = EntropyScientificDiagnostics.from_manifest(result.entropy_diagnostics.to_manifest())
+    assert restored.fingerprint == result.entropy_diagnostics.fingerprint
+    assert restored.recompute_final()["forward_kl"] == pytest.approx(
+        result.train_entropy_forward_kl
+    )
+    assert restored_result.entropy_diagnostics is not None
+    assert restored_result.entropy_diagnostics.fingerprint == result.entropy_diagnostics.fingerprint
 
 
 def test_entropy_budget_is_rejected_before_local_representation_work(tmp_path: Path) -> None:
