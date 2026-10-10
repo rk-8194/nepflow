@@ -49,6 +49,7 @@ def test_loader_builds_immutable_typed_root_and_applies_defaults(tmp_path: Path)
     assert config.generation.surface_enabled is False
     assert config.generation.n_surfaces == 0
     assert config.hpc.vasp_command == "vasp_std"
+    assert config.selection.algorithm == "information_entropy"
     with pytest.raises(AttributeError):
         config.project = config.project
 

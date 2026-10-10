@@ -1,14 +1,19 @@
 """Regression coverage for the potential-independent entropy representation."""
 
+import logging
+import re
+
 import numpy as np
 import pytest
 from ase import Atoms
 
+import nepflow.stages.selection.representations as representation_module
 from nepflow.errors import StateError
 from nepflow.stages.selection.representations import (
     LocalRepresentationConfig,
     build_local_environment_representation,
     fit_deterministic_whitening,
+    load_or_calculate_local_representations,
 )
 
 
@@ -34,6 +39,19 @@ def _build(candidate: Atoms, *, magnetic_mode: str = "structural"):
         candidate_ids=["candidate-a"],
         structure_ids=["structure-a"],
     )
+
+
+def _dense_atoms() -> Atoms:
+    return Atoms(
+        symbols=["Si"] * 32,
+        positions=[[0.9 * index, 0.0, 0.0] for index in range(32)],
+        cell=[40.0, 40.0, 40.0],
+        pbc=False,
+    )
+
+
+def _pool() -> list[Atoms]:
+    return [_atoms(), _dense_atoms()]
 
 
 def test_translation_and_global_spatial_rotation_invariance() -> None:
@@ -129,3 +147,97 @@ def test_structural_mode_rejects_repeated_geometry_but_magnetic_mode_distinguish
         structure_ids=["structure-a", "structure-a"],
     )
     assert not np.allclose(result.raw_descriptors[0], result.raw_descriptors[-1])
+
+
+def test_neighbour_list_is_built_once_per_candidate_and_not_on_cache_hit(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[Atoms] = []
+    original = representation_module.neighbor_list
+
+    def counted_neighbor_list(*args, **kwargs):
+        calls.append(args[1])
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(representation_module, "neighbor_list", counted_neighbor_list)
+    candidates = _pool()
+    config = LocalRepresentationConfig(cutoff=4.0, radial_bins=4, angular_bins=4)
+    load_or_calculate_local_representations(
+        tmp_path,
+        candidates,
+        config=config,
+        local_descriptor_workers=1,
+        candidate_ids=["candidate-a", "candidate-b"],
+        structure_ids=["structure-a", "structure-b"],
+    )
+    assert len(calls) == len(candidates)
+    calls.clear()
+    load_or_calculate_local_representations(
+        tmp_path,
+        candidates,
+        config=config,
+        local_descriptor_workers=1,
+        candidate_ids=["candidate-a", "candidate-b"],
+        structure_ids=["structure-a", "structure-b"],
+    )
+    assert calls == []
+
+
+def test_serial_and_parallel_local_descriptors_are_identical() -> None:
+    candidates = _pool()
+    kwargs = {
+        "config": LocalRepresentationConfig(cutoff=4.0, radial_bins=4, angular_bins=4),
+        "candidate_ids": ["candidate-a", "candidate-b"],
+        "structure_ids": ["structure-a", "structure-b"],
+    }
+    serial = build_local_environment_representation(
+        candidates,
+        local_descriptor_workers=1,
+        **kwargs,
+    )
+    parallel = build_local_environment_representation(
+        candidates,
+        local_descriptor_workers=2,
+        **kwargs,
+    )
+    np.testing.assert_array_equal(serial.raw_descriptors, parallel.raw_descriptors)
+    np.testing.assert_array_equal(serial.descriptors, parallel.descriptors)
+    np.testing.assert_array_equal(serial.transform.mean, parallel.transform.mean)
+    np.testing.assert_array_equal(serial.transform.eigenvalues, parallel.transform.eigenvalues)
+    np.testing.assert_array_equal(serial.transform.eigenvectors, parallel.transform.eigenvectors)
+    assert serial.rows == parallel.rows
+    assert serial.fingerprint == parallel.fingerprint
+
+
+def test_local_descriptor_progress_is_bounded_and_cache_hits_are_silent(
+    tmp_path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    candidates = [
+        Atoms("Si", positions=[[float(index), 0.0, 0.0]], cell=[20.0] * 3, pbc=False)
+        for index in range(7)
+    ]
+    kwargs = {
+        "config": LocalRepresentationConfig(cutoff=2.0, radial_bins=2, angular_bins=2),
+        "local_descriptor_workers": 1,
+        "candidate_ids": [f"candidate-{index}" for index in range(7)],
+        "structure_ids": [f"structure-{index}" for index in range(7)],
+    }
+    caplog.set_level(logging.INFO, logger=representation_module.__name__)
+    load_or_calculate_local_representations(tmp_path, candidates, **kwargs)
+    messages = [
+        record.getMessage()
+        for record in caplog.records
+        if record.getMessage().startswith("Local descriptor generation:")
+    ]
+    assert len(messages) <= 100
+    assert messages[-1].startswith("Local descriptor generation: 7/7 structures (100%)")
+    counts = [int(re.search(r"(\d+)/7", message).group(1)) for message in messages]
+    assert counts == sorted(set(counts))
+
+    caplog.clear()
+    load_or_calculate_local_representations(tmp_path, candidates, **kwargs)
+    assert not any(
+        record.getMessage().startswith("Local descriptor generation:") for record in caplog.records
+    )

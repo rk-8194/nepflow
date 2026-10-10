@@ -4,13 +4,17 @@ from __future__ import annotations
 
 import logging
 import math
+import multiprocessing as mp
+import os
 import sys
 import time
 from collections.abc import Mapping, Sequence
+from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, wait
 from dataclasses import dataclass, field
 from io import BytesIO
+from multiprocessing.context import BaseContext
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 from ase.neighborlist import neighbor_list
@@ -694,17 +698,35 @@ def _gaussian_histogram(value: float, centres: np.ndarray, sigma: float) -> np.n
     return np.exp(-0.5 * ((float(value) - centres) / sigma) ** 2)
 
 
-def _local_descriptor_for_atom(
+@dataclass(frozen=True, slots=True)
+class _LocalStructureContext:
+    """Precomputed, per-structure inputs shared by every centre atom."""
+
+    symbols: tuple[str, ...]
+    species: tuple[str, ...]
+    config: LocalRepresentationConfig
+    species_index: dict[str, int]
+    radial_centres: np.ndarray
+    radial_sigma: float
+    angular_centres: np.ndarray
+    angular_sigma: float
+    neighbours: tuple[tuple[tuple[int, np.ndarray, float], ...], ...]
+    magnetic_moments: np.ndarray
+    centre_one_hot: np.ndarray
+    pair_indices: dict[tuple[int, int], int]
+
+
+def _prepare_local_structure_context(
     candidate: Any,
-    atom_index: int,
-    symbols: Sequence[str],
-    species: Sequence[str],
+    species: tuple[str, ...],
     config: LocalRepresentationConfig,
     magnetic_moments: np.ndarray,
-) -> np.ndarray:
+) -> _LocalStructureContext:
+    """Build one reusable neighbour and basis context for a candidate."""
+
+    symbols = tuple(str(symbol) for symbol in candidate.get_chemical_symbols())
     positions = np.asarray(candidate.get_positions(), dtype=np.float64)
     cell = np.asarray(candidate.get_cell(), dtype=np.float64)
-    centre_symbol = symbols[atom_index]
     species_index = {symbol: index for index, symbol in enumerate(species)}
     radial_centres = np.linspace(
         config.cutoff / (2.0 * config.radial_bins),
@@ -718,82 +740,115 @@ def _local_descriptor_for_atom(
         config.angular_bins,
     )
     angular_sigma = config.angular_sigma or 2.0 / config.angular_bins
-    radial = np.zeros((len(species), config.radial_bins), dtype=np.float64)
-    neighbours: list[tuple[int, np.ndarray, float]] = []
-    indices, neighbour_indices, offsets = neighbor_list(
-        "ijS",
-        candidate,
-        config.cutoff,
-    )
+    grouped_neighbours: list[list[tuple[int, np.ndarray, float]]] = [[] for _ in symbols]
+    indices, neighbour_indices, offsets = neighbor_list("ijS", candidate, config.cutoff)
     for source, target, offset in zip(indices, neighbour_indices, offsets):
-        if int(source) != atom_index:
-            continue
+        source_index = int(source)
+        target_index = int(target)
         offset_vector = np.asarray(offset, dtype=np.float64) @ cell
-        vector = positions[int(target)] + offset_vector - positions[atom_index]
+        vector = positions[target_index] + offset_vector - positions[source_index]
         distance = float(np.linalg.norm(vector))
         if distance <= 1.0e-12 or distance > config.cutoff + 1.0e-12:
             continue
-        neighbours.append((int(target), vector, distance))
-        radial[species_index[symbols[int(target)]]] += _gaussian_histogram(
-            distance,
-            radial_centres,
-            radial_sigma,
-        )
+        grouped_neighbours[source_index].append((target_index, vector, distance))
 
-    angular = np.zeros(
-        (len(species) * (len(species) + 1) // 2, config.angular_bins),
-        dtype=np.float64,
-    )
-    pair_channel = 0
     pair_indices: dict[tuple[int, int], int] = {}
+    pair_channel = 0
     for first_species in range(len(species)):
         for second_species in range(first_species, len(species)):
             pair_indices[(first_species, second_species)] = pair_channel
             pair_channel += 1
+    return _LocalStructureContext(
+        symbols=symbols,
+        species=species,
+        config=config,
+        species_index=species_index,
+        radial_centres=radial_centres,
+        radial_sigma=radial_sigma,
+        angular_centres=angular_centres,
+        angular_sigma=angular_sigma,
+        neighbours=tuple(tuple(values) for values in grouped_neighbours),
+        magnetic_moments=magnetic_moments,
+        centre_one_hot=np.eye(len(species), dtype=np.float64),
+        pair_indices=pair_indices,
+    )
+
+
+def _local_descriptor_for_atom(
+    context: _LocalStructureContext,
+    atom_index: int,
+) -> np.ndarray:
+    """Calculate one local descriptor from a precomputed structure context."""
+
+    centre_symbol = context.symbols[atom_index]
+    radial = np.zeros(
+        (len(context.species), context.config.radial_bins),
+        dtype=np.float64,
+    )
+    neighbours = context.neighbours[atom_index]
+    for target_index, _, distance in neighbours:
+        radial[context.species_index[context.symbols[target_index]]] += _gaussian_histogram(
+            distance,
+            context.radial_centres,
+            context.radial_sigma,
+        )
+
+    angular = np.zeros(
+        (
+            len(context.species) * (len(context.species) + 1) // 2,
+            context.config.angular_bins,
+        ),
+        dtype=np.float64,
+    )
     for left in range(len(neighbours)):
         left_index, left_vector, left_distance = neighbours[left]
         for right_index, right_vector, right_distance in neighbours[left + 1 :]:
             cosine = float(np.dot(left_vector, right_vector) / (left_distance * right_distance))
             cosine = float(np.clip(cosine, -1.0, 1.0))
-            left_species = species_index[symbols[left_index]]
-            right_species = species_index[symbols[right_index]]
+            left_species = context.species_index[context.symbols[left_index]]
+            right_species = context.species_index[context.symbols[right_index]]
             pair = (min(left_species, right_species), max(left_species, right_species))
-            angular[pair_indices[pair]] += _gaussian_histogram(
+            angular[context.pair_indices[pair]] += _gaussian_histogram(
                 cosine,
-                angular_centres,
-                angular_sigma,
+                context.angular_centres,
+                context.angular_sigma,
             )
 
     features = [
-        np.eye(len(species), dtype=np.float64)[species_index[centre_symbol]],
+        context.centre_one_hot[context.species_index[centre_symbol]],
         radial.reshape(-1),
         angular.reshape(-1),
     ]
-    if config.magnetic_mode == "non_soc":
-        centre_spin = magnetic_moments[atom_index]
+    if context.config.magnetic_mode == "non_soc":
+        centre_spin = context.magnetic_moments[atom_index]
         centre_magnitude = float(np.linalg.norm(centre_spin))
         magnetic_radial = np.zeros_like(radial)
-        correlation = np.zeros((len(species), config.angular_bins), dtype=np.float64)
+        correlation = np.zeros(
+            (len(context.species), context.config.angular_bins),
+            dtype=np.float64,
+        )
         centre_unit = centre_spin / centre_magnitude if centre_magnitude > 1.0e-12 else None
         for neighbour_index, _, distance in neighbours:
-            neighbour_spin = magnetic_moments[neighbour_index]
+            neighbour_spin = context.magnetic_moments[neighbour_index]
             neighbour_magnitude = float(np.linalg.norm(neighbour_spin))
-            magnetic_radial[species_index[symbols[neighbour_index]]] += (
+            magnetic_radial[context.species_index[context.symbols[neighbour_index]]] += (
                 neighbour_magnitude
                 * _gaussian_histogram(
                     distance,
-                    radial_centres,
-                    radial_sigma,
+                    context.radial_centres,
+                    context.radial_sigma,
                 )
             )
             if centre_unit is not None and neighbour_magnitude > 1.0e-12:
                 relative_spin = float(np.dot(centre_unit, neighbour_spin / neighbour_magnitude))
             else:
                 relative_spin = 0.0
-            correlation[species_index[symbols[neighbour_index]]] += _gaussian_histogram(
-                relative_spin,
-                angular_centres,
-                angular_sigma,
+            correlation[context.species_index[context.symbols[neighbour_index]]] += (
+                _gaussian_histogram(
+                    relative_spin,
+                    context.angular_centres,
+                    context.angular_sigma,
+                )
             )
         features.extend(
             [
@@ -803,6 +858,297 @@ def _local_descriptor_for_atom(
             ]
         )
     return np.concatenate(features).astype(np.float64, copy=False)
+
+
+@dataclass(frozen=True, slots=True)
+class _LocalDescriptorTask:
+    """One picklable, candidate-scoped raw descriptor task."""
+
+    candidate_index: int
+    candidate: Any
+    species: tuple[str, ...]
+    config: LocalRepresentationConfig
+
+
+@dataclass(frozen=True, slots=True)
+class _LocalDescriptorResult:
+    """Raw descriptors and deterministic atom ordering from one candidate."""
+
+    candidate_index: int
+    descriptors: np.ndarray
+    atom_order: tuple[int, ...]
+
+
+class LocalDescriptorWorkerError(RuntimeError):
+    """A candidate-scoped local descriptor worker failure."""
+
+
+def _compute_local_descriptor_task(task: _LocalDescriptorTask) -> _LocalDescriptorResult:
+    """Compute one candidate's raw local descriptors in a worker-safe function."""
+
+    moments = (
+        _magnetic_vectors(task.candidate)
+        if task.config.magnetic_mode == "non_soc"
+        else np.zeros((len(task.candidate), 3), dtype=np.float64)
+    )
+    context = _prepare_local_structure_context(
+        task.candidate,
+        task.species,
+        task.config,
+        moments,
+    )
+    local_values = [
+        _local_descriptor_for_atom(context, atom_index)
+        for atom_index in range(len(context.symbols))
+    ]
+    order = tuple(
+        sorted(
+            range(len(local_values)),
+            key=lambda index: (
+                tuple(float(round(value, 12)) for value in local_values[index]),
+                context.symbols[index],
+                index,
+            ),
+        )
+    )
+    feature_width = _local_feature_width(task.config, task.species)
+    descriptors = np.asarray(
+        [local_values[index] for index in order],
+        dtype=np.float64,
+    ).reshape((len(order), feature_width))
+    return _LocalDescriptorResult(task.candidate_index, descriptors, order)
+
+
+def _local_feature_width(
+    config: LocalRepresentationConfig,
+    species: Sequence[str],
+) -> int:
+    """Return the fixed raw descriptor width for one local environment."""
+
+    species_count = len(species)
+    pair_count = species_count * (species_count + 1) // 2
+    width = species_count + species_count * config.radial_bins
+    width += pair_count * config.angular_bins
+    if config.magnetic_mode == "non_soc":
+        width += 1 + species_count * config.radial_bins
+        width += species_count * config.angular_bins
+    return width
+
+
+def _limit_local_worker_threads() -> None:
+    """Limit native math-library pools inside a child process only."""
+
+    for name in (
+        "OMP_NUM_THREADS",
+        "MKL_NUM_THREADS",
+        "OPENBLAS_NUM_THREADS",
+        "NUMEXPR_NUM_THREADS",
+    ):
+        os.environ[name] = "1"
+
+
+def _effective_local_cpu_allocation() -> int:
+    """Return the CPUs available to this process and its scheduler allocation."""
+
+    limits: list[int] = []
+    affinity = cast(Any, getattr(os, "sched_getaffinity", None))
+    if callable(affinity):
+        try:
+            limits.append(len(cast(Any, affinity(0))))
+        except OSError:
+            pass
+    for name in (
+        "SLURM_CPUS_PER_TASK",
+        "SLURM_CPUS_ON_NODE",
+        "SLURM_JOB_CPUS_PER_NODE",
+    ):
+        value = os.environ.get(name, "").strip()
+        if not value:
+            continue
+        token = value.split(",", 1)[0].split("(", 1)[0].strip()
+        try:
+            limits.append(int(token))
+        except ValueError:
+            continue
+    limits.append(os.cpu_count() or 1)
+    return max(1, min(limit for limit in limits if limit > 0))
+
+
+def _resolve_local_descriptor_workers(requested: int, candidate_count: int) -> int:
+    """Resolve worker policy without exceeding the effective CPU allocation."""
+
+    if isinstance(requested, bool) or not isinstance(requested, int) or requested < 0:
+        raise ValueError("local_descriptor_workers must be a non-negative integer")
+    allocation = _effective_local_cpu_allocation()
+    if requested > allocation:
+        raise ValueError(
+            "local_descriptor_workers="
+            f"{requested} exceeds the effective CPU allocation ({allocation}); "
+            "reduce the value or use 0 for automatic selection"
+        )
+    if candidate_count <= 1:
+        return 1
+    if requested == 1:
+        return 1
+    if requested == 0:
+        return max(1, min(8, allocation, candidate_count))
+    return min(requested, candidate_count)
+
+
+def _local_process_context() -> BaseContext:
+    """Use a safe process start method for the current platform."""
+
+    method = "spawn" if os.name == "nt" else "forkserver"
+    return mp.get_context(method)
+
+
+class _LocalDescriptorProgress:
+    """Parent-owned, bounded whole-percent progress reporting."""
+
+    def __init__(self, total: int) -> None:
+        self.total = total
+        self.started = time.perf_counter()
+        self.last_percent = 0
+
+    def completed(self, count: int) -> None:
+        percent = min(100, count * 100 // self.total)
+        if percent <= self.last_percent:
+            return
+        elapsed = max(0.0, time.perf_counter() - self.started)
+        remaining = max(0.0, elapsed / count * (self.total - count))
+        logger.info(
+            "Local descriptor generation: %d/%d structures (%d%%); "
+            "elapsed %.3fs; estimated remaining %.3fs",
+            count,
+            self.total,
+            percent,
+            elapsed,
+            remaining,
+        )
+        self.last_percent = percent
+
+
+def _compute_local_raw_descriptors(
+    candidates: Sequence[Any],
+    candidate_ids: Sequence[str],
+    structure_ids: Sequence[str],
+    species: tuple[str, ...],
+    config: LocalRepresentationConfig,
+    local_descriptor_workers: int,
+) -> tuple[np.ndarray, list[LocalEnvironmentRow]]:
+    """Compute raw rows serially or with bounded candidate-level processes."""
+
+    worker_count = _resolve_local_descriptor_workers(
+        local_descriptor_workers,
+        len(candidates),
+    )
+    logger.info(
+        "Local descriptor workers: %d (effective allocation %d)",
+        worker_count,
+        _effective_local_cpu_allocation(),
+    )
+    feature_width = _local_feature_width(config, species)
+    raw = np.empty(
+        (sum(len(candidate) for candidate in candidates), feature_width),
+        dtype=np.float64,
+    )
+    rows: list[LocalEnvironmentRow] = []
+    progress = _LocalDescriptorProgress(len(candidates))
+    pending: dict[Future[_LocalDescriptorResult], int] = {}
+    ready: dict[int, _LocalDescriptorResult] = {}
+    next_to_submit = 0
+    next_to_publish = 0
+    completed = 0
+    write_offset = 0
+
+    def task_for(index: int) -> _LocalDescriptorTask:
+        return _LocalDescriptorTask(index, candidates[index], species, config)
+
+    def publish(result: _LocalDescriptorResult) -> None:
+        nonlocal write_offset, next_to_publish
+        index = result.candidate_index
+        candidate = candidates[index]
+        expected_atoms = len(candidate)
+        if result.descriptors.shape != (expected_atoms, feature_width):
+            raise ValueError(
+                "local descriptor worker returned an invalid shape for "
+                f"candidate index {index} ({candidate_ids[index]})"
+            )
+        if len(result.atom_order) != expected_atoms:
+            raise ValueError(
+                "local descriptor worker returned an invalid atom order for "
+                f"candidate index {index} ({candidate_ids[index]})"
+            )
+        raw[write_offset : write_offset + expected_atoms] = result.descriptors
+        rows.extend(
+            LocalEnvironmentRow(candidate_ids[index], structure_ids[index], atom_index)
+            for atom_index in result.atom_order
+        )
+        write_offset += expected_atoms
+        next_to_publish += 1
+
+    if worker_count == 1:
+        for index in range(len(candidates)):
+            try:
+                result = _compute_local_descriptor_task(task_for(index))
+            except BaseException as exc:
+                raise LocalDescriptorWorkerError(
+                    "Local descriptor generation failed for candidate index "
+                    f"{index} ({candidate_ids[index]})"
+                ) from exc
+            publish(result)
+            completed += 1
+            progress.completed(completed)
+        return raw, rows
+
+    executor: ProcessPoolExecutor | None = None
+    try:
+        executor = ProcessPoolExecutor(
+            max_workers=worker_count,
+            mp_context=_local_process_context(),
+            initializer=_limit_local_worker_threads,
+        )
+        bound = max(worker_count, 2 * worker_count)
+        while next_to_submit < len(candidates) and len(pending) + len(ready) < bound:
+            future = executor.submit(_compute_local_descriptor_task, task_for(next_to_submit))
+            pending[future] = next_to_submit
+            next_to_submit += 1
+
+        while pending:
+            done, _ = wait(tuple(pending), return_when=FIRST_COMPLETED)
+            for future in sorted(done, key=lambda item: pending[item]):
+                index = pending.pop(future)
+                try:
+                    result = future.result()
+                except BaseException as exc:
+                    raise LocalDescriptorWorkerError(
+                        "Local descriptor worker failed for candidate index "
+                        f"{index} ({candidate_ids[index]})"
+                    ) from exc
+                if result.candidate_index != index:
+                    raise LocalDescriptorWorkerError(
+                        "Local descriptor worker returned candidate index "
+                        f"{result.candidate_index}, expected {index} ({candidate_ids[index]})"
+                    )
+                ready[index] = result
+                completed += 1
+                progress.completed(completed)
+            while next_to_publish in ready:
+                publish(ready.pop(next_to_publish))
+            while next_to_submit < len(candidates) and len(pending) + len(ready) < bound:
+                future = executor.submit(_compute_local_descriptor_task, task_for(next_to_submit))
+                pending[future] = next_to_submit
+                next_to_submit += 1
+    except BaseException:
+        for future in pending:
+            future.cancel()
+        if executor is not None:
+            executor.shutdown(wait=True, cancel_futures=True)
+        raise
+    else:
+        if executor is not None:
+            executor.shutdown(wait=True)
+    return raw, rows
 
 
 def _canonicalize_eigenvectors(
@@ -965,6 +1311,7 @@ def build_local_environment_representation(
     config: LocalRepresentationConfig | Mapping[str, Any] | None = None,
     candidate_ids: Sequence[str] | None = None,
     structure_ids: Sequence[str] | None = None,
+    local_descriptor_workers: int = 0,
 ) -> LocalEnvironmentRepresentation:
     """Build deterministic local rows and fit whitening on the complete pool."""
 
@@ -988,43 +1335,17 @@ def build_local_environment_representation(
     )
     if not all_species:
         raise ValueError("candidates must contain at least one chemical species")
-    descriptors: list[np.ndarray] = []
-    rows: list[LocalEnvironmentRow] = []
-    for candidate_id, structure_id, candidate in zip(
+    raw, rows = _compute_local_raw_descriptors(
+        candidates,
         ordered_candidate_ids,
         ordered_structure_ids,
-        candidates,
-    ):
-        symbols = tuple(str(symbol) for symbol in candidate.get_chemical_symbols())
-        moments = (
-            _magnetic_vectors(candidate)
-            if settings.magnetic_mode == "non_soc"
-            else np.zeros((len(candidate), 3))
-        )
-        local_values = [
-            _local_descriptor_for_atom(
-                candidate,
-                atom_index,
-                symbols,
-                all_species,
-                settings,
-                moments,
-            )
-            for atom_index in range(len(candidate))
-        ]
-        order = sorted(
-            range(len(local_values)),
-            key=lambda index: (
-                tuple(float(round(value, 12)) for value in local_values[index]),
-                symbols[index],
-                index,
-            ),
-        )
-        descriptors.extend(local_values[index] for index in order)
-        rows.extend(LocalEnvironmentRow(candidate_id, structure_id, index) for index in order)
-    raw = np.asarray(descriptors, dtype=np.float64)
+        all_species,
+        settings,
+        local_descriptor_workers,
+    )
     if not np.all(np.isfinite(raw)):
         raise ValueError("local representation contains non-finite values")
+    logger.info("Local descriptor whitening started")
     transform = fit_deterministic_whitening(
         raw,
         tolerance=settings.whitening_tolerance,
@@ -1032,6 +1353,7 @@ def build_local_environment_representation(
         singular_policy=settings.whitening_singular_policy,
     )
     whitened = transform.apply(raw)
+    logger.info("Local descriptor whitening completed")
     identity = _local_identity(
         ordered_candidate_ids,
         ordered_structure_ids,
@@ -1245,10 +1567,12 @@ def load_or_calculate_local_representations(
     config: LocalRepresentationConfig | Mapping[str, Any] | None = None,
     candidate_ids: Sequence[str] | None = None,
     structure_ids: Sequence[str] | None = None,
+    local_descriptor_workers: int = 0,
 ) -> LocalEnvironmentRepresentation:
     """Load exact-identity local rows or calculate and publish them."""
 
     settings = _coerce_local_representation_config(config)
+    _resolve_local_descriptor_workers(local_descriptor_workers, len(candidates))
     ordered_candidate_ids = _local_candidate_ids(candidates, candidate_ids)
     ordered_structure_ids = _local_structure_ids(candidates, structure_ids)
     if settings.magnetic_mode == "structural":
@@ -1290,6 +1614,7 @@ def load_or_calculate_local_representations(
         config=settings,
         candidate_ids=ordered_candidate_ids,
         structure_ids=ordered_structure_ids,
+        local_descriptor_workers=local_descriptor_workers,
     )
     identity = _local_identity(
         ordered_candidate_ids,
@@ -1312,6 +1637,7 @@ __all__ = [
     "LOCAL_REPRESENTATION_SCHEMA_VERSION",
     "LocalEnvironmentRepresentation",
     "LocalEnvironmentRow",
+    "LocalDescriptorWorkerError",
     "LocalRepresentationConfig",
     "WhiteningTransform",
     "build_local_environment_representation",

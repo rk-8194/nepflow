@@ -203,6 +203,7 @@ _ALLOWED_KEYS: dict[str, frozenset[str]] = {
             "max_search_iterations",
             "test_pool_factor",
             "local_magnetic_mode",
+            "local_descriptor_workers",
             "background_mass",
         }
     ),

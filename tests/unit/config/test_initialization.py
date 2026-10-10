@@ -87,6 +87,7 @@ class InitConfigPromptTests(unittest.TestCase):
             self.assertIn("crystal_structures=bcc,fcc", config_text)
             self.assertIn("target_n_atoms=128", config_text)
             self.assertIn("scp_address=user@host:/opt/nepflow", config_text)
+            self.assertIn("algorithm=information_entropy", config_text)
             self.assertIn("composition_aware_fps=false", config_text)
             self.assertIn("composition_aware_fps_frontier_fraction=0.10", config_text)
             self.assertIn("composition_aware_fps_ternary_weight=1.0", config_text)

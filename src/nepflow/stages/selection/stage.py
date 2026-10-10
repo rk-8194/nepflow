@@ -212,6 +212,7 @@ class SelectionStage:
                 config=LocalRepresentationConfig(
                     magnetic_mode=settings.local_magnetic_mode,
                 ),
+                local_descriptor_workers=settings.local_descriptor_workers,
                 candidate_ids=candidate_identity_ids,
                 structure_ids=physical_structure_ids,
             )

@@ -322,7 +322,7 @@ class MagnetismConfig:
 class SelectionConfig:
     """Sparse selection and descriptor controls."""
 
-    algorithm: str = "fps"
+    algorithm: str = "information_entropy"
     nep_model_file: str = "nep89.txt"
     include_seed_structures: bool = False
     include_single_element_elastic_stress_structures: bool = False
@@ -340,6 +340,7 @@ class SelectionConfig:
     max_search_iterations: int = 30
     test_pool_factor: float = 0.5
     local_magnetic_mode: str = "structural"
+    local_descriptor_workers: int = 0
     background_mass: float = 1.0e-12
 
 

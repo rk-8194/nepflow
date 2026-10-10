@@ -263,6 +263,10 @@ def validate_config(
             "selection.local_magnetic_mode must be one of: "
             + ", ".join(sorted(ALLOWED_LOCAL_MAGNETIC_MODES))
         )
+    if isinstance(config.selection.local_descriptor_workers, bool) or not isinstance(
+        config.selection.local_descriptor_workers, int
+    ):
+        raise ConfigurationError("selection.local_descriptor_workers must be an integer")
     if (
         not math.isfinite(config.selection.background_mass)
         or config.selection.background_mass <= 0.0
@@ -280,11 +284,12 @@ def validate_config(
         "target_tolerance",
         "max_search_iterations",
         "composition_aware_fps_adaptive_retries",
+        "local_descriptor_workers",
     ):
         _require_non_negative(
             f"selection.{field_name}",
             getattr(config.selection, field_name),
-            strictly_positive=field_name not in {"target_tolerance"},
+            strictly_positive=field_name not in {"target_tolerance", "local_descriptor_workers"},
         )
     for field_name in (
         "test_pool_factor",

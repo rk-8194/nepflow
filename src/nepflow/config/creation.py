@@ -261,8 +261,8 @@ max_magnetic_variants_per_parent=16
 max_magnetic_variants_per_defect=16
 
 [selection]
-# Independent training-selection algorithm: fps or information_entropy.
-algorithm=fps
+# Independent training-selection algorithm: information_entropy or fps.
+algorithm=information_entropy
 # NEP model file for descriptor computation (in config/nep/ directory)
 # Download NEP89 from: https://github.com/brucefan1983/GPUMD/tree/master/potentials/nep/nep89_20250409
 # Place this in the config/nep folder.
@@ -298,6 +298,9 @@ target_tolerance=50
 # structure: mean of per-atom descriptors â†’ one vector per structure (recommended)
 descriptor_type=structure
 local_magnetic_mode=structural
+# Local descriptor execution: 0=automatic (affinity/scheduler-aware, capped at 8),
+# 1=serial, or an explicit process count within the allocated CPUs.
+local_descriptor_workers=0
 background_mass=1e-12
 
 [vasp]

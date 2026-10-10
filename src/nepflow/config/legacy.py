@@ -306,6 +306,7 @@ def _selection_values(config: NepflowConfig) -> dict[str, str]:
         "max_search_iterations": str(selection.max_search_iterations),
         "test_pool_factor": str(selection.test_pool_factor),
         "local_magnetic_mode": selection.local_magnetic_mode,
+        "local_descriptor_workers": str(selection.local_descriptor_workers),
         "background_mass": str(selection.background_mass),
     }
 

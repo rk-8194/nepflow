@@ -102,7 +102,7 @@ def select_training_set(
     single_element_elastic_indices: list[int] | None = None,
     elastic_indices: list[int] | None = None,
     candidate_ids: Sequence[str] | None = None,
-    algorithm_id: str = "fps",
+    algorithm_id: str = "information_entropy",
     algorithm_registry: AlgorithmRegistry | None = None,
     local_representation: Any | None = None,
 ) -> tuple[list[int], float]:

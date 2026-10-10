@@ -645,7 +645,7 @@ def parse_selection(values: Mapping[str, str]) -> SelectionConfig:
     """Parse selection and descriptor settings."""
 
     return SelectionConfig(
-        algorithm=values.get("algorithm", "fps").strip().lower(),
+        algorithm=values.get("algorithm", "information_entropy").strip().lower(),
         nep_model_file=values.get("nep_model_file", "nep89.txt").strip(),
         include_seed_structures=_parse_bool(
             values.get("include_seed_structures", "false"),
@@ -699,6 +699,10 @@ def parse_selection(values: Mapping[str, str]) -> SelectionConfig:
             values.get("test_pool_factor", "0.5"), "selection.test_pool_factor"
         ),
         local_magnetic_mode=values.get("local_magnetic_mode", "structural").strip().lower(),
+        local_descriptor_workers=_parse_int(
+            values.get("local_descriptor_workers", "0"),
+            "selection.local_descriptor_workers",
+        ),
         background_mass=_parse_float(
             values.get("background_mass", "1e-12"), "selection.background_mass"
         ),
