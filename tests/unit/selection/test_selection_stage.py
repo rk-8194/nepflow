@@ -7,8 +7,6 @@ import numpy as np
 import pytest
 
 pytest.importorskip("ase")
-pytest.importorskip("NepTrainKit")
-
 from ase import Atoms
 
 from nepflow.config.models import NepflowConfig, ProjectConfig, SelectionConfig
@@ -89,7 +87,7 @@ def test_prepare_returns_none_for_an_empty_generated_file(tmp_path):
     with StateStore(tmp_path / "state.db") as store:
         stage = SelectionStage(context=_context(tmp_path, store, settings))
         with (
-            patch.object(selection_stage_module.Structure, "read_multiple", return_value=[]),
+            patch.object(selection_stage_module, "_read_nep_structures", return_value=[]),
             patch.object(selection_stage_module, "ase_read", return_value=[]),
         ):
             assert stage.prepare(tmp_path) is None

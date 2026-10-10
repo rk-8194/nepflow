@@ -29,14 +29,18 @@ from nepflow.io.atomic import atomic_write_bytes
 from nepflow.io.hashing import sha256_bytes, sha256_canonical_json, sha256_file
 from nepflow.io.json import read_json_object, write_json
 
-NepCalculator: Any
-try:
-    from NepTrainKit.core.calculator import NepCalculator
-except ImportError:  # pragma: no cover - the local backend does not need NepTrainKit
-    NepCalculator = None
-
 logger = logging.getLogger(__name__)
 DESCRIPTOR_CACHE_SCHEMA_VERSION = DESCRIPTOR_CACHE_SCHEMA
+
+
+def _load_nep_calculator() -> Any:
+    """Load NepTrainKit only when the NEP descriptor backend is required."""
+
+    try:
+        from NepTrainKit.core.calculator import NepCalculator
+    except ImportError as exc:  # pragma: no cover - depends on optional backend installation
+        raise ImportError("NepTrainKit is required for the NEP descriptor representation") from exc
+    return NepCalculator
 
 
 def compute_structure_descriptors(
@@ -325,9 +329,8 @@ def load_or_calculate_representations(
         logger.info("  Loaded cached descriptors from %s", descriptor_cache)
         return descriptors
 
-    if NepCalculator is None:
-        raise ImportError("NepTrainKit is required for the NEP descriptor representation")
-    calc = NepCalculator(str(nep_model_path))
+    calculator_type = _load_nep_calculator()
+    calc = calculator_type(str(nep_model_path))
     logger.info("  Loaded NEP model: %s", nep_model_file)
     descriptors = _validate_descriptors(
         compute_descriptors_batched(

@@ -6,9 +6,6 @@ from pathlib import Path
 from unittest.mock import patch
 
 import numpy as np
-import pytest
-
-pytest.importorskip("NepTrainKit")
 
 from nepflow.stages.selection import representations as DESCRIPTORS  # noqa: E402
 
@@ -105,7 +102,7 @@ class DescriptorTests(unittest.TestCase):
         mean_descriptor: bool = True,
     ) -> None:
         width = 3 if mean_descriptor else 2
-        with patch.object(DESCRIPTORS, "NepCalculator", CalculatorBoundary):
+        with patch.object(DESCRIPTORS, "_load_nep_calculator", return_value=CalculatorBoundary):
             descriptors = DESCRIPTORS.load_or_calculate_representations(
                 project_dir,
                 structures,
@@ -312,7 +309,7 @@ class DescriptorTests(unittest.TestCase):
             model_path = model_dir / "nep89.txt"
             model_path.write_text("stub", encoding="utf-8")
 
-            with patch.object(DESCRIPTORS, "NepCalculator", CalculatorBoundary):
+            with patch.object(DESCRIPTORS, "_load_nep_calculator", return_value=CalculatorBoundary):
                 descriptors = DESCRIPTORS.load_or_calculate_representations(
                     project_dir,
                     [CacheStructure(f"structure-{i}") for i in range(3)],
@@ -334,7 +331,7 @@ class DescriptorTests(unittest.TestCase):
             model_dir.mkdir(parents=True, exist_ok=True)
             (model_dir / "nep89.txt").write_text("stub", encoding="utf-8")
 
-            with patch.object(DESCRIPTORS, "NepCalculator", CalculatorBoundary):
+            with patch.object(DESCRIPTORS, "_load_nep_calculator", return_value=CalculatorBoundary):
                 descriptors = DESCRIPTORS.load_or_calculate_representations(
                     project_dir,
                     [CacheStructure(f"structure-{i}") for i in range(3)],
@@ -353,7 +350,7 @@ class DescriptorTests(unittest.TestCase):
             (model_dir / "nep89.txt").write_text("stub", encoding="utf-8")
             structures = [CacheStructure(f"structure-{i}") for i in range(3)]
 
-            with patch.object(DESCRIPTORS, "NepCalculator", CalculatorBoundary):
+            with patch.object(DESCRIPTORS, "_load_nep_calculator", return_value=CalculatorBoundary):
                 descriptors = DESCRIPTORS.load_or_calculate_representations(
                     project_dir,
                     structures,

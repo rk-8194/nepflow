@@ -2,12 +2,11 @@
 
 import hashlib
 import json
+import sys
 from pathlib import Path
 
 import numpy as np
 import pytest
-
-pytest.importorskip("NepTrainKit")
 
 from nepflow.io.json import dumps
 from nepflow.stages.selection import representations
@@ -71,6 +70,24 @@ def test_exact_identity_reuses_cache_without_recalculation(tmp_path) -> None:
     np.testing.assert_array_equal(result, expected)
 
 
+def test_cache_hit_does_not_require_neptrainkit(tmp_path, monkeypatch) -> None:
+    structures = [_Structure(f"structure-{index}") for index in range(3)]
+    expected = _write_cache(tmp_path, structures)
+    monkeypatch.setitem(sys.modules, "NepTrainKit", None)
+    monkeypatch.setitem(sys.modules, "NepTrainKit.core", None)
+    monkeypatch.setitem(sys.modules, "NepTrainKit.core.calculator", None)
+
+    result = representations.load_or_calculate_representations(
+        tmp_path,
+        structures,
+        mean_descriptor=True,
+        batch_size=2,
+        nep_model_file="nep89.txt",
+    )
+
+    np.testing.assert_array_equal(result, expected)
+
+
 def test_manifest_serialization_remains_byte_for_byte_unchanged(tmp_path) -> None:
     structures = [_Structure(f"structure-{index}") for index in range(3)]
     _write_cache(tmp_path, structures)
@@ -86,8 +103,8 @@ def test_order_change_invalidates_equal_shape_cache(tmp_path, monkeypatch) -> No
     replacement = np.full((3, 2), 7.0)
     monkeypatch.setattr(
         representations,
-        "NepCalculator",
-        lambda path: _CalculatorBoundary(str(path), 7.0),
+        "_load_nep_calculator",
+        lambda: lambda path: _CalculatorBoundary(str(path), 7.0),
     )
 
     result = representations.load_or_calculate_representations(
@@ -111,8 +128,8 @@ def test_corrupt_manifest_invalidates_cache(tmp_path, monkeypatch) -> None:
     replacement = np.full((3, 2), 9.0)
     monkeypatch.setattr(
         representations,
-        "NepCalculator",
-        lambda path: _CalculatorBoundary(str(path), 9.0),
+        "_load_nep_calculator",
+        lambda: lambda path: _CalculatorBoundary(str(path), 9.0),
     )
 
     result = representations.load_or_calculate_representations(
@@ -128,3 +145,19 @@ def test_corrupt_manifest_invalidates_cache(tmp_path, monkeypatch) -> None:
         representations.descriptor_manifest_path(tmp_path).read_text(encoding="utf-8")
     )
     assert saved["structure_ids"] == [item.structure_id for item in structures]
+
+
+def test_missing_neptrainkit_on_cache_miss_raises_explicit_error(tmp_path, monkeypatch) -> None:
+    structures = [_Structure(f"structure-{index}") for index in range(3)]
+    _write_cache(tmp_path, structures)
+    monkeypatch.setitem(sys.modules, "NepTrainKit", None)
+    monkeypatch.setitem(sys.modules, "NepTrainKit.core", None)
+    monkeypatch.setitem(sys.modules, "NepTrainKit.core.calculator", None)
+    with pytest.raises(ImportError, match="NepTrainKit is required"):
+        representations.load_or_calculate_representations(
+            tmp_path,
+            list(reversed(structures)),
+            mean_descriptor=True,
+            batch_size=2,
+            nep_model_file="nep89.txt",
+        )

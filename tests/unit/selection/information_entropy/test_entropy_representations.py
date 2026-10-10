@@ -1,7 +1,11 @@
 """Regression coverage for the potential-independent entropy representation."""
 
 import logging
+import os
 import re
+import subprocess
+import sys
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -15,6 +19,36 @@ from nepflow.stages.selection.representations import (
     fit_deterministic_whitening,
     load_or_calculate_local_representations,
 )
+
+
+def test_entropy_worker_import_does_not_load_neptrainkit() -> None:
+    repo_root = Path(__file__).resolve().parents[4]
+    source_path = str(repo_root / "src")
+    environment = os.environ.copy()
+    existing_pythonpath = environment.get("PYTHONPATH")
+    environment["PYTHONPATH"] = (
+        source_path
+        if not existing_pythonpath
+        else os.pathsep.join((source_path, existing_pythonpath))
+    )
+    script = """
+import sys
+
+from nepflow.stages.selection.representations import _compute_local_descriptor_task
+from nepflow.stages.selection.stage import SelectionStage
+
+assert _compute_local_descriptor_task is not None
+assert SelectionStage is not None
+assert not any(name.startswith("NepTrainKit") for name in sys.modules)
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        env=environment,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
 
 
 def _atoms(symbols: str = "SiOSi") -> Atoms:

@@ -10,7 +10,6 @@ from typing import Any
 
 import numpy as np
 from ase.io import read as ase_read
-from NepTrainKit.core.structure import Structure
 
 from nepflow.config.models import NepflowConfig, SelectionConfig
 from nepflow.errors import StateError
@@ -46,6 +45,14 @@ from .strategy import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _read_nep_structures(generated_path: Path) -> list[Any]:
+    """Load legacy NepTrainKit structures only when the NEP path needs them."""
+
+    from NepTrainKit.core.structure import Structure
+
+    return Structure.read_multiple(str(generated_path))
 
 
 def _aggregate_local_representations(
@@ -165,7 +172,7 @@ class SelectionStage:
             )
 
         started = time.perf_counter()
-        structures = Structure.read_multiple(str(generated_path))
+        structures = _read_nep_structures(generated_path)
         ase_structures = ase_read(str(generated_path), index=":", format="extxyz")
         if not isinstance(ase_structures, list):
             ase_structures = [ase_structures]
