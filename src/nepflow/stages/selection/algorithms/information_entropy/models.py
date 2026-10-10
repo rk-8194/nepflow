@@ -991,6 +991,322 @@ class EntropyObjectiveDiagnostics:
         return self.is_final
 
 
+@dataclass(frozen=True, slots=True)
+class EntropySelectionStep:
+    """One immutable anchor or greedy acquisition history entry."""
+
+    candidate_id: str
+    structure_id: str | None
+    acquisition_iteration: int
+    reason: str
+    marginal_gain: float | None
+    objective: float
+    anchor_normalized_objective: float
+    selected_count: int
+    cross_entropy: float | None = None
+    forward_kl: float | None = None
+    state_fingerprint: str = ""
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.candidate_id, str) or not self.candidate_id.strip():
+            raise ValueError("selection step candidate_id must be non-blank")
+        if self.structure_id is not None and (
+            not isinstance(self.structure_id, str) or not self.structure_id.strip()
+        ):
+            raise ValueError("selection step structure_id must be non-blank when supplied")
+        if self.reason not in {"anchor", "greedy"}:
+            raise ValueError("selection step reason must be 'anchor' or 'greedy'")
+        iteration = _exact_integer(
+            self.acquisition_iteration,
+            name="selection step acquisition_iteration",
+        )
+        selected_count = _exact_integer(self.selected_count, name="selection step selected_count")
+        if iteration < 0 or selected_count < 1:
+            raise ValueError("selection step iteration and selected_count must be positive")
+        if self.reason == "anchor":
+            if self.marginal_gain is not None:
+                raise ValueError("anchor selection steps cannot claim a marginal gain")
+            if iteration != 0:
+                raise ValueError("anchor selection steps must use acquisition_iteration zero")
+        elif self.marginal_gain is None:
+            raise ValueError("greedy selection steps require a marginal gain")
+        if self.marginal_gain is not None and (
+            not math.isfinite(float(self.marginal_gain)) or self.marginal_gain <= 0.0
+        ):
+            raise ValueError("selection step marginal gain must be finite and positive")
+        for name, value in (
+            ("objective", self.objective),
+            ("anchor_normalized_objective", self.anchor_normalized_objective),
+        ):
+            if not math.isfinite(float(value)):
+                raise ValueError(f"selection step {name} must be finite")
+        for name, value in (
+            ("cross_entropy", self.cross_entropy),
+            ("forward_kl", self.forward_kl),
+        ):
+            if value is not None and not math.isfinite(float(value)):
+                raise ValueError(f"selection step {name} must be finite when supplied")
+        if not isinstance(self.state_fingerprint, str) or not self.state_fingerprint.strip():
+            raise ValueError("selection step state fingerprint must be non-blank")
+        object.__setattr__(self, "acquisition_iteration", iteration)
+        object.__setattr__(self, "selected_count", selected_count)
+        if self.marginal_gain is not None:
+            object.__setattr__(self, "marginal_gain", float(self.marginal_gain))
+
+
+@dataclass(frozen=True, slots=True)
+class EntropySelectionHistory:
+    """Immutable acquisition order and per-step records."""
+
+    acquisition_order: tuple[str, ...]
+    steps: tuple[EntropySelectionStep, ...]
+
+    def __post_init__(self) -> None:
+        order = tuple(self.acquisition_order)
+        steps = tuple(self.steps)
+        if len(set(order)) != len(order):
+            raise ValueError("selection acquisition order must contain unique candidate IDs")
+        if tuple(step.candidate_id for step in steps) != order:
+            raise ValueError("selection history steps must follow acquisition order")
+        anchor_count = sum(step.reason == "anchor" for step in steps)
+        if any(step.reason == "anchor" for step in steps[anchor_count:]):
+            raise ValueError("anchor steps must precede greedy steps")
+        object.__setattr__(self, "acquisition_order", order)
+        object.__setattr__(self, "steps", steps)
+
+    @property
+    def candidate_ids(self) -> tuple[str, ...]:
+        return self.acquisition_order
+
+    @property
+    def records(self) -> tuple[EntropySelectionStep, ...]:
+        return self.steps
+
+
+@dataclass(frozen=True, slots=True)
+class EntropySelectionPerformance:
+    """Operational counters kept separate from the scientific result."""
+
+    gain_evaluations: int
+    initial_gain_evaluations: int
+    refreshed_gain_evaluations: int
+    update_gain_evaluations: int
+    heap_pops: int = 0
+    heap_reinsertions: int = 0
+    certifications: int = 0
+    support_work: int = 0
+    elapsed_seconds: float = 0.0
+
+    def __post_init__(self) -> None:
+        names = (
+            "gain_evaluations",
+            "initial_gain_evaluations",
+            "refreshed_gain_evaluations",
+            "update_gain_evaluations",
+            "heap_pops",
+            "heap_reinsertions",
+            "certifications",
+            "support_work",
+        )
+        for name in names:
+            value = _exact_integer(getattr(self, name), name=name)
+            if value < 0:
+                raise ValueError(f"{name} must be non-negative")
+            object.__setattr__(self, name, value)
+        if self.gain_evaluations != (
+            self.initial_gain_evaluations
+            + self.refreshed_gain_evaluations
+            + self.update_gain_evaluations
+        ):
+            raise ValueError("gain_evaluations must equal its component counters")
+        if not math.isfinite(float(self.elapsed_seconds)) or self.elapsed_seconds < 0.0:
+            raise ValueError("elapsed_seconds must be finite and non-negative")
+
+    @property
+    def gain_calls(self) -> int:
+        return self.gain_evaluations
+
+
+@dataclass(frozen=True, slots=True)
+class EntropySelectionResult:
+    """Immutable direct-optimizer result ready for later stage adaptation."""
+
+    method: str
+    method_version: str
+    budget: int
+    beta: float
+    anchor_ids: tuple[str, ...]
+    acquisition_order: tuple[str, ...]
+    selected_candidate_ids: tuple[str, ...]
+    selected_indices: tuple[int, ...]
+    history: EntropySelectionHistory
+    anchor_objective: float
+    final_objective: float
+    final_anchor_normalized_objective: float
+    final_cross_entropy: float
+    final_shannon_entropy: float
+    final_forward_kl: float
+    pool_fingerprint: str
+    graph_fingerprint: str
+    contributions_fingerprint: str
+    state_fingerprint: str
+    performance: EntropySelectionPerformance
+    final_normalized_support: tuple[float, ...]
+    structure_provenance: tuple[tuple[str, str], ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.method not in {"full_greedy", "lazy_greedy"}:
+            raise ValueError("selection method must be 'full_greedy' or 'lazy_greedy'")
+        if not isinstance(self.method_version, str) or not self.method_version.strip():
+            raise ValueError("selection method_version must be non-blank")
+        budget = _exact_integer(self.budget, name="selection budget")
+        if budget < 0:
+            raise ValueError("selection budget must be non-negative")
+        beta = float(self.beta)
+        if not math.isfinite(beta) or beta <= 0.0:
+            raise ValueError("selection beta must be finite and strictly positive")
+        anchor_ids = tuple(self.anchor_ids)
+        acquisition_order = tuple(self.acquisition_order)
+        selected_ids = tuple(self.selected_candidate_ids)
+        selected_indices = tuple(
+            _exact_integer(value, name="selection index") for value in self.selected_indices
+        )
+        if len(acquisition_order) != budget or len(set(acquisition_order)) != budget:
+            raise ValueError("acquisition order must contain exactly budget unique IDs")
+        if len(anchor_ids) > budget or acquisition_order[: len(anchor_ids)] != anchor_ids:
+            raise ValueError("anchors must be the first acquisition IDs")
+        if len(selected_ids) != budget or len(selected_indices) != budget:
+            raise ValueError("selection membership must contain exactly budget candidates")
+        if tuple(sorted(selected_indices)) != selected_indices:
+            raise ValueError("selection indices must be in canonical index order")
+        if set(selected_ids) != set(acquisition_order):
+            raise ValueError("selection membership must match acquisition order")
+        if self.history.acquisition_order != acquisition_order:
+            raise ValueError("selection history does not match acquisition order")
+        for name, value in (
+            ("anchor_objective", self.anchor_objective),
+            ("final_objective", self.final_objective),
+            ("final_anchor_normalized_objective", self.final_anchor_normalized_objective),
+            ("final_cross_entropy", self.final_cross_entropy),
+            ("final_shannon_entropy", self.final_shannon_entropy),
+            ("final_forward_kl", self.final_forward_kl),
+        ):
+            if not math.isfinite(float(value)):
+                raise ValueError(f"{name} must be finite")
+        for name, value in (
+            ("pool_fingerprint", self.pool_fingerprint),
+            ("graph_fingerprint", self.graph_fingerprint),
+            ("contributions_fingerprint", self.contributions_fingerprint),
+            ("state_fingerprint", self.state_fingerprint),
+        ):
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"{name} must be non-blank")
+        normalized_support = tuple(float(value) for value in self.final_normalized_support)
+        if not normalized_support or any(
+            not math.isfinite(value) or value <= 0.0 for value in normalized_support
+        ):
+            raise ValueError("final_normalized_support must be finite and strictly positive")
+        if not math.isclose(
+            sum(normalized_support),
+            1.0,
+            rel_tol=0.0,
+            abs_tol=SPARSE_NUMERICAL_TOLERANCE,
+        ):
+            raise ValueError("final_normalized_support must sum to one")
+        provenance = tuple(self.structure_provenance)
+        if len({candidate_id for candidate_id, _ in provenance}) != len(provenance):
+            raise ValueError("structure provenance must contain unique candidate IDs")
+        if any(
+            not isinstance(candidate_id, str)
+            or not candidate_id.strip()
+            or not isinstance(structure_id, str)
+            or not structure_id.strip()
+            for candidate_id, structure_id in provenance
+        ):
+            raise ValueError("structure provenance IDs must be non-blank strings")
+        object.__setattr__(self, "budget", budget)
+        object.__setattr__(self, "beta", beta)
+        object.__setattr__(self, "anchor_ids", anchor_ids)
+        object.__setattr__(self, "acquisition_order", acquisition_order)
+        object.__setattr__(self, "selected_candidate_ids", selected_ids)
+        object.__setattr__(self, "selected_indices", selected_indices)
+        object.__setattr__(self, "final_normalized_support", normalized_support)
+        object.__setattr__(self, "structure_provenance", provenance)
+
+    @property
+    def algorithm_id(self) -> str:
+        return "information_entropy"
+
+    @property
+    def algorithm_version(self) -> str:
+        return self.method_version
+
+    @property
+    def selected_ids(self) -> tuple[str, ...]:
+        return self.selected_candidate_ids
+
+    @property
+    def acquisition_ids(self) -> tuple[str, ...]:
+        return self.acquisition_order
+
+    @property
+    def steps(self) -> tuple[EntropySelectionStep, ...]:
+        return self.history.steps
+
+    @property
+    def membership(self) -> frozenset[str]:
+        return frozenset(self.selected_candidate_ids)
+
+    @property
+    def K(self) -> int:
+        return self.budget
+
+    @property
+    def final_F(self) -> float:
+        return self.final_objective
+
+    @property
+    def objective_history(self) -> tuple[float, ...]:
+        return (self.anchor_objective,) + tuple(
+            step.objective for step in self.history.steps if step.reason == "greedy"
+        )
+
+    @property
+    def marginal_gains(self) -> tuple[float, ...]:
+        return tuple(
+            step.marginal_gain
+            for step in self.history.steps
+            if step.reason == "greedy" and step.marginal_gain is not None
+        )
+
+    @property
+    def anchor_count(self) -> int:
+        return len(self.anchor_ids)
+
+    @property
+    def initial_objective(self) -> float:
+        return self.anchor_objective
+
+    @property
+    def final_diagnostics(self) -> tuple[float, float, float]:
+        return (self.final_cross_entropy, self.final_shannon_entropy, self.final_forward_kl)
+
+    @property
+    def final_q(self) -> tuple[float, ...]:
+        return self.final_normalized_support
+
+    @property
+    def final_normalized_q(self) -> tuple[float, ...]:
+        return self.final_normalized_support
+
+
+# Short aliases keep the optimizer API discoverable without duplicating model classes.
+GreedySelectionStep = EntropySelectionStep
+GreedySelectionHistory = EntropySelectionHistory
+GreedySelectionPerformance = EntropySelectionPerformance
+GreedySelectionResult = EntropySelectionResult
+
+
 BandwidthSettings = EntropyBandwidthSettings
 CalibrationSettings = EntropyBandwidthSettings
 BandwidthResult = FrozenBandwidths
@@ -1011,6 +1327,10 @@ __all__ = [
     "EntropyPool",
     "EntropyObjectiveDiagnostics",
     "EntropyObjectiveState",
+    "EntropySelectionHistory",
+    "EntropySelectionPerformance",
+    "EntropySelectionResult",
+    "EntropySelectionStep",
     "FrozenBandwidths",
     "InformationEntropyConfig",
     "KernelMetadata",
@@ -1028,4 +1348,8 @@ __all__ = [
     "SparseAtomicKernelRow",
     "SparseCandidateContributionRow",
     "SparseCandidateContributions",
+    "GreedySelectionHistory",
+    "GreedySelectionPerformance",
+    "GreedySelectionResult",
+    "GreedySelectionStep",
 ]

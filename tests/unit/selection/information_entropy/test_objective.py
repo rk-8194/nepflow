@@ -135,10 +135,7 @@ def test_sparse_marginal_gain_matches_dense_reference_without_mutation() -> None
     support = np.flatnonzero(q[:, 1] > 0.0)
     dense_gain = float(
         np.sum(
-            (
-                pool.probabilities[support]
-                * np.log1p(q[support, 1] / old_support[support])
-            ),
+            (pool.probabilities[support] * np.log1p(q[support, 1] / old_support[support])),
             dtype=np.float64,
         )
     )
@@ -248,8 +245,9 @@ def test_invalid_anchors_and_budget_are_rejected_without_state_creation() -> Non
         initialize_entropy_objective(pool, contributions, 0.25, anchors=(), budget=4)
 
 
-def test_duplicate_selection_and_stale_contribution_identity_fail_without_partial_mutation(
-) -> None:
+def test_duplicate_selection_and_stale_contribution_identity_fail_without_partial_mutation() -> (
+    None
+):
     pool, contributions = _fixture()
     state = initialize_entropy_objective(pool, contributions, 0.25, anchors=("a",), budget=2)
     old_support = state.s.copy()
