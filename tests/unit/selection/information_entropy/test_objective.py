@@ -135,8 +135,10 @@ def test_sparse_marginal_gain_matches_dense_reference_without_mutation() -> None
     support = np.flatnonzero(q[:, 1] > 0.0)
     dense_gain = float(
         np.sum(
-            pool.probabilities[support]
-            * np.log1p(q[support, 1] / old_support[support]),
+            (
+                pool.probabilities[support]
+                * np.log1p(q[support, 1] / old_support[support])
+            ),
             dtype=np.float64,
         )
     )
