@@ -178,6 +178,8 @@ class InitConfigPromptTests(unittest.TestCase):
             assert project["config_fingerprint"] == project["metadata"]["config_fingerprint"]
             assert project["metadata"]["config_schema_version"] == config.schema_version
             assert project["metadata"]["state_schema_version"] == CURRENT_SCHEMA_VERSION
+            assert config.magnetism.include_non_magnetic is True
+            assert config.magnetism.moment_sets == ()
             assert stage_run is not None
             assert stage_run["stage"] == WorkflowStage.INIT.value
             assert stage_run["status"] == StageRunState.RUNNING.value

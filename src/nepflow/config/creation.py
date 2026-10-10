@@ -221,22 +221,34 @@ antisite_min=0.0
 antisite_max=0.1
 
 [magnetism]
-# Magnetic candidates are opt-in and require a magnetic-capable target MLIP.
+# Magnetic expansion is opt-in. Set target_potential_magnetic=true before
+# enabling FM/AFM; enabled=true alone does not imply FM or AFM generation.
 enabled=false
 target_potential_magnetic=false
 include_non_magnetic=true
 include_ferromagnetic=false
 include_antiferromagnetic=false
-# JSON object: {{"set_name":{{"Fe":2.5,"Cr":1.5}}}}
+# Leave moment_sets blank unless scientifically justified project values are
+# available. Example only - not a default or recommendation for arbitrary chemistry:
+# moment_sets={{"low":{{"Fe":2.5,"Cr":1.5}},"nominal":{{"Fe":3.5,"Cr":2.5}},"high":{{"Fe":4.5,"Cr":3.5}}}}
 moment_sets=
+# Topology/symmetry matching tolerance.
 symmetry_tolerance=0.001
+# Numerical tolerance for AFM phase reality and commensurability checks.
 phase_tolerance=1e-8
+# AFM enumeration budget retained per structural parent; this is AFM-only.
 max_afm_orderings=16
+# Omit AFM for unsupported topology rather than guessing magnetic signs.
 unmapped_site_policy=skip_afm
+# "all" makes every supported configurational source eligible.
 magnetic_sources=all
-# Comma-separated supported defect families, blank means pristine only.
+# Blank means pristine/unperturbed structures only, not all defects.
 defect_families=
+# Zero means unlimited eligible defect parents, but only for explicitly enabled
+# families listed in defect_families.
 max_defect_parents=0
+# Final total magnetic-variant budgets per structural parent and defect parent.
+# max_afm_orderings above limits AFM enumeration specifically.
 max_magnetic_variants_per_parent=16
 max_magnetic_variants_per_defect=16
 
