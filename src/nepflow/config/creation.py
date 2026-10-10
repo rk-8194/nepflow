@@ -197,28 +197,34 @@ rattle_std_min=0.015
 rattle_std_max=0.06
 rattle_d_min=1.5
 
-# Vacancies (fraction of atoms to remove)
-vacancy_min=0.0
-vacancy_max=0.1
+# Vacancies (fraction of atoms to remove; about 1-3 defects in a 128-atom cell)
+# The fraction is applied to the actual generated supercell atom count, so
+# realised integer counts may differ when the cell is not exactly 128 atoms.
+vacancy_min=0.008
+vacancy_max=0.025
 vacancy_species=
 
-# Interstitials (atoms inserted at random valid positions)
+# Interstitials (about 1-3 defects in a 128-atom cell; see vacancy note above)
 interstitial_d_min=1.65
-interstitial_min=0.05
-interstitial_max=0.1
+interstitial_min=0.008
+interstitial_max=0.025
 interstitial_sites=
 crystallographic_interstitial_sites=
-defect_defect_d_min=0.0
-periodic_image_d_min=0.0
-interstitial_max_attempts=500
+# Minimum separation between inserted defect sites (Angstrom).
+defect_defect_d_min=1.65
+# Minimum shortest periodic cell translation checked for defect placement (Angstrom);
+# this is not a full relaxed defect-image interaction-distance calculation.
+periodic_image_d_min=6.0
+# Stochastic placement attempts per requested interstitial site.
+interstitial_max_attempts=1000
 
 # Substitution and antisite defects. Pairs use source->target notation.
 substitution_pairs=
-substitution_min=0.0
-substitution_max=0.1
+substitution_min=0.008
+substitution_max=0.025
 antisite_pairs=
-antisite_min=0.0
-antisite_max=0.1
+antisite_min=0.008
+antisite_max=0.025
 
 [magnetism]
 # Magnetic expansion is opt-in. Set target_potential_magnetic=true before

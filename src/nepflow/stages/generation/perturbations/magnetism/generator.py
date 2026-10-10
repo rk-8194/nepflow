@@ -64,8 +64,14 @@ class MagneticExpansionStream:
         self.generator = generator
         self.fail_on_empty_expansion = fail_on_empty_expansion
         self._structural_parents_examined = 0
+        self._selected_structural_parents = 0
+        self._defect_budget_excluded_parents = 0
         self._eligible_structural_parents = 0
+        self._selected_with_configured_magnetic_sites = 0
+        self._selected_without_configured_magnetic_sites = 0
         self._expanded_structural_parents = 0
+        self._zero_output_failures = 0
+        self._configured_magnetic_site_count = 0
         self._emitted_non_magnetic = 0
         self._emitted_ferromagnetic = 0
         self._emitted_antiferromagnetic = 0
@@ -93,8 +99,18 @@ class MagneticExpansionStream:
             )
         summary = MagneticGenerationSummary(
             structural_parents_examined=self._structural_parents_examined,
+            selected_structural_parents=self._selected_structural_parents,
+            defect_budget_excluded_parents=self._defect_budget_excluded_parents,
             eligible_structural_parents=self._eligible_structural_parents,
+            selected_with_configured_magnetic_sites=(
+                self._selected_with_configured_magnetic_sites
+            ),
+            selected_without_configured_magnetic_sites=(
+                self._selected_without_configured_magnetic_sites
+            ),
             expanded_structural_parents=self._expanded_structural_parents,
+            zero_output_failures=self._zero_output_failures,
+            configured_magnetic_site_count=self._configured_magnetic_site_count,
             emitted_non_magnetic=self._emitted_non_magnetic,
             emitted_ferromagnetic=self._emitted_ferromagnetic,
             emitted_antiferromagnetic=self._emitted_antiferromagnetic,
@@ -127,12 +143,15 @@ class MagneticExpansionStream:
         ):
             selected = False
         if selected:
-            self._eligible_structural_parents += 1
+            self._selected_structural_parents += 1
         if selected and family in MAGNETIC_DEFECT_FAMILIES:
             if config.max_defect_parents and self._defect_parents >= config.max_defect_parents:
+                self._defect_budget_excluded_parents += 1
                 selected = False
             else:
                 self._defect_parents += 1
+        if selected:
+            self._eligible_structural_parents += 1
         if not selected:
             preserved = structure.copy()
             annotate_candidate_id(preserved)
@@ -147,6 +166,11 @@ class MagneticExpansionStream:
         )
         result = self.generator.generate_result(structure, variant_limit=variant_limit)
         self._diagnostics.extend(result.summary.diagnostics)
+        self._configured_magnetic_site_count += result.summary.configured_magnetic_site_count
+        if result.summary.configured_magnetic_site_count:
+            self._selected_with_configured_magnetic_sites += 1
+        else:
+            self._selected_without_configured_magnetic_sites += 1
         self._emitted_non_magnetic += result.summary.emitted_non_magnetic
         self._emitted_ferromagnetic += result.summary.emitted_ferromagnetic
         self._emitted_antiferromagnetic += result.summary.emitted_antiferromagnetic
@@ -163,14 +187,21 @@ class MagneticExpansionStream:
             (config.include_ferromagnetic or config.include_antiferromagnetic)
             and not result.summary.emitted_ferromagnetic
             and not result.summary.emitted_antiferromagnetic
+            and result.summary.configured_magnetic_site_count > 0
             and not any(
-                diagnostic.code == "UNMAPPED_MAGNETIC_SITE"
+                diagnostic.code
+                in {
+                    "UNMAPPED_MAGNETIC_SITE",
+                    "INCOMMENSURATE_PROPAGATION",
+                    "NON_REAL_PROPAGATION_PHASE",
+                    "NO_VALID_AFM_ORDERINGS",
+                }
                 for diagnostic in result.summary.diagnostics
             )
         )
-        if empty_requested_expansion:
+        if empty_requested_expansion and self.fail_on_empty_expansion:
+            self._zero_output_failures += 1
             self._zero_variant_eligible_parents += 1
-        if self.fail_on_empty_expansion and empty_requested_expansion:
             raise MagneticGenerationError(
                 "eligible magnetic structural parent produced no FM or AFM candidates"
             )
@@ -238,6 +269,10 @@ class MagneticGenerator:
         eligible_by_set = {
             moment_set.name: self._eligible_mask(atoms, moment_set) for moment_set in moment_sets
         }
+        configured_magnetic_mask = np.zeros(len(atoms), dtype=bool)
+        for mask in eligible_by_set.values():
+            configured_magnetic_mask |= mask
+        configured_magnetic_site_count = int(np.count_nonzero(configured_magnetic_mask))
 
         if self.config.include_ferromagnetic:
             for moment_set in moment_sets:
@@ -392,6 +427,30 @@ class MagneticGenerator:
             )
         candidates.extend(retained_afm)
 
+        if (
+            self.config.include_antiferromagnetic
+            and configured_magnetic_site_count > 0
+            and not retained_afm
+            and not any(
+                diagnostic.ordering == MagneticOrdering.ANTIFERROMAGNETIC.value
+                and diagnostic.code
+                in {
+                    "UNMAPPED_MAGNETIC_SITE",
+                    "INCOMMENSURATE_PROPAGATION",
+                    "NON_REAL_PROPAGATION_PHASE",
+                }
+                for diagnostic in diagnostics
+            )
+        ):
+            diagnostics.append(
+                self._diagnostic(
+                    "NO_VALID_AFM_ORDERINGS",
+                    "no valid commensurate AFM ordering was available for this parent",
+                    ordering=MagneticOrdering.ANTIFERROMAGNETIC,
+                    parent_structure_id=parent_structure_id,
+                )
+            )
+
         unique_candidates: list[Atoms] = []
         seen_candidate_ids: set[str] = set()
         for candidate in candidates:
@@ -443,6 +502,7 @@ class MagneticGenerator:
                 for candidate in candidates
             ),
             total_magnetic_candidates=len(candidates),
+            configured_magnetic_site_count=configured_magnetic_site_count,
             total_available_afm=total_available_afm,
             retained_afm=actual_retained_afm,
             budget_truncated=afm_budget_truncated,

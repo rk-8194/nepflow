@@ -1138,7 +1138,7 @@ def test_application_composition_injects_magnetic_generator_only_when_enabled(
 
 @pytest.mark.real_generation_boundary
 def test_real_magnetic_generator_expands_pristine_parent_through_process(tmp_path) -> None:
-    """The production streaming coordinator must publish NM, FM, and AFM states."""
+    """The production stream handles both magnetic and no-site pristine parents."""
 
     base = Atoms(
         "CrW",
@@ -1151,6 +1151,16 @@ def test_real_magnetic_generator_expands_pristine_parent_through_process(tmp_pat
             "seed_id": "magnetic-seed",
             "source": "magnetic-fixture",
             "elements": ["Cr", "W"],
+            "configurational_type": "test_base",
+        }
+    )
+    pure_w = base.copy()
+    pure_w.set_chemical_symbols(["W", "W"])
+    pure_w.info.update(
+        {
+            "seed_id": "pure-w-seed",
+            "source": "pure-w-fixture",
+            "elements": ["W"],
             "configurational_type": "test_base",
         }
     )
@@ -1176,7 +1186,7 @@ def test_real_magnetic_generator_expands_pristine_parent_through_process(tmp_pat
     )
 
     output_path = coordinator.process(
-        [base],
+        [base, pure_w],
         tmp_path,
         n_rattled=0,
         n_vacancies=0,
@@ -1187,18 +1197,24 @@ def test_real_magnetic_generator_expands_pristine_parent_through_process(tmp_pat
     assert isinstance(candidates, list)
     orderings = {candidate.info.get("magnetic_ordering") for candidate in candidates}
     assert {"nonmagnetic", "fm", "afm"}.issubset(orderings)
-    assert len(candidates) > 1
+    assert len(candidates) > 2
     assert all("magnetic_ordering" in candidate.info for candidate in candidates)
 
-    structure_ids = {candidate.info["structure_id"] for candidate in candidates}
     candidate_ids = {candidate.info["candidate_id"] for candidate in candidates}
-    assert len(structure_ids) == 1
     assert len(candidate_ids) == len(candidates)
+    pure_w_candidates = [
+        candidate for candidate in candidates if set(candidate.get_chemical_symbols()) == {"W"}
+    ]
     magnetic_candidates = [
         candidate
         for candidate in candidates
-        if candidate.info["magnetic_ordering"] != "nonmagnetic"
+        if set(candidate.get_chemical_symbols()) == {"Cr", "W"}
+        and candidate.info["magnetic_ordering"] != "nonmagnetic"
     ]
+    assert len(pure_w_candidates) == 1
+    assert pure_w_candidates[0].info["magnetic_ordering"] == "nonmagnetic"
+    assert len(magnetic_candidates) > 1
+    assert len({candidate.info["structure_id"] for candidate in magnetic_candidates}) == 1
     for candidate in magnetic_candidates:
         for symbol, vector, constrained in zip(
             candidate.get_chemical_symbols(),
@@ -1215,13 +1231,20 @@ def test_real_magnetic_generator_expands_pristine_parent_through_process(tmp_pat
     summary = coordinator.get_summary()
     magnetic_summary = summary["magnetic"]
     assert summary["total"] == len(candidates)
-    assert magnetic_summary["structural_parents_examined"] == 1
-    assert magnetic_summary["eligible_structural_parents"] == 1
-    assert magnetic_summary["expanded_structural_parents"] == 1
+    assert magnetic_summary["structural_parents_examined"] == 2
+    assert magnetic_summary["selected_structural_parents"] == 2
+    assert magnetic_summary["eligible_structural_parents"] == 2
+    assert magnetic_summary["selected_with_configured_magnetic_sites"] == 1
+    assert magnetic_summary["selected_without_configured_magnetic_sites"] == 1
+    assert magnetic_summary["expanded_structural_parents"] == 2
     assert magnetic_summary["emitted_non_magnetic"] >= 1
     assert magnetic_summary["emitted_ferromagnetic"] >= 1
     assert magnetic_summary["emitted_antiferromagnetic"] >= 1
     assert magnetic_summary["total_magnetic_candidates"] == len(candidates)
+    assert any(
+        diagnostic["code"] == "NO_MAGNETIC_SITES"
+        for diagnostic in magnetic_summary["diagnostics"]
+    )
 
 
 def test_magnetic_harness_receives_global_ordered_defect_parents(tmp_path) -> None:

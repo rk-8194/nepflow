@@ -313,6 +313,20 @@ class GenerationStage:
                 magnetic.get("eligible_structural_parents", 0),
             )
             self.logger.info(
+                "  selected parents: %s; defect-budget excluded: %s",
+                magnetic.get("selected_structural_parents", 0),
+                magnetic.get("defect_budget_excluded_parents", 0),
+            )
+            self.logger.info(
+                "  selected with magnetic sites: %s; without magnetic sites: %s",
+                magnetic.get("selected_with_configured_magnetic_sites", 0),
+                magnetic.get("selected_without_configured_magnetic_sites", 0),
+            )
+            self.logger.info(
+                "  zero-output failures: %s",
+                magnetic.get("zero_output_failures", 0),
+            )
+            self.logger.info(
                 "  expanded parents: %s",
                 magnetic.get("expanded_structural_parents", 0),
             )

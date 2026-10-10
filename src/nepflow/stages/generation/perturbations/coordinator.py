@@ -1268,13 +1268,17 @@ class PerturbationCoordinator:
                     self._magnetic_summary = magnetic_summary
                     progress_tracker.written = self._total
                     logger.info(
-                        "Magnetic expansion complete: examined=%s; eligible=%s; expanded=%s; "
+                        "Magnetic expansion complete: examined=%s; selected=%s; eligible=%s; "
+                        "defect-budget-excluded=%s; expanded=%s; no-sites=%s; "
                         "NM=%s; FM=%s; AFM=%s; final magnetic candidates=%s; "
                         "AFM retained/available=%s/%s; AFM truncated=%s; "
                         "final variant budget truncations=%s",
                         magnetic_summary.structural_parents_examined,
+                        magnetic_summary.selected_structural_parents,
                         magnetic_summary.eligible_structural_parents,
+                        magnetic_summary.defect_budget_excluded_parents,
                         magnetic_summary.expanded_structural_parents,
+                        magnetic_summary.selected_without_configured_magnetic_sites,
                         magnetic_summary.emitted_non_magnetic,
                         magnetic_summary.emitted_ferromagnetic,
                         magnetic_summary.emitted_antiferromagnetic,

@@ -39,8 +39,14 @@ class MagneticGenerationSummary:
     budget_truncated: bool = False
     diagnostics: tuple[MagneticGenerationDiagnostic, ...] = ()
     structural_parents_examined: int = 0
+    selected_structural_parents: int = 0
+    defect_budget_excluded_parents: int = 0
     eligible_structural_parents: int = 0
+    selected_with_configured_magnetic_sites: int = 0
+    selected_without_configured_magnetic_sites: int = 0
     expanded_structural_parents: int = 0
+    zero_output_failures: int = 0
+    configured_magnetic_site_count: int = 0
     emitted_non_magnetic: int = 0
     emitted_ferromagnetic: int = 0
     emitted_antiferromagnetic: int = 0
@@ -62,8 +68,18 @@ class MagneticGenerationSummary:
     def to_dict(self) -> dict[str, Any]:
         return {
             "structural_parents_examined": self.structural_parents_examined,
+            "selected_structural_parents": self.selected_structural_parents,
+            "defect_budget_excluded_parents": self.defect_budget_excluded_parents,
             "eligible_structural_parents": self.eligible_structural_parents,
+            "selected_with_configured_magnetic_sites": (
+                self.selected_with_configured_magnetic_sites
+            ),
+            "selected_without_configured_magnetic_sites": (
+                self.selected_without_configured_magnetic_sites
+            ),
             "expanded_structural_parents": self.expanded_structural_parents,
+            "zero_output_failures": self.zero_output_failures,
+            "configured_magnetic_site_count": self.configured_magnetic_site_count,
             "emitted_non_magnetic": self.emitted_non_magnetic,
             "emitted_ferromagnetic": self.emitted_ferromagnetic,
             "emitted_antiferromagnetic": self.emitted_antiferromagnetic,

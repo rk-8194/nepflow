@@ -199,6 +199,11 @@ def test_defect_parent_limit_is_independent_and_scope_is_explicit() -> None:
     assert [item.info["candidate_id"] for item in first_run.candidates] == [
         item.info["candidate_id"] for item in second_run.candidates
     ]
+    assert first_run.summary.structural_parents_examined == 3
+    assert first_run.summary.selected_structural_parents == 2
+    assert first_run.summary.defect_budget_excluded_parents == 1
+    assert first_run.summary.eligible_structural_parents == 1
+    assert first_run.summary.expanded_structural_parents == 1
 
 
 def test_defect_magnetism_is_opt_in_per_family() -> None:

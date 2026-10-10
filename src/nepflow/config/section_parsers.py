@@ -368,17 +368,21 @@ def _parse_generation_perturbations(values: Mapping[str, str]) -> dict[str, Any]
             "generation.rattle_std_max",
         ),
         "rattle_d_min": _parse_float(values.get("rattle_d_min", "1.5"), "generation.rattle_d_min"),
-        "vacancy_min": _parse_float(values.get("vacancy_min", "0.0"), "generation.vacancy_min"),
-        "vacancy_max": _parse_float(values.get("vacancy_max", "0.1"), "generation.vacancy_max"),
+        "vacancy_min": _parse_float(
+            values.get("vacancy_min", "0.008"), "generation.vacancy_min"
+        ),
+        "vacancy_max": _parse_float(
+            values.get("vacancy_max", "0.025"), "generation.vacancy_max"
+        ),
         "interstitial_d_min": _parse_float(
             values.get("interstitial_d_min", "1.65"),
             "generation.interstitial_d_min",
         ),
         "interstitial_min": _parse_float(
-            values.get("interstitial_min", "0.05"), "generation.interstitial_min"
+            values.get("interstitial_min", "0.008"), "generation.interstitial_min"
         ),
         "interstitial_max": _parse_float(
-            values.get("interstitial_max", "0.1"),
+            values.get("interstitial_max", "0.025"),
             "generation.interstitial_max",
         ),
         "gas_interstitial_d_min": _parse_float(
@@ -386,15 +390,15 @@ def _parse_generation_perturbations(values: Mapping[str, str]) -> dict[str, Any]
             "generation.gas_interstitial_d_min",
         ),
         "defect_defect_d_min": _parse_float(
-            values.get("defect_defect_d_min", "0.0"),
+            values.get("defect_defect_d_min", "1.65"),
             "generation.defect_defect_d_min",
         ),
         "periodic_image_d_min": _parse_float(
-            values.get("periodic_image_d_min", "0.0"),
+            values.get("periodic_image_d_min", "6.0"),
             "generation.periodic_image_d_min",
         ),
         "interstitial_max_attempts": _parse_int(
-            values.get("interstitial_max_attempts", "500"),
+            values.get("interstitial_max_attempts", "1000"),
             "generation.interstitial_max_attempts",
         ),
         "max_gas_occupancy": _parse_int(
@@ -408,16 +412,20 @@ def _parse_generation_perturbations(values: Mapping[str, str]) -> dict[str, Any]
             values.get("substitution_pairs", ""), "generation.substitution_pairs"
         ),
         "substitution_min": _parse_float(
-            values.get("substitution_min", "0.0"), "generation.substitution_min"
+            values.get("substitution_min", "0.008"), "generation.substitution_min"
         ),
         "substitution_max": _parse_float(
-            values.get("substitution_max", "0.1"), "generation.substitution_max"
+            values.get("substitution_max", "0.025"), "generation.substitution_max"
         ),
         "antisite_pairs": _parse_species_pairs(
             values.get("antisite_pairs", ""), "generation.antisite_pairs"
         ),
-        "antisite_min": _parse_float(values.get("antisite_min", "0.0"), "generation.antisite_min"),
-        "antisite_max": _parse_float(values.get("antisite_max", "0.1"), "generation.antisite_max"),
+        "antisite_min": _parse_float(
+            values.get("antisite_min", "0.008"), "generation.antisite_min"
+        ),
+        "antisite_max": _parse_float(
+            values.get("antisite_max", "0.025"), "generation.antisite_max"
+        ),
         "interstitial_sites": _parse_interstitial_sites(
             values.get("interstitial_sites", ""), "generation.interstitial_sites"
         ),

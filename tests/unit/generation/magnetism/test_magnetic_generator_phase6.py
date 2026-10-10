@@ -73,6 +73,19 @@ def test_simple_bipartite_afm_and_propagation_sign_pattern() -> None:
     np.testing.assert_allclose(target.arrays["magnetic_moments"][:, 2], expected)
 
 
+def test_pure_cr_parent_keeps_normal_fm_and_afm_generation() -> None:
+    result = MagneticGenerator(
+        _config(moment_sets=(MagneticMomentSet("nominal", {"Cr": 2.5}),))
+    ).generate_result(_supercell("Cr", 8))
+
+    assert result.summary.configured_magnetic_site_count == 8
+    assert result.summary.emitted_ferromagnetic == 1
+    assert result.summary.emitted_antiferromagnetic > 0
+    assert not any(
+        diagnostic.code == "NO_MAGNETIC_SITES" for diagnostic in result.summary.diagnostics
+    )
+
+
 def test_multi_orbit_afm_enumerates_intracell_phase() -> None:
     parent = Atoms(
         "FeNi",
@@ -183,3 +196,22 @@ def test_expansion_scope_does_not_touch_unselected_structural_families() -> None
     assert result.candidates[0].info["magnetic_ordering"] == "fm"
     assert result.candidates[0].info["perturbation_type"] == "unperturbed"
     assert "magnetic_ordering" not in result.candidates[1].info
+
+
+def test_structurally_selected_parent_without_configured_sites_emits_only_nm() -> None:
+    result = MagneticGenerator(
+        _config(moment_sets=(MagneticMomentSet("nominal", {"Cr": 2.5}),))
+    ).expand_structures([_supercell("W", 4)])
+
+    assert len(result.candidates) == 1
+    assert result.candidates[0].info["magnetic_ordering"] == "nonmagnetic"
+    assert result.summary.selected_structural_parents == 1
+    assert result.summary.eligible_structural_parents == 1
+    assert result.summary.selected_with_configured_magnetic_sites == 0
+    assert result.summary.selected_without_configured_magnetic_sites == 1
+    assert result.summary.zero_output_failures == 0
+    assert result.summary.emitted_ferromagnetic == 0
+    assert result.summary.emitted_antiferromagnetic == 0
+    assert any(
+        diagnostic.code == "NO_MAGNETIC_SITES" for diagnostic in result.summary.diagnostics
+    )

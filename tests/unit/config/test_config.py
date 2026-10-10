@@ -2,7 +2,13 @@ from pathlib import Path
 
 import pytest
 
-from nepflow.config import find_config_path, load_config, load_legacy_config
+from nepflow.config import (
+    GenerationConfig,
+    find_config_path,
+    load_config,
+    load_legacy_config,
+    render_default_config,
+)
 from nepflow.errors import ConfigurationError
 
 BASE_CONFIG = """
@@ -45,6 +51,71 @@ def test_loader_builds_immutable_typed_root_and_applies_defaults(tmp_path: Path)
     assert config.hpc.vasp_command == "vasp_std"
     with pytest.raises(AttributeError):
         config.project = config.project
+
+
+def test_canonical_point_defect_defaults_round_trip_without_chemistry_inference(
+    tmp_path: Path,
+) -> None:
+    expected = GenerationConfig()
+    assert expected.target_n_atoms == 128
+    assert expected.vacancy_min == 0.008
+    assert expected.vacancy_max == 0.025
+    assert expected.interstitial_d_min == 1.65
+    assert expected.interstitial_min == 0.008
+    assert expected.interstitial_max == 0.025
+    assert expected.defect_defect_d_min == 1.65
+    assert expected.periodic_image_d_min == 6.0
+    assert expected.interstitial_max_attempts == 1000
+    assert expected.substitution_min == 0.008
+    assert expected.substitution_max == 0.025
+    assert expected.antisite_min == 0.008
+    assert expected.antisite_max == 0.025
+    assert expected.n_substitutions == 0
+    assert expected.n_antisites == 0
+
+    fields = (
+        "target_n_atoms",
+        "vacancy_min",
+        "vacancy_max",
+        "interstitial_d_min",
+        "interstitial_min",
+        "interstitial_max",
+        "defect_defect_d_min",
+        "periodic_image_d_min",
+        "interstitial_max_attempts",
+        "substitution_min",
+        "substitution_max",
+        "antisite_min",
+        "antisite_max",
+    )
+    fallback = load_config(write_config(tmp_path, BASE_CONFIG)).generation
+    for field in fields:
+        assert getattr(fallback, field) == getattr(expected, field)
+
+    rendered = render_default_config(
+        "demo",
+        {
+            "elements": "W,Cr",
+            "gas_elements": "",
+            "crystal_structures": "bcc",
+            "target_n_atoms": "128",
+            "scp_address": "",
+            "ntasks": "1",
+        },
+    )
+    path = write_config(tmp_path, rendered)
+    loaded = load_config(path).generation
+    for field in fields:
+        assert getattr(loaded, field) == getattr(expected, field)
+    for field in (
+        "vacancy_species",
+        "substitution_pairs",
+        "antisite_pairs",
+        "interstitial_sites",
+        "crystallographic_interstitial_sites",
+    ):
+        assert getattr(loaded, field) == ()
+        assert f"{field}=\n" in rendered
 
 
 def test_generation_source_scope_defaults_are_explicit_and_stable(tmp_path: Path) -> None:

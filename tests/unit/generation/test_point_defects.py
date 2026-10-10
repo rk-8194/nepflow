@@ -97,6 +97,34 @@ def test_segregated_vacancy_slot_windows_are_continuous_and_deterministic() -> N
     ]
 
 
+def test_canonical_point_defect_ranges_request_one_to_three_for_128_atoms() -> None:
+    base, prepared, _ = _prepared_segregated_base()
+    settings = PerturbationSettings(
+        target_n_atoms=128,
+        vacancy_range=(0.008, 0.025),
+        interstitial_range=(0.008, 0.025),
+        random_seed=42,
+    )
+
+    requested_vacancies = [
+        vacancies(prepared, base, 1, settings, None, _annotate, seed=seed)[0].info[
+            "requested_n_vacancies"
+        ]
+        for seed in (1, 7, 19, 42, 101, 997)
+    ]
+    requested_interstitials = [
+        interstitials(prepared, base, 1, settings, None, _annotate, seed=seed)[0].info[
+            "requested_n_interstitials"
+        ]
+        for seed in (1, 7, 19, 42, 101, 997)
+    ]
+
+    for requested in (requested_vacancies, requested_interstitials):
+        assert min(requested) >= 1
+        assert max(requested) <= 3
+        assert all(value < 6 for value in requested)
+
+
 def test_species_restricted_vacancy_and_impossible_species_failure() -> None:
     base = _base()
     settings = PerturbationSettings(
