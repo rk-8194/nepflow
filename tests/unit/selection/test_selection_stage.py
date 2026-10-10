@@ -1,7 +1,7 @@
 """Selection orchestration, injection, persistence, and reconciliation tests."""
 
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import ANY, patch
 
 import numpy as np
 import pytest
@@ -107,17 +107,28 @@ def test_stage_consumes_injected_typed_config_without_discovery(tmp_path):
             patch.object(stage, "prepare", return_value=prepared),
             patch.object(stage, "execute", return_value=result) as execute,
             patch.object(stage, "finalize", return_value=result) as finalize,
+            patch.object(selection_stage_module, "verify_selection_artifacts", return_value={}),
         ):
             returned = stage.run()
 
     assert returned is result
-    execute.assert_called_once_with(settings, prepared, context=context)
-    finalize.assert_called_once_with(prepared, result, context=context)
+    execute.assert_called_once_with(
+        settings,
+        prepared,
+        context=context,
+        resource_budget=ANY,
+    )
+    finalize.assert_called_once_with(
+        prepared,
+        result,
+        context=context,
+        resource_budget=ANY,
+    )
     assert not hasattr(stage, "_find_config_file")
     assert not hasattr(selection_stage_module, "load_config")
 
 
-def test_selection_run_persists_exact_ids_policy_and_completion(tmp_path):
+def test_selection_run_persists_exact_ids_as_pending_before_publication(tmp_path):
     settings = SelectionConfig(target_train_count=1, target_test_count=1)
     candidates = [_atoms("Si", 0.0), _atoms("Ge", 1.0)]
     result = _result(np.ones((2, 2)))
@@ -134,8 +145,8 @@ def test_selection_run_persists_exact_ids_policy_and_completion(tmp_path):
             result,
         )
 
-        assert record["status"] == "completed"
-        assert record["completed_at"] is not None
+        assert record["status"] == "pending"
+        assert record["completed_at"] is None
         assert record["parameters"]["selected_structure_ids"]["train"] == [
             structure_ids(candidates)[0]
         ]
@@ -194,7 +205,7 @@ def test_reopen_reconciles_by_identity_after_candidate_reordering(tmp_path):
     assert [current_ids[index] for index in restored.test_indices] == [original_ids[1]]
 
 
-def test_report_failure_does_not_remove_completed_scientific_result(tmp_path):
+def test_report_failure_leaves_selection_pending(tmp_path):
     settings = SelectionConfig(target_train_count=1, target_test_count=1)
     with StateStore(tmp_path / "state.db") as store:
         context = _context(tmp_path, store, settings)
@@ -219,4 +230,4 @@ def test_report_failure_does_not_remove_completed_scientific_result(tmp_path):
         run_ids = store.connection.execute("SELECT selection_run_id FROM selection_runs").fetchall()
         assert len(run_ids) == 1
         record = store.get_selection_run(run_ids[0][0])
-        assert record["status"] == "completed"
+        assert record["status"] == "pending"

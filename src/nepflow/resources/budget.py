@@ -9,6 +9,7 @@ an allocation: an unknown memory limit is not treated as unlimited memory.
 from __future__ import annotations
 
 import ctypes
+import logging
 import math
 import os
 import shutil
@@ -26,6 +27,8 @@ except ImportError:  # pragma: no cover - exercised on Windows
 
 DEFAULT_SAFETY_MARGIN_FRACTION = 0.10
 _UNLIMITED = (1 << 60) - 1
+_CGROUP_STATUSES = {"finite", "unlimited", "absent", "unknown"}
+logger = logging.getLogger(__name__)
 
 
 def _optional_nonnegative(value: int | None, name: str) -> int | None:
@@ -51,6 +54,8 @@ class ResourceSnapshot:
     host_available_memory_bytes: int | None = None
     effective_cgroup_memory_limit_bytes: int | None = None
     effective_cgroup_current_bytes: int | None = None
+    cgroup_status: str = "absent"
+    cgroup_paths: tuple[str, ...] = ()
     rlimit_address_space_bytes: int | None = None
     rlimit_data_bytes: int | None = None
     scheduler_allocation_bytes: int | None = None
@@ -76,6 +81,21 @@ class ResourceSnapshot:
         )
         for name in names:
             object.__setattr__(self, name, _optional_nonnegative(getattr(self, name), name))
+        status = str(self.cgroup_status).strip().lower()
+        if status not in _CGROUP_STATUSES:
+            raise ValueError(
+                "cgroup_status must be one of: "
+                f"{', '.join(sorted(_CGROUP_STATUSES))}"
+            )
+        if status == "absent" and self.effective_cgroup_memory_limit_bytes is not None:
+            status = "finite" if self.effective_cgroup_current_bytes is not None else "unknown"
+        if status == "finite" and (
+            self.effective_cgroup_memory_limit_bytes is None
+            or self.effective_cgroup_current_bytes is None
+        ):
+            status = "unknown"
+        object.__setattr__(self, "cgroup_status", status)
+        object.__setattr__(self, "cgroup_paths", tuple(map(str, self.cgroup_paths)))
         if self.effective_cgroup_current_bytes is not None and (
             self.effective_cgroup_memory_limit_bytes is not None
             and self.effective_cgroup_current_bytes
@@ -85,7 +105,7 @@ class ResourceSnapshot:
         candidates: list[int] = []
         if self.host_available_memory_bytes is not None:
             candidates.append(self.host_available_memory_bytes)
-        if self.cgroup_headroom_bytes is not None:
+        if self.cgroup_status == "finite" and self.cgroup_headroom_bytes is not None:
             candidates.append(self.cgroup_headroom_bytes)
         if self.scheduler_allocation_bytes is not None:
             candidates.append(self.scheduler_allocation_bytes)
@@ -112,10 +132,31 @@ class ResourceSnapshot:
 
     @property
     def cgroup_headroom_bytes(self) -> int | None:
-        if self.effective_cgroup_memory_limit_bytes is None:
+        if (
+            self.cgroup_status != "finite"
+            or self.effective_cgroup_memory_limit_bytes is None
+            or self.effective_cgroup_current_bytes is None
+        ):
             return None
-        current = self.effective_cgroup_current_bytes or 0
-        return max(0, self.effective_cgroup_memory_limit_bytes - current)
+        return max(
+            0,
+            self.effective_cgroup_memory_limit_bytes - self.effective_cgroup_current_bytes,
+        )
+
+    def diagnostic_summary(self) -> str:
+        """Return actionable provenance for a memory-admission failure."""
+
+        uncertainty = ", ".join(self.uncertainty) or "none"
+        sources = ", ".join(self.detection_sources) or "none"
+        paths = ", ".join(self.cgroup_paths) or "none"
+        return (
+            f"host_available={self.host_available_memory_bytes}, "
+            f"cgroup_status={self.cgroup_status}, cgroup_paths={paths}, "
+            f"cgroup_limit={self.effective_cgroup_memory_limit_bytes}, "
+            f"cgroup_current={self.effective_cgroup_current_bytes}, "
+            f"effective_available={self.effective_available_memory_bytes}, "
+            f"sources={sources}, uncertainty={uncertainty}"
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -285,6 +326,17 @@ class ResourceBudgetService:
         with self._lock:
             return tuple(sorted(lease.operation for lease in self._leases if not lease.closed))
 
+    def unknown_memory_message(self, operation: str, *, resizing: bool = False) -> str:
+        action = " while resizing" if resizing else ""
+        snapshot = self.budget.snapshot
+        return (
+            f"runtime memory availability is unknown{action} for {operation!r}; "
+            f"mode={self.budget.execution_mode}, "
+            f"memory_budget_override={self.budget.memory_budget_bytes is not None}; "
+            f"{snapshot.diagnostic_summary()}. Provide an explicit expert "
+            "[resources] memory_budget_bytes or repair the unavailable resource probe."
+        )
+
     def acquire(
         self,
         operation: str,
@@ -300,8 +352,7 @@ class ResourceBudgetService:
             available = self.budget.available_memory_bytes
             if available is None:
                 raise ResourceCapacityError(
-                    "runtime memory availability is unknown; provide an explicit expert "
-                    f"memory budget before starting {operation!r}",
+                    self.unknown_memory_message(operation),
                     operation=operation,
                     requested_bytes=memory_request,
                     available_bytes=None,
@@ -384,8 +435,7 @@ class ResourceBudgetService:
             available = self.budget.available_memory_bytes
             if available is None:
                 raise ResourceCapacityError(
-                    "runtime memory availability is unknown while resizing "
-                    f"{lease.operation!r}",
+                    self.unknown_memory_message(lease.operation, resizing=True),
                     operation=lease.operation,
                     requested_bytes=new_memory,
                     reserved_headroom_bytes=self.budget.reserved_headroom_bytes,
@@ -528,8 +578,21 @@ def _linux_cgroup_paths(
                 continue
             if wanted == "memory" and "memory" not in mount_options:
                 continue
+            mount_root = Path(_unescape_mountinfo(left_fields[3]))
             mount_point = Path(_unescape_mountinfo(left_fields[4]))
-            path = mount_point / relative
+            membership_path = Path("/") / relative
+            if mount_root == Path("/"):
+                mapped_relative = relative
+            else:
+                mount_root_text = str(mount_root).rstrip("/") or "/"
+                membership_text = str(membership_path)
+                if membership_text == mount_root_text:
+                    mapped_relative = ""
+                elif membership_text.startswith(mount_root_text + "/"):
+                    mapped_relative = membership_text[len(mount_root_text) + 1 :]
+                else:
+                    continue
+            path = mount_point / mapped_relative
             paths.append((path, mount_point, filesystem))
             break
     if not paths and membership and not mountinfo:
@@ -573,50 +636,96 @@ def _ancestor_values(path: Path, mount_root: Path, names: tuple[str, ...]) -> li
     return values
 
 
+@dataclass(frozen=True, slots=True)
+class _CgroupPathProbe:
+    metrics: tuple[tuple[int, int | None], ...] = ()
+    saw_limit: bool = False
+    saw_unlimited: bool = False
+    saw_unknown: bool = False
+
+
+def _probe_ancestor_memory_metrics(
+    path: Path,
+    mount_root: Path,
+    limit_name: str,
+    current_name: str,
+) -> _CgroupPathProbe:
+    metrics: list[tuple[int, int | None]] = []
+    saw_limit = False
+    saw_unlimited = False
+    saw_unknown = False
+    current = path
+    try:
+        while True:
+            limit_path = current / limit_name
+            limit_text = _safe_read(limit_path)
+            if limit_text is None:
+                if limit_path.exists():
+                    saw_unknown = True
+            else:
+                saw_limit = True
+                token = limit_text.strip().lower()
+                if token == "max":
+                    saw_unlimited = True
+                else:
+                    try:
+                        limit = int(token)
+                    except ValueError:
+                        limit = -1
+                    if limit >= _UNLIMITED:
+                        saw_unlimited = True
+                    elif 0 <= limit < _UNLIMITED:
+                        current_path = current / current_name
+                        current_text = _safe_read(current_path)
+                        if current_text is None:
+                            saw_unknown = True
+                        else:
+                            try:
+                                parsed = int(current_text.strip())
+                            except ValueError:
+                                parsed = -1
+                            if parsed >= 0:
+                                metrics.append((limit, parsed))
+                            else:
+                                saw_unknown = True
+                    else:
+                        saw_unknown = True
+            if current == mount_root or current.parent == current:
+                break
+            current = current.parent
+    except OSError:
+        saw_unknown = True
+    return _CgroupPathProbe(tuple(metrics), saw_limit, saw_unlimited, saw_unknown)
+
+
 def _ancestor_memory_metrics(
     path: Path,
     mount_root: Path,
     limit_name: str,
     current_name: str,
 ) -> list[tuple[int, int | None]]:
-    metrics: list[tuple[int, int | None]] = []
-    current = path
-    try:
-        while True:
-            limit_text = _safe_read(current / limit_name)
-            if limit_text is not None:
-                token = limit_text.strip()
-                if token != "max":
-                    try:
-                        limit = int(token)
-                    except ValueError:
-                        limit = -1
-                    if 0 <= limit < _UNLIMITED:
-                        current_text = _safe_read(current / current_name)
-                        current_value: int | None = None
-                        if current_text is not None:
-                            try:
-                                parsed = int(current_text.strip())
-                            except ValueError:
-                                parsed = -1
-                            if parsed >= 0:
-                                current_value = parsed
-                        metrics.append((limit, current_value))
-            if current == mount_root or current.parent == current:
-                break
-            current = current.parent
-    except OSError:
-        pass
-    return metrics
+    """Compatibility wrapper for callers that only need finite metrics."""
+
+    return list(
+        _probe_ancestor_memory_metrics(path, mount_root, limit_name, current_name).metrics
+    )
 
 
 def _detect_linux_cgroup(
     proc_root: Path, cgroup_root: Path
-) -> tuple[int | None, int | None, list[str], list[str]]:
+) -> tuple[
+    int | None,
+    int | None,
+    str,
+    tuple[str, ...],
+    list[str],
+    list[str],
+]:
     metrics: list[tuple[int, int | None]] = []
     sources: list[str] = []
     uncertainty: list[str] = []
     paths = _linux_cgroup_paths(proc_root, cgroup_root)
+    path_probes: list[_CgroupPathProbe] = []
     for path, mount_point, filesystem in paths:
         if filesystem == "cgroup2":
             limit_names = ("memory.max",)
@@ -624,35 +733,74 @@ def _detect_linux_cgroup(
         else:
             limit_names = ("memory.limit_in_bytes",)
             current_names = ("memory.usage_in_bytes",)
-        path_metrics = _ancestor_memory_metrics(
+        path_probe = _probe_ancestor_memory_metrics(
             path,
             mount_point,
             limit_names[0],
             current_names[0],
         )
-        metrics.extend(path_metrics)
-        if path_metrics:
-            sources.append(f"{filesystem}:{path}")
+        path_probes.append(path_probe)
+        metrics.extend(path_probe.metrics)
+        sources.append(f"{filesystem}:{path}")
     if not metrics:
-        if paths:
-            uncertainty.append("cgroup memory metrics are unavailable")
-        return None, None, sources, uncertainty
-    effective_limit = min(limit for limit, _ in metrics)
+        membership = _safe_read(proc_root / "self" / "cgroup")
+        mountinfo = _safe_read(proc_root / "self" / "mountinfo")
+        if not paths and membership is not None and membership.strip() and mountinfo is not None:
+            uncertainty.append("cgroup membership could not be mapped to a memory mount")
+            return None, None, "unknown", (), sources, uncertainty
+        if not paths and membership is None:
+            uncertainty.append("cgroup membership is unreadable")
+            return None, None, "unknown", (), sources, uncertainty
+        if not paths:
+            return None, None, "absent", (), sources, uncertainty
+        if any(probe.saw_unknown for probe in path_probes):
+            uncertainty.append("cgroup memory limit or usage is unreadable")
+            return (
+                None,
+                None,
+                "unknown",
+                tuple(str(path) for path, _, _ in paths),
+                sources,
+                uncertainty,
+            )
+        if all(probe.saw_limit and probe.saw_unlimited for probe in path_probes):
+            return (
+                None,
+                None,
+                "unlimited",
+                tuple(str(path) for path, _, _ in paths),
+                sources,
+                uncertainty,
+            )
+        uncertainty.append("cgroup memory controller has no usable limit")
+        return None, None, "unknown", tuple(str(path) for path, _, _ in paths), sources, uncertainty
+    if any(probe.saw_unknown for probe in path_probes):
+        uncertainty.append("an applicable cgroup memory limit or usage is unreadable")
+    effective_headroom_index: int | None = None
     headrooms: list[int] = []
     for limit, current in metrics:
         if current is None:
-            headrooms.append(limit)
+            uncertainty.append("cgroup usage is unreadable")
+            headrooms.append(0)
         elif current > limit:
             uncertainty.append("cgroup usage exceeded a discovered limit")
             headrooms.append(0)
         else:
             headrooms.append(limit - current)
-    effective_headroom_index = min(range(len(headrooms)), key=headrooms.__getitem__)
-    effective_current = metrics[effective_headroom_index][1]
-    if effective_current is not None and effective_current > effective_limit:
-        uncertainty.append("nested cgroup metrics were inconsistent")
-        effective_current = effective_limit
-    return effective_limit, effective_current, sources, uncertainty
+    if headrooms:
+        effective_headroom_index = min(range(len(headrooms)), key=headrooms.__getitem__)
+    assert effective_headroom_index is not None
+    effective_limit, effective_current = metrics[effective_headroom_index]
+    assert effective_current is not None
+    status = "unknown" if any(probe.saw_unknown for probe in path_probes) else "finite"
+    return (
+        effective_limit,
+        min(effective_current, effective_limit),
+        status,
+        tuple(str(path) for path, _, _ in paths),
+        sources,
+        uncertainty,
+    )
 
 
 def _detect_rlimits(proc_root: Path) -> tuple[int | None, int | None, int | None, list[str]]:
@@ -757,6 +905,8 @@ def detect_resource_snapshot(
     host_available: int | None = None
     cgroup_limit: int | None = None
     cgroup_current: int | None = None
+    cgroup_status = "absent"
+    cgroup_paths: tuple[str, ...] = ()
     rlimit_as: int | None = None
     rlimit_data: int | None = None
     rss: int | None = None
@@ -778,9 +928,14 @@ def detect_resource_snapshot(
                 sources.append("/proc/meminfo:MemAvailable")
         else:
             uncertainty.append("/proc/meminfo is unavailable")
-        cgroup_limit, cgroup_current, cg_sources, cg_uncertainty = _detect_linux_cgroup(
-            proc, cgroup
-        )
+        (
+            cgroup_limit,
+            cgroup_current,
+            cgroup_status,
+            cgroup_paths,
+            cg_sources,
+            cg_uncertainty,
+        ) = _detect_linux_cgroup(proc, cgroup)
         sources.extend(cg_sources)
         uncertainty.extend(cg_uncertainty)
     elif platform_value == "darwin":
@@ -822,8 +977,12 @@ def detect_resource_snapshot(
     if host_available is not None:
         candidates.append(host_available)
     cgroup_headroom = None
-    if cgroup_limit is not None:
-        cgroup_headroom = max(0, cgroup_limit - (cgroup_current or 0))
+    if (
+        cgroup_status == "finite"
+        and cgroup_limit is not None
+        and cgroup_current is not None
+    ):
+        cgroup_headroom = max(0, cgroup_limit - cgroup_current)
         candidates.append(cgroup_headroom)
     if scheduler_bytes is not None:
         candidates.append(scheduler_bytes)
@@ -836,6 +995,8 @@ def detect_resource_snapshot(
         host_available_memory_bytes=host_available,
         effective_cgroup_memory_limit_bytes=cgroup_limit,
         effective_cgroup_current_bytes=cgroup_current,
+        cgroup_status=cgroup_status,
+        cgroup_paths=cgroup_paths,
         rlimit_address_space_bytes=rlimit_as,
         rlimit_data_bytes=rlimit_data,
         scheduler_allocation_bytes=scheduler_bytes,
@@ -869,10 +1030,28 @@ def build_resource_budget(
     if not math.isfinite(float(safety_margin_fraction)) or not 0.0 <= safety_margin_fraction < 1.0:
         raise ValueError("safety_margin_fraction must be finite and in [0, 1)")
     detected = current.effective_available_memory_bytes
-    if normalized_mode == "auto" and any(
-        note == "cgroup memory metrics are unavailable" for note in current.uncertainty
-    ):
-        detected = None
+    if normalized_mode == "auto" and current.cgroup_status == "unknown":
+        # MemAvailable is not a safe substitute for a cgroup limit that may
+        # exist but could not be read.  Independent process/scheduler bounds
+        # remain valid and can still admit work.
+        independent_bounds = [
+            bound
+            for bound in (
+                current.scheduler_allocation_bytes,
+                (
+                    max(0, current.rlimit_address_space_bytes - (current.process_rss_bytes or 0))
+                    if current.rlimit_address_space_bytes is not None
+                    else None
+                ),
+                (
+                    max(0, current.rlimit_data_bytes - (current.process_rss_bytes or 0))
+                    if current.rlimit_data_bytes is not None
+                    else None
+                ),
+            )
+            if bound is not None
+        ]
+        detected = min(independent_bounds) if independent_bounds else None
     if memory_budget_bytes is not None:
         memory_budget_bytes = _optional_positive(memory_budget_bytes, "memory_budget_bytes")
         detected = memory_budget_bytes if detected is None else min(detected, memory_budget_bytes)
@@ -887,15 +1066,29 @@ def build_resource_budget(
     if scratch_budget_bytes is not None:
         scratch_budget_bytes = _optional_positive(scratch_budget_bytes, "scratch_budget_bytes")
         scratch = scratch_budget_bytes if scratch is None else min(scratch, scratch_budget_bytes)
+    provenance_parts = list(current.detection_sources)
+    if memory_budget_bytes is not None:
+        provenance_parts.append("memory_budget_override")
     budget = ResourceBudget(
         execution_mode=execution_mode,
         memory_budget_bytes=detected,
         reserved_headroom_bytes=reserve,
         scratch_budget_bytes=scratch,
-        provenance_of_budget=";".join(current.detection_sources) or "unknown",
+        provenance_of_budget=";".join(provenance_parts) or "unknown",
         snapshot=current,
         scratch_is_memory_backed=current.scratch_is_memory_backed,
         worker_cap=worker_cap,
+    )
+    logger.info(
+        "Runtime resource budget: mode=%s, memory_budget_bytes=%s, available_headroom_bytes=%s, "
+        "scratch_budget_bytes=%s, cgroup_status=%s, provenance=%s, uncertainty=%s",
+        budget.execution_mode,
+        budget.memory_budget_bytes,
+        budget.available_memory_bytes,
+        budget.scratch_budget_bytes,
+        current.cgroup_status,
+        budget.provenance_of_budget,
+        "; ".join(current.uncertainty) or "none",
     )
     return ResourceBudgetService(budget)
 

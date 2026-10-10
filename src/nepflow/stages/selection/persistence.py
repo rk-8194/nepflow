@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-from nepflow.config.models import SelectionConfig
+from nepflow.config.models import SelectionConfig, TEST_SELECTION_POLICIES
 from nepflow.domain.identities import calculate_candidate_id, calculate_structure_id
 from nepflow.errors import ArtifactError, StateError
 from nepflow.io.hashing import sha256_canonical_json
@@ -226,6 +226,22 @@ def selection_parameters(
     def ids(indices: Sequence[int], values: Sequence[str]) -> list[str]:
         return [values[index] for index in indices]
 
+    train_indices = set(result.train_indices)
+    test_indices = set(result.test_indices)
+    anchor_indices = set(
+        result.seed_indices
+        + result.single_element_elastic_indices
+        + result.elastic_indices
+    )
+    if train_indices & test_indices:
+        raise StateError("Selection result train/test candidate identities overlap")
+    if anchor_indices & test_indices:
+        raise StateError("Selection result test identities overlap mandatory anchors")
+    train_structure_set = {ordered_structure_ids[index] for index in train_indices}
+    test_structure_set = {ordered_structure_ids[index] for index in test_indices}
+    if train_structure_set & test_structure_set:
+        raise StateError("Selection result train/test physical identities overlap")
+
     metrics = {
         "train_min_dist": _persistable_number(result.train_min_dist),
         "test_min_dist": _persistable_number(result.test_min_dist),
@@ -240,6 +256,8 @@ def selection_parameters(
         "train_elastic_count": result.train_elastic_count,
         "train_min_dist_applicable": result.train_min_dist_applicable,
         "train_fps_count_applicable": result.train_fps_count_applicable,
+        "test_selection_policy": result.test_selection_policy,
+        "test_selection_version": result.test_selection_version,
     }
     entropy_record: dict[str, Any] | None = None
     if result.algorithm_id == "information_entropy":
@@ -296,6 +314,9 @@ def selection_parameters(
         "full_configuration": to_jsonable(asdict(settings)),
         "algorithm_id": result.algorithm_id,
         "algorithm_version": result.algorithm_version,
+        "test_selection_policy": result.test_selection_policy,
+        "test_selection_version": result.test_selection_version,
+        "test_selection_provenance": to_jsonable(result.test_selection_provenance),
         "selected_candidate_ids": {
             "train": ids(result.train_indices, ordered_candidate_ids),
             "test": ids(result.test_indices, ordered_candidate_ids),
@@ -319,6 +340,11 @@ def selection_parameters(
             "elastic": ids(result.elastic_indices, ordered_structure_ids),
         },
         "metrics": metrics,
+        "test_selection": {
+            "policy": result.test_selection_policy,
+            "version": result.test_selection_version,
+            "provenance": to_jsonable(result.test_selection_provenance),
+        },
         "entropy": entropy_record,
         "coverage_metrics": to_jsonable(coverage_metrics or {}),
     }
@@ -337,10 +363,19 @@ def persist_selection_result(
     coverage_metrics: Mapping[str, Any] | None = None,
     started_at: str | None = None,
     completed_at: str | None = None,
+    status: str = "pending",
 ) -> dict[str, Any]:
-    """Write one completed selection record through the canonical StateStore API."""
+    """Persist immutable selection science before filesystem publication.
+
+    The record deliberately remains ``pending`` until the stage has published
+    and verified every required artifact.  This keeps a formatter or disk
+    failure from creating an authoritative completed run with incomplete
+    outputs.
+    """
 
     now = datetime.now(timezone.utc).isoformat()
+    if status not in {"pending", "completed"}:
+        raise StateError(f"Unsupported selection persistence status: {status!r}")
     if store.get_project(project_id) is None:
         raise StateError(
             f"Cannot persist selection for unknown project {project_id!r}; "
@@ -349,7 +384,7 @@ def persist_selection_result(
     return store.upsert_selection_run(
         selection_run_id(project_id, candidate_ids, settings),
         project_id,
-        status="completed",
+        status=status,
         method=result.algorithm_id,
         parameters=selection_parameters(
             settings,
@@ -360,7 +395,61 @@ def persist_selection_result(
             diagnostics_artifact_dir=Path(project_dir) / "structures" / "selected",
         ),
         started_at=started_at or now,
-        completed_at=completed_at or now,
+        completed_at=completed_at if status == "completed" else None,
+    )
+
+
+def mark_selection_pending(
+    store: StateStore,
+    selection_run: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Move an old completed row back to recoverable publication-pending state."""
+
+    selection_run_id_value = selection_run.get("selection_run_id")
+    project_id = selection_run.get("project_id")
+    if not isinstance(selection_run_id_value, str) or not isinstance(project_id, str):
+        raise StateError("Persisted selection run identity is malformed")
+    parameters = selection_run.get("parameters")
+    if not isinstance(parameters, Mapping):
+        raise StateError("Persisted selection run has no structured parameters")
+    return store.upsert_selection_run(
+        selection_run_id_value,
+        project_id,
+        status="pending",
+        method=selection_run.get("method"),
+        parameters=parameters,
+        started_at=selection_run.get("started_at"),
+        completed_at=None,
+    )
+
+
+def complete_selection_result(
+    store: StateStore,
+    selection_run: Mapping[str, Any],
+    *,
+    completed_at: str | None = None,
+) -> dict[str, Any]:
+    """Mark a pending scientific run completed after artifact verification."""
+
+    selection_run_id_value = selection_run.get("selection_run_id")
+    project_id = selection_run.get("project_id")
+    if not isinstance(selection_run_id_value, str) or not isinstance(project_id, str):
+        raise StateError("Persisted selection run identity is malformed")
+    parameters = selection_run.get("parameters")
+    if not isinstance(parameters, Mapping):
+        raise StateError("Persisted selection run has no structured parameters")
+    if selection_run.get("status") not in {"pending", "completed"}:
+        raise StateError(
+            f"Cannot complete selection run in status {selection_run.get('status')!r}"
+        )
+    return store.upsert_selection_run(
+        selection_run_id_value,
+        project_id,
+        status="completed",
+        method=selection_run.get("method"),
+        parameters=parameters,
+        started_at=selection_run.get("started_at"),
+        completed_at=completed_at or datetime.now(timezone.utc).isoformat(),
     )
 
 
@@ -476,6 +565,38 @@ def restore_selection_result(
     ):
         raise StateError("Persisted selection record is incomplete")
 
+    test_selection_record = parameters.get("test_selection", {})
+    if not isinstance(test_selection_record, Mapping):
+        raise StateError("Persisted test-selection policy is malformed")
+    default_test_policy = metrics.get(
+        "test_selection_policy",
+        "candidate_mean_fps_legacy",
+    )
+    persisted_test_policy = str(
+        test_selection_record.get(
+            "policy",
+            parameters.get("test_selection_policy", default_test_policy),
+        )
+    )
+    if persisted_test_policy not in TEST_SELECTION_POLICIES:
+        raise StateError(
+            f"Persisted test-selection policy is unsupported: {persisted_test_policy!r}"
+        )
+    persisted_test_version = str(
+        test_selection_record.get(
+            "version",
+            parameters.get(
+                "test_selection_version",
+                metrics.get("test_selection_version", "candidate-mean-fps-v1"),
+            ),
+        )
+    )
+    persisted_test_provenance = test_selection_record.get(
+        "provenance", parameters.get("test_selection_provenance", {})
+    )
+    if not isinstance(persisted_test_provenance, Mapping):
+        raise StateError("Persisted test-selection provenance is malformed")
+
     train_ids = selected.get("train", ())
     test_ids = selected.get("test", ())
     train_indices = _indices_for_ids(train_ids, current_candidate_ids, label="train")
@@ -493,6 +614,13 @@ def restore_selection_result(
     elastic_indices = _indices_for_ids(
         anchors.get("elastic", ()), current_candidate_ids, label="elastic anchor"
     )
+    if set(test_indices) & set(seed_indices + single_indices + elastic_indices):
+        raise StateError("Persisted selection test identities overlap mandatory anchors")
+    if current_structure_ids is not None:
+        train_structure_set = {current_structure_ids[index] for index in train_indices}
+        test_structure_set = {current_structure_ids[index] for index in test_indices}
+        if train_structure_set & test_structure_set:
+            raise StateError("Persisted selection train/test physical identities overlap")
 
     def verify_structure_selection(
         persisted: Any,
@@ -600,9 +728,18 @@ def restore_selection_result(
         ),
         train_fps_count=int(metrics.get("train_fps_count", 0)),
         test_indices=test_indices,
-        test_min_dist=float(metric("test_min_dist", 0.0) or 0.0),
-        min_train_test_dist=float(metric("min_train_test_dist", math.inf) or math.inf),
-        mean_train_test_dist=float(metric("mean_train_test_dist", math.inf) or math.inf),
+        test_min_dist=metric(
+            "test_min_dist",
+            0.0 if persisted_test_policy == "candidate_mean_fps_legacy" else None,
+        ),
+        min_train_test_dist=metric(
+            "min_train_test_dist",
+            math.inf if persisted_test_policy == "candidate_mean_fps_legacy" else None,
+        ),
+        mean_train_test_dist=metric(
+            "mean_train_test_dist",
+            math.inf if persisted_test_policy == "candidate_mean_fps_legacy" else None,
+        ),
         seed_indices=seed_indices,
         single_element_elastic_indices=single_indices,
         elastic_indices=elastic_indices,
@@ -628,6 +765,9 @@ def restore_selection_result(
         train_fps_count_applicable=bool(
             metrics.get("train_fps_count_applicable", persisted_algorithm != "information_entropy")
         ),
+        test_selection_policy=persisted_test_policy,
+        test_selection_version=persisted_test_version,
+        test_selection_provenance=persisted_test_provenance,
     )
 
 
@@ -636,7 +776,9 @@ __all__ = [
     "LEGACY_SELECTION_RUN_SCHEMA",
     "candidate_set_fingerprint",
     "candidate_ids",
+    "complete_selection_result",
     "legacy_selection_run_id",
+    "mark_selection_pending",
     "persist_selection_result",
     "restore_selection_result",
     "selection_parameters",

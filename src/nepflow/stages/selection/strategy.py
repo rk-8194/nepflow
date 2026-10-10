@@ -303,6 +303,12 @@ def select_test_set(
             "test_min_dist": 0.0,
             "min_train_test_dist": float("inf"),
             "mean_train_test_dist": float("inf"),
+            "test_selection_policy": "candidate_mean_fps_legacy",
+            "test_selection_version": "candidate-mean-fps-v1",
+            "test_selection_provenance": {
+                "representation": "candidate-level descriptor vectors",
+                "selection_rule": "legacy candidate-mean FPS",
+            },
         }
 
     if target_test >= len(remaining_indices):
@@ -322,6 +328,12 @@ def select_test_set(
             "test_min_dist": 0.0,
             "min_train_test_dist": minimum,
             "mean_train_test_dist": mean_distance,
+            "test_selection_policy": "candidate_mean_fps_legacy",
+            "test_selection_version": "candidate-mean-fps-v1",
+            "test_selection_provenance": {
+                "representation": "candidate-level descriptor vectors",
+                "selection_rule": "legacy candidate-mean FPS",
+            },
         }
 
     from scipy.spatial.distance import cdist
@@ -375,6 +387,12 @@ def select_test_set(
         "test_min_dist": test_min_dist,
         "min_train_test_dist": minimum,
         "mean_train_test_dist": mean_distance,
+        "test_selection_policy": "candidate_mean_fps_legacy",
+        "test_selection_version": "candidate-mean-fps-v1",
+        "test_selection_provenance": {
+            "representation": "candidate-level descriptor vectors",
+            "selection_rule": "legacy candidate-mean FPS",
+        },
     }
 
 

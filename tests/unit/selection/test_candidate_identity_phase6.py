@@ -8,19 +8,14 @@ pytest.importorskip("NepTrainKit")
 from ase import Atoms
 
 from nepflow.config.models import SelectionConfig
-from nepflow.errors import StateError
-from nepflow.stages.selection.artifacts import (
-    SELECTION_ARTIFACT_SCHEMA,
-    read_selection_manifest,
-    write_selected_structures,
-)
+from nepflow.errors import ArtifactError, StateError
+from nepflow.stages.selection.artifacts import write_selected_structures
 from nepflow.stages.selection.models import SelectionResult
 from nepflow.stages.selection.persistence import (
     LEGACY_SELECTION_RUN_SCHEMA,
     candidate_ids,
     candidate_set_fingerprint,
     persist_selection_result,
-    restore_selection_result,
     structure_ids,
 )
 from nepflow.stages.selection.representations import (
@@ -68,51 +63,30 @@ def test_candidate_ids_are_unique_while_structure_ids_repeat() -> None:
     )
 
 
-def test_selection_state_persists_and_restores_by_candidate_id(tmp_path) -> None:
+def test_selection_state_rejects_magnetic_train_test_physical_identity_reuse(tmp_path) -> None:
     structures = _pair()
     candidates = candidate_ids(structures)
     physical = structure_ids(structures)
     settings = SelectionConfig(target_train_count=1, target_test_count=1)
     with StateStore(tmp_path / "state.db") as store:
         store.upsert_project("demo", name="demo", root_path=str(tmp_path))
-        record = persist_selection_result(
-            store,
-            "demo",
-            "demo",
-            str(tmp_path),
-            settings,
-            candidates,
-            _result(),
-            candidate_structure_ids=physical,
-        )
-
-    parameters = record["parameters"]
-    assert parameters["candidate_ids"] == candidates
-    assert parameters["candidate_structure_ids"] == physical
-    assert parameters["selected_candidate_ids"] == {
-        "train": ["candidate_fm"],
-        "test": ["candidate_afm"],
-    }
-
-    restored = restore_selection_result(
-        record,
-        np.ones((2, 1)),
-        list(reversed(candidates)),
-        candidate_structure_ids=list(reversed(physical)),
-    )
-    assert restored.train_indices == [1]
-    assert restored.test_indices == [0]
+        with pytest.raises(StateError, match="physical identities overlap"):
+            persist_selection_result(
+                store,
+                "demo",
+                "demo",
+                str(tmp_path),
+                settings,
+                candidates,
+                _result(),
+                candidate_structure_ids=physical,
+            )
 
 
-def test_selection_artifact_persists_both_identity_types(tmp_path) -> None:
+def test_selection_artifact_rejects_magnetic_physical_identity_reuse(tmp_path) -> None:
     structures = _pair()
-    write_selected_structures(tmp_path, structures, [0], [1])
-
-    manifest = read_selection_manifest(tmp_path)
-    assert manifest["schema_version"] == SELECTION_ARTIFACT_SCHEMA
-    assert manifest["train_candidate_ids"] == ["candidate_fm"]
-    assert manifest["test_candidate_ids"] == ["candidate_afm"]
-    assert manifest["train_structure_ids"] == manifest["test_structure_ids"]
+    with pytest.raises(ArtifactError, match="physical IDs overlap"):
+        write_selected_structures(tmp_path, structures, [0], [1])
 
 
 def test_structural_descriptor_cache_identity_does_not_include_candidate_ids() -> None:

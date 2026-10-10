@@ -395,7 +395,7 @@ def calculate_frozen_bandwidths(
     remaining = service.remaining_managed_budget
     if remaining is None:
         raise ResourceCapacityError(
-            "bandwidth calculation requires known runtime memory headroom",
+            service.unknown_memory_message("entropy bandwidth calculation"),
             operation="entropy bandwidth calculation",
         )
     if remaining < 1:
@@ -514,8 +514,7 @@ def _resolve_runtime_limits(
     remaining = service.remaining_managed_budget
     if remaining is None:
         raise ResourceCapacityError(
-            "bandwidth calibration requires known runtime memory headroom; "
-            "provide [resources] memory_budget_bytes",
+            service.unknown_memory_message("entropy bandwidth calibration"),
             operation="entropy bandwidth calibration",
         )
     if remaining < 1:

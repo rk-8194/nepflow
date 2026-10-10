@@ -886,7 +886,7 @@ class InformationEntropySelectionAlgorithm:
         remaining_budget = runtime_budget.remaining_managed_budget
         if remaining_budget is None:
             raise ValueError(
-                "information-entropy selection requires known runtime memory headroom"
+                runtime_budget.unknown_memory_message("information-entropy selection")
             )
         radius_query_bytes = min(
             bandwidth_settings.max_radius_query_bytes or max(1, remaining_budget // 2),

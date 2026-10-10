@@ -9,6 +9,11 @@ from nepflow.domain.magnetism import MagneticMomentSet
 
 CONFIG_SCHEMA_VERSION = 1
 
+TEST_SELECTION_POLICIES = frozenset(
+    {"representative", "extrapolative", "candidate_mean_fps_legacy"}
+)
+TEST_ATOM_WEIGHTINGS = frozenset({"candidate", "atom"})
+
 ALL_SOURCES = "all"
 SUPPORTED_CONFIGURATIONAL_SOURCES = frozenset(
     {
@@ -397,6 +402,11 @@ class SelectionConfig:
     target_train_count: int = 1000
     target_test_count: int = 200
     target_tolerance: int = 50
+    test_selection_policy: str = "representative"
+    test_atom_weighting: str = "candidate"
+    test_signature_bins: int = 4
+    test_novelty_quantile: float = 0.95
+    test_novelty_beta: float = 0.5
     descriptor_type: str = "structure"
     batch_size: int = 500
     max_search_iterations: int = 30

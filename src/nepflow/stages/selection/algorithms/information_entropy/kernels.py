@@ -215,7 +215,7 @@ class _KernelSupportProvider:
             remaining = service.remaining_managed_budget
             if remaining is None:
                 raise ResourceCapacityError(
-                    "kernel support queries require known runtime memory headroom",
+                    service.unknown_memory_message("entropy kernel support queries"),
                     operation="entropy kernel support queries",
                 )
             if remaining < 1:
@@ -601,7 +601,7 @@ def evaluate_leave_one_out_objectives(
     remaining = service.remaining_managed_budget
     if remaining is None:
         raise ResourceCapacityError(
-            "batched leave-one-out evaluation requires known runtime memory headroom",
+            service.unknown_memory_message("entropy batched leave-one-out evaluation"),
             operation="entropy batched leave-one-out evaluation",
         )
     if remaining < 1:
@@ -1285,8 +1285,7 @@ def build_streamed_candidate_contributions(
     remaining_budget = runtime_budget.remaining_managed_budget
     if remaining_budget is None:
         raise ResourceCapacityError(
-            "streamed candidate contributions require known runtime memory headroom; "
-            "provide [resources] memory_budget_bytes",
+            runtime_budget.unknown_memory_message("entropy streamed candidate contributions"),
             operation="entropy streamed candidate contributions",
         )
     if max_radius_query_bytes is None:

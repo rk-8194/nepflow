@@ -15,6 +15,8 @@ from .models import (
     MAGNETIC_DEFECT_FAMILIES,
     SUPPORTED_CONFIGURATIONAL_SOURCES,
     SUPPORTED_SURFACE_MILLER_INDICES,
+    TEST_ATOM_WEIGHTINGS,
+    TEST_SELECTION_POLICIES,
     GenerationConfig,
     NepflowConfig,
 )
@@ -379,6 +381,22 @@ def validate_config(
         value = getattr(config.selection, field_name)
         if not 0.0 < value <= 1.0:
             raise ConfigurationError(f"selection.{field_name} must be in (0, 1]")
+    if config.selection.test_selection_policy not in TEST_SELECTION_POLICIES:
+        raise ConfigurationError(
+            "selection.test_selection_policy must be one of: "
+            + ", ".join(sorted(TEST_SELECTION_POLICIES))
+        )
+    if config.selection.test_atom_weighting not in TEST_ATOM_WEIGHTINGS:
+        raise ConfigurationError(
+            "selection.test_atom_weighting must be one of: "
+            + ", ".join(sorted(TEST_ATOM_WEIGHTINGS))
+        )
+    if config.selection.test_signature_bins < 1:
+        raise ConfigurationError("selection.test_signature_bins must be positive")
+    if not 0.0 < config.selection.test_novelty_quantile <= 1.0:
+        raise ConfigurationError("selection.test_novelty_quantile must be in (0, 1]")
+    if not 0.0 <= config.selection.test_novelty_beta <= 1.0:
+        raise ConfigurationError("selection.test_novelty_beta must be in [0, 1]")
     if config.selection.composition_aware_fps_ternary_weight < 0.0:
         raise ConfigurationError(
             "selection.composition_aware_fps_ternary_weight must be non-negative"

@@ -137,6 +137,7 @@ def test_test_selection_returns_cross_distance_metrics(monkeypatch):
 
     assert result["test_indices"] == [2]
     assert result["test_min_dist"] == 0.4
+    assert result["test_selection_policy"] == "candidate_mean_fps_legacy"
 
 
 def test_distance_helpers_are_owned_by_sampling():

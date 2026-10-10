@@ -48,6 +48,27 @@ def test_selection_manifest_verifies_published_artifacts(tmp_path):
         read_selection_manifest(tmp_path)
 
 
+def test_selection_manifest_persists_test_policy_provenance(tmp_path):
+    structures = [
+        Atoms("Si", positions=[[0.0, 0.0, 0.0]]),
+        Atoms("Ge", positions=[[0.0, 0.0, 0.0]]),
+    ]
+    write_selected_structures(
+        tmp_path,
+        structures,
+        [0],
+        [1],
+        test_selection_policy="representative",
+        test_selection_version="local-environment-holdout-v1",
+        test_selection_provenance={"label_holdout": True},
+    )
+
+    manifest = read_selection_manifest(tmp_path)
+    assert manifest["test_selection_policy"] == "representative"
+    assert manifest["test_selection_version"] == "local-environment-holdout-v1"
+    assert manifest["test_selection_provenance"] == {"label_holdout": True}
+
+
 def test_selection_manifest_rejects_unknown_schema(tmp_path):
     structures = [
         Atoms("Si", positions=[[0.0, 0.0, 0.0]]),

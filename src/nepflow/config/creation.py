@@ -293,8 +293,15 @@ composition_aware_fps_descriptor_floor_fraction=0.95
 target_train_count=1000
 target_test_count=200
 target_tolerance=50
+test_selection_policy=representative
+# Equal weight per candidate by default; use "atom" for atom-weighted holdout strata.
+test_atom_weighting=candidate
+test_signature_bins=4
+test_novelty_quantile=0.95
+test_novelty_beta=0.5
 
-# Descriptor aggregation type (the current selector consumes one vector per structure)
+# Descriptor aggregation type for structure-level/FPS descriptors. Entropy uses
+# candidate means for plotting only; its holdout policies consume local rows.
 # structure: mean of per-atom descriptors â†’ one vector per structure (recommended)
 descriptor_type=structure
 local_magnetic_mode=structural

@@ -15,6 +15,7 @@ from ase.io import read as ase_read
 
 from nepflow.config.models import NepflowConfig, SelectionConfig
 from nepflow.errors import StateError
+from nepflow.io.atomic import atomic_write_bytes
 from nepflow.resources.budget import ResourceBudgetService, build_resource_budget
 from nepflow.workflow.controller import StageContext
 
@@ -28,19 +29,25 @@ from .algorithms.information_entropy import (
     build_entropy_diagnostics,
     build_entropy_pool,
 )
-from .artifacts import write_selected_structures
+from .artifacts import verify_selection_artifacts, write_selected_structures
 from .debug import run_debug_selection
 from .models import SelectionResult
 from .persistence import candidate_ids as ordered_candidate_ids
 from .persistence import (
+    complete_selection_result,
     legacy_selection_run_id,
+    mark_selection_pending,
     persist_selection_result,
     restore_selection_result,
     selection_policy,
     selection_run_id,
 )
 from .persistence import structure_ids as ordered_structure_ids
-from .reports import plot_descriptor_space, write_diagnostics_report
+from .reports import (
+    plot_descriptor_space,
+    write_diagnostics_report,
+    write_entropy_presentation_reports,
+)
 from .representations import (
     LocalEnvironmentRepresentation,
     LocalRepresentationConfig,
@@ -57,8 +64,39 @@ from .strategy import (
     select_test_set,
     select_training_set,
 )
+from .test_selection import select_local_test_holdout
 
 logger = logging.getLogger(__name__)
+
+
+def _publication_paths(project_dir: Path) -> tuple[Path, ...]:
+    selected = project_dir / "structures" / "selected"
+    reports = project_dir / "reports"
+    return (
+        selected / "train.xyz",
+        selected / "test.xyz",
+        selected / "selection_manifest.json",
+        reports / "descriptor_space.png",
+        reports / "entropy_diagnostics.md",
+        reports / "entropy_presentation-v1.npz",
+        reports / "descriptor_bandwidth.png",
+        reports / "entropy_probability_projection.png",
+    )
+
+
+def _snapshot_publication(project_dir: Path) -> dict[Path, bytes | None]:
+    return {
+        path: path.read_bytes() if path.is_file() else None
+        for path in _publication_paths(project_dir)
+    }
+
+
+def _restore_publication(snapshot: dict[Path, bytes | None]) -> None:
+    for path, content in snapshot.items():
+        if content is None:
+            path.unlink(missing_ok=True)
+        else:
+            atomic_write_bytes(path, content)
 
 
 def _read_nep_structures(generated_path: Path) -> list[Any]:
@@ -73,7 +111,7 @@ def _aggregate_local_representations(
     representation: LocalEnvironmentRepresentation,
     candidate_ids: list[str] | tuple[str, ...],
 ) -> np.ndarray:
-    """Produce plotting/test-policy rows while entropy owns local geometry."""
+    """Produce candidate-mean plotting rows while entropy owns local geometry."""
 
     rows_by_candidate: dict[str, list[int]] = {candidate_id: [] for candidate_id in candidate_ids}
     for row_index, row in enumerate(representation.rows):
@@ -132,6 +170,7 @@ class SelectionStage:
             raise ValueError("No generated structures are available for selection")
 
         started_at = datetime.now(timezone.utc).isoformat()
+        runtime_budget: ResourceBudgetService | None = None
         if active.debug:
             result = run_debug_selection(
                 active.project_dir,
@@ -142,23 +181,24 @@ class SelectionStage:
             )
         else:
             resource_config = getattr(active.config, "resources", None)
+            runtime_budget = build_resource_budget(
+                execution_mode=getattr(resource_config, "execution_mode", "auto"),
+                memory_budget_bytes=getattr(resource_config, "memory_budget_bytes", None),
+                scratch_budget_bytes=getattr(resource_config, "scratch_budget_bytes", None),
+                reserved_headroom_bytes=getattr(
+                    resource_config, "reserved_headroom_bytes", None
+                ),
+                safety_margin_fraction=getattr(
+                    resource_config, "safety_margin_fraction", 0.10
+                ),
+                scratch_path=getattr(resource_config, "scratch_path", None) or None,
+                worker_cap=getattr(resource_config, "worker_cap", None),
+            )
             result = self.execute(
                 settings,
                 prepared,
                 context=active,
-                resource_budget=build_resource_budget(
-                    execution_mode=getattr(resource_config, "execution_mode", "auto"),
-                    memory_budget_bytes=getattr(resource_config, "memory_budget_bytes", None),
-                    scratch_budget_bytes=getattr(resource_config, "scratch_budget_bytes", None),
-                    reserved_headroom_bytes=getattr(
-                        resource_config, "reserved_headroom_bytes", None
-                    ),
-                    safety_margin_fraction=getattr(
-                        resource_config, "safety_margin_fraction", 0.10
-                    ),
-                    scratch_path=getattr(resource_config, "scratch_path", None) or None,
-                    worker_cap=getattr(resource_config, "worker_cap", None),
-                ),
+                resource_budget=runtime_budget,
             )
 
         candidate_identity_ids = ordered_candidate_ids(prepared["ase_structures"])
@@ -173,19 +213,67 @@ class SelectionStage:
                 result.train_indices,
                 candidate_bins,
             )
-        persist_selection_result(
-            state_store,
-            active.project_name,
-            active.project_name,
-            str(active.project_dir),
-            settings,
-            candidate_identity_ids,
-            result,
-            candidate_structure_ids=physical_structure_ids,
-            coverage_metrics=coverage_metrics,
-            started_at=started_at,
-        )
-        self.finalize(prepared, result, context=active)
+        publication_snapshot = _snapshot_publication(active.project_dir)
+        try:
+            selection_run = state_store.get_selection_run(
+                selection_run_id(active.project_name, candidate_identity_ids, settings)
+            )
+            if selection_run is None and settings.algorithm == "fps":
+                selection_run = state_store.get_selection_run(
+                    legacy_selection_run_id(
+                        active.project_name,
+                        candidate_identity_ids,
+                        settings,
+                    )
+                )
+            if selection_run is not None and selection_run.get("status") == "completed":
+                try:
+                    verify_selection_artifacts(
+                        active.project_dir,
+                        algorithm_id=result.algorithm_id,
+                    )
+                except Exception as exc:
+                    logger.info("Completed selection needs artifact repair: %s", exc)
+                    selection_run = mark_selection_pending(state_store, selection_run)
+                    self.finalize(
+                        prepared,
+                        result,
+                        context=active,
+                        resource_budget=runtime_budget,
+                        repair_only=True,
+                    )
+                    verify_selection_artifacts(
+                        active.project_dir,
+                        algorithm_id=result.algorithm_id,
+                    )
+                    complete_selection_result(state_store, selection_run)
+                return result
+
+            if selection_run is None:
+                selection_run = persist_selection_result(
+                    state_store,
+                    active.project_name,
+                    active.project_name,
+                    str(active.project_dir),
+                    settings,
+                    candidate_identity_ids,
+                    result,
+                    candidate_structure_ids=physical_structure_ids,
+                    coverage_metrics=coverage_metrics,
+                    started_at=started_at,
+                    status="pending",
+                )
+            elif selection_run.get("status") != "pending":
+                raise StateError(
+                    "Selection run has unsupported recovery status: "
+                    f"{selection_run.get('status')!r}"
+                )
+            self.finalize(prepared, result, context=active, resource_budget=runtime_budget)
+            verify_selection_artifacts(active.project_dir, algorithm_id=result.algorithm_id)
+            complete_selection_result(state_store, selection_run)
+        except BaseException:
+            _restore_publication(publication_snapshot)
+            raise
         return result
 
     def prepare(self, project_dir: Path | None = None) -> dict[str, Any] | None:
@@ -335,11 +423,12 @@ class SelectionStage:
             )
             logger.info(
                 "  Entropy local representation complete: N=%d atomic rows, d'=%d; "
-                "candidate-mean plotting/test descriptors: M=%d, d'=%d",
+                "candidate-mean plotting descriptors only: M=%d, d'=%d; test_policy=%s",
                 len(local_representation.rows),
                 local_representation.descriptors.shape[1],
                 representations.shape[0],
                 representations.shape[1],
+                settings.test_selection_policy,
             )
         else:
             validate_candidate_representation_identity(
@@ -357,7 +446,7 @@ class SelectionStage:
             )
         logger.info("  Descriptor shape: %s", representations.shape)
         if settings.algorithm == "information_entropy":
-            logger.info("  Descriptor type: candidate-mean local (plot/test FPS policy only)")
+            logger.info("  Descriptor type: candidate-mean local (plotting only)")
         else:
             logger.info("  Descriptor type: %s", settings.descriptor_type)
 
@@ -374,10 +463,10 @@ class SelectionStage:
                     )
                 )
             if existing is not None:
-                if existing.get("status") != "completed":
+                if existing.get("status") not in {"completed", "pending"}:
                     raise StateError(
-                        "Selection run exists but is not complete; explicit reconciliation "
-                        "is required before selecting again"
+                        "Selection run exists in an unsupported recovery state; explicit "
+                        "reconciliation is required before selecting again"
                     )
                 persisted_parameters = existing.get("parameters")
                 if not isinstance(persisted_parameters, dict) or persisted_parameters.get(
@@ -407,7 +496,10 @@ class SelectionStage:
                             raise StateError(
                                 "Persisted entropy selection fingerprint does not match current representation"
                             )
-                logger.info("  Reconciled completed selection by candidate identity")
+                logger.info(
+                    "  Reconciled %s selection by candidate identity",
+                    existing.get("status", "completed"),
+                )
                 return restore_selection_result(
                     existing,
                     representations,
@@ -436,12 +528,52 @@ class SelectionStage:
         else:  # Compatibility with injected legacy strategy doubles.
             train_indices, train_min_dist = training
             algorithm_result = None
-        test_selection = select_test_set(
-            representations,
-            prepared["structures"],
-            train_indices,
-            settings,
-        )
+        configured_test_policy = settings.test_selection_policy
+        if settings.algorithm == "information_entropy" and configured_test_policy != (
+            "candidate_mean_fps_legacy"
+        ):
+            if local_representation is None:
+                raise StateError("Entropy test selection requires the local representation")
+            test_selection = select_local_test_holdout(
+                local_representation,
+                prepared["ase_structures"],
+                train_indices,
+                anchor_indices=anchor_indices,
+                target_count=settings.target_test_count,
+                policy=configured_test_policy,
+                candidate_ids=candidate_identity_ids,
+                structure_ids=physical_structure_ids,
+                atom_weighting=settings.test_atom_weighting,
+                signature_bins=settings.test_signature_bins,
+                novelty_quantile=settings.test_novelty_quantile,
+                novelty_beta=settings.test_novelty_beta,
+                resource_budget=runtime_budget,
+            ).as_mapping()
+            logger.info(
+                "  Test set policy: %s (%d structures; local-environment representation)",
+                test_selection["test_selection_policy"],
+                len(test_selection["test_indices"]),
+            )
+        else:
+            # FPS remains an independent peer.  Its historical candidate-vector
+            # holdout is retained for FPS runs and only available to entropy as
+            # the explicitly named legacy policy.
+            test_selection = select_test_set(
+                representations,
+                prepared["structures"],
+                train_indices,
+                settings,
+            )
+        test_indices = [int(index) for index in test_selection["test_indices"]]
+        if set(test_indices) & set(train_indices):
+            raise StateError("Test selection returned a training candidate")
+        train_physical_ids = {physical_structure_ids[index] for index in train_indices}
+        test_physical_ids = {physical_structure_ids[index] for index in test_indices}
+        if train_physical_ids & test_physical_ids:
+            raise StateError("Test selection returned a physical identity from training")
+        anchor_physical_ids = {physical_structure_ids[index] for index in anchor_indices}
+        if anchor_physical_ids & test_physical_ids:
+            raise StateError("Test selection returned a mandatory anchor")
 
         entropy_result = getattr(algorithm_result, "algorithm_result", None)
         entropy_history = []
@@ -549,6 +681,9 @@ class SelectionStage:
             entropy_diagnostics=entropy_diagnostics,
             train_min_dist_applicable=settings.algorithm == "fps",
             train_fps_count_applicable=settings.algorithm == "fps",
+            test_selection_policy=test_selection["test_selection_policy"],
+            test_selection_version=test_selection["test_selection_version"],
+            test_selection_provenance=test_selection["test_selection_provenance"],
             **train_entropy_values,
         )
 
@@ -558,23 +693,51 @@ class SelectionStage:
         result: SelectionResult,
         *,
         context: StageContext | None = None,
+        resource_budget: ResourceBudgetService | None = None,
+        repair_only: bool = False,
     ) -> SelectionResult:
-        """Write presentation artifacts without changing the scientific result."""
+        """Publish and verify selection artifacts without changing science."""
 
         active = context or self._active_context(None)
         logger.info("")
         logger.info("Step 5: Plotting descriptor space")
-        plot_descriptor_space(
-            result.descriptors,
-            result.train_indices,
-            result.test_indices,
-            active.project_dir / "reports" / "descriptor_space.png",
-            descriptor_label=(
-                "Whitened local candidate-mean representation"
-                if result.algorithm_id == "information_entropy"
-                else "NEP descriptor space"
-            ),
-        )
+        descriptor_path = active.project_dir / "reports" / "descriptor_space.png"
+        if not repair_only or not descriptor_path.is_file():
+            plot_descriptor_space(
+                result.descriptors,
+                result.train_indices,
+                result.test_indices,
+                active.project_dir / "reports" / "descriptor_space.png",
+                descriptor_label=(
+                    "PCA of candidate-mean whitened local descriptors"
+                    if result.algorithm_id == "information_entropy"
+                    else "NEP descriptor space"
+                ),
+            )
+
+        if repair_only:
+            if result.entropy_diagnostics is not None:
+                diagnostics_path = active.project_dir / "reports" / "entropy_diagnostics.md"
+                if not diagnostics_path.is_file():
+                    write_diagnostics_report(result.entropy_diagnostics, diagnostics_path)
+                reports_dir = active.project_dir / "reports"
+                presentation_paths = (
+                    reports_dir / "entropy_presentation-v1.npz",
+                    reports_dir / "descriptor_bandwidth.png",
+                    reports_dir / "entropy_probability_projection.png",
+                )
+                if (
+                    any(not path.is_file() for path in presentation_paths)
+                    and isinstance(result.entropy_diagnostics.pool, EntropyPool)
+                    and isinstance(result.entropy_diagnostics.bandwidths, FrozenBandwidths)
+                ):
+                    write_entropy_presentation_reports(
+                        result.entropy_diagnostics,
+                        result.descriptors,
+                        reports_dir,
+                        resource_budget=resource_budget,
+                    )
+            return result
 
         logger.info("")
         logger.info("Step 6: Saving selected structures")
@@ -597,12 +760,25 @@ class SelectionStage:
                     active.project_dir / "structures" / "selected"
                 )
             ),
+            test_selection_policy=result.test_selection_policy,
+            test_selection_version=result.test_selection_version,
+            test_selection_provenance=result.test_selection_provenance,
         )
         if result.entropy_diagnostics is not None:
             write_diagnostics_report(
                 result.entropy_diagnostics,
                 active.project_dir / "reports" / "entropy_diagnostics.md",
             )
+            if (
+                isinstance(result.entropy_diagnostics.pool, EntropyPool)
+                and isinstance(result.entropy_diagnostics.bandwidths, FrozenBandwidths)
+            ):
+                write_entropy_presentation_reports(
+                    result.entropy_diagnostics,
+                    result.descriptors,
+                    active.project_dir / "reports",
+                    resource_budget=resource_budget,
+                )
 
         total = len(prepared["structures"])
         logger.info("")
@@ -635,18 +811,34 @@ class SelectionStage:
                 result.train_min_dist,
             )
         if result.test_indices:
-            logger.info(
-                "  Test:     %d structures (independent FPS policy; min_distance=%.6f)",
-                len(result.test_indices),
-                result.test_min_dist,
-            )
+            if result.test_selection_policy == "candidate_mean_fps_legacy":
+                logger.info(
+                    "  Test:     %d structures (candidate_mean_fps_legacy; min_distance=%.6f)",
+                    len(result.test_indices),
+                    result.test_min_dist,
+                )
+            else:
+                purpose = (
+                    "representative predictive evaluation"
+                    if result.test_selection_policy == "representative"
+                    else "extrapolative stress test"
+                )
+                logger.info(
+                    "  Test:     %d structures (%s; local-environment policy)",
+                    len(result.test_indices),
+                    purpose,
+                )
         else:
             logger.info("  Test:     0 structures (no eligible candidates remain)")
-        logger.info(
-            "  Train<->test nearest-neighbour distance - min: %.6f, mean: %.6f",
-            result.min_train_test_dist,
-            result.mean_train_test_dist,
-        )
+        if result.min_train_test_dist is not None and result.mean_train_test_dist is not None:
+            logger.info(
+                "  Train<->test candidate-vector nearest-neighbour distance - min: %.6f, "
+                "mean: %.6f",
+                result.min_train_test_dist,
+                result.mean_train_test_dist,
+            )
+        else:
+            logger.info("  Train<->test candidate-vector distance: not applicable to local policy")
         return result
 
 

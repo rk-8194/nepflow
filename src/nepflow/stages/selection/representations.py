@@ -1123,7 +1123,10 @@ def _compute_local_raw_descriptors(
     if managed_budget is None:
         raise ResourceCapacityError(
             "local descriptor generation requires known runtime memory headroom; "
-            "provide [resources] memory_budget_bytes",
+            "provide [resources] memory_budget_bytes. "
+            f"mode={runtime_budget.budget.execution_mode}, "
+            f"memory_budget_override={runtime_budget.budget.memory_budget_bytes is not None}; "
+            f"{runtime_budget.budget.snapshot.diagnostic_summary()}",
             operation="local descriptor generation",
         )
     if max_local_descriptor_inflight_bytes is None:

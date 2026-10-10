@@ -23,9 +23,9 @@ class SelectionResult:
     train_anchor_count: int
     train_fps_count: int
     test_indices: list[int]
-    test_min_dist: float
-    min_train_test_dist: float
-    mean_train_test_dist: float
+    test_min_dist: float | None
+    min_train_test_dist: float | None
+    mean_train_test_dist: float | None
     seed_indices: list[int]
     single_element_elastic_indices: list[int]
     elastic_indices: list[int]
@@ -45,6 +45,9 @@ class SelectionResult:
     entropy_diagnostics: EntropyScientificDiagnostics | None = None
     train_min_dist_applicable: bool = True
     train_fps_count_applicable: bool = True
+    test_selection_policy: str = "candidate_mean_fps_legacy"
+    test_selection_version: str = "candidate-mean-fps-v1"
+    test_selection_provenance: Mapping[str, Any] = field(default_factory=dict)
 
     def as_mapping(self) -> dict[str, Any]:
         """Return the legacy result shape at the artifact boundary."""
@@ -85,6 +88,9 @@ class SelectionResult:
             "seed_indices": self.seed_indices,
             "single_element_elastic_indices": self.single_element_elastic_indices,
             "elastic_indices": self.elastic_indices,
+            "test_selection_policy": self.test_selection_policy,
+            "test_selection_version": self.test_selection_version,
+            "test_selection_provenance": self.test_selection_provenance,
         }
 
     def __getitem__(self, key: str) -> Any:

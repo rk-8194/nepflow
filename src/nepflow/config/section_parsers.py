@@ -782,6 +782,21 @@ def parse_selection(values: Mapping[str, str]) -> SelectionConfig:
         target_tolerance=_parse_int(
             values.get("target_tolerance", "50"), "selection.target_tolerance"
         ),
+        test_selection_policy=values.get(
+            "test_selection_policy", "representative"
+        ).strip().lower(),
+        test_atom_weighting=values.get("test_atom_weighting", "candidate").strip().lower(),
+        test_signature_bins=_parse_int(
+            values.get("test_signature_bins", "4"), "selection.test_signature_bins"
+        ),
+        test_novelty_quantile=_parse_float(
+            values.get("test_novelty_quantile", "0.95"),
+            "selection.test_novelty_quantile",
+        ),
+        test_novelty_beta=_parse_float(
+            values.get("test_novelty_beta", "0.5"),
+            "selection.test_novelty_beta",
+        ),
         descriptor_type=values.get("descriptor_type", "structure").strip().lower(),
         batch_size=_parse_int(values.get("batch_size", "500"), "selection.batch_size"),
         max_search_iterations=_parse_int(

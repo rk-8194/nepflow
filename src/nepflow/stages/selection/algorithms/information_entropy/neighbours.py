@@ -294,7 +294,7 @@ class IndexedCPUNeighbourIndex:
         remaining = service.remaining_managed_budget
         if remaining is None:
             raise ResourceCapacityError(
-                "indexed neighbour construction requires known runtime memory headroom",
+                service.unknown_memory_message("indexed neighbour construction"),
                 operation="indexed neighbour construction",
             )
         if remaining < 1:
@@ -478,6 +478,50 @@ class IndexedCPUNeighbourIndex:
             "atomic_distance_evaluations": int(self.atomic_distance_evaluations),
             **_process_memory_metrics(),
         }
+
+    def query_nearest_distances(
+        self,
+        queries: np.ndarray,
+        *,
+        chunk_size: int = 1024,
+        context: str = "indexed nearest-neighbour query",
+    ) -> np.ndarray:
+        """Return exact nearest distances for external query rows in bounded chunks.
+
+        The query rows are not inserted into the index and no query-by-index
+        distance matrix is materialized.  This is used by the independent
+        extrapolative holdout policy to compare candidate-owned local rows with
+        training-owned local rows.
+        """
+
+        values = _validate_descriptors(queries)
+        block_size = _validate_chunk_size(chunk_size)
+        distances = np.empty(values.shape[0], dtype=np.float64)
+        for start in range(0, values.shape[0], block_size):
+            stop = min(start + block_size, values.shape[0])
+            block = values[start:stop]
+            estimated_bytes = _estimate_radius_workspace_bytes(
+                int(block.shape[0]),
+                1,
+                int(block.shape[1]),
+            )
+            if estimated_bytes > self.max_radius_query_bytes:
+                raise self._capacity_error(
+                    source_index=None,
+                    radius=None,
+                    requested_bytes=estimated_bytes,
+                    context=context,
+                )
+            with self.resource_budget.acquire(context, max(1, estimated_bytes)):
+                _tree_distances, tree_indices = self._tree.query(block, k=1, workers=1)
+                nearest = self.unique_locations[np.asarray(tree_indices, dtype=np.int64)]
+                delta = nearest - block
+                distances[start:stop] = np.sqrt(
+                    np.sum(delta * delta, axis=1, dtype=np.float64)
+                )
+        if not np.all(np.isfinite(distances)):
+            raise ValueError(f"{context} produced non-finite distances")
+        return distances
 
     @staticmethod
     def _distance_values(
@@ -833,7 +877,7 @@ def compute_exact_neighbours(
     remaining = service.remaining_managed_budget
     if remaining is None:
         raise ResourceCapacityError(
-            "exact neighbour calculation requires known runtime memory headroom",
+            service.unknown_memory_message("exact neighbour calculation"),
             operation="exact neighbour calculation",
         )
     requested_bytes = int(
@@ -1048,7 +1092,7 @@ def compute_indexed_cpu_neighbours(
     remaining = service.remaining_managed_budget
     if remaining is None:
         raise ResourceCapacityError(
-            "indexed neighbour calculation requires known runtime memory headroom",
+            service.unknown_memory_message("indexed neighbour calculation"),
             operation="indexed neighbour calculation",
         )
     requested_bytes = int(16 * values.shape[0] * order_k + 128 * values.shape[0])
@@ -1150,7 +1194,7 @@ def compute_radius_support(
         remaining = service.remaining_managed_budget
         if remaining is None:
             raise ResourceCapacityError(
-                "exact radius support requires known runtime memory headroom",
+                service.unknown_memory_message("exact radius support"),
                 operation="exact radius support",
             )
         if remaining < 1:

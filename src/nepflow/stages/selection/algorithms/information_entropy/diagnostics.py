@@ -443,6 +443,7 @@ class GraphDiagnostics:
     atomic_graph_materialized: bool = True
     atomic_graph_csr_bytes: int = -1
     kernel_operator_fingerprint: str | None = None
+    contribution_spool_bytes: int | None = None
 
     def __post_init__(self) -> None:
         for name in (
@@ -471,6 +472,7 @@ class GraphDiagnostics:
             "indexed_workspace_bytes",
             "measured_peak_memory_bytes",
             "estimated_peak_memory_bytes",
+            "contribution_spool_bytes",
         ):
             value = getattr(self, name)
             if value is not None and int(value) < 0:
@@ -510,6 +512,7 @@ class GraphDiagnostics:
                 "indexed_workspace_bytes": self.indexed_workspace_bytes,
                 "measured_peak_memory_bytes": self.measured_peak_memory_bytes,
                 "estimated_peak_memory_bytes": self.estimated_peak_memory_bytes,
+                "contribution_spool_bytes": self.contribution_spool_bytes,
             },
             "backend": self.backend,
             "metric": self.metric,
@@ -715,6 +718,15 @@ class EntropyScientificDiagnostics:
 
     def _fingerprint_payload(self) -> dict[str, Any]:
         calibration_record = self._calibration_manifest()
+        graph_record = self.graph.to_manifest()
+        graph_memory = graph_record.get("memory")
+        if isinstance(graph_memory, dict):
+            # Spool size is publication telemetry, not scientific identity.
+            # Keep fingerprints compatible with v3 records written before the
+            # streamed-memory presentation field was exposed.
+            graph_memory = dict(graph_memory)
+            graph_memory.pop("contribution_spool_bytes", None)
+            graph_record["memory"] = graph_memory
         return {
             "schema_version": self.schema_version,
             "candidate_ids": list(self.candidate_ids),
@@ -752,7 +764,7 @@ class EntropyScientificDiagnostics:
             "radius_summary": self.radius_summary.to_manifest(),
             "bandwidth_summary": self.bandwidth_summary.to_manifest(),
             "calibration": self._calibration_manifest(),
-            "graph": self.graph.to_manifest(),
+            "graph": graph_record,
             "selected_candidate_ids": list(self.selected_candidate_ids),
             "acquisition_order": list(self.acquisition_order),
             "test_candidate_ids": list(self.test_candidate_ids),
@@ -852,6 +864,23 @@ class EntropyScientificDiagnostics:
         values = np.asarray(self.bandwidths.bandwidths, dtype=np.float64).copy()
         values.setflags(write=False)
         return values
+
+    @property
+    def selected_bandwidth_fingerprint(self) -> str:
+        """Return the selected h_a identity, including after persisted restore."""
+
+        if self.bandwidths is not None:
+            return self.bandwidths.fingerprint
+        calibration = self._calibration_manifest()
+        if not isinstance(calibration, Mapping):
+            raise ValueError("selected bandwidth identity is unavailable")
+        selected = calibration.get("selected")
+        if not isinstance(selected, Mapping):
+            raise ValueError("selected bandwidth identity is unavailable")
+        fingerprint = selected.get("bandwidth_fingerprint", selected.get("bandwidth"))
+        if not isinstance(fingerprint, str) or not fingerprint.strip():
+            raise ValueError("selected bandwidth identity is unavailable")
+        return fingerprint
 
     @property
     def selection_history_records(self) -> list[dict[str, Any]]:
@@ -1339,6 +1368,11 @@ def _graph_from_manifest(value: Mapping[str, Any]) -> GraphDiagnostics:
             if value.get("kernel_operator_fingerprint") is None
             else str(value["kernel_operator_fingerprint"])
         ),
+        contribution_spool_bytes=(
+            None
+            if memory.get("contribution_spool_bytes") is None
+            else int(memory["contribution_spool_bytes"])
+        ),
         numerical_tolerance=float(
             value.get("numerical_tolerance", DIAGNOSTICS_NUMERICAL_TOLERANCE)
         ),
@@ -1672,6 +1706,9 @@ def build_entropy_diagnostics(
             graph.array_bytes if isinstance(graph, SparseAtomicKernelGraph) else 0
         ),
         kernel_operator_fingerprint=operator_fingerprint,
+        contribution_spool_bytes=(
+            None if isinstance(graph, SparseAtomicKernelGraph) else graph.contribution_spool_bytes
+        ),
     )
     raw = np.asarray(local_representation.raw_descriptors, dtype=np.float64)
     whitened = np.asarray(local_representation.descriptors, dtype=np.float64)

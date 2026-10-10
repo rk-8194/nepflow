@@ -845,6 +845,52 @@ probabilities, acquisition order, or scientific fingerprints.  Generated
 configuration shall expose these settings only in `[resources]`; per-kernel
 entry and byte ceilings are not part of the normal scientific configuration.
 
+### 26.2 Independent local-environment test holdouts
+
+Entropy training and test-set construction have separate scientific purposes.
+The entropy training pool remains the complete whitened local-environment pool,
+including candidates that may later be used as label/DFT-energy holdouts; test
+selection must not rerun the entropy acquisition objective or use one arithmetic
+mean descriptor per candidate as its decision representation.
+
+The default `representative` holdout uses deterministic strata formed from
+candidate composition, declared structural family, and local-descriptor
+distribution signatures.  `test_atom_weighting=candidate` gives each eligible
+candidate equal weight; `atom` weights strata by their local-row counts.  The
+`extrapolative` holdout instead ranks candidates by the mean and configured upper
+quantile of candidate-owned local-row distances to indexed training rows, with a
+bounded local-profile diversity tie-break.  Its scores describe out-of-domain
+stress, not population-average accuracy.  Both policies exclude training,
+mandatory-anchor, and shared physical-structure identities, report unmet quotas
+and exclusion reasons, and persist their version and provenance.
+
+These are label/DFT-energy holdouts rather than cold holdouts: the full candidate
+pool is used for descriptor whitening and entropy bandwidth calibration before
+the test identities are chosen.  A genuinely unseen cold split requires a
+separate, versioned prepartition policy and a recalculated training pool.  The
+legacy `candidate_mean_fps_legacy` policy is retained only as an explicit
+compatibility path; the independent `fps` training algorithm keeps its existing
+candidate-vector test behavior.
+
+### 26.3 Presentation-only entropy diagnostics
+
+Entropy reporting shall retain `reports/descriptor_space.png` as a candidate-level
+PCA diagnostic: one marker per candidate mean, with the ordered train, test, and
+unselected identities. The figure shall identify the whitened local-descriptor
+space, the source dimension `d'`, explained variance, and the fact that the
+projection is not used by the entropy objective.
+
+Additional entropy figures may summarize the source-specific high-dimensional
+bandwidths and aggregate the original atomic-row `p` and final-mixture `q` masses
+onto a common projected grid. They shall not draw atomic scatter clouds or
+interpret an `h_a` value as a two-dimensional kernel radius. A versioned,
+identity-checked presentation artifact under `reports/` shall contain the compact
+candidate summaries and probability grids needed to rerender these figures after
+restore, without recalibrating bandwidths, rebuilding neighbours, or rerunning
+selection. Presentation failures are warnings after the scientific selection
+result and its authoritative artifacts have been persisted; they must not change
+the scientific fingerprint or block recovery.
+
 ---
 
 ## 27. Tie-Breaking

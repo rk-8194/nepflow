@@ -120,6 +120,12 @@ def test_stage_runs_the_sparse_entropy_pipeline_and_keeps_fps_separate(tmp_path:
     assert result.train_entropy_objective is not None
     assert result.train_entropy_graph_fingerprint
     assert result.train_entropy_contributions_fingerprint
+    assert result.test_selection_policy == "representative"
+    assert result.test_selection_version == "local-environment-holdout-v1"
+    assert result.test_selection_provenance["label_holdout"] is True
+    assert result.test_selection_provenance["preprocessing_scope"] == (
+        "full_candidate_pool_representation_and_calibration"
+    )
     assert set(result.train_indices).isdisjoint(result.test_indices)
     assert result.entropy_diagnostics is not None
     restored = EntropyScientificDiagnostics.from_manifest(result.entropy_diagnostics.to_manifest())
@@ -129,6 +135,8 @@ def test_stage_runs_the_sparse_entropy_pipeline_and_keeps_fps_separate(tmp_path:
     )
     assert restored_result.entropy_diagnostics is not None
     assert restored_result.entropy_diagnostics.fingerprint == result.entropy_diagnostics.fingerprint
+    assert restored_result.test_selection_policy == result.test_selection_policy
+    assert restored_result.test_selection_provenance == result.test_selection_provenance
 
 
 def test_entropy_budget_is_rejected_before_local_representation_work(tmp_path: Path) -> None:

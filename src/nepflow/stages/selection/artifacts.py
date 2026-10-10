@@ -9,6 +9,7 @@ from typing import Any, Mapping
 
 from ase.io import write as ase_write
 
+from nepflow.config.models import TEST_SELECTION_POLICIES
 from nepflow.domain.identities import CANDIDATE_IDENTITY_SCHEMA, STRUCTURE_IDENTITY_SCHEMA
 from nepflow.errors import ArtifactError
 from nepflow.io.atomic import atomic_write_bytes, atomic_write_text
@@ -36,6 +37,9 @@ def write_selected_structures(
     train_anchor_indices: list[int] | None = None,
     train_acquisition_order: list[str] | None = None,
     entropy_diagnostics: Mapping[str, Any] | None = None,
+    test_selection_policy: str = "candidate_mean_fps_legacy",
+    test_selection_version: str = "candidate-mean-fps-v1",
+    test_selection_provenance: Mapping[str, Any] | None = None,
 ) -> tuple[Path, Path]:
     """Write selected train/test structures using the established paths."""
 
@@ -52,6 +56,31 @@ def write_selected_structures(
         raise ArtifactError("Selection artifact identity counts do not match structures")
     if len(set(all_candidate_ids)) != len(all_candidate_ids):
         raise ArtifactError("Selection artifact candidate IDs are not unique")
+    if set(train_indices) & set(test_indices):
+        raise ArtifactError("Selection artifact train/test candidate indices overlap")
+    try:
+        train_structure_set = {all_structure_ids[index] for index in train_indices}
+        test_structure_set = {all_structure_ids[index] for index in test_indices}
+    except (IndexError, TypeError) as exc:
+        raise ArtifactError("Selection artifact index is out of range") from exc
+    if train_structure_set & test_structure_set:
+        raise ArtifactError("Selection artifact train/test physical IDs overlap")
+    anchor_indices = set(train_anchor_indices or [])
+    if anchor_indices & set(test_indices):
+        raise ArtifactError("Selection artifact test indices overlap mandatory anchors")
+    if {all_structure_ids[index] for index in anchor_indices} & test_structure_set:
+        raise ArtifactError("Selection artifact test physical IDs overlap mandatory anchors")
+    if (
+        not isinstance(test_selection_policy, str)
+        or test_selection_policy not in TEST_SELECTION_POLICIES
+    ):
+        raise ArtifactError("Selection artifact test-selection policy is unsupported")
+    if not isinstance(test_selection_version, str) or not test_selection_version.strip():
+        raise ArtifactError("Selection artifact test-selection version is blank")
+    if test_selection_provenance is not None and not isinstance(
+        test_selection_provenance, Mapping
+    ):
+        raise ArtifactError("Selection artifact test-selection provenance is malformed")
     if all(
         candidate_id == structure_id
         for candidate_id, structure_id in zip(all_candidate_ids, all_structure_ids)
@@ -90,6 +119,26 @@ def write_selected_structures(
         path: path.read_bytes() if path.is_file() else None
         for path in (train_path, test_path, manifest_path)
     }
+    if isinstance(entropy_diagnostics, Mapping):
+        objective = entropy_diagnostics.get("objective")
+        numeric = objective.get("numeric_arrays") if isinstance(objective, Mapping) else None
+        numeric_name = numeric.get("path") if isinstance(numeric, Mapping) else None
+        if isinstance(numeric_name, str) and numeric_name.strip():
+            numeric_path = Path(numeric_name)
+            if numeric_path.is_absolute():
+                numeric_path = selected_dir / numeric_path.name
+            else:
+                numeric_path = selected_dir / numeric_path
+            try:
+                numeric_path.resolve().relative_to(selected_dir.resolve())
+            except ValueError as exc:
+                raise ArtifactError(
+                    "Selection entropy diagnostics artifact path escapes the artifact "
+                    "directory"
+                ) from exc
+            previous[numeric_path] = (
+                numeric_path.read_bytes() if numeric_path.is_file() else None
+            )
     try:
         write_extxyz(train_path, selected_structures(train_indices))
         logger.info("  Training set saved to %s", train_path)
@@ -132,7 +181,8 @@ def write_selected_structures(
                 diagnostic_path = selected_dir / numeric_path
                 if not diagnostic_path.is_file():
                     raise ArtifactError(
-                        f"Selection entropy diagnostics numeric artifact is missing: {diagnostic_path}"
+                        "Selection entropy diagnostics numeric artifact is missing: "
+                        f"{diagnostic_path}"
                     )
                 artifact_records[Path(numeric_path).name] = {
                     "path": Path(numeric_path).name,
@@ -148,6 +198,9 @@ def write_selected_structures(
                 "train_structure_ids": [all_structure_ids[index] for index in train_indices],
                 "test_structure_ids": [all_structure_ids[index] for index in test_indices],
                 "algorithm_id": algorithm_id,
+                "test_selection_policy": test_selection_policy,
+                "test_selection_version": test_selection_version,
+                "test_selection_provenance": dict(test_selection_provenance or {}),
                 "train_anchor_count": len(set(train_anchor_indices or [])),
                 "train_anchor_candidate_ids": [
                     all_candidate_ids[index] for index in sorted(set(train_anchor_indices or []))
@@ -208,6 +261,19 @@ def read_selection_manifest(project_dir: Path) -> dict:
         manifest["test_candidate_ids"] = list(test_candidate_ids)
     if set(train_candidate_ids) & set(test_candidate_ids):
         raise ArtifactError(f"Selection artifact train/test candidate IDs overlap: {path}")
+    train_structure_ids = manifest.get("train_structure_ids", [])
+    test_structure_ids = manifest.get("test_structure_ids", [])
+    if set(train_structure_ids) & set(test_structure_ids):
+        raise ArtifactError(f"Selection artifact train/test physical IDs overlap: {path}")
+    policy = manifest.get("test_selection_policy", "candidate_mean_fps_legacy")
+    version = manifest.get("test_selection_version", "candidate-mean-fps-v1")
+    provenance = manifest.get("test_selection_provenance", {})
+    if not isinstance(policy, str) or policy not in TEST_SELECTION_POLICIES:
+        raise ArtifactError(f"Selection artifact test-selection policy is malformed: {path}")
+    if not isinstance(version, str) or not version.strip():
+        raise ArtifactError(f"Selection artifact test-selection version is malformed: {path}")
+    if not isinstance(provenance, dict):
+        raise ArtifactError(f"Selection artifact test-selection provenance is malformed: {path}")
     diagnostics = manifest.get("entropy_diagnostics")
     if manifest.get("algorithm_id") == "information_entropy" and diagnostics is None:
         raise ArtifactError(f"Selection entropy diagnostics are missing: {path}")
@@ -246,13 +312,16 @@ def read_selection_manifest(project_dir: Path) -> dict:
         if isinstance(numeric, Mapping) and numeric.get("storage") == "file":
             name = numeric.get("path")
             if not isinstance(name, str) or Path(name).is_absolute():
-                raise ArtifactError(f"Selection entropy diagnostics artifact path is malformed: {path}")
+                raise ArtifactError(
+                    f"Selection entropy diagnostics artifact path is malformed: {path}"
+                )
             diagnostic_path = selected_dir / name
             try:
                 diagnostic_path.resolve().relative_to(selected_dir.resolve())
             except ValueError as exc:
                 raise ArtifactError(
-                    f"Selection entropy diagnostics artifact path escapes the artifact directory: {path}"
+                    "Selection entropy diagnostics artifact path escapes the artifact "
+                    f"directory: {path}"
                 ) from exc
             record = artifacts.get(Path(name).name)
             if (
@@ -261,8 +330,41 @@ def read_selection_manifest(project_dir: Path) -> dict:
                 or record.get("sha256") != sha256_file(diagnostic_path, required=True)
             ):
                 raise ArtifactError(
-                    f"Selection entropy diagnostics artifact changed or is missing: {diagnostic_path}"
+                    "Selection entropy diagnostics artifact changed or is missing: "
+                    f"{diagnostic_path}"
                 )
+    return manifest
+
+
+def verify_selection_artifacts(
+    project_dir: Path,
+    *,
+    algorithm_id: str = "fps",
+    require_reports: bool = True,
+) -> dict:
+    """Verify published selection artifacts and required presentation files."""
+
+    project_dir = Path(project_dir)
+    manifest = read_selection_manifest(project_dir)
+    selected_dir = project_dir / "structures" / "selected"
+    reports_dir = project_dir / "reports"
+    if require_reports:
+        descriptor_report = reports_dir / "descriptor_space.png"
+        if not descriptor_report.is_file() or descriptor_report.stat().st_size == 0:
+            raise ArtifactError(
+                f"Selection descriptor report is missing or empty: {descriptor_report}"
+            )
+        if algorithm_id == "information_entropy":
+            diagnostics_report = reports_dir / "entropy_diagnostics.md"
+            if not diagnostics_report.is_file() or diagnostics_report.stat().st_size == 0:
+                raise ArtifactError(
+                    "Selection entropy diagnostics report is missing or empty: "
+                    f"{diagnostics_report}"
+                )
+    for filename in ("train.xyz", "test.xyz", SELECTION_MANIFEST_FILENAME):
+        path = selected_dir / filename
+        if not path.is_file() or path.stat().st_size == 0:
+            raise ArtifactError(f"Selection artifact is missing or empty: {path}")
     return manifest
 
 
@@ -271,5 +373,6 @@ __all__ = [
     "LEGACY_SELECTION_ARTIFACT_SCHEMA",
     "SELECTION_MANIFEST_FILENAME",
     "read_selection_manifest",
+    "verify_selection_artifacts",
     "write_selected_structures",
 ]
