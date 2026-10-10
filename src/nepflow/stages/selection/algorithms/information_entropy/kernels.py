@@ -15,6 +15,7 @@ import numpy as np
 from nepflow.io.hashing import sha256_canonical_json
 
 from .models import (
+    DEFAULT_RADIUS_QUERY_BYTES,
     INDEXED_NEIGHBOUR_BACKEND_ID,
     INDEXED_NEIGHBOUR_BACKEND_VERSION,
     KERNEL_FAMILY,
@@ -37,6 +38,7 @@ from .neighbours import (
     _validate_chunk_size,
     _validate_descriptors,
     build_neighbour_index,
+    compute_radius_support,
 )
 
 SourceProgressCallback = Callable[[int, int], None]
@@ -139,10 +141,20 @@ class _KernelSupportProvider:
         backend: str,
         chunk_size: int,
         index: IndexedCPUNeighbourIndex | None = None,
+        max_radius_query_bytes: int = DEFAULT_RADIUS_QUERY_BYTES,
+        capacity_context: str | None = None,
     ) -> None:
         self.descriptors = _validate_descriptors(descriptors)
         self.backend = backend
         self.chunk_size = _validate_chunk_size(chunk_size)
+        if isinstance(max_radius_query_bytes, bool) or not isinstance(
+            max_radius_query_bytes, (int, np.integer)
+        ):
+            raise ValueError("max_radius_query_bytes must be a positive integer")
+        self.max_radius_query_bytes = int(max_radius_query_bytes)
+        if self.max_radius_query_bytes < 1:
+            raise ValueError("max_radius_query_bytes must be a positive integer")
+        self.capacity_context = capacity_context
         if backend == INDEXED_NEIGHBOUR_BACKEND_ID:
             self.index = (
                 index
@@ -150,6 +162,7 @@ class _KernelSupportProvider:
                 else build_neighbour_index(
                     self.descriptors,
                     backend=backend,
+                    max_radius_query_bytes=self.max_radius_query_bytes,
                 )
             )
             if not isinstance(self.index, IndexedCPUNeighbourIndex):
@@ -167,30 +180,38 @@ class _KernelSupportProvider:
         self.radius_queries = 0
         self.support_entries = 0
         self._normaliser_cache: dict[tuple[int, float], float] = {}
+        self.current_support_count = 0
+        self.max_support_count = 0
+        self.query_workspace_peak_bytes = 0
 
     def support(self, source_index: int, radius: float) -> tuple[np.ndarray, np.ndarray]:
         scale = float(radius)
         if self.index is not None:
             self.index_queries += 1
-            self.radius_queries += 1
-            target_indices, distances = self.index.radius_support(source_index, scale)
+            target_indices, distances = self.index.radius_support(
+                source_index,
+                scale,
+                context=self.capacity_context,
+            )
+            self.radius_queries = self.index.radius_queries
+            self.query_workspace_peak_bytes = self.index.query_workspace_peak_bytes
             self.support_entries += int(target_indices.shape[0])
+            self.current_support_count = int(target_indices.shape[0])
+            self.max_support_count = max(self.max_support_count, self.current_support_count)
             return target_indices, distances
-        target_parts: list[np.ndarray] = []
-        distance_parts: list[np.ndarray] = []
-        for start in range(0, self.descriptors.shape[0], self.chunk_size):
-            stop = min(start + self.chunk_size, self.descriptors.shape[0])
-            distances = _distance_block(self.descriptors, source_index, start, stop)
-            self.distance_evaluations += stop - start
-            positive = distances < scale
-            if np.any(positive):
-                target_parts.append(np.arange(start, stop, dtype=np.int64)[positive])
-                distance_parts.append(distances[positive])
-        if not target_parts:
-            raise ValueError(f"source kernel support is empty for source {source_index}")
-        targets = np.concatenate(target_parts)
-        distances = np.concatenate(distance_parts)
+        targets, distances = compute_radius_support(
+            self.descriptors,
+            source_index,
+            scale,
+            backend=NEIGHBOUR_BACKEND_ID,
+            chunk_size=self.chunk_size,
+            max_radius_query_bytes=self.max_radius_query_bytes,
+            context=self.capacity_context,
+        )
+        self.distance_evaluations += self.descriptors.shape[0]
         self.support_entries += int(targets.shape[0])
+        self.current_support_count = int(targets.shape[0])
+        self.max_support_count = max(self.max_support_count, self.current_support_count)
         return targets, distances
 
     def normaliser(
@@ -223,6 +244,8 @@ def source_normalisers(
     backend: str = NEIGHBOUR_BACKEND_ID,
     index: IndexedCPUNeighbourIndex | None = None,
     support_provider: _KernelSupportProvider | None = None,
+    max_radius_query_bytes: int = DEFAULT_RADIUS_QUERY_BYTES,
+    capacity_context: str | None = None,
 ) -> np.ndarray:
     """Return ``Z_b`` over the complete exact compact-kernel support."""
 
@@ -234,6 +257,8 @@ def source_normalisers(
         backend=backend,
         chunk_size=block,
         index=index,
+        max_radius_query_bytes=max_radius_query_bytes,
+        capacity_context=capacity_context,
     )
     normalisers = np.empty(values.shape[0], dtype=np.float64)
     for source_index, scale in enumerate(scales):
@@ -257,6 +282,8 @@ def iter_normalized_kernel_columns(
     backend: str = NEIGHBOUR_BACKEND_ID,
     index: IndexedCPUNeighbourIndex | None = None,
     support_provider: _KernelSupportProvider | None = None,
+    max_radius_query_bytes: int = DEFAULT_RADIUS_QUERY_BYTES,
+    capacity_context: str | None = None,
 ) -> Iterator[NormalizedKernelColumn]:
     """Yield positive normalized source columns using bounded workspaces.
 
@@ -274,6 +301,8 @@ def iter_normalized_kernel_columns(
         backend=backend,
         chunk_size=block,
         index=index,
+        max_radius_query_bytes=max_radius_query_bytes,
+        capacity_context=capacity_context,
     )
     for source_index, scale in enumerate(scales):
         target_indices, distances = provider.support(source_index, float(scale))
@@ -304,6 +333,7 @@ def normalized_kernel_matrix(
     *,
     chunk_size: int = 1024,
     max_dense_entries: int = 1_000_000,
+    max_radius_query_bytes: int = DEFAULT_RADIUS_QUERY_BYTES,
 ) -> np.ndarray:
     """Build a deliberately bounded dense oracle for small correctness tests.
 
@@ -323,6 +353,7 @@ def normalized_kernel_matrix(
         values,
         np.asarray(bandwidths, dtype=np.float64),
         chunk_size=chunk_size,
+        max_radius_query_bytes=max_radius_query_bytes,
     ):
         matrix[column.target_indices, column.source_index] = column.values
     return matrix
@@ -340,6 +371,8 @@ def evaluate_leave_one_out_objective(
     progress_callback: SourceProgressCallback | None = None,
     backend: str = NEIGHBOUR_BACKEND_ID,
     index: IndexedCPUNeighbourIndex | None = None,
+    max_radius_query_bytes: int = DEFAULT_RADIUS_QUERY_BYTES,
+    capacity_context: str | None = None,
 ) -> LeaveOneOutObjective:
     """Evaluate the exact source-normalized finite-pool LOO objective."""
 
@@ -367,6 +400,8 @@ def evaluate_leave_one_out_objective(
         progress_callback=progress_callback,
         backend=backend,
         index=index,
+        max_radius_query_bytes=max_radius_query_bytes,
+        capacity_context=capacity_context,
     ):
         non_source = column.target_indices != column.source_index
         if np.any(non_source):
@@ -558,6 +593,7 @@ def build_sparse_atomic_kernel_graph(
     max_edges: int = _DEFAULT_SPARSE_EDGE_LIMIT,
     max_graph_bytes: int | None = None,
     progress_callback: SourceProgressCallback | None = None,
+    max_radius_query_bytes: int = DEFAULT_RADIUS_QUERY_BYTES,
 ) -> SparseAtomicKernelGraph:
     """Build the exact source-major sparse finite-pool atomic kernel graph."""
 
@@ -591,6 +627,7 @@ def build_sparse_atomic_kernel_graph(
         values,
         backend=frozen.backend,
         chunk_size=block,
+        max_radius_query_bytes=max_radius_query_bytes,
     )
     if (
         frozen.backend == INDEXED_NEIGHBOUR_BACKEND_ID
@@ -614,6 +651,7 @@ def build_sparse_atomic_kernel_graph(
             progress_callback=report_source_progress,
             backend=frozen.backend,
             support_provider=support_provider,
+            max_radius_query_bytes=max_radius_query_bytes,
         ):
             edge_counts[column.source_index] += np.int64(column.target_indices.shape[0])
         edge_count = int(np.sum(edge_counts, dtype=np.int64))
@@ -647,6 +685,7 @@ def build_sparse_atomic_kernel_graph(
             chunk_size=block,
             backend=frozen.backend,
             support_provider=support_provider,
+            max_radius_query_bytes=max_radius_query_bytes,
         ):
             start = int(positions[column.source_index])
             stop = start + column.target_indices.shape[0]

@@ -338,6 +338,7 @@ class EntropyBandwidthConfig:
     chunk_size: int = 1024
     max_neighbour_entries: int = 1_000_000
     max_index_bytes: int | None = None
+    max_radius_query_bytes: int = 256 * 1024 * 1024
 
 
 @dataclass(frozen=True, slots=True)

@@ -24,6 +24,7 @@ SPARSE_KERNEL_GRAPH_SCHEMA_VERSION = "sparse-atomic-kernel-graph-v1"
 SPARSE_CANDIDATE_CONTRIBUTION_SCHEMA_VERSION = "sparse-candidate-contributions-v1"
 SPARSE_NUMERICAL_TOLERANCE = 1.0e-12
 ENTROPY_OBJECTIVE_SCHEMA_VERSION = "entropy-objective-v1"
+DEFAULT_RADIUS_QUERY_BYTES = 256 * 1024 * 1024
 
 
 def _readonly_float_array(value: Any, *, name: str) -> np.ndarray:
@@ -78,6 +79,8 @@ class EntropyBandwidthSettings:
     chunk_size: int = 1024
     max_neighbour_entries: int = 1_000_000
     max_index_bytes: int | None = None
+    max_radius_query_bytes: int = DEFAULT_RADIUS_QUERY_BYTES
+    max_calibration_work_bytes: int | None = None
 
     def __post_init__(self) -> None:
         mode = str(self.mode).strip().lower()
@@ -103,6 +106,18 @@ class EntropyBandwidthSettings:
             or int(self.max_index_bytes) < 1
         ):
             raise ValueError("max_index_bytes must be a positive integer when provided")
+        if (
+            isinstance(self.max_radius_query_bytes, bool)
+            or not isinstance(self.max_radius_query_bytes, (int, np.integer))
+            or int(self.max_radius_query_bytes) < 1
+        ):
+            raise ValueError("max_radius_query_bytes must be a positive integer")
+        if self.max_calibration_work_bytes is not None and (
+            isinstance(self.max_calibration_work_bytes, bool)
+            or not isinstance(self.max_calibration_work_bytes, (int, np.integer))
+            or int(self.max_calibration_work_bytes) < 1
+        ):
+            raise ValueError("max_calibration_work_bytes must be a positive integer when provided")
         k_candidates = _validate_ordered_integer_domain(self.k_candidates, "k_candidates")
         c_candidates = _validate_ordered_float_domain(self.c_candidates, "c_candidates")
         if mode == "manual":
@@ -117,8 +132,21 @@ class EntropyBandwidthSettings:
         object.__setattr__(self, "c_candidates", c_candidates)
         object.__setattr__(self, "chunk_size", int(self.chunk_size))
         object.__setattr__(self, "max_neighbour_entries", int(self.max_neighbour_entries))
+        object.__setattr__(self, "max_radius_query_bytes", int(self.max_radius_query_bytes))
         if self.max_index_bytes is not None:
             object.__setattr__(self, "max_index_bytes", int(self.max_index_bytes))
+        if self.max_calibration_work_bytes is not None:
+            object.__setattr__(
+                self, "max_calibration_work_bytes", int(self.max_calibration_work_bytes)
+            )
+
+    @property
+    def operational_work_bytes(self) -> int:
+        """Return the effective per-source calibration/query workspace limit."""
+
+        if self.max_calibration_work_bytes is not None:
+            return int(self.max_calibration_work_bytes)
+        return int(self.max_radius_query_bytes)
 
 
 def _validate_positive_integer(value: Any, name: str) -> int:
@@ -1386,6 +1414,7 @@ __all__ = [
     "INDEXED_NEIGHBOUR_BACKEND_ID",
     "INDEXED_NEIGHBOUR_BACKEND_VERSION",
     "DEFAULT_NEIGHBOUR_BACKEND_ID",
+    "DEFAULT_RADIUS_QUERY_BYTES",
     "NEIGHBOUR_DISTINCT_POLICY",
     "NEIGHBOUR_METRIC",
     "SPARSE_CANDIDATE_CONTRIBUTION_SCHEMA_VERSION",

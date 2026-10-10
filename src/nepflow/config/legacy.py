@@ -345,6 +345,9 @@ def _selection_values(config: NepflowConfig) -> dict[str, str]:
         "entropy_bandwidth_max_index_bytes": ""
         if selection.entropy.bandwidth.max_index_bytes is None
         else str(selection.entropy.bandwidth.max_index_bytes),
+        "entropy_bandwidth_max_radius_query_bytes": str(
+            selection.entropy.bandwidth.max_radius_query_bytes
+        ),
         "entropy_max_edges": str(selection.entropy.max_edges),
         "entropy_max_graph_bytes": ""
         if selection.entropy.max_graph_bytes is None

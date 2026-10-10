@@ -309,6 +309,13 @@ def validate_config(
         raise ConfigurationError(
             "selection.entropy.bandwidth.max_index_bytes must be positive when provided"
         )
+    if (
+        not isinstance(bandwidth.max_radius_query_bytes, int)
+        or bandwidth.max_radius_query_bytes < 1
+    ):
+        raise ConfigurationError(
+            "selection.entropy.bandwidth.max_radius_query_bytes must be positive"
+        )
     if tuple(sorted(set(bandwidth.k_candidates))) != tuple(bandwidth.k_candidates) or any(
         value < 1 for value in bandwidth.k_candidates
     ):

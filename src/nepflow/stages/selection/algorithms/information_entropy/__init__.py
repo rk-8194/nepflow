@@ -1,6 +1,7 @@
 """Model-independent information-entropy selection."""
 
 from .bandwidth import (
+    BandwidthCalibrationCapacityError,
     BandwidthCalibrationError,
     build_entropy_pool,
     calculate_bandwidths,
@@ -51,6 +52,7 @@ from .kernels import (
 )
 from .models import (
     DEFAULT_NEIGHBOUR_BACKEND_ID,
+    DEFAULT_RADIUS_QUERY_BYTES,
     ENTROPY_OBJECTIVE_SCHEMA_VERSION,
     INDEXED_NEIGHBOUR_BACKEND_ID,
     INDEXED_NEIGHBOUR_BACKEND_VERSION,
@@ -84,10 +86,12 @@ from .models import (
     SparseCandidateContributionRow,
 )
 from .neighbours import (
+    CalibrationCapacityError,
     ExactNeighbourResult,
     IndexedCPUNeighbourIndex,
     NeighbourBackendCapabilities,
     NeighbourResult,
+    RadiusQueryCapacityError,
     build_neighbour_index,
     compute_exact_neighbours,
     compute_indexed_cpu_neighbours,
@@ -149,6 +153,7 @@ from .sensitivity import (
 )
 
 __all__ = [
+    "BandwidthCalibrationCapacityError",
     "BandwidthCalibrationError",
     "DIAGNOSTICS_NUMERICAL_TOLERANCE",
     "DIAGNOSTICS_SCHEMA_VERSION",
@@ -176,6 +181,8 @@ __all__ = [
     "ExactNeighbourResult",
     "IndexedCPUNeighbourIndex",
     "NeighbourBackendCapabilities",
+    "CalibrationCapacityError",
+    "RadiusQueryCapacityError",
     "FrozenBandwidths",
     "GreedySelectionHistory",
     "GreedySelectionPerformance",
@@ -186,6 +193,7 @@ __all__ = [
     "ScientificDiagnostics",
     "InformationEntropyConfig",
     "DEFAULT_NEIGHBOUR_BACKEND_ID",
+    "DEFAULT_RADIUS_QUERY_BYTES",
     "INDEXED_NEIGHBOUR_BACKEND_ID",
     "INDEXED_NEIGHBOUR_BACKEND_VERSION",
     "InformationEntropySelectionAlgorithm",

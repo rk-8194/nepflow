@@ -325,6 +325,7 @@ entropy_bandwidth_metric=euclidean
 entropy_bandwidth_chunk_size=1024
 entropy_bandwidth_max_neighbour_entries=1000000
 entropy_bandwidth_max_index_bytes=
+entropy_bandwidth_max_radius_query_bytes=268435456
 entropy_max_edges=1000000
 entropy_max_graph_bytes=
 entropy_max_entries=1000000

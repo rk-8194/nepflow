@@ -687,6 +687,15 @@ def parse_selection(values: Mapping[str, str]) -> SelectionConfig:
             value("entropy_bandwidth_max_index_bytes", ""),
             "selection.entropy_bandwidth_max_index_bytes",
         ),
+        max_radius_query_bytes=_parse_int(
+            value(
+                "entropy_bandwidth_max_radius_query_bytes",
+                "268435456",
+                "max_radius_query_bytes",
+                "entropy_max_radius_query_bytes",
+            ),
+            "selection.entropy_bandwidth_max_radius_query_bytes",
+        ),
     )
     entropy = EntropySelectionConfig(
         beta=_parse_float(value("entropy_beta", "1.0", "beta"), "selection.entropy_beta"),

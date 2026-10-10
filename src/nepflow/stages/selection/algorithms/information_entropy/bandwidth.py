@@ -21,6 +21,7 @@ from .models import (
     CALIBRATION_OPTIMIZER_ID,
     CALIBRATION_OPTIMIZER_VERSION,
     DEFAULT_NEIGHBOUR_BACKEND_ID,
+    DEFAULT_RADIUS_QUERY_BYTES,
     KERNEL_FAMILY,
     KERNEL_VERSION,
     NEIGHBOUR_METRIC,
@@ -32,6 +33,7 @@ from .models import (
 )
 from .neighbours import (
     ExactNeighbourResult,
+    RadiusQueryCapacityError,
     build_neighbour_index,
     compute_neighbours,
 )
@@ -45,6 +47,9 @@ class BandwidthCalibrationError(ValueError):
     def __init__(self, message: str, *, attempts: Sequence[CalibrationAttempt] = ()) -> None:
         super().__init__(message)
         self.attempts = tuple(attempts)
+
+
+BandwidthCalibrationCapacityError = RadiusQueryCapacityError
 
 
 @dataclass(frozen=True, slots=True)
@@ -361,6 +366,7 @@ def calculate_frozen_bandwidths(
     backend: str = DEFAULT_NEIGHBOUR_BACKEND_ID,
     max_neighbour_entries: int = 1_000_000,
     max_index_bytes: int | None = None,
+    max_radius_query_bytes: int = DEFAULT_RADIUS_QUERY_BYTES,
 ) -> FrozenBandwidths:
     """Calculate and freeze exact full-pool ``r_k`` and ``h=c*r_k``."""
 
@@ -380,6 +386,7 @@ def calculate_frozen_bandwidths(
         pool.descriptors,
         backend=backend,
         max_index_bytes=max_index_bytes,
+        max_radius_query_bytes=max_radius_query_bytes,
     )
     neighbours = compute_neighbours(
         pool.descriptors,
@@ -413,6 +420,8 @@ def _settings_from_arguments(
     chunk_size: int,
     max_neighbour_entries: int,
     max_index_bytes: int | None,
+    max_radius_query_bytes: int,
+    max_calibration_work_bytes: int | None,
 ) -> EntropyBandwidthSettings:
     if settings is not None:
         if any(value is not None for value in (mode, k, c, k_candidates, c_candidates)):
@@ -431,6 +440,8 @@ def _settings_from_arguments(
             chunk_size=chunk_size,
             max_neighbour_entries=max_neighbour_entries,
             max_index_bytes=max_index_bytes,
+            max_radius_query_bytes=max_radius_query_bytes,
+            max_calibration_work_bytes=max_calibration_work_bytes,
         )
     return EntropyBandwidthSettings(
         mode=selected_mode,
@@ -441,6 +452,8 @@ def _settings_from_arguments(
         chunk_size=chunk_size,
         max_neighbour_entries=max_neighbour_entries,
         max_index_bytes=max_index_bytes,
+        max_radius_query_bytes=max_radius_query_bytes,
+        max_calibration_work_bytes=max_calibration_work_bytes,
     )
 
 
@@ -474,6 +487,8 @@ def calibrate_bandwidth(
     chunk_size: int = 1024,
     max_neighbour_entries: int = 1_000_000,
     max_index_bytes: int | None = None,
+    max_radius_query_bytes: int = DEFAULT_RADIUS_QUERY_BYTES,
+    max_calibration_work_bytes: int | None = None,
 ) -> BandwidthCalibrationResult:
     """Run deterministic manual or bounded-grid finite-pool calibration."""
 
@@ -501,6 +516,8 @@ def calibrate_bandwidth(
         chunk_size=chunk_size,
         max_neighbour_entries=max_neighbour_entries,
         max_index_bytes=max_index_bytes,
+        max_radius_query_bytes=max_radius_query_bytes,
+        max_calibration_work_bytes=max_calibration_work_bytes,
     )
     if pool.descriptors.shape[0] < 2:
         raise BandwidthCalibrationError("leave-one-out calibration requires at least two rows")
@@ -509,6 +526,7 @@ def calibrate_bandwidth(
         pool.descriptors,
         backend=selected_settings.backend,
         max_index_bytes=selected_settings.max_index_bytes,
+        max_radius_query_bytes=selected_settings.operational_work_bytes,
     )
 
     if selected_settings.mode == "manual":
@@ -607,12 +625,31 @@ def calibrate_bandwidth(
             percentage = 100.0 * completed / total_sources
             logger.info(
                 "Bandwidth calibration pair source progress: k=%d, c=%g, source=%d/%d "
-                "(%.1f%%), elapsed=%.3fs, estimated remaining=%.3fs",
+                "(%.1f%%), current_support=%d, max_support=%d, radius_queries=%d, "
+                "support_cache_bytes=0, "
+                "support_cache_peak_bytes=0, index_bytes=%d, query_workspace_peak_bytes=%d, "
+                "process_peak_rss_bytes=%s, cgroup_memory_current_bytes=%s, "
+                "elapsed=%.3fs, estimated remaining=%.3fs",
                 candidate_k,
                 candidate_c,
                 completed,
                 total_sources,
                 percentage,
+                int(getattr(index, "current_support_count", 0)),
+                int(getattr(index, "max_support_count", 0)),
+                int(getattr(index, "radius_queries", 0)),
+                int(getattr(index, "index_bytes", 0)),
+                int(getattr(index, "query_workspace_peak_bytes", 0)),
+                (
+                    str(index.memory_metrics().get("process_peak_rss_bytes"))
+                    if index is not None
+                    else "unavailable"
+                ),
+                (
+                    str(index.memory_metrics().get("cgroup_memory_current_bytes"))
+                    if index is not None
+                    else "unavailable"
+                ),
                 elapsed,
                 remaining,
             )
@@ -659,6 +696,8 @@ def calibrate_bandwidth(
                     progress_callback=source_progress_logger(candidate_k, float(candidate_c)),
                     backend=selected_settings.backend,
                     index=index,
+                    max_radius_query_bytes=selected_settings.operational_work_bytes,
+                    capacity_context=f"k={candidate_k}, c={float(candidate_c):g}",
                 )
                 if not objective.valid or objective.objective is None:
                     record_attempt(
@@ -794,6 +833,7 @@ automatic_bandwidth_calibration = calibrate_bandwidth
 
 
 __all__ = [
+    "BandwidthCalibrationCapacityError",
     "BandwidthCalibrationError",
     "automatic_bandwidth_calibration",
     "build_entropy_pool",
