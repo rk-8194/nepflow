@@ -667,6 +667,9 @@ def test_serial_and_parallel_publication_lock_scopes_seeds_and_extxyz_bytes(tmp_
             "rejected_count": 0,
             "rejected_reason_counts": {},
             "rejections_by_family": {},
+            "rejections": [],
+            "surface_plan_attempts": [],
+            "surface_plan_slots": {},
         }
     )
 

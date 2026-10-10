@@ -74,7 +74,6 @@ def test_canonical_point_defect_defaults_round_trip_without_chemistry_inference(
     assert expected.n_antisites == 0
 
     fields = (
-        "target_n_atoms",
         "vacancy_min",
         "vacancy_max",
         "interstitial_d_min",
@@ -89,6 +88,7 @@ def test_canonical_point_defect_defaults_round_trip_without_chemistry_inference(
         "antisite_max",
     )
     fallback = load_config(write_config(tmp_path, BASE_CONFIG)).generation
+    assert fallback.target_n_atoms == 64
     for field in fields:
         assert getattr(fallback, field) == getattr(expected, field)
 
@@ -105,6 +105,7 @@ def test_canonical_point_defect_defaults_round_trip_without_chemistry_inference(
     )
     path = write_config(tmp_path, rendered)
     loaded = load_config(path).generation
+    assert loaded.target_n_atoms == 128
     for field in fields:
         assert getattr(loaded, field) == getattr(expected, field)
     for field in (
