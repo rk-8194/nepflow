@@ -69,6 +69,7 @@ def test_duplicate_anchor_categories_deduplicate_one_candidate(tmp_path):
             np.arange(len(lineage), dtype=float).reshape(len(lineage), 1),
             structures,
             settings,
+            algorithm_id="fps",
             seed_indices=seed,
             single_element_elastic_indices=seed,
             elastic_indices=seed,

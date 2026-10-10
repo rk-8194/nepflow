@@ -49,6 +49,7 @@ def test_training_selection_preserves_and_deduplicates_anchors(monkeypatch):
         np.arange(8, dtype=float).reshape(4, 2),
         [StructureStub() for _ in range(4)],
         _settings(),
+        algorithm_id="fps",
         seed_indices=[2, 0],
         elastic_indices=[2],
     )
@@ -99,6 +100,7 @@ def test_composition_aware_selection_falls_back_for_unary_data(monkeypatch):
         np.array([[0.0], [1.0], [2.0]]),
         [StructureStub() for _ in range(3)],
         _settings(target_train=2, composition_aware_fps=True),
+        algorithm_id="fps",
         ase_structures=[_atoms("Si"), _atoms("Ge"), _atoms("W")],
     )
 
