@@ -58,12 +58,25 @@ def test_training_selection_preserves_and_deduplicates_anchors(monkeypatch):
     assert minimum == 0.5
 
 
+def test_training_selection_defaults_to_information_entropy_without_local_representation():
+    with pytest.raises(
+        ValueError,
+        match="information-entropy selection requires a local environment representation",
+    ):
+        strategy.select_training_set(
+            np.arange(6, dtype=float).reshape(3, 2),
+            [StructureStub() for _ in range(3)],
+            _settings(target_train=2),
+        )
+
+
 def test_training_selection_rejects_too_many_unique_anchors():
     with pytest.raises(ValueError, match="unique anchors=3"):
         strategy.select_training_set(
             np.ones((4, 2)),
             [StructureStub() for _ in range(4)],
             {"target_train": 2},
+            algorithm_id="fps",
             seed_indices=[0, 1],
             elastic_indices=[2],
         )
@@ -82,6 +95,7 @@ def test_composition_aware_selection_preserves_anchor_and_target():
             composition_aware_fps_adaptive_retries=1,
             composition_aware_fps_descriptor_floor_fraction=0.0,
         ),
+        algorithm_id="fps",
         ase_structures=structures,
         seed_indices=[0],
     )

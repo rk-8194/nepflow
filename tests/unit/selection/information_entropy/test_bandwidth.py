@@ -29,7 +29,10 @@ def _pool() -> EntropyPool:
 def test_candidate_weights_are_equal_by_candidate_then_by_row() -> None:
     pool = _pool()
 
-    np.testing.assert_allclose(pool.probabilities, [0.25, 0.25, 1.0 / 3.0, 0.25, 0.25])
+    np.testing.assert_allclose(
+        pool.probabilities,
+        [1.0 / 6.0, 1.0 / 6.0, 1.0 / 3.0, 1.0 / 6.0, 1.0 / 6.0],
+    )
     assert float(np.sum(pool.probabilities)) == pytest.approx(1.0)
     assert pool.row_candidate_indices.tolist() == [0, 0, 1, 2, 2]
 
@@ -135,10 +138,16 @@ def test_rejected_k_is_logged_as_one_invalid_pair_per_scale(
         record.getMessage()
         for record in caplog.records
         if "Bandwidth calibration pair completed:" in record.getMessage()
-        and "invalid=" in record.getMessage()
+        and "J(k,c)=" not in record.getMessage()
     ]
     assert len(invalid_messages) == 2
     assert result.evaluation_count == 4
+    assert [attempt.status for attempt in result.attempts] == [
+        "valid",
+        "valid",
+        "invalid",
+        "invalid",
+    ]
     assert "4/4 combinations" in caplog.text
 
 

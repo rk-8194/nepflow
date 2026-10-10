@@ -199,11 +199,11 @@ def compute_exact_neighbours(
         ordered_row_ids = tuple(str(value) for value in row_ids)
         if len(ordered_row_ids) != n_rows or any(not value.strip() for value in ordered_row_ids):
             raise ValueError("row_ids must be non-blank and align with descriptor rows")
-    locations, row_to_location, first_indices = np.unique(
+    locations, first_indices, row_to_location = np.unique(
         values,
         axis=0,
-        return_inverse=True,
         return_index=True,
+        return_inverse=True,
     )
     representatives = np.asarray(first_indices, dtype=np.int64)
     n_locations = locations.shape[0]
