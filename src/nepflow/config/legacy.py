@@ -278,6 +278,7 @@ def _magnetism_values(config: NepflowConfig) -> dict[str, str]:
 def _selection_values(config: NepflowConfig) -> dict[str, str]:
     selection = config.selection
     return {
+        "algorithm": selection.algorithm,
         "nep_model_file": selection.nep_model_file,
         "include_seed_structures": _bool_text(selection.include_seed_structures),
         "include_single_element_elastic_stress_structures": _bool_text(
@@ -304,6 +305,8 @@ def _selection_values(config: NepflowConfig) -> dict[str, str]:
         "batch_size": str(selection.batch_size),
         "max_search_iterations": str(selection.max_search_iterations),
         "test_pool_factor": str(selection.test_pool_factor),
+        "local_magnetic_mode": selection.local_magnetic_mode,
+        "background_mass": str(selection.background_mass),
     }
 
 

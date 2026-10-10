@@ -212,6 +212,4 @@ def test_structurally_selected_parent_without_configured_sites_emits_only_nm() -
     assert result.summary.zero_output_failures == 0
     assert result.summary.emitted_ferromagnetic == 0
     assert result.summary.emitted_antiferromagnetic == 0
-    assert any(
-        diagnostic.code == "NO_MAGNETIC_SITES" for diagnostic in result.summary.diagnostics
-    )
+    assert any(diagnostic.code == "NO_MAGNETIC_SITES" for diagnostic in result.summary.diagnostics)

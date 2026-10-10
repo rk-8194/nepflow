@@ -185,6 +185,7 @@ _ALLOWED_KEYS: dict[str, frozenset[str]] = {
     ),
     "selection": frozenset(
         {
+            "algorithm",
             "nep_model_file",
             "include_seed_structures",
             "include_single_element_elastic_stress_structures",
@@ -201,6 +202,8 @@ _ALLOWED_KEYS: dict[str, frozenset[str]] = {
             "batch_size",
             "max_search_iterations",
             "test_pool_factor",
+            "local_magnetic_mode",
+            "background_mass",
         }
     ),
     "vasp": frozenset({"enabled", "kspacing", "kgamma"}),

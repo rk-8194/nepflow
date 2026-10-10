@@ -128,9 +128,10 @@ def test_bcc_surface_has_low_index_termination_and_provenance() -> None:
     assert candidate.info["surface_miller_index"] == (1, 0, 0)
     assert candidate.info["surface_state"] == "pristine"
     assert candidate.info["surface_termination"] == "termination_0"
-    assert candidate.info["surface_termination_descriptor"] in candidate.info[
-        "surface_termination_identity"
-    ]
+    assert (
+        candidate.info["surface_termination_descriptor"]
+        in candidate.info["surface_termination_identity"]
+    )
     assert candidate.info["surface_layers"] > 0
     assert candidate.info["surface_stoichiometry_change"] == {}
     assert candidate.info["surface_stoichiometry_changed"] is False

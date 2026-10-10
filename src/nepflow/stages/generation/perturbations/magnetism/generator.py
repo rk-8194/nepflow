@@ -102,9 +102,7 @@ class MagneticExpansionStream:
             selected_structural_parents=self._selected_structural_parents,
             defect_budget_excluded_parents=self._defect_budget_excluded_parents,
             eligible_structural_parents=self._eligible_structural_parents,
-            selected_with_configured_magnetic_sites=(
-                self._selected_with_configured_magnetic_sites
-            ),
+            selected_with_configured_magnetic_sites=(self._selected_with_configured_magnetic_sites),
             selected_without_configured_magnetic_sites=(
                 self._selected_without_configured_magnetic_sites
             ),
@@ -179,8 +177,7 @@ class MagneticExpansionStream:
         self._retained_afm += result.summary.retained_afm
         self._budget_truncated = self._budget_truncated or result.summary.budget_truncated
         self._final_variant_budget_truncated = (
-            self._final_variant_budget_truncated
-            or result.summary.final_variant_budget_truncated
+            self._final_variant_budget_truncated or result.summary.final_variant_budget_truncated
         )
         self._final_variant_budget_truncations += result.summary.final_variant_budget_truncations
         empty_requested_expansion = (
@@ -487,18 +484,15 @@ class MagneticGenerator:
 
         summary = MagneticGenerationSummary(
             emitted_non_magnetic=sum(
-                candidate.info.get("magnetic_ordering")
-                == MagneticOrdering.NONMAGNETIC.value
+                candidate.info.get("magnetic_ordering") == MagneticOrdering.NONMAGNETIC.value
                 for candidate in candidates
             ),
             emitted_ferromagnetic=sum(
-                candidate.info.get("magnetic_ordering")
-                == MagneticOrdering.FERROMAGNETIC.value
+                candidate.info.get("magnetic_ordering") == MagneticOrdering.FERROMAGNETIC.value
                 for candidate in candidates
             ),
             emitted_antiferromagnetic=sum(
-                candidate.info.get("magnetic_ordering")
-                == MagneticOrdering.ANTIFERROMAGNETIC.value
+                candidate.info.get("magnetic_ordering") == MagneticOrdering.ANTIFERROMAGNETIC.value
                 for candidate in candidates
             ),
             total_magnetic_candidates=len(candidates),

@@ -320,9 +320,7 @@ def _composition_details(
     parent_total = max(1, len(parent))
     candidate_total = max(1, len(candidate))
     elements = sorted(set(parent_counts) | set(candidate_counts))
-    parent_fractions = {
-        element: parent_counts[element] / parent_total for element in elements
-    }
+    parent_fractions = {element: parent_counts[element] / parent_total for element in elements}
     candidate_fractions = {
         element: candidate_counts[element] / candidate_total for element in elements
     }
@@ -619,9 +617,7 @@ def _plan_surface_terminations(
         target = int(settings.target_n_atoms if target_override is None else target_override)
         max_atoms = int(settings.surface_max_n_atoms)
         tolerance = float(settings.surface_target_tolerance)
-        max_in_plane_values = tuple(
-            int(value) for value in settings.surface_max_in_plane_repeat
-        )
+        max_in_plane_values = tuple(int(value) for value in settings.surface_max_in_plane_repeat)
         max_normal = int(settings.surface_max_normal_repeat)
         requested_vacuum = float(settings.surface_vacuum)
         minimum_half_depth = float(settings.surface_min_half_depth)
@@ -631,9 +627,7 @@ def _plan_surface_terminations(
             float(value) for value in settings.surface_min_in_plane_dimensions
         )
         explicit_thickness = (
-            0.0
-            if settings.surface_thickness is None
-            else float(settings.surface_thickness)
+            0.0 if settings.surface_thickness is None else float(settings.surface_thickness)
         )
     except (OverflowError, TypeError, ValueError) as exc:
         raise SurfaceConstructionError("surface planner settings are invalid") from exc
@@ -787,9 +781,7 @@ def _plan_surface_terminations(
                         rejected["shape"] += 1
                         continue
                     shape_score = max(dimensions) / minimum_dimension - 1.0
-                    excess_vacuum = max(
-                        0.0, geometry.realized_vacuum - requested_vacuum
-                    )
+                    excess_vacuum = max(0.0, geometry.realized_vacuum - requested_vacuum)
                     within_band = delta <= tolerance + 1.0e-12
                     tie_break = (
                         shape_score,

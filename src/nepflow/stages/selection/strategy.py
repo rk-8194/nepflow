@@ -51,7 +51,7 @@ def _setting_or_default(
 
     try:
         return setting(settings, name)
-    except KeyError:
+    except (AttributeError, KeyError):
         return default
 
 
@@ -60,6 +60,7 @@ def _algorithm_options(
     *,
     ase_structures: Sequence[Any] | None = None,
     composition_aware: bool | None = None,
+    local_representation: Any | None = None,
 ) -> dict[str, Any]:
     """Build the FPS options while retaining legacy mapping defaults."""
 
@@ -86,6 +87,8 @@ def _algorithm_options(
         "fps_target_selector": select_farthest_points_for_target,
         "max_search_iterations": _setting_or_default(settings, "max_search_iterations", 30),
         "target_tolerance": _setting_or_default(settings, "target_tolerance", 50),
+        "local_representation": local_representation,
+        "background_mass": _setting_or_default(settings, "background_mass", 1.0e-12),
     }
 
 
@@ -101,6 +104,7 @@ def select_training_set(
     candidate_ids: Sequence[str] | None = None,
     algorithm_id: str = "fps",
     algorithm_registry: AlgorithmRegistry | None = None,
+    local_representation: Any | None = None,
 ) -> tuple[list[int], float]:
     """Dispatch one training-selection algorithm with mandatory anchors."""
 
@@ -151,6 +155,7 @@ def select_training_set(
         settings,
         ase_structures=ase_structures,
         composition_aware=composition_aware,
+        local_representation=local_representation,
     )
     request = SelectionAlgorithmRequest(
         candidate_ids=ordered_candidate_ids,

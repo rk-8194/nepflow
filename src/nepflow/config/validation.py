@@ -24,6 +24,8 @@ ALLOWED_CRYSTAL_STRUCTURES = frozenset({"bcc", "fcc", "hcp", "diamond", "simple_
 # contract.  Reject the nominal mode instead of allowing it to fail later in
 # descriptor caching or FPS row-to-structure mapping.
 ALLOWED_DESCRIPTOR_TYPES = frozenset({"structure"})
+ALLOWED_SELECTION_ALGORITHMS = frozenset({"fps", "information_entropy"})
+ALLOWED_LOCAL_MAGNETIC_MODES = frozenset({"structural", "non_soc"})
 TIME_PATTERN = re.compile(r"^(?:\d+):[0-5]\d:[0-5]\d$")
 KNOWN_ELEMENT_SYMBOLS = frozenset(symbol for symbol in chemical_symbols if symbol)
 
@@ -252,6 +254,20 @@ def validate_config(
     if not all(math.isfinite(value) for value in config.generation.elastic_strain_amplitudes):
         raise ConfigurationError("generation.elastic_strain_amplitudes must contain finite values")
 
+    if config.selection.algorithm not in ALLOWED_SELECTION_ALGORITHMS:
+        raise ConfigurationError(
+            "selection.algorithm must be one of: " + ", ".join(sorted(ALLOWED_SELECTION_ALGORITHMS))
+        )
+    if config.selection.local_magnetic_mode not in ALLOWED_LOCAL_MAGNETIC_MODES:
+        raise ConfigurationError(
+            "selection.local_magnetic_mode must be one of: "
+            + ", ".join(sorted(ALLOWED_LOCAL_MAGNETIC_MODES))
+        )
+    if (
+        not math.isfinite(config.selection.background_mass)
+        or config.selection.background_mass <= 0.0
+    ):
+        raise ConfigurationError("selection.background_mass must be finite and positive")
     if config.selection.descriptor_type not in ALLOWED_DESCRIPTOR_TYPES:
         raise ConfigurationError(
             "selection.descriptor_type must be one of: "
@@ -487,8 +503,7 @@ def _validate_surface_settings(config: GenerationConfig) -> None:
     ):
         raise ConfigurationError("generation.surface_max_normal_repeat must be positive")
     if len(config.surface_min_in_plane_dimensions) != 2 or any(
-        not math.isfinite(value) or value < 0.0
-        for value in config.surface_min_in_plane_dimensions
+        not math.isfinite(value) or value < 0.0 for value in config.surface_min_in_plane_dimensions
     ):
         raise ConfigurationError(
             "generation.surface_min_in_plane_dimensions must be finite and non-negative"

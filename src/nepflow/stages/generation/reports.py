@@ -46,9 +46,7 @@ def build_generation_coverage(
         "defects": _defect_coverage(candidates),
         "surface": {
             "enabled": bool(surface_enabled) if surface_enabled is not None else False,
-            "requested_orientations": _normalise_orientations(
-                requested_surface_orientations or ()
-            ),
+            "requested_orientations": _normalise_orientations(requested_surface_orientations or ()),
             "orientations_attempted": [],
             "accepted_terminations_by_orientation": {},
             "rejected_terminations_by_orientation": {},
@@ -59,9 +57,7 @@ def build_generation_coverage(
                 "vacuum": _profile(_numeric_values(candidates, "surface_realized_vacuum")),
                 "depth": _profile(_numeric_values(candidates, "surface_half_depth")),
                 "area": _profile(_numeric_values(candidates, "surface_in_plane_area")),
-                "bulk_core": _profile(
-                    _numeric_values(candidates, "surface_bulk_core_atom_count")
-                ),
+                "bulk_core": _profile(_numeric_values(candidates, "surface_bulk_core_atom_count")),
                 "bulk_core_eligible": _profile(
                     _numeric_values(candidates, "surface_bulk_core_eligible_atom_count")
                 ),
@@ -370,12 +366,8 @@ def _surface_planner_coverage(
         "enabled": bool(enabled) if enabled is not None else bool(attempted or accepted),
         "requested_orientations": [list(orientation) for orientation in requested],
         "orientations_attempted": [list(orientation) for orientation in attempted.values()],
-        "accepted_terminations_by_orientation": {
-            key: accepted[key] for key in sorted(accepted)
-        },
-        "rejected_terminations_by_orientation": {
-            key: rejected[key] for key in sorted(rejected)
-        },
+        "accepted_terminations_by_orientation": {key: accepted[key] for key in sorted(accepted)},
+        "rejected_terminations_by_orientation": {key: rejected[key] for key in sorted(rejected)},
         "orientations_with_zero_accepted_candidates": zero_output,
         "chosen_repeat_tuples": chosen_repeats,
         "target_vs_realised_atom_count": target_counts,

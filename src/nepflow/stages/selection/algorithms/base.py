@@ -60,4 +60,3 @@ class SelectionAlgorithm(Protocol):
 
     def select(self, request: SelectionAlgorithmRequest) -> SelectionAlgorithmResult:
         """Select complete candidates for the supplied request."""
-

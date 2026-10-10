@@ -1242,8 +1242,7 @@ def test_real_magnetic_generator_expands_pristine_parent_through_process(tmp_pat
     assert magnetic_summary["emitted_antiferromagnetic"] >= 1
     assert magnetic_summary["total_magnetic_candidates"] == len(candidates)
     assert any(
-        diagnostic["code"] == "NO_MAGNETIC_SITES"
-        for diagnostic in magnetic_summary["diagnostics"]
+        diagnostic["code"] == "NO_MAGNETIC_SITES" for diagnostic in magnetic_summary["diagnostics"]
     )
 
 

@@ -368,12 +368,8 @@ def _parse_generation_perturbations(values: Mapping[str, str]) -> dict[str, Any]
             "generation.rattle_std_max",
         ),
         "rattle_d_min": _parse_float(values.get("rattle_d_min", "1.5"), "generation.rattle_d_min"),
-        "vacancy_min": _parse_float(
-            values.get("vacancy_min", "0.008"), "generation.vacancy_min"
-        ),
-        "vacancy_max": _parse_float(
-            values.get("vacancy_max", "0.025"), "generation.vacancy_max"
-        ),
+        "vacancy_min": _parse_float(values.get("vacancy_min", "0.008"), "generation.vacancy_min"),
+        "vacancy_max": _parse_float(values.get("vacancy_max", "0.025"), "generation.vacancy_max"),
         "interstitial_d_min": _parse_float(
             values.get("interstitial_d_min", "1.65"),
             "generation.interstitial_d_min",
@@ -500,14 +496,10 @@ def _parse_generation_perturbations(values: Mapping[str, str]) -> dict[str, Any]
         "surface_symmetric": _parse_bool(
             values.get("surface_symmetric", "false"), "generation.surface_symmetric"
         ),
-        "surface_stoichiometry_policy": values.get(
-            "surface_stoichiometry_policy", "allow"
-        )
+        "surface_stoichiometry_policy": values.get("surface_stoichiometry_policy", "allow")
         .strip()
         .lower(),
-        "surface_polarity_policy": values.get("surface_polarity_policy", "allow")
-        .strip()
-        .lower(),
+        "surface_polarity_policy": values.get("surface_polarity_policy", "allow").strip().lower(),
         "grain_boundary_enabled": _parse_bool(
             values.get("grain_boundary_enabled", "false"),
             "generation.grain_boundary_enabled",
@@ -653,6 +645,7 @@ def parse_selection(values: Mapping[str, str]) -> SelectionConfig:
     """Parse selection and descriptor settings."""
 
     return SelectionConfig(
+        algorithm=values.get("algorithm", "fps").strip().lower(),
         nep_model_file=values.get("nep_model_file", "nep89.txt").strip(),
         include_seed_structures=_parse_bool(
             values.get("include_seed_structures", "false"),
@@ -704,6 +697,10 @@ def parse_selection(values: Mapping[str, str]) -> SelectionConfig:
         ),
         test_pool_factor=_parse_float(
             values.get("test_pool_factor", "0.5"), "selection.test_pool_factor"
+        ),
+        local_magnetic_mode=values.get("local_magnetic_mode", "structural").strip().lower(),
+        background_mass=_parse_float(
+            values.get("background_mass", "1e-12"), "selection.background_mass"
         ),
     )
 

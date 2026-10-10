@@ -6,6 +6,7 @@ from collections.abc import Mapping
 
 from .base import SelectionAlgorithm, SelectionAlgorithmRequest, SelectionAlgorithmResult
 from .fps import FPSSelectionAlgorithm
+from .information_entropy import InformationEntropyConfig, InformationEntropySelectionAlgorithm
 
 AlgorithmRegistry = Mapping[str, SelectionAlgorithm]
 
@@ -18,7 +19,12 @@ def dispatch_selection_algorithm(
     """Dispatch exactly once to the explicitly requested algorithm."""
 
     algorithms = (
-        {FPSSelectionAlgorithm.algorithm_id: FPSSelectionAlgorithm()}
+        {
+            FPSSelectionAlgorithm.algorithm_id: FPSSelectionAlgorithm(),
+            InformationEntropySelectionAlgorithm.algorithm_id: (
+                InformationEntropySelectionAlgorithm()
+            ),
+        }
         if registry is None
         else registry
     )
@@ -32,6 +38,8 @@ def dispatch_selection_algorithm(
 __all__ = [
     "AlgorithmRegistry",
     "FPSSelectionAlgorithm",
+    "InformationEntropyConfig",
+    "InformationEntropySelectionAlgorithm",
     "SelectionAlgorithm",
     "SelectionAlgorithmRequest",
     "SelectionAlgorithmResult",

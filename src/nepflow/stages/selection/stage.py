@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 from ase.io import read as ase_read
 from NepTrainKit.core.structure import Structure
 
@@ -29,6 +30,9 @@ from .persistence import (
 from .persistence import structure_ids as ordered_structure_ids
 from .reports import plot_descriptor_space
 from .representations import (
+    LocalEnvironmentRepresentation,
+    LocalRepresentationConfig,
+    load_or_calculate_local_representations,
     load_or_calculate_representations,
     validate_candidate_representation_identity,
 )
@@ -42,6 +46,24 @@ from .strategy import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _aggregate_local_representations(
+    representation: LocalEnvironmentRepresentation,
+    candidate_ids: list[str] | tuple[str, ...],
+) -> np.ndarray:
+    """Produce plotting/test-policy rows while entropy owns local geometry."""
+
+    rows_by_candidate: dict[str, list[int]] = {candidate_id: [] for candidate_id in candidate_ids}
+    for row_index, row in enumerate(representation.rows):
+        rows_by_candidate[row.candidate_id].append(row_index)
+    return np.asarray(
+        [
+            np.mean(representation.descriptors[rows_by_candidate[candidate_id]], axis=0)
+            for candidate_id in candidate_ids
+        ],
+        dtype=np.float64,
+    )
 
 
 class SelectionStage:
@@ -174,7 +196,7 @@ class SelectionStage:
 
         active = context or self.context
         logger.info("")
-        logger.info("Step 2: Computing NEP descriptors")
+        logger.info("Step 2: Computing %s representations", settings.algorithm)
         project_dir = (
             active.project_dir
             if active is not None
@@ -182,19 +204,35 @@ class SelectionStage:
         )
         candidate_identity_ids = ordered_candidate_ids(prepared["ase_structures"])
         physical_structure_ids = ordered_structure_ids(prepared["ase_structures"])
-        validate_candidate_representation_identity(
-            candidate_identity_ids,
-            physical_structure_ids,
-        )
-        representations = load_or_calculate_representations(
-            project_dir,
-            prepared["structures"],
-            mean_descriptor=settings.descriptor_type == "structure",
-            batch_size=settings.batch_size,
-            nep_model_file=settings.nep_model_file,
-            candidate_ids=candidate_identity_ids,
-            candidate_structure_ids=physical_structure_ids,
-        )
+        local_representation: LocalEnvironmentRepresentation | None = None
+        if settings.algorithm == "information_entropy":
+            local_representation = load_or_calculate_local_representations(
+                project_dir,
+                prepared["ase_structures"],
+                config=LocalRepresentationConfig(
+                    magnetic_mode=settings.local_magnetic_mode,
+                ),
+                candidate_ids=candidate_identity_ids,
+                structure_ids=physical_structure_ids,
+            )
+            representations = _aggregate_local_representations(
+                local_representation,
+                candidate_identity_ids,
+            )
+        else:
+            validate_candidate_representation_identity(
+                candidate_identity_ids,
+                physical_structure_ids,
+            )
+            representations = load_or_calculate_representations(
+                project_dir,
+                prepared["structures"],
+                mean_descriptor=settings.descriptor_type == "structure",
+                batch_size=settings.batch_size,
+                nep_model_file=settings.nep_model_file,
+                candidate_ids=candidate_identity_ids,
+                candidate_structure_ids=physical_structure_ids,
+            )
         logger.info("  Descriptor shape: %s", representations.shape)
         logger.info("  Descriptor type: %s", settings.descriptor_type)
 
@@ -259,6 +297,8 @@ class SelectionStage:
             single_element_elastic_indices=single_element_elastic_indices,
             elastic_indices=elastic_indices,
             candidate_ids=candidate_identity_ids,
+            algorithm_id=settings.algorithm,
+            local_representation=local_representation,
         )
         test_selection = select_test_set(
             representations,
