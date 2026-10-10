@@ -163,7 +163,7 @@ def test_budget_is_checked_before_graph_arrays_are_allocated() -> None:
         build_sparse_atomic_kernel_graph(pool, frozen, max_edges=1)
 
     graph = build_sparse_atomic_kernel_graph(pool, frozen)
-    with pytest.raises(ValueError, match=r"required_entries=.*max_entries"):
+    with pytest.raises(ValueError, match=r"required_entries>1, max_entries=1"):
         aggregate_candidate_contributions(graph, max_entries=1)
 
 
