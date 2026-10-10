@@ -20,6 +20,7 @@ KERNEL_VERSION = "wendland-c2-v1"
 SPARSE_KERNEL_GRAPH_SCHEMA_VERSION = "sparse-atomic-kernel-graph-v1"
 SPARSE_CANDIDATE_CONTRIBUTION_SCHEMA_VERSION = "sparse-candidate-contributions-v1"
 SPARSE_NUMERICAL_TOLERANCE = 1.0e-12
+ENTROPY_OBJECTIVE_SCHEMA_VERSION = "entropy-objective-v1"
 
 
 def _readonly_float_array(value: Any, *, name: str) -> np.ndarray:
@@ -777,6 +778,219 @@ class SparseCandidateContributions:
             yield self.candidate_row(candidate_index)
 
 
+def _readonly_objective_vector(value: Any, *, name: str) -> np.ndarray:
+    array = np.array(value, copy=True)
+    if array.dtype != np.dtype(np.float64) or array.ndim != 1:
+        raise ValueError(f"{name} must be a one-dimensional float64 array")
+    if not np.all(np.isfinite(array)) or np.any(array <= 0.0):
+        raise ValueError(f"{name} must be finite and strictly positive")
+    array.setflags(write=False)
+    return array
+
+
+@dataclass(slots=True)
+class EntropyObjectiveState:
+    """Mutable selected-set state over immutable finite-pool objective inputs."""
+
+    probabilities: np.ndarray
+    baseline: np.ndarray
+    s: np.ndarray
+    candidate_ids: tuple[str, ...]
+    selected_indices: tuple[int, ...]
+    selected_candidate_ids: tuple[str, ...]
+    budget: int
+    beta: float
+    objective: float
+    anchor_objective: float
+    pool_fingerprint: str
+    graph_fingerprint: str
+    contributions_fingerprint: str
+    fingerprint: str
+    numerical_tolerance: float = SPARSE_NUMERICAL_TOLERANCE
+    schema_version: str = ENTROPY_OBJECTIVE_SCHEMA_VERSION
+
+    def __post_init__(self) -> None:
+        probabilities = _readonly_objective_vector(self.probabilities, name="probabilities")
+        baseline = _readonly_objective_vector(self.baseline, name="baseline")
+        support = _readonly_objective_vector(self.s, name="objective support")
+        if not (probabilities.shape == baseline.shape == support.shape):
+            raise ValueError("objective vectors must have identical shapes")
+        candidate_ids = tuple(self.candidate_ids)
+        if not candidate_ids or any(
+            not isinstance(value, str) or not value.strip() for value in candidate_ids
+        ):
+            raise ValueError("objective candidate_ids must be non-empty and non-blank")
+        if len(set(candidate_ids)) != len(candidate_ids):
+            raise ValueError("objective candidate_ids must be unique")
+        selected_indices = tuple(
+            _exact_integer(value, name="selected candidate index")
+            for value in self.selected_indices
+        )
+        selected_ids = tuple(self.selected_candidate_ids)
+        if len(selected_indices) != len(selected_ids):
+            raise ValueError("selected candidate indices and IDs must align")
+        if len(set(selected_indices)) != len(selected_indices):
+            raise ValueError("selected candidates must be unique")
+        if any(index < 0 or index >= len(candidate_ids) for index in selected_indices):
+            raise ValueError("selected candidate index is outside candidate_ids")
+        if selected_ids != tuple(candidate_ids[index] for index in selected_indices):
+            raise ValueError("selected candidate IDs do not match selected indices")
+        budget = _exact_integer(self.budget, name="objective budget")
+        if budget < 0 or budget > len(candidate_ids):
+            raise ValueError("objective budget must satisfy 0 <= budget <= candidate count")
+        if len(selected_indices) > budget:
+            raise ValueError("selected candidate count exceeds objective budget")
+        if isinstance(self.beta, bool):
+            raise ValueError("beta must be finite and strictly positive")
+        beta = float(self.beta)
+        if not math.isfinite(beta) or beta <= 0.0:
+            raise ValueError("beta must be finite and strictly positive")
+        tolerance = float(self.numerical_tolerance)
+        if not math.isfinite(tolerance) or tolerance <= 0.0:
+            raise ValueError("objective numerical_tolerance must be finite and positive")
+        if not math.isclose(
+            tolerance,
+            SPARSE_NUMERICAL_TOLERANCE,
+            rel_tol=0.0,
+            abs_tol=0.0,
+        ):
+            raise ValueError("unsupported objective numerical tolerance")
+        if self.schema_version != ENTROPY_OBJECTIVE_SCHEMA_VERSION:
+            raise ValueError("unsupported entropy objective schema version")
+        for name, value in (
+            ("pool_fingerprint", self.pool_fingerprint),
+            ("graph_fingerprint", self.graph_fingerprint),
+            ("contributions_fingerprint", self.contributions_fingerprint),
+            ("fingerprint", self.fingerprint),
+        ):
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"{name} must be a non-blank string")
+        if not math.isfinite(float(self.objective)):
+            raise ValueError("objective value must be finite")
+        if not math.isfinite(float(self.anchor_objective)):
+            raise ValueError("anchor objective must be finite")
+        with np.errstate(over="raise", invalid="raise"):
+            try:
+                expected_baseline = beta * probabilities
+            except FloatingPointError as exc:
+                raise ValueError("objective baseline overflowed") from exc
+        if not np.array_equal(expected_baseline, baseline):
+            raise ValueError("objective baseline does not equal beta times probabilities")
+        total_mass = float(np.sum(support, dtype=np.float64))
+        expected_mass = beta + len(selected_indices)
+        if not math.isclose(total_mass, expected_mass, rel_tol=0.0, abs_tol=tolerance):
+            raise ValueError("objective support mass does not match beta plus selected count")
+        probabilities.setflags(write=False)
+        baseline.setflags(write=False)
+        support.setflags(write=True)
+        object.__setattr__(self, "probabilities", probabilities)
+        object.__setattr__(self, "baseline", baseline)
+        object.__setattr__(self, "s", support)
+        object.__setattr__(self, "candidate_ids", candidate_ids)
+        object.__setattr__(self, "selected_indices", selected_indices)
+        object.__setattr__(self, "selected_candidate_ids", selected_ids)
+        object.__setattr__(self, "budget", budget)
+        object.__setattr__(self, "beta", beta)
+        object.__setattr__(self, "objective", float(self.objective))
+        object.__setattr__(self, "anchor_objective", float(self.anchor_objective))
+        object.__setattr__(self, "numerical_tolerance", tolerance)
+
+    @property
+    def support(self) -> np.ndarray:
+        """The owned mutable ``s_i(A)`` vector used by the update primitive."""
+
+        return self.s
+
+    @property
+    def target_probabilities(self) -> np.ndarray:
+        return self.probabilities
+
+    @property
+    def selected_ids(self) -> tuple[str, ...]:
+        return self.selected_candidate_ids
+
+    @property
+    def selected_count(self) -> int:
+        return len(self.selected_indices)
+
+    @property
+    def n_targets(self) -> int:
+        return int(self.s.shape[0])
+
+    @property
+    def is_final(self) -> bool:
+        return self.selected_count == self.budget
+
+    @property
+    def anchor_normalized_objective(self) -> float:
+        return self.objective - self.anchor_objective
+
+
+@dataclass(frozen=True, slots=True)
+class EntropyObjectiveDiagnostics:
+    """Cross-entropy and forward-KL diagnostics for the current prefix."""
+
+    selected_count: int
+    budget: int
+    denominator: float
+    total_mass: float
+    objective: float
+    anchor_normalized_objective: float
+    cross_entropy: float
+    shannon_entropy: float
+    kl_divergence: float
+    beta: float
+    is_final: bool
+    state_fingerprint: str
+
+    def __post_init__(self) -> None:
+        selected_count = _exact_integer(self.selected_count, name="diagnostic selected count")
+        budget = _exact_integer(self.budget, name="diagnostic budget")
+        if selected_count < 0 or budget < selected_count:
+            raise ValueError("diagnostic selected count is incompatible with budget")
+        if isinstance(self.beta, bool):
+            raise ValueError("diagnostic beta must be finite and strictly positive")
+        beta = float(self.beta)
+        if not math.isfinite(beta) or beta <= 0.0:
+            raise ValueError("diagnostic beta must be finite and strictly positive")
+        tolerance = SPARSE_NUMERICAL_TOLERANCE
+        for name, value in (
+            ("denominator", self.denominator),
+            ("total_mass", self.total_mass),
+            ("objective", self.objective),
+            ("anchor_normalized_objective", self.anchor_normalized_objective),
+            ("cross_entropy", self.cross_entropy),
+            ("shannon_entropy", self.shannon_entropy),
+            ("kl_divergence", self.kl_divergence),
+        ):
+            if not math.isfinite(float(value)):
+                raise ValueError(f"diagnostic {name} must be finite")
+        if self.denominator <= 0.0 or self.total_mass <= 0.0:
+            raise ValueError("diagnostic mass and denominator must be positive")
+        if not math.isclose(
+            self.total_mass,
+            self.denominator,
+            rel_tol=0.0,
+            abs_tol=tolerance,
+        ):
+            raise ValueError("diagnostic total mass must equal its denominator")
+        if self.kl_divergence < -tolerance:
+            raise ValueError("diagnostic KL divergence is materially negative")
+        if not isinstance(self.state_fingerprint, str) or not self.state_fingerprint.strip():
+            raise ValueError("diagnostic state fingerprint must be non-blank")
+        object.__setattr__(self, "selected_count", selected_count)
+        object.__setattr__(self, "budget", budget)
+        object.__setattr__(self, "beta", beta)
+
+    @property
+    def normalized_prefix_mass(self) -> float:
+        return self.total_mass / self.denominator
+
+    @property
+    def is_final_budget(self) -> bool:
+        return self.is_final
+
+
 BandwidthSettings = EntropyBandwidthSettings
 CalibrationSettings = EntropyBandwidthSettings
 BandwidthResult = FrozenBandwidths
@@ -795,6 +1009,8 @@ __all__ = [
     "CalibrationSettings",
     "EntropyBandwidthSettings",
     "EntropyPool",
+    "EntropyObjectiveDiagnostics",
+    "EntropyObjectiveState",
     "FrozenBandwidths",
     "InformationEntropyConfig",
     "KernelMetadata",
@@ -805,6 +1021,7 @@ __all__ = [
     "NEIGHBOUR_DISTINCT_POLICY",
     "NEIGHBOUR_METRIC",
     "SPARSE_CANDIDATE_CONTRIBUTION_SCHEMA_VERSION",
+    "ENTROPY_OBJECTIVE_SCHEMA_VERSION",
     "SPARSE_KERNEL_GRAPH_SCHEMA_VERSION",
     "SPARSE_NUMERICAL_TOLERANCE",
     "SparseAtomicKernelGraph",
