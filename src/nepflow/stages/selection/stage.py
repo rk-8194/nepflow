@@ -23,6 +23,7 @@ from .algorithms.information_entropy import (
     BandwidthCalibrationResult,
     EntropyBandwidthSettings,
     EntropyPool,
+    FrozenBandwidths,
     SparseAtomicKernelGraph,
     SparseCandidateContributions,
     StreamedKernelExecutionSummary,

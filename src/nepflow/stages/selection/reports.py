@@ -763,6 +763,7 @@ def plot_candidate_bandwidth_summary(
     ]
     markers = ("o", "^", "s")
     labels = ("Unselected", "Train", "Test")
+    colors = ("gray", "tab:red", "tab:blue")
     for mask, marker, label in zip(masks, markers, labels):
         ax.scatter(
             data.candidate_coords[mask, 0],
