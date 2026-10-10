@@ -151,6 +151,8 @@ class PerturbationSettings:
     surface_max_normal_repeat: int = 16
     surface_min_in_plane_dimensions: tuple[float, float] = (0.0, 0.0)
     surface_symmetric: bool = False
+    surface_stoichiometry_policy: str = "allow"
+    surface_polarity_policy: str = "allow"
     surface_sources: SourceScope = DEFAULT_SOURCE_SCOPE
     grain_boundary_enabled: bool = False
     grain_boundary_rotation_axis: tuple[int, int, int] = (0, 0, 1)
@@ -289,6 +291,8 @@ class PerturbationSettings:
             "surface_max_normal_repeat": self.surface_max_normal_repeat,
             "surface_min_in_plane_dimensions": self.surface_min_in_plane_dimensions,
             "surface_symmetric": self.surface_symmetric,
+            "surface_stoichiometry_policy": self.surface_stoichiometry_policy,
+            "surface_polarity_policy": self.surface_polarity_policy,
             "surface_sources": list(self.surface_sources),
             "grain_boundary_enabled": self.grain_boundary_enabled,
             "grain_boundary_rotation_axis": self.grain_boundary_rotation_axis,

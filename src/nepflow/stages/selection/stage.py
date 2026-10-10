@@ -258,6 +258,7 @@ class SelectionStage:
             seed_indices=seed_indices,
             single_element_elastic_indices=single_element_elastic_indices,
             elastic_indices=elastic_indices,
+            candidate_ids=candidate_identity_ids,
         )
         test_selection = select_test_set(
             representations,

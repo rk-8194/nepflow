@@ -19,6 +19,10 @@ def build_generation_coverage(
     candidates: Sequence[Any],
     *,
     requested_family_counts: Mapping[str, int] | None = None,
+    surface_enabled: bool | None = None,
+    requested_surface_orientations: Sequence[Any] | None = None,
+    surface_plan_attempts: Sequence[Mapping[str, Any]] | None = None,
+    surface_rejections: Sequence[Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Calculate generation-domain coverage from structured metadata."""
 
@@ -41,6 +45,48 @@ def build_generation_coverage(
         "rattle": {"amplitudes": _numeric_profile(candidates, "rattle_std")},
         "defects": _defect_coverage(candidates),
         "surface": {
+            "enabled": bool(surface_enabled) if surface_enabled is not None else False,
+            "requested_orientations": _normalise_orientations(
+                requested_surface_orientations or ()
+            ),
+            "orientations_attempted": [],
+            "accepted_terminations_by_orientation": {},
+            "rejected_terminations_by_orientation": {},
+            "orientations_with_zero_accepted_candidates": [],
+            "chosen_repeat_tuples": [],
+            "target_vs_realised_atom_count": [],
+            "realised_metrics": {
+                "vacuum": _profile(_numeric_values(candidates, "surface_realized_vacuum")),
+                "depth": _profile(_numeric_values(candidates, "surface_half_depth")),
+                "area": _profile(_numeric_values(candidates, "surface_in_plane_area")),
+                "bulk_core": _profile(
+                    _numeric_values(candidates, "surface_bulk_core_atom_count")
+                ),
+                "bulk_core_eligible": _profile(
+                    _numeric_values(candidates, "surface_bulk_core_eligible_atom_count")
+                ),
+                "bulk_core_environment_radius": _profile(
+                    _numeric_values(candidates, "surface_bulk_environment_radius")
+                ),
+                "material_thickness": _profile(
+                    _numeric_values(candidates, "surface_material_thickness")
+                ),
+            },
+            "chemistry": {
+                "symmetry_status": _count_values(
+                    _info_value(item, "surface_symmetry_status") for item in candidates
+                ),
+                "polarity_status": _count_values(
+                    _info_value(item, "surface_polarity_status") for item in candidates
+                ),
+                "stoichiometry_policy": _count_values(
+                    _info_value(item, "surface_stoichiometry_policy") for item in candidates
+                ),
+            },
+            "planner_versions": _count_values(
+                _info_value(item, "surface_planner_version") for item in candidates
+            ),
+            "rejection_reasons": {},
             "miller_indices": _count_values(
                 _info_value(item, "surface_miller_index", _info_value(item, "miller_index"))
                 for item in candidates
@@ -84,6 +130,15 @@ def build_generation_coverage(
     }
     coverage["requested_families_with_zero_output"] = sorted(
         family for family, count in requested.items() if count > 0 and realised.get(family, 0) == 0
+    )
+    coverage["surface"].update(
+        _surface_planner_coverage(
+            candidates,
+            requested_orientations=requested_surface_orientations or (),
+            plan_attempts=surface_plan_attempts or (),
+            rejections=surface_rejections or (),
+            enabled=surface_enabled,
+        )
     )
     return to_jsonable(coverage)
 
@@ -200,6 +255,158 @@ def _defect_coverage(candidates: Sequence[Any]) -> dict[str, Any]:
                 "realised_concentrations": _profile(concentrations),
             }
     return result
+
+
+def _surface_planner_coverage(
+    candidates: Sequence[Any],
+    *,
+    requested_orientations: Sequence[Any],
+    plan_attempts: Sequence[Mapping[str, Any]],
+    rejections: Sequence[Mapping[str, Any]],
+    enabled: bool | None,
+) -> dict[str, Any]:
+    """Build deterministic planner/termination coverage for the final manifest."""
+
+    requested = _normalise_orientations(requested_orientations)
+    accepted: dict[str, dict[str, Any]] = {}
+    for item in candidates:
+        orientation = _normalise_orientation(
+            _info_value(item, "surface_miller_index", _info_value(item, "miller_index"))
+        )
+        if orientation is None:
+            continue
+        key = _orientation_key(orientation)
+        entry = accepted.setdefault(
+            key,
+            {
+                "orientation": list(orientation),
+                "candidate_count": 0,
+                "termination_indices": [],
+                "termination_descriptors": [],
+            },
+        )
+        entry["candidate_count"] += 1
+        termination = _info_value(item, "surface_termination")
+        if termination is not None and termination not in entry["termination_indices"]:
+            entry["termination_indices"].append(termination)
+        descriptor = _info_value(item, "surface_termination_descriptor")
+        if descriptor is not None and descriptor not in entry["termination_descriptors"]:
+            entry["termination_descriptors"].append(descriptor)
+
+    rejected: dict[str, list[dict[str, Any]]] = {}
+    rejection_reasons: Counter[str] = Counter()
+    for rejection in rejections:
+        if str(rejection.get("family", "")) != "surface":
+            continue
+        evidence = rejection.get("evidence", {})
+        if not isinstance(evidence, Mapping):
+            evidence = {}
+        orientation = _normalise_orientation(evidence.get("orientation"))
+        if orientation is None:
+            continue
+        key = _orientation_key(orientation)
+        record = {
+            "orientation": list(orientation),
+            "termination_index": evidence.get("termination_index"),
+            "termination_descriptor": evidence.get("termination_descriptor"),
+            "reason": rejection.get("reason", "surface_planner_rejected"),
+            "evidence": dict(evidence),
+        }
+        rejected.setdefault(key, []).append(record)
+        reason_counts = evidence.get("planner_reason_counts", {})
+        if isinstance(reason_counts, Mapping) and reason_counts:
+            for reason, count in reason_counts.items():
+                rejection_reasons[str(reason)] += int(count)
+        else:
+            rejection_reasons[str(record["reason"])] += 1
+
+    attempted: dict[str, tuple[int, int, int]] = {}
+    for attempt in plan_attempts:
+        orientation = _normalise_orientation(attempt.get("orientation"))
+        if orientation is not None:
+            attempted[_orientation_key(orientation)] = orientation
+    for orientation in accepted.values():
+        normalized = _normalise_orientation(orientation.get("orientation"))
+        if normalized is not None:
+            attempted[_orientation_key(normalized)] = normalized
+    for values in rejected.values():
+        for record in values:
+            normalized = _normalise_orientation(record.get("orientation"))
+            if normalized is not None:
+                attempted[_orientation_key(normalized)] = normalized
+
+    chosen_repeats: list[dict[str, Any]] = []
+    target_counts: list[dict[str, Any]] = []
+    for item in candidates:
+        orientation = _normalise_orientation(
+            _info_value(item, "surface_miller_index", _info_value(item, "miller_index"))
+        )
+        if orientation is None:
+            continue
+        chosen_repeats.append(
+            {
+                "orientation": list(orientation),
+                "termination": _info_value(item, "surface_termination"),
+                "repeat": _info_value(item, "surface_planner_repeat"),
+                "normal_repeat": _info_value(item, "surface_normal_repeat"),
+            }
+        )
+        target_counts.append(
+            {
+                "orientation": list(orientation),
+                "termination": _info_value(item, "surface_termination"),
+                "target": _info_value(item, "surface_target_n_atoms"),
+                "realised": _info_value(item, "surface_realized_atom_count"),
+                "within_target_band": _info_value(item, "surface_target_band"),
+            }
+        )
+
+    zero_output = [
+        list(orientation)
+        for key, orientation in attempted.items()
+        if accepted.get(key, {}).get("candidate_count", 0) == 0
+    ]
+    return {
+        "enabled": bool(enabled) if enabled is not None else bool(attempted or accepted),
+        "requested_orientations": [list(orientation) for orientation in requested],
+        "orientations_attempted": [list(orientation) for orientation in attempted.values()],
+        "accepted_terminations_by_orientation": {
+            key: accepted[key] for key in sorted(accepted)
+        },
+        "rejected_terminations_by_orientation": {
+            key: rejected[key] for key in sorted(rejected)
+        },
+        "orientations_with_zero_accepted_candidates": zero_output,
+        "chosen_repeat_tuples": chosen_repeats,
+        "target_vs_realised_atom_count": target_counts,
+        "rejection_reasons": dict(sorted(rejection_reasons.items())),
+    }
+
+
+def _normalise_orientations(values: Sequence[Any]) -> list[list[int]]:
+    result: list[list[int]] = []
+    seen: set[tuple[int, int, int]] = set()
+    for value in values:
+        orientation = _normalise_orientation(value)
+        if orientation is None or orientation in seen:
+            continue
+        seen.add(orientation)
+        result.append(list(orientation))
+    return result
+
+
+def _normalise_orientation(value: Any) -> tuple[int, int, int] | None:
+    try:
+        values = tuple(int(item) for item in value)
+    except (TypeError, ValueError):
+        return None
+    if len(values) != 3:
+        return None
+    return values  # type: ignore[return-value]
+
+
+def _orientation_key(value: tuple[int, int, int]) -> str:
+    return ",".join(str(item) for item in value)
 
 
 def _numeric_profile(items: Sequence[Any], key: str) -> dict[str, Any]:

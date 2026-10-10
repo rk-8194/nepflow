@@ -429,7 +429,11 @@ def _validate_surface_settings(config: GenerationConfig) -> None:
         raise ConfigurationError(
             "generation.surface_target_tolerance must be finite and non-negative"
         )
-    if config.surface_max_n_atoms <= 0:
+    if (
+        isinstance(config.surface_max_n_atoms, bool)
+        or not isinstance(config.surface_max_n_atoms, int)
+        or config.surface_max_n_atoms <= 0
+    ):
         raise ConfigurationError("generation.surface_max_n_atoms must be positive")
     _require_non_negative("generation.surface_max_terminations", config.surface_max_terminations)
     if config.surface_termination_policy not in {"all", "first"}:
@@ -476,8 +480,41 @@ def _validate_surface_settings(config: GenerationConfig) -> None:
         raise ConfigurationError(
             "generation.surface_max_in_plane_repeat must not be below surface_in_plane_repeat"
         )
-    if config.surface_max_normal_repeat <= 0:
+    if (
+        isinstance(config.surface_max_normal_repeat, bool)
+        or not isinstance(config.surface_max_normal_repeat, int)
+        or config.surface_max_normal_repeat <= 0
+    ):
         raise ConfigurationError("generation.surface_max_normal_repeat must be positive")
+    if len(config.surface_min_in_plane_dimensions) != 2 or any(
+        not math.isfinite(value) or value < 0.0
+        for value in config.surface_min_in_plane_dimensions
+    ):
+        raise ConfigurationError(
+            "generation.surface_min_in_plane_dimensions must be finite and non-negative"
+        )
+    if not math.isfinite(config.surface_vacuum) or config.surface_vacuum <= 0.0:
+        raise ConfigurationError("generation.surface_vacuum must be positive and finite")
+    if str(config.surface_stoichiometry_policy).strip().lower() not in {
+        "allow",
+        "reject",
+        "reject_changed",
+        "require_stoichiometric",
+    }:
+        raise ConfigurationError(
+            "generation.surface_stoichiometry_policy must be 'allow' or 'reject'"
+        )
+    if str(config.surface_polarity_policy).strip().lower() not in {
+        "allow",
+        "reject_known_polar",
+        "reject_polar",
+        "require_known_nonpolar",
+        "require_nonpolar",
+    }:
+        raise ConfigurationError(
+            "generation.surface_polarity_policy must be 'allow', "
+            "'reject_known_polar', or 'require_known_nonpolar'"
+        )
 
 
 def _validate_grain_boundary_settings(config: GenerationConfig) -> None:

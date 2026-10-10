@@ -172,6 +172,8 @@ def test_surface_orientation_semantics_round_trip_without_count_reinterpretation
             "surface_max_n_atoms = 192\n"
             "surface_max_in_plane_repeat = 3,4\n"
             "surface_max_normal_repeat = 12\n"
+            "surface_stoichiometry_policy = reject\n"
+            "surface_polarity_policy = require_known_nonpolar\n"
             "surface_termination_policy = first"
         ),
         1,
@@ -193,6 +195,8 @@ def test_surface_orientation_semantics_round_trip_without_count_reinterpretation
     assert config.generation.surface_max_n_atoms == 192
     assert config.generation.surface_max_in_plane_repeat == (3, 4)
     assert config.generation.surface_max_normal_repeat == 12
+    assert config.generation.surface_stoichiometry_policy == "reject"
+    assert config.generation.surface_polarity_policy == "require_known_nonpolar"
     assert legacy.get("generation", "n_surfaces") == "1"
     assert legacy.get("generation", "surface_miller_indices") == "1,0,0;1,1,0;1,1,1"
     assert legacy.get("generation", "surface_target_n_atoms") == "96"

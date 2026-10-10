@@ -21,7 +21,10 @@ from nepflow.config.models import (
 from nepflow.errors import ConfigurationError
 
 from .perturbations.surfaces import (
+    _POLARITY_POLICIES,
     _SURFACE_PLANNER_VERSION,
+    _STOICHIOMETRY_POLICIES,
+    _composition_details,
     SurfaceConstructionError,
     measure_surface_bulk_core,
     measure_surface_geometry,
@@ -552,8 +555,10 @@ def _validate_surface_state(
     info = getattr(candidate, "info", {})
     required = (
         "parent_structure_id",
+        "surface_state",
         "surface_miller_index",
         "surface_termination",
+        "surface_termination_descriptor",
         "surface_termination_identity",
         "surface_layers",
         "surface_vacuum",
@@ -601,10 +606,30 @@ def _validate_surface_state(
         "surface_planner_version",
         "surface_in_plane_repeat",
         "surface_stoichiometry_change",
+        "surface_symmetric",
+        "surface_symmetric_requested",
+        "surface_symmetry_status",
+        "surface_stoichiometry_policy",
+        "surface_stoichiometry_policy_result",
+        "surface_polarity_policy",
+        "surface_polarity",
+        "surface_polarity_status",
+        "surface_polarity_policy_result",
+        "surface_parent_species_counts",
+        "surface_parent_species_fractions",
+        "surface_slab_species_counts",
+        "surface_slab_species_fractions",
+        "surface_atom_count_change",
+        "surface_stoichiometry_changed",
     )
     missing = [key for key in required if key not in info]
     if missing:
         return CandidateValidationIssue("missing_surface_provenance", {"fields": missing})
+    if info["surface_state"] != "pristine":
+        return CandidateValidationIssue(
+            "invalid_surface_state",
+            {"value": info["surface_state"], "expected": "pristine"},
+        )
     if info["surface_planner_version"] != _SURFACE_PLANNER_VERSION:
         return CandidateValidationIssue(
             "unsupported_surface_planner_version",
@@ -780,6 +805,36 @@ def _validate_surface_state(
         stored_shape_score = float(info["surface_material_shape_score"])
         stored_excess_vacuum = float(info["surface_excess_vacuum"])
         stored_tie_break = tuple(float(value) for value in info["surface_planner_tie_break"])
+        stored_descriptor = str(info["surface_termination_descriptor"])
+        stored_identity = str(info["surface_termination_identity"])
+        stored_symmetric = bool(info["surface_symmetric"])
+        stored_symmetric_requested = bool(info["surface_symmetric_requested"])
+        stored_symmetry_status = str(info["surface_symmetry_status"])
+        stored_stoichiometry_policy = str(info["surface_stoichiometry_policy"])
+        stored_stoichiometry_result = str(info["surface_stoichiometry_policy_result"])
+        stored_polarity_policy = str(info["surface_polarity_policy"])
+        stored_polarity = str(info["surface_polarity"])
+        stored_polarity_status = str(info["surface_polarity_status"])
+        stored_polarity_result = str(info["surface_polarity_policy_result"])
+        stored_parent_counts = {
+            str(key): int(value)
+            for key, value in dict(info["surface_parent_species_counts"]).items()
+        }
+        stored_parent_fractions = {
+            str(key): float(value)
+            for key, value in dict(info["surface_parent_species_fractions"]).items()
+        }
+        stored_slab_counts = {
+            str(key): int(value) for key, value in dict(info["surface_slab_species_counts"]).items()
+        }
+        stored_slab_fractions = {
+            str(key): float(value)
+            for key, value in dict(info["surface_slab_species_fractions"]).items()
+        }
+        stored_count_delta = {
+            str(key): int(value) for key, value in dict(info["surface_atom_count_change"]).items()
+        }
+        stored_stoichiometry_changed = bool(info["surface_stoichiometry_changed"])
     except (TypeError, ValueError):
         return CandidateValidationIssue("invalid_surface_geometry_provenance", {})
     geometry_matches = (
@@ -843,6 +898,65 @@ def _validate_surface_state(
                 "realized_bulk_core_atoms": bulk_core.bulk_core_atom_count,
             },
         )
+    try:
+        (
+            expected_parent_counts,
+            expected_parent_fractions,
+            expected_slab_counts,
+            expected_slab_fractions,
+            expected_count_delta,
+            expected_composition_delta,
+        ) = _composition_details(reference, candidate)
+        expected_stoichiometry_changed = bool(expected_composition_delta)
+        expected_stoichiometry_policy = _STOICHIOMETRY_POLICIES[
+            str(settings.surface_stoichiometry_policy).strip().lower()
+        ]
+        expected_polarity_policy = _POLARITY_POLICIES[
+            str(settings.surface_polarity_policy).strip().lower()
+        ]
+    except (KeyError, TypeError, ValueError):
+        return CandidateValidationIssue("invalid_surface_chemistry_provenance", {})
+    chemistry_matches = (
+        bool(stored_descriptor)
+        and stored_descriptor in stored_identity
+        and stored_symmetry_status in {"symmetric", "asymmetric", "unknown"}
+        and stored_symmetric == (stored_symmetry_status == "symmetric")
+        and stored_symmetric_requested == bool(settings.surface_symmetric)
+        and stored_stoichiometry_policy == expected_stoichiometry_policy
+        and stored_stoichiometry_result == "accepted"
+        and stored_polarity_policy == expected_polarity_policy
+        and stored_polarity == stored_polarity_status
+        and stored_parent_counts == expected_parent_counts
+        and stored_slab_counts == expected_slab_counts
+        and stored_count_delta == expected_count_delta
+        and stored_stoichiometry_changed == expected_stoichiometry_changed
+        and set(stored_parent_fractions) == set(expected_parent_fractions)
+        and np.allclose(
+            [stored_parent_fractions[key] for key in sorted(expected_parent_fractions)],
+            [expected_parent_fractions[key] for key in sorted(expected_parent_fractions)],
+            rtol=1.0e-6,
+            atol=1.0e-6,
+        )
+        and set(stored_slab_fractions) == set(expected_slab_fractions)
+        and np.allclose(
+            [stored_slab_fractions[key] for key in sorted(expected_slab_fractions)],
+            [expected_slab_fractions[key] for key in sorted(expected_slab_fractions)],
+            rtol=1.0e-6,
+            atol=1.0e-6,
+        )
+        and info["surface_stoichiometry_change"] == expected_composition_delta
+        and stored_polarity_result == "accepted"
+    )
+    if not chemistry_matches:
+        return CandidateValidationIssue("surface_chemistry_provenance_mismatch", {})
+    if settings.surface_symmetric and stored_symmetry_status != "symmetric":
+        return CandidateValidationIssue("surface_symmetry_policy_violation", {})
+    if expected_stoichiometry_policy == "reject" and expected_stoichiometry_changed:
+        return CandidateValidationIssue("surface_stoichiometry_policy_violation", {})
+    if expected_polarity_policy == "reject_known_polar" and stored_polarity == "polar":
+        return CandidateValidationIssue("surface_polarity_policy_violation", {})
+    if expected_polarity_policy == "require_known_nonpolar" and stored_polarity != "nonpolar":
+        return CandidateValidationIssue("surface_polarity_policy_violation", {})
     target_atoms = (
         int(settings.target_n_atoms)
         if settings.surface_target_n_atoms is None
@@ -1123,6 +1237,26 @@ def validate_generation_config(config: GenerationConfig) -> GenerationConfig:
         raise ConfigurationError("generation.surface_thickness must be positive and finite")
     if not math.isfinite(config.surface_vacuum) or config.surface_vacuum <= 0.0:
         raise ConfigurationError("generation.surface_vacuum must be positive and finite")
+    if str(config.surface_stoichiometry_policy).strip().lower() not in {
+        "allow",
+        "reject",
+        "reject_changed",
+        "require_stoichiometric",
+    }:
+        raise ConfigurationError(
+            "generation.surface_stoichiometry_policy must be 'allow' or 'reject'"
+        )
+    if str(config.surface_polarity_policy).strip().lower() not in {
+        "allow",
+        "reject_known_polar",
+        "reject_polar",
+        "require_known_nonpolar",
+        "require_nonpolar",
+    }:
+        raise ConfigurationError(
+            "generation.surface_polarity_policy must be 'allow', "
+            "'reject_known_polar', or 'require_known_nonpolar'"
+        )
     if config.n_grain_boundaries < 0:
         raise ConfigurationError("generation.n_grain_boundaries must be non-negative")
     if tuple(config.grain_boundary_rotation_axis) != (0, 0, 1):

@@ -203,6 +203,8 @@ def _generation_values(config: NepflowConfig) -> dict[str, str]:
             map(str, generation.surface_min_in_plane_dimensions)
         ),
         "surface_symmetric": _bool_text(generation.surface_symmetric),
+        "surface_stoichiometry_policy": generation.surface_stoichiometry_policy,
+        "surface_polarity_policy": generation.surface_polarity_policy,
         "grain_boundary_enabled": _bool_text(generation.grain_boundary_enabled),
         "n_grain_boundaries": str(generation.n_grain_boundaries),
         "grain_boundary_sources": ",".join(generation.grain_boundary_sources),

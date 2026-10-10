@@ -461,18 +461,13 @@ def execute_perturbation_task(task: PerturbationTask) -> PerturbationTaskResult:
             )
         )
     if settings.surface_enabled and family_applies_to_base("surface", task.base, settings):
-        # ``n_surfaces`` is a legacy compatibility input.  Preserve its old
-        # single-orientation behaviour for direct callers, but never let it
-        # truncate a multi-orientation request.  A zero legacy count means
-        # "use the configured surface plan" in the new contract.
-        surface_count: int | None = None
-        if len(settings.surface_miller_indices) == 1 and task.counts.n_surfaces > 0:
-            surface_count = task.counts.n_surfaces
+        # ``n_surfaces`` is retained on the typed compatibility record only;
+        # the planner owns the configured orientation/termination cardinality.
         output.extend(
             surfaces(
                 task.base,
                 task.base,
-                surface_count,
+                None,
                 settings,
                 None,
                 annotate,
@@ -839,6 +834,9 @@ class PerturbationCoordinator:
         self._output_file: Path | None = None
         self._magnetic_summary: MagneticGenerationSummary | None = None
         self._task_elapsed_seconds: dict[tuple[int, str, str, int, int | None], float] = {}
+        self._surface_plan_attempts: list[dict[str, Any]] = []
+        self._surface_plan_rejections: list[PerturbationRejection] = []
+        self._surface_plan_slots: dict[str, int] = {}
 
     @staticmethod
     def _available_cpu_count() -> int:
@@ -943,6 +941,10 @@ class PerturbationCoordinator:
         counts: PerturbationCounts,
         settings: PerturbationSettings,
         base: Any | None = None,
+        *,
+        rejection_sink: Any = None,
+        attempt_sink: Any = None,
+        slot_count_sink: Any = None,
     ) -> int:
         """Return the deterministic number of output slots for one family."""
 
@@ -977,10 +979,26 @@ class PerturbationCoordinator:
         if family == "surface":
             if not settings.surface_enabled or base is None:
                 return 0
-            total = surface_slot_count(base, settings)
-            if len(settings.surface_miller_indices) == 1 and counts.n_surfaces > 0:
-                return min(counts.n_surfaces, total)
-            return total
+            try:
+                return surface_slot_count(
+                    base,
+                    settings,
+                    rejection_sink=rejection_sink,
+                    attempt_sink=attempt_sink,
+                    slot_count_sink=slot_count_sink,
+                )
+            except TypeError as exc:
+                # Preserve compatibility with focused test doubles and old
+                # direct adapters that still expose the two-argument helper.
+                if "unexpected keyword argument" not in str(exc):
+                    raise
+                if attempt_sink is not None:
+                    for miller_index in settings.surface_miller_indices:
+                        attempt_sink(tuple(int(value) for value in miller_index))
+                total = surface_slot_count(base, settings)
+                if slot_count_sink is not None:
+                    slot_count_sink(total)
+                return total
         if family == "grain_boundary":
             return min(1, counts.n_grain_boundaries)
         raise KeyError(f"Unknown perturbation family: {family}")
@@ -991,6 +1009,10 @@ class PerturbationCoordinator:
         counts: PerturbationCounts,
         settings: PerturbationSettings,
         base: Any | None = None,
+        *,
+        rejection_sink: Any = None,
+        attempt_sink: Any = None,
+        slot_count_sink: Any = None,
     ) -> tuple[tuple[int, int], ...]:
         """Return canonical bounded windows for one family.
 
@@ -999,7 +1021,15 @@ class PerturbationCoordinator:
         generic slot batch size.
         """
 
-        total_slots = PerturbationCoordinator._family_slot_count(family, counts, settings, base)
+        total_slots = PerturbationCoordinator._family_slot_count(
+            family,
+            counts,
+            settings,
+            base,
+            rejection_sink=rejection_sink,
+            attempt_sink=attempt_sink,
+            slot_count_sink=slot_count_sink,
+        )
         if total_slots <= 0:
             return ()
         if family == "liquid":
@@ -1073,13 +1103,70 @@ class PerturbationCoordinator:
 
         task_settings = settings or self.settings
         total = 0
+        self._surface_plan_attempts = []
+        self._surface_plan_rejections = []
+        self._surface_plan_slots = {}
         for base in base_structures:
+            parent_structure_id = calculate_structure_id(base)
+
+            def record_attempt(orientation: tuple[int, int, int]) -> None:
+                self._surface_plan_attempts.append(
+                    {
+                        "parent_structure_id": parent_structure_id,
+                        "orientation": tuple(int(value) for value in orientation),
+                    }
+                )
+
+            def record_rejection(item: dict[str, Any]) -> None:
+                orientation = tuple(int(value) for value in item["orientation"])
+                orientation_label = ",".join(str(value) for value in orientation)
+                termination_index = item.get("termination_index")
+                termination_label = (
+                    "orientation"
+                    if termination_index is None
+                    else f"termination_{int(termination_index)}"
+                )
+                self._surface_plan_rejections.append(
+                    PerturbationRejection(
+                        parent_structure_id=parent_structure_id,
+                        family="surface",
+                        operation_id=(
+                            f"{parent_structure_id}:surface:{orientation_label}:"
+                            f"{termination_label}:planner"
+                        ),
+                        slot=termination_label,
+                        reason=str(item.get("reason", "surface_planner_rejected")),
+                        evidence={
+                            "orientation": orientation,
+                            "termination_index": termination_index,
+                            "termination_descriptor": item.get("termination_descriptor"),
+                            **dict(item.get("evidence", {})),
+                        },
+                    )
+                )
+
+            def record_slot_count(slot_count: int) -> None:
+                self._surface_plan_slots[parent_structure_id] = int(slot_count)
+
             for family in _FAMILY_ORDER:
                 if family != "unperturbed" and not family_applies_to_base(
                     family, base, task_settings
                 ):
                     continue
-                total += len(self._family_slot_windows(family, counts, task_settings, base))
+                rejection_sink = record_rejection if family == "surface" else None
+                attempt_sink = record_attempt if family == "surface" else None
+                slot_count_sink = record_slot_count if family == "surface" else None
+                total += len(
+                    self._family_slot_windows(
+                        family,
+                        counts,
+                        task_settings,
+                        base,
+                        rejection_sink=rejection_sink,
+                        attempt_sink=attempt_sink,
+                        slot_count_sink=slot_count_sink,
+                    )
+                )
         return total
 
     def generate_candidates(
@@ -1095,7 +1182,7 @@ class PerturbationCoordinator:
             n_workers,
             self._batch_task_count(base_structures, counts),
         )
-        self._rejected_attempts = []
+        self._rejected_attempts = list(self._surface_plan_rejections)
         self._provenance_records = ()
         self._duplicate_count = 0
         self._magnetic_summary = None
@@ -1148,8 +1235,8 @@ class PerturbationCoordinator:
             n_antisites=n_antisites,
             n_vacancy_interstitial=n_vacancy_interstitial,
             n_gas_in_vacancy=n_gas_in_vacancy,
-            # A positive legacy cap applies only to the single-orientation
-            # compatibility path; multi-orientation plans remain uncapped.
+            # Retained for the typed compatibility signature. Normal
+            # generation is planner-driven and never uses this as a cap.
             n_surfaces=n_surfaces,
             n_grain_boundaries=n_grain_boundaries,
         )
@@ -1158,7 +1245,7 @@ class PerturbationCoordinator:
         self._total = 0
         self._by_type = {}
         self._by_config = {}
-        self._rejected_attempts = []
+        self._rejected_attempts = list(self._surface_plan_rejections)
         self._provenance_records = ()
         self._duplicate_count = 0
         self._magnetic_summary = None
@@ -1699,6 +1786,9 @@ class PerturbationCoordinator:
             "rejected_count": len(self._rejected_attempts),
             "rejected_reason_counts": rejected_reason_counts,
             "rejections_by_family": rejected_by_family,
+            "rejections": [item.to_dict() for item in self._rejected_attempts],
+            "surface_plan_attempts": [dict(item) for item in self._surface_plan_attempts],
+            "surface_plan_slots": dict(self._surface_plan_slots),
         }
         if self._magnetic_summary is not None:
             summary["magnetic"] = self._magnetic_summary.to_dict()

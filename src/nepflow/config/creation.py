@@ -174,6 +174,8 @@ surface_max_in_plane_repeat=4,4
 surface_max_normal_repeat=16
 surface_min_in_plane_dimensions=0.0,0.0
 surface_symmetric=false
+surface_stoichiometry_policy=allow
+surface_polarity_policy=allow
 
 # --- Grain-boundary perturbations ---
 # Supported initial relationship: Sigma 5 [001] symmetric tilt, (210), 36.8699°.

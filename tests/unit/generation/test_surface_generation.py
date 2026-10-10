@@ -126,9 +126,17 @@ def test_bcc_surface_has_low_index_termination_and_provenance() -> None:
         == candidate.info["generation_provenance"]["parent_structure_id"]
     )
     assert candidate.info["surface_miller_index"] == (1, 0, 0)
+    assert candidate.info["surface_state"] == "pristine"
     assert candidate.info["surface_termination"] == "termination_0"
+    assert candidate.info["surface_termination_descriptor"] in candidate.info[
+        "surface_termination_identity"
+    ]
     assert candidate.info["surface_layers"] > 0
     assert candidate.info["surface_stoichiometry_change"] == {}
+    assert candidate.info["surface_stoichiometry_changed"] is False
+    assert candidate.info["surface_polarity"] == "unknown"
+    assert candidate.info["surface_symmetry_status"] in {"symmetric", "asymmetric", "unknown"}
+    assert candidate.info["surface_parent_species_counts"] == {"Fe": len(parent)}
     assert candidate.info["surface_half_depth"] >= 6.0
     assert candidate.info["surface_bulk_core_atom_count"] >= 1
     assert validate_generated_candidate(candidate, parent, _settings(), "surface") is None
@@ -499,6 +507,10 @@ def test_surface_config_validation_rejects_invalid_miller_and_repeat() -> None:
         validate_generation_config(
             GenerationConfig(surface_in_plane_repeat=(2, 1), surface_max_in_plane_repeat=(1, 1))
         )
+    with pytest.raises(ConfigurationError, match="surface_stoichiometry_policy"):
+        validate_generation_config(GenerationConfig(surface_stoichiometry_policy="repair"))
+    with pytest.raises(ConfigurationError, match="surface_polarity_policy"):
+        validate_generation_config(GenerationConfig(surface_polarity_policy="repair"))
 
 
 def test_surface_coordinator_serial_and_parallel_are_reproducible(

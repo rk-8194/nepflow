@@ -172,7 +172,10 @@ class GenerationConfig:
     surface_max_in_plane_repeat: tuple[int, int] = (4, 4)
     surface_max_normal_repeat: int = 16
     surface_min_in_plane_dimensions: tuple[float, float] = (0.0, 0.0)
+    # Require the backend to return a genuinely symmetric slab when enabled.
     surface_symmetric: bool = False
+    surface_stoichiometry_policy: str = "allow"
+    surface_polarity_policy: str = "allow"
     grain_boundary_enabled: bool = False
     n_grain_boundaries: int = 0
     grain_boundary_sources: SourceScope = DEFAULT_SOURCE_SCOPE

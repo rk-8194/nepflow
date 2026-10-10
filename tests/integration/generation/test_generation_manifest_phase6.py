@@ -106,6 +106,9 @@ def test_final_manifest_is_authoritative_and_stable_across_reruns(tmp_path: Path
     assert manifest["realised_family_counts"]["volume_profile"] == 1
     assert manifest["duplicates_removed"] == 0
     assert manifest["coverage"]["outputs_by_source_and_family"]["mp_phase"]["volume_profile"] == 1
+    assert manifest["coverage"]["surface"]["enabled"] is False
+    assert manifest["coverage"]["surface"]["orientations_attempted"] == []
+    assert manifest["coverage"]["surface"]["accepted_terminations_by_orientation"] == {}
 
     second = _stage(tmp_path).run(request=request)
 

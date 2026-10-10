@@ -500,6 +500,14 @@ def _parse_generation_perturbations(values: Mapping[str, str]) -> dict[str, Any]
         "surface_symmetric": _parse_bool(
             values.get("surface_symmetric", "false"), "generation.surface_symmetric"
         ),
+        "surface_stoichiometry_policy": values.get(
+            "surface_stoichiometry_policy", "allow"
+        )
+        .strip()
+        .lower(),
+        "surface_polarity_policy": values.get("surface_polarity_policy", "allow")
+        .strip()
+        .lower(),
         "grain_boundary_enabled": _parse_bool(
             values.get("grain_boundary_enabled", "false"),
             "generation.grain_boundary_enabled",

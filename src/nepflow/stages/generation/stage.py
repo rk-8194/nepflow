@@ -471,8 +471,12 @@ class GenerationStage:
             counts_by_family[family] = counts_by_family.get(family, 0) + 1
 
         base_values = list(bases) if bases is not None else self._load_structures(manifest.path)
-        requested_family_counts = self._requested_family_counts(request, base_values)
         runtime_summary = summary or {}
+        requested_family_counts = self._requested_family_counts(
+            request,
+            base_values,
+            surface_plan_slots=runtime_summary.get("surface_plan_slots", {}),
+        )
         rejections_by_family = runtime_summary.get("rejections_by_family", {})
         if not isinstance(rejections_by_family, Mapping):
             rejections_by_family = {}
@@ -498,6 +502,10 @@ class GenerationStage:
                 base_values,
                 candidates,
                 requested_family_counts=requested_family_counts,
+                surface_enabled=request.generation.surface_enabled,
+                requested_surface_orientations=request.generation.surface_miller_indices,
+                surface_plan_attempts=runtime_summary.get("surface_plan_attempts", ()),
+                surface_rejections=runtime_summary.get("rejections", ()),
             ),
             config_fingerprint=self._generation_config_fingerprint(request),
             manifest_path=self._generation_manifest_path(request, candidate_path),
@@ -638,6 +646,8 @@ class GenerationStage:
     def _requested_family_counts(
         request: GenerationRequest,
         bases: Sequence[Any],
+        *,
+        surface_plan_slots: Mapping[str, Any] | None = None,
     ) -> dict[str, int]:
         """Calculate requested family slots after source-scope filtering."""
 
@@ -649,7 +659,9 @@ class GenerationStage:
             "rattled": "rattle_sources",
         }
         counts: dict[str, int] = {}
+        planned_surface_slots = surface_plan_slots or {}
         for base in bases:
+            base_structure_id = calculate_structure_id(base)
             source = str(getattr(base, "info", {}).get("configurational_type", "")).strip().lower()
 
             def add(family: str, count: int, *, enabled: bool = True) -> None:
@@ -681,15 +693,20 @@ class GenerationStage:
             add("antisite", config.n_antisites)
             add("vacancy_interstitial", config.n_vacancy_interstitial, enabled=gas_enabled)
             add("gas_in_vacancy", config.n_gas_in_vacancy, enabled=gas_enabled)
-            surface_termination_slots = (
-                config.surface_max_terminations
-                if config.surface_termination_policy != "first"
-                and config.surface_max_terminations > 0
-                else 1
-            )
+            configured_surface_slots = planned_surface_slots.get(base_structure_id)
+            if configured_surface_slots is None:
+                surface_termination_slots = (
+                    config.surface_max_terminations
+                    if config.surface_termination_policy != "first"
+                    and config.surface_max_terminations > 0
+                    else 1
+                )
+                configured_surface_slots = len(config.surface_miller_indices) * (
+                    surface_termination_slots
+                )
             add(
                 "surface",
-                len(config.surface_miller_indices) * surface_termination_slots,
+                int(configured_surface_slots),
                 enabled=config.surface_enabled,
             )
             add(

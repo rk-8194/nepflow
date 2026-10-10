@@ -217,6 +217,8 @@ def _build_perturbation_coordinator(context: StageContext) -> PerturbationCoordi
         surface_max_normal_repeat=generation.surface_max_normal_repeat,
         surface_min_in_plane_dimensions=generation.surface_min_in_plane_dimensions,
         surface_symmetric=generation.surface_symmetric,
+        surface_stoichiometry_policy=generation.surface_stoichiometry_policy,
+        surface_polarity_policy=generation.surface_polarity_policy,
         surface_sources=generation.surface_sources,
         grain_boundary_enabled=generation.grain_boundary_enabled,
         grain_boundary_rotation_axis=generation.grain_boundary_rotation_axis,

@@ -114,6 +114,8 @@ _ALLOWED_KEYS: dict[str, frozenset[str]] = {
             "surface_max_normal_repeat",
             "surface_min_in_plane_dimensions",
             "surface_symmetric",
+            "surface_stoichiometry_policy",
+            "surface_polarity_policy",
             "grain_boundary_enabled",
             "n_grain_boundaries",
             "grain_boundary_sources",

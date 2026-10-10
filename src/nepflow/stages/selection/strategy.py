@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 import numpy as np
 from ase.io import read as ase_read
@@ -13,12 +13,13 @@ from nepflow.config.models import SelectionConfig
 from nepflow.domain.identities import calculate_structure_id
 from nepflow.errors import ValidationError
 
+from .algorithms import (
+    AlgorithmRegistry,
+    SelectionAlgorithmRequest,
+    dispatch_selection_algorithm,
+)
 from .sampling import (
-    build_composition_aware_candidate_set,
     calculate_cross_distance_stats,
-    composition_aware_attempt_schedule,
-    composition_projection_bins,
-    select_best_sampling_attempt,
     select_farthest_points_for_target,
 )
 
@@ -43,6 +44,51 @@ def setting(settings: SelectionConfig | Mapping[str, Any], name: str) -> Any:
     return getattr(settings, name)
 
 
+def _setting_or_default(
+    settings: SelectionConfig | Mapping[str, Any], name: str, default: Any
+) -> Any:
+    """Read an optional algorithm setting for legacy test mappings."""
+
+    try:
+        return setting(settings, name)
+    except KeyError:
+        return default
+
+
+def _algorithm_options(
+    settings: SelectionConfig | Mapping[str, Any],
+    *,
+    ase_structures: Sequence[Any] | None = None,
+    composition_aware: bool | None = None,
+) -> dict[str, Any]:
+    """Build the FPS options while retaining legacy mapping defaults."""
+
+    return {
+        "ase_structures": tuple(ase_structures or ()),
+        "composition_aware_fps": (
+            _setting_or_default(settings, "composition_aware_fps", False)
+            if composition_aware is None
+            else composition_aware
+        ),
+        "composition_aware_fps_adaptive_retries": _setting_or_default(
+            settings, "composition_aware_fps_adaptive_retries", 4
+        ),
+        "composition_aware_fps_descriptor_floor_fraction": _setting_or_default(
+            settings, "composition_aware_fps_descriptor_floor_fraction", 0.95
+        ),
+        "composition_aware_fps_frontier_fraction": _setting_or_default(
+            settings, "composition_aware_fps_frontier_fraction", 0.1
+        ),
+        "composition_aware_fps_ternary_weight": _setting_or_default(
+            settings, "composition_aware_fps_ternary_weight", 1.0
+        ),
+        "descriptor_type": _setting_or_default(settings, "descriptor_type", "structure"),
+        "fps_target_selector": select_farthest_points_for_target,
+        "max_search_iterations": _setting_or_default(settings, "max_search_iterations", 30),
+        "target_tolerance": _setting_or_default(settings, "target_tolerance", 50),
+    }
+
+
 def select_training_set(
     representations: np.ndarray,
     structures: list,
@@ -52,11 +98,14 @@ def select_training_set(
     seed_indices: list[int] | None = None,
     single_element_elastic_indices: list[int] | None = None,
     elastic_indices: list[int] | None = None,
+    candidate_ids: Sequence[str] | None = None,
+    algorithm_id: str = "fps",
+    algorithm_registry: AlgorithmRegistry | None = None,
 ) -> tuple[list[int], float]:
-    """Select a training set while preserving mandatory anchor identity."""
+    """Dispatch one training-selection algorithm with mandatory anchors."""
 
     logger.info("")
-    logger.info("Step 3: Selecting training set via FPS")
+    logger.info("Step 3: Selecting training set via %s", algorithm_id)
 
     seed_indices = sorted(set(seed_indices or []))
     single_element_elastic_indices = sorted(set(single_element_elastic_indices or []))
@@ -89,42 +138,34 @@ def select_training_set(
             "  Preselected %d elastic stress structures as training anchors",
             len(elastic_indices),
         )
-    if setting(settings, "composition_aware_fps"):
+    composition_aware = _setting_or_default(settings, "composition_aware_fps", False)
+    if composition_aware and algorithm_id == "fps":
         logger.info("  Composition-aware FPS enabled for training selection")
 
-    if target_train >= len(structures):
-        logger.info(
-            "  target_train_count (%d) >= total (%d), selecting all for training",
-            target_train,
-            len(structures),
-        )
-        return list(range(len(structures))), 0.0
-
-    anchor_set = set(anchor_indices)
-    remaining_indices = [index for index in range(len(structures)) if index not in anchor_set]
-    remaining_target = target_train - len(anchor_indices)
-    if remaining_target == 0:
-        return anchor_indices, 0.0
-
-    if setting(settings, "composition_aware_fps"):
-        selected, minimum = select_composition_aware_training_set(
-            representations,
-            structures,
-            settings,
-            ase_structures or [],
-            anchor_indices,
-            remaining_indices,
-            remaining_target,
-        )
-    else:
-        selected, minimum = select_plain_fps_training_set(
-            representations,
-            structures,
-            settings,
-            remaining_indices,
-            remaining_target,
-        )
-        selected = sorted(anchor_indices + selected)
+    ordered_candidate_ids = (
+        tuple(str(index) for index in range(len(structures)))
+        if candidate_ids is None
+        else tuple(candidate_ids)
+    )
+    options = _algorithm_options(
+        settings,
+        ase_structures=ase_structures,
+        composition_aware=composition_aware,
+    )
+    request = SelectionAlgorithmRequest(
+        candidate_ids=ordered_candidate_ids,
+        candidate_structures=structures,
+        representations=representations,
+        target_count=target_train,
+        anchor_indices=tuple(anchor_indices),
+        anchor_ids=tuple(ordered_candidate_ids[index] for index in anchor_indices),
+        algorithm_id=algorithm_id,
+        algorithm_version="selection-request-v1",
+        options=options,
+    )
+    result = dispatch_selection_algorithm(request, registry=algorithm_registry)
+    selected = list(result.selected_indices)
+    minimum = result.minimum_distance
 
     logger.info(
         "  Training set: %d structures (min_distance=%.6f)",
@@ -141,20 +182,23 @@ def select_plain_fps_training_set(
     remaining_indices: list[int],
     remaining_target: int,
 ) -> tuple[list[int], float]:
-    """Select a target-sized remainder using the canonical FPS service."""
+    """Compatibility wrapper for the peer FPS algorithm."""
 
-    remaining_representations = representations[remaining_indices]
-    remaining_structures = [structures[index] for index in remaining_indices]
-    fps_indices, minimum = select_farthest_points_for_target(
-        remaining_representations,
-        remaining_structures,
-        setting(settings, "descriptor_type") == "structure",
-        remaining_target,
-        setting(settings, "target_tolerance"),
-        setting(settings, "max_search_iterations"),
-        label="train",
+    local_structures = [structures[index] for index in remaining_indices]
+    local_ids = tuple(str(index) for index in remaining_indices)
+    request = SelectionAlgorithmRequest(
+        candidate_ids=local_ids,
+        candidate_structures=local_structures,
+        representations=representations[remaining_indices],
+        target_count=remaining_target,
+        anchor_indices=(),
+        anchor_ids=(),
+        algorithm_id="fps",
+        algorithm_version="selection-request-v1",
+        options=_algorithm_options(settings),
     )
-    return [int(remaining_indices[index]) for index in fps_indices], minimum
+    result = dispatch_selection_algorithm(request)
+    return [remaining_indices[index] for index in result.selected_indices], result.minimum_distance
 
 
 def select_composition_aware_training_set(
@@ -166,136 +210,28 @@ def select_composition_aware_training_set(
     remaining_indices: list[int],
     remaining_target: int,
 ) -> tuple[list[int], float]:
-    """Run adaptive composition-aware selection and preserve descriptor floors."""
+    """Compatibility wrapper for composition-aware FPS."""
 
-    if not ase_structures:
-        logger.warning(
-            "  Composition-aware FPS requested, but ASE structures were not provided; "
-            "falling back to descriptor-only FPS"
-        )
-        selected, minimum = select_plain_fps_training_set(
-            representations,
-            structures,
-            settings,
-            remaining_indices,
-            remaining_target,
-        )
-        return sorted(anchor_indices + selected), minimum
-
-    candidate_bins = {
-        index: composition_projection_bins(ase_structures[index])
-        for index in range(len(ase_structures))
-    }
-    total_binary_bins = len(
-        {
-            bin_key
-            for index in remaining_indices + anchor_indices
-            for bin_key in candidate_bins[index]["binary"]
-        }
+    candidate_ids = tuple(str(index) for index in range(len(structures)))
+    options = _algorithm_options(
+        settings,
+        ase_structures=ase_structures,
+        composition_aware=True,
     )
-    total_ternary_bins = len(
-        {
-            bin_key
-            for index in remaining_indices + anchor_indices
-            for bin_key in candidate_bins[index]["ternary"]
-        }
+    options["eligible_indices"] = tuple(remaining_indices)
+    request = SelectionAlgorithmRequest(
+        candidate_ids=candidate_ids,
+        candidate_structures=structures,
+        representations=representations,
+        target_count=len(anchor_indices) + remaining_target,
+        anchor_indices=tuple(sorted(anchor_indices)),
+        anchor_ids=tuple(candidate_ids[index] for index in sorted(anchor_indices)),
+        algorithm_id="fps",
+        algorithm_version="selection-request-v1",
+        options=options,
     )
-    if total_binary_bins == 0 and total_ternary_bins == 0:
-        logger.info(
-            "  No binary or ternary composition projections found; "
-            "falling back to descriptor-only FPS"
-        )
-        selected, minimum = select_plain_fps_training_set(
-            representations,
-            structures,
-            settings,
-            remaining_indices,
-            remaining_target,
-        )
-        return sorted(anchor_indices + selected), minimum
-
-    from collections import Counter
-
-    binary_counts: Counter = Counter()
-    ternary_counts: Counter = Counter()
-    for index in anchor_indices:
-        binary_counts.update(candidate_bins[index]["binary"])
-        ternary_counts.update(candidate_bins[index]["ternary"])
-
-    logger.info(
-        "  Composition-aware fill: %d remaining slots, %d binary bins, %d ternary bins",
-        remaining_target,
-        total_binary_bins,
-        total_ternary_bins,
-    )
-    logger.info(
-        "  Anchor composition footprint: %d occupied binary bins, %d occupied ternary bins",
-        len(binary_counts),
-        len(ternary_counts),
-    )
-
-    attempt_schedule = composition_aware_attempt_schedule(
-        setting(settings, "composition_aware_fps_frontier_fraction"),
-        setting(settings, "composition_aware_fps_ternary_weight"),
-        setting(settings, "composition_aware_fps_adaptive_retries"),
-    )
-    attempt_results: list[dict] = []
-    for attempt_number, (frontier_fraction, ternary_weight) in enumerate(
-        attempt_schedule,
-        start=1,
-    ):
-        logger.info(
-            "  Attempt %d/%d: frontier_fraction=%.3f, ternary_weight=%.3f",
-            attempt_number,
-            len(attempt_schedule),
-            frontier_fraction,
-            ternary_weight,
-        )
-        attempt_result = build_composition_aware_candidate_set(
-            representations,
-            candidate_bins,
-            anchor_indices,
-            remaining_indices,
-            remaining_target,
-            frontier_fraction,
-            ternary_weight,
-        )
-        attempt_result["attempt_number"] = attempt_number
-        attempt_results.append(attempt_result)
-        logger.info(
-            "    Coverage: binary occ=%.3f, binary entropy=%.3f, "
-            "ternary occ=%.3f, ternary entropy=%.3f",
-            attempt_result["binary_occupied_bin_fraction"],
-            attempt_result["binary_normalized_entropy"],
-            attempt_result["ternary_occupied_bin_fraction"],
-            attempt_result["ternary_normalized_entropy"],
-        )
-        logger.info(
-            "    Descriptor quality: min_dist=%.6f, mean_nn=%.6f",
-            attempt_result["train_min_dist"],
-            attempt_result["train_mean_nn_dist"],
-        )
-
-    best_attempt = select_best_sampling_attempt(
-        attempt_results,
-        setting(settings, "composition_aware_fps_descriptor_floor_fraction"),
-    )
-    logger.info(
-        "  Selected attempt %d with frontier_fraction=%.3f, ternary_weight=%.3f",
-        best_attempt["attempt_number"],
-        best_attempt["frontier_fraction"],
-        best_attempt["ternary_weight"],
-    )
-    logger.info(
-        "  Composition-aware selection filled %d structures; touched %d/%d "
-        "binary bins and %d/%d ternary bins",
-        len(best_attempt["selected_indices"]) - len(anchor_indices),
-        best_attempt["occupied_binary_bins"],
-        total_binary_bins,
-        best_attempt["occupied_ternary_bins"],
-        total_ternary_bins,
-    )
-    return best_attempt["selected_indices"], best_attempt["train_min_dist"]
+    result = dispatch_selection_algorithm(request)
+    return list(result.selected_indices), result.minimum_distance
 
 
 def select_test_set(
