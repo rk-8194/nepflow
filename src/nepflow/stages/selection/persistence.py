@@ -267,6 +267,7 @@ def selection_parameters(
             "forward_kl": result.train_entropy_forward_kl,
             "pool_fingerprint": result.train_entropy_pool_fingerprint,
             "graph_fingerprint": result.train_entropy_graph_fingerprint,
+            "kernel_operator_fingerprint": result.train_entropy_kernel_operator_fingerprint,
             "contributions_fingerprint": result.train_entropy_contributions_fingerprint,
             "state_fingerprint": result.train_entropy_state_fingerprint,
             "history": result.train_entropy_history,
@@ -600,6 +601,9 @@ def restore_selection_result(
         train_entropy_forward_kl=entropy_values.get("forward_kl"),
         train_entropy_pool_fingerprint=entropy_values.get("pool_fingerprint"),
         train_entropy_graph_fingerprint=entropy_values.get("graph_fingerprint"),
+        train_entropy_kernel_operator_fingerprint=entropy_values.get(
+            "kernel_operator_fingerprint", entropy_values.get("graph_fingerprint")
+        ),
         train_entropy_contributions_fingerprint=entropy_values.get("contributions_fingerprint"),
         train_entropy_state_fingerprint=entropy_values.get("state_fingerprint"),
         train_entropy_history=[dict(value) for value in history if isinstance(value, Mapping)],

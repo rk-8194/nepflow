@@ -37,6 +37,7 @@ class SelectionResult:
     train_entropy_forward_kl: float | None = None
     train_entropy_pool_fingerprint: str | None = None
     train_entropy_graph_fingerprint: str | None = None
+    train_entropy_kernel_operator_fingerprint: str | None = None
     train_entropy_contributions_fingerprint: str | None = None
     train_entropy_state_fingerprint: str | None = None
     train_entropy_history: list[dict[str, Any]] = field(default_factory=list)
@@ -67,6 +68,9 @@ class SelectionResult:
             "train_entropy_forward_kl": self.train_entropy_forward_kl,
             "train_entropy_pool_fingerprint": self.train_entropy_pool_fingerprint,
             "train_entropy_graph_fingerprint": self.train_entropy_graph_fingerprint,
+            "train_entropy_kernel_operator_fingerprint": (
+                self.train_entropy_kernel_operator_fingerprint
+            ),
             "train_entropy_contributions_fingerprint": self.train_entropy_contributions_fingerprint,
             "train_entropy_state_fingerprint": self.train_entropy_state_fingerprint,
             "train_entropy_history": self.train_entropy_history,

@@ -22,6 +22,10 @@ KERNEL_FAMILY = "wendland_c2"
 KERNEL_VERSION = "wendland-c2-v1"
 SPARSE_KERNEL_GRAPH_SCHEMA_VERSION = "sparse-atomic-kernel-graph-v1"
 SPARSE_CANDIDATE_CONTRIBUTION_SCHEMA_VERSION = "sparse-candidate-contributions-v1"
+SPARSE_STREAMED_CANDIDATE_CONTRIBUTION_SCHEMA_VERSION = (
+    "sparse-candidate-contributions-streamed-v1"
+)
+KERNEL_OPERATOR_SCHEMA_VERSION = "kernel-operator-v1"
 SPARSE_NUMERICAL_TOLERANCE = 1.0e-12
 ENTROPY_OBJECTIVE_SCHEMA_VERSION = "entropy-objective-v1"
 DEFAULT_RADIUS_QUERY_BYTES = 256 * 1024 * 1024
@@ -643,6 +647,189 @@ class SparseAtomicKernelGraph:
 
 
 @dataclass(frozen=True, slots=True)
+class StreamedKernelExecutionSummary:
+    """Immutable execution evidence for direct source-column aggregation.
+
+    This record deliberately describes an implicit exact atomic operator.  It
+    is not an empty or synthetic ``SparseAtomicKernelGraph``.
+    """
+
+    atomic_row_count: int
+    implicit_edge_count: int
+    source_support_min: int
+    source_support_mean: float
+    source_support_max: int
+    self_edge_count: int
+    source_mass_max_deviation: float
+    candidate_entry_count: int
+    candidate_support_min: int
+    candidate_support_mean: float
+    candidate_support_max: int
+    candidate_pmf_max_deviation: float
+    candidate_csr_array_bytes: int
+    contribution_spool_bytes: int
+    estimated_peak_memory_bytes: int
+    measured_peak_memory_bytes: int | None
+    pool_fingerprint: str
+    bandwidth_fingerprint: str
+    transform_fingerprint: str
+    backend: str
+    metric: str
+    backend_version: str
+    kernel_operator_fingerprint: str
+    atomic_graph_materialized: bool = False
+    atomic_graph_csr_bytes: int = 0
+    source_query_count: int = 0
+    numerical_tolerance: float = SPARSE_NUMERICAL_TOLERANCE
+
+    def __post_init__(self) -> None:
+        for name in (
+            "atomic_row_count",
+            "implicit_edge_count",
+            "source_support_min",
+            "source_support_max",
+            "self_edge_count",
+            "candidate_entry_count",
+            "candidate_support_min",
+            "candidate_support_max",
+            "candidate_csr_array_bytes",
+            "contribution_spool_bytes",
+            "estimated_peak_memory_bytes",
+            "atomic_graph_csr_bytes",
+            "source_query_count",
+        ):
+            value = _exact_integer(getattr(self, name), name=name)
+            if value < 0:
+                raise ValueError(f"{name} must be non-negative")
+            object.__setattr__(self, name, value)
+        if self.atomic_row_count < 1 or self.source_query_count != self.atomic_row_count:
+            raise ValueError("streamed execution must query every atomic source exactly once")
+        if self.implicit_edge_count < self.atomic_row_count:
+            raise ValueError("streamed execution must retain at least one self support per source")
+        if self.source_support_min < 1 or self.source_support_max < self.source_support_min:
+            raise ValueError("streamed source support distribution is invalid")
+        if (
+            self.candidate_support_min < 1
+            or self.candidate_support_max < self.candidate_support_min
+        ):
+            raise ValueError("streamed candidate support distribution is invalid")
+        for name in (
+            "source_support_mean",
+            "source_mass_max_deviation",
+            "candidate_support_mean",
+            "candidate_pmf_max_deviation",
+            "numerical_tolerance",
+        ):
+            value = float(getattr(self, name))
+            if not math.isfinite(value) or value < 0.0:
+                raise ValueError(f"{name} must be finite and non-negative")
+            object.__setattr__(self, name, value)
+        if self.numerical_tolerance <= 0.0:
+            raise ValueError("numerical_tolerance must be strictly positive")
+        if self.atomic_graph_materialized:
+            raise ValueError("streamed execution summary cannot claim a materialized graph")
+        if self.atomic_graph_csr_bytes != 0:
+            raise ValueError("streamed execution must report zero atomic graph CSR bytes")
+        for name, value in (
+            ("backend", self.backend),
+            ("metric", self.metric),
+            ("backend_version", self.backend_version),
+            ("pool_fingerprint", self.pool_fingerprint),
+            ("bandwidth_fingerprint", self.bandwidth_fingerprint),
+            ("transform_fingerprint", self.transform_fingerprint),
+            ("kernel_operator_fingerprint", self.kernel_operator_fingerprint),
+        ):
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"{name} must be non-blank")
+        if self.measured_peak_memory_bytes is not None:
+            value = _exact_integer(
+                self.measured_peak_memory_bytes, name="measured_peak_memory_bytes"
+            )
+            if value < 0:
+                raise ValueError("measured_peak_memory_bytes must be non-negative")
+            object.__setattr__(self, "measured_peak_memory_bytes", value)
+
+    @property
+    def E(self) -> int:
+        return self.implicit_edge_count
+
+    @property
+    def Q(self) -> int:
+        return self.candidate_entry_count
+
+    @property
+    def edge_count(self) -> int:
+        return self.implicit_edge_count
+
+    @property
+    def csr_array_bytes(self) -> int:
+        return self.atomic_graph_csr_bytes
+
+    @property
+    def array_bytes(self) -> int:
+        """Atomic graph bytes; streamed execution intentionally reports zero."""
+
+        return self.atomic_graph_csr_bytes
+
+    @property
+    def atomic_graph_CSR_bytes(self) -> int:
+        """Compatibility spelling matching the diagnostics terminology."""
+
+        return self.atomic_graph_csr_bytes
+
+    @property
+    def peak_resident_memory_bytes(self) -> int | None:
+        return self.measured_peak_memory_bytes
+
+    @property
+    def source_normalization_max_deviation(self) -> float:
+        return self.source_mass_max_deviation
+
+    @property
+    def kernel_source_fingerprint(self) -> str:
+        return self.kernel_operator_fingerprint
+
+    def to_manifest(self) -> dict[str, Any]:
+        return {
+            "atomic_graph_materialized": False,
+            "atomic_row_count": self.atomic_row_count,
+            "edge_count": self.implicit_edge_count,
+            "edge_per_row": self.implicit_edge_count / self.atomic_row_count,
+            "self_edge_count": self.self_edge_count,
+            "source_mass_deviation": self.source_mass_max_deviation,
+            "source_support": {
+                "minimum": self.source_support_min,
+                "mean": self.source_support_mean,
+                "maximum": self.source_support_max,
+            },
+            "candidate_entry_count": self.candidate_entry_count,
+            "candidate_support": {
+                "minimum": self.candidate_support_min,
+                "mean": self.candidate_support_mean,
+                "maximum": self.candidate_support_max,
+            },
+            "candidate_pmf_max_deviation": self.candidate_pmf_max_deviation,
+            "memory": {
+                "csr_array_bytes": 0,
+                "atomic_graph_csr_bytes": 0,
+                "candidate_csr_array_bytes": self.candidate_csr_array_bytes,
+                "measured_peak_memory_bytes": self.measured_peak_memory_bytes,
+                "estimated_peak_memory_bytes": self.estimated_peak_memory_bytes,
+                "contribution_spool_bytes": self.contribution_spool_bytes,
+            },
+            "backend": self.backend,
+            "metric": self.metric,
+            "backend_version": self.backend_version,
+            "pool_fingerprint": self.pool_fingerprint,
+            "bandwidth_fingerprint": self.bandwidth_fingerprint,
+            "transform_fingerprint": self.transform_fingerprint,
+            "kernel_operator_fingerprint": self.kernel_operator_fingerprint,
+            "source_query_count": self.source_query_count,
+            "numerical_tolerance": self.numerical_tolerance,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class SparseCandidateContributionRow:
     """Read-only candidate-major sparse contribution row."""
 
@@ -700,6 +887,7 @@ class SparseCandidateContributions:
     pool_fingerprint: str = ""
     sparse_schema_version: str = SPARSE_CANDIDATE_CONTRIBUTION_SCHEMA_VERSION
     numerical_tolerance: float = SPARSE_NUMERICAL_TOLERANCE
+    kernel_operator_fingerprint: str = ""
 
     def __post_init__(self) -> None:
         indptr = _readonly_exact_array(
@@ -767,13 +955,15 @@ class SparseCandidateContributions:
             if np.any(source_counts <= 0):
                 raise ValueError("candidate source counts must be strictly positive")
         for name, value in (
-            ("graph_fingerprint", self.graph_fingerprint),
             ("fingerprint", self.fingerprint),
             ("sparse_schema_version", self.sparse_schema_version),
         ):
             if not isinstance(value, str) or not value.strip():
                 raise ValueError(f"{name} must be a non-blank string")
-        if self.sparse_schema_version != SPARSE_CANDIDATE_CONTRIBUTION_SCHEMA_VERSION:
+        if self.sparse_schema_version not in {
+            SPARSE_CANDIDATE_CONTRIBUTION_SCHEMA_VERSION,
+            SPARSE_STREAMED_CANDIDATE_CONTRIBUTION_SCHEMA_VERSION,
+        }:
             raise ValueError("unsupported sparse candidate contribution schema version")
         if not math.isclose(
             tolerance,
@@ -789,6 +979,15 @@ class SparseCandidateContributions:
         object.__setattr__(self, "row_count", row_count)
         object.__setattr__(self, "candidate_source_counts", source_counts)
         object.__setattr__(self, "numerical_tolerance", tolerance)
+        operator_fingerprint = self.kernel_operator_fingerprint or self.graph_fingerprint
+        if not isinstance(operator_fingerprint, str) or not operator_fingerprint.strip():
+            raise ValueError("kernel_operator_fingerprint must be non-blank")
+        if (
+            self.sparse_schema_version == SPARSE_CANDIDATE_CONTRIBUTION_SCHEMA_VERSION
+            and (not isinstance(self.graph_fingerprint, str) or not self.graph_fingerprint.strip())
+        ):
+            raise ValueError("graph_fingerprint is required for graph-backed contributions")
+        object.__setattr__(self, "kernel_operator_fingerprint", operator_fingerprint)
 
     @property
     def n_candidates(self) -> int:
@@ -805,6 +1004,12 @@ class SparseCandidateContributions:
     @property
     def nnz(self) -> int:
         return self.entry_count
+
+    @property
+    def kernel_source_fingerprint(self) -> str:
+        """Canonical identity of the exact kernel operator that produced q_C."""
+
+        return self.kernel_operator_fingerprint
 
     @property
     def array_bytes(self) -> int:
@@ -892,6 +1097,7 @@ class EntropyObjectiveState:
     fingerprint: str
     numerical_tolerance: float = SPARSE_NUMERICAL_TOLERANCE
     schema_version: str = ENTROPY_OBJECTIVE_SCHEMA_VERSION
+    kernel_operator_fingerprint: str = ""
 
     def __post_init__(self) -> None:
         probabilities = _readonly_objective_vector(self.probabilities, name="probabilities")
@@ -943,7 +1149,6 @@ class EntropyObjectiveState:
             raise ValueError("unsupported entropy objective schema version")
         for name, value in (
             ("pool_fingerprint", self.pool_fingerprint),
-            ("graph_fingerprint", self.graph_fingerprint),
             ("contributions_fingerprint", self.contributions_fingerprint),
             ("fingerprint", self.fingerprint),
         ):
@@ -978,6 +1183,10 @@ class EntropyObjectiveState:
         object.__setattr__(self, "objective", float(self.objective))
         object.__setattr__(self, "anchor_objective", float(self.anchor_objective))
         object.__setattr__(self, "numerical_tolerance", tolerance)
+        operator_fingerprint = self.kernel_operator_fingerprint or self.graph_fingerprint
+        if not isinstance(operator_fingerprint, str) or not operator_fingerprint.strip():
+            raise ValueError("kernel_operator_fingerprint must be non-blank")
+        object.__setattr__(self, "kernel_operator_fingerprint", operator_fingerprint)
 
     @property
     def support(self) -> np.ndarray:
@@ -1237,6 +1446,7 @@ class EntropySelectionResult:
     performance: EntropySelectionPerformance
     final_normalized_support: tuple[float, ...]
     structure_provenance: tuple[tuple[str, str], ...] = ()
+    kernel_operator_fingerprint: str = ""
 
     def __post_init__(self) -> None:
         if self.method not in {"full_greedy", "lazy_greedy"}:
@@ -1279,12 +1489,15 @@ class EntropySelectionResult:
                 raise ValueError(f"{name} must be finite")
         for name, value in (
             ("pool_fingerprint", self.pool_fingerprint),
-            ("graph_fingerprint", self.graph_fingerprint),
             ("contributions_fingerprint", self.contributions_fingerprint),
             ("state_fingerprint", self.state_fingerprint),
         ):
             if not isinstance(value, str) or not value.strip():
                 raise ValueError(f"{name} must be non-blank")
+        operator_fingerprint = self.kernel_operator_fingerprint or self.graph_fingerprint
+        if not isinstance(operator_fingerprint, str) or not operator_fingerprint.strip():
+            raise ValueError("kernel_operator_fingerprint must be non-blank")
+        object.__setattr__(self, "kernel_operator_fingerprint", operator_fingerprint)
         normalized_support = tuple(float(value) for value in self.final_normalized_support)
         if not normalized_support or any(
             not math.isfinite(value) or value <= 0.0 for value in normalized_support
@@ -1430,6 +1643,8 @@ __all__ = [
     "NEIGHBOUR_DISTINCT_POLICY",
     "NEIGHBOUR_METRIC",
     "SPARSE_CANDIDATE_CONTRIBUTION_SCHEMA_VERSION",
+    "SPARSE_STREAMED_CANDIDATE_CONTRIBUTION_SCHEMA_VERSION",
+    "KERNEL_OPERATOR_SCHEMA_VERSION",
     "ENTROPY_OBJECTIVE_SCHEMA_VERSION",
     "SPARSE_KERNEL_GRAPH_SCHEMA_VERSION",
     "SPARSE_NUMERICAL_TOLERANCE",
@@ -1437,6 +1652,7 @@ __all__ = [
     "SparseAtomicKernelRow",
     "SparseCandidateContributionRow",
     "SparseCandidateContributions",
+    "StreamedKernelExecutionSummary",
     "GreedySelectionHistory",
     "GreedySelectionPerformance",
     "GreedySelectionResult",

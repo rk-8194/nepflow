@@ -13,6 +13,7 @@ from nepflow.io.hashing import sha256_canonical_json
 from .models import (
     ENTROPY_OBJECTIVE_SCHEMA_VERSION,
     SPARSE_CANDIDATE_CONTRIBUTION_SCHEMA_VERSION,
+    SPARSE_STREAMED_CANDIDATE_CONTRIBUTION_SCHEMA_VERSION,
     SPARSE_NUMERICAL_TOLERANCE,
     EntropyObjectiveDiagnostics,
     EntropyObjectiveState,
@@ -66,12 +67,18 @@ def _validate_objective_inputs(
     )
     if contribution_pool_fingerprint != pool_fingerprint:
         raise ValueError("candidate contributions belong to a different entropy pool")
-    _validate_identity(contributions.graph_fingerprint, name="graph fingerprint")
+    _validate_identity(
+        contributions.kernel_operator_fingerprint,
+        name="kernel operator fingerprint",
+    )
     contribution_fingerprint = _validate_identity(
         contributions.fingerprint,
         name="contribution fingerprint",
     )
-    if contributions.sparse_schema_version != SPARSE_CANDIDATE_CONTRIBUTION_SCHEMA_VERSION:
+    if contributions.sparse_schema_version not in {
+        SPARSE_CANDIDATE_CONTRIBUTION_SCHEMA_VERSION,
+        SPARSE_STREAMED_CANDIDATE_CONTRIBUTION_SCHEMA_VERSION,
+    }:
         raise ValueError("candidate contributions use an incompatible schema version")
     if not math.isclose(
         contributions.numerical_tolerance,
@@ -186,6 +193,7 @@ def _state_fingerprint(
     *,
     pool_fingerprint: str,
     graph_fingerprint: str,
+    kernel_operator_fingerprint: str,
     contributions_fingerprint: str,
     selected_indices: tuple[int, ...],
     beta: float,
@@ -197,6 +205,7 @@ def _state_fingerprint(
         "schema": ENTROPY_OBJECTIVE_SCHEMA_VERSION,
         "pool": pool_fingerprint,
         "graph": graph_fingerprint,
+        "kernel_operator": kernel_operator_fingerprint,
         "contributions": contributions_fingerprint,
         "selected_indices": list(selected_indices),
         "beta": beta,
@@ -271,8 +280,8 @@ def _validate_state_compatibility(
         raise ValueError("objective state belongs to different candidate contributions")
     if state.pool_fingerprint != contributions.pool_fingerprint:
         raise ValueError("objective state and contributions have mismatched pool identities")
-    if state.graph_fingerprint != contributions.graph_fingerprint:
-        raise ValueError("objective state belongs to different kernel graph contributions")
+    if state.kernel_operator_fingerprint != contributions.kernel_operator_fingerprint:
+        raise ValueError("objective state belongs to different kernel operator contributions")
     if state.candidate_ids != tuple(contributions.candidate_ids):
         raise ValueError("objective state and contributions have different candidate ordering")
     if state.n_targets != contributions.row_count:
@@ -392,6 +401,7 @@ def initialize_entropy_objective(
     fingerprint = _state_fingerprint(
         pool_fingerprint=pool.fingerprint,
         graph_fingerprint=contributions.graph_fingerprint,
+        kernel_operator_fingerprint=contributions.kernel_operator_fingerprint,
         contributions_fingerprint=contribution_fingerprint,
         selected_indices=tuple(anchor_indices),
         beta=beta_value,
@@ -412,6 +422,7 @@ def initialize_entropy_objective(
         anchor_objective=objective,
         pool_fingerprint=pool.fingerprint,
         graph_fingerprint=contributions.graph_fingerprint,
+        kernel_operator_fingerprint=contributions.kernel_operator_fingerprint,
         contributions_fingerprint=contribution_fingerprint,
         fingerprint=fingerprint,
     )
@@ -490,6 +501,7 @@ def apply_candidate(
     state.fingerprint = _state_fingerprint(
         pool_fingerprint=state.pool_fingerprint,
         graph_fingerprint=state.graph_fingerprint,
+        kernel_operator_fingerprint=state.kernel_operator_fingerprint,
         contributions_fingerprint=state.contributions_fingerprint,
         selected_indices=new_indices,
         beta=state.beta,

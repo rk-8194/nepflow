@@ -329,9 +329,12 @@ entropy_bandwidth_max_index_bytes=
 entropy_bandwidth_max_radius_query_bytes=268435456
 entropy_bandwidth_max_calibration_work_bytes=536870912
 entropy_bandwidth_calibration_batch_size=
+# Atomic graph limits apply only to the bounded reference/debug graph API;
+# production information_entropy streams exact candidate contributions.
 entropy_max_edges=1000000
 entropy_max_graph_bytes=
 entropy_max_graph_spool_bytes=
+# Candidate capacity for the production streamed q_C CSR and its temporary spool.
 entropy_max_entries=1000000
 entropy_max_contribution_bytes=
 entropy_max_contribution_spool_bytes=

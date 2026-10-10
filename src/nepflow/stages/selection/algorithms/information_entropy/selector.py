@@ -16,7 +16,7 @@ from nepflow.stages.selection.representations import LocalEnvironmentRepresentat
 
 from ..base import SelectionAlgorithmRequest, SelectionAlgorithmResult
 from .bandwidth import build_entropy_pool, calibrate_bandwidth
-from .kernels import aggregate_candidate_contributions, build_sparse_atomic_kernel_graph
+from .kernels import build_streamed_candidate_contributions
 from .models import (
     EntropyBandwidthSettings,
     EntropyObjectiveState,
@@ -398,6 +398,7 @@ def _result(
         final_forward_kl=diagnostics.kl_divergence,
         pool_fingerprint=state.pool_fingerprint,
         graph_fingerprint=state.graph_fingerprint,
+        kernel_operator_fingerprint=state.kernel_operator_fingerprint,
         contributions_fingerprint=state.contributions_fingerprint,
         state_fingerprint=state.fingerprint,
         performance=counters.performance(time.perf_counter() - started),
@@ -410,7 +411,7 @@ def _start_log(method: str, prepared: _PreparedSelection, logger: logging.Logger
     state = prepared.state
     logger.info(
         "%s start: M=%d, N=%d, K=%d, anchors=%d, remaining=%d, beta=%.17g, "
-        "graph=%s, contributions=%s, tie_rule=largest_exact_gain_then_lexicographic_id",
+        "kernel_operator=%s, contributions=%s, tie_rule=largest_exact_gain_then_lexicographic_id",
         method,
         len(state.candidate_ids),
         state.n_targets,
@@ -418,7 +419,7 @@ def _start_log(method: str, prepared: _PreparedSelection, logger: logging.Logger
         len(prepared.anchor_ids),
         state.budget - state.selected_count,
         state.beta,
-        state.graph_fingerprint,
+        state.kernel_operator_fingerprint,
         state.contributions_fingerprint,
     )
 
@@ -869,23 +870,21 @@ class InformationEntropySelectionAlgorithm:
             calibration.objective if calibration.objective is not None else "n/a",
         )
         bandwidth = calibration.selected
-        graph = build_sparse_atomic_kernel_graph(
+        # The production operator streams exact normalized source columns
+        # directly into candidate PMFs.  max_edges/max_graph_* remain limits
+        # for the bounded graph reference API and do not constrain implicit E.
+        contributions, execution = build_streamed_candidate_contributions(
             pool,
             bandwidth,
             chunk_size=bandwidth_settings.chunk_size,
-            max_edges=int(self._entropy_value(request.options, "max_edges", 1_000_000)),
-            max_graph_bytes=self._entropy_value(request.options, "max_graph_bytes", None),
-            max_spool_bytes=self._entropy_value(request.options, "max_graph_spool_bytes", None),
-            max_radius_query_bytes=bandwidth_settings.radius_query_bytes,
-        )
-        contributions = aggregate_candidate_contributions(
-            graph,
             max_entries=int(self._entropy_value(request.options, "max_entries", 1_000_000)),
-            max_graph_bytes=self._entropy_value(request.options, "max_contribution_bytes", None)
-            or self._entropy_value(request.options, "max_graph_bytes", None),
+            max_contribution_bytes=self._entropy_value(
+                request.options, "max_contribution_bytes", None
+            ),
             max_spool_bytes=self._entropy_value(
                 request.options, "max_contribution_spool_bytes", None
             ),
+            max_radius_query_bytes=bandwidth_settings.radius_query_bytes,
         )
         method = str(self._entropy_value(request.options, "optimizer_method", "lazy_greedy"))
         optimizer = full_greedy if method == "full_greedy" else lazy_greedy
@@ -911,7 +910,8 @@ class InformationEntropySelectionAlgorithm:
         diagnostics = {
             "entropy_result": entropy_result,
             "calibration": calibration,
-            "graph": graph,
+            "graph": execution,
+            "execution": execution,
             "contributions": contributions,
             "pool": pool,
         }

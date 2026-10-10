@@ -7,7 +7,7 @@ import logging
 import math
 import tempfile
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -20,12 +20,14 @@ from .models import (
     DEFAULT_RADIUS_QUERY_BYTES,
     INDEXED_NEIGHBOUR_BACKEND_ID,
     INDEXED_NEIGHBOUR_BACKEND_VERSION,
+    KERNEL_OPERATOR_SCHEMA_VERSION,
     KERNEL_FAMILY,
     KERNEL_VERSION,
     NEIGHBOUR_BACKEND_ID,
     NEIGHBOUR_BACKEND_VERSION,
     NEIGHBOUR_METRIC,
     SPARSE_CANDIDATE_CONTRIBUTION_SCHEMA_VERSION,
+    SPARSE_STREAMED_CANDIDATE_CONTRIBUTION_SCHEMA_VERSION,
     SPARSE_KERNEL_GRAPH_SCHEMA_VERSION,
     SPARSE_NUMERICAL_TOLERANCE,
     BandwidthCalibrationResult,
@@ -34,6 +36,7 @@ from .models import (
     KernelMetadata,
     SparseAtomicKernelGraph,
     SparseCandidateContributions,
+    StreamedKernelExecutionSummary,
 )
 from .neighbours import (
     IndexedCPUNeighbourIndex,
@@ -348,6 +351,7 @@ def iter_normalized_kernel_columns(
     support_provider: _KernelSupportProvider | None = None,
     max_radius_query_bytes: int = DEFAULT_RADIUS_QUERY_BYTES,
     capacity_context: str | None = None,
+    source_indices: Sequence[int] | np.ndarray | None = None,
 ) -> Iterator[NormalizedKernelColumn]:
     """Yield positive normalized source columns using bounded workspaces.
 
@@ -368,7 +372,17 @@ def iter_normalized_kernel_columns(
         max_radius_query_bytes=max_radius_query_bytes,
         capacity_context=capacity_context,
     )
-    for source_index, scale in enumerate(scales):
+    if source_indices is None:
+        ordered_sources = range(values.shape[0])
+    else:
+        ordered_sources = tuple(int(source_index) for source_index in source_indices)
+        if any(
+            source_index < 0 or source_index >= values.shape[0]
+            for source_index in ordered_sources
+        ):
+            raise ValueError("source_indices contains an out-of-range source row")
+    for source_index in ordered_sources:
+        scale = scales[source_index]
         target_indices, distances = provider.support(source_index, float(scale))
         normaliser = provider.normaliser(
             source_index,
@@ -835,6 +849,42 @@ def _graph_fingerprint(
     return sha256_canonical_json(payload)
 
 
+def _kernel_operator_fingerprint(
+    pool: EntropyPool,
+    bandwidths: FrozenBandwidths,
+) -> str:
+    """Fingerprint the exact kernel operator without materialising its support."""
+
+    return sha256_canonical_json(
+        {
+            "schema": KERNEL_OPERATOR_SCHEMA_VERSION,
+            "pool": pool.fingerprint,
+            "transform": pool.transform_fingerprint,
+            "representation": pool.representation_fingerprint,
+            "candidate_ids": list(pool.candidate_ids),
+            "row_candidate_indices": _array_digest(pool.row_candidate_indices),
+            "bandwidth": bandwidths.fingerprint,
+            "bandwidth_values": _array_digest(bandwidths.bandwidths),
+            "k": bandwidths.k,
+            "c": bandwidths.c,
+            "neighbour_backend": bandwidths.backend,
+            "neighbour_backend_version": bandwidths.backend_version,
+            "neighbour_backend_fingerprint": bandwidths.backend_fingerprint,
+            "metric": bandwidths.metric,
+            "distinct_location_policy": "exact-coordinate-location-v1",
+            "kernel_family": KERNEL_FAMILY,
+            "kernel_version": KERNEL_VERSION,
+            "normalization": "finite-pool-source-column-v1",
+            "source_bandwidth_orientation": "h_a",
+            "duplicate_target_policy": "retain-all-original-pool-rows-v1",
+            "source_reduction_order": "candidate-id-then-original-source-index-v1",
+            "target_order": "ascending-original-pool-row-index",
+            "dtype": "float64",
+            "numerical_tolerance": SPARSE_NUMERICAL_TOLERANCE,
+        }
+    )
+
+
 def _report_graph_progress(
     completed: int,
     total: int,
@@ -1098,6 +1148,378 @@ def build_sparse_atomic_kernel_graph(
         elapsed,
     )
     return graph
+
+
+def _measured_peak_memory_bytes() -> int | None:
+    """Read the Linux high-water mark when available, without a dependency."""
+
+    try:
+        with open("/proc/self/status", encoding="utf-8") as handle:
+            for line in handle:
+                if line.startswith("VmHWM:"):
+                    return int(line.split()[1]) * 1024
+    except (OSError, ValueError):
+        return None
+    return None
+
+
+def build_streamed_candidate_contributions(
+    pool: EntropyPool,
+    bandwidths: FrozenBandwidths | BandwidthCalibrationResult,
+    *,
+    chunk_size: int = 1024,
+    max_entries: int = _DEFAULT_SPARSE_EDGE_LIMIT,
+    max_contribution_bytes: int | None = None,
+    max_spool_bytes: int | None = None,
+    progress_callback: SourceProgressCallback | None = None,
+    max_radius_query_bytes: int = DEFAULT_RADIUS_QUERY_BYTES,
+) -> tuple[SparseCandidateContributions, StreamedKernelExecutionSummary]:
+    """Build exact candidate PMFs by streaming normalized source columns.
+
+    Sources are queried once, in candidate-ID/source-row order.  A reusable
+    dense accumulator is reduced to one candidate row before the next source
+    group is processed; only the final candidate CSR is retained.
+    """
+
+    values, frozen = _validate_sparse_graph_inputs(pool, bandwidths)
+    block = _validate_chunk_size(chunk_size)
+    entry_limit = _validate_sparse_limit(max_entries, "max_entries")
+    byte_limit = (
+        None
+        if max_contribution_bytes is None
+        else _validate_sparse_limit(max_contribution_bytes, "max_contribution_bytes")
+    )
+    spool_limit = _validate_spool_limit(max_spool_bytes, "max_contribution_spool_bytes")
+    if spool_limit is None:
+        spool_limit = len(_EDGE_SPOOL_HEADER) + entry_limit * _EDGE_SPOOL_RECORD_BYTES
+    if spool_limit < len(_EDGE_SPOOL_HEADER):
+        raise ValueError(
+            "max_contribution_spool_bytes is too small for the candidate contribution spool header"
+        )
+    if progress_callback is not None and not callable(progress_callback):
+        raise TypeError("progress_callback must be callable")
+
+    n_rows = int(values.shape[0])
+    candidate_ids = tuple(pool.candidate_ids)
+    candidate_count = len(candidate_ids)
+    owners = np.asarray(pool.row_candidate_indices, dtype=np.int64)
+    source_counts = np.bincount(owners, minlength=candidate_count).astype(np.int64)
+    if np.any(source_counts <= 0):
+        missing = candidate_ids[int(np.flatnonzero(source_counts <= 0)[0])]
+        raise ValueError(f"candidate {missing!r} owns no source rows")
+    source_order = np.argsort(owners, kind="stable")
+    candidate_offsets = np.empty(candidate_count + 1, dtype=np.int64)
+    candidate_offsets[0] = 0
+    np.cumsum(source_counts, dtype=np.int64, out=candidate_offsets[1:])
+
+    operator_fingerprint = _kernel_operator_fingerprint(pool, frozen)
+    support_provider = _KernelSupportProvider(
+        values,
+        backend=frozen.backend,
+        chunk_size=block,
+        max_radius_query_bytes=max_radius_query_bytes,
+        capacity_context=(
+            f"N={n_rows}, M={candidate_count}, operator={operator_fingerprint}"
+        ),
+    )
+    if (
+        frozen.backend == INDEXED_NEIGHBOUR_BACKEND_ID
+        and frozen.backend_fingerprint
+        and support_provider.index is not None
+        and frozen.backend_fingerprint != support_provider.index.fingerprint
+    ):
+        raise ValueError("frozen bandwidths have a mismatched indexed backend fingerprint")
+
+    def estimated_peak_bytes(entry_count: int, support_count: int) -> int:
+        final_arrays = 8 * (candidate_count + 1 + entry_count + entry_count + candidate_count)
+        workspace = (
+            values.nbytes
+            + owners.nbytes
+            + source_order.nbytes
+            + source_counts.nbytes
+            + candidate_offsets.nbytes
+            + 8 * n_rows
+            + n_rows
+            + 32 * support_count
+            + (support_provider.index.index_bytes if support_provider.index is not None else 0)
+        )
+        return int(final_arrays + workspace)
+
+    logger.info(
+        "Streamed candidate contributions started: N=%d, M=%d, operator=%s, "
+        "max_entries=%d, max_contribution_bytes=%s, max_spool_bytes=%d",
+        n_rows,
+        candidate_count,
+        operator_fingerprint,
+        entry_limit,
+        byte_limit if byte_limit is not None else "unbounded",
+        spool_limit,
+    )
+    started = time.perf_counter()
+    support_sizes = np.empty(n_rows, dtype=np.int64)
+    candidate_support_sizes = np.empty(candidate_count, dtype=np.int64)
+    accumulator = np.zeros(n_rows, dtype=np.float64)
+    touched = np.zeros(n_rows, dtype=bool)
+    implicit_edges = 0
+    self_edges = 0
+    source_mass_deviation = 0.0
+    peak_estimated_bytes = estimated_peak_bytes(0, 0)
+    if byte_limit is not None and peak_estimated_bytes > byte_limit:
+        raise ValueError(
+            "streamed candidate contributions exceed max_contribution_bytes before "
+            "source enumeration: "
+            f"N={n_rows}, M={candidate_count}, Q=0, E=0, requested_bytes={peak_estimated_bytes}, "
+            f"limit={byte_limit}"
+        )
+    spool_bytes = len(_EDGE_SPOOL_HEADER)
+    completed_sources = 0
+    next_percent = [1]
+
+    def report_source(source_index: int, support_count: int) -> None:
+        nonlocal completed_sources
+        completed_sources += 1
+        if n_rows < 100 or completed_sources * 100 >= next_percent[0] * n_rows:
+            logger.info(
+                "Streamed candidate contributions progress: sources=%d/%d (%.1f%%), "
+                "implicit_edges=%d, Q=%d",
+                completed_sources,
+                n_rows,
+                100.0 * completed_sources / n_rows,
+                implicit_edges,
+                int(np.sum(candidate_support_sizes, dtype=np.int64)),
+            )
+            while next_percent[0] <= 100 and completed_sources * 100 >= next_percent[0] * n_rows:
+                next_percent[0] += 1
+        if progress_callback is not None:
+            progress_callback(completed_sources, n_rows)
+
+    try:
+        with tempfile.TemporaryFile(mode="w+b") as spool:
+            spool_digest = _spool_write_header(spool)
+            for candidate_index in range(candidate_count):
+                accumulator.fill(0.0)
+                touched.fill(False)
+                start_source = int(candidate_offsets[candidate_index])
+                stop_source = int(candidate_offsets[candidate_index + 1])
+                candidate_source_indices = source_order[start_source:stop_source]
+                for column in iter_normalized_kernel_columns(
+                    values,
+                    frozen.bandwidths,
+                    chunk_size=block,
+                    backend=frozen.backend,
+                    support_provider=support_provider,
+                    max_radius_query_bytes=max_radius_query_bytes,
+                    source_indices=candidate_source_indices,
+                ):
+                    source_index = int(column.source_index)
+                    scale = float(frozen.bandwidths[source_index])
+                    target_indices = np.asarray(column.target_indices, dtype=np.int64)
+                    normalized = np.asarray(column.values, dtype=np.float64)
+                    if (
+                        target_indices.ndim != 1
+                        or normalized.ndim != 1
+                        or target_indices.shape != normalized.shape
+                        or target_indices.size == 0
+                        or not np.all(np.isfinite(normalized))
+                        or np.any(normalized <= 0.0)
+                    ):
+                        raise ValueError(
+                            f"invalid normalized support: N={n_rows}, M={candidate_count}, "
+                            f"candidate={candidate_ids[candidate_index]!r}, source={source_index}, "
+                            f"h_a={scale:.17g}, E={implicit_edges}"
+                        )
+                    column_mass = float(np.sum(normalized, dtype=np.float64))
+                    if not math.isclose(
+                        column_mass, 1.0, rel_tol=0.0, abs_tol=SPARSE_NUMERICAL_TOLERANCE
+                    ):
+                        raise ValueError(
+                            f"source normalization failed: N={n_rows}, M={candidate_count}, "
+                            f"candidate={candidate_ids[candidate_index]!r}, source={source_index}, "
+                            f"h_a={scale:.17g}, mass={column_mass:.17g}, E={implicit_edges}"
+                        )
+                    support_count = int(target_indices.size)
+                    support_sizes[source_index] = support_count
+                    implicit_edges += support_count
+                    self_edges += int(np.count_nonzero(target_indices == source_index))
+                    source_mass_deviation = max(source_mass_deviation, abs(column_mass - 1.0))
+                    if np.any(target_indices[1:] <= target_indices[:-1]):
+                        order = np.argsort(target_indices, kind="stable")
+                        target_indices = target_indices[order]
+                        normalized = normalized[order]
+                    accumulator[target_indices] += normalized
+                    touched[target_indices] = True
+                    requested_bytes = estimated_peak_bytes(
+                        int(np.count_nonzero(touched)),
+                        support_count,
+                    )
+                    peak_estimated_bytes = max(peak_estimated_bytes, requested_bytes)
+                    if byte_limit is not None and requested_bytes > byte_limit:
+                        raise ValueError(
+                            "streamed candidate contributions exceed max_contribution_bytes: "
+                            f"N={n_rows}, M={candidate_count}, "
+                            f"candidate={candidate_ids[candidate_index]!r}, "
+                            f"n_C={stop_source - start_source}, source={source_index}, "
+                            f"h_a={scale:.17g}, Q={int(np.sum(candidate_support_sizes))}, "
+                            f"E={implicit_edges}, requested_bytes={requested_bytes}, "
+                            f"limit={byte_limit}"
+                        )
+                    report_source(source_index, support_count)
+
+                targets = np.flatnonzero(touched).astype(np.int64, copy=False)
+                values_for_candidate = np.asarray(
+                    accumulator[targets] / float(source_counts[candidate_index]), dtype=np.float64
+                )
+                if not np.all(np.isfinite(values_for_candidate)) or np.any(
+                    values_for_candidate <= 0.0
+                ):
+                    raise ValueError(
+                        "streamed candidate contribution is non-finite or non-positive"
+                    )
+                mass = float(np.sum(values_for_candidate, dtype=np.float64))
+                if not math.isclose(
+                    mass, 1.0, rel_tol=0.0, abs_tol=SPARSE_NUMERICAL_TOLERANCE
+                ):
+                    raise ValueError(
+                        f"candidate {candidate_ids[candidate_index]!r} contribution is not "
+                        "normalized"
+                    )
+                support = int(targets.size)
+                candidate_support_sizes[candidate_index] = support
+                completed_entries = int(
+                    np.sum(candidate_support_sizes[: candidate_index + 1], dtype=np.int64)
+                )
+                if completed_entries > entry_limit:
+                    raise ValueError(
+                        "streamed candidate contributions exceed max_entries: "
+                        f"N={n_rows}, M={candidate_count}, "
+                        f"candidate={candidate_ids[candidate_index]!r}, "
+                        f"n_C={stop_source - start_source}, source=-1, h_a=aggregate, "
+                        f"Q={completed_entries}, E={implicit_edges}, max_entries={entry_limit}"
+                    )
+                prospective_spool_bytes = spool_bytes + support * _EDGE_SPOOL_RECORD_BYTES
+                if prospective_spool_bytes > spool_limit:
+                    raise ValueError(
+                        "streamed candidate contribution spool exceeds its capacity: "
+                        f"N={n_rows}, M={candidate_count}, "
+                        f"candidate={candidate_ids[candidate_index]!r}, "
+                        f"n_C={stop_source - start_source}, Q={completed_entries}, "
+                        f"E={implicit_edges}, "
+                        f"requested_bytes={prospective_spool_bytes}, limit={spool_limit}"
+                    )
+                records = np.empty(support, dtype=_EDGE_SPOOL_DTYPE)
+                records["target"] = targets
+                records["value"] = values_for_candidate
+                _spool_write_records(spool, spool_digest, records)
+                spool_bytes = prospective_spool_bytes
+
+            if completed_sources != n_rows:
+                raise ValueError("streamed candidate contribution did not query every source row")
+            entry_count = int(np.sum(candidate_support_sizes, dtype=np.int64))
+            candidate_indptr = np.empty(candidate_count + 1, dtype=np.int64)
+            candidate_indptr[0] = 0
+            np.cumsum(candidate_support_sizes, dtype=np.int64, out=candidate_indptr[1:])
+            final_bytes = estimated_peak_bytes(entry_count, 0)
+            peak_estimated_bytes = max(peak_estimated_bytes, final_bytes)
+            if byte_limit is not None and final_bytes > byte_limit:
+                raise ValueError(
+                    "streamed candidate contributions exceed max_contribution_bytes "
+                    "before final CSR: "
+                    f"N={n_rows}, M={candidate_count}, Q={entry_count}, E={implicit_edges}, "
+                    f"requested_bytes={final_bytes}, limit={byte_limit}"
+                )
+            target_indices = np.empty(entry_count, dtype=np.int64)
+            contribution_values = np.empty(entry_count, dtype=np.float64)
+            spool.seek(0)
+            if spool.read(len(_EDGE_SPOOL_HEADER)) != _EDGE_SPOOL_HEADER:
+                raise ValueError("candidate contribution spool has an invalid version header")
+            read_digest = hashlib.sha256()
+            read_digest.update(_EDGE_SPOOL_HEADER)
+            cursor = 0
+            for records in _spool_read_records(spool, read_digest, entry_count):
+                count = records.shape[0]
+                target_indices[cursor : cursor + count] = records["target"]
+                contribution_values[cursor : cursor + count] = records["value"]
+                cursor += count
+            if spool.read(1) or cursor != entry_count:
+                raise ValueError("candidate contribution spool contains an invalid record count")
+            if read_digest.digest() != spool_digest.digest():
+                raise ValueError("candidate contribution spool checksum validation failed")
+
+        candidate_fingerprint = sha256_canonical_json(
+            {
+                "schema": SPARSE_STREAMED_CANDIDATE_CONTRIBUTION_SCHEMA_VERSION,
+                "kernel_operator": operator_fingerprint,
+                "candidate_ids": list(candidate_ids),
+                "candidate_indptr": _array_digest(candidate_indptr),
+                "target_indices": _array_digest(target_indices),
+                "values": _array_digest(contribution_values),
+                "candidate_source_counts": _array_digest(source_counts),
+            }
+        )
+        contributions = SparseCandidateContributions(
+            candidate_indptr=candidate_indptr,
+            target_indices=target_indices,
+            values=contribution_values,
+            candidate_ids=candidate_ids,
+            graph_fingerprint="",
+            kernel_operator_fingerprint=operator_fingerprint,
+            fingerprint=candidate_fingerprint,
+            row_count=n_rows,
+            candidate_source_counts=source_counts,
+            pool_fingerprint=pool.fingerprint,
+            sparse_schema_version=SPARSE_STREAMED_CANDIDATE_CONTRIBUTION_SCHEMA_VERSION,
+        )
+    except Exception as exc:
+        logger.error("Streamed candidate contributions failed: %s", exc)
+        raise
+
+    summary = StreamedKernelExecutionSummary(
+        atomic_row_count=n_rows,
+        implicit_edge_count=implicit_edges,
+        source_support_min=int(np.min(support_sizes)),
+        source_support_mean=float(np.mean(support_sizes)),
+        source_support_max=int(np.max(support_sizes)),
+        self_edge_count=self_edges,
+        source_mass_max_deviation=source_mass_deviation,
+        candidate_entry_count=contributions.entry_count,
+        candidate_support_min=int(np.min(candidate_support_sizes)),
+        candidate_support_mean=float(np.mean(candidate_support_sizes)),
+        candidate_support_max=int(np.max(candidate_support_sizes)),
+        candidate_pmf_max_deviation=float(
+            np.max(
+                np.abs(
+                    np.add.reduceat(
+                        contributions.values, contributions.candidate_indptr[:-1]
+                    )
+                    - 1.0
+                )
+            )
+        ),
+        candidate_csr_array_bytes=contributions.array_bytes,
+        contribution_spool_bytes=spool_bytes,
+        estimated_peak_memory_bytes=peak_estimated_bytes,
+        measured_peak_memory_bytes=_measured_peak_memory_bytes(),
+        pool_fingerprint=pool.fingerprint,
+        bandwidth_fingerprint=frozen.fingerprint,
+        transform_fingerprint=pool.transform_fingerprint,
+        backend=frozen.backend,
+        metric=frozen.metric,
+        backend_version=frozen.backend_version,
+        kernel_operator_fingerprint=operator_fingerprint,
+        source_query_count=completed_sources,
+    )
+    logger.info(
+        "Streamed candidate contributions completed: E=%d (implicit), Q=%d, "
+        "atomic_graph_materialized=false, final_csr_bytes=%d, spool_bytes=%d, "
+        "peak_estimated_bytes=%d, elapsed=%.3fs",
+        summary.E,
+        summary.Q,
+        summary.candidate_csr_array_bytes,
+        summary.contribution_spool_bytes,
+        summary.estimated_peak_memory_bytes,
+        max(0.0, time.perf_counter() - started),
+    )
+    return contributions, summary
 
 
 def _coerce_graph_and_pool(
@@ -1413,6 +1835,8 @@ def aggregate_candidate_contributions(
     return contributions
 
 
+build_direct_candidate_contributions = build_streamed_candidate_contributions
+stream_candidate_contributions = build_streamed_candidate_contributions
 build_sparse_candidate_contributions = aggregate_candidate_contributions
 build_candidate_contributions = aggregate_candidate_contributions
 compute_candidate_contributions = aggregate_candidate_contributions
@@ -1430,6 +1854,7 @@ evaluate_loo_objective = evaluate_leave_one_out_objective
 __all__ = [
     "KERNEL_FAMILY",
     "KERNEL_VERSION",
+    "KERNEL_OPERATOR_SCHEMA_VERSION",
     "KernelMetadata",
     "LeaveOneOutObjective",
     "NormalizedKernelColumn",
@@ -1440,12 +1865,16 @@ __all__ = [
     "BatchSourceProgressCallback",
     "SparseAtomicKernelGraph",
     "SparseCandidateContributions",
+    "StreamedKernelExecutionSummary",
     "aggregate_candidate_contributions",
     "aggregate_sparse_candidate_contributions",
     "build_atomic_kernel_graph",
     "build_candidate_contributions",
     "build_sparse_atomic_kernel_graph",
     "build_sparse_candidate_contributions",
+    "build_streamed_candidate_contributions",
+    "build_direct_candidate_contributions",
+    "stream_candidate_contributions",
     "build_sparse_kernel_graph",
     "compute_candidate_contributions",
     "construct_atomic_kernel_graph",

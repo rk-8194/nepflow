@@ -779,7 +779,11 @@ Tie-breaking must use a stable rule, preferably stable structure identity.
 
 The method must not construct or retain a dense (N	imes N) similarity matrix for large candidate populations.
 
-The local kernel is represented as a sparse graph.
+The local kernel has an exact sparse-support graph as its mathematical
+representation.  Production selection may evaluate that operator by streaming
+each exact normalized source column directly into the candidate contribution
+accumulator instead of materialising the atomic graph.  This is an equivalent
+implementation of the same finite-pool kernel, not a change to the formalism.
 
 Each source environment (a) stores only target environments (i) for which:
 
@@ -793,7 +797,7 @@ For a compactly supported kernel, this sparsity is exact rather than an approxim
 
 The implementation should use sparse compressed arrays suitable for batched CPU/GPU processing.
 
-Conceptually store edges:
+For bounded reference and debugging runs, conceptually store edges:
 
 [
 (a,i,kappa_{ia}).
@@ -806,6 +810,11 @@ q_C(i).
 ]
 
 Duplicate target indices contributed by multiple atoms in the same structure must be summed during aggregation.
+
+Sparse candidate contributions remain mandatory for the objective.  Atomic
+graph CSR materialisation is optional and is not part of the default production
+path; streamed execution must still report the exact implicit edge count and
+source-support diagnostics.
 
 ### 15.3 Update complexity
 

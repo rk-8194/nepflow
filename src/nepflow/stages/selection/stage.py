@@ -23,6 +23,7 @@ from .algorithms.information_entropy import (
     EntropyPool,
     SparseAtomicKernelGraph,
     SparseCandidateContributions,
+    StreamedKernelExecutionSummary,
     build_entropy_diagnostics,
     build_entropy_pool,
 )
@@ -446,7 +447,14 @@ class SelectionStage:
                 "train_entropy_cross_entropy": entropy_result.final_cross_entropy,
                 "train_entropy_forward_kl": entropy_result.final_forward_kl,
                 "train_entropy_pool_fingerprint": entropy_result.pool_fingerprint,
-                "train_entropy_graph_fingerprint": entropy_result.graph_fingerprint,
+                # Legacy result field retained as an operator-identity alias;
+                # diagnostics use the explicit kernel_operator field.
+                "train_entropy_graph_fingerprint": (
+                    entropy_result.graph_fingerprint or entropy_result.kernel_operator_fingerprint
+                ),
+                "train_entropy_kernel_operator_fingerprint": (
+                    entropy_result.kernel_operator_fingerprint
+                ),
                 "train_entropy_contributions_fingerprint": entropy_result.contributions_fingerprint,
                 "train_entropy_state_fingerprint": entropy_result.state_fingerprint,
             }
@@ -465,7 +473,11 @@ class SelectionStage:
                 "calibration_fingerprint": getattr(calibration, "calibration_fingerprint", None),
                 "selected_k": getattr(calibration, "k", None),
                 "selected_c": getattr(calibration, "c", None),
-                "graph_fingerprint": entropy_result.graph_fingerprint,
+                "graph_fingerprint": (
+                    entropy_result.graph_fingerprint or entropy_result.kernel_operator_fingerprint
+                ),
+                "kernel_operator_fingerprint": entropy_result.kernel_operator_fingerprint,
+                "atomic_graph_materialized": getattr(graph, "atomic_graph_materialized", True),
                 "graph_edge_count": getattr(graph, "edge_count", None),
                 "graph_array_bytes": getattr(graph, "array_bytes", None),
                 "contributions_fingerprint": entropy_result.contributions_fingerprint,
@@ -476,8 +488,8 @@ class SelectionStage:
                 raise StateError("Information-entropy selection did not retain its pool")
             if not isinstance(calibration, BandwidthCalibrationResult):
                 raise StateError("Information-entropy selection did not retain calibration")
-            if not isinstance(graph, SparseAtomicKernelGraph):
-                raise StateError("Information-entropy selection did not retain its graph")
+            if not isinstance(graph, (SparseAtomicKernelGraph, StreamedKernelExecutionSummary)):
+                raise StateError("Information-entropy selection did not retain kernel execution")
             if not isinstance(contributions, SparseCandidateContributions):
                 raise StateError("Information-entropy selection did not retain contributions")
             if not isinstance(local_representation, LocalEnvironmentRepresentation):
