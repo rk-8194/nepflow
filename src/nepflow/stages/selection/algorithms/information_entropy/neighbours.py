@@ -294,18 +294,23 @@ class IndexedCPUNeighbourIndex:
         self.unique_locations = np.ascontiguousarray(locations, dtype=np.float64)
         self.location_representatives = np.asarray(first_indices, dtype=np.int64)
         self.row_to_location = np.asarray(row_to_location, dtype=np.int64)
-        self._location_rows = tuple(
-            np.flatnonzero(self.row_to_location == location).astype(np.int64, copy=False)
-            for location in range(self.unique_locations.shape[0])
+        location_count = int(self.unique_locations.shape[0])
+        grouping_started = time.perf_counter()
+        self.rows_by_location = np.asarray(
+            np.argsort(self.row_to_location, kind="stable"),
+            dtype=np.int64,
         )
-        try:
-            from scipy.spatial import cKDTree  # pyright: ignore[reportAttributeAccessIssue]
-        except ImportError as exc:
-            raise ValueError(
-                f"neighbour backend {self.backend!r} is unavailable: scipy.spatial.cKDTree"
-            ) from exc
-        self._tree: Any = cKDTree(self.unique_locations, copy_data=True)
-        self._neighbour_cache: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+        location_counts = np.bincount(self.row_to_location, minlength=location_count).astype(
+            np.int64,
+            copy=False,
+        )
+        self.location_indptr = np.empty(location_count + 1, dtype=np.int64)
+        self.location_indptr[0] = 0
+        np.cumsum(location_counts, dtype=np.int64, out=self.location_indptr[1:])
+        self.rows_by_location.setflags(write=False)
+        self.location_indptr.setflags(write=False)
+        self.grouping_build_seconds = max(0.0, time.perf_counter() - grouping_started)
+        self.grouping_bytes = int(self.rows_by_location.nbytes + self.location_indptr.nbytes)
         self.max_radius_query_bytes = _validate_memory_limit(
             max_radius_query_bytes, "max_radius_query_bytes"
         )
@@ -317,7 +322,12 @@ class IndexedCPUNeighbourIndex:
         self.radius_queries = 0
         self.radius_query_preflights = 0
         self.distance_evaluations = 0
+        self.unique_distance_evaluations = 0
+        self.atomic_distance_evaluations = 0
         self.current_support_count = 0
+        self.min_support_count: int | None = None
+        self.support_count_total = 0
+        self.support_count_samples = 0
         self.max_support_count = 0
         self.query_workspace_peak_bytes = 0
         self.index_bytes = self._estimate_index_bytes()
@@ -332,8 +342,19 @@ class IndexedCPUNeighbourIndex:
                 raise ValueError(
                     "indexed exact neighbour backend exceeds max_index_bytes: "
                     f"N={values.shape[0]}, Q={self.unique_locations.shape[0]}, "
-                    f"estimated_peak_bytes={self.index_bytes}, max_index_bytes={int(max_index_bytes)}"
+                    f"estimated_peak_bytes={self.index_bytes}, "
+                    f"max_index_bytes={int(max_index_bytes)}"
                 )
+        try:
+            from scipy.spatial import cKDTree  # pyright: ignore[reportAttributeAccessIssue]
+        except ImportError as exc:
+            raise ValueError(
+                f"neighbour backend {self.backend!r} is unavailable: scipy.spatial.cKDTree"
+            ) from exc
+        tree_started = time.perf_counter()
+        self._tree: Any = cKDTree(self.unique_locations, copy_data=True)
+        self.tree_build_seconds = max(0.0, time.perf_counter() - tree_started)
+        self._neighbour_cache: dict[int, tuple[np.ndarray, np.ndarray]] = {}
         self.fingerprint = sha256_canonical_json(
             {
                 "backend": self.backend,
@@ -348,21 +369,21 @@ class IndexedCPUNeighbourIndex:
         )
 
     def _estimate_index_bytes(self) -> int:
-        n_rows = int(self.descriptors.shape[0])
         n_locations = int(self.unique_locations.shape[0])
-        # Include NumPy storage, row buckets, and a conservative cKDTree /
+        # Include NumPy storage, compact row grouping, and a conservative cKDTree /
         # Python-container allowance.  This is an operational upper estimate,
         # not a claim about the allocator's exact resident-set accounting.
         return int(
             self.unique_locations.nbytes
             + self.location_representatives.nbytes
             + self.row_to_location.nbytes
-            + 8 * n_rows
-            + 256 * n_locations
+            + self.rows_by_location.nbytes
+            + self.location_indptr.nbytes
+            + 128 * n_locations
             + 4096
         )
 
-    def memory_metrics(self) -> dict[str, int | None]:
+    def memory_metrics(self) -> dict[str, int | float | None]:
         """Return operational memory counters for progress diagnostics."""
 
         return {
@@ -370,10 +391,24 @@ class IndexedCPUNeighbourIndex:
             "support_cache_peak_bytes": 0,
             "neighbour_cache_bytes": int(self.neighbour_cache_bytes),
             "index_bytes": int(self.index_bytes),
+            "grouping_bytes": int(self.grouping_bytes),
+            "grouping_build_seconds": float(self.grouping_build_seconds),
+            "tree_build_seconds": float(self.tree_build_seconds),
             "query_workspace_peak_bytes": int(self.query_workspace_peak_bytes),
             "current_support_count": int(self.current_support_count),
+            "min_support_count": self.min_support_count,
+            "mean_support_count": (
+                self.support_count_total / self.support_count_samples
+                if self.support_count_samples
+                else None
+            ),
             "max_support_count": int(self.max_support_count),
+            "index_queries": int(self.index_queries),
             "radius_queries": int(self.radius_queries),
+            "radius_query_preflights": int(self.radius_query_preflights),
+            "distance_evaluations": int(self.distance_evaluations),
+            "unique_distance_evaluations": int(self.unique_distance_evaluations),
+            "atomic_distance_evaluations": int(self.atomic_distance_evaluations),
             **_process_memory_metrics(),
         }
 
@@ -531,6 +566,7 @@ class IndexedCPUNeighbourIndex:
                 self.unique_locations[initial_indices],
             )
             self.distance_evaluations += int(initial_indices.shape[0])
+            self.unique_distance_evaluations += int(initial_indices.shape[0])
             kth_boundary = float(np.sort(initial_distances)[k - 1])
             search_radius = kth_boundary + max(
                 16.0 * float(np.spacing(kth_boundary)),
@@ -550,6 +586,7 @@ class IndexedCPUNeighbourIndex:
                 max_workspace_bytes=self.max_radius_query_bytes,
             )
             self.distance_evaluations += int(boundary_indices.shape[0])
+            self.unique_distance_evaluations += int(boundary_indices.shape[0])
             positive = distances > 0.0
             boundary_indices = boundary_indices[positive]
             distances = distances[positive]
@@ -616,13 +653,15 @@ class IndexedCPUNeighbourIndex:
             max_workspace_bytes=self.max_radius_query_bytes,
         )
         self.distance_evaluations += int(location_indices.shape[0])
+        self.unique_distance_evaluations += int(location_indices.shape[0])
         included = location_distances < value
         included_locations = location_indices[included]
         included_distances = location_distances[included]
         if included_locations.size == 0:
             raise ValueError("positive kernel radius support omitted the source row")
         support_count = sum(
-            int(self._location_rows[int(location)].shape[0]) for location in included_locations
+            int(self.location_indptr[int(location) + 1] - self.location_indptr[int(location)])
+            for location in included_locations
         )
         estimated_bytes = _estimate_radius_workspace_bytes(
             int(location_indices.shape[0]),
@@ -641,14 +680,26 @@ class IndexedCPUNeighbourIndex:
         location_order = np.argsort(included_locations, kind="stable")
         ordered_locations = included_locations[location_order]
         ordered_distances = included_distances[location_order]
-        row_parts = [self._location_rows[int(location)] for location in ordered_locations]
+        row_parts = [
+            self.rows_by_location[
+                self.location_indptr[int(location)] : self.location_indptr[int(location) + 1]
+            ]
+            for location in ordered_locations
+        ]
         target_indices = np.concatenate(row_parts).astype(np.int64, copy=False)
         target_distances = np.repeat(ordered_distances, [part.shape[0] for part in row_parts])
         row_order = np.argsort(target_indices, kind="stable")
         target_indices = target_indices[row_order]
         target_distances = np.asarray(target_distances[row_order], dtype=np.float64)
         self.distance_evaluations += int(target_indices.shape[0])
+        self.atomic_distance_evaluations += int(target_indices.shape[0])
         self.current_support_count = int(target_indices.shape[0])
+        if self.min_support_count is None:
+            self.min_support_count = self.current_support_count
+        else:
+            self.min_support_count = min(self.min_support_count, self.current_support_count)
+        self.support_count_total += self.current_support_count
+        self.support_count_samples += 1
         self.max_support_count = max(self.max_support_count, self.current_support_count)
         if not np.any(target_indices == source):
             raise ValueError("positive kernel radius support omitted the source row")

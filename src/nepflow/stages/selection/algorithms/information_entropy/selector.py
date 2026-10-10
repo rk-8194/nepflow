@@ -822,6 +822,12 @@ class InformationEntropySelectionAlgorithm:
                     None if bandwidth.max_index_bytes is None else int(bandwidth.max_index_bytes)
                 ),
                 max_radius_query_bytes=int(bandwidth.max_radius_query_bytes),
+                max_calibration_work_bytes=int(bandwidth.max_calibration_work_bytes),
+                calibration_batch_size=(
+                    None
+                    if bandwidth.calibration_batch_size is None
+                    else int(bandwidth.calibration_batch_size)
+                ),
             )
         return EntropyBandwidthSettings()
 
@@ -869,7 +875,7 @@ class InformationEntropySelectionAlgorithm:
             chunk_size=bandwidth_settings.chunk_size,
             max_edges=int(self._entropy_value(request.options, "max_edges", 1_000_000)),
             max_graph_bytes=self._entropy_value(request.options, "max_graph_bytes", None),
-            max_radius_query_bytes=bandwidth_settings.operational_work_bytes,
+            max_radius_query_bytes=bandwidth_settings.radius_query_bytes,
         )
         contributions = aggregate_candidate_contributions(
             graph,

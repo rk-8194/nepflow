@@ -87,6 +87,18 @@ def main() -> None:
         f"neighbours: distinct_locations={len(neighbours.unique_locations)}, "
         f"index_bytes={getattr(index, 'index_bytes', 0)}"
     )
+    index_metrics = index.memory_metrics() if index is not None else {}
+    print(
+        "index_metrics: "
+        f"grouping_seconds={index_metrics.get('grouping_build_seconds', 'unavailable')}, "
+        f"grouping_bytes={index_metrics.get('grouping_bytes', 'unavailable')}, "
+        f"tree_seconds={index_metrics.get('tree_build_seconds', 'unavailable')}, "
+        f"radius_queries={index_metrics.get('radius_queries', 'unavailable')}, "
+        f"unique_distance_evaluations="
+        f"{index_metrics.get('unique_distance_evaluations', 'unavailable')}, "
+        f"atomic_distance_evaluations="
+        f"{index_metrics.get('atomic_distance_evaluations', 'unavailable')}"
+    )
     settings = EntropyBandwidthSettings(
         mode="automatic",
         k_candidates=(1, 2),
@@ -94,6 +106,11 @@ def main() -> None:
         backend=args.backend,
     )
     calibration = _timed("calibration_loo", lambda: calibrate_bandwidth(pool, settings))
+    print(
+        f"calibration: c_count={len(settings.c_candidates)}, "
+        f"configured_c_batch_size={settings.calibration_batch_size or 'automatic'}, "
+        f"selected_k={calibration.selected.k}, selected_c={calibration.selected.c}"
+    )
     graph = _timed("sparse_graph", lambda: build_sparse_atomic_kernel_graph(pool, calibration))
     contributions = _timed(
         "candidate_aggregation", lambda: aggregate_candidate_contributions(graph)

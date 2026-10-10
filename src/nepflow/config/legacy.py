@@ -348,6 +348,12 @@ def _selection_values(config: NepflowConfig) -> dict[str, str]:
         "entropy_bandwidth_max_radius_query_bytes": str(
             selection.entropy.bandwidth.max_radius_query_bytes
         ),
+        "entropy_bandwidth_max_calibration_work_bytes": str(
+            selection.entropy.bandwidth.max_calibration_work_bytes
+        ),
+        "entropy_bandwidth_calibration_batch_size": ""
+        if selection.entropy.bandwidth.calibration_batch_size is None
+        else str(selection.entropy.bandwidth.calibration_batch_size),
         "entropy_max_edges": str(selection.entropy.max_edges),
         "entropy_max_graph_bytes": ""
         if selection.entropy.max_graph_bytes is None

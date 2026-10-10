@@ -15,6 +15,7 @@ import numpy as np
 from nepflow.io.hashing import sha256_canonical_json
 
 from .models import (
+    DEFAULT_CALIBRATION_WORK_BYTES,
     DEFAULT_RADIUS_QUERY_BYTES,
     INDEXED_NEIGHBOUR_BACKEND_ID,
     INDEXED_NEIGHBOUR_BACKEND_VERSION,
@@ -35,13 +36,17 @@ from .models import (
 )
 from .neighbours import (
     IndexedCPUNeighbourIndex,
+    RadiusQueryCapacityError,
+    _estimate_radius_workspace_bytes,
     _validate_chunk_size,
     _validate_descriptors,
+    _validate_memory_limit,
     build_neighbour_index,
     compute_radius_support,
 )
 
 SourceProgressCallback = Callable[[int, int], None]
+BatchSourceProgressCallback = Callable[[int, int], None]
 
 logger = logging.getLogger(__name__)
 
@@ -181,6 +186,9 @@ class _KernelSupportProvider:
         self.support_entries = 0
         self._normaliser_cache: dict[tuple[int, float], float] = {}
         self.current_support_count = 0
+        self.min_support_count: int | None = None
+        self.support_count_total = 0
+        self.support_count_samples = 0
         self.max_support_count = 0
         self.query_workspace_peak_bytes = 0
 
@@ -197,8 +205,15 @@ class _KernelSupportProvider:
             self.query_workspace_peak_bytes = self.index.query_workspace_peak_bytes
             self.support_entries += int(target_indices.shape[0])
             self.current_support_count = int(target_indices.shape[0])
+            if self.min_support_count is None:
+                self.min_support_count = self.current_support_count
+            else:
+                self.min_support_count = min(self.min_support_count, self.current_support_count)
+            self.support_count_total += self.current_support_count
+            self.support_count_samples += 1
             self.max_support_count = max(self.max_support_count, self.current_support_count)
             return target_indices, distances
+        self.radius_queries += 1
         targets, distances = compute_radius_support(
             self.descriptors,
             source_index,
@@ -211,6 +226,12 @@ class _KernelSupportProvider:
         self.distance_evaluations += self.descriptors.shape[0]
         self.support_entries += int(targets.shape[0])
         self.current_support_count = int(targets.shape[0])
+        if self.min_support_count is None:
+            self.min_support_count = self.current_support_count
+        else:
+            self.min_support_count = min(self.min_support_count, self.current_support_count)
+        self.support_count_total += self.current_support_count
+        self.support_count_samples += 1
         self.max_support_count = max(self.max_support_count, self.current_support_count)
         return targets, distances
 
@@ -432,6 +453,223 @@ def evaluate_leave_one_out_objective(
             reason="leave-one-out objective is non-finite",
         )
     return LeaveOneOutObjective(valid=True, objective=objective, probabilities=loo)
+
+
+def evaluate_leave_one_out_objectives(
+    descriptors: np.ndarray,
+    probabilities: np.ndarray,
+    bandwidths: np.ndarray,
+    *,
+    chunk_size: int = 1024,
+    progress_callback: BatchSourceProgressCallback | None = None,
+    backend: str = NEIGHBOUR_BACKEND_ID,
+    index: IndexedCPUNeighbourIndex | None = None,
+    max_radius_query_bytes: int = DEFAULT_RADIUS_QUERY_BYTES,
+    max_calibration_work_bytes: int = DEFAULT_CALIBRATION_WORK_BYTES,
+    capacity_context: str | None = None,
+) -> tuple[LeaveOneOutObjective, ...]:
+    """Evaluate a bounded batch of exact LOO objectives source-by-source.
+
+    ``bandwidths`` has shape ``(C, N)``.  The maximum source radius is queried
+    once and filtered independently for each of the ``C`` bandwidth vectors.
+    Each numerator row is updated in source-major order, matching the
+    single-bandwidth reference evaluator.
+    """
+
+    values = _validate_descriptors(descriptors)
+    masses = np.asarray(probabilities)
+    if masses.dtype != np.dtype(np.float64):
+        raise ValueError("probabilities must have dtype float64")
+    if masses.ndim != 1 or masses.shape[0] != values.shape[0]:
+        raise ValueError("probabilities must align with descriptor rows")
+    if not np.all(np.isfinite(masses)) or np.any(masses <= 0.0):
+        raise ValueError("probabilities must be finite and strictly positive")
+    if not math.isclose(float(np.sum(masses, dtype=np.float64)), 1.0, rel_tol=0.0, abs_tol=1.0e-12):
+        raise ValueError("probabilities must sum to one")
+    if values.shape[0] < 2:
+        raise ValueError("leave-one-out calibration requires at least two rows")
+    denominators = 1.0 - masses
+    if not np.all(np.isfinite(denominators)) or np.any(denominators <= 0.0):
+        raise ValueError("leave-one-out requires 1 - p_a to be strictly positive")
+    scales = np.asarray(bandwidths)
+    if scales.dtype != np.dtype(np.float64):
+        raise ValueError("bandwidths must have dtype float64")
+    if scales.ndim != 2 or scales.shape[1] != values.shape[0] or scales.shape[0] == 0:
+        raise ValueError("batched bandwidths must have shape (C, N)")
+    if not np.all(np.isfinite(scales)) or np.any(scales <= 0.0):
+        raise ValueError("batched bandwidths must be finite and strictly positive")
+    if progress_callback is not None and not callable(progress_callback):
+        raise TypeError("progress_callback must be callable")
+    work_limit = _validate_memory_limit(
+        max_calibration_work_bytes, "max_calibration_work_bytes"
+    )
+    radius_limit = min(
+        _validate_memory_limit(max_radius_query_bytes, "max_radius_query_bytes"),
+        work_limit,
+    )
+    block = _validate_chunk_size(chunk_size)
+    batch_count = int(scales.shape[0])
+    row_count = int(values.shape[0])
+    # Keep a conservative allowance for the CxN numerator and bandwidth
+    # batch, while the radius-query guard accounts for source-local geometry.
+    batch_arrays_bytes = 16 * batch_count * row_count + 8192
+    if batch_arrays_bytes > work_limit:
+        details = [
+            f"N={row_count}",
+            f"d'={values.shape[1]}",
+            f"batch_count={batch_count}",
+            f"requested_bytes={batch_arrays_bytes}",
+            f"max_calibration_work_bytes={work_limit}",
+        ]
+        if capacity_context:
+            details.append(capacity_context)
+        raise RadiusQueryCapacityError(
+            "batched calibration workspace exceeds memory capacity: " + ", ".join(details)
+        )
+    if isinstance(index, IndexedCPUNeighbourIndex) and index.max_radius_query_bytes > radius_limit:
+        raise RadiusQueryCapacityError(
+            "indexed radius-query limit exceeds batched calibration workspace: "
+            f"configured_max_radius_query_bytes={index.max_radius_query_bytes}, "
+            f"max_calibration_work_bytes={work_limit}"
+        )
+    provider = _KernelSupportProvider(
+        values,
+        backend=backend,
+        chunk_size=block,
+        index=index,
+        max_radius_query_bytes=radius_limit,
+        capacity_context=capacity_context,
+    )
+    numerator = np.zeros((batch_count, row_count), dtype=np.float64)
+    invalid_reasons: list[str | None] = [None] * batch_count
+    peak_workspace_bytes = batch_arrays_bytes
+    for source_index in range(row_count):
+        source_scales = scales[:, source_index]
+        maximum_scale = float(np.max(source_scales))
+        target_indices, distances = provider.support(source_index, maximum_scale)
+        support_count = int(target_indices.shape[0])
+        query_bytes = int(getattr(provider.index, "query_workspace_peak_bytes", 0))
+        requested_bytes = batch_arrays_bytes + query_bytes + 32 * support_count
+        peak_workspace_bytes = max(peak_workspace_bytes, requested_bytes)
+        if requested_bytes > work_limit:
+            details = [
+                f"N={row_count}",
+                f"d'={values.shape[1]}",
+                f"source_row={source_index}",
+                f"radius={maximum_scale}",
+                f"requested_bytes={requested_bytes}",
+                f"max_calibration_work_bytes={work_limit}",
+            ]
+            if capacity_context:
+                details.append(capacity_context)
+            raise RadiusQueryCapacityError(
+                "batched calibration workspace exceeds memory capacity: "
+                + ", ".join(details)
+            )
+        for batch_index, scale in enumerate(source_scales):
+            if invalid_reasons[batch_index] is not None:
+                continue
+            try:
+                included = distances < float(scale)
+                selected_targets = target_indices[included]
+                selected_distances = distances[included]
+                raw = np.asarray(
+                    wendland_kernel(selected_distances / float(scale)),
+                    dtype=np.float64,
+                )
+                positive = raw > 0.0
+                if not np.all(positive):
+                    selected_targets = selected_targets[positive]
+                    raw = raw[positive]
+                total = float(np.sum(raw, dtype=np.float64))
+                if not math.isfinite(total) or total <= 0.0:
+                    raise ValueError(
+                        f"source kernel normaliser is invalid for source {source_index}"
+                    )
+                normalized = raw / total
+                column_total = float(np.sum(normalized, dtype=np.float64))
+                if not math.isclose(column_total, 1.0, rel_tol=0.0, abs_tol=1.0e-12):
+                    raise ValueError(
+                        f"normalized source kernel column {source_index} does not sum to one"
+                    )
+                non_source = selected_targets != source_index
+                if np.any(non_source):
+                    numerator[batch_index, selected_targets[non_source]] += (
+                        masses[source_index] * normalized[non_source]
+                    )
+            except (FloatingPointError, OverflowError, ValueError) as exc:
+                invalid_reasons[batch_index] = str(exc)
+        if progress_callback is not None:
+            progress_callback(source_index + 1, row_count)
+
+    results: list[LeaveOneOutObjective] = []
+    for batch_index in range(batch_count):
+        if invalid_reasons[batch_index] is not None:
+            results.append(
+                LeaveOneOutObjective(
+                    valid=False,
+                    objective=None,
+                    probabilities=np.full(row_count, np.nan, dtype=np.float64),
+                    reason=invalid_reasons[batch_index],
+                )
+            )
+            continue
+        with np.errstate(divide="ignore", invalid="ignore", over="raise"):
+            try:
+                loo = numerator[batch_index] / denominators
+            except FloatingPointError as exc:
+                raise ValueError("leave-one-out probability reduction overflowed") from exc
+        invalid = ~np.isfinite(loo) | (loo <= 0.0)
+        if np.any(invalid):
+            first = int(np.flatnonzero(invalid)[0])
+            results.append(
+                LeaveOneOutObjective(
+                    valid=False,
+                    objective=None,
+                    probabilities=loo,
+                    reason=f"zero or non-finite leave-one-out support at target row {first}",
+                )
+            )
+            continue
+        with np.errstate(divide="ignore", invalid="ignore"):
+            objective = float(-np.sum(masses * np.log(loo), dtype=np.float64))
+        if not math.isfinite(objective):
+            results.append(
+                LeaveOneOutObjective(
+                    valid=False,
+                    objective=None,
+                    probabilities=loo,
+                    reason="leave-one-out objective is non-finite",
+                )
+            )
+        else:
+            results.append(LeaveOneOutObjective(valid=True, objective=objective, probabilities=loo))
+    logger.info(
+        "Batched leave-one-out calibration completed: batch_count=%d, "
+        "peak_calibration_workspace_bytes=%d, support_count_min=%s, "
+        "support_count_mean=%s, support_count_max=%d, radius_queries=%d, "
+        "distance_evaluations=%d",
+        batch_count,
+        peak_workspace_bytes,
+        str(provider.min_support_count),
+        str(
+            provider.support_count_total / provider.support_count_samples
+            if provider.support_count_samples
+            else None
+        ),
+        provider.max_support_count,
+        provider.index.radius_queries if provider.index is not None else provider.radius_queries,
+        (
+            provider.index.distance_evaluations
+            if provider.index is not None
+            else provider.distance_evaluations
+        ),
+    )
+    return tuple(results)
+
+
+evaluate_batched_leave_one_out_objectives = evaluate_leave_one_out_objectives
+evaluate_leave_one_out_batch = evaluate_leave_one_out_objectives
 
 
 _DEFAULT_SPARSE_EDGE_LIMIT = 1_000_000
@@ -1021,6 +1259,7 @@ __all__ = [
     "SPARSE_KERNEL_GRAPH_SCHEMA_VERSION",
     "SPARSE_NUMERICAL_TOLERANCE",
     "SourceProgressCallback",
+    "BatchSourceProgressCallback",
     "SparseAtomicKernelGraph",
     "SparseCandidateContributions",
     "aggregate_candidate_contributions",
@@ -1035,6 +1274,9 @@ __all__ = [
     "construct_sparse_atomic_kernel_graph",
     "create_sparse_atomic_kernel_graph",
     "evaluate_leave_one_out_objective",
+    "evaluate_leave_one_out_objectives",
+    "evaluate_batched_leave_one_out_objectives",
+    "evaluate_leave_one_out_batch",
     "evaluate_loo_objective",
     "evaluate_wendland_kernel",
     "iter_normalized_kernel_columns",

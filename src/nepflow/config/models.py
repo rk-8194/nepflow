@@ -339,6 +339,8 @@ class EntropyBandwidthConfig:
     max_neighbour_entries: int = 1_000_000
     max_index_bytes: int | None = None
     max_radius_query_bytes: int = 256 * 1024 * 1024
+    max_calibration_work_bytes: int = 512 * 1024 * 1024
+    calibration_batch_size: int | None = None
 
 
 @dataclass(frozen=True, slots=True)

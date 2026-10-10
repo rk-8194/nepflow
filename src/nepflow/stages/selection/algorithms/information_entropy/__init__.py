@@ -35,6 +35,7 @@ from .diagnostics import (
     weighted_quantile,
 )
 from .kernels import (
+    BatchSourceProgressCallback,
     LeaveOneOutObjective,
     NormalizedKernelColumn,
     SourceProgressCallback,
@@ -43,7 +44,10 @@ from .kernels import (
     aggregate_candidate_contributions,
     build_sparse_atomic_kernel_graph,
     build_sparse_candidate_contributions,
+    evaluate_batched_leave_one_out_objectives,
+    evaluate_leave_one_out_batch,
     evaluate_leave_one_out_objective,
+    evaluate_leave_one_out_objectives,
     iter_normalized_kernel_columns,
     normalized_kernel_matrix,
     source_normalisers,
@@ -51,6 +55,7 @@ from .kernels import (
     wendland_kernel,
 )
 from .models import (
+    DEFAULT_CALIBRATION_WORK_BYTES,
     DEFAULT_NEIGHBOUR_BACKEND_ID,
     DEFAULT_RADIUS_QUERY_BYTES,
     ENTROPY_OBJECTIVE_SCHEMA_VERSION,
@@ -193,6 +198,7 @@ __all__ = [
     "ScientificDiagnostics",
     "InformationEntropyConfig",
     "DEFAULT_NEIGHBOUR_BACKEND_ID",
+    "DEFAULT_CALIBRATION_WORK_BYTES",
     "DEFAULT_RADIUS_QUERY_BYTES",
     "INDEXED_NEIGHBOUR_BACKEND_ID",
     "INDEXED_NEIGHBOUR_BACKEND_VERSION",
@@ -206,6 +212,7 @@ __all__ = [
     "NormalizedKernelColumn",
     "NeighbourResult",
     "SourceProgressCallback",
+    "BatchSourceProgressCallback",
     "SparseAtomicKernelGraph",
     "SparseAtomicKernelRow",
     "SparseCandidateContributionRow",
@@ -254,6 +261,9 @@ __all__ = [
     "derive_candidate_probabilities",
     "duplicate_thinning_sensitivity",
     "evaluate_leave_one_out_objective",
+    "evaluate_batched_leave_one_out_objectives",
+    "evaluate_leave_one_out_batch",
+    "evaluate_leave_one_out_objectives",
     "exact_backend_sensitivity",
     "evaluate_objective",
     "evaluate_objective_diagnostics",

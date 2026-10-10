@@ -316,6 +316,20 @@ def validate_config(
         raise ConfigurationError(
             "selection.entropy.bandwidth.max_radius_query_bytes must be positive"
         )
+    if (
+        not isinstance(bandwidth.max_calibration_work_bytes, int)
+        or bandwidth.max_calibration_work_bytes < 1
+    ):
+        raise ConfigurationError(
+            "selection.entropy.bandwidth.max_calibration_work_bytes must be positive"
+        )
+    if bandwidth.calibration_batch_size is not None and (
+        not isinstance(bandwidth.calibration_batch_size, int)
+        or bandwidth.calibration_batch_size < 1
+    ):
+        raise ConfigurationError(
+            "selection.entropy.bandwidth.calibration_batch_size must be positive when provided"
+        )
     if tuple(sorted(set(bandwidth.k_candidates))) != tuple(bandwidth.k_candidates) or any(
         value < 1 for value in bandwidth.k_candidates
     ):

@@ -15,11 +15,15 @@ import numpy as np
 from nepflow.io.hashing import sha256_canonical_json
 from nepflow.stages.selection.representations import LocalEnvironmentRepresentation
 
-from .kernels import evaluate_leave_one_out_objective
+from .kernels import (
+    evaluate_leave_one_out_objective,
+    evaluate_leave_one_out_objectives,
+)
 from .models import (
     BANDWIDTH_SCHEMA_VERSION,
     CALIBRATION_OPTIMIZER_ID,
     CALIBRATION_OPTIMIZER_VERSION,
+    DEFAULT_CALIBRATION_WORK_BYTES,
     DEFAULT_NEIGHBOUR_BACKEND_ID,
     DEFAULT_RADIUS_QUERY_BYTES,
     KERNEL_FAMILY,
@@ -34,6 +38,7 @@ from .models import (
 from .neighbours import (
     ExactNeighbourResult,
     RadiusQueryCapacityError,
+    _estimate_radius_workspace_bytes,
     build_neighbour_index,
     compute_neighbours,
 )
@@ -421,7 +426,8 @@ def _settings_from_arguments(
     max_neighbour_entries: int,
     max_index_bytes: int | None,
     max_radius_query_bytes: int,
-    max_calibration_work_bytes: int | None,
+    max_calibration_work_bytes: int,
+    calibration_batch_size: int | None,
 ) -> EntropyBandwidthSettings:
     if settings is not None:
         if any(value is not None for value in (mode, k, c, k_candidates, c_candidates)):
@@ -442,6 +448,7 @@ def _settings_from_arguments(
             max_index_bytes=max_index_bytes,
             max_radius_query_bytes=max_radius_query_bytes,
             max_calibration_work_bytes=max_calibration_work_bytes,
+            calibration_batch_size=calibration_batch_size,
         )
     return EntropyBandwidthSettings(
         mode=selected_mode,
@@ -454,6 +461,7 @@ def _settings_from_arguments(
         max_index_bytes=max_index_bytes,
         max_radius_query_bytes=max_radius_query_bytes,
         max_calibration_work_bytes=max_calibration_work_bytes,
+        calibration_batch_size=calibration_batch_size,
     )
 
 
@@ -488,7 +496,8 @@ def calibrate_bandwidth(
     max_neighbour_entries: int = 1_000_000,
     max_index_bytes: int | None = None,
     max_radius_query_bytes: int = DEFAULT_RADIUS_QUERY_BYTES,
-    max_calibration_work_bytes: int | None = None,
+    max_calibration_work_bytes: int = DEFAULT_CALIBRATION_WORK_BYTES,
+    calibration_batch_size: int | None = None,
 ) -> BandwidthCalibrationResult:
     """Run deterministic manual or bounded-grid finite-pool calibration."""
 
@@ -518,6 +527,7 @@ def calibrate_bandwidth(
         max_index_bytes=max_index_bytes,
         max_radius_query_bytes=max_radius_query_bytes,
         max_calibration_work_bytes=max_calibration_work_bytes,
+        calibration_batch_size=calibration_batch_size,
     )
     if pool.descriptors.shape[0] < 2:
         raise BandwidthCalibrationError("leave-one-out calibration requires at least two rows")
@@ -526,7 +536,7 @@ def calibrate_bandwidth(
         pool.descriptors,
         backend=selected_settings.backend,
         max_index_bytes=selected_settings.max_index_bytes,
-        max_radius_query_bytes=selected_settings.operational_work_bytes,
+        max_radius_query_bytes=selected_settings.radius_query_bytes,
     )
 
     if selected_settings.mode == "manual":
@@ -605,7 +615,16 @@ def calibrate_bandwidth(
                 *progress_values[2:],
             )
 
-    def source_progress_logger(candidate_k: int, candidate_c: float) -> Callable[[int, int], None]:
+    def source_progress_logger(
+        candidate_k: int,
+        candidate_cs: Sequence[float],
+    ) -> Callable[[int, int], None]:
+        ordered_cs = tuple(float(value) for value in candidate_cs)
+        c_label = (
+            f"c={ordered_cs[0]:g}"
+            if len(ordered_cs) == 1
+            else "c_batch=" + ",".join(f"{value:g}" for value in ordered_cs)
+        )
         pair_started = time.perf_counter()
         next_percent = 5
         last_completed = 0
@@ -623,33 +642,44 @@ def calibrate_bandwidth(
                 return
             elapsed, remaining = _progress_timing(completed, total_sources, pair_started)
             percentage = 100.0 * completed / total_sources
+            metrics: Mapping[str, int | float | None] = (
+                index.memory_metrics() if index is not None else {}
+            )
+
+            def metric(name: str, default: int | float = 0) -> int | float:
+                value = metrics.get(name)
+                return default if value is None else value
+
             logger.info(
-                "Bandwidth calibration pair source progress: k=%d, c=%g, source=%d/%d "
-                "(%.1f%%), current_support=%d, max_support=%d, radius_queries=%d, "
+                "Bandwidth calibration pair source progress: k=%d, %s, source=%d/%d "
+                "(%.1f%%), current_support=%d, min_support=%s, mean_support=%s, "
+                "max_support=%d, "
+                "radius_queries=%d, unique_distance_evaluations=%d, "
+                "atomic_distance_evaluations=%d, "
                 "support_cache_bytes=0, "
-                "support_cache_peak_bytes=0, index_bytes=%d, query_workspace_peak_bytes=%d, "
+                "support_cache_peak_bytes=0, grouping_bytes=%d, grouping_build_seconds=%.3f, "
+                "tree_build_seconds=%.3f, index_bytes=%d, query_workspace_peak_bytes=%d, "
                 "process_peak_rss_bytes=%s, cgroup_memory_current_bytes=%s, "
                 "elapsed=%.3fs, estimated remaining=%.3fs",
                 candidate_k,
-                candidate_c,
+                c_label,
                 completed,
                 total_sources,
                 percentage,
-                int(getattr(index, "current_support_count", 0)),
-                int(getattr(index, "max_support_count", 0)),
-                int(getattr(index, "radius_queries", 0)),
-                int(getattr(index, "index_bytes", 0)),
-                int(getattr(index, "query_workspace_peak_bytes", 0)),
-                (
-                    str(index.memory_metrics().get("process_peak_rss_bytes"))
-                    if index is not None
-                    else "unavailable"
-                ),
-                (
-                    str(index.memory_metrics().get("cgroup_memory_current_bytes"))
-                    if index is not None
-                    else "unavailable"
-                ),
+                int(metric("current_support_count")),
+                str(metrics.get("min_support_count", "unavailable")),
+                str(metrics.get("mean_support_count", "unavailable")),
+                int(metric("max_support_count")),
+                int(metric("radius_queries")),
+                int(metric("unique_distance_evaluations")),
+                int(metric("atomic_distance_evaluations")),
+                int(metric("grouping_bytes")),
+                float(metric("grouping_build_seconds")),
+                float(metric("tree_build_seconds")),
+                int(metric("index_bytes")),
+                int(metric("query_workspace_peak_bytes")),
+                str(metrics.get("process_peak_rss_bytes", "unavailable")),
+                str(metrics.get("cgroup_memory_current_bytes", "unavailable")),
                 elapsed,
                 remaining,
             )
@@ -658,6 +688,50 @@ def calibrate_bandwidth(
                     next_percent += 5
 
         return report
+
+    def c_batches() -> tuple[tuple[float, ...], ...]:
+        ordered = tuple(float(value) for value in domain_c)
+        if selected_settings.mode == "manual":
+            return (ordered,)
+        row_count = int(pool.descriptors.shape[0])
+        per_c_bytes = 16 * row_count
+        source_workspace_bound = _estimate_radius_workspace_bytes(
+            row_count,
+            row_count,
+            int(pool.descriptors.shape[1]),
+            row_count,
+        )
+        available = selected_settings.operational_work_bytes - 8192 - source_workspace_bound
+        maximum = available // max(1, per_c_bytes)
+        if maximum < 1:
+            raise RadiusQueryCapacityError(
+                "batched calibration workspace cannot fit one c value: "
+                f"N={pool.descriptors.shape[0]}, d'={pool.descriptors.shape[1]}, "
+                f"requested_bytes={per_c_bytes + 8192 + source_workspace_bound}, "
+                f"max_calibration_work_bytes={selected_settings.operational_work_bytes}, "
+                f"k_domain={tuple(int(value) for value in domain_k)}"
+            )
+        width = min(
+            len(ordered),
+            int(maximum),
+            (
+                int(selected_settings.calibration_batch_size)
+                if selected_settings.calibration_batch_size is not None
+                else len(ordered)
+            ),
+        )
+        logger.info(
+            "Bandwidth calibration c batching: batch_size=%d, c_count=%d, c_batches=%d, "
+            "estimated_batch_workspace_bytes=%d, max_calibration_work_bytes=%d",
+            width,
+            len(ordered),
+            (len(ordered) + width - 1) // width,
+            8192 + width * per_c_bytes + source_workspace_bound,
+            selected_settings.operational_work_bytes,
+        )
+        return tuple(ordered[start : start + width] for start in range(0, len(ordered), width))
+
+    batches = c_batches()
 
     for candidate_k in domain_k:
         try:
@@ -685,53 +759,80 @@ def calibrate_bandwidth(
                 )
             continue
 
-        for candidate_c in domain_c:
+        for c_batch in batches:
             try:
-                frozen = _freeze_from_neighbours(pool, neighbours, candidate_c)
-                objective = evaluate_leave_one_out_objective(
-                    pool.descriptors,
-                    pool.probabilities,
-                    frozen.bandwidths,
-                    chunk_size=selected_settings.chunk_size,
-                    progress_callback=source_progress_logger(candidate_k, float(candidate_c)),
-                    backend=selected_settings.backend,
-                    index=index,
-                    max_radius_query_bytes=selected_settings.operational_work_bytes,
-                    capacity_context=f"k={candidate_k}, c={float(candidate_c):g}",
+                frozen_batch = tuple(
+                    _freeze_from_neighbours(pool, neighbours, candidate_c)
+                    for candidate_c in c_batch
                 )
-                if not objective.valid or objective.objective is None:
+                if selected_settings.mode == "manual":
+                    frozen = frozen_batch[0]
+                    objectives = (
+                        evaluate_leave_one_out_objective(
+                            pool.descriptors,
+                            pool.probabilities,
+                            frozen.bandwidths,
+                            chunk_size=selected_settings.chunk_size,
+                            progress_callback=source_progress_logger(candidate_k, c_batch),
+                            backend=selected_settings.backend,
+                            index=index,
+                            max_radius_query_bytes=selected_settings.radius_query_bytes,
+                            capacity_context=f"k={candidate_k}, c={c_batch[0]:g}",
+                        ),
+                    )
+                else:
+                    objectives = evaluate_leave_one_out_objectives(
+                        pool.descriptors,
+                        pool.probabilities,
+                        np.stack([frozen.bandwidths for frozen in frozen_batch]),
+                        chunk_size=selected_settings.chunk_size,
+                        progress_callback=source_progress_logger(candidate_k, c_batch),
+                        backend=selected_settings.backend,
+                        index=index,
+                        max_radius_query_bytes=selected_settings.radius_query_bytes,
+                        max_calibration_work_bytes=selected_settings.operational_work_bytes,
+                        capacity_context=(
+                            f"k={candidate_k}, c_batch="
+                            + ",".join(f"{value:g}" for value in c_batch)
+                        ),
+                    )
+                for candidate_c, frozen, objective in zip(
+                    c_batch,
+                    frozen_batch,
+                    objectives,
+                    strict=True,
+                ):
+                    if not objective.valid or objective.objective is None:
+                        record_attempt(
+                            CalibrationAttempt(
+                                candidate_k,
+                                float(candidate_c),
+                                "invalid",
+                                reason=objective.reason or "invalid leave-one-out objective",
+                                bandwidth_fingerprint=frozen.fingerprint,
+                            )
+                        )
+                        continue
+                    attempt = CalibrationAttempt(
+                        candidate_k,
+                        float(candidate_c),
+                        "valid",
+                        objective=objective.objective,
+                        bandwidth_fingerprint=frozen.fingerprint,
+                    )
+                    record_attempt(attempt)
+                    if winner is None or objective.objective < winner[0]:
+                        winner = (objective.objective, frozen, objective.probabilities)
+            except (FloatingPointError, OverflowError, ValueError) as exc:
+                for candidate_c in c_batch:
                     record_attempt(
                         CalibrationAttempt(
                             candidate_k,
                             float(candidate_c),
                             "invalid",
-                            reason=objective.reason or "invalid leave-one-out objective",
-                            bandwidth_fingerprint=frozen.fingerprint,
+                            reason=str(exc),
                         )
                     )
-                    continue
-                attempt = CalibrationAttempt(
-                    candidate_k,
-                    float(candidate_c),
-                    "valid",
-                    objective=objective.objective,
-                    bandwidth_fingerprint=frozen.fingerprint,
-                )
-                record_attempt(attempt)
-                if winner is None or objective.objective < winner[0]:
-                    winner = (objective.objective, frozen, objective.probabilities)
-            except (FloatingPointError, OverflowError, ValueError) as exc:
-                record_attempt(
-                    CalibrationAttempt(
-                        candidate_k,
-                        float(candidate_c),
-                        "invalid",
-                        reason=str(exc),
-                    )
-                )
-
-        if selected_settings.mode == "manual":
-            break
 
     if winner is None:
         elapsed, _ = _progress_timing(

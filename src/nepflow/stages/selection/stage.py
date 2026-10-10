@@ -288,6 +288,8 @@ class SelectionStage:
                 max_neighbour_entries=entropy.bandwidth.max_neighbour_entries,
                 max_index_bytes=entropy.bandwidth.max_index_bytes,
                 max_radius_query_bytes=entropy.bandwidth.max_radius_query_bytes,
+                max_calibration_work_bytes=entropy.bandwidth.max_calibration_work_bytes,
+                calibration_batch_size=entropy.bandwidth.calibration_batch_size,
             )
             for limit_name in ("max_edges", "max_entries"):
                 limit = getattr(entropy, limit_name)
