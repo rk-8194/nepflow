@@ -22,10 +22,10 @@ from nepflow.errors import ConfigurationError
 
 from .perturbations.surfaces import (
     _POLARITY_POLICIES,
-    _SURFACE_PLANNER_VERSION,
     _STOICHIOMETRY_POLICIES,
-    _composition_details,
+    _SURFACE_PLANNER_VERSION,
     SurfaceConstructionError,
+    _composition_details,
     measure_surface_bulk_core,
     measure_surface_geometry,
 )

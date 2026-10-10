@@ -15,12 +15,6 @@ from typing import Any
 import numpy as np
 from ase.neighborlist import neighbor_list
 
-NepCalculator: Any
-try:
-    from NepTrainKit.core.calculator import NepCalculator
-except ImportError:  # pragma: no cover - the local backend does not need NepTrainKit
-    NepCalculator = None
-
 from nepflow.domain.identities import (
     DESCRIPTOR_CACHE_SCHEMA,
     DescriptorCacheIdentity,
@@ -30,6 +24,12 @@ from nepflow.errors import StateError
 from nepflow.io.atomic import atomic_write_bytes
 from nepflow.io.hashing import sha256_bytes, sha256_canonical_json, sha256_file
 from nepflow.io.json import read_json_object, write_json
+
+NepCalculator: Any
+try:
+    from NepTrainKit.core.calculator import NepCalculator
+except ImportError:  # pragma: no cover - the local backend does not need NepTrainKit
+    NepCalculator = None
 
 logger = logging.getLogger(__name__)
 DESCRIPTOR_CACHE_SCHEMA_VERSION = DESCRIPTOR_CACHE_SCHEMA

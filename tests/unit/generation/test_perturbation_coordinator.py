@@ -17,8 +17,8 @@ from ase.io import read
 import nepflow.stages.generation.perturbations.coordinator as coordinator_module
 from nepflow.application.composition import _build_perturbation_coordinator
 from nepflow.config.models import CompositionConfig, MagnetismConfig, NepflowConfig
-from nepflow.domain.magnetism import MagneticMomentSet
 from nepflow.domain.identities import calculate_structure_id
+from nepflow.domain.magnetism import MagneticMomentSet
 from nepflow.stages.generation.generators.segregated import SegregatedGenerator
 from nepflow.stages.generation.perturbations.coordinator import (
     PerturbationCoordinator,
@@ -45,11 +45,11 @@ from nepflow.stages.generation.perturbations.models import (
     PerturbationTask,
     derive_child_seed,
 )
-from nepflow.workflow import StageContext
 from nepflow.stages.generation.perturbations.provenance import (
     annotate_generation_provenance,
 )
 from nepflow.stages.generation.validation import validate_generated_candidate
+from nepflow.workflow import StageContext
 
 
 @pytest.fixture(autouse=True)
