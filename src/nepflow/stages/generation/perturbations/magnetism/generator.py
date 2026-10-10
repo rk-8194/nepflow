@@ -55,23 +55,57 @@ class MagneticExpansionStream:
     publish bounded structural batches without changing scientific ordering.
     """
 
-    def __init__(self, generator: "MagneticGenerator") -> None:
+    def __init__(
+        self,
+        generator: "MagneticGenerator",
+        *,
+        fail_on_empty_expansion: bool = False,
+    ) -> None:
         self.generator = generator
+        self.fail_on_empty_expansion = fail_on_empty_expansion
+        self._structural_parents_examined = 0
+        self._eligible_structural_parents = 0
+        self._expanded_structural_parents = 0
+        self._emitted_non_magnetic = 0
+        self._emitted_ferromagnetic = 0
+        self._emitted_antiferromagnetic = 0
+        self._total_magnetic_candidates = 0
         self._diagnostics: list[MagneticGenerationDiagnostic] = []
         self._total_available_afm = 0
         self._retained_afm = 0
         self._budget_truncated = False
+        self._final_variant_budget_truncated = False
+        self._final_variant_budget_truncations = 0
+        self._zero_variant_eligible_parents = 0
         self._defect_parents = 0
 
     @property
     def summary(self) -> MagneticGenerationSummary:
         """Return aggregate diagnostics and budgets observed so far."""
 
+        diagnostics = list(self._diagnostics)
+        if self._eligible_structural_parents == 0:
+            diagnostics.append(
+                MagneticGenerationDiagnostic(
+                    code="NO_ELIGIBLE_STRUCTURAL_PARENTS",
+                    message="no structural parents matched the configured magnetic scope",
+                )
+            )
         summary = MagneticGenerationSummary(
+            structural_parents_examined=self._structural_parents_examined,
+            eligible_structural_parents=self._eligible_structural_parents,
+            expanded_structural_parents=self._expanded_structural_parents,
+            emitted_non_magnetic=self._emitted_non_magnetic,
+            emitted_ferromagnetic=self._emitted_ferromagnetic,
+            emitted_antiferromagnetic=self._emitted_antiferromagnetic,
+            total_magnetic_candidates=self._total_magnetic_candidates,
             total_available_afm=self._total_available_afm,
             retained_afm=self._retained_afm,
             budget_truncated=self._budget_truncated,
-            diagnostics=tuple(self._diagnostics),
+            final_variant_budget_truncated=self._final_variant_budget_truncated,
+            final_variant_budget_truncations=self._final_variant_budget_truncations,
+            zero_variant_eligible_parents=self._zero_variant_eligible_parents,
+            diagnostics=tuple(diagnostics),
         )
         self.generator._last_summary = summary
         return summary
@@ -84,6 +118,7 @@ class MagneticExpansionStream:
 
     def _expand_one(self, structure: Atoms) -> Iterator[Atoms]:
         config = self.generator.config
+        self._structural_parents_examined += 1
         family = str(structure.info.get("perturbation_type", "unperturbed")).strip().lower()
         selected = family == "unperturbed" or family in config.defect_families
         source = str(structure.info.get("configurational_type", "")).strip().lower()
@@ -91,6 +126,8 @@ class MagneticExpansionStream:
             ALL_SOURCES in config.magnetic_sources or source in config.magnetic_sources
         ):
             selected = False
+        if selected:
+            self._eligible_structural_parents += 1
         if selected and family in MAGNETIC_DEFECT_FAMILIES:
             if config.max_defect_parents and self._defect_parents >= config.max_defect_parents:
                 selected = False
@@ -102,6 +139,7 @@ class MagneticExpansionStream:
             yield preserved
             return
 
+        self._expanded_structural_parents += 1
         variant_limit = (
             config.max_magnetic_variants_per_defect
             if family in MAGNETIC_DEFECT_FAMILIES
@@ -109,9 +147,33 @@ class MagneticExpansionStream:
         )
         result = self.generator.generate_result(structure, variant_limit=variant_limit)
         self._diagnostics.extend(result.summary.diagnostics)
+        self._emitted_non_magnetic += result.summary.emitted_non_magnetic
+        self._emitted_ferromagnetic += result.summary.emitted_ferromagnetic
+        self._emitted_antiferromagnetic += result.summary.emitted_antiferromagnetic
+        self._total_magnetic_candidates += result.summary.total_magnetic_candidates
         self._total_available_afm += result.summary.total_available_afm
         self._retained_afm += result.summary.retained_afm
         self._budget_truncated = self._budget_truncated or result.summary.budget_truncated
+        self._final_variant_budget_truncated = (
+            self._final_variant_budget_truncated
+            or result.summary.final_variant_budget_truncated
+        )
+        self._final_variant_budget_truncations += result.summary.final_variant_budget_truncations
+        empty_requested_expansion = (
+            (config.include_ferromagnetic or config.include_antiferromagnetic)
+            and not result.summary.emitted_ferromagnetic
+            and not result.summary.emitted_antiferromagnetic
+            and not any(
+                diagnostic.code == "UNMAPPED_MAGNETIC_SITE"
+                for diagnostic in result.summary.diagnostics
+            )
+        )
+        if empty_requested_expansion:
+            self._zero_variant_eligible_parents += 1
+        if self.fail_on_empty_expansion and empty_requested_expansion:
+            raise MagneticGenerationError(
+                "eligible magnetic structural parent produced no FM or AFM candidates"
+            )
         yield from result.candidates
 
 
@@ -347,7 +409,8 @@ class MagneticGenerator:
             if variant_limit is None
             else int(variant_limit)
         )
-        if maximum > 0 and len(candidates) > maximum:
+        final_variant_budget_truncated = maximum > 0 and len(candidates) > maximum
+        if final_variant_budget_truncated:
             diagnostics.append(
                 self._diagnostic(
                     "MAGNETIC_VARIANT_BUDGET_TRUNCATED",
@@ -361,12 +424,30 @@ class MagneticGenerator:
             candidate.info.get("magnetic_ordering") == MagneticOrdering.ANTIFERROMAGNETIC.value
             for candidate in candidates
         )
-        actual_budget_truncated = actual_retained_afm < total_available_afm
+        afm_budget_truncated = len(retained_afm) < total_available_afm
 
         summary = MagneticGenerationSummary(
+            emitted_non_magnetic=sum(
+                candidate.info.get("magnetic_ordering")
+                == MagneticOrdering.NONMAGNETIC.value
+                for candidate in candidates
+            ),
+            emitted_ferromagnetic=sum(
+                candidate.info.get("magnetic_ordering")
+                == MagneticOrdering.FERROMAGNETIC.value
+                for candidate in candidates
+            ),
+            emitted_antiferromagnetic=sum(
+                candidate.info.get("magnetic_ordering")
+                == MagneticOrdering.ANTIFERROMAGNETIC.value
+                for candidate in candidates
+            ),
+            total_magnetic_candidates=len(candidates),
             total_available_afm=total_available_afm,
             retained_afm=actual_retained_afm,
-            budget_truncated=actual_budget_truncated,
+            budget_truncated=afm_budget_truncated,
+            final_variant_budget_truncated=final_variant_budget_truncated,
+            final_variant_budget_truncations=int(final_variant_budget_truncated),
             diagnostics=tuple(diagnostics),
         )
         diagnostic_text = json.dumps(
@@ -378,7 +459,7 @@ class MagneticGenerator:
             candidate.info.update(
                 {
                     "magnetic_total_available_afm": total_available_afm,
-                    "magnetic_retained_afm": len(retained_afm),
+                    "magnetic_retained_afm": actual_retained_afm,
                     "magnetic_budget_truncated": summary.budget_truncated,
                     "magnetic_generation_diagnostics": diagnostic_text,
                 }
@@ -393,7 +474,7 @@ class MagneticGenerator:
         unchanged. This is the Phase 6 boundary that prevents magnetic logic
         from becoming a universal postprocessor.
         """
-        stream = self.expansion_stream()
+        stream = MagneticExpansionStream(self, fail_on_empty_expansion=False)
         expanded = list(stream.expand(structures))
         summary = stream.summary
         self._last_summary = summary
@@ -402,7 +483,7 @@ class MagneticGenerator:
     def expansion_stream(self) -> MagneticExpansionStream:
         """Create one stateful stream for a complete ordered expansion run."""
 
-        return MagneticExpansionStream(self)
+        return MagneticExpansionStream(self, fail_on_empty_expansion=True)
 
     def expand_file(
         self, path: Path, *, output_path: Path | None = None

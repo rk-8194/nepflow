@@ -15,6 +15,9 @@ from ase import Atoms
 from ase.io import read
 
 import nepflow.stages.generation.perturbations.coordinator as coordinator_module
+from nepflow.application.composition import _build_perturbation_coordinator
+from nepflow.config.models import CompositionConfig, MagnetismConfig, NepflowConfig
+from nepflow.domain.magnetism import MagneticMomentSet
 from nepflow.domain.identities import calculate_structure_id
 from nepflow.stages.generation.generators.segregated import SegregatedGenerator
 from nepflow.stages.generation.perturbations.coordinator import (
@@ -30,6 +33,7 @@ from nepflow.stages.generation.perturbations.defects import (
     vacancies,
     vacancy_interstitial,
 )
+from nepflow.stages.generation.perturbations.magnetism import MagneticGenerator
 from nepflow.stages.generation.perturbations.magnetism.models import (
     MagneticGenerationSummary,
 )
@@ -41,6 +45,7 @@ from nepflow.stages.generation.perturbations.models import (
     PerturbationTask,
     derive_child_seed,
 )
+from nepflow.workflow import StageContext
 from nepflow.stages.generation.perturbations.provenance import (
     annotate_generation_provenance,
 )
@@ -924,8 +929,8 @@ def test_process_logs_one_concise_line_per_published_task(
     ]
     progress = [message for message in messages if message.startswith("Perturbation ")]
     assert progress == [
-        "Perturbation 1/2 complete: unperturbed; total structures=1",
-        "Perturbation 2/2 complete: unperturbed; total structures=2",
+        "Perturbation 1/2 complete: unperturbed; final candidates=1",
+        "Perturbation 2/2 complete: unperturbed; final candidates=1",
     ]
     assert not any(
         any(
@@ -988,9 +993,9 @@ def test_process_logs_publications_in_canonical_order_when_workers_finish_out_of
         and record.getMessage().startswith("Perturbation ")
     ]
     assert progress == [
-        "Perturbation 1/3 complete: unperturbed; total structures=1",
-        "Perturbation 2/3 complete: unperturbed; total structures=2",
-        "Perturbation 3/3 complete: unperturbed; total structures=3",
+        "Perturbation 1/3 complete: unperturbed; final candidates=1",
+        "Perturbation 2/3 complete: unperturbed; final candidates=1",
+        "Perturbation 3/3 complete: unperturbed; final candidates=1",
     ]
 
 
@@ -1106,6 +1111,117 @@ def test_magnetic_disabled_baseline_does_not_add_magnetic_state(tmp_path) -> Non
 
     assert "magnetic" not in coordinator.get_summary()
     assert all("magnetic_ordering" not in item.info for item in read(str(output_path), index=":"))
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_application_composition_injects_magnetic_generator_only_when_enabled(
+    tmp_path, enabled: bool
+) -> None:
+    config = NepflowConfig(
+        composition=CompositionConfig(elements=("Cr", "W")),
+        magnetism=MagnetismConfig(enabled=enabled),
+    )
+    context = StageContext(
+        project_name="demo",
+        project_dir=tmp_path,
+        config_file=tmp_path / "project.config",
+        state_file=tmp_path / "state.db",
+        state_store=None,
+        workflow_state=None,
+        config=config,
+    )
+
+    coordinator = _build_perturbation_coordinator(context)
+
+    assert isinstance(coordinator.magnetic_generator, MagneticGenerator) is enabled
+
+
+@pytest.mark.real_generation_boundary
+def test_real_magnetic_generator_expands_pristine_parent_through_process(tmp_path) -> None:
+    """The production streaming coordinator must publish NM, FM, and AFM states."""
+
+    base = Atoms(
+        "CrW",
+        positions=[[0.0, 0.0, 0.0], [1.5, 1.5, 1.5]],
+        cell=np.eye(3) * 3.0,
+        pbc=True,
+    )
+    base.info.update(
+        {
+            "seed_id": "magnetic-seed",
+            "source": "magnetic-fixture",
+            "elements": ["Cr", "W"],
+            "configurational_type": "test_base",
+        }
+    )
+    magnetic_generator = MagneticGenerator(
+        MagnetismConfig(
+            enabled=True,
+            target_potential_magnetic=True,
+            include_non_magnetic=True,
+            include_ferromagnetic=True,
+            include_antiferromagnetic=True,
+            moment_sets=(MagneticMomentSet("cr-only", {"Cr": 2.5}),),
+            max_afm_orderings=16,
+            max_magnetic_variants_per_parent=100,
+        )
+    )
+    coordinator = PerturbationCoordinator(
+        settings=PerturbationSettings(
+            target_n_atoms=8,
+            n_volume_points=0,
+            elastic_stress_enabled=False,
+        ),
+        magnetic_generator=magnetic_generator,
+    )
+
+    output_path = coordinator.process(
+        [base],
+        tmp_path,
+        n_rattled=0,
+        n_vacancies=0,
+        n_interstitials=0,
+        n_workers=1,
+    )
+    candidates = read(str(output_path), index=":")
+    assert isinstance(candidates, list)
+    orderings = {candidate.info.get("magnetic_ordering") for candidate in candidates}
+    assert {"nonmagnetic", "fm", "afm"}.issubset(orderings)
+    assert len(candidates) > 1
+    assert all("magnetic_ordering" in candidate.info for candidate in candidates)
+
+    structure_ids = {candidate.info["structure_id"] for candidate in candidates}
+    candidate_ids = {candidate.info["candidate_id"] for candidate in candidates}
+    assert len(structure_ids) == 1
+    assert len(candidate_ids) == len(candidates)
+    magnetic_candidates = [
+        candidate
+        for candidate in candidates
+        if candidate.info["magnetic_ordering"] != "nonmagnetic"
+    ]
+    for candidate in magnetic_candidates:
+        for symbol, vector, constrained in zip(
+            candidate.get_chemical_symbols(),
+            candidate.arrays["magnetic_moments"],
+            candidate.arrays["magnetic_constraint_mask"],
+        ):
+            if symbol == "W":
+                assert vector.tolist() == [0.0, 0.0, 0.0]
+                assert not constrained
+            elif symbol == "Cr":
+                assert vector.tolist() != [0.0, 0.0, 0.0]
+                assert constrained
+
+    summary = coordinator.get_summary()
+    magnetic_summary = summary["magnetic"]
+    assert summary["total"] == len(candidates)
+    assert magnetic_summary["structural_parents_examined"] == 1
+    assert magnetic_summary["eligible_structural_parents"] == 1
+    assert magnetic_summary["expanded_structural_parents"] == 1
+    assert magnetic_summary["emitted_non_magnetic"] >= 1
+    assert magnetic_summary["emitted_ferromagnetic"] >= 1
+    assert magnetic_summary["emitted_antiferromagnetic"] >= 1
+    assert magnetic_summary["total_magnetic_candidates"] == len(candidates)
 
 
 def test_magnetic_harness_receives_global_ordered_defect_parents(tmp_path) -> None:

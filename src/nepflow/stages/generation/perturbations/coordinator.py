@@ -1180,6 +1180,17 @@ class PerturbationCoordinator:
             family_plan,
             output_file,
         )
+        if self.magnetic_generator is None:
+            logger.info("Magnetic expansion disabled")
+        else:
+            magnetic_config = getattr(self.magnetic_generator, "config", None)
+            logger.info(
+                "Magnetic expansion enabled: NM=%s, FM=%s, AFM=%s, moment_sets=%s",
+                getattr(magnetic_config, "include_non_magnetic", "?"),
+                getattr(magnetic_config, "include_ferromagnetic", "?"),
+                getattr(magnetic_config, "include_antiferromagnetic", "?"),
+                len(getattr(magnetic_config, "moment_sets", ())),
+            )
         progress_tracker = _ProgressTracker(
             batch_task_count,
             n_workers,
@@ -1220,30 +1231,64 @@ class PerturbationCoordinator:
                         retained_records=retained_records,
                     )
                     if self.magnetic_generator is None:
-                        self._flush(batch, output_handle=output_handle)
+                        final_count = self._flush(batch, output_handle=output_handle)
                     else:
                         assert magnetic_stream is not None
-                        self._flush(
+                        final_count = self._flush(
                             magnetic_stream.expand(batch),
                             output_handle=output_handle,
                         )
                     duplicates = self._duplicate_count - duplicates_before
                     progress_tracker.published_result(
                         result.task,
-                        written=len(batch),
+                        written=final_count,
                         duplicates=duplicates,
                     )
-                    logger.info(
-                        "Perturbation %s/%s complete: %s; total structures=%s",
-                        progress_tracker.published,
-                        batch_task_count,
-                        result.task.family or "all",
-                        progress_tracker.written,
-                    )
+                    if magnetic_stream is None:
+                        logger.info(
+                            "Perturbation %s/%s complete: %s; final candidates=%s",
+                            progress_tracker.published,
+                            batch_task_count,
+                            result.task.family or "all",
+                            final_count,
+                        )
+                    else:
+                        logger.info(
+                            "Perturbation %s/%s complete: %s; structural retained=%s; "
+                            "final candidates=%s",
+                            progress_tracker.published,
+                            batch_task_count,
+                            result.task.family or "all",
+                            len(batch),
+                            final_count,
+                        )
                     progress_tracker.snapshot(reason="publication")
                 if magnetic_stream is not None:
-                    self._magnetic_summary = magnetic_stream.summary
+                    magnetic_summary = magnetic_stream.summary
+                    self._magnetic_summary = magnetic_summary
                     progress_tracker.written = self._total
+                    logger.info(
+                        "Magnetic expansion complete: examined=%s; eligible=%s; expanded=%s; "
+                        "NM=%s; FM=%s; AFM=%s; final magnetic candidates=%s; "
+                        "AFM retained/available=%s/%s; AFM truncated=%s; "
+                        "final variant budget truncations=%s",
+                        magnetic_summary.structural_parents_examined,
+                        magnetic_summary.eligible_structural_parents,
+                        magnetic_summary.expanded_structural_parents,
+                        magnetic_summary.emitted_non_magnetic,
+                        magnetic_summary.emitted_ferromagnetic,
+                        magnetic_summary.emitted_antiferromagnetic,
+                        magnetic_summary.total_magnetic_candidates,
+                        magnetic_summary.retained_afm,
+                        magnetic_summary.total_available_afm,
+                        "yes" if magnetic_summary.afm_budget_truncated else "no",
+                        magnetic_summary.final_variant_budget_truncations,
+                    )
+                    if magnetic_summary.eligible_structural_parents == 0:
+                        logger.info(
+                            "Magnetic expansion: no eligible structural parents; "
+                            "structural candidates preserved"
+                        )
                 output_handle.flush()
                 os.fsync(output_handle.fileno())
             if temporary_path is None:
@@ -1598,10 +1643,10 @@ class PerturbationCoordinator:
                 raise
             raise PerturbationTaskError(task, exc) from exc
 
-    def _flush(self, candidates: Iterable[Any], *, output_handle: Any | None = None) -> None:
+    def _flush(self, candidates: Iterable[Any], *, output_handle: Any | None = None) -> int:
         batch = list(candidates)
         if not batch:
-            return
+            return 0
         if self._output_file is None:
             raise RuntimeError("process output is not initialized")
         for candidate in batch:
@@ -1624,6 +1669,7 @@ class PerturbationCoordinator:
             self._total += 1
             self._by_type[family] = self._by_type.get(family, 0) + 1
             self._by_config[configuration] = self._by_config.get(configuration, 0) + 1
+        return len(batch)
 
     def get_provenance_records(self) -> tuple[GeneratedStructureRecord, ...]:
         """Return accepted candidate provenance in deterministic operation order."""

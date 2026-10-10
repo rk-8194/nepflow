@@ -32,12 +32,28 @@ class MagneticGenerationDiagnostic:
 
 @dataclass(frozen=True, slots=True)
 class MagneticGenerationSummary:
-    """Counts and budget information for one structural parent."""
+    """Counts and budget information for one parent or expansion stream."""
 
     total_available_afm: int = 0
     retained_afm: int = 0
     budget_truncated: bool = False
     diagnostics: tuple[MagneticGenerationDiagnostic, ...] = ()
+    structural_parents_examined: int = 0
+    eligible_structural_parents: int = 0
+    expanded_structural_parents: int = 0
+    emitted_non_magnetic: int = 0
+    emitted_ferromagnetic: int = 0
+    emitted_antiferromagnetic: int = 0
+    total_magnetic_candidates: int = 0
+    final_variant_budget_truncated: bool = False
+    final_variant_budget_truncations: int = 0
+    zero_variant_eligible_parents: int = 0
+
+    @property
+    def afm_budget_truncated(self) -> bool:
+        """Whether the AFM-only enumeration budget truncated any states."""
+
+        return self.budget_truncated
 
     @property
     def omitted_afm(self) -> int:
@@ -45,10 +61,21 @@ class MagneticGenerationSummary:
 
     def to_dict(self) -> dict[str, Any]:
         return {
+            "structural_parents_examined": self.structural_parents_examined,
+            "eligible_structural_parents": self.eligible_structural_parents,
+            "expanded_structural_parents": self.expanded_structural_parents,
+            "emitted_non_magnetic": self.emitted_non_magnetic,
+            "emitted_ferromagnetic": self.emitted_ferromagnetic,
+            "emitted_antiferromagnetic": self.emitted_antiferromagnetic,
+            "total_magnetic_candidates": self.total_magnetic_candidates,
             "total_available_afm": self.total_available_afm,
             "retained_afm": self.retained_afm,
             "omitted_afm": self.omitted_afm,
             "budget_truncated": self.budget_truncated,
+            "afm_budget_truncated": self.afm_budget_truncated,
+            "final_variant_budget_truncated": self.final_variant_budget_truncated,
+            "final_variant_budget_truncations": self.final_variant_budget_truncations,
+            "zero_variant_eligible_parents": self.zero_variant_eligible_parents,
             "diagnostics": [diagnostic.to_dict() for diagnostic in self.diagnostics],
         }
 

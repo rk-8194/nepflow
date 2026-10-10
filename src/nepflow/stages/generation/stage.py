@@ -301,6 +301,41 @@ class GenerationStage:
         self.logger.info("By configurational type:")
         for configuration_type, count in sorted(summary.get("by_config", {}).items()):
             self.logger.info("  %-25s: %5s", configuration_type, count)
+        magnetic = summary.get("magnetic")
+        if isinstance(magnetic, Mapping):
+            self.logger.info("Magnetic expansion:")
+            self.logger.info(
+                "  structural parents examined: %s",
+                magnetic.get("structural_parents_examined", 0),
+            )
+            self.logger.info(
+                "  eligible parents: %s",
+                magnetic.get("eligible_structural_parents", 0),
+            )
+            self.logger.info(
+                "  expanded parents: %s",
+                magnetic.get("expanded_structural_parents", 0),
+            )
+            self.logger.info("  NM candidates: %s", magnetic.get("emitted_non_magnetic", 0))
+            self.logger.info("  FM candidates: %s", magnetic.get("emitted_ferromagnetic", 0))
+            self.logger.info("  AFM candidates: %s", magnetic.get("emitted_antiferromagnetic", 0))
+            self.logger.info(
+                "  final magnetic candidates: %s",
+                magnetic.get("total_magnetic_candidates", 0),
+            )
+            self.logger.info(
+                "  AFM states retained/available: %s/%s",
+                magnetic.get("retained_afm", 0),
+                magnetic.get("total_available_afm", 0),
+            )
+            self.logger.info(
+                "  AFM truncated: %s",
+                "yes" if magnetic.get("afm_budget_truncated", False) else "no",
+            )
+            self.logger.info(
+                "  final variant-budget truncations: %s",
+                magnetic.get("final_variant_budget_truncations", 0),
+            )
 
     def _prepare_bases(self, request: GenerationRequest, bases: list[Any]) -> list[Any]:
         bases = deduplicate_base_structures(bases)
