@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from typing import Any
 
@@ -11,6 +11,8 @@ import numpy as np
 
 from .models import KERNEL_FAMILY, KERNEL_VERSION, KernelMetadata
 from .neighbours import _validate_chunk_size, _validate_descriptors
+
+SourceProgressCallback = Callable[[int, int], None]
 
 
 def _validate_bandwidths(bandwidths: Any, row_count: int) -> np.ndarray:
@@ -129,6 +131,7 @@ def iter_normalized_kernel_columns(
     bandwidths: np.ndarray,
     *,
     chunk_size: int = 1024,
+    progress_callback: SourceProgressCallback | None = None,
 ) -> Iterator[NormalizedKernelColumn]:
     """Yield positive normalized source columns using bounded workspaces.
 
@@ -139,6 +142,8 @@ def iter_normalized_kernel_columns(
     values = _validate_descriptors(descriptors)
     scales = _validate_bandwidths(bandwidths, values.shape[0])
     block = _validate_chunk_size(chunk_size)
+    if progress_callback is not None and not callable(progress_callback):
+        raise TypeError("progress_callback must be callable")
     normalisers = source_normalisers(values, scales, chunk_size=block)
     for source_index, scale in enumerate(scales):
         normaliser = normalisers[source_index]
@@ -156,6 +161,8 @@ def iter_normalized_kernel_columns(
             yield NormalizedKernelColumn(source_index, target_indices, normalized)
         if not math.isclose(column_total, 1.0, rel_tol=0.0, abs_tol=1.0e-12):
             raise ValueError(f"normalized source kernel column {source_index} does not sum to one")
+        if progress_callback is not None:
+            progress_callback(source_index + 1, values.shape[0])
 
 
 def normalized_kernel_matrix(
@@ -197,6 +204,7 @@ def evaluate_leave_one_out_objective(
     bandwidths: np.ndarray,
     *,
     chunk_size: int = 1024,
+    progress_callback: SourceProgressCallback | None = None,
 ) -> LeaveOneOutObjective:
     """Evaluate the exact source-normalized finite-pool LOO objective."""
 
@@ -221,6 +229,7 @@ def evaluate_leave_one_out_objective(
         values,
         _validate_bandwidths(bandwidths, values.shape[0]),
         chunk_size=chunk_size,
+        progress_callback=progress_callback,
     ):
         non_source = column.target_indices != column.source_index
         if np.any(non_source):
@@ -262,6 +271,7 @@ __all__ = [
     "KernelMetadata",
     "LeaveOneOutObjective",
     "NormalizedKernelColumn",
+    "SourceProgressCallback",
     "evaluate_leave_one_out_objective",
     "evaluate_loo_objective",
     "evaluate_wendland_kernel",

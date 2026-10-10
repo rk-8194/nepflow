@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import math
-from collections.abc import Mapping, Sequence
+import time
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -27,6 +29,8 @@ from .models import (
     FrozenBandwidths,
 )
 from .neighbours import ExactNeighbourResult, compute_exact_neighbours
+
+logger = logging.getLogger(__name__)
 
 
 class BandwidthCalibrationError(ValueError):
@@ -278,6 +282,13 @@ def _positive_float(value: Any, name: str) -> float:
     return result
 
 
+def _progress_timing(completed: int, total: int, started: float) -> tuple[float, float]:
+    elapsed = max(0.0, time.perf_counter() - started)
+    rate = completed / elapsed if completed > 0 and elapsed > 0.0 else 0.0
+    remaining = (total - completed) / rate if rate > 0.0 else 0.0
+    return elapsed, max(0.0, remaining)
+
+
 def _pool_row_ids(pool: EntropyPool) -> tuple[str, ...]:
     def row_value(row: Any, name: str, default: Any) -> Any:
         return row.get(name, default) if isinstance(row, Mapping) else getattr(row, name, default)
@@ -472,9 +483,108 @@ def calibrate_bandwidth(
         domain_k = selected_settings.k_candidates
         domain_c = selected_settings.c_candidates
 
+    total_combinations = len(domain_k) * len(domain_c)
+    calibration_started = time.perf_counter()
+    logger.info(
+        "Bandwidth calibration started: mode=%s, ordered combinations=%d",
+        selected_settings.mode,
+        total_combinations,
+    )
+    if pool.descriptors.shape[0] < 2:
+        elapsed, _ = _progress_timing(0, total_combinations, calibration_started)
+        logger.error(
+            "Bandwidth calibration failed: no valid pair, attempted=0, valid=0, "
+            "invalid=0, elapsed=%.3fs",
+            elapsed,
+        )
+        raise BandwidthCalibrationError("leave-one-out calibration requires at least two rows")
+
     attempts: list[CalibrationAttempt] = []
     radii_by_k: dict[int, ExactNeighbourResult | str] = {}
     winner: tuple[float, FrozenBandwidths, np.ndarray] | None = None
+    completed_combinations = 0
+    valid_count = 0
+    invalid_count = 0
+
+    def record_attempt(attempt: CalibrationAttempt) -> None:
+        nonlocal completed_combinations, valid_count, invalid_count
+        attempts.append(attempt)
+        completed_combinations += 1
+        if attempt.status == "valid":
+            valid_count += 1
+        else:
+            invalid_count += 1
+        elapsed, remaining = _progress_timing(
+            completed_combinations,
+            total_combinations,
+            calibration_started,
+        )
+        percentage = 100.0 * completed_combinations / total_combinations
+        progress_values = (
+            attempt.k,
+            attempt.c,
+            completed_combinations,
+            total_combinations,
+            percentage,
+            valid_count,
+            invalid_count,
+            elapsed,
+            remaining,
+        )
+        if attempt.status == "valid":
+            logger.info(
+                "Bandwidth calibration pair completed: k=%d, c=%g, J(k,c)=%.12g, "
+                "%d/%d combinations (%.1f%%), valid=%d, invalid=%d, elapsed=%.3fs, "
+                "estimated remaining=%.3fs",
+                *progress_values[:2],
+                attempt.objective,
+                *progress_values[2:],
+            )
+        else:
+            logger.info(
+                "Bandwidth calibration pair completed: k=%d, c=%g, invalid=%s, "
+                "%d/%d combinations (%.1f%%), valid=%d, invalid=%d, elapsed=%.3fs, "
+                "estimated remaining=%.3fs",
+                *progress_values[:2],
+                attempt.reason or "unspecified invalidity",
+                *progress_values[2:],
+            )
+
+    def source_progress_logger(candidate_k: int, candidate_c: float) -> Callable[[int, int], None]:
+        pair_started = time.perf_counter()
+        next_percent = 5
+        last_completed = 0
+
+        def report(completed: int, total_sources: int) -> None:
+            nonlocal next_percent, last_completed
+            if completed <= last_completed:
+                return
+            last_completed = completed
+            if total_sources < 20:
+                should_report = True
+            else:
+                should_report = completed * 100 >= next_percent * total_sources
+            if not should_report:
+                return
+            elapsed, remaining = _progress_timing(completed, total_sources, pair_started)
+            percentage = 100.0 * completed / total_sources
+            logger.info(
+                "Bandwidth calibration pair source progress: k=%d, c=%g, source=%d/%d "
+                "(%.1f%%), elapsed=%.3fs, estimated remaining=%.3fs",
+                candidate_k,
+                candidate_c,
+                completed,
+                total_sources,
+                percentage,
+                elapsed,
+                remaining,
+            )
+            if total_sources >= 20:
+                while next_percent <= 100 and completed * 100 >= next_percent * total_sources:
+                    next_percent += 5
+
+        return report
+
     for candidate_k in domain_k:
         try:
             neighbours = radii_by_k.get(candidate_k)
@@ -493,7 +603,7 @@ def calibrate_bandwidth(
             reason = str(exc)
             radii_by_k[candidate_k] = reason
             for candidate_c in domain_c:
-                attempts.append(
+                record_attempt(
                     CalibrationAttempt(candidate_k, float(candidate_c), "invalid", reason=reason)
                 )
             continue
@@ -506,9 +616,10 @@ def calibrate_bandwidth(
                     pool.probabilities,
                     frozen.bandwidths,
                     chunk_size=selected_settings.chunk_size,
+                    progress_callback=source_progress_logger(candidate_k, float(candidate_c)),
                 )
                 if not objective.valid or objective.objective is None:
-                    attempts.append(
+                    record_attempt(
                         CalibrationAttempt(
                             candidate_k,
                             float(candidate_c),
@@ -525,11 +636,11 @@ def calibrate_bandwidth(
                     objective=objective.objective,
                     bandwidth_fingerprint=frozen.fingerprint,
                 )
-                attempts.append(attempt)
+                record_attempt(attempt)
                 if winner is None or objective.objective < winner[0]:
                     winner = (objective.objective, frozen, objective.probabilities)
             except (FloatingPointError, OverflowError, ValueError) as exc:
-                attempts.append(
+                record_attempt(
                     CalibrationAttempt(
                         candidate_k,
                         float(candidate_c),
@@ -542,6 +653,19 @@ def calibrate_bandwidth(
             break
 
     if winner is None:
+        elapsed, _ = _progress_timing(
+            completed_combinations,
+            total_combinations,
+            calibration_started,
+        )
+        logger.error(
+            "Bandwidth calibration failed: no valid pair, attempted=%d, valid=%d, "
+            "invalid=%d, elapsed=%.3fs",
+            completed_combinations,
+            valid_count,
+            invalid_count,
+            elapsed,
+        )
         raise BandwidthCalibrationError(
             "no valid entropy bandwidth calibration pair exists; "
             + "; ".join(
@@ -551,6 +675,23 @@ def calibrate_bandwidth(
             attempts=attempts,
         )
     objective_value, selected_bandwidths, loo_probabilities = winner
+    elapsed, _ = _progress_timing(
+        completed_combinations,
+        total_combinations,
+        calibration_started,
+    )
+    logger.info(
+        "Bandwidth calibration completed: selected k=%d, c=%g, objective=%.12g, "
+        "attempted=%d/%d (100.0%%), valid=%d, invalid=%d, elapsed=%.3fs",
+        selected_bandwidths.k,
+        selected_bandwidths.c,
+        objective_value,
+        completed_combinations,
+        total_combinations,
+        valid_count,
+        invalid_count,
+        elapsed,
+    )
     calibration_payload = {
         "schema": "entropy-calibration-v1",
         "pool": pool.fingerprint,

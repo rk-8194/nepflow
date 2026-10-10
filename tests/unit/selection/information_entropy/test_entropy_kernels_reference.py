@@ -72,3 +72,29 @@ def test_dense_kernel_oracle_has_an_explicit_memory_guard() -> None:
     bandwidths = np.ones(5, dtype=np.float64)
     with pytest.raises(ValueError, match="memory bound"):
         normalized_kernel_matrix(descriptors, bandwidths, max_dense_entries=4)
+
+
+def test_source_progress_callback_preserves_objective_and_reports_completed_sources() -> None:
+    descriptors = np.asarray([[0.0], [1.0], [3.0]], dtype=np.float64)
+    bandwidths = np.asarray([2.0, 3.0, 2.0], dtype=np.float64)
+    probabilities = np.asarray([0.5, 0.25, 0.25], dtype=np.float64)
+    progress: list[tuple[int, int]] = []
+
+    without_callback = evaluate_leave_one_out_objective(
+        descriptors,
+        probabilities,
+        bandwidths,
+        chunk_size=1,
+    )
+    with_callback = evaluate_leave_one_out_objective(
+        descriptors,
+        probabilities,
+        bandwidths,
+        chunk_size=1,
+        progress_callback=lambda completed, total: progress.append((completed, total)),
+    )
+
+    assert progress == [(1, 3), (2, 3), (3, 3)]
+    assert with_callback.valid == without_callback.valid
+    assert with_callback.objective == pytest.approx(without_callback.objective)
+    np.testing.assert_array_equal(with_callback.probabilities, without_callback.probabilities)

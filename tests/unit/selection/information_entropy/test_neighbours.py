@@ -1,5 +1,7 @@
 """Exact distinct-location neighbour reference tests."""
 
+import logging
+
 import numpy as np
 import pytest
 
@@ -66,3 +68,49 @@ def test_all_coincident_or_insufficient_locations_fail() -> None:
     insufficient = np.asarray([[0.0], [1.0], [0.0]], dtype=np.float64)
     with pytest.raises(ValueError, match="distinct"):
         compute_exact_neighbours(insufficient, 2)
+
+
+def test_neighbour_progress_reports_each_small_completed_query(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(
+        logging.INFO,
+        logger="nepflow.stages.selection.algorithms.information_entropy.neighbours",
+    )
+    descriptors = np.arange(5, dtype=np.float64).reshape(-1, 1)
+
+    compute_exact_neighbours(descriptors, 1)
+
+    progress = [
+        record.getMessage()
+        for record in caplog.records
+        if "Exact neighbour search progress:" in record.getMessage()
+    ]
+    assert len(progress) == len(descriptors)
+    assert all(f"{index}/5" in message for index, message in enumerate(progress, 1))
+    assert "100.0%" in progress[-1]
+    assert all("estimated remaining=" in message for message in progress)
+
+
+def test_neighbour_progress_reaches_one_percent_thresholds_for_large_pool(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(
+        logging.INFO,
+        logger="nepflow.stages.selection.algorithms.information_entropy.neighbours",
+    )
+    descriptors = np.arange(101, dtype=np.float64).reshape(-1, 1)
+
+    compute_exact_neighbours(descriptors, 1)
+
+    progress = [
+        record.getMessage()
+        for record in caplog.records
+        if "Exact neighbour search progress:" in record.getMessage()
+    ]
+    assert len(progress) == 100
+    completed = [int(message.split(": ", 1)[1].split("/", 1)[0]) for message in progress]
+    assert completed == sorted(set(completed))
+    assert completed[-1] == len(descriptors)
+    assert "Exact neighbour search started: N=101, distinct locations=101, k=1" in caplog.text
+    assert "Exact neighbour search completed: 101/101 (100.0%)" in caplog.text

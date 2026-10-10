@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import hashlib
+import logging
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -17,6 +19,8 @@ from .models import (
     NEIGHBOUR_DISTINCT_POLICY,
     NEIGHBOUR_METRIC,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def _validate_descriptors(descriptors: Any) -> np.ndarray:
@@ -203,6 +207,16 @@ def compute_exact_neighbours(
     )
     representatives = np.asarray(first_indices, dtype=np.int64)
     n_locations = locations.shape[0]
+    started = time.perf_counter()
+    logger.info(
+        "Exact neighbour search started: N=%d, distinct locations=%d, k=%d, "
+        "backend=%s, chunk_size=%d",
+        n_rows,
+        n_locations,
+        order_k,
+        NEIGHBOUR_BACKEND_ID,
+        block,
+    )
     if n_locations - 1 < order_k:
         raise ValueError(
             f"k={order_k} requires at least {order_k} other distinct descriptor locations; "
@@ -212,13 +226,48 @@ def compute_exact_neighbours(
     radii = np.empty(n_rows, dtype=np.float64)
     neighbour_indices = np.empty((n_rows, order_k), dtype=np.int64)
     neighbour_distances = np.empty((n_rows, order_k), dtype=np.float64)
+    next_percent = 1
+
+    def report_query_progress(completed: int) -> None:
+        nonlocal next_percent
+        if n_rows < 100:
+            should_report = True
+        else:
+            should_report = completed * 100 >= next_percent * n_rows
+        if not should_report:
+            return
+        elapsed = max(0.0, time.perf_counter() - started)
+        rate = completed / elapsed if completed > 0 and elapsed > 0.0 else 0.0
+        remaining = (n_rows - completed) / rate if rate > 0.0 else 0.0
+        percentage = 100.0 * completed / n_rows
+        logger.info(
+            "Exact neighbour search progress: %d/%d (%.1f%%), elapsed=%.3fs, "
+            "estimated remaining=%.3fs",
+            completed,
+            n_rows,
+            percentage,
+            elapsed,
+            max(0.0, remaining),
+        )
+        if n_rows >= 100:
+            while next_percent <= 100 and completed * 100 >= next_percent * n_rows:
+                next_percent += 1
+
     for query_index in range(n_rows):
+        logger.debug("Exact neighbour query %d/%d started", query_index + 1, n_rows)
         query_location = int(row_to_location[query_index])
         query = values[query_index]
         best_distances = np.empty(0, dtype=np.float64)
         best_representatives = np.empty(0, dtype=np.int64)
         for start in range(0, n_locations, block):
             stop = min(start + block, n_locations)
+            logger.debug(
+                "Exact neighbour query %d/%d processing location block [%d:%d)",
+                query_index + 1,
+                n_rows,
+                start,
+                stop,
+            )
             location_block = locations[start:stop]
             location_ids = np.arange(start, stop, dtype=np.int64)
             mask = location_ids != query_location
@@ -251,8 +300,15 @@ def compute_exact_neighbours(
         radii[query_index] = best_distances[-1]
         neighbour_indices[query_index] = best_representatives
         neighbour_distances[query_index] = best_distances
+        logger.debug("Exact neighbour query %d/%d completed", query_index + 1, n_rows)
+        report_query_progress(query_index + 1)
     if not np.all(np.isfinite(radii)) or np.any(radii <= 0.0):
         raise ValueError("exact kth-neighbour radii must be finite and positive")
+
+    elapsed = max(0.0, time.perf_counter() - started)
+    logger.info(
+        "Exact neighbour search completed: %d/%d (100.0%%), elapsed=%.3fs", n_rows, n_rows, elapsed
+    )
 
     if representation_fingerprint is None:
         representation_id = _array_fingerprint(values)
