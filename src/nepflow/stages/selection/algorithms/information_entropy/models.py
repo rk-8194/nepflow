@@ -29,7 +29,6 @@ KERNEL_OPERATOR_SCHEMA_VERSION = "kernel-operator-v1"
 SPARSE_NUMERICAL_TOLERANCE = 1.0e-12
 ENTROPY_OBJECTIVE_SCHEMA_VERSION = "entropy-objective-v1"
 DEFAULT_RADIUS_QUERY_BYTES = 256 * 1024 * 1024
-DEFAULT_CALIBRATION_WORK_BYTES = 512 * 1024 * 1024
 
 
 def _readonly_float_array(value: Any, *, name: str) -> np.ndarray:
@@ -82,10 +81,10 @@ class EntropyBandwidthSettings:
     backend: str = DEFAULT_NEIGHBOUR_BACKEND_ID
     metric: str = NEIGHBOUR_METRIC
     chunk_size: int = 1024
-    max_neighbour_entries: int = 1_000_000
+    max_neighbour_entries: int | None = None
     max_index_bytes: int | None = None
-    max_radius_query_bytes: int = DEFAULT_RADIUS_QUERY_BYTES
-    max_calibration_work_bytes: int = DEFAULT_CALIBRATION_WORK_BYTES
+    max_radius_query_bytes: int | None = None
+    max_calibration_work_bytes: int | None = None
     calibration_batch_size: int | None = None
 
     def __post_init__(self) -> None:
@@ -100,30 +99,26 @@ class EntropyBandwidthSettings:
             raise ValueError("chunk_size must be a positive integer")
         if self.chunk_size < 1:
             raise ValueError("chunk_size must be a positive integer")
-        if (
+        if self.max_neighbour_entries is not None and (
             isinstance(self.max_neighbour_entries, bool)
             or not isinstance(self.max_neighbour_entries, (int, np.integer))
             or int(self.max_neighbour_entries) < 1
         ):
-            raise ValueError("max_neighbour_entries must be a positive integer")
+            raise ValueError("max_neighbour_entries must be a positive integer when provided")
         if self.max_index_bytes is not None and (
             isinstance(self.max_index_bytes, bool)
             or not isinstance(self.max_index_bytes, (int, np.integer))
             or int(self.max_index_bytes) < 1
         ):
             raise ValueError("max_index_bytes must be a positive integer when provided")
-        if (
-            isinstance(self.max_radius_query_bytes, bool)
-            or not isinstance(self.max_radius_query_bytes, (int, np.integer))
-            or int(self.max_radius_query_bytes) < 1
-        ):
-            raise ValueError("max_radius_query_bytes must be a positive integer")
-        if (
-            isinstance(self.max_calibration_work_bytes, bool)
-            or not isinstance(self.max_calibration_work_bytes, (int, np.integer))
-            or int(self.max_calibration_work_bytes) < 1
-        ):
-            raise ValueError("max_calibration_work_bytes must be a positive integer")
+        for name in ("max_radius_query_bytes", "max_calibration_work_bytes"):
+            value = getattr(self, name)
+            if value is not None and (
+                isinstance(value, bool)
+                or not isinstance(value, (int, np.integer))
+                or int(value) < 1
+            ):
+                raise ValueError(f"{name} must be a positive integer when provided")
         if self.calibration_batch_size is not None and (
             isinstance(self.calibration_batch_size, bool)
             or not isinstance(self.calibration_batch_size, (int, np.integer))
@@ -143,11 +138,16 @@ class EntropyBandwidthSettings:
         object.__setattr__(self, "k_candidates", k_candidates)
         object.__setattr__(self, "c_candidates", c_candidates)
         object.__setattr__(self, "chunk_size", int(self.chunk_size))
-        object.__setattr__(self, "max_neighbour_entries", int(self.max_neighbour_entries))
-        object.__setattr__(self, "max_radius_query_bytes", int(self.max_radius_query_bytes))
+        if self.max_neighbour_entries is not None:
+            object.__setattr__(self, "max_neighbour_entries", int(self.max_neighbour_entries))
+        if self.max_radius_query_bytes is not None:
+            object.__setattr__(self, "max_radius_query_bytes", int(self.max_radius_query_bytes))
         if self.max_index_bytes is not None:
             object.__setattr__(self, "max_index_bytes", int(self.max_index_bytes))
-        object.__setattr__(self, "max_calibration_work_bytes", int(self.max_calibration_work_bytes))
+        if self.max_calibration_work_bytes is not None:
+            object.__setattr__(
+                self, "max_calibration_work_bytes", int(self.max_calibration_work_bytes)
+            )
         if self.calibration_batch_size is not None:
             object.__setattr__(self, "calibration_batch_size", int(self.calibration_batch_size))
 
@@ -155,12 +155,16 @@ class EntropyBandwidthSettings:
     def operational_work_bytes(self) -> int:
         """Return the effective per-source calibration/query workspace limit."""
 
+        if self.max_calibration_work_bytes is None:
+            raise ValueError("operational work bytes require a runtime resource budget")
         return int(self.max_calibration_work_bytes)
 
     @property
     def radius_query_bytes(self) -> int:
         """Return the effective single-source exact-query limit."""
 
+        if self.max_radius_query_bytes is None:
+            raise ValueError("radius query bytes require a runtime resource budget")
         return min(int(self.max_radius_query_bytes), self.operational_work_bytes)
 
 
@@ -1639,7 +1643,6 @@ __all__ = [
     "INDEXED_NEIGHBOUR_BACKEND_VERSION",
     "DEFAULT_NEIGHBOUR_BACKEND_ID",
     "DEFAULT_RADIUS_QUERY_BYTES",
-    "DEFAULT_CALIBRATION_WORK_BYTES",
     "NEIGHBOUR_DISTINCT_POLICY",
     "NEIGHBOUR_METRIC",
     "SPARSE_CANDIDATE_CONTRIBUTION_SCHEMA_VERSION",

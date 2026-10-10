@@ -12,6 +12,11 @@ from typing import Any
 import numpy as np
 
 from nepflow.io.hashing import sha256_canonical_json
+from nepflow.resources.budget import (
+    ResourceBudgetService,
+    ResourceCapacityError,
+    build_resource_budget,
+)
 
 from .models import (
     DEFAULT_NEIGHBOUR_BACKEND_ID,
@@ -280,10 +285,70 @@ class IndexedCPUNeighbourIndex:
         descriptors: np.ndarray,
         *,
         max_index_bytes: int | None = None,
-        max_radius_query_bytes: int = DEFAULT_RADIUS_QUERY_BYTES,
+        max_radius_query_bytes: int | None = None,
         max_neighbour_cache_bytes: int = DEFAULT_NEIGHBOUR_CACHE_BYTES,
+        resource_budget: ResourceBudgetService | None = None,
     ) -> None:
         values = _validate_descriptors(descriptors)
+        service = resource_budget or build_resource_budget()
+        remaining = service.remaining_managed_budget
+        if remaining is None:
+            raise ResourceCapacityError(
+                "indexed neighbour construction requires known runtime memory headroom",
+                operation="indexed neighbour construction",
+            )
+        if remaining < 1:
+            raise ResourceCapacityError(
+                "indexed neighbour construction has no allocatable runtime memory headroom",
+                operation="indexed neighbour construction",
+                requested_bytes=1,
+                available_bytes=remaining,
+                reserved_headroom_bytes=service.budget.reserved_headroom_bytes,
+            )
+        explicit_index_limit = (
+            None
+            if max_index_bytes is None
+            else _validate_memory_limit(max_index_bytes, "max_index_bytes")
+        )
+        effective_index_limit = (
+            remaining
+            if explicit_index_limit is None
+            else min(explicit_index_limit, remaining)
+        )
+        # Preflight the worst-case unique-location/grouping/tree footprint before
+        # np.unique and cKDTree can materialize their temporary arrays.  The
+        # post-build estimate below remains the tighter check for duplicate rows.
+        estimated_peak_index_bytes = int(
+            2 * values.nbytes + 160 * values.shape[0] + 8192
+        )
+        if estimated_peak_index_bytes > effective_index_limit:
+            if (
+                explicit_index_limit is not None
+                and estimated_peak_index_bytes > explicit_index_limit
+            ):
+                raise ValueError(
+                    "indexed exact neighbour backend exceeds max_index_bytes before allocation: "
+                    f"N={values.shape[0]}, estimated_peak_bytes={estimated_peak_index_bytes}, "
+                    f"max_index_bytes={explicit_index_limit}"
+                )
+            raise ResourceCapacityError(
+                "indexed exact neighbour backend cannot reserve its pre-build footprint: "
+                f"N={values.shape[0]}, estimated_peak_bytes={estimated_peak_index_bytes}, "
+                f"available_bytes={remaining}",
+                operation="indexed neighbour construction",
+                requested_bytes=estimated_peak_index_bytes,
+                available_bytes=remaining,
+                reserved_headroom_bytes=service.budget.reserved_headroom_bytes,
+            )
+        radius_limit = (
+            max(1, remaining // 2)
+            if max_radius_query_bytes is None
+            else min(
+                _validate_memory_limit(max_radius_query_bytes, "max_radius_query_bytes"),
+                remaining,
+            )
+        )
+        self.resource_budget = service
         locations, first_indices, row_to_location = np.unique(
             values,
             axis=0,
@@ -311,9 +376,7 @@ class IndexedCPUNeighbourIndex:
         self.location_indptr.setflags(write=False)
         self.grouping_build_seconds = max(0.0, time.perf_counter() - grouping_started)
         self.grouping_bytes = int(self.rows_by_location.nbytes + self.location_indptr.nbytes)
-        self.max_radius_query_bytes = _validate_memory_limit(
-            max_radius_query_bytes, "max_radius_query_bytes"
-        )
+        self.max_radius_query_bytes = radius_limit
         self.max_neighbour_cache_bytes = _validate_memory_limit(
             max_neighbour_cache_bytes, "max_neighbour_cache_bytes"
         )
@@ -331,20 +394,24 @@ class IndexedCPUNeighbourIndex:
         self.max_support_count = 0
         self.query_workspace_peak_bytes = 0
         self.index_bytes = self._estimate_index_bytes()
-        if max_index_bytes is not None:
-            if isinstance(max_index_bytes, bool) or not isinstance(
-                max_index_bytes, (int, np.integer)
-            ):
-                raise ValueError("max_index_bytes must be a positive integer")
-            if int(max_index_bytes) < 1:
-                raise ValueError("max_index_bytes must be a positive integer")
-            if self.index_bytes > int(max_index_bytes):
+        if self.index_bytes > effective_index_limit:
+            if explicit_index_limit is not None and self.index_bytes > explicit_index_limit:
                 raise ValueError(
                     "indexed exact neighbour backend exceeds max_index_bytes: "
                     f"N={values.shape[0]}, Q={self.unique_locations.shape[0]}, "
                     f"estimated_peak_bytes={self.index_bytes}, "
-                    f"max_index_bytes={int(max_index_bytes)}"
+                    f"max_index_bytes={explicit_index_limit}"
                 )
+            raise ResourceCapacityError(
+                "indexed exact neighbour backend exceeds its runtime memory allowance: "
+                f"N={values.shape[0]}, Q={self.unique_locations.shape[0]}, "
+                f"estimated_peak_bytes={self.index_bytes}, "
+                f"max_index_bytes={effective_index_limit}",
+                operation="indexed neighbour construction",
+                requested_bytes=self.index_bytes,
+                available_bytes=remaining,
+                reserved_headroom_bytes=service.budget.reserved_headroom_bytes,
+            )
         try:
             from scipy.spatial import cKDTree  # pyright: ignore[reportAttributeAccessIssue]
         except ImportError as exc:
@@ -736,7 +803,8 @@ def compute_exact_neighbours(
     chunk_size: int = 1024,
     representation_fingerprint: str | None = None,
     row_ids: Sequence[str] | None = None,
-    max_neighbour_entries: int = 1_000_000,
+    max_neighbour_entries: int | None = None,
+    resource_budget: ResourceBudgetService | None = None,
 ) -> ExactNeighbourResult:
     """Calculate exact kth-neighbour radii without an ``N x N`` allocation.
 
@@ -749,18 +817,40 @@ def compute_exact_neighbours(
     values = _validate_descriptors(descriptors)
     order_k = _validate_k(k)
     block = _validate_chunk_size(chunk_size)
-    if isinstance(max_neighbour_entries, bool) or not isinstance(
-        max_neighbour_entries, (int, np.integer)
-    ):
-        raise ValueError("max_neighbour_entries must be a positive integer")
-    max_entries = int(max_neighbour_entries)
-    if max_entries < 1:
-        raise ValueError("max_neighbour_entries must be a positive integer")
     n_rows = values.shape[0]
-    if n_rows * order_k > max_entries:
+    if max_neighbour_entries is not None and (
+        isinstance(max_neighbour_entries, bool)
+        or not isinstance(max_neighbour_entries, (int, np.integer))
+        or int(max_neighbour_entries) < 1
+    ):
+        raise ValueError("max_neighbour_entries must be a positive integer when provided")
+    if max_neighbour_entries is not None and n_rows * order_k > int(max_neighbour_entries):
         raise ValueError(
             "exact neighbour result exceeds its explicit bounded-memory limit; "
             "reduce k or configure a scalable neighbour backend"
+        )
+    service = resource_budget or build_resource_budget()
+    remaining = service.remaining_managed_budget
+    if remaining is None:
+        raise ResourceCapacityError(
+            "exact neighbour calculation requires known runtime memory headroom",
+            operation="exact neighbour calculation",
+        )
+    requested_bytes = int(
+        values.nbytes
+        + 16 * n_rows * order_k
+        + 128 * n_rows
+        + 32 * min(n_rows, block) * values.shape[1]
+    )
+    if requested_bytes > remaining:
+        raise ResourceCapacityError(
+            "exact neighbour result exceeds its runtime memory allowance: "
+            f"N={n_rows}, k={order_k}, requested_bytes={requested_bytes}, "
+            f"available_bytes={remaining}",
+            operation="exact neighbour calculation",
+            requested_bytes=requested_bytes,
+            available_bytes=remaining,
+            reserved_headroom_bytes=service.budget.reserved_headroom_bytes,
         )
     ordered_row_ids = _validate_row_ids(row_ids, n_rows)
     locations, first_indices, row_to_location = np.unique(
@@ -921,29 +1011,57 @@ def compute_indexed_cpu_neighbours(
     chunk_size: int = 1024,
     representation_fingerprint: str | None = None,
     row_ids: Sequence[str] | None = None,
-    max_neighbour_entries: int = 1_000_000,
+    max_neighbour_entries: int | None = None,
+    resource_budget: ResourceBudgetService | None = None,
 ) -> ExactNeighbourResult:
     """Calculate exact kth other-location neighbours through the indexed CPU backend."""
 
     values = _validate_descriptors(descriptors)
     order_k = _validate_k(k)
     _validate_chunk_size(chunk_size)
-    if isinstance(max_neighbour_entries, bool) or not isinstance(
-        max_neighbour_entries, (int, np.integer)
+    if max_neighbour_entries is not None and (
+        isinstance(max_neighbour_entries, bool)
+        or not isinstance(max_neighbour_entries, (int, np.integer))
+        or int(max_neighbour_entries) < 1
     ):
-        raise ValueError("max_neighbour_entries must be a positive integer")
-    max_entries = int(max_neighbour_entries)
-    if max_entries < 1:
-        raise ValueError("max_neighbour_entries must be a positive integer")
-    if values.shape[0] * order_k > max_entries:
+        raise ValueError("max_neighbour_entries must be a positive integer when provided")
+    if max_neighbour_entries is not None and values.shape[0] * order_k > int(
+        max_neighbour_entries
+    ):
         raise ValueError(
             "indexed exact neighbour result exceeds its explicit bounded-memory limit: "
             f"N={values.shape[0]}, required_entries={values.shape[0] * order_k}, "
-            f"max_entries={max_entries}"
+            f"max_entries={int(max_neighbour_entries)}"
         )
-    active_index = index if index is not None else IndexedCPUNeighbourIndex(values)
+    active_index = (
+        index
+        if index is not None
+        else IndexedCPUNeighbourIndex(values, resource_budget=resource_budget)
+    )
     if not np.array_equal(active_index.descriptors, values):
         raise ValueError("indexed neighbour index belongs to different descriptors")
+    service = (
+        resource_budget
+        or getattr(active_index, "resource_budget", None)
+        or build_resource_budget()
+    )
+    remaining = service.remaining_managed_budget
+    if remaining is None:
+        raise ResourceCapacityError(
+            "indexed neighbour calculation requires known runtime memory headroom",
+            operation="indexed neighbour calculation",
+        )
+    requested_bytes = int(16 * values.shape[0] * order_k + 128 * values.shape[0])
+    if requested_bytes > remaining:
+        raise ResourceCapacityError(
+            "indexed neighbour result exceeds its runtime memory allowance: "
+            f"N={values.shape[0]}, k={order_k}, requested_bytes={requested_bytes}, "
+            f"available_bytes={remaining}",
+            operation="indexed neighbour calculation",
+            requested_bytes=requested_bytes,
+            available_bytes=remaining,
+            reserved_headroom_bytes=service.budget.reserved_headroom_bytes,
+        )
     ordered_row_ids = _validate_row_ids(row_ids, values.shape[0])
     radii, neighbour_indices, neighbour_distances = active_index.query_neighbours(order_k)
     representation_id = (
@@ -988,7 +1106,8 @@ def build_neighbour_index(
     *,
     backend: str = DEFAULT_NEIGHBOUR_BACKEND_ID,
     max_index_bytes: int | None = None,
-    max_radius_query_bytes: int = DEFAULT_RADIUS_QUERY_BYTES,
+    max_radius_query_bytes: int | None = None,
+    resource_budget: ResourceBudgetService | None = None,
 ) -> IndexedCPUNeighbourIndex | None:
     """Build the explicitly requested reusable index, with no fallback."""
 
@@ -997,6 +1116,7 @@ def build_neighbour_index(
             descriptors,
             max_index_bytes=max_index_bytes,
             max_radius_query_bytes=max_radius_query_bytes,
+            resource_budget=resource_budget,
         )
     if backend == NEIGHBOUR_BACKEND_ID:
         return None
@@ -1011,7 +1131,8 @@ def compute_radius_support(
     backend: str = DEFAULT_NEIGHBOUR_BACKEND_ID,
     index: IndexedCPUNeighbourIndex | None = None,
     chunk_size: int = 1024,
-    max_radius_query_bytes: int = DEFAULT_RADIUS_QUERY_BYTES,
+    max_radius_query_bytes: int | None = None,
+    resource_budget: ResourceBudgetService | None = None,
     context: str | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Return strict compact-kernel support for one source row.
@@ -1022,12 +1143,41 @@ def compute_radius_support(
 
     values = _validate_descriptors(descriptors)
     block = _validate_chunk_size(chunk_size)
-    limit = _validate_memory_limit(max_radius_query_bytes, "max_radius_query_bytes")
+    if max_radius_query_bytes is None and index is not None:
+        limit = index.max_radius_query_bytes
+    else:
+        service = resource_budget or build_resource_budget()
+        remaining = service.remaining_managed_budget
+        if remaining is None:
+            raise ResourceCapacityError(
+                "exact radius support requires known runtime memory headroom",
+                operation="exact radius support",
+            )
+        if remaining < 1:
+            raise ResourceCapacityError(
+                "exact radius support has no allocatable runtime memory headroom",
+                operation="exact radius support",
+                requested_bytes=1,
+                available_bytes=remaining,
+                reserved_headroom_bytes=service.budget.reserved_headroom_bytes,
+            )
+        limit = (
+            max(1, remaining // 2)
+            if max_radius_query_bytes is None
+            else min(
+                _validate_memory_limit(max_radius_query_bytes, "max_radius_query_bytes"),
+                remaining,
+            )
+        )
     if backend == INDEXED_NEIGHBOUR_BACKEND_ID:
         active_index = (
             index
             if index is not None
-            else IndexedCPUNeighbourIndex(values, max_radius_query_bytes=limit)
+            else IndexedCPUNeighbourIndex(
+                values,
+                max_radius_query_bytes=limit,
+                resource_budget=resource_budget,
+            )
         )
         if not np.array_equal(active_index.descriptors, values):
             raise ValueError("indexed radius-support index belongs to different descriptors")

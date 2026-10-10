@@ -14,9 +14,13 @@ from typing import Any
 import numpy as np
 
 from nepflow.io.hashing import sha256_canonical_json
+from nepflow.resources.budget import (
+    ResourceBudgetService,
+    ResourceCapacityError,
+    build_resource_budget,
+)
 
 from .models import (
-    DEFAULT_CALIBRATION_WORK_BYTES,
     DEFAULT_RADIUS_QUERY_BYTES,
     INDEXED_NEIGHBOUR_BACKEND_ID,
     INDEXED_NEIGHBOUR_BACKEND_VERSION,
@@ -192,19 +196,46 @@ class _KernelSupportProvider:
         backend: str,
         chunk_size: int,
         index: IndexedCPUNeighbourIndex | None = None,
-        max_radius_query_bytes: int = DEFAULT_RADIUS_QUERY_BYTES,
+        max_radius_query_bytes: int | None = None,
+        resource_budget: ResourceBudgetService | None = None,
         capacity_context: str | None = None,
     ) -> None:
         self.descriptors = _validate_descriptors(descriptors)
         self.backend = backend
         self.chunk_size = _validate_chunk_size(chunk_size)
-        if isinstance(max_radius_query_bytes, bool) or not isinstance(
-            max_radius_query_bytes, (int, np.integer)
-        ):
-            raise ValueError("max_radius_query_bytes must be a positive integer")
-        self.max_radius_query_bytes = int(max_radius_query_bytes)
-        if self.max_radius_query_bytes < 1:
-            raise ValueError("max_radius_query_bytes must be a positive integer")
+        self.resource_budget = (
+            resource_budget
+            or getattr(index, "resource_budget", None)
+            or build_resource_budget()
+        )
+        if max_radius_query_bytes is None and index is not None:
+            self.max_radius_query_bytes = index.max_radius_query_bytes
+        else:
+            service = self.resource_budget
+            remaining = service.remaining_managed_budget
+            if remaining is None:
+                raise ResourceCapacityError(
+                    "kernel support queries require known runtime memory headroom",
+                    operation="entropy kernel support queries",
+                )
+            if remaining < 1:
+                raise ResourceCapacityError(
+                    "kernel support queries have no allocatable runtime memory headroom",
+                    operation="entropy kernel support queries",
+                    requested_bytes=1,
+                    available_bytes=remaining,
+                    reserved_headroom_bytes=service.budget.reserved_headroom_bytes,
+                )
+            if max_radius_query_bytes is None:
+                self.max_radius_query_bytes = max(1, remaining // 2)
+            else:
+                if isinstance(max_radius_query_bytes, bool) or not isinstance(
+                    max_radius_query_bytes, (int, np.integer)
+                ):
+                    raise ValueError("max_radius_query_bytes must be a positive integer")
+                self.max_radius_query_bytes = min(int(max_radius_query_bytes), remaining)
+                if self.max_radius_query_bytes < 1:
+                    raise ValueError("max_radius_query_bytes must be a positive integer")
         self.capacity_context = capacity_context
         if backend == INDEXED_NEIGHBOUR_BACKEND_ID:
             self.index = (
@@ -214,6 +245,7 @@ class _KernelSupportProvider:
                     self.descriptors,
                     backend=backend,
                     max_radius_query_bytes=self.max_radius_query_bytes,
+                    resource_budget=self.resource_budget,
                 )
             )
             if not isinstance(self.index, IndexedCPUNeighbourIndex):
@@ -267,6 +299,7 @@ class _KernelSupportProvider:
             backend=NEIGHBOUR_BACKEND_ID,
             chunk_size=self.chunk_size,
             max_radius_query_bytes=self.max_radius_query_bytes,
+            resource_budget=self.resource_budget,
             context=self.capacity_context,
         )
         self.distance_evaluations += self.descriptors.shape[0]
@@ -311,7 +344,8 @@ def source_normalisers(
     backend: str = NEIGHBOUR_BACKEND_ID,
     index: IndexedCPUNeighbourIndex | None = None,
     support_provider: _KernelSupportProvider | None = None,
-    max_radius_query_bytes: int = DEFAULT_RADIUS_QUERY_BYTES,
+    max_radius_query_bytes: int | None = None,
+    resource_budget: ResourceBudgetService | None = None,
     capacity_context: str | None = None,
 ) -> np.ndarray:
     """Return ``Z_b`` over the complete exact compact-kernel support."""
@@ -325,6 +359,7 @@ def source_normalisers(
         chunk_size=block,
         index=index,
         max_radius_query_bytes=max_radius_query_bytes,
+        resource_budget=resource_budget,
         capacity_context=capacity_context,
     )
     normalisers = np.empty(values.shape[0], dtype=np.float64)
@@ -349,7 +384,8 @@ def iter_normalized_kernel_columns(
     backend: str = NEIGHBOUR_BACKEND_ID,
     index: IndexedCPUNeighbourIndex | None = None,
     support_provider: _KernelSupportProvider | None = None,
-    max_radius_query_bytes: int = DEFAULT_RADIUS_QUERY_BYTES,
+    max_radius_query_bytes: int | None = None,
+    resource_budget: ResourceBudgetService | None = None,
     capacity_context: str | None = None,
     source_indices: Sequence[int] | np.ndarray | None = None,
 ) -> Iterator[NormalizedKernelColumn]:
@@ -370,6 +406,7 @@ def iter_normalized_kernel_columns(
         chunk_size=block,
         index=index,
         max_radius_query_bytes=max_radius_query_bytes,
+        resource_budget=resource_budget,
         capacity_context=capacity_context,
     )
     if source_indices is None:
@@ -411,7 +448,7 @@ def normalized_kernel_matrix(
     *,
     chunk_size: int = 1024,
     max_dense_entries: int = 1_000_000,
-    max_radius_query_bytes: int = DEFAULT_RADIUS_QUERY_BYTES,
+    max_radius_query_bytes: int | None = None,
 ) -> np.ndarray:
     """Build a deliberately bounded dense oracle for small correctness tests.
 
@@ -449,7 +486,8 @@ def evaluate_leave_one_out_objective(
     progress_callback: SourceProgressCallback | None = None,
     backend: str = NEIGHBOUR_BACKEND_ID,
     index: IndexedCPUNeighbourIndex | None = None,
-    max_radius_query_bytes: int = DEFAULT_RADIUS_QUERY_BYTES,
+    max_radius_query_bytes: int | None = None,
+    resource_budget: ResourceBudgetService | None = None,
     capacity_context: str | None = None,
 ) -> LeaveOneOutObjective:
     """Evaluate the exact source-normalized finite-pool LOO objective."""
@@ -479,6 +517,7 @@ def evaluate_leave_one_out_objective(
         backend=backend,
         index=index,
         max_radius_query_bytes=max_radius_query_bytes,
+        resource_budget=resource_budget,
         capacity_context=capacity_context,
     ):
         non_source = column.target_indices != column.source_index
@@ -521,8 +560,9 @@ def evaluate_leave_one_out_objectives(
     progress_callback: BatchSourceProgressCallback | None = None,
     backend: str = NEIGHBOUR_BACKEND_ID,
     index: IndexedCPUNeighbourIndex | None = None,
-    max_radius_query_bytes: int = DEFAULT_RADIUS_QUERY_BYTES,
-    max_calibration_work_bytes: int = DEFAULT_CALIBRATION_WORK_BYTES,
+    max_radius_query_bytes: int | None = None,
+    max_calibration_work_bytes: int | None = None,
+    resource_budget: ResourceBudgetService | None = None,
     capacity_context: str | None = None,
 ) -> tuple[LeaveOneOutObjective, ...]:
     """Evaluate a bounded batch of exact LOO objectives source-by-source.
@@ -557,13 +597,39 @@ def evaluate_leave_one_out_objectives(
         raise ValueError("batched bandwidths must be finite and strictly positive")
     if progress_callback is not None and not callable(progress_callback):
         raise TypeError("progress_callback must be callable")
-    work_limit = _validate_memory_limit(
-        max_calibration_work_bytes, "max_calibration_work_bytes"
-    )
-    radius_limit = min(
-        _validate_memory_limit(max_radius_query_bytes, "max_radius_query_bytes"),
-        work_limit,
-    )
+    service = resource_budget or build_resource_budget()
+    remaining = service.remaining_managed_budget
+    if remaining is None:
+        raise ResourceCapacityError(
+            "batched leave-one-out evaluation requires known runtime memory headroom",
+            operation="entropy batched leave-one-out evaluation",
+        )
+    if remaining < 1:
+        raise ResourceCapacityError(
+            "batched leave-one-out evaluation has no allocatable runtime memory headroom",
+            operation="entropy batched leave-one-out evaluation",
+            requested_bytes=1,
+            available_bytes=remaining,
+            reserved_headroom_bytes=service.budget.reserved_headroom_bytes,
+        )
+    if max_calibration_work_bytes is None or max_radius_query_bytes is None:
+        work_limit = min(max_calibration_work_bytes or remaining, remaining)
+        radius_limit = min(
+            (
+                index.max_radius_query_bytes
+                if max_radius_query_bytes is None and index is not None
+                else max_radius_query_bytes or max(1, remaining // 2)
+            ),
+            work_limit,
+        )
+    else:
+        work_limit = _validate_memory_limit(
+            max_calibration_work_bytes, "max_calibration_work_bytes"
+        )
+        radius_limit = min(
+            _validate_memory_limit(max_radius_query_bytes, "max_radius_query_bytes"),
+            work_limit,
+        )
     block = _validate_chunk_size(chunk_size)
     batch_count = int(scales.shape[0])
     row_count = int(values.shape[0])
@@ -595,6 +661,7 @@ def evaluate_leave_one_out_objectives(
         chunk_size=block,
         index=index,
         max_radius_query_bytes=radius_limit,
+        resource_budget=service,
         capacity_context=capacity_context,
     )
     numerator = np.zeros((batch_count, row_count), dtype=np.float64)
@@ -1168,11 +1235,12 @@ def build_streamed_candidate_contributions(
     bandwidths: FrozenBandwidths | BandwidthCalibrationResult,
     *,
     chunk_size: int = 1024,
-    max_entries: int = _DEFAULT_SPARSE_EDGE_LIMIT,
+    max_entries: int | None = None,
     max_contribution_bytes: int | None = None,
     max_spool_bytes: int | None = None,
     progress_callback: SourceProgressCallback | None = None,
-    max_radius_query_bytes: int = DEFAULT_RADIUS_QUERY_BYTES,
+    max_radius_query_bytes: int | None = None,
+    resource_budget: ResourceBudgetService | None = None,
 ) -> tuple[SparseCandidateContributions, StreamedKernelExecutionSummary]:
     """Build exact candidate PMFs by streaming normalized source columns.
 
@@ -1183,16 +1251,16 @@ def build_streamed_candidate_contributions(
 
     values, frozen = _validate_sparse_graph_inputs(pool, bandwidths)
     block = _validate_chunk_size(chunk_size)
-    entry_limit = _validate_sparse_limit(max_entries, "max_entries")
+    entry_limit = (
+        None if max_entries is None else _validate_sparse_limit(max_entries, "max_entries")
+    )
     byte_limit = (
         None
         if max_contribution_bytes is None
         else _validate_sparse_limit(max_contribution_bytes, "max_contribution_bytes")
     )
     spool_limit = _validate_spool_limit(max_spool_bytes, "max_contribution_spool_bytes")
-    if spool_limit is None:
-        spool_limit = len(_EDGE_SPOOL_HEADER) + entry_limit * _EDGE_SPOOL_RECORD_BYTES
-    if spool_limit < len(_EDGE_SPOOL_HEADER):
+    if spool_limit is not None and spool_limit < len(_EDGE_SPOOL_HEADER):
         raise ValueError(
             "max_contribution_spool_bytes is too small for the candidate contribution spool header"
         )
@@ -1202,6 +1270,57 @@ def build_streamed_candidate_contributions(
     n_rows = int(values.shape[0])
     candidate_ids = tuple(pool.candidate_ids)
     candidate_count = len(candidate_ids)
+    maximum_entry_count = candidate_count * n_rows
+    if maximum_entry_count > np.iinfo(np.int64).max:
+        raise ResourceCapacityError(
+            "streamed candidate contributions exceed the int64 CSR capacity: "
+            f"N={n_rows}, M={candidate_count}, Q_max={maximum_entry_count}",
+            operation="entropy streamed candidate contributions",
+            requested_bytes=maximum_entry_count * 16,
+            available_bytes=None,
+        )
+    if entry_limit is None:
+        entry_limit = maximum_entry_count
+    runtime_budget = resource_budget or build_resource_budget()
+    remaining_budget = runtime_budget.remaining_managed_budget
+    if remaining_budget is None:
+        raise ResourceCapacityError(
+            "streamed candidate contributions require known runtime memory headroom; "
+            "provide [resources] memory_budget_bytes",
+            operation="entropy streamed candidate contributions",
+        )
+    if max_radius_query_bytes is None:
+        max_radius_query_bytes = max(1, remaining_budget // 2)
+    else:
+        max_radius_query_bytes = min(
+            _validate_memory_limit(max_radius_query_bytes, "max_radius_query_bytes"),
+            max(1, remaining_budget),
+        )
+    derived_spool_limit = spool_limit is None
+    if spool_limit is None:
+        scratch_limit = runtime_budget.budget.scratch_budget_bytes
+        if scratch_limit is None:
+            raise ResourceCapacityError(
+                "streamed candidate contributions require known scratch capacity; "
+                "provide [resources] scratch_budget_bytes or a usable temporary filesystem",
+                operation="entropy streamed candidate contributions",
+            )
+        spool_limit = int(scratch_limit)
+    if spool_limit < len(_EDGE_SPOOL_HEADER):
+        if derived_spool_limit:
+            raise ResourceCapacityError(
+                "streamed candidate contributions have insufficient scratch capacity for "
+                "their temporary spool header",
+                operation="entropy streamed candidate contributions",
+                requested_bytes=len(_EDGE_SPOOL_HEADER),
+                available_bytes=runtime_budget.remaining_managed_budget,
+                reserved_headroom_bytes=runtime_budget.budget.reserved_headroom_bytes,
+                scratch_needed_bytes=len(_EDGE_SPOOL_HEADER),
+                scratch_available_bytes=runtime_budget.budget.scratch_budget_bytes,
+            )
+        raise ValueError(
+            "max_contribution_spool_bytes is too small for the candidate contribution spool header"
+        )
     owners = np.asarray(pool.row_candidate_indices, dtype=np.int64)
     source_counts = np.bincount(owners, minlength=candidate_count).astype(np.int64)
     if np.any(source_counts <= 0):
@@ -1212,23 +1331,52 @@ def build_streamed_candidate_contributions(
     candidate_offsets[0] = 0
     np.cumsum(source_counts, dtype=np.int64, out=candidate_offsets[1:])
 
-    operator_fingerprint = _kernel_operator_fingerprint(pool, frozen)
-    support_provider = _KernelSupportProvider(
-        values,
-        backend=frozen.backend,
-        chunk_size=block,
-        max_radius_query_bytes=max_radius_query_bytes,
-        capacity_context=(
-            f"N={n_rows}, M={candidate_count}, operator={operator_fingerprint}"
-        ),
+    initial_runtime_bytes = int(
+        16 * values.nbytes + owners.nbytes + source_order.nbytes + 256 * n_rows
     )
-    if (
-        frozen.backend == INDEXED_NEIGHBOUR_BACKEND_ID
-        and frozen.backend_fingerprint
-        and support_provider.index is not None
-        and frozen.backend_fingerprint != support_provider.index.fingerprint
-    ):
-        raise ValueError("frozen bandwidths have a mismatched indexed backend fingerprint")
+    operator_fingerprint = _kernel_operator_fingerprint(pool, frozen)
+    try:
+        lease = runtime_budget.acquire(
+            "entropy streamed candidate contributions",
+            max(1, initial_runtime_bytes),
+            scratch_bytes=len(_EDGE_SPOOL_HEADER),
+        )
+    except ResourceCapacityError as exc:
+        raise ResourceCapacityError(
+            "streamed candidate contributions cannot reserve initial workspace: "
+            f"N={n_rows}, M={candidate_count}, Q=0, E=0, "
+            f"requested_bytes={initial_runtime_bytes}, "
+            f"available_bytes={runtime_budget.remaining_managed_budget}, "
+            f"scratch_available_bytes={runtime_budget.budget.scratch_budget_bytes}",
+            operation="entropy streamed candidate contributions",
+            requested_bytes=initial_runtime_bytes,
+            available_bytes=runtime_budget.remaining_managed_budget,
+            reserved_headroom_bytes=runtime_budget.budget.reserved_headroom_bytes,
+            scratch_needed_bytes=len(_EDGE_SPOOL_HEADER),
+            scratch_available_bytes=runtime_budget.budget.scratch_budget_bytes,
+        ) from exc
+
+    try:
+        support_provider = _KernelSupportProvider(
+            values,
+            backend=frozen.backend,
+            chunk_size=block,
+            max_radius_query_bytes=max_radius_query_bytes,
+            resource_budget=runtime_budget,
+            capacity_context=(
+                f"N={n_rows}, M={candidate_count}, operator={operator_fingerprint}"
+            ),
+        )
+        if (
+            frozen.backend == INDEXED_NEIGHBOUR_BACKEND_ID
+            and frozen.backend_fingerprint
+            and support_provider.index is not None
+            and frozen.backend_fingerprint != support_provider.index.fingerprint
+        ):
+            raise ValueError("frozen bandwidths have a mismatched indexed backend fingerprint")
+    except BaseException:
+        lease.close()
+        raise
 
     def estimated_peak_bytes(entry_count: int, support_count: int) -> int:
         final_arrays = 8 * (candidate_count + 1 + entry_count + entry_count + candidate_count)
@@ -1256,13 +1404,64 @@ def build_streamed_candidate_contributions(
         spool_limit,
     )
     started = time.perf_counter()
-    support_sizes = np.empty(n_rows, dtype=np.int64)
-    candidate_support_sizes = np.empty(candidate_count, dtype=np.int64)
+    support_sizes = np.zeros(n_rows, dtype=np.int64)
+    candidate_support_sizes = np.zeros(candidate_count, dtype=np.int64)
     accumulator = np.zeros(n_rows, dtype=np.float64)
     touched = np.zeros(n_rows, dtype=bool)
     implicit_edges = 0
     self_edges = 0
     source_mass_deviation = 0.0
+    q_completed = 0
+    q_active = 0
+    q_observed = 0
+    last_q_observed = 0
+
+    def resize_workspace(
+        requested_bytes: int,
+        scratch_bytes: int,
+        *,
+        source_index: int | None = None,
+    ) -> None:
+        try:
+            lease.resize(requested_bytes, scratch_bytes=scratch_bytes)
+        except ResourceCapacityError as exc:
+            raise ResourceCapacityError(
+                "streamed candidate contributions exceed the runtime resource budget: "
+                f"N={n_rows}, M={candidate_count}, Q={q_observed}, E={implicit_edges}, "
+                f"source={source_index if source_index is not None else 'n/a'}, "
+                f"requested_bytes={requested_bytes}, "
+                f"available_bytes={runtime_budget.remaining_managed_budget}, "
+                f"scratch_needed_bytes={scratch_bytes}, "
+                f"scratch_available_bytes={runtime_budget.budget.scratch_budget_bytes}",
+                operation="entropy streamed candidate contributions",
+                requested_bytes=requested_bytes,
+                available_bytes=runtime_budget.remaining_managed_budget,
+                reserved_headroom_bytes=runtime_budget.budget.reserved_headroom_bytes,
+                scratch_needed_bytes=scratch_bytes,
+                scratch_available_bytes=runtime_budget.budget.scratch_budget_bytes,
+            ) from exc
+
+    def validate_q_invariants(candidate_index: int, source_index: int) -> None:
+        nonlocal last_q_observed
+        if not (
+            0 <= q_active <= n_rows
+            and 0 <= q_completed <= maximum_entry_count
+            and 0 <= q_observed <= maximum_entry_count
+            and q_observed == q_completed + q_active
+            and q_observed >= last_q_observed
+        ):
+            candidate_label = (
+                candidate_ids[candidate_index] if 0 <= candidate_index < candidate_count else None
+            )
+            raise RuntimeError(
+                "invalid streamed candidate-entry counters: "
+                f"candidate={candidate_label!r}, source={source_index}, "
+                f"Q_completed={q_completed}, Q_active={q_active}, "
+                f"Q_observed={q_observed}, previous_Q_observed={last_q_observed}, "
+                f"N={n_rows}, M={candidate_count}"
+            )
+        last_q_observed = q_observed
+
     peak_estimated_bytes = estimated_peak_bytes(0, 0)
     if byte_limit is not None and peak_estimated_bytes > byte_limit:
         raise ValueError(
@@ -1281,12 +1480,15 @@ def build_streamed_candidate_contributions(
         if n_rows < 100 or completed_sources * 100 >= next_percent[0] * n_rows:
             logger.info(
                 "Streamed candidate contributions progress: sources=%d/%d (%.1f%%), "
-                "implicit_edges=%d, Q=%d",
+                "implicit_edges=%d, Q=%d (Q_observed=Q_completed+Q_active; "
+                "Q_completed=%d, Q_active=%d)",
                 completed_sources,
                 n_rows,
                 100.0 * completed_sources / n_rows,
                 implicit_edges,
-                int(np.sum(candidate_support_sizes, dtype=np.int64)),
+                q_observed,
+                q_completed,
+                q_active,
             )
             while next_percent[0] <= 100 and completed_sources * 100 >= next_percent[0] * n_rows:
                 next_percent[0] += 1
@@ -1294,14 +1496,19 @@ def build_streamed_candidate_contributions(
             progress_callback(completed_sources, n_rows)
 
     try:
-        with tempfile.TemporaryFile(mode="w+b") as spool:
+        scratch_directory = runtime_budget.budget.snapshot.scratch_path or None
+        with tempfile.TemporaryFile(mode="w+b", dir=scratch_directory) as spool:
             spool_digest = _spool_write_header(spool)
             for candidate_index in range(candidate_count):
                 accumulator.fill(0.0)
                 touched.fill(False)
+                q_active = 0
+                q_observed = q_completed
+                validate_q_invariants(candidate_index, -1)
                 start_source = int(candidate_offsets[candidate_index])
                 stop_source = int(candidate_offsets[candidate_index + 1])
                 candidate_source_indices = source_order[start_source:stop_source]
+                last_source_index = int(candidate_source_indices[-1])
                 for column in iter_normalized_kernel_columns(
                     values,
                     frozen.bandwidths,
@@ -1328,6 +1535,17 @@ def build_streamed_candidate_contributions(
                             f"candidate={candidate_ids[candidate_index]!r}, source={source_index}, "
                             f"h_a={scale:.17g}, E={implicit_edges}"
                         )
+                    if (
+                        np.any(target_indices < 0)
+                        or np.any(target_indices >= n_rows)
+                        or np.any(target_indices[1:] <= target_indices[:-1])
+                    ):
+                        raise ValueError(
+                            "normalized support target indices must be strictly ascending "
+                            "and unique: "
+                            f"N={n_rows}, M={candidate_count}, "
+                            f"candidate={candidate_ids[candidate_index]!r}, source={source_index}"
+                        )
                     column_mass = float(np.sum(normalized, dtype=np.float64))
                     if not math.isclose(
                         column_mass, 1.0, rel_tol=0.0, abs_tol=SPARSE_NUMERICAL_TOLERANCE
@@ -1342,24 +1560,41 @@ def build_streamed_candidate_contributions(
                     implicit_edges += support_count
                     self_edges += int(np.count_nonzero(target_indices == source_index))
                     source_mass_deviation = max(source_mass_deviation, abs(column_mass - 1.0))
-                    if np.any(target_indices[1:] <= target_indices[:-1]):
-                        order = np.argsort(target_indices, kind="stable")
-                        target_indices = target_indices[order]
-                        normalized = normalized[order]
-                    accumulator[target_indices] += normalized
+                    previously_touched = touched[target_indices]
+                    q_active += int(np.count_nonzero(~previously_touched))
                     touched[target_indices] = True
+                    accumulator[target_indices] += normalized
+                    q_observed = q_completed + q_active
+                    validate_q_invariants(candidate_index, source_index)
+                    if q_observed > entry_limit:
+                        raise ValueError(
+                            "streamed candidate contributions exceed max_entries during "
+                            "source enumeration: "
+                            f"N={n_rows}, M={candidate_count}, "
+                            f"candidate={candidate_ids[candidate_index]!r}, "
+                            f"source={source_index}, Q_completed={q_completed}, "
+                            f"Q_active={q_active}, Q_observed={q_observed}, "
+                            f"E={implicit_edges}, max_entries={entry_limit}, "
+                            "failure=mid-candidate"
+                        )
                     requested_bytes = estimated_peak_bytes(
-                        int(np.count_nonzero(touched)),
+                        q_observed,
                         support_count,
                     )
                     peak_estimated_bytes = max(peak_estimated_bytes, requested_bytes)
+                    resize_workspace(
+                        requested_bytes,
+                        spool_bytes,
+                        source_index=source_index,
+                    )
                     if byte_limit is not None and requested_bytes > byte_limit:
                         raise ValueError(
                             "streamed candidate contributions exceed max_contribution_bytes: "
                             f"N={n_rows}, M={candidate_count}, "
                             f"candidate={candidate_ids[candidate_index]!r}, "
                             f"n_C={stop_source - start_source}, source={source_index}, "
-                            f"h_a={scale:.17g}, Q={int(np.sum(candidate_support_sizes))}, "
+                            f"h_a={scale:.17g}, Q_completed={q_completed}, "
+                            f"Q_active={q_active}, Q_observed={q_observed}, "
                             f"E={implicit_edges}, requested_bytes={requested_bytes}, "
                             f"limit={byte_limit}"
                         )
@@ -1384,25 +1619,48 @@ def build_streamed_candidate_contributions(
                         "normalized"
                     )
                 support = int(targets.size)
-                candidate_support_sizes[candidate_index] = support
-                completed_entries = int(
-                    np.sum(candidate_support_sizes[: candidate_index + 1], dtype=np.int64)
-                )
+                if support != q_active:
+                    raise RuntimeError(
+                        "streamed candidate support counter disagrees with finalized CSR row: "
+                        f"candidate={candidate_ids[candidate_index]!r}, "
+                        f"source={last_source_index}, "
+                        f"Q_completed={q_completed}, Q_active={q_active}, support={support}"
+                    )
+                completed_entries = q_completed + support
                 if completed_entries > entry_limit:
                     raise ValueError(
-                        "streamed candidate contributions exceed max_entries: "
+                        "streamed candidate contributions exceed max_entries at finalization: "
                         f"N={n_rows}, M={candidate_count}, "
                         f"candidate={candidate_ids[candidate_index]!r}, "
-                        f"n_C={stop_source - start_source}, source=-1, h_a=aggregate, "
-                        f"Q={completed_entries}, E={implicit_edges}, max_entries={entry_limit}"
+                        f"n_C={stop_source - start_source}, source={last_source_index}, "
+                        f"Q_completed={q_completed}, Q_active={q_active}, "
+                        f"Q_observed={completed_entries}, E={implicit_edges}, "
+                        f"max_entries={entry_limit}, failure=finalization"
                     )
                 prospective_spool_bytes = spool_bytes + support * _EDGE_SPOOL_RECORD_BYTES
                 if prospective_spool_bytes > spool_limit:
+                    if derived_spool_limit:
+                        raise ResourceCapacityError(
+                            "streamed candidate contributions exceed available scratch "
+                            "capacity: "
+                            f"N={n_rows}, M={candidate_count}, Q={completed_entries}, "
+                            f"E={implicit_edges}, candidate={candidate_ids[candidate_index]!r}, "
+                            f"requested_bytes={prospective_spool_bytes}, "
+                            f"scratch_available_bytes={spool_limit}",
+                            operation="entropy streamed candidate contributions",
+                            requested_bytes=prospective_spool_bytes,
+                            available_bytes=runtime_budget.remaining_managed_budget,
+                            reserved_headroom_bytes=runtime_budget.budget.reserved_headroom_bytes,
+                            scratch_needed_bytes=prospective_spool_bytes,
+                            scratch_available_bytes=spool_limit,
+                        )
                     raise ValueError(
                         "streamed candidate contribution spool exceeds its capacity: "
                         f"N={n_rows}, M={candidate_count}, "
                         f"candidate={candidate_ids[candidate_index]!r}, "
-                        f"n_C={stop_source - start_source}, Q={completed_entries}, "
+                        f"n_C={stop_source - start_source}, "
+                        f"Q_completed={q_completed}, Q_active={q_active}, "
+                        f"Q_observed={completed_entries}, "
                         f"E={implicit_edges}, "
                         f"requested_bytes={prospective_spool_bytes}, limit={spool_limit}"
                     )
@@ -1411,15 +1669,37 @@ def build_streamed_candidate_contributions(
                 records["value"] = values_for_candidate
                 _spool_write_records(spool, spool_digest, records)
                 spool_bytes = prospective_spool_bytes
+                candidate_support_sizes[candidate_index] = support
+                q_completed = completed_entries
+                q_active = 0
+                q_observed = q_completed
+                validate_q_invariants(candidate_index, last_source_index)
+                resize_workspace(
+                    estimated_peak_bytes(q_completed, 0),
+                    spool_bytes,
+                    source_index=last_source_index,
+                )
 
             if completed_sources != n_rows:
                 raise ValueError("streamed candidate contribution did not query every source row")
-            entry_count = int(np.sum(candidate_support_sizes, dtype=np.int64))
+            entry_count = q_completed
+            if entry_count > np.iinfo(np.int64).max:
+                raise ValueError(
+                    "streamed candidate contribution entry count exceeds int64 CSR capacity: "
+                    f"N={n_rows}, M={candidate_count}, Q={entry_count}"
+                )
             candidate_indptr = np.empty(candidate_count + 1, dtype=np.int64)
             candidate_indptr[0] = 0
             np.cumsum(candidate_support_sizes, dtype=np.int64, out=candidate_indptr[1:])
+            if int(candidate_indptr[-1]) != entry_count:
+                raise RuntimeError(
+                    "streamed candidate CSR offsets disagree with finalized entry count: "
+                    f"N={n_rows}, M={candidate_count}, Q_completed={entry_count}, "
+                    f"csr_entries={int(candidate_indptr[-1])}"
+                )
             final_bytes = estimated_peak_bytes(entry_count, 0)
             peak_estimated_bytes = max(peak_estimated_bytes, final_bytes)
+            resize_workspace(final_bytes, spool_bytes)
             if byte_limit is not None and final_bytes > byte_limit:
                 raise ValueError(
                     "streamed candidate contributions exceed max_contribution_bytes "
@@ -1469,10 +1749,25 @@ def build_streamed_candidate_contributions(
             pool_fingerprint=pool.fingerprint,
             sparse_schema_version=SPARSE_STREAMED_CANDIDATE_CONTRIBUTION_SCHEMA_VERSION,
         )
-    except Exception as exc:
+    except BaseException as exc:
         logger.error("Streamed candidate contributions failed: %s", exc)
+        lease.close()
+        if isinstance(exc, OSError):
+            raise ResourceCapacityError(
+                "streamed candidate contribution spool could not be created or written: "
+                f"N={n_rows}, M={candidate_count}, Q={q_completed}, E={implicit_edges}, "
+                f"scratch_needed_bytes={spool_bytes}, "
+                f"scratch_available_bytes={runtime_budget.budget.scratch_budget_bytes}",
+                operation="entropy streamed candidate contributions",
+                requested_bytes=peak_estimated_bytes,
+                available_bytes=runtime_budget.remaining_managed_budget,
+                reserved_headroom_bytes=runtime_budget.budget.reserved_headroom_bytes,
+                scratch_needed_bytes=spool_bytes,
+                scratch_available_bytes=runtime_budget.budget.scratch_budget_bytes,
+            ) from exc
         raise
 
+    lease.close()
     summary = StreamedKernelExecutionSummary(
         atomic_row_count=n_rows,
         implicit_edge_count=implicit_edges,

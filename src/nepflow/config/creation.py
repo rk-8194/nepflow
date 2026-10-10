@@ -298,10 +298,8 @@ target_tolerance=50
 # structure: mean of per-atom descriptors â†’ one vector per structure (recommended)
 descriptor_type=structure
 local_magnetic_mode=structural
-# Local descriptor execution: 0=automatic (affinity/scheduler-aware, capped at 8),
-# 1=serial, or an explicit process count within the allocated CPUs.
+# Local descriptor execution: 0=automatic, 1=serial, or an explicit process count.
 local_descriptor_workers=0
-max_local_descriptor_inflight_bytes=536870912
 background_mass=1e-12
 
 # Information-entropy training selector (inactive when algorithm=fps)
@@ -324,20 +322,18 @@ entropy_bandwidth_c_candidates=1.5,2.0,4.0,8.0
 entropy_bandwidth_backend=exact_indexed_cpu
 entropy_bandwidth_metric=euclidean
 entropy_bandwidth_chunk_size=1024
-entropy_bandwidth_max_neighbour_entries=1000000
-entropy_bandwidth_max_index_bytes=
-entropy_bandwidth_max_radius_query_bytes=268435456
-entropy_bandwidth_max_calibration_work_bytes=536870912
-entropy_bandwidth_calibration_batch_size=
 # Atomic graph limits apply only to the bounded reference/debug graph API;
 # production information_entropy streams exact candidate contributions.
-entropy_max_edges=1000000
-entropy_max_graph_bytes=
-entropy_max_graph_spool_bytes=
-# Candidate capacity for the production streamed q_C CSR and its temporary spool.
-entropy_max_entries=1000000
-entropy_max_contribution_bytes=
-entropy_max_contribution_spool_bytes=
+
+[resources]
+# Runtime-only resource policy.  "auto" discovers process-local host/cgroup limits.
+execution_mode=auto
+memory_budget_bytes=
+scratch_budget_bytes=
+reserved_headroom_bytes=
+safety_margin_fraction=0.10
+scratch_path=
+worker_cap=
 
 [vasp]
 enabled=true

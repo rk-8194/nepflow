@@ -822,6 +822,29 @@ Parallel execution must not alter:
 
 Where floating-point nondeterminism makes exact reproducibility impossible, this must be documented and bounded.
 
+### 26.1 Runtime resource admission
+
+Selection execution resources are operational constraints and are separate from
+the scientific selection policy.  Entropy selection and local descriptor
+workers shall use one shared typed runtime budget that accounts for the
+process-local memory headroom, applicable cgroup and process limits, scheduler
+context, worker concurrency, and the actual scratch filesystem used for
+temporary streams.
+
+On Linux, `MemAvailable` and the process's effective nested cgroup limits are
+the relevant local observations; a SLURM allocation request is not a promise
+of free cluster-wide memory.  Memory-backed scratch contributes to the same
+memory budget.  Windows uses a Win32 memory-status probe, while platforms with
+unknown availability fail closed unless an explicit expert budget is supplied.
+
+The budget service must reserve peak workspace, release reservations on normal
+completion and failure, and raise a typed capacity error before an unsafe
+allocation.  Low resources may reduce exact operational batch or worker
+widths, but may not change kernels, bandwidth candidates, candidate
+probabilities, acquisition order, or scientific fingerprints.  Generated
+configuration shall expose these settings only in `[resources]`; per-kernel
+entry and byte ceilings are not part of the normal scientific configuration.
+
 ---
 
 ## 27. Tie-Breaking

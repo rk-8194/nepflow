@@ -149,7 +149,7 @@ def compare_exact_neighbour_backends(
     *,
     row_ids: Sequence[str] | None = None,
     representation_fingerprint: str = "sensitivity",
-    max_neighbour_entries: int = 1_000_000,
+    max_neighbour_entries: int | None = None,
 ) -> dict[str, Any]:
     """Compare the exact reference and exact indexed CPU neighbour backends."""
 

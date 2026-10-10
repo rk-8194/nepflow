@@ -29,6 +29,11 @@ from nepflow.errors import StateError
 from nepflow.io.atomic import atomic_write_bytes, atomic_write_stream
 from nepflow.io.hashing import sha256_bytes, sha256_canonical_json, sha256_file
 from nepflow.io.json import read_json_object, write_json
+from nepflow.resources.budget import (
+    ResourceBudgetService,
+    ResourceCapacityError,
+    build_resource_budget,
+)
 
 logger = logging.getLogger(__name__)
 DESCRIPTOR_CACHE_SCHEMA_VERSION = DESCRIPTOR_CACHE_SCHEMA
@@ -424,7 +429,6 @@ LOCAL_REPRESENTATION_BACKEND = "invariant-radial-angular-v1"
 LOCAL_ENVIRONMENT_ORDERING_VERSION = "candidate-order-atom-key-v1"
 LOCAL_PREPROCESSING_VERSION = "full-pool-whitening-v1"
 LOCAL_REPRESENTATION_CACHE_SCHEMA_VERSION = "local-representation-cache-v2"
-DEFAULT_LOCAL_DESCRIPTOR_INFLIGHT_BYTES = 512 * 1024 * 1024
 
 
 def _sha256_array(value: np.ndarray) -> str:
@@ -1006,12 +1010,20 @@ def _effective_local_cpu_allocation() -> int:
     return max(1, min(limit for limit in limits if limit > 0))
 
 
-def _resolve_local_descriptor_workers(requested: int, candidate_count: int) -> int:
+def _resolve_local_descriptor_workers(
+    requested: int,
+    candidate_count: int,
+    worker_cap: int | None = None,
+) -> int:
     """Resolve worker policy without exceeding the effective CPU allocation."""
 
     if isinstance(requested, bool) or not isinstance(requested, int) or requested < 0:
         raise ValueError("local_descriptor_workers must be a non-negative integer")
     allocation = _effective_local_cpu_allocation()
+    if worker_cap is not None:
+        if isinstance(worker_cap, bool) or not isinstance(worker_cap, int) or worker_cap < 1:
+            raise ValueError("worker_cap must be a positive integer when provided")
+        allocation = min(allocation, worker_cap)
     if requested > allocation:
         raise ValueError(
             "local_descriptor_workers="
@@ -1096,27 +1108,47 @@ def _compute_local_raw_descriptors(
     config: LocalRepresentationConfig,
     local_descriptor_workers: int,
     *,
-    max_local_descriptor_inflight_bytes: int = DEFAULT_LOCAL_DESCRIPTOR_INFLIGHT_BYTES,
+    max_local_descriptor_inflight_bytes: int | None = None,
+    resource_budget: ResourceBudgetService | None = None,
 ) -> tuple[np.ndarray, list[LocalEnvironmentRow]]:
     """Compute raw rows serially or with bounded candidate-level processes."""
 
+    runtime_budget = resource_budget or build_resource_budget()
     worker_count = _resolve_local_descriptor_workers(
         local_descriptor_workers,
         len(candidates),
+        runtime_budget.budget.worker_cap,
     )
-    inflight_limit = _validate_local_descriptor_inflight_bytes(
-        max_local_descriptor_inflight_bytes
-    )
+    managed_budget = runtime_budget.remaining_managed_budget
+    if managed_budget is None:
+        raise ResourceCapacityError(
+            "local descriptor generation requires known runtime memory headroom; "
+            "provide [resources] memory_budget_bytes",
+            operation="local descriptor generation",
+        )
+    if max_local_descriptor_inflight_bytes is None:
+        inflight_limit = managed_budget
+    else:
+        inflight_limit = _validate_local_descriptor_inflight_bytes(
+            max_local_descriptor_inflight_bytes
+        )
     logger.info(
         "Local descriptor workers: %d (effective allocation %d)",
         worker_count,
         _effective_local_cpu_allocation(),
     )
     feature_width = _local_feature_width(config, species)
-    raw = np.empty(
-        (sum(len(candidate) for candidate in candidates), feature_width),
-        dtype=np.float64,
+    total_atoms = sum(len(candidate) for candidate in candidates)
+    base_workspace_bytes = int(total_atoms * feature_width * 8)
+    lease = runtime_budget.acquire(
+        "local descriptor generation",
+        max(1, base_workspace_bytes),
     )
+    try:
+        raw = np.empty((total_atoms, feature_width), dtype=np.float64)
+    except BaseException:
+        lease.close()
+        raise
     rows: list[LocalEnvironmentRow] = []
     base_workspace_bytes = int(raw.nbytes)
     task_estimates = [
@@ -1124,6 +1156,7 @@ def _compute_local_raw_descriptors(
         for candidate in candidates
     ]
     if base_workspace_bytes >= inflight_limit:
+        lease.close()
         raise ValueError(
             "local descriptor in-flight budget is smaller than the existing raw workspace: "
             f"workspace_bytes={base_workspace_bytes}, max_local_descriptor_inflight_bytes="
@@ -1166,8 +1199,10 @@ def _compute_local_raw_descriptors(
         write_offset += expected_atoms
         next_to_publish += 1
         inflight_bytes -= estimated_bytes
+        lease.resize(max(1, inflight_bytes))
 
     def admission_error(index: int, estimated_bytes: int) -> ValueError:
+        lease.close()
         return ValueError(
             "local descriptor task exceeds in-flight byte budget before launch: "
             f"candidate_index={index}, candidate_id={candidate_ids[index]}, "
@@ -1177,22 +1212,29 @@ def _compute_local_raw_descriptors(
         )
 
     if worker_count == 1:
-        for index in range(len(candidates)):
-            estimate = task_estimates[index]
-            if base_workspace_bytes + estimate > inflight_limit:
-                raise admission_error(index, estimate)
-            inflight_bytes += estimate
-            try:
-                result = _compute_local_descriptor_task(task_for(index))
-            except BaseException as exc:
-                inflight_bytes -= estimate
-                raise LocalDescriptorWorkerError(
-                    "Local descriptor generation failed for candidate index "
-                    f"{index} ({candidate_ids[index]})"
-                ) from exc
-            publish(result, estimate)
-            completed += 1
-            progress.completed(completed)
+        try:
+            for index in range(len(candidates)):
+                estimate = task_estimates[index]
+                if base_workspace_bytes + estimate > inflight_limit:
+                    raise admission_error(index, estimate)
+                inflight_bytes += estimate
+                lease.resize(inflight_bytes)
+                try:
+                    result = _compute_local_descriptor_task(task_for(index))
+                except BaseException as exc:
+                    inflight_bytes -= estimate
+                    lease.resize(max(1, inflight_bytes))
+                    raise LocalDescriptorWorkerError(
+                        "Local descriptor generation failed for candidate index "
+                        f"{index} ({candidate_ids[index]})"
+                    ) from exc
+                publish(result, estimate)
+                completed += 1
+                progress.completed(completed)
+        except BaseException:
+            lease.close()
+            raise
+        lease.close()
         return raw, rows
 
     executor: ProcessPoolExecutor | None = None
@@ -1212,6 +1254,7 @@ def _compute_local_raw_descriptors(
                     if not pending and not ready:
                         raise admission_error(next_to_submit, estimate)
                     break
+                lease.resize(inflight_bytes + estimate)
                 future = executor.submit(_compute_local_descriptor_task, task_for(next_to_submit))
                 pending[future] = next_to_submit
                 pending_bytes[future] = estimate
@@ -1250,10 +1293,12 @@ def _compute_local_raw_descriptors(
             future.cancel()
         if executor is not None:
             executor.shutdown(wait=True, cancel_futures=True)
+        lease.close()
         raise
     else:
         if executor is not None:
             executor.shutdown(wait=True)
+    lease.close()
     return raw, rows
 
 
@@ -1418,7 +1463,8 @@ def build_local_environment_representation(
     candidate_ids: Sequence[str] | None = None,
     structure_ids: Sequence[str] | None = None,
     local_descriptor_workers: int = 0,
-    max_local_descriptor_inflight_bytes: int = DEFAULT_LOCAL_DESCRIPTOR_INFLIGHT_BYTES,
+    max_local_descriptor_inflight_bytes: int | None = None,
+    resource_budget: ResourceBudgetService | None = None,
 ) -> LocalEnvironmentRepresentation:
     """Build deterministic local rows and fit whitening on the complete pool."""
 
@@ -1450,6 +1496,7 @@ def build_local_environment_representation(
         settings,
         local_descriptor_workers,
         max_local_descriptor_inflight_bytes=max_local_descriptor_inflight_bytes,
+        resource_budget=resource_budget,
     )
     if not np.all(np.isfinite(raw)):
         raise ValueError("local representation contains non-finite values")
@@ -1738,13 +1785,20 @@ def load_or_calculate_local_representations(
     candidate_ids: Sequence[str] | None = None,
     structure_ids: Sequence[str] | None = None,
     local_descriptor_workers: int = 0,
-    max_local_descriptor_inflight_bytes: int = DEFAULT_LOCAL_DESCRIPTOR_INFLIGHT_BYTES,
+    max_local_descriptor_inflight_bytes: int | None = None,
+    resource_budget: ResourceBudgetService | None = None,
 ) -> LocalEnvironmentRepresentation:
     """Load exact-identity local rows or calculate and publish them."""
 
     settings = _coerce_local_representation_config(config)
-    _resolve_local_descriptor_workers(local_descriptor_workers, len(candidates))
-    _validate_local_descriptor_inflight_bytes(max_local_descriptor_inflight_bytes)
+    runtime_budget = resource_budget or build_resource_budget()
+    _resolve_local_descriptor_workers(
+        local_descriptor_workers,
+        len(candidates),
+        runtime_budget.budget.worker_cap,
+    )
+    if max_local_descriptor_inflight_bytes is not None:
+        _validate_local_descriptor_inflight_bytes(max_local_descriptor_inflight_bytes)
     ordered_candidate_ids = _local_candidate_ids(candidates, candidate_ids)
     ordered_structure_ids = _local_structure_ids(candidates, structure_ids)
     if settings.magnetic_mode == "structural":
@@ -1788,6 +1842,7 @@ def load_or_calculate_local_representations(
         structure_ids=ordered_structure_ids,
         local_descriptor_workers=local_descriptor_workers,
         max_local_descriptor_inflight_bytes=max_local_descriptor_inflight_bytes,
+        resource_budget=runtime_budget,
     )
     identity = _local_identity(
         ordered_candidate_ids,
@@ -1803,7 +1858,6 @@ def load_or_calculate_local_representations(
 
 __all__ = [
     "DESCRIPTOR_CACHE_SCHEMA_VERSION",
-    "DEFAULT_LOCAL_DESCRIPTOR_INFLIGHT_BYTES",
     "LOCAL_ENVIRONMENT_ORDERING_VERSION",
     "LOCAL_PREPROCESSING_VERSION",
     "LOCAL_REPRESENTATION_BACKEND",

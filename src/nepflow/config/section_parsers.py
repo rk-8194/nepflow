@@ -25,6 +25,7 @@ from .models import (
     NepTrainingConfig,
     PathsConfig,
     ProjectConfig,
+    ResourceConfig,
     SelectionConfig,
     SlurmConfig,
     ValidationConfig,
@@ -679,36 +680,11 @@ def parse_selection(values: Mapping[str, str]) -> SelectionConfig:
             value("entropy_bandwidth_chunk_size", "1024", "bandwidth_chunk_size"),
             "selection.entropy_bandwidth_chunk_size",
         ),
-        max_neighbour_entries=_parse_int(
-            value("entropy_bandwidth_max_neighbour_entries", "1000000"),
-            "selection.entropy_bandwidth_max_neighbour_entries",
-        ),
-        max_index_bytes=_parse_optional_int(
-            value("entropy_bandwidth_max_index_bytes", ""),
-            "selection.entropy_bandwidth_max_index_bytes",
-        ),
-        max_radius_query_bytes=_parse_int(
-            value(
-                "entropy_bandwidth_max_radius_query_bytes",
-                "268435456",
-                "max_radius_query_bytes",
-                "entropy_max_radius_query_bytes",
-            ),
-            "selection.entropy_bandwidth_max_radius_query_bytes",
-        ),
-        max_calibration_work_bytes=_parse_int(
-            value(
-                "entropy_bandwidth_max_calibration_work_bytes",
-                "536870912",
-                "max_calibration_work_bytes",
-                "entropy_max_calibration_work_bytes",
-            ),
-            "selection.entropy_bandwidth_max_calibration_work_bytes",
-        ),
-        calibration_batch_size=_parse_optional_int(
-            value("entropy_bandwidth_calibration_batch_size", "", "calibration_batch_size"),
-            "selection.entropy_bandwidth_calibration_batch_size",
-        ),
+        max_neighbour_entries=None,
+        max_index_bytes=None,
+        max_radius_query_bytes=None,
+        max_calibration_work_bytes=None,
+        calibration_batch_size=None,
     )
     entropy = EntropySelectionConfig(
         beta=_parse_float(value("entropy_beta", "1.0", "beta"), "selection.entropy_beta"),
@@ -753,34 +729,12 @@ def parse_selection(values: Mapping[str, str]) -> SelectionConfig:
         .strip()
         .lower(),
         bandwidth=bandwidth,
-        max_edges=_parse_int(
-            value("entropy_max_edges", "1000000", "max_edges"),
-            "selection.entropy_max_edges",
-        ),
-        max_graph_bytes=_parse_optional_int(
-            value("entropy_max_graph_bytes", "", "max_graph_bytes"),
-            "selection.entropy_max_graph_bytes",
-        ),
-        max_graph_spool_bytes=_parse_optional_int(
-            value("entropy_max_graph_spool_bytes", "", "max_graph_spool_bytes"),
-            "selection.entropy_max_graph_spool_bytes",
-        ),
-        max_entries=_parse_int(
-            value("entropy_max_entries", "1000000", "max_entries"),
-            "selection.entropy_max_entries",
-        ),
-        max_contribution_bytes=_parse_optional_int(
-            value("entropy_max_contribution_bytes", "", "max_contribution_bytes"),
-            "selection.entropy_max_contribution_bytes",
-        ),
-        max_contribution_spool_bytes=_parse_optional_int(
-            value(
-                "entropy_max_contribution_spool_bytes",
-                "",
-                "max_contribution_spool_bytes",
-            ),
-            "selection.entropy_max_contribution_spool_bytes",
-        ),
+        max_edges=None,
+        max_graph_bytes=None,
+        max_graph_spool_bytes=None,
+        max_entries=None,
+        max_contribution_bytes=None,
+        max_contribution_spool_bytes=None,
     )
 
     return SelectionConfig(
@@ -842,14 +796,34 @@ def parse_selection(values: Mapping[str, str]) -> SelectionConfig:
             values.get("local_descriptor_workers", "0"),
             "selection.local_descriptor_workers",
         ),
-        max_local_descriptor_inflight_bytes=_parse_int(
-            values.get("max_local_descriptor_inflight_bytes", str(512 * 1024 * 1024)),
-            "selection.max_local_descriptor_inflight_bytes",
-        ),
+        max_local_descriptor_inflight_bytes=None,
         background_mass=_parse_float(
             values.get("background_mass", "1e-12"), "selection.background_mass"
         ),
         entropy=entropy,
+    )
+
+
+def parse_resources(values: Mapping[str, str]) -> ResourceConfig:
+    """Parse the single operational runtime-resource section."""
+
+    return ResourceConfig(
+        execution_mode=values.get("execution_mode", "auto").strip().lower(),
+        memory_budget_bytes=_parse_optional_int(
+            values.get("memory_budget_bytes", ""), "resources.memory_budget_bytes"
+        ),
+        scratch_budget_bytes=_parse_optional_int(
+            values.get("scratch_budget_bytes", ""), "resources.scratch_budget_bytes"
+        ),
+        reserved_headroom_bytes=_parse_optional_int(
+            values.get("reserved_headroom_bytes", ""), "resources.reserved_headroom_bytes"
+        ),
+        safety_margin_fraction=_parse_float(
+            values.get("safety_margin_fraction", "0.10"),
+            "resources.safety_margin_fraction",
+        ),
+        scratch_path=values.get("scratch_path", "").strip(),
+        worker_cap=_parse_optional_int(values.get("worker_cap", ""), "resources.worker_cap"),
     )
 
 

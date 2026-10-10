@@ -13,6 +13,7 @@ from ase.io import read as ase_read
 from nepflow.config.models import SelectionConfig
 from nepflow.domain.identities import calculate_structure_id
 from nepflow.errors import ValidationError
+from nepflow.resources.budget import ResourceBudgetService
 
 from .algorithms import (
     AlgorithmRegistry,
@@ -78,6 +79,7 @@ def _algorithm_options(
     ase_structures: Sequence[Any] | None = None,
     composition_aware: bool | None = None,
     local_representation: Any | None = None,
+    resource_budget: ResourceBudgetService | None = None,
 ) -> dict[str, Any]:
     """Build the FPS options while retaining legacy mapping defaults."""
 
@@ -107,6 +109,7 @@ def _algorithm_options(
         "local_representation": local_representation,
         "background_mass": _setting_or_default(settings, "background_mass", 1.0e-12),
         "entropy_config": getattr(settings, "entropy", None),
+        "resource_budget": resource_budget,
     }
 
 
@@ -124,6 +127,7 @@ def select_training_set(
     algorithm_registry: AlgorithmRegistry | None = None,
     local_representation: Any | None = None,
     candidate_structure_ids: Sequence[str] | None = None,
+    resource_budget: ResourceBudgetService | None = None,
 ) -> TrainingSelection:
     """Dispatch one training-selection algorithm with mandatory anchors."""
 
@@ -175,6 +179,7 @@ def select_training_set(
         ase_structures=ase_structures,
         composition_aware=composition_aware,
         local_representation=local_representation,
+        resource_budget=resource_budget,
     )
     if candidate_structure_ids is not None:
         if len(candidate_structure_ids) != len(ordered_candidate_ids):

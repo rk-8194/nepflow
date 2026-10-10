@@ -299,29 +299,11 @@ def validate_config(
         raise ConfigurationError("selection.entropy.bandwidth.metric only supports euclidean")
     if not isinstance(bandwidth.chunk_size, int) or bandwidth.chunk_size < 1:
         raise ConfigurationError("selection.entropy.bandwidth.chunk_size must be positive")
-    if not isinstance(bandwidth.max_neighbour_entries, int) or bandwidth.max_neighbour_entries < 1:
-        raise ConfigurationError(
-            "selection.entropy.bandwidth.max_neighbour_entries must be positive"
-        )
     if bandwidth.max_index_bytes is not None and (
         not isinstance(bandwidth.max_index_bytes, int) or bandwidth.max_index_bytes < 1
     ):
         raise ConfigurationError(
             "selection.entropy.bandwidth.max_index_bytes must be positive when provided"
-        )
-    if (
-        not isinstance(bandwidth.max_radius_query_bytes, int)
-        or bandwidth.max_radius_query_bytes < 1
-    ):
-        raise ConfigurationError(
-            "selection.entropy.bandwidth.max_radius_query_bytes must be positive"
-        )
-    if (
-        not isinstance(bandwidth.max_calibration_work_bytes, int)
-        or bandwidth.max_calibration_work_bytes < 1
-    ):
-        raise ConfigurationError(
-            "selection.entropy.bandwidth.max_calibration_work_bytes must be positive"
         )
     if bandwidth.calibration_batch_size is not None and (
         not isinstance(bandwidth.calibration_batch_size, int)
@@ -345,10 +327,6 @@ def validate_config(
             raise ConfigurationError("manual entropy bandwidth requires positive c")
     elif bandwidth.k is not None or bandwidth.c is not None:
         raise ConfigurationError("automatic entropy bandwidth cannot specify manual k or c")
-    for field_name in ("max_edges", "max_entries"):
-        value = getattr(entropy, field_name)
-        if not isinstance(value, int) or value < 1:
-            raise ConfigurationError(f"selection.entropy.{field_name} must be positive")
     for field_name in (
         "max_graph_bytes",
         "max_graph_spool_bytes",
@@ -370,14 +348,6 @@ def validate_config(
     ):
         raise ConfigurationError("selection.local_descriptor_workers must be an integer")
     if (
-        isinstance(config.selection.max_local_descriptor_inflight_bytes, bool)
-        or not isinstance(config.selection.max_local_descriptor_inflight_bytes, int)
-        or config.selection.max_local_descriptor_inflight_bytes < 1
-    ):
-        raise ConfigurationError(
-            "selection.max_local_descriptor_inflight_bytes must be a positive integer"
-        )
-    if (
         not math.isfinite(config.selection.background_mass)
         or config.selection.background_mass <= 0.0
     ):
@@ -395,7 +365,6 @@ def validate_config(
         "max_search_iterations",
         "composition_aware_fps_adaptive_retries",
         "local_descriptor_workers",
-        "max_local_descriptor_inflight_bytes",
     ):
         _require_non_negative(
             f"selection.{field_name}",
@@ -414,6 +383,32 @@ def validate_config(
         raise ConfigurationError(
             "selection.composition_aware_fps_ternary_weight must be non-negative"
         )
+
+    resources = config.resources
+    if resources.execution_mode not in {"auto", "explicit"}:
+        raise ConfigurationError("resources.execution_mode must be auto or explicit")
+    if resources.execution_mode == "explicit" and resources.memory_budget_bytes is None:
+        raise ConfigurationError(
+            "resources.memory_budget_bytes is required when execution_mode=explicit"
+        )
+    for field_name in ("memory_budget_bytes", "scratch_budget_bytes", "worker_cap"):
+        value = getattr(resources, field_name)
+        if value is not None and (
+            isinstance(value, bool) or not isinstance(value, int) or value < 1
+        ):
+            raise ConfigurationError(f"resources.{field_name} must be positive when provided")
+    if resources.reserved_headroom_bytes is not None and (
+        isinstance(resources.reserved_headroom_bytes, bool)
+        or not isinstance(resources.reserved_headroom_bytes, int)
+        or resources.reserved_headroom_bytes < 0
+    ):
+        raise ConfigurationError(
+            "resources.reserved_headroom_bytes must be non-negative when provided"
+        )
+    if not math.isfinite(resources.safety_margin_fraction) or not 0.0 <= (
+        resources.safety_margin_fraction
+    ) < 1.0:
+        raise ConfigurationError("resources.safety_margin_fraction must be in [0, 1)")
 
     if config.vasp.kspacing <= 0.0 or not math.isfinite(config.vasp.kspacing):
         raise ConfigurationError("vasp.kspacing must be a positive finite float")

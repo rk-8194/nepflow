@@ -12,6 +12,7 @@ from typing import Any
 
 import numpy as np
 
+from nepflow.resources.budget import ResourceBudgetService, build_resource_budget
 from nepflow.stages.selection.representations import LocalEnvironmentRepresentation
 
 from ..base import SelectionAlgorithmRequest, SelectionAlgorithmResult
@@ -818,12 +819,24 @@ class InformationEntropySelectionAlgorithm:
                 backend=str(bandwidth.backend),
                 metric=str(bandwidth.metric),
                 chunk_size=int(bandwidth.chunk_size),
-                max_neighbour_entries=int(bandwidth.max_neighbour_entries),
+                max_neighbour_entries=(
+                    None
+                    if bandwidth.max_neighbour_entries is None
+                    else int(bandwidth.max_neighbour_entries)
+                ),
                 max_index_bytes=(
                     None if bandwidth.max_index_bytes is None else int(bandwidth.max_index_bytes)
                 ),
-                max_radius_query_bytes=int(bandwidth.max_radius_query_bytes),
-                max_calibration_work_bytes=int(bandwidth.max_calibration_work_bytes),
+                max_radius_query_bytes=(
+                    None
+                    if bandwidth.max_radius_query_bytes is None
+                    else int(bandwidth.max_radius_query_bytes)
+                ),
+                max_calibration_work_bytes=(
+                    None
+                    if bandwidth.max_calibration_work_bytes is None
+                    else int(bandwidth.max_calibration_work_bytes)
+                ),
                 calibration_batch_size=(
                     None
                     if bandwidth.calibration_batch_size is None
@@ -861,7 +874,24 @@ class InformationEntropySelectionAlgorithm:
         if tuple(pool.candidate_ids) != request.candidate_ids:
             raise ValueError("local representation candidate order does not match selection input")
         bandwidth_settings = self._bandwidth_settings(request.options)
-        calibration = calibrate_bandwidth(pool, bandwidth_settings)
+        resource_budget = request.options.get("resource_budget")
+        if resource_budget is not None and not isinstance(resource_budget, ResourceBudgetService):
+            raise TypeError("resource_budget must be a ResourceBudgetService")
+        runtime_budget = resource_budget or build_resource_budget()
+        calibration = calibrate_bandwidth(
+            pool,
+            bandwidth_settings,
+            resource_budget=runtime_budget,
+        )
+        remaining_budget = runtime_budget.remaining_managed_budget
+        if remaining_budget is None:
+            raise ValueError(
+                "information-entropy selection requires known runtime memory headroom"
+            )
+        radius_query_bytes = min(
+            bandwidth_settings.max_radius_query_bytes or max(1, remaining_budget // 2),
+            max(1, remaining_budget),
+        )
         logger = LOGGER
         logger.info(
             "Entropy bandwidth calibrated: k=%d, c=%.17g, LOO objective=%s",
@@ -877,14 +907,15 @@ class InformationEntropySelectionAlgorithm:
             pool,
             bandwidth,
             chunk_size=bandwidth_settings.chunk_size,
-            max_entries=int(self._entropy_value(request.options, "max_entries", 1_000_000)),
+            max_entries=self._entropy_value(request.options, "max_entries", None),
             max_contribution_bytes=self._entropy_value(
                 request.options, "max_contribution_bytes", None
             ),
             max_spool_bytes=self._entropy_value(
                 request.options, "max_contribution_spool_bytes", None
             ),
-            max_radius_query_bytes=bandwidth_settings.radius_query_bytes,
+            max_radius_query_bytes=radius_query_bytes,
+            resource_budget=runtime_budget,
         )
         method = str(self._entropy_value(request.options, "optimizer_method", "lazy_greedy"))
         optimizer = full_greedy if method == "full_greedy" else lazy_greedy

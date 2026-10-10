@@ -15,6 +15,7 @@ from ase.io import read as ase_read
 
 from nepflow.config.models import NepflowConfig, SelectionConfig
 from nepflow.errors import StateError
+from nepflow.resources.budget import ResourceBudgetService, build_resource_budget
 from nepflow.workflow.controller import StageContext
 
 from .algorithms.information_entropy import (
@@ -140,7 +141,25 @@ class SelectionStage:
                 ),
             )
         else:
-            result = self.execute(settings, prepared, context=active)
+            resource_config = getattr(active.config, "resources", None)
+            result = self.execute(
+                settings,
+                prepared,
+                context=active,
+                resource_budget=build_resource_budget(
+                    execution_mode=getattr(resource_config, "execution_mode", "auto"),
+                    memory_budget_bytes=getattr(resource_config, "memory_budget_bytes", None),
+                    scratch_budget_bytes=getattr(resource_config, "scratch_budget_bytes", None),
+                    reserved_headroom_bytes=getattr(
+                        resource_config, "reserved_headroom_bytes", None
+                    ),
+                    safety_margin_fraction=getattr(
+                        resource_config, "safety_margin_fraction", 0.10
+                    ),
+                    scratch_path=getattr(resource_config, "scratch_path", None) or None,
+                    worker_cap=getattr(resource_config, "worker_cap", None),
+                ),
+            )
 
         candidate_identity_ids = ordered_candidate_ids(prepared["ase_structures"])
         physical_structure_ids = ordered_structure_ids(prepared["ase_structures"])
@@ -211,10 +230,12 @@ class SelectionStage:
         prepared: dict[str, Any],
         *,
         context: StageContext | None = None,
+        resource_budget: ResourceBudgetService | None = None,
     ) -> SelectionResult:
         """Compose representation, strategy, and identity-safe result services."""
 
         active = context or self.context
+        runtime_budget = resource_budget or build_resource_budget()
         logger.info("")
         logger.info("Step 2: Computing %s representations", settings.algorithm)
         project_dir = (
@@ -286,20 +307,8 @@ class SelectionStage:
                 backend=entropy.bandwidth.backend,
                 metric=entropy.bandwidth.metric,
                 chunk_size=entropy.bandwidth.chunk_size,
-                max_neighbour_entries=entropy.bandwidth.max_neighbour_entries,
-                max_index_bytes=entropy.bandwidth.max_index_bytes,
-                max_radius_query_bytes=entropy.bandwidth.max_radius_query_bytes,
-                max_calibration_work_bytes=entropy.bandwidth.max_calibration_work_bytes,
-                calibration_batch_size=entropy.bandwidth.calibration_batch_size,
+                calibration_batch_size=None,
             )
-            for limit_name in ("max_edges", "max_entries"):
-                limit = getattr(entropy, limit_name)
-                if not isinstance(limit, int) or limit < 1:
-                    raise ValueError(f"selection.entropy.{limit_name} must be positive")
-            for limit_name in ("max_graph_bytes", "max_contribution_bytes"):
-                limit = getattr(entropy, limit_name)
-                if limit is not None and (not isinstance(limit, int) or limit < 1):
-                    raise ValueError(f"selection.entropy.{limit_name} must be positive")
             local_representation = load_or_calculate_local_representations(
                 project_dir,
                 prepared["ase_structures"],
@@ -316,7 +325,7 @@ class SelectionStage:
                     whitening_singular_policy=entropy.whitening_singular_policy,
                 ),
                 local_descriptor_workers=settings.local_descriptor_workers,
-                max_local_descriptor_inflight_bytes=settings.max_local_descriptor_inflight_bytes,
+                resource_budget=runtime_budget,
                 candidate_ids=candidate_identity_ids,
                 structure_ids=physical_structure_ids,
             )
@@ -418,6 +427,7 @@ class SelectionStage:
             algorithm_id=settings.algorithm,
             local_representation=local_representation,
             candidate_structure_ids=physical_structure_ids,
+            resource_budget=runtime_budget,
         )
         if isinstance(training, TrainingSelection):
             train_indices = training.indices

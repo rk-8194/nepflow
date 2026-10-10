@@ -7,12 +7,17 @@ import logging
 import math
 import time
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 import numpy as np
 
 from nepflow.io.hashing import sha256_canonical_json
+from nepflow.resources.budget import (
+    ResourceBudgetService,
+    ResourceCapacityError,
+    build_resource_budget,
+)
 from nepflow.stages.selection.representations import LocalEnvironmentRepresentation
 
 from .kernels import (
@@ -23,9 +28,7 @@ from .models import (
     BANDWIDTH_SCHEMA_VERSION,
     CALIBRATION_OPTIMIZER_ID,
     CALIBRATION_OPTIMIZER_VERSION,
-    DEFAULT_CALIBRATION_WORK_BYTES,
     DEFAULT_NEIGHBOUR_BACKEND_ID,
-    DEFAULT_RADIUS_QUERY_BYTES,
     KERNEL_FAMILY,
     KERNEL_VERSION,
     NEIGHBOUR_METRIC,
@@ -369,9 +372,10 @@ def calculate_frozen_bandwidths(
     representation_fingerprint: str | None = None,
     chunk_size: int = 1024,
     backend: str = DEFAULT_NEIGHBOUR_BACKEND_ID,
-    max_neighbour_entries: int = 1_000_000,
+    max_neighbour_entries: int | None = None,
     max_index_bytes: int | None = None,
-    max_radius_query_bytes: int = DEFAULT_RADIUS_QUERY_BYTES,
+    max_radius_query_bytes: int | None = None,
+    resource_budget: ResourceBudgetService | None = None,
 ) -> FrozenBandwidths:
     """Calculate and freeze exact full-pool ``r_k`` and ``h=c*r_k``."""
 
@@ -387,11 +391,33 @@ def calculate_frozen_bandwidths(
             representation_fingerprint=representation_fingerprint,
         )
     )
+    service = resource_budget or build_resource_budget()
+    remaining = service.remaining_managed_budget
+    if remaining is None:
+        raise ResourceCapacityError(
+            "bandwidth calculation requires known runtime memory headroom",
+            operation="entropy bandwidth calculation",
+        )
+    if remaining < 1:
+        raise ResourceCapacityError(
+            "bandwidth calculation has no allocatable runtime memory headroom",
+            operation="entropy bandwidth calculation",
+            requested_bytes=1,
+            available_bytes=remaining,
+            reserved_headroom_bytes=service.budget.reserved_headroom_bytes,
+        )
     index = build_neighbour_index(
         pool.descriptors,
         backend=backend,
-        max_index_bytes=max_index_bytes,
-        max_radius_query_bytes=max_radius_query_bytes,
+        max_index_bytes=(
+            remaining if max_index_bytes is None else min(max_index_bytes, remaining)
+        ),
+        max_radius_query_bytes=(
+            max(1, remaining // 2)
+            if max_radius_query_bytes is None
+            else min(max_radius_query_bytes, max(1, remaining))
+        ),
+        resource_budget=service,
     )
     neighbours = compute_neighbours(
         pool.descriptors,
@@ -402,6 +428,7 @@ def calculate_frozen_bandwidths(
         chunk_size=chunk_size,
         representation_fingerprint=pool.representation_fingerprint,
         row_ids=_pool_row_ids(pool),
+        resource_budget=service,
     )
     return _freeze_from_neighbours(pool, neighbours, c)
 
@@ -423,10 +450,10 @@ def _settings_from_arguments(
     backend: str,
     metric: str,
     chunk_size: int,
-    max_neighbour_entries: int,
+    max_neighbour_entries: int | None,
     max_index_bytes: int | None,
-    max_radius_query_bytes: int,
-    max_calibration_work_bytes: int,
+    max_radius_query_bytes: int | None,
+    max_calibration_work_bytes: int | None,
     calibration_batch_size: int | None,
 ) -> EntropyBandwidthSettings:
     if settings is not None:
@@ -476,6 +503,74 @@ def _attempt_payload(attempt: CalibrationAttempt) -> dict[str, Any]:
     }
 
 
+def _resolve_runtime_limits(
+    settings: EntropyBandwidthSettings,
+    pool: EntropyPool,
+    resource_budget: ResourceBudgetService | None,
+) -> tuple[EntropyBandwidthSettings, ResourceBudgetService]:
+    """Fill operational limits from the shared budget without changing science."""
+
+    service = resource_budget or build_resource_budget()
+    remaining = service.remaining_managed_budget
+    if remaining is None:
+        raise ResourceCapacityError(
+            "bandwidth calibration requires known runtime memory headroom; "
+            "provide [resources] memory_budget_bytes",
+            operation="entropy bandwidth calibration",
+        )
+    if remaining < 1:
+        raise ResourceCapacityError(
+            "entropy bandwidth calibration has no allocatable runtime memory headroom",
+            operation="entropy bandwidth calibration",
+            requested_bytes=1,
+            available_bytes=remaining,
+            reserved_headroom_bytes=service.budget.reserved_headroom_bytes,
+        )
+    maximum_k = max(settings.k_candidates) if settings.mode == "automatic" else int(settings.k or 1)
+    estimated_neighbour_bytes = int(
+        pool.descriptors.nbytes
+        + 16 * len(pool.descriptors) * maximum_k
+        + 64 * len(pool.descriptors)
+    )
+    if estimated_neighbour_bytes > remaining:
+        raise ResourceCapacityError(
+            "entropy bandwidth calibration cannot reserve exact neighbour storage: "
+            f"N={len(pool.descriptors)}, requested_bytes={estimated_neighbour_bytes}, "
+            f"available_bytes={remaining}, k_max={maximum_k}",
+            operation="entropy bandwidth calibration",
+            requested_bytes=estimated_neighbour_bytes,
+            available_bytes=remaining,
+            reserved_headroom_bytes=service.budget.reserved_headroom_bytes,
+        )
+    work_bytes = min(
+        settings.max_calibration_work_bytes or remaining,
+        remaining,
+    )
+    radius_bytes = min(
+        settings.max_radius_query_bytes or max(1, remaining // 2),
+        work_bytes,
+    )
+    index_bytes = min(settings.max_index_bytes or remaining, remaining)
+    resolved = replace(
+        settings,
+        max_neighbour_entries=settings.max_neighbour_entries,
+        max_index_bytes=index_bytes,
+        max_radius_query_bytes=radius_bytes,
+        max_calibration_work_bytes=work_bytes,
+    )
+    logger.info(
+        "Entropy runtime budget admitted calibration: N=%d, remaining_bytes=%d, "
+        "index_bytes=%d, radius_query_bytes=%d, work_bytes=%d, provenance=%s",
+        len(pool.descriptors),
+        remaining,
+        index_bytes,
+        radius_bytes,
+        work_bytes,
+        service.budget.provenance_of_budget,
+    )
+    return resolved, service
+
+
 def calibrate_bandwidth(
     representation_or_pool: LocalEnvironmentRepresentation | EntropyPool | np.ndarray,
     settings: EntropyBandwidthSettings | Mapping[str, Any] | None = None,
@@ -493,11 +588,12 @@ def calibrate_bandwidth(
     backend: str = DEFAULT_NEIGHBOUR_BACKEND_ID,
     metric: str = NEIGHBOUR_METRIC,
     chunk_size: int = 1024,
-    max_neighbour_entries: int = 1_000_000,
+    max_neighbour_entries: int | None = None,
     max_index_bytes: int | None = None,
-    max_radius_query_bytes: int = DEFAULT_RADIUS_QUERY_BYTES,
-    max_calibration_work_bytes: int = DEFAULT_CALIBRATION_WORK_BYTES,
+    max_radius_query_bytes: int | None = None,
+    max_calibration_work_bytes: int | None = None,
     calibration_batch_size: int | None = None,
+    resource_budget: ResourceBudgetService | None = None,
 ) -> BandwidthCalibrationResult:
     """Run deterministic manual or bounded-grid finite-pool calibration."""
 
@@ -529,6 +625,11 @@ def calibrate_bandwidth(
         max_calibration_work_bytes=max_calibration_work_bytes,
         calibration_batch_size=calibration_batch_size,
     )
+    selected_settings, runtime_budget = _resolve_runtime_limits(
+        selected_settings,
+        pool,
+        resource_budget,
+    )
     if pool.descriptors.shape[0] < 2:
         raise BandwidthCalibrationError("leave-one-out calibration requires at least two rows")
 
@@ -537,6 +638,7 @@ def calibrate_bandwidth(
         backend=selected_settings.backend,
         max_index_bytes=selected_settings.max_index_bytes,
         max_radius_query_bytes=selected_settings.radius_query_bytes,
+        resource_budget=runtime_budget,
     )
 
     if selected_settings.mode == "manual":
@@ -746,6 +848,7 @@ def calibrate_bandwidth(
                     max_neighbour_entries=selected_settings.max_neighbour_entries,
                     representation_fingerprint=pool.representation_fingerprint,
                     row_ids=_pool_row_ids(pool),
+                    resource_budget=runtime_budget,
                 )
                 radii_by_k[candidate_k] = neighbours
             if isinstance(neighbours, str):
@@ -777,6 +880,7 @@ def calibrate_bandwidth(
                             backend=selected_settings.backend,
                             index=index,
                             max_radius_query_bytes=selected_settings.radius_query_bytes,
+                            resource_budget=runtime_budget,
                             capacity_context=f"k={candidate_k}, c={c_batch[0]:g}",
                         ),
                     )
@@ -791,6 +895,7 @@ def calibrate_bandwidth(
                         index=index,
                         max_radius_query_bytes=selected_settings.radius_query_bytes,
                         max_calibration_work_bytes=selected_settings.operational_work_bytes,
+                        resource_budget=runtime_budget,
                         capacity_context=(
                             f"k={candidate_k}, c_batch="
                             + ",".join(f"{value:g}" for value in c_batch)

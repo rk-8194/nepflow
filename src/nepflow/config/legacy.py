@@ -307,9 +307,6 @@ def _selection_values(config: NepflowConfig) -> dict[str, str]:
         "test_pool_factor": str(selection.test_pool_factor),
         "local_magnetic_mode": selection.local_magnetic_mode,
         "local_descriptor_workers": str(selection.local_descriptor_workers),
-        "max_local_descriptor_inflight_bytes": str(
-            selection.max_local_descriptor_inflight_bytes
-        ),
         "background_mass": str(selection.background_mass),
         "entropy_beta": str(selection.entropy.beta),
         "entropy_optimizer_method": selection.entropy.optimizer_method,
@@ -342,29 +339,33 @@ def _selection_values(config: NepflowConfig) -> dict[str, str]:
         "entropy_bandwidth_backend": selection.entropy.bandwidth.backend,
         "entropy_bandwidth_metric": selection.entropy.bandwidth.metric,
         "entropy_bandwidth_chunk_size": str(selection.entropy.bandwidth.chunk_size),
-        "entropy_bandwidth_max_neighbour_entries": str(
-            selection.entropy.bandwidth.max_neighbour_entries
-        ),
+        "entropy_bandwidth_max_neighbour_entries": ""
+        if selection.entropy.bandwidth.max_neighbour_entries is None
+        else str(selection.entropy.bandwidth.max_neighbour_entries),
         "entropy_bandwidth_max_index_bytes": ""
         if selection.entropy.bandwidth.max_index_bytes is None
         else str(selection.entropy.bandwidth.max_index_bytes),
-        "entropy_bandwidth_max_radius_query_bytes": str(
-            selection.entropy.bandwidth.max_radius_query_bytes
-        ),
-        "entropy_bandwidth_max_calibration_work_bytes": str(
-            selection.entropy.bandwidth.max_calibration_work_bytes
-        ),
+        "entropy_bandwidth_max_radius_query_bytes": ""
+        if selection.entropy.bandwidth.max_radius_query_bytes is None
+        else str(selection.entropy.bandwidth.max_radius_query_bytes),
+        "entropy_bandwidth_max_calibration_work_bytes": ""
+        if selection.entropy.bandwidth.max_calibration_work_bytes is None
+        else str(selection.entropy.bandwidth.max_calibration_work_bytes),
         "entropy_bandwidth_calibration_batch_size": ""
         if selection.entropy.bandwidth.calibration_batch_size is None
         else str(selection.entropy.bandwidth.calibration_batch_size),
-        "entropy_max_edges": str(selection.entropy.max_edges),
+        "entropy_max_edges": ""
+        if selection.entropy.max_edges is None
+        else str(selection.entropy.max_edges),
         "entropy_max_graph_bytes": ""
         if selection.entropy.max_graph_bytes is None
         else str(selection.entropy.max_graph_bytes),
         "entropy_max_graph_spool_bytes": ""
         if selection.entropy.max_graph_spool_bytes is None
         else str(selection.entropy.max_graph_spool_bytes),
-        "entropy_max_entries": str(selection.entropy.max_entries),
+        "entropy_max_entries": ""
+        if selection.entropy.max_entries is None
+        else str(selection.entropy.max_entries),
         "entropy_max_contribution_bytes": ""
         if selection.entropy.max_contribution_bytes is None
         else str(selection.entropy.max_contribution_bytes),

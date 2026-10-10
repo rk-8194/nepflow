@@ -21,6 +21,7 @@ from .section_parsers import (
     parse_nep,
     parse_paths,
     parse_project,
+    parse_resources,
     parse_selection,
     parse_slurm,
     parse_training,
@@ -204,7 +205,6 @@ _ALLOWED_KEYS: dict[str, frozenset[str]] = {
             "test_pool_factor",
             "local_magnetic_mode",
             "local_descriptor_workers",
-            "max_local_descriptor_inflight_bytes",
             "background_mass",
             "entropy_beta",
             "entropy_optimizer_method",
@@ -225,17 +225,6 @@ _ALLOWED_KEYS: dict[str, frozenset[str]] = {
             "entropy_bandwidth_backend",
             "entropy_bandwidth_metric",
             "entropy_bandwidth_chunk_size",
-            "entropy_bandwidth_max_neighbour_entries",
-            "entropy_bandwidth_max_index_bytes",
-            "entropy_bandwidth_max_radius_query_bytes",
-            "entropy_bandwidth_max_calibration_work_bytes",
-            "entropy_bandwidth_calibration_batch_size",
-            "entropy_max_edges",
-            "entropy_max_graph_bytes",
-            "entropy_max_graph_spool_bytes",
-            "entropy_max_entries",
-            "entropy_max_contribution_bytes",
-            "entropy_max_contribution_spool_bytes",
             "beta",
             "optimizer_method",
             "local_cutoff",
@@ -255,17 +244,17 @@ _ALLOWED_KEYS: dict[str, frozenset[str]] = {
             "neighbour_backend",
             "neighbour_metric",
             "bandwidth_chunk_size",
-            "max_neighbour_entries",
-            "max_index_bytes",
-            "max_radius_query_bytes",
-            "max_calibration_work_bytes",
-            "calibration_batch_size",
-            "max_edges",
-            "max_graph_bytes",
-            "max_graph_spool_bytes",
-            "max_entries",
-            "max_contribution_bytes",
-            "max_contribution_spool_bytes",
+        }
+    ),
+    "resources": frozenset(
+        {
+            "execution_mode",
+            "memory_budget_bytes",
+            "scratch_budget_bytes",
+            "reserved_headroom_bytes",
+            "safety_margin_fraction",
+            "scratch_path",
+            "worker_cap",
         }
     ),
     "vasp": frozenset({"enabled", "kspacing", "kgamma"}),
@@ -359,6 +348,36 @@ _ALLOWED_KEYS: dict[str, frozenset[str]] = {
     ),
 }
 
+_REMOVED_OPERATIONAL_KEYS = frozenset(
+    {
+        "max_local_descriptor_inflight_bytes",
+        "entropy_bandwidth_max_neighbour_entries",
+        "entropy_bandwidth_max_index_bytes",
+        "entropy_bandwidth_max_radius_query_bytes",
+        "entropy_max_radius_query_bytes",
+        "entropy_bandwidth_max_calibration_work_bytes",
+        "entropy_max_calibration_work_bytes",
+        "entropy_bandwidth_calibration_batch_size",
+        "entropy_max_edges",
+        "entropy_max_graph_bytes",
+        "entropy_max_graph_spool_bytes",
+        "entropy_max_entries",
+        "entropy_max_contribution_bytes",
+        "entropy_max_contribution_spool_bytes",
+        "max_neighbour_entries",
+        "max_index_bytes",
+        "max_radius_query_bytes",
+        "max_calibration_work_bytes",
+        "calibration_batch_size",
+        "max_edges",
+        "max_graph_bytes",
+        "max_graph_spool_bytes",
+        "max_entries",
+        "max_contribution_bytes",
+        "max_contribution_spool_bytes",
+    }
+)
+
 
 def canonical_config_path(project_dir: Path) -> Path:
     """Return the only supported project configuration path."""
@@ -427,6 +446,7 @@ def load_config(
         validation=parse_validation(sections.get("validate", {}), sections.get("gpumd", {})),
         hpc=parse_hpc(sections.get("hpc", {})),
         slurm=slurm,
+        resources=parse_resources(sections.get("resources", {})),
         source_path=path,
         raw_sections=frozenset(sections),
     )
@@ -467,6 +487,11 @@ def _reject_unknown_keys(parser: ConfigParser) -> None:
                     "slurm.vasp_command is not supported; use the single hpc.vasp_command source"
                 )
             if normalized_key not in _ALLOWED_KEYS[normalized_section]:
+                if normalized_key in _REMOVED_OPERATIONAL_KEYS:
+                    raise ConfigurationError(
+                        f"Removed operational resource key {section}.{key}; "
+                        "move this constraint to the [resources] section"
+                    )
                 raise ConfigurationError(f"Unknown configuration key {section}.{key}")
 
 

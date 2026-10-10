@@ -336,10 +336,10 @@ class EntropyBandwidthConfig:
     backend: str = "exact_indexed_cpu"
     metric: str = "euclidean"
     chunk_size: int = 1024
-    max_neighbour_entries: int = 1_000_000
+    max_neighbour_entries: int | None = None
     max_index_bytes: int | None = None
-    max_radius_query_bytes: int = 256 * 1024 * 1024
-    max_calibration_work_bytes: int = 512 * 1024 * 1024
+    max_radius_query_bytes: int | None = None
+    max_calibration_work_bytes: int | None = None
     calibration_batch_size: int | None = None
 
 
@@ -359,12 +359,25 @@ class EntropySelectionConfig:
     whitening_regularization: float = 1.0e-12
     whitening_singular_policy: str = "regularize"
     bandwidth: EntropyBandwidthConfig = field(default_factory=EntropyBandwidthConfig)
-    max_edges: int = 1_000_000
+    max_edges: int | None = None
     max_graph_bytes: int | None = None
     max_graph_spool_bytes: int | None = None
-    max_entries: int = 1_000_000
+    max_entries: int | None = None
     max_contribution_bytes: int | None = None
     max_contribution_spool_bytes: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ResourceConfig:
+    """Operational runtime-resource policy, excluded from scientific identity."""
+
+    execution_mode: str = "auto"
+    memory_budget_bytes: int | None = None
+    scratch_budget_bytes: int | None = None
+    reserved_headroom_bytes: int | None = None
+    safety_margin_fraction: float = 0.10
+    scratch_path: str = ""
+    worker_cap: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -390,7 +403,7 @@ class SelectionConfig:
     test_pool_factor: float = 0.5
     local_magnetic_mode: str = "structural"
     local_descriptor_workers: int = 0
-    max_local_descriptor_inflight_bytes: int = 512 * 1024 * 1024
+    max_local_descriptor_inflight_bytes: int | None = None
     background_mass: float = 1.0e-12
     entropy: EntropySelectionConfig = field(default_factory=EntropySelectionConfig)
 
@@ -517,6 +530,7 @@ class NepflowConfig:
     validation: ValidationConfig = field(default_factory=ValidationConfig)
     hpc: HpcConfig = field(default_factory=HpcConfig)
     slurm: SlurmConfig = field(default_factory=SlurmConfig)
+    resources: ResourceConfig = field(default_factory=ResourceConfig)
     source_path: Path | None = field(default=None, compare=False, repr=False)
     raw_sections: frozenset[str] = field(
         default_factory=frozenset,
@@ -532,6 +546,8 @@ class NepflowConfig:
             raise TypeError("effective configuration must normalize to a mapping")
         mapping.pop("source_path", None)
         mapping.pop("raw_sections", None)
+        # Runtime resource policy is operational state, not scientific project identity.
+        mapping.pop("resources", None)
         if redact_secrets:
             materials_project = mapping["materials_project"]
             if isinstance(materials_project, dict):

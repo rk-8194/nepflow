@@ -95,6 +95,12 @@ def selection_policy(settings: SelectionConfig) -> dict[str, Any]:
     """Serialize the complete typed selection policy used for a run."""
 
     values = asdict(settings)
+    for name in (
+        "batch_size",
+        "local_descriptor_workers",
+        "max_local_descriptor_inflight_bytes",
+    ):
+        values.pop(name, None)
     if settings.algorithm == "information_entropy":
         # These settings belong to the independent NEP/FPS peer or are purely
         # operational for entropy.  They must not invalidate a scientific
@@ -106,15 +112,11 @@ def selection_policy(settings: SelectionConfig) -> dict[str, Any]:
             "composition_aware_fps_ternary_weight",
             "composition_aware_fps_adaptive_retries",
             "composition_aware_fps_descriptor_floor_fraction",
-            "batch_size",
-            "local_descriptor_workers",
-            "max_local_descriptor_inflight_bytes",
             "background_mass",
         ):
             values.pop(name, None)
         entropy_values = values.get("entropy")
         if isinstance(entropy_values, dict):
-            entropy_values.pop("bandwidth", {}).pop("chunk_size", None)
             for name in (
                 "max_edges",
                 "max_graph_bytes",
@@ -124,6 +126,17 @@ def selection_policy(settings: SelectionConfig) -> dict[str, Any]:
                 "max_contribution_spool_bytes",
             ):
                 entropy_values.pop(name, None)
+            bandwidth_values = entropy_values.get("bandwidth")
+            if isinstance(bandwidth_values, dict):
+                for name in (
+                    "chunk_size",
+                    "max_neighbour_entries",
+                    "max_index_bytes",
+                    "max_radius_query_bytes",
+                    "max_calibration_work_bytes",
+                    "calibration_batch_size",
+                ):
+                    bandwidth_values.pop(name, None)
     elif settings.algorithm == "fps":
         values.pop("entropy", None)
     return to_jsonable(values)
