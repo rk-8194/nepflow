@@ -36,7 +36,7 @@ DESCRIPTOR_CACHE_SCHEMA_VERSION = DESCRIPTOR_CACHE_SCHEMA
 
 
 def compute_structure_descriptors(
-    calc: NepCalculator,
+    calc: Any,
     structures: list,
     *,
     mean_descriptor: bool,
@@ -346,7 +346,7 @@ def load_or_calculate_representations(
 
 
 def compute_descriptors_batched(
-    calc: NepCalculator,
+    calc: Any,
     structures: list,
     *,
     mean_descriptor: bool,
@@ -755,14 +755,9 @@ def _local_descriptor_for_atom(
         for right_index, right_vector, right_distance in neighbours[left + 1 :]:
             cosine = float(np.dot(left_vector, right_vector) / (left_distance * right_distance))
             cosine = float(np.clip(cosine, -1.0, 1.0))
-            pair = tuple(
-                sorted(
-                    (
-                        species_index[symbols[left_index]],
-                        species_index[symbols[right_index]],
-                    )
-                )
-            )
+            left_species = species_index[symbols[left_index]]
+            right_species = species_index[symbols[right_index]]
+            pair = (min(left_species, right_species), max(left_species, right_species))
             angular[pair_indices[pair]] += _gaussian_histogram(
                 cosine,
                 angular_centres,
@@ -875,7 +870,7 @@ def fit_deterministic_whitening(
         raise ValueError("regularization must be finite and non-negative")
     if policy not in {"drop", "regularize", "reject"}:
         raise ValueError("singular_policy must be one of: drop, regularize, reject")
-    mean = np.mean(matrix, axis=0, dtype=np.float64)
+    mean = np.asarray(np.mean(matrix, axis=0, dtype=np.float64), dtype=np.float64)
     centred = matrix - mean
     covariance = (centred.T @ centred) / float(matrix.shape[0])
     covariance = (covariance + covariance.T) / 2.0
