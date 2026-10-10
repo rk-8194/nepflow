@@ -17,6 +17,9 @@ CALIBRATION_OPTIMIZER_ID = "bounded-grid"
 CALIBRATION_OPTIMIZER_VERSION = "bounded-grid-v1"
 KERNEL_FAMILY = "wendland_c2"
 KERNEL_VERSION = "wendland-c2-v1"
+SPARSE_KERNEL_GRAPH_SCHEMA_VERSION = "sparse-atomic-kernel-graph-v1"
+SPARSE_CANDIDATE_CONTRIBUTION_SCHEMA_VERSION = "sparse-candidate-contributions-v1"
+SPARSE_NUMERICAL_TOLERANCE = 1.0e-12
 
 
 def _readonly_float_array(value: Any, *, name: str) -> np.ndarray:
@@ -27,6 +30,20 @@ def _readonly_float_array(value: Any, *, name: str) -> np.ndarray:
         raise ValueError(f"{name} must be strictly positive")
     array.setflags(write=False)
     return array
+
+
+def _readonly_exact_array(value: Any, *, dtype: np.dtype[Any], name: str) -> np.ndarray:
+    array = np.array(value, copy=True)
+    if array.dtype != dtype:
+        raise ValueError(f"{name} must have dtype {dtype}")
+    array.setflags(write=False)
+    return array
+
+
+def _exact_integer(value: Any, *, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
+        raise ValueError(f"{name} must be an integer")
+    return int(value)
 
 
 @dataclass(frozen=True, slots=True)
@@ -300,6 +317,466 @@ class KernelMetadata:
     self_membership: bool = True
 
 
+@dataclass(frozen=True, slots=True)
+class SparseAtomicKernelRow:
+    """Read-only source-major row of the sparse atomic kernel graph."""
+
+    source_index: int
+    candidate_index: int
+    target_indices: np.ndarray
+    values: np.ndarray
+
+    def __post_init__(self) -> None:
+        targets = _readonly_exact_array(
+            self.target_indices,
+            dtype=np.dtype(np.int64),
+            name="source-row target_indices",
+        )
+        values = _readonly_exact_array(
+            self.values,
+            dtype=np.dtype(np.float64),
+            name="source-row values",
+        )
+        if targets.ndim != 1 or values.ndim != 1 or targets.shape != values.shape:
+            raise ValueError("source-row targets and values must be aligned vectors")
+        if not np.all(np.isfinite(values)) or np.any(values <= 0.0):
+            raise ValueError("source-row values must be finite and strictly positive")
+        object.__setattr__(self, "target_indices", targets)
+        object.__setattr__(self, "values", values)
+        object.__setattr__(
+            self, "source_index", _exact_integer(self.source_index, name="source_index")
+        )
+        object.__setattr__(
+            self,
+            "candidate_index",
+            _exact_integer(self.candidate_index, name="candidate_index"),
+        )
+
+    @property
+    def targets(self) -> np.ndarray:
+        return self.target_indices
+
+    @property
+    def weights(self) -> np.ndarray:
+        return self.values
+
+
+@dataclass(frozen=True, slots=True)
+class SparseAtomicKernelGraph:
+    """Immutable source-major CSR representation of the finite-pool kernel."""
+
+    source_indptr: np.ndarray
+    target_indices: np.ndarray
+    values: np.ndarray
+    row_candidate_indices: np.ndarray
+    candidate_ids: tuple[str, ...]
+    pool_fingerprint: str
+    bandwidth_fingerprint: str
+    transform_fingerprint: str
+    fingerprint: str
+    kernel_family: str = KERNEL_FAMILY
+    kernel_version: str = KERNEL_VERSION
+    normalization: str = "finite-pool-source-column-v1"
+    source_bandwidth_orientation: str = "h_a"
+    self_membership: bool = True
+    sparse_schema_version: str = SPARSE_KERNEL_GRAPH_SCHEMA_VERSION
+    numerical_tolerance: float = SPARSE_NUMERICAL_TOLERANCE
+
+    def __post_init__(self) -> None:
+        source_indptr = _readonly_exact_array(
+            self.source_indptr,
+            dtype=np.dtype(np.int64),
+            name="source_indptr",
+        )
+        target_indices = _readonly_exact_array(
+            self.target_indices,
+            dtype=np.dtype(np.int64),
+            name="target_indices",
+        )
+        values = _readonly_exact_array(self.values, dtype=np.dtype(np.float64), name="values")
+        row_candidates = _readonly_exact_array(
+            self.row_candidate_indices,
+            dtype=np.dtype(np.int64),
+            name="row_candidate_indices",
+        )
+        candidate_ids = tuple(self.candidate_ids)
+        if not candidate_ids or any(
+            not isinstance(value, str) or not value.strip() for value in candidate_ids
+        ):
+            raise ValueError("candidate_ids must be non-empty and non-blank")
+        if len(set(candidate_ids)) != len(candidate_ids):
+            raise ValueError("candidate_ids must be unique")
+        if source_indptr.ndim != 1 or row_candidates.ndim != 1:
+            raise ValueError("source graph row arrays must be one-dimensional")
+        source_count = row_candidates.shape[0]
+        if source_indptr.shape[0] != source_count + 1:
+            raise ValueError("source_indptr must have one more entry than source rows")
+        if target_indices.ndim != 1 or values.ndim != 1:
+            raise ValueError("source graph edge arrays must be one-dimensional")
+        edge_count = target_indices.shape[0]
+        if values.shape[0] != edge_count:
+            raise ValueError("target_indices and values must have equal lengths")
+        if source_indptr[0] != 0 or source_indptr[-1] != edge_count:
+            raise ValueError("source_indptr endpoints must cover all graph edges")
+        if np.any(np.diff(source_indptr) < 0):
+            raise ValueError("source_indptr must be non-decreasing")
+        if np.any(row_candidates < 0) or np.any(row_candidates >= len(candidate_ids)):
+            raise ValueError("source row ownership contains an unknown candidate")
+        if not np.all(np.isfinite(values)) or np.any(values <= 0.0):
+            raise ValueError("graph values must be finite and strictly positive")
+        tolerance = float(self.numerical_tolerance)
+        if not math.isfinite(tolerance) or tolerance <= 0.0:
+            raise ValueError("numerical_tolerance must be finite and strictly positive")
+        for source_index in range(source_count):
+            start = int(source_indptr[source_index])
+            stop = int(source_indptr[source_index + 1])
+            targets = target_indices[start:stop]
+            if targets.size == 0 or not np.any(targets == source_index):
+                raise ValueError(f"source row {source_index} is missing its self-edge")
+            if np.any(targets < 0) or np.any(targets >= source_count):
+                raise ValueError("graph target index is outside the source-row range")
+            if targets.size > 1 and np.any(np.diff(targets) <= 0):
+                raise ValueError("graph target indices must be strictly increasing per source")
+            if not math.isclose(
+                float(np.sum(values[start:stop], dtype=np.float64)),
+                1.0,
+                rel_tol=0.0,
+                abs_tol=tolerance,
+            ):
+                raise ValueError(f"source row {source_index} is not normalized")
+        for name, value in (
+            ("pool_fingerprint", self.pool_fingerprint),
+            ("bandwidth_fingerprint", self.bandwidth_fingerprint),
+            ("transform_fingerprint", self.transform_fingerprint),
+            ("fingerprint", self.fingerprint),
+            ("kernel_family", self.kernel_family),
+            ("kernel_version", self.kernel_version),
+            ("normalization", self.normalization),
+            ("source_bandwidth_orientation", self.source_bandwidth_orientation),
+            ("sparse_schema_version", self.sparse_schema_version),
+        ):
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"{name} must be a non-blank string")
+        if self.kernel_family != KERNEL_FAMILY or self.kernel_version != KERNEL_VERSION:
+            raise ValueError("unsupported sparse graph kernel identity")
+        if self.normalization != "finite-pool-source-column-v1":
+            raise ValueError("unsupported sparse graph normalization convention")
+        if self.source_bandwidth_orientation != "h_a":
+            raise ValueError("sparse graph source bandwidth orientation must be h_a")
+        if self.sparse_schema_version != SPARSE_KERNEL_GRAPH_SCHEMA_VERSION:
+            raise ValueError("unsupported sparse graph schema version")
+        if not math.isclose(
+            tolerance,
+            SPARSE_NUMERICAL_TOLERANCE,
+            rel_tol=0.0,
+            abs_tol=0.0,
+        ):
+            raise ValueError("unsupported sparse graph numerical tolerance")
+        if not self.self_membership:
+            raise ValueError("source-major graph must retain self membership")
+        object.__setattr__(self, "source_indptr", source_indptr)
+        object.__setattr__(self, "target_indices", target_indices)
+        object.__setattr__(self, "values", values)
+        object.__setattr__(self, "row_candidate_indices", row_candidates)
+        object.__setattr__(self, "candidate_ids", candidate_ids)
+        object.__setattr__(self, "numerical_tolerance", tolerance)
+
+    @property
+    def n_sources(self) -> int:
+        return int(self.row_candidate_indices.shape[0])
+
+    @property
+    def n_targets(self) -> int:
+        return self.n_sources
+
+    @property
+    def edge_count(self) -> int:
+        return int(self.target_indices.shape[0])
+
+    @property
+    def nnz(self) -> int:
+        return self.edge_count
+
+    @property
+    def array_bytes(self) -> int:
+        return int(
+            self.source_indptr.nbytes
+            + self.target_indices.nbytes
+            + self.values.nbytes
+            + self.row_candidate_indices.nbytes
+        )
+
+    @property
+    def support_sizes(self) -> np.ndarray:
+        values = np.diff(self.source_indptr).astype(np.int64, copy=True)
+        values.setflags(write=False)
+        return values
+
+    @property
+    def density(self) -> float:
+        denominator = self.n_sources * self.n_targets
+        return self.edge_count / denominator if denominator else 0.0
+
+    @property
+    def source_offsets(self) -> np.ndarray:
+        return self.source_indptr
+
+    @property
+    def indptr(self) -> np.ndarray:
+        return self.source_indptr
+
+    @property
+    def indices(self) -> np.ndarray:
+        return self.target_indices
+
+    @property
+    def data(self) -> np.ndarray:
+        return self.values
+
+    @property
+    def source_candidate_indices(self) -> np.ndarray:
+        return self.row_candidate_indices
+
+    def source_row(self, source_index: int) -> SparseAtomicKernelRow:
+        index = int(source_index)
+        if index < 0 or index >= self.n_sources:
+            raise IndexError("source index is outside the graph")
+        start = int(self.source_indptr[index])
+        stop = int(self.source_indptr[index + 1])
+        return SparseAtomicKernelRow(
+            source_index=index,
+            candidate_index=int(self.row_candidate_indices[index]),
+            target_indices=self.target_indices[start:stop],
+            values=self.values[start:stop],
+        )
+
+    get_source_row = source_row
+
+    def iter_source_rows(self):
+        for source_index in range(self.n_sources):
+            yield self.source_row(source_index)
+
+
+@dataclass(frozen=True, slots=True)
+class SparseCandidateContributionRow:
+    """Read-only candidate-major sparse contribution row."""
+
+    candidate_index: int
+    candidate_id: str
+    target_indices: np.ndarray
+    values: np.ndarray
+
+    def __post_init__(self) -> None:
+        targets = _readonly_exact_array(
+            self.target_indices,
+            dtype=np.dtype(np.int64),
+            name="candidate target_indices",
+        )
+        values = _readonly_exact_array(
+            self.values,
+            dtype=np.dtype(np.float64),
+            name="candidate values",
+        )
+        if targets.ndim != 1 or values.ndim != 1 or targets.shape != values.shape:
+            raise ValueError("candidate targets and values must be aligned vectors")
+        if not np.all(np.isfinite(values)) or np.any(values <= 0.0):
+            raise ValueError("candidate values must be finite and strictly positive")
+        object.__setattr__(self, "target_indices", targets)
+        object.__setattr__(self, "values", values)
+        object.__setattr__(
+            self,
+            "candidate_index",
+            _exact_integer(self.candidate_index, name="candidate_index"),
+        )
+        if not isinstance(self.candidate_id, str) or not self.candidate_id.strip():
+            raise ValueError("candidate_id must be a non-blank string")
+
+    @property
+    def targets(self) -> np.ndarray:
+        return self.target_indices
+
+    @property
+    def weights(self) -> np.ndarray:
+        return self.values
+
+
+@dataclass(frozen=True, slots=True)
+class SparseCandidateContributions:
+    """Immutable candidate-major CSR representation of ``q_C``."""
+
+    candidate_indptr: np.ndarray
+    target_indices: np.ndarray
+    values: np.ndarray
+    candidate_ids: tuple[str, ...]
+    graph_fingerprint: str
+    fingerprint: str
+    row_count: int = -1
+    candidate_source_counts: np.ndarray | None = None
+    pool_fingerprint: str = ""
+    sparse_schema_version: str = SPARSE_CANDIDATE_CONTRIBUTION_SCHEMA_VERSION
+    numerical_tolerance: float = SPARSE_NUMERICAL_TOLERANCE
+
+    def __post_init__(self) -> None:
+        indptr = _readonly_exact_array(
+            self.candidate_indptr,
+            dtype=np.dtype(np.int64),
+            name="candidate_indptr",
+        )
+        targets = _readonly_exact_array(
+            self.target_indices,
+            dtype=np.dtype(np.int64),
+            name="candidate target_indices",
+        )
+        values = _readonly_exact_array(
+            self.values, dtype=np.dtype(np.float64), name="candidate values"
+        )
+        candidate_ids = tuple(self.candidate_ids)
+        if not candidate_ids or any(
+            not isinstance(value, str) or not value.strip() for value in candidate_ids
+        ):
+            raise ValueError("candidate_ids must be non-empty and non-blank")
+        if len(set(candidate_ids)) != len(candidate_ids):
+            raise ValueError("candidate_ids must be unique")
+        if indptr.ndim != 1 or indptr.shape[0] != len(candidate_ids) + 1:
+            raise ValueError("candidate_indptr must have one more entry than candidates")
+        if targets.ndim != 1 or values.ndim != 1 or targets.shape != values.shape:
+            raise ValueError("candidate target_indices and values must be aligned")
+        if indptr[0] != 0 or indptr[-1] != targets.shape[0] or np.any(np.diff(indptr) < 0):
+            raise ValueError("candidate_indptr must be a non-decreasing CSR offset array")
+        row_count = _exact_integer(self.row_count, name="row_count")
+        if row_count < 0:
+            row_count = int(np.max(targets)) + 1 if targets.size else 0
+        if row_count < 1:
+            raise ValueError("candidate contributions require at least one target row")
+        if np.any(targets < 0) or np.any(targets >= row_count):
+            raise ValueError("candidate target index is outside the pool row range")
+        if not np.all(np.isfinite(values)) or np.any(values <= 0.0):
+            raise ValueError("candidate contributions must be finite and strictly positive")
+        tolerance = float(self.numerical_tolerance)
+        if not math.isfinite(tolerance) or tolerance <= 0.0:
+            raise ValueError("numerical_tolerance must be finite and strictly positive")
+        for candidate_index in range(len(candidate_ids)):
+            start = int(indptr[candidate_index])
+            stop = int(indptr[candidate_index + 1])
+            candidate_targets = targets[start:stop]
+            if candidate_targets.size == 0:
+                raise ValueError(f"candidate {candidate_ids[candidate_index]!r} has empty support")
+            if candidate_targets.size > 1 and np.any(np.diff(candidate_targets) <= 0):
+                raise ValueError("candidate target indices must be strictly increasing")
+            if not math.isclose(
+                float(np.sum(values[start:stop], dtype=np.float64)),
+                1.0,
+                rel_tol=0.0,
+                abs_tol=tolerance,
+            ):
+                raise ValueError(f"candidate {candidate_ids[candidate_index]!r} is not normalized")
+        source_counts = self.candidate_source_counts
+        if source_counts is not None:
+            source_counts = _readonly_exact_array(
+                source_counts,
+                dtype=np.dtype(np.int64),
+                name="candidate_source_counts",
+            )
+            if source_counts.ndim != 1 or source_counts.shape[0] != len(candidate_ids):
+                raise ValueError("candidate_source_counts must align with candidate_ids")
+            if np.any(source_counts <= 0):
+                raise ValueError("candidate source counts must be strictly positive")
+        for name, value in (
+            ("graph_fingerprint", self.graph_fingerprint),
+            ("fingerprint", self.fingerprint),
+            ("sparse_schema_version", self.sparse_schema_version),
+        ):
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"{name} must be a non-blank string")
+        if self.sparse_schema_version != SPARSE_CANDIDATE_CONTRIBUTION_SCHEMA_VERSION:
+            raise ValueError("unsupported sparse candidate contribution schema version")
+        if not math.isclose(
+            tolerance,
+            SPARSE_NUMERICAL_TOLERANCE,
+            rel_tol=0.0,
+            abs_tol=0.0,
+        ):
+            raise ValueError("unsupported sparse candidate numerical tolerance")
+        object.__setattr__(self, "candidate_indptr", indptr)
+        object.__setattr__(self, "target_indices", targets)
+        object.__setattr__(self, "values", values)
+        object.__setattr__(self, "candidate_ids", candidate_ids)
+        object.__setattr__(self, "row_count", row_count)
+        object.__setattr__(self, "candidate_source_counts", source_counts)
+        object.__setattr__(self, "numerical_tolerance", tolerance)
+
+    @property
+    def n_candidates(self) -> int:
+        return len(self.candidate_ids)
+
+    @property
+    def n_targets(self) -> int:
+        return self.row_count
+
+    @property
+    def entry_count(self) -> int:
+        return int(self.target_indices.shape[0])
+
+    @property
+    def nnz(self) -> int:
+        return self.entry_count
+
+    @property
+    def array_bytes(self) -> int:
+        total = self.candidate_indptr.nbytes + self.target_indices.nbytes + self.values.nbytes
+        if self.candidate_source_counts is not None:
+            total += self.candidate_source_counts.nbytes
+        return int(total)
+
+    @property
+    def support_sizes(self) -> np.ndarray:
+        values = np.diff(self.candidate_indptr).astype(np.int64, copy=True)
+        values.setflags(write=False)
+        return values
+
+    @property
+    def indptr(self) -> np.ndarray:
+        return self.candidate_indptr
+
+    @property
+    def indices(self) -> np.ndarray:
+        return self.target_indices
+
+    @property
+    def data(self) -> np.ndarray:
+        return self.values
+
+    def candidate_index(self, candidate: int | str) -> int:
+        if isinstance(candidate, bool):
+            raise TypeError("candidate selector must be an index or candidate ID")
+        if isinstance(candidate, str):
+            try:
+                return self.candidate_ids.index(candidate)
+            except ValueError as exc:
+                raise KeyError(candidate) from exc
+        index = _exact_integer(candidate, name="candidate selector")
+        if index < 0 or index >= self.n_candidates:
+            raise IndexError("candidate index is outside the contribution record")
+        return index
+
+    def candidate_row(self, candidate: int | str) -> SparseCandidateContributionRow:
+        index = self.candidate_index(candidate)
+        start = int(self.candidate_indptr[index])
+        stop = int(self.candidate_indptr[index + 1])
+        return SparseCandidateContributionRow(
+            candidate_index=index,
+            candidate_id=self.candidate_ids[index],
+            target_indices=self.target_indices[start:stop],
+            values=self.values[start:stop],
+        )
+
+    get_candidate = candidate_row
+
+    def iter_candidates(self):
+        for candidate_index in range(self.n_candidates):
+            yield self.candidate_row(candidate_index)
+
+
 BandwidthSettings = EntropyBandwidthSettings
 CalibrationSettings = EntropyBandwidthSettings
 BandwidthResult = FrozenBandwidths
@@ -327,4 +804,11 @@ __all__ = [
     "NEIGHBOUR_BACKEND_VERSION",
     "NEIGHBOUR_DISTINCT_POLICY",
     "NEIGHBOUR_METRIC",
+    "SPARSE_CANDIDATE_CONTRIBUTION_SCHEMA_VERSION",
+    "SPARSE_KERNEL_GRAPH_SCHEMA_VERSION",
+    "SPARSE_NUMERICAL_TOLERANCE",
+    "SparseAtomicKernelGraph",
+    "SparseAtomicKernelRow",
+    "SparseCandidateContributionRow",
+    "SparseCandidateContributions",
 ]
