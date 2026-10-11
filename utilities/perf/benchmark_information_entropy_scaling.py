@@ -268,7 +268,9 @@ def _prepare(
         knn_query_wall_seconds = max(0.0, time.perf_counter() - knn_started)
         after_initial_knn = _snapshot_metrics(index)
         if preserve_for_restart:
-            first_checkpoint_metrics = dict(knn_checkpoint_metrics)
+            # The restart call replaces its output dictionary; keep the first
+            # pass's checkpoint write metrics and collect restart I/O separately.
+            restart_checkpoint_metrics: dict[str, Any] = {}
             if index is not None:
                 index._evict_neighbour_cache()
             restart_started = time.perf_counter()
@@ -283,7 +285,7 @@ def _prepare(
                 resource_budget=service,
                 checkpoint_path=checkpoint_root,
                 checkpoint_every_locations=chunk_size,
-                checkpoint_metrics=knn_checkpoint_metrics,
+                checkpoint_metrics=restart_checkpoint_metrics,
                 resume=True,
                 preserve_checkpoint=False,
             )
@@ -291,8 +293,8 @@ def _prepare(
             knn_checkpoint_metrics["restart_cost_seconds"] = restart_cost_seconds
             knn_checkpoint_metrics["restart_cost_measured"] = True
             knn_checkpoint_metrics["restart_bytes_read"] = int(
-                knn_checkpoint_metrics.get("bytes_read", 0) or 0
-            ) - int(first_checkpoint_metrics.get("bytes_read", 0) or 0)
+                restart_checkpoint_metrics.get("bytes_read", 0) or 0
+            )
     # The diagnostic restart is deliberately excluded from the production kNN
     # wall time and from the full-selection estimate.
     knn_wall_seconds = knn_query_wall_seconds
@@ -677,7 +679,10 @@ def _correctness_checks(
                     "reference_scalar_vs_batched_match": reference_scalar_batch_match,
                     "objective_match": objective_match,
                     "neighbour_match": neighbour_match,
-                    "scientific_fingerprint_match": bandwidth_arrays_equal,
+                    "scientific_values_equal": bandwidth_arrays_equal,
+                    "bandwidth_fingerprint_strings_equal": (
+                        production_frozen.fingerprint == reference_frozen.fingerprint
+                    ),
                     "production_bandwidth_fingerprint": production_frozen.fingerprint,
                     "reference_bandwidth_fingerprint": reference_frozen.fingerprint,
                     "bandwidth_arrays_equal": bandwidth_arrays_equal,
@@ -787,6 +792,12 @@ def _correctness_checks(
             "k_values": list(PRODUCTION_K_VALUES),
             "c_values": list(PRODUCTION_C_VALUES),
             "pair_count": len(pair_results),
+            "fingerprint_comparison_semantics": (
+                "scientific_values_equal and bandwidth_arrays_equal compare exact "
+                "float64 bandwidth/radius data. bandwidth_fingerprint_strings_equal "
+                "compares full provenance-bearing fingerprint strings, which can "
+                "differ across exact backends with identical scientific values."
+            ),
             "all_16_pairs_tested": grid_complete,
             "all_16_pairs_passed": all_pairs_passed,
             "pairs": pair_results,
