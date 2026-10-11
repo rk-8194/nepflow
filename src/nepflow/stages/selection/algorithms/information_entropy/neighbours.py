@@ -1131,13 +1131,18 @@ class IndexedCPUNeighbourIndex:
     ) -> float | None:
         """Return a certified relative error bound for one FP64 norm.
 
-        The bound covers one rounded subtraction and square per component, a
-        worst-case sequential ``d``-term accumulation, and a rounded square
-        root.  It also covers an independent ``d``-term cKDTree distance
-        calculation and its rounded square root.  The interval is widened by
-        ``nextafter`` at both ends.  Any non-finite, subnormal,
-        underflow-prone, or overflow-prone operation is rejected so the
-        caller must use complete exact radius verification.
+        For one distance evaluation, ``3*d`` covers the componentwise
+        subtraction, square, and conservative sequential accumulation.  The
+        fixed allowance covers the square root, scalar result handling, and
+        the cKDTree scalar comparison/return path.
+        This same bound is applied independently to the canonical NumPy
+        distance and to the cKDTree-reported distance; the ``eps=0`` tree
+        contract supplies the ordering guarantee for locations omitted from
+        the returned prefix.  The bound is evaluated as ``gamma_n`` rather
+        than by subtracting two nearly equal powers.  ``nextafter`` is used
+        only to round an already-positive bound outward.  Any non-finite,
+        subnormal, underflow-prone, or overflow-prone operation is rejected
+        so the caller must use complete exact radius verification.
         """
 
         if dimension < 1 or query.shape != target.shape or query.size != dimension:
@@ -1161,16 +1166,24 @@ class IndexedCPUNeighbourIndex:
             return None
         if not np.isfinite(squared_sum) or float(squared_sum) <= 0.0:
             return None
-        unit_roundoff = np.finfo(np.float64).eps / 2.0
-        # The exponent covers the canonical norm operations and an additional
-        # worst-case norm evaluation by cKDTree.  ``nextafter`` makes the
-        # interval outward-rounded rather than relying on a strict algebraic
-        # approximation to the IEEE error factor.
-        factor = (1.0 + unit_roundoff) ** (2 * int(dimension) + 8)
-        relative = float(np.nextafter(factor - 1.0, np.inf))
-        if not np.isfinite(relative) or relative >= 1.0:
+        unit_roundoff = np.float64(np.finfo(np.float64).eps / 2.0)
+        operation_count = 3 * int(dimension) + 8
+        with np.errstate(over="ignore", divide="ignore", invalid="ignore"):
+            operation_product = np.float64(operation_count) * unit_roundoff
+        if (
+            not np.isfinite(operation_product)
+            or operation_product <= 0.0
+            or operation_product >= 1.0
+        ):
             return None
-        return relative
+        # Higham's gamma_n = n*u/(1-n*u) is stable here because the numerator
+        # and denominator are formed directly; no (1+u)**n - 1 cancellation is
+        # involved.  The final nextafter only makes this valid bound outward.
+        with np.errstate(over="ignore", divide="ignore", invalid="ignore"):
+            relative = operation_product / (np.float64(1.0) - operation_product)
+        if not np.isfinite(relative) or relative <= 0.0 or relative >= 1.0:
+            return None
+        return float(np.nextafter(relative, np.inf))
 
     @staticmethod
     def _distance_interval(value: float, relative_error: float) -> tuple[float, float] | None:
@@ -1554,6 +1567,10 @@ class IndexedCPUNeighbourIndex:
                     max(1, tree_workspace),
                 )
                 tree_query_count = min(n_locations, order_k + 2)
+                # eps=0 is part of the certification proof: cKDTree's exact
+                # query contract makes the first excluded location a boundary
+                # for every omitted location.  The returned scalar distances
+                # are still checked with the independent FP64 intervals below.
                 _tree_distances, tree_indices = self._tree.query(
                     queries,
                     k=tree_query_count,

@@ -165,7 +165,87 @@ def test_indexed_certification_preserves_exhaustive_42d_oracle(
     np.testing.assert_array_equal(actual.indices, expected.indices)
     np.testing.assert_array_equal(actual.distances, expected.distances)
     np.testing.assert_array_equal(actual.radii, expected.radii)
+    assert actual.representation_fingerprint == expected.representation_fingerprint
+    assert actual.row_ids == expected.row_ids
     assert int(metrics["knn_fast_path_certified_count"]) > 0
+
+
+@pytest.mark.parametrize("dimension", [1, 7, 42, 128])
+def test_fp64_certification_bound_is_stable_and_positive(dimension: int) -> None:
+    query = np.zeros(dimension, dtype=np.float64)
+    target = np.ones(dimension, dtype=np.float64)
+
+    bound = IndexedCPUNeighbourIndex._euclidean_relative_error_bound(
+        query,
+        target,
+        dimension=dimension,
+    )
+
+    assert bound is not None
+    assert np.isfinite(bound)
+    assert bound > 0.0
+    expected_operation_count = 3 * dimension + 8
+    unit_roundoff = np.finfo(np.float64).eps / 2.0
+    numerator = expected_operation_count * unit_roundoff
+    expected = numerator / (1.0 - numerator)
+    assert bound >= expected
+    if dimension == 42:
+        assert 1.0e-14 < bound < 2.0e-14
+        assert bound != np.finfo(np.float64).tiny
+
+
+def test_certification_gap_guard_is_scale_aware_and_fail_closed() -> None:
+    query = np.zeros(42, dtype=np.float64)
+    kth_target = np.zeros(42, dtype=np.float64)
+    kth_target[0] = 1.0
+
+    one_ulp_target = kth_target.copy()
+    one_ulp_target[0] = np.nextafter(1.0, 2.0)
+    assert not IndexedCPUNeighbourIndex._certified_knn_boundary(
+        query,
+        kth_target,
+        one_ulp_target,
+        kth_target,
+        one_ulp_target,
+        1.0,
+        float(one_ulp_target[0]),
+        1.0,
+        float(one_ulp_target[0]),
+        dimension=42,
+    )
+
+    separated_target = kth_target.copy()
+    separated_target[0] = 1.0 + 1.0e-10
+    assert IndexedCPUNeighbourIndex._certified_knn_boundary(
+        query,
+        kth_target,
+        separated_target,
+        kth_target,
+        separated_target,
+        1.0,
+        float(separated_target[0]),
+        1.0,
+        float(separated_target[0]),
+        dimension=42,
+    )
+
+    scale = 1.0e100
+    scaled_kth_target = np.zeros(42, dtype=np.float64)
+    scaled_kth_target[0] = scale
+    scaled_near_target = scaled_kth_target.copy()
+    scaled_near_target[0] = np.nextafter(scale, np.inf)
+    assert not IndexedCPUNeighbourIndex._certified_knn_boundary(
+        query,
+        scaled_kth_target,
+        scaled_near_target,
+        scaled_kth_target,
+        scaled_near_target,
+        scale,
+        float(scaled_near_target[0]),
+        scale,
+        float(scaled_near_target[0]),
+        dimension=42,
+    )
 
 
 def test_indexed_certification_skips_radius_queries_for_a_separated_cloud() -> None:
@@ -188,6 +268,29 @@ def test_indexed_certification_skips_radius_queries_for_a_separated_cloud() -> N
     assert metrics["knn_fast_path_ambiguous_count"] == 0
     assert metrics["radius_query_preflights"] == 0
     assert metrics["radius_queries"] == 0
+
+
+def test_indexed_certification_fingerprint_is_chunk_and_worker_invariant() -> None:
+    rng = np.random.default_rng(20261011)
+    descriptors = rng.normal(size=(19, 42)).astype(np.float64)
+    first, _ = _indexed_against_exhaustive(
+        descriptors,
+        k=4,
+        chunk_size=1,
+        worker_count=1,
+    )
+    second, _ = _indexed_against_exhaustive(
+        descriptors,
+        k=4,
+        chunk_size=8,
+        worker_count=2,
+    )
+
+    assert first.fingerprint == second.fingerprint
+    assert first.representation_fingerprint == second.representation_fingerprint
+    np.testing.assert_array_equal(first.indices, second.indices)
+    np.testing.assert_array_equal(first.distances, second.distances)
+    np.testing.assert_array_equal(first.radii, second.radii)
 
 
 def test_indexed_certification_falls_back_for_equal_and_ulp_boundaries() -> None:
@@ -213,7 +316,11 @@ def test_indexed_certification_falls_back_for_equal_and_ulp_boundaries() -> None
 
     np.testing.assert_array_equal(actual.indices, expected.indices)
     np.testing.assert_array_equal(actual.distances, expected.distances)
+    np.testing.assert_array_equal(actual.radii, expected.radii)
+    assert actual.representation_fingerprint == expected.representation_fingerprint
+    assert actual.row_ids == expected.row_ids
     assert metrics["knn_fast_path_ambiguous_count"] > 0
+    assert metrics["knn_fast_path_fallback_count"] > 0
     assert metrics["radius_query_preflights"] > 0
 
 
