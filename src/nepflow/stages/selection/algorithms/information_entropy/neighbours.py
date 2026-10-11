@@ -21,7 +21,11 @@ from nepflow.resources.budget import (
     build_resource_budget,
 )
 
-from .checkpointing import CheckpointValidationError, VersionedCheckpointStore
+from .checkpointing import (
+    CheckpointValidationError,
+    IncrementalCheckpointStore,
+    VersionedCheckpointStore,
+)
 from .models import (
     DEFAULT_NEIGHBOUR_BACKEND_ID,
     DEFAULT_RADIUS_QUERY_BYTES,
@@ -624,11 +628,11 @@ class IndexedCPUNeighbourIndex:
             "checkpoint_fsync": "checkpoint_serialization",
         }
         for alias, phase in aliases.items():
-            if f"{phase}_seconds" in metrics:
+            if f"{alias}_seconds" not in metrics and f"{phase}_seconds" in metrics:
                 metrics[f"{alias}_seconds"] = metrics[f"{phase}_seconds"]
-            if f"{phase}_count" in metrics:
+            if f"{alias}_count" not in metrics and f"{phase}_count" in metrics:
                 metrics[f"{alias}_count"] = metrics[f"{phase}_count"]
-            if f"{phase}_bytes" in metrics:
+            if f"{alias}_bytes" not in metrics and f"{phase}_bytes" in metrics:
                 metrics[f"{alias}_bytes"] = metrics[f"{phase}_bytes"]
         return metrics
 
@@ -908,7 +912,7 @@ class IndexedCPUNeighbourIndex:
         k: int,
         *,
         chunk_size: int = 1024,
-        checkpoint_store: VersionedCheckpointStore | None = None,
+        checkpoint_store: VersionedCheckpointStore | IncrementalCheckpointStore | None = None,
         checkpoint_name: str = "knn",
         checkpoint_identity: dict[str, Any] | None = None,
         checkpoint_every_locations: int = 1,
@@ -944,6 +948,9 @@ class IndexedCPUNeighbourIndex:
         neighbour_indices = np.empty((n_locations, order_k), dtype=np.int64)
         neighbour_distances = np.empty((n_locations, order_k), dtype=np.float64)
         source_start = 0
+        incremental_store: IncrementalCheckpointStore | None = None
+        legacy_store: VersionedCheckpointStore | None = None
+        loaded_legacy = False
         if checkpoint_store is not None:
             if checkpoint_identity is None:
                 raise ValueError("kNN checkpoint identity is required")
@@ -953,16 +960,69 @@ class IndexedCPUNeighbourIndex:
                 or int(checkpoint_every_locations) < 1
             ):
                 raise ValueError("checkpoint_every_locations must be a positive integer")
+            if isinstance(checkpoint_store, IncrementalCheckpointStore):
+                incremental_store = checkpoint_store
+                legacy_store = VersionedCheckpointStore(checkpoint_store.root)
+            elif isinstance(checkpoint_store, VersionedCheckpointStore):
+                incremental_store = IncrementalCheckpointStore(
+                    checkpoint_store.root,
+                    resource_budget=self.resource_budget,
+                )
+                legacy_store = checkpoint_store
+            else:
+                raise TypeError("checkpoint_store must be a supported checkpoint store")
             if not resume:
-                checkpoint_store.clear(checkpoint_name)
-            if resume and checkpoint_store.exists(checkpoint_name):
-                _identity, checkpoint_state, checkpoint_arrays = checkpoint_store.load(
+                incremental_store.clear(checkpoint_name)
+                legacy_store.clear(checkpoint_name)
+            else:
+                # Remove only unreferenced partial chunk/manifest artifacts
+                # left by a crash before reading the authoritative pointer.
+                incremental_store.clean_stale()
+            if resume and incremental_store.exists(checkpoint_name):
+                checkpoint_started = time.perf_counter()
+                _identity, checkpoint_state, checkpoint_arrays = incremental_store.load(
                     checkpoint_name,
                     expected_identity=checkpoint_identity,
+                    k_max=order_k,
+                    location_count=n_locations,
                 )
                 source_start = int(checkpoint_state.get("cursor", -1))
                 saved_neighbours = checkpoint_arrays.get("neighbour_locations")
                 saved_distances = checkpoint_arrays.get("neighbour_distances")
+                self._record_phase(
+                    "checkpoint_read",
+                    time.perf_counter() - checkpoint_started,
+                    count=int(checkpoint_state.get("chunk_count", 0)),
+                    bytes_written=int(incremental_store.metrics().get("bytes_read", 0)),
+                )
+                self._phase_bytes["checkpoint_retained"] = int(
+                    incremental_store.metrics().get("retained_bytes", 0)
+                )
+            elif resume and legacy_store.exists(checkpoint_name):
+                _identity, checkpoint_state, checkpoint_arrays = legacy_store.load(
+                    checkpoint_name,
+                    expected_identity=checkpoint_identity,
+                )
+                loaded_legacy = True
+                source_start = int(checkpoint_state.get("cursor", -1))
+                saved_neighbours = checkpoint_arrays.get("neighbour_locations")
+                saved_distances = checkpoint_arrays.get("neighbour_distances")
+                if (
+                    source_start < 1
+                    or source_start > n_locations
+                    or saved_neighbours is None
+                    or saved_distances is None
+                    or saved_neighbours.shape != (source_start, order_k)
+                    or saved_distances.shape != (source_start, order_k)
+                    or saved_neighbours.dtype != np.dtype(np.int64)
+                    or saved_distances.dtype != np.dtype(np.float64)
+                ):
+                    raise CheckpointValidationError(
+                        "kNN checkpoint cursor or arrays are incompatible"
+                    )
+                neighbour_indices[:source_start] = saved_neighbours
+                neighbour_distances[:source_start] = saved_distances
+            if resume and incremental_store.exists(checkpoint_name):
                 if (
                     source_start < 0
                     or source_start > n_locations
@@ -976,9 +1036,39 @@ class IndexedCPUNeighbourIndex:
                     )
                 neighbour_indices[:source_start] = saved_neighbours
                 neighbour_distances[:source_start] = saved_distances
+            if loaded_legacy:
+                # Migrate a verified v1 full-prefix checkpoint once.  The
+                # old generation remains authoritative until this new first
+                # incremental manifest is promoted successfully.
+                assert incremental_store is not None
+                migration_before = incremental_store.metrics()
+                migration = incremental_store.write_chunk(
+                    checkpoint_name,
+                    identity=checkpoint_identity,
+                    start=0,
+                    neighbour_locations=neighbour_indices[:source_start],
+                    neighbour_distances=neighbour_distances[:source_start],
+                    k_max=order_k,
+                    location_count=n_locations,
+                )
+                migration_after = incremental_store.metrics()
+                self._record_phase(
+                    "checkpoint_serialization",
+                    float(migration.get("write_seconds", 0.0)),
+                    bytes_written=int(migration.get("bytes_written", 0)),
+                )
+                self._record_phase(
+                    "checkpoint_fsync",
+                    float(migration_after.get("fsync_seconds", 0.0))
+                    - float(migration_before.get("fsync_seconds", 0.0)),
+                )
+                self._phase_bytes["checkpoint_retained"] = int(
+                    migration_after.get("retained_bytes", 0)
+                )
         next_percent = 1
         last_log = started
         start = source_start
+        checkpoint_cursor = source_start
         while start < n_locations:
             stop = min(start + chunk_size, n_locations)
             queries = self.unique_locations[start:stop]
@@ -1142,24 +1232,46 @@ class IndexedCPUNeighbourIndex:
             if (
                 checkpoint_store is not None
                 and checkpoint_identity is not None
-                and stop % int(checkpoint_every_locations) == 0
+                and (
+                    stop % int(checkpoint_every_locations) == 0
+                    or stop == n_locations
+                )
             ):
                 checkpoint_started = time.perf_counter()
-                checkpoint_store.write(
+                assert incremental_store is not None
+                metrics_before = incremental_store.metrics()
+                write_metrics = incremental_store.write_chunk(
                     checkpoint_name,
                     identity=checkpoint_identity,
-                    state={"cursor": stop},
-                    arrays={
-                        "neighbour_locations": neighbour_indices[:stop],
-                        "neighbour_distances": neighbour_distances[:stop],
-                    },
+                    start=checkpoint_cursor,
+                    neighbour_locations=neighbour_indices[checkpoint_cursor:stop],
+                    neighbour_distances=neighbour_distances[checkpoint_cursor:stop],
+                    k_max=order_k,
+                    location_count=n_locations,
                 )
+                checkpoint_cursor = stop
+                metrics_after = incremental_store.metrics()
                 self._record_phase(
                     "checkpoint_serialization",
-                    time.perf_counter() - checkpoint_started,
-                    bytes_written=int(
-                        neighbour_indices[:stop].nbytes + neighbour_distances[:stop].nbytes
+                    float(
+                        write_metrics.get(
+                            "write_seconds", time.perf_counter() - checkpoint_started
+                        )
                     ),
+                    bytes_written=int(write_metrics.get("bytes_written", 0)),
+                )
+                self._record_phase(
+                    "checkpoint_fsync",
+                    float(metrics_after.get("fsync_seconds", 0.0))
+                    - float(metrics_before.get("fsync_seconds", 0.0)),
+                )
+                self._record_phase(
+                    "checkpoint_digest",
+                    float(metrics_after.get("digest_seconds", 0.0))
+                    - float(metrics_before.get("digest_seconds", 0.0)),
+                )
+                self._phase_bytes["checkpoint_retained"] = int(
+                    metrics_after.get("retained_bytes", 0)
                 )
 
             completed = stop
@@ -1200,8 +1312,11 @@ class IndexedCPUNeighbourIndex:
             start = stop
 
         if checkpoint_store is not None:
-            checkpoint_store.clear(checkpoint_name)
-            checkpoint_store.clean_stale()
+            assert incremental_store is not None and legacy_store is not None
+            incremental_store.clear(checkpoint_name)
+            incremental_store.clean_stale()
+            legacy_store.clear(checkpoint_name)
+            legacy_store.clean_stale()
         neighbour_indices.setflags(write=False)
         neighbour_distances.setflags(write=False)
         self._last_neighbour_compute_seconds = max(0.0, time.perf_counter() - started)
@@ -1219,7 +1334,7 @@ class IndexedCPUNeighbourIndex:
             float(phase_metrics.get("radius_preflight_count_seconds", 0.0) or 0.0),
             float(phase_metrics.get("radius_retrieval_seconds", 0.0) or 0.0),
             float(phase_metrics.get("canonical_distance_verification_seconds", 0.0) or 0.0),
-            float(phase_metrics.get("checkpoint_serialization_seconds", 0.0) or 0.0),
+            float(phase_metrics.get("checkpoint_fsync_seconds", 0.0) or 0.0),
             int(phase_metrics.get("checkpoint_serialization_bytes", 0) or 0),
         )
         return neighbour_indices, neighbour_distances
@@ -1229,7 +1344,7 @@ class IndexedCPUNeighbourIndex:
         k: int,
         *,
         chunk_size: int = 1024,
-        checkpoint_store: VersionedCheckpointStore | None = None,
+        checkpoint_store: VersionedCheckpointStore | IncrementalCheckpointStore | None = None,
         checkpoint_name: str = "knn",
         checkpoint_identity: dict[str, Any] | None = None,
         checkpoint_every_locations: int = 1,
@@ -1260,7 +1375,7 @@ class IndexedCPUNeighbourIndex:
         ks: Sequence[int],
         *,
         chunk_size: int = 1024,
-        checkpoint_store: VersionedCheckpointStore | None = None,
+        checkpoint_store: VersionedCheckpointStore | IncrementalCheckpointStore | None = None,
         checkpoint_name: str = "knn",
         checkpoint_identity: dict[str, Any] | None = None,
         checkpoint_every_locations: int = 1,
@@ -2384,7 +2499,9 @@ def compute_indexed_cpu_neighbours(
         )
     ordered_row_ids = _validate_row_ids(row_ids, values.shape[0])
     checkpoint_store = (
-        None if checkpoint_path is None else VersionedCheckpointStore(checkpoint_path)
+        None
+        if checkpoint_path is None
+        else IncrementalCheckpointStore(checkpoint_path, resource_budget=service)
     )
     checkpoint_identity = {
         "phase": "exact-knn",
@@ -2513,7 +2630,9 @@ def compute_indexed_cpu_neighbours_many(
         )
     ordered_row_ids = _validate_row_ids(row_ids, values.shape[0])
     checkpoint_store = (
-        None if checkpoint_path is None else VersionedCheckpointStore(checkpoint_path)
+        None
+        if checkpoint_path is None
+        else IncrementalCheckpointStore(checkpoint_path, resource_budget=service)
     )
     checkpoint_identity = {
         "phase": "exact-knn",

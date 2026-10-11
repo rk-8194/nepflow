@@ -124,11 +124,13 @@ def _prepare(
     max_radius_query_bytes: int | None,
     max_index_bytes: int | None,
     max_neighbour_cache_bytes: int | None,
+    checkpoint_enabled: bool,
 ) -> tuple[
     Any,
     IndexedCPUNeighbourIndex | TiledCPUNeighbourIndex | None,
     Any,
     ExactNeighbourResult,
+    dict[str, Any],
 ]:
     service = _budget(worker_count, memory_bytes, scratch_bytes)
     index = None
@@ -142,18 +144,22 @@ def _prepare(
             max_neighbour_cache_bytes=max_neighbour_cache_bytes,
             resource_budget=service,
         )
-    neighbours = compute_neighbours(
-        pool.descriptors,
-        k_max,
-        backend=backend,
-        index=index,
-        chunk_size=chunk_size,
-        representation_fingerprint=pool.representation_fingerprint,
-        row_ids=_pool_row_ids(pool),
-        resource_budget=service,
-    )
+    with tempfile.TemporaryDirectory(prefix="nepflow-entropy-knn-bench-") as temporary:
+        neighbours = compute_neighbours(
+            pool.descriptors,
+            k_max,
+            backend=backend,
+            index=index,
+            chunk_size=chunk_size,
+            representation_fingerprint=pool.representation_fingerprint,
+            row_ids=_pool_row_ids(pool),
+            resource_budget=service,
+            checkpoint_path=Path(temporary) if checkpoint_enabled else None,
+            checkpoint_every_locations=chunk_size,
+        )
     frozen = _freeze_from_neighbours(pool, neighbours, c)
-    return service, index, frozen, neighbours
+    checkpoint_metrics = {} if index is None else index.memory_metrics()
+    return service, index, frozen, neighbours, checkpoint_metrics
 
 
 def _run_stream(
@@ -380,17 +386,32 @@ def _correctness_checks(
 
 def _profiling_summary(results: list[dict[str, Any]]) -> dict[str, Any]:
     totals: dict[str, float] = {}
+    checkpoint_bytes = 0
+    checkpoint_fsync_seconds = 0.0
+    checkpoint_digest_seconds = 0.0
     for result in results:
-        phase_seconds = result.get("result", {}).get("operations", {}).get(
-            "phase_seconds", {}
-        )
+        operations = result.get("result", {}).get("operations", {})
+        phase_seconds = operations.get("phase_seconds", {})
         for phase, seconds in phase_seconds.items():
             totals[phase] = totals.get(phase, 0.0) + float(seconds)
+        knn_checkpoint = operations.get("knn_checkpoint", {})
+        checkpoint_bytes += int(knn_checkpoint.get("checkpoint_serialization_bytes", 0) or 0)
+        checkpoint_fsync_seconds += float(
+            knn_checkpoint.get("checkpoint_fsync_seconds", 0.0) or 0.0
+        )
+        checkpoint_digest_seconds += float(
+            knn_checkpoint.get("checkpoint_digest_seconds", 0.0) or 0.0
+        )
     dominant = sorted(totals.items(), key=lambda item: (-item[1], item[0]))
     return {
         "dominant_phases_by_aggregate_seconds": [
             {"phase": phase, "seconds": seconds} for phase, seconds in dominant[:5]
         ],
+        "knn_checkpoint_io": {
+            "array_bytes_written": checkpoint_bytes,
+            "fsync_seconds": checkpoint_fsync_seconds,
+            "digest_seconds": checkpoint_digest_seconds,
+        },
         "interpretation": (
             "Use the largest phase as the next optimization target; support/query, "
             "canonical reduction, spool, and checkpoint timings are operational only."
@@ -438,7 +459,7 @@ def main() -> None:
     for backend in backends:
         for worker_count in args.workers:
             for checkpoint_enabled in (False, True):
-                service, index, frozen, neighbours = _prepare(
+                service, index, frozen, neighbours, checkpoint_metrics = _prepare(
                     pool,
                     backend,
                     worker_count,
@@ -450,6 +471,7 @@ def main() -> None:
                     max_radius_query_bytes=args.max_radius_query_bytes,
                     max_index_bytes=args.max_index_bytes,
                     max_neighbour_cache_bytes=args.max_neighbour_cache_bytes,
+                    checkpoint_enabled=checkpoint_enabled,
                 )
                 cold = _run_stream(
                     pool,
@@ -473,6 +495,8 @@ def main() -> None:
                     checkpoint_enabled=checkpoint_enabled,
                     label=f"{backend}-{worker_count}-warm",
                 )
+                cold["operations"]["knn_checkpoint"] = checkpoint_metrics
+                warm["operations"]["knn_checkpoint"] = checkpoint_metrics
                 if cold["contributions_fingerprint"] != warm["contributions_fingerprint"]:
                     raise AssertionError("warm-cache contribution fingerprint changed")
                 checks = correctness_cache.get(backend)

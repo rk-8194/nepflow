@@ -17,6 +17,7 @@ from .checkpointing import (
     CHECKPOINT_SCHEMA_VERSION,
     CandidateAggregationCheckpoint,
     CheckpointValidationError,
+    IncrementalCheckpointStore,
     VersionedCheckpointStore,
 )
 from .diagnostics import (
@@ -239,6 +240,7 @@ __all__ = [
     "CHECKPOINT_SCHEMA_VERSION",
     "CandidateAggregationCheckpoint",
     "CheckpointValidationError",
+    "IncrementalCheckpointStore",
     "VersionedCheckpointStore",
     "SparseAtomicKernelGraph",
     "SparseAtomicKernelRow",
