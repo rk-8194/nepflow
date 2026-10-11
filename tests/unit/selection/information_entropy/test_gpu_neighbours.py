@@ -4,11 +4,16 @@ from __future__ import annotations
 
 import sys
 import types
+from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pytest
 
-from nepflow.resources.budget import build_resource_budget
+from nepflow.resources.budget import ResourceCapacityError, build_resource_budget
+from nepflow.stages.selection.algorithms.information_entropy.checkpointing import (
+    IncrementalCheckpointStore,
+)
 from nepflow.stages.selection.algorithms.information_entropy.models import (
     EntropyBandwidthSettings,
     GPU_NEIGHBOUR_BACKEND_ID,
@@ -41,6 +46,8 @@ def _fake_cupy(*, device_count: int = 1, free_bytes: int = 64 * 1024 * 1024):
         asnumpy=np.asarray,
         zeros=np.zeros,
         sqrt=np.sqrt,
+        isfinite=np.isfinite,
+        all=np.all,
         argpartition=np.argpartition,
         take_along_axis=np.take_along_axis,
         cuda=types.SimpleNamespace(Device=Device, runtime=runtime),
@@ -157,7 +164,107 @@ def test_fake_gpu_knn_reports_bounded_transfers_and_reuses_k_prefix(
     assert metrics["gpu_h2d_bytes"] > 0
     assert metrics["gpu_d2h_bytes"] > 0
     assert metrics["gpu_target_tiles"] > 0
+    assert metrics["gpu_source_tiles"] == 4
+    assert metrics["gpu_h2d_bytes"] < descriptors.nbytes * descriptors.shape[0]
+    assert metrics["gpu_operation_seconds_inclusive"] >= metrics["gpu_kernel_seconds"]
     index.close()
+
+
+def test_fake_gpu_knn_checkpoint_resume_publishes_only_new_ranges(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setitem(sys.modules, "cupy", _fake_cupy())
+
+    class InterruptingStore(IncrementalCheckpointStore):
+        def __init__(self, root: str) -> None:
+            super().__init__(root)
+            self.interrupted = False
+
+        def write_chunk(
+            self, *args: Any, **kwargs: Any
+        ) -> dict[str, float | int]:
+            result = super().write_chunk(*args, **kwargs)
+            if not self.interrupted:
+                self.interrupted = True
+                raise RuntimeError("intentional interruption")
+            return result
+
+    descriptors = np.asarray(
+        [[float(i), float(i % 5), float((i * 11) % 7)] for i in range(13)],
+        dtype=np.float64,
+    )
+    budget = _budget()
+    store = InterruptingStore(str(tmp_path))
+    identity = {"schema": "gpu-test", "ordered": list(range(len(descriptors)))}
+    from nepflow.stages.selection.algorithms.information_entropy.gpu_neighbours import (
+        ExactTiledGPUNeighbourIndex,
+    )
+
+    interrupted = ExactTiledGPUNeighbourIndex(
+        descriptors,
+        gpu_tile_size=4,
+        max_device_bytes=4096,
+        resource_budget=budget,
+    )
+    with pytest.raises(RuntimeError, match="intentional interruption"):
+        interrupted.query_neighbours(
+            3,
+            chunk_size=4,
+            checkpoint_store=store,
+            checkpoint_identity=identity,
+            checkpoint_every_locations=1,
+        )
+    assert store.exists("knn")
+
+    resumed = ExactTiledGPUNeighbourIndex(
+        descriptors,
+        gpu_tile_size=4,
+        max_device_bytes=4096,
+        resource_budget=budget,
+    )
+    _, resumed_indices, resumed_distances = resumed.query_neighbours(
+        3,
+        chunk_size=4,
+        checkpoint_store=store,
+        checkpoint_identity=identity,
+        checkpoint_every_locations=1,
+        preserve_checkpoint=True,
+    )
+    reference = compute_exact_neighbours(
+        descriptors, 3, chunk_size=4, resource_budget=budget
+    )
+    np.testing.assert_array_equal(resumed_indices, reference.neighbour_indices)
+    np.testing.assert_array_equal(resumed_distances, reference.neighbour_distances)
+    state = store.load(
+        "knn",
+        expected_identity=identity,
+        k_max=3,
+        location_count=len(resumed.unique_locations),
+    )[1]
+    assert state["cursor"] == len(resumed.unique_locations)
+    assert state["chunk_count"] == 4
+
+
+def test_fake_gpu_knn_fails_before_unbounded_result_admission(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setitem(sys.modules, "cupy", _fake_cupy())
+    descriptors = np.asarray([[float(i), float(i % 3)] for i in range(32)])
+    with pytest.raises(ResourceCapacityError, match="memory allowance"):
+        compute_neighbours(
+            descriptors,
+            4,
+            backend=GPU_NEIGHBOUR_BACKEND_ID,
+            gpu_tile_size=4,
+            max_gpu_neighbour_bytes=4096,
+            resource_budget=build_resource_budget(
+                execution_mode="explicit",
+                memory_budget_bytes=4096,
+                scratch_budget_bytes=16 * 1024 * 1024,
+                safety_margin_fraction=0.0,
+            ),
+        )
 
 
 @pytest.mark.cuda

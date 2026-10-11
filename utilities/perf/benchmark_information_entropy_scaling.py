@@ -28,6 +28,9 @@ from nepflow.stages.selection.algorithms.information_entropy.bandwidth import (
     _pool_row_ids,
     build_entropy_pool,
 )
+from nepflow.stages.selection.algorithms.information_entropy.gpu_neighbours import (
+    ExactTiledGPUNeighbourIndex,
+)
 from nepflow.stages.selection.algorithms.information_entropy.kernels import (
     aggregate_candidate_contributions,
     build_sparse_atomic_kernel_graph,
@@ -143,7 +146,10 @@ def _exclusive_knn_phase_seconds(metrics: dict[str, Any]) -> dict[str, float]:
         "radius_preflight_count",
         "radius_retrieval",
         "canonical_distance_verification",
-        "gpu_kernel",
+        "gpu_h2d",
+        "gpu_d2h",
+        "gpu_distance_reduction",
+        "gpu_launch_allocation",
         "gpu_certification",
         "gpu_cpu_verification",
         "checkpoint_serialization",
@@ -161,6 +167,10 @@ def _exclusive_knn_phase_seconds(metrics: dict[str, Any]) -> dict[str, float]:
         )
         for phase in phase_names
     }
+    if raw_phases["gpu_distance_reduction"] == 0.0:
+        raw_phases["gpu_distance_reduction"] = float(
+            metrics.get("gpu_kernel_seconds", 0.0) or 0.0
+        )
     publication = raw_phases["checkpoint_serialization"]
     fsync = raw_phases["checkpoint_fsync"]
     digest = raw_phases["checkpoint_digest"]
@@ -250,7 +260,7 @@ def _prepare(
     materialize_frozen: bool = True,
 ) -> tuple[
     Any,
-    IndexedCPUNeighbourIndex | TiledCPUNeighbourIndex | None,
+    IndexedCPUNeighbourIndex | TiledCPUNeighbourIndex | ExactTiledGPUNeighbourIndex | None,
     Any,
     ExactNeighbourResult,
     dict[str, Any],
