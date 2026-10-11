@@ -693,6 +693,21 @@ def parse_selection(values: Mapping[str, str]) -> SelectionConfig:
         ),
         max_calibration_work_bytes=None,
         calibration_batch_size=None,
+        kernel_support_execution=value(
+            "entropy_kernel_support_execution", "cpu", "kernel_support_execution"
+        ),
+        gpu_device=_parse_int(
+            value("entropy_gpu_device", "0", "gpu_device"),
+            "selection.entropy_gpu_device",
+        ),
+        gpu_tile_size=_parse_int(
+            value("entropy_gpu_tile_size", "128", "gpu_tile_size"),
+            "selection.entropy_gpu_tile_size",
+        ),
+        max_gpu_support_bytes=_parse_optional_int(
+            value("entropy_max_gpu_support_bytes", "", "max_gpu_support_bytes"),
+            "selection.entropy_max_gpu_support_bytes",
+        ),
     )
     entropy = EntropySelectionConfig(
         beta=_parse_float(value("entropy_beta", "1.0", "beta"), "selection.entropy_beta"),

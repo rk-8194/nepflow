@@ -1339,6 +1339,27 @@ Descriptor calculation, neighbour graph construction, and bandwidth calibration 
 
 GPU acceleration is desirable for large pools but must not be required for correctness tests.
 
+The implemented optional support execution mode is configured independently of
+nearest-neighbour determination:
+
+```ini
+kernel_support_execution=exact_tiled_gpu
+gpu_device=0
+gpu_tile_size=128
+max_gpu_support_bytes=
+```
+
+`neighbour_backend` remains an exact CPU backend (`exact_indexed_cpu` or
+`exact_tiled_cpu`). The explicit GPU provider uses CuPy FP64 only for bounded
+source/target screening on the selected visible CUDA ordinal. Every retained
+support distance is recomputed by the canonical CPU float64 primitive, and
+strict-boundary decisions are therefore identical to the CPU implementation.
+Unavailable CuPy/CUDA devices and workspace exhaustion fail explicitly; the
+default `kernel_support_execution=cpu` path and CPU-only installations are
+unchanged. Execution evidence (tile counts, FP64 evaluations, H2D/D2H bytes,
+ambiguous/rescanned boundaries, and CPU certification time) is recorded in the
+streamed execution summary without changing scientific fingerprints.
+
 ---
 
 ## 25. Numerical requirements

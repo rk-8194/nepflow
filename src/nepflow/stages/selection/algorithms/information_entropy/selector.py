@@ -7,7 +7,7 @@ import logging
 import math
 import time
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 import numpy as np
@@ -849,6 +849,16 @@ class InformationEntropySelectionAlgorithm:
                     if bandwidth.calibration_batch_size is None
                     else int(bandwidth.calibration_batch_size)
                 ),
+                kernel_support_execution=str(
+                    getattr(bandwidth, "kernel_support_execution", "cpu")
+                ),
+                gpu_device=int(getattr(bandwidth, "gpu_device", 0)),
+                gpu_tile_size=int(getattr(bandwidth, "gpu_tile_size", 128)),
+                max_gpu_support_bytes=(
+                    None
+                    if getattr(bandwidth, "max_gpu_support_bytes", None) is None
+                    else int(bandwidth.max_gpu_support_bytes)
+                ),
             )
         return EntropyBandwidthSettings()
 
@@ -881,6 +891,18 @@ class InformationEntropySelectionAlgorithm:
         if tuple(pool.candidate_ids) != request.candidate_ids:
             raise ValueError("local representation candidate order does not match selection input")
         bandwidth_settings = self._bandwidth_settings(request.options)
+        support_overrides = {
+            name: request.options[name]
+            for name in (
+                "kernel_support_execution",
+                "gpu_device",
+                "gpu_tile_size",
+                "max_gpu_support_bytes",
+            )
+            if name in request.options
+        }
+        if support_overrides:
+            bandwidth_settings = replace(bandwidth_settings, **support_overrides)
         resource_budget = request.options.get("resource_budget")
         if resource_budget is not None and not isinstance(resource_budget, ResourceBudgetService):
             raise TypeError("resource_budget must be a ResourceBudgetService")
@@ -891,6 +913,10 @@ class InformationEntropySelectionAlgorithm:
             resource_budget=runtime_budget,
             checkpoint_path=request.options.get("calibration_checkpoint_path"),
             resume=bool(request.options.get("resume_checkpoints", True)),
+            kernel_support_execution=bandwidth_settings.kernel_support_execution,
+            gpu_device=bandwidth_settings.gpu_device,
+            gpu_tile_size=bandwidth_settings.gpu_tile_size,
+            max_gpu_support_bytes=bandwidth_settings.max_gpu_support_bytes,
         )
         remaining_budget = runtime_budget.remaining_managed_budget
         if remaining_budget is None:
@@ -923,6 +949,10 @@ class InformationEntropySelectionAlgorithm:
             ),
             max_radius_query_bytes=radius_query_bytes,
             resource_budget=runtime_budget,
+            kernel_support_execution=bandwidth_settings.kernel_support_execution,
+            gpu_device=bandwidth_settings.gpu_device,
+            gpu_tile_size=bandwidth_settings.gpu_tile_size,
+            max_gpu_support_bytes=bandwidth_settings.max_gpu_support_bytes,
             storage=str(self._entropy_value(request.options, "contribution_storage", "auto")),
             storage_path=self._entropy_value(request.options, "contribution_storage_path", None),
             checkpoint_path=self._entropy_value(

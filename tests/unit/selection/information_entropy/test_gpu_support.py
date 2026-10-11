@@ -1,0 +1,288 @@
+"""CPU-safe and CUDA integration evidence for exact GPU support execution."""
+
+from __future__ import annotations
+
+import builtins
+import importlib
+import sys
+import types
+
+import numpy as np
+import pytest
+
+from nepflow.resources.budget import build_resource_budget
+from nepflow.stages.selection.algorithms.information_entropy.bandwidth import (
+    build_entropy_pool,
+    calibrate_bandwidth,
+)
+from nepflow.stages.selection.algorithms.information_entropy.gpu_support import (
+    ExactTiledGPUSupport,
+    GPUCapacityError,
+    GPUDeviceValidationError,
+    GPUSupportError,
+)
+from nepflow.stages.selection.algorithms.information_entropy.kernels import (
+    build_streamed_candidate_contributions,
+    evaluate_leave_one_out_objectives,
+)
+from nepflow.stages.selection.algorithms.information_entropy.models import (
+    EntropyBandwidthSettings,
+)
+from nepflow.stages.selection.algorithms.information_entropy.selector import lazy_greedy
+
+
+def _fake_cupy(*, device_count: int = 1, free_bytes: int = 64 * 1024 * 1024):
+    class Device:
+        def __init__(self, ordinal: int):
+            self.ordinal = ordinal
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+    runtime = types.SimpleNamespace(
+        getDeviceCount=lambda: device_count,
+        memGetInfo=lambda: (free_bytes, free_bytes),
+    )
+    return types.SimpleNamespace(
+        float64=np.float64,
+        asarray=np.asarray,
+        asnumpy=np.asarray,
+        zeros=np.zeros,
+        sqrt=np.sqrt,
+        cuda=types.SimpleNamespace(Device=Device, runtime=runtime),
+    )
+
+
+def test_gpu_support_module_is_lazy_and_cpu_import_is_cuda_free(monkeypatch: pytest.MonkeyPatch):
+    module_name = "nepflow.stages.selection.algorithms.information_entropy.gpu_support"
+    module = importlib.import_module(module_name)
+    original_import = builtins.__import__
+
+    def reject_cupy(name: str, *args: object, **kwargs: object):
+        if name == "cupy":
+            raise AssertionError("CPU import attempted to load CuPy")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", reject_cupy)
+    importlib.reload(module)
+
+
+def test_explicit_gpu_settings_validate_without_cuda():
+    with pytest.raises(ValueError, match="kernel_support_execution"):
+        EntropyBandwidthSettings(kernel_support_execution="automatic_gpu")
+    with pytest.raises(ValueError, match="gpu_device"):
+        EntropyBandwidthSettings(kernel_support_execution="exact_tiled_gpu", gpu_device=-1)
+
+
+def test_missing_cupy_fails_explicitly(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setitem(sys.modules, "cupy", None)
+    with pytest.raises(GPUSupportError, match="requires optional CuPy"):
+        ExactTiledGPUSupport(
+            np.zeros((2, 2), dtype=np.float64),
+            max_host_bytes=1_000_000,
+        )
+
+
+def test_gpu_device_and_tile_capacity_are_explicit(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setitem(sys.modules, "cupy", _fake_cupy(device_count=1, free_bytes=1024))
+    with pytest.raises(GPUDeviceValidationError, match="gpu_device=1"):
+        ExactTiledGPUSupport(
+            np.zeros((2, 2), dtype=np.float64),
+            device=1,
+            max_host_bytes=1_000_000,
+        )
+    with pytest.raises(GPUCapacityError, match="at least 40 bytes"):
+        ExactTiledGPUSupport(
+            np.zeros((2, 2), dtype=np.float64),
+            max_device_bytes=39,
+            max_host_bytes=1_000_000,
+        )
+
+
+def test_fake_gpu_support_preserves_strict_ulp_duplicates_and_original_rows(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setitem(sys.modules, "cupy", _fake_cupy())
+    descriptors = np.asarray([[0.0], [1.0], [1.0], [2.0]], dtype=np.float64)
+    radii = np.asarray(
+        [np.nextafter(1.0, 0.0), 1.0, np.nextafter(1.0, 2.0), 2.0],
+        dtype=np.float64,
+    )
+    provider = ExactTiledGPUSupport(
+        descriptors,
+        tile_size=2,
+        max_device_bytes=64 * 1024,
+        max_host_bytes=1_000_000,
+    )
+    offsets, targets, distances = provider.support_many(np.arange(4), radii)
+    expected_targets: list[int] = []
+    expected_distances: list[float] = []
+    expected_offsets = [0]
+    for source, radius in enumerate(radii):
+        exact = np.sqrt(np.sum((descriptors - descriptors[source]) ** 2, axis=1))
+        keep = exact < radius
+        expected_targets.extend(np.flatnonzero(keep).tolist())
+        expected_distances.extend(exact[keep].tolist())
+        expected_offsets.append(len(expected_targets))
+    np.testing.assert_array_equal(offsets, np.asarray(expected_offsets, dtype=np.int64))
+    np.testing.assert_array_equal(targets, np.asarray(expected_targets, dtype=np.int64))
+    np.testing.assert_array_equal(distances, np.asarray(expected_distances, dtype=np.float64))
+    assert provider.operational_metrics()["gpu_cpu_rescanned_count"] >= len(expected_targets)
+
+
+def test_gpu_mode_checkpoint_resume_keeps_execution_identity(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+):
+    monkeypatch.setitem(sys.modules, "cupy", _fake_cupy())
+    descriptors = np.asarray([[float(i), float(i % 2)] for i in range(6)], dtype=np.float64)
+    probabilities = np.full(6, 1.0 / 6.0, dtype=np.float64)
+    bandwidths = np.full(6, 2.0, dtype=np.float64)
+    budget = build_resource_budget(
+        execution_mode="explicit",
+        memory_budget_bytes=64 * 1024 * 1024,
+        scratch_budget_bytes=8 * 1024 * 1024,
+        safety_margin_fraction=0.0,
+    )
+    checkpoint = tmp_path / "loo"
+
+    def interrupt(completed: int, _total: int) -> None:
+        if completed >= 3:
+            raise RuntimeError("test interruption")
+
+    with pytest.raises(RuntimeError, match="test interruption"):
+        evaluate_leave_one_out_objectives(
+            descriptors,
+            probabilities,
+            bandwidths.reshape(1, -1),
+            chunk_size=2,
+            progress_callback=interrupt,
+            max_radius_query_bytes=1_000_000,
+            max_calibration_work_bytes=4_000_000,
+            resource_budget=budget,
+            checkpoint_path=checkpoint,
+            checkpoint_every_sources=2,
+            kernel_support_execution="exact_tiled_gpu",
+            max_gpu_support_bytes=64 * 1024,
+        )
+    resumed = evaluate_leave_one_out_objectives(
+        descriptors,
+        probabilities,
+        bandwidths.reshape(1, -1),
+        chunk_size=2,
+        max_radius_query_bytes=1_000_000,
+        max_calibration_work_bytes=4_000_000,
+        resource_budget=budget,
+        checkpoint_path=checkpoint,
+        checkpoint_every_sources=2,
+        kernel_support_execution="exact_tiled_gpu",
+        max_gpu_support_bytes=64 * 1024,
+    )[0]
+    reference = evaluate_leave_one_out_objectives(
+        descriptors,
+        probabilities,
+        bandwidths.reshape(1, -1),
+        chunk_size=2,
+        max_radius_query_bytes=1_000_000,
+        max_calibration_work_bytes=4_000_000,
+        resource_budget=budget,
+        kernel_support_execution="exact_tiled_gpu",
+        max_gpu_support_bytes=64 * 1024,
+    )[0]
+    assert resumed.valid == reference.valid
+    assert resumed.objective == reference.objective
+    np.testing.assert_array_equal(resumed.probabilities, reference.probabilities)
+
+
+@pytest.mark.cuda
+def test_cuda_support_and_complete_calibration_match_cpu():
+    cp = pytest.importorskip("cupy")
+    if int(cp.cuda.runtime.getDeviceCount()) < 1:
+        pytest.skip("no visible CUDA device")
+    descriptors = np.asarray(
+        [[float(i), float(i % 3), float((i * 7) % 5)] for i in range(20)],
+        dtype=np.float64,
+    )
+    pool = build_entropy_pool(
+        descriptors,
+        candidate_ids=tuple(f"c{i}" for i in range(5)),
+        row_candidate_ids=tuple(f"c{i // 4}" for i in range(20)),
+    )
+    budget = build_resource_budget(
+        execution_mode="explicit",
+        memory_budget_bytes=256 * 1024 * 1024,
+        scratch_budget_bytes=64 * 1024 * 1024,
+        safety_margin_fraction=0.0,
+    )
+    cpu_settings = EntropyBandwidthSettings(
+        backend="exact_indexed_cpu",
+        kernel_support_execution="cpu",
+        chunk_size=4,
+    )
+    gpu_settings = EntropyBandwidthSettings(
+        backend="exact_indexed_cpu",
+        kernel_support_execution="exact_tiled_gpu",
+        gpu_device=0,
+        gpu_tile_size=4,
+        max_gpu_support_bytes=32 * 1024 * 1024,
+        chunk_size=4,
+    )
+    cpu = calibrate_bandwidth(
+        pool,
+        cpu_settings,
+        resource_budget=budget,
+        max_radius_query_bytes=4 * 1024 * 1024,
+    )
+    gpu = calibrate_bandwidth(
+        pool,
+        gpu_settings,
+        resource_budget=budget,
+        max_radius_query_bytes=4 * 1024 * 1024,
+    )
+    np.testing.assert_array_equal(cpu.selected.bandwidths, gpu.selected.bandwidths)
+    assert cpu.selected.k == gpu.selected.k
+    assert cpu.selected.c == gpu.selected.c
+    assert cpu.calibration_fingerprint == gpu.calibration_fingerprint
+    assert cpu.evaluation_count == gpu.evaluation_count == 16
+    for cpu_attempt, gpu_attempt in zip(cpu.attempts, gpu.attempts, strict=True):
+        assert cpu_attempt.k == gpu_attempt.k
+        assert cpu_attempt.c == gpu_attempt.c
+        assert cpu_attempt.status == gpu_attempt.status
+        assert cpu_attempt.reason == gpu_attempt.reason
+        if cpu_attempt.objective is None or gpu_attempt.objective is None:
+            assert cpu_attempt.objective == gpu_attempt.objective
+        else:
+            assert cpu_attempt.objective == gpu_attempt.objective
+    cpu_contributions, _ = build_streamed_candidate_contributions(
+        pool,
+        cpu.selected,
+        chunk_size=4,
+        max_radius_query_bytes=4 * 1024 * 1024,
+        resource_budget=budget,
+    )
+    gpu_contributions, gpu_summary = build_streamed_candidate_contributions(
+        pool,
+        gpu.selected,
+        chunk_size=4,
+        max_radius_query_bytes=4 * 1024 * 1024,
+        max_gpu_support_bytes=32 * 1024 * 1024,
+        resource_budget=budget,
+        kernel_support_execution="exact_tiled_gpu",
+    )
+    np.testing.assert_array_equal(
+        cpu_contributions.candidate_indptr, gpu_contributions.candidate_indptr
+    )
+    np.testing.assert_array_equal(
+        cpu_contributions.target_indices, gpu_contributions.target_indices
+    )
+    np.testing.assert_array_equal(cpu_contributions.values, gpu_contributions.values)
+    assert cpu_contributions.fingerprint == gpu_contributions.fingerprint
+    cpu_selection = lazy_greedy(pool, cpu_contributions, beta=1.0, budget=3)
+    gpu_selection = lazy_greedy(pool, gpu_contributions, beta=1.0, budget=3)
+    assert cpu_selection.selected_candidate_ids == gpu_selection.selected_candidate_ids
+    assert cpu_selection.objective_history == gpu_selection.objective_history
+    assert cpu_selection.marginal_gains == gpu_selection.marginal_gains
+    assert gpu_summary.support_execution == "exact_tiled_gpu"
+    assert gpu_summary.operational_metrics["gpu_fp64_evaluations"] > 0

@@ -291,6 +291,22 @@ def test_loader_rejects_unsupported_atomic_descriptor_mode(tmp_path: Path) -> No
         load_config(write_config(tmp_path, text))
 
 
+def test_loader_accepts_explicit_gpu_support_execution_controls(tmp_path: Path) -> None:
+    text = BASE_CONFIG + """
+[selection]
+kernel_support_execution = exact_tiled_gpu
+gpu_device = 2
+gpu_tile_size = 32
+max_gpu_support_bytes = 1048576
+"""
+    config = load_config(write_config(tmp_path, text))
+    bandwidth = config.selection.entropy.bandwidth
+    assert bandwidth.kernel_support_execution == "exact_tiled_gpu"
+    assert bandwidth.gpu_device == 2
+    assert bandwidth.gpu_tile_size == 32
+    assert bandwidth.max_gpu_support_bytes == 1048576
+
+
 @pytest.mark.parametrize(
     "text, message",
     [

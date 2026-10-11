@@ -304,6 +304,29 @@ def validate_config(
         )
     if bandwidth.metric != "euclidean":
         raise ConfigurationError("selection.entropy.bandwidth.metric only supports euclidean")
+    if bandwidth.kernel_support_execution not in {"cpu", "exact_cpu", "exact_tiled_gpu"}:
+        raise ConfigurationError(
+            "selection.entropy.bandwidth.kernel_support_execution must be cpu, exact_cpu, "
+            "or exact_tiled_gpu"
+        )
+    if isinstance(bandwidth.gpu_device, bool) or not isinstance(bandwidth.gpu_device, int):
+        raise ConfigurationError("selection.entropy.bandwidth.gpu_device must be an integer")
+    if bandwidth.gpu_device < 0:
+        raise ConfigurationError("selection.entropy.bandwidth.gpu_device must be non-negative")
+    if isinstance(bandwidth.gpu_tile_size, bool) or not isinstance(
+        bandwidth.gpu_tile_size, int
+    ) or bandwidth.gpu_tile_size < 1:
+        raise ConfigurationError(
+            "selection.entropy.bandwidth.gpu_tile_size must be positive"
+        )
+    if bandwidth.max_gpu_support_bytes is not None and (
+        isinstance(bandwidth.max_gpu_support_bytes, bool)
+        or not isinstance(bandwidth.max_gpu_support_bytes, int)
+        or bandwidth.max_gpu_support_bytes < 1
+    ):
+        raise ConfigurationError(
+            "selection.entropy.bandwidth.max_gpu_support_bytes must be positive when provided"
+        )
     if not isinstance(bandwidth.chunk_size, int) or bandwidth.chunk_size < 1:
         raise ConfigurationError("selection.entropy.bandwidth.chunk_size must be positive")
     if bandwidth.max_index_bytes is not None and (

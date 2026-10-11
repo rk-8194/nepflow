@@ -19,6 +19,12 @@ TILED_NEIGHBOUR_BACKEND_ID = "exact_tiled_cpu"
 TILED_NEIGHBOUR_BACKEND_VERSION = "exact-tiled-cpu-v1"
 DEFAULT_NEIGHBOUR_BACKEND_ID = INDEXED_NEIGHBOUR_BACKEND_ID
 NEIGHBOUR_METRIC = "euclidean"
+KERNEL_SUPPORT_EXECUTION_CPU = "cpu"
+KERNEL_SUPPORT_EXECUTION_GPU = "exact_tiled_gpu"
+KERNEL_SUPPORT_EXECUTION_GPU_VERSION = "exact-tiled-gpu-v1"
+KERNEL_SUPPORT_EXECUTIONS = frozenset(
+    {KERNEL_SUPPORT_EXECUTION_CPU, KERNEL_SUPPORT_EXECUTION_GPU}
+)
 NEIGHBOUR_DISTINCT_POLICY = "exact-coordinate-location-v1"
 BANDWIDTH_SCHEMA_VERSION = "entropy-bandwidth-v1"
 CALIBRATION_OPTIMIZER_ID = "bounded-grid"
@@ -91,6 +97,10 @@ class EntropyBandwidthSettings:
     max_neighbour_cache_bytes: int | None = None
     max_calibration_work_bytes: int | None = None
     calibration_batch_size: int | None = None
+    kernel_support_execution: str = KERNEL_SUPPORT_EXECUTION_CPU
+    gpu_device: int = 0
+    gpu_tile_size: int = 128
+    max_gpu_support_bytes: int | None = None
 
     def __post_init__(self) -> None:
         mode = str(self.mode).strip().lower()
@@ -104,6 +114,27 @@ class EntropyBandwidthSettings:
             raise ValueError(f"unsupported neighbour backend: {self.backend!r}")
         if self.metric != NEIGHBOUR_METRIC:
             raise ValueError(f"unsupported neighbour metric: {self.metric!r}")
+        support_execution = str(self.kernel_support_execution).strip().lower()
+        if support_execution == "exact_cpu":
+            support_execution = KERNEL_SUPPORT_EXECUTION_CPU
+        if support_execution not in KERNEL_SUPPORT_EXECUTIONS:
+            raise ValueError(
+                "kernel_support_execution must be 'cpu' or 'exact_tiled_gpu'"
+            )
+        if isinstance(self.gpu_device, bool) or not isinstance(
+            self.gpu_device, (int, np.integer)
+        ) or int(self.gpu_device) < 0:
+            raise ValueError("gpu_device must be a non-negative integer")
+        if isinstance(self.gpu_tile_size, bool) or not isinstance(
+            self.gpu_tile_size, (int, np.integer)
+        ) or int(self.gpu_tile_size) < 1:
+            raise ValueError("gpu_tile_size must be a positive integer")
+        if self.max_gpu_support_bytes is not None and (
+            isinstance(self.max_gpu_support_bytes, bool)
+            or not isinstance(self.max_gpu_support_bytes, (int, np.integer))
+            or int(self.max_gpu_support_bytes) < 1
+        ):
+            raise ValueError("max_gpu_support_bytes must be positive when provided")
         if isinstance(self.chunk_size, bool) or not isinstance(self.chunk_size, (int, np.integer)):
             raise ValueError("chunk_size must be a positive integer")
         if self.chunk_size < 1:
@@ -148,6 +179,9 @@ class EntropyBandwidthSettings:
         elif self.k is not None or self.c is not None:
             raise ValueError("automatic bandwidth mode does not accept manual k or c")
         object.__setattr__(self, "mode", mode)
+        object.__setattr__(self, "kernel_support_execution", support_execution)
+        object.__setattr__(self, "gpu_device", int(self.gpu_device))
+        object.__setattr__(self, "gpu_tile_size", int(self.gpu_tile_size))
         object.__setattr__(self, "k_candidates", k_candidates)
         object.__setattr__(self, "c_candidates", c_candidates)
         object.__setattr__(self, "chunk_size", int(self.chunk_size))
@@ -167,6 +201,10 @@ class EntropyBandwidthSettings:
             )
         if self.calibration_batch_size is not None:
             object.__setattr__(self, "calibration_batch_size", int(self.calibration_batch_size))
+        if self.max_gpu_support_bytes is not None:
+            object.__setattr__(
+                self, "max_gpu_support_bytes", int(self.max_gpu_support_bytes)
+            )
 
     @property
     def operational_work_bytes(self) -> int:
@@ -722,6 +760,9 @@ class StreamedKernelExecutionSummary:
     # Timings/counters are diagnostic evidence only; they are not part of the
     # kernel operator or pool fingerprints.
     operational_metrics: dict[str, Any] = field(default_factory=dict, compare=False, repr=False)
+    support_execution: str = KERNEL_SUPPORT_EXECUTION_CPU
+    support_execution_version: str = "cpu-canonical-v1"
+    gpu_device: int | None = None
 
     def __post_init__(self) -> None:
         for name in (
@@ -778,6 +819,14 @@ class StreamedKernelExecutionSummary:
             self.candidate_storage_path, str
         ):
             raise ValueError("candidate_storage_path must be a string when supplied")
+        if self.support_execution not in KERNEL_SUPPORT_EXECUTIONS:
+            raise ValueError("unsupported support execution in streamed summary")
+        if self.gpu_device is not None and (
+            isinstance(self.gpu_device, bool)
+            or not isinstance(self.gpu_device, int)
+            or self.gpu_device < 0
+        ):
+            raise ValueError("gpu_device must be non-negative when supplied")
         for name, value in (
             ("backend", self.backend),
             ("metric", self.metric),
@@ -878,6 +927,9 @@ class StreamedKernelExecutionSummary:
             "bandwidth_fingerprint": self.bandwidth_fingerprint,
             "transform_fingerprint": self.transform_fingerprint,
             "kernel_operator_fingerprint": self.kernel_operator_fingerprint,
+            "support_execution": self.support_execution,
+            "support_execution_version": self.support_execution_version,
+            "gpu_device": self.gpu_device,
             "source_query_count": self.source_query_count,
             "numerical_tolerance": self.numerical_tolerance,
             "operations": dict(self.operational_metrics),
@@ -1921,6 +1973,10 @@ __all__ = [
     "TILED_NEIGHBOUR_BACKEND_VERSION",
     "DEFAULT_NEIGHBOUR_BACKEND_ID",
     "DEFAULT_RADIUS_QUERY_BYTES",
+    "KERNEL_SUPPORT_EXECUTION_CPU",
+    "KERNEL_SUPPORT_EXECUTION_GPU",
+    "KERNEL_SUPPORT_EXECUTION_GPU_VERSION",
+    "KERNEL_SUPPORT_EXECUTIONS",
     "NEIGHBOUR_DISTINCT_POLICY",
     "NEIGHBOUR_METRIC",
     "SPARSE_CANDIDATE_CONTRIBUTION_SCHEMA_VERSION",

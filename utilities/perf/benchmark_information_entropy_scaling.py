@@ -422,6 +422,10 @@ def _run_stream(
     max_radius_query_bytes: int | None,
     checkpoint_enabled: bool,
     label: str,
+    kernel_support_execution: str,
+    gpu_device: int,
+    gpu_tile_size: int,
+    max_gpu_support_bytes: int | None,
 ) -> dict[str, Any]:
     index_before = _snapshot_metrics(index)
     with tempfile.TemporaryDirectory(prefix="nepflow-entropy-bench-") as temporary:
@@ -439,6 +443,10 @@ def _run_stream(
             checkpoint_path=checkpoint_path,
             checkpoint_name=f"{label}-candidate-aggregation",
             resume=False,
+            kernel_support_execution=kernel_support_execution,
+            gpu_device=gpu_device,
+            gpu_tile_size=gpu_tile_size,
+            max_gpu_support_bytes=max_gpu_support_bytes,
         )
         elapsed = max(0.0, time.perf_counter() - started)
     operations = dict(summary.operational_metrics)
@@ -479,6 +487,10 @@ def _correctness_checks(
     backend: str,
     index: IndexedCPUNeighbourIndex | TiledCPUNeighbourIndex | None,
     resource_budget: Any,
+    kernel_support_execution: str,
+    gpu_device: int,
+    gpu_tile_size: int,
+    max_gpu_support_bytes: int | None,
 ) -> dict[str, Any]:
     """Run independent bounded checks for the complete production calibration grid."""
 
@@ -567,6 +579,10 @@ def _correctness_checks(
                 index=index,
                 max_radius_query_bytes=max_radius_query_bytes,
                 resource_budget=resource_budget,
+                kernel_support_execution=kernel_support_execution,
+                gpu_device=gpu_device,
+                gpu_tile_size=gpu_tile_size,
+                max_gpu_support_bytes=max_gpu_support_bytes,
             )[0]
             reference_independent_batch = evaluate_leave_one_out_objectives(
                 pool.descriptors,
@@ -585,6 +601,10 @@ def _correctness_checks(
                 index=index,
                 max_radius_query_bytes=max_radius_query_bytes,
                 resource_budget=resource_budget,
+                kernel_support_execution=kernel_support_execution,
+                gpu_device=gpu_device,
+                gpu_tile_size=gpu_tile_size,
+                max_gpu_support_bytes=max_gpu_support_bytes,
             )
             reference_scalar = evaluate_leave_one_out_objective(
                 pool.descriptors,
@@ -1076,6 +1096,14 @@ def main() -> None:
     parser.add_argument("--max-radius-query-bytes", type=int, default=None)
     parser.add_argument("--max-index-bytes", type=int, default=None)
     parser.add_argument("--max-neighbour-cache-bytes", type=int, default=None)
+    parser.add_argument(
+        "--kernel-support-execution",
+        choices=("cpu", "exact_tiled_gpu"),
+        default="cpu",
+    )
+    parser.add_argument("--gpu-device", type=int, default=0)
+    parser.add_argument("--gpu-tile-size", type=int, default=128)
+    parser.add_argument("--max-gpu-support-bytes", type=int, default=None)
     parser.add_argument("--memory-budget-bytes", type=int, default=None)
     parser.add_argument("--scratch-budget-bytes", type=int, default=None)
     parser.add_argument("--oracle-limit", type=int, default=1024)
@@ -1126,6 +1154,10 @@ def main() -> None:
                     max_radius_query_bytes=args.max_radius_query_bytes,
                     checkpoint_enabled=checkpoint_enabled,
                     label=f"{backend}-{worker_count}-cold",
+                    kernel_support_execution=args.kernel_support_execution,
+                    gpu_device=args.gpu_device,
+                    gpu_tile_size=args.gpu_tile_size,
+                    max_gpu_support_bytes=args.max_gpu_support_bytes,
                 )
                 warm = _run_stream(
                     pool,
@@ -1137,6 +1169,10 @@ def main() -> None:
                     max_radius_query_bytes=args.max_radius_query_bytes,
                     checkpoint_enabled=checkpoint_enabled,
                     label=f"{backend}-{worker_count}-warm",
+                    kernel_support_execution=args.kernel_support_execution,
+                    gpu_device=args.gpu_device,
+                    gpu_tile_size=args.gpu_tile_size,
+                    max_gpu_support_bytes=args.max_gpu_support_bytes,
                 )
                 for run in (cold, warm):
                     run["operations"]["contribution_checkpoint"] = {
@@ -1152,13 +1188,6 @@ def main() -> None:
                         "entries": int(run["operations"].get("support_entries", 0) or 0),
                     }
                     run["preparation"] = preparation
-                    run["full_selection_wall_seconds"] = float(
-                        preparation["wall_seconds"] + run["streamed_contribution_wall_seconds"]
-                    )
-                    run["full_selection_elapsed_semantics"] = (
-                        "preparation plus streamed candidate contributions; "
-                        "contribution checkpoint I/O remains nested in the stream stage"
-                    )
                 if cold["contributions_fingerprint"] != warm["contributions_fingerprint"]:
                     raise AssertionError("warm-cache contribution fingerprint changed")
                 checks = correctness_cache.get(backend)
@@ -1174,8 +1203,25 @@ def main() -> None:
                         backend=backend,
                         index=index,
                         resource_budget=service,
+                        kernel_support_execution=args.kernel_support_execution,
+                        gpu_device=args.gpu_device,
+                        gpu_tile_size=args.gpu_tile_size,
+                        max_gpu_support_bytes=args.max_gpu_support_bytes,
                     )
                     correctness_cache[backend] = checks
+                calibration_seconds = float(checks.get("calibration_wall_seconds", 0.0) or 0.0)
+                for run in (cold, warm):
+                    run["loo_calibration_wall_seconds"] = calibration_seconds
+                    run["full_selection_wall_seconds"] = float(
+                        preparation["wall_seconds"]
+                        + run["streamed_contribution_wall_seconds"]
+                        + calibration_seconds
+                    )
+                    run["full_selection_elapsed_semantics"] = (
+                        "preparation plus the measured independent 16-pair LOO calibration "
+                        "when oracle checks ran, plus streamed candidate contributions; "
+                        "contribution checkpoint I/O remains nested in the stream stage"
+                    )
                 workload = {
                     "N": int(pool.descriptors.shape[0]),
                     "M": len(pool.candidate_ids),
@@ -1192,6 +1238,10 @@ def main() -> None:
                     "max_neighbour_cache_bytes": args.max_neighbour_cache_bytes,
                     "memory_budget_bytes": args.memory_budget_bytes,
                     "scratch_budget_bytes": args.scratch_budget_bytes,
+                    "kernel_support_execution": args.kernel_support_execution,
+                    "gpu_device": args.gpu_device,
+                    "gpu_tile_size": args.gpu_tile_size,
+                    "max_gpu_support_bytes": args.max_gpu_support_bytes,
                 }
                 common = {
                     "backend": backend,
@@ -1222,7 +1272,7 @@ def main() -> None:
                     index.close()
 
     output = {
-        "schema": "nepflow-information-entropy-scaling-benchmark-v3",
+        "schema": "nepflow-information-entropy-scaling-benchmark-v4",
         "fixture": {
             "case": args.case,
             "seed": 20261011,
@@ -1234,6 +1284,10 @@ def main() -> None:
             "backend_set": list(backends),
             "worker_counts": list(args.workers),
             "pool_fingerprint": pool.fingerprint,
+            "kernel_support_execution": args.kernel_support_execution,
+            "gpu_device": args.gpu_device,
+            "gpu_tile_size": args.gpu_tile_size,
+            "max_gpu_support_bytes": args.max_gpu_support_bytes,
         },
         "results": results,
         "profiling_summary": _profiling_summary(results),

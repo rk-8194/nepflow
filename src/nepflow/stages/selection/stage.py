@@ -399,6 +399,10 @@ class SelectionStage:
                 max_neighbour_cache_bytes=entropy.bandwidth.max_neighbour_cache_bytes,
                 max_calibration_work_bytes=entropy.bandwidth.max_calibration_work_bytes,
                 calibration_batch_size=entropy.bandwidth.calibration_batch_size,
+                kernel_support_execution=entropy.bandwidth.kernel_support_execution,
+                gpu_device=entropy.bandwidth.gpu_device,
+                gpu_tile_size=entropy.bandwidth.gpu_tile_size,
+                max_gpu_support_bytes=entropy.bandwidth.max_gpu_support_bytes,
             )
             local_representation = load_or_calculate_local_representations(
                 project_dir,

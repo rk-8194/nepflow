@@ -465,6 +465,10 @@ def _settings_from_arguments(
     max_neighbour_cache_bytes: int | None,
     max_calibration_work_bytes: int | None,
     calibration_batch_size: int | None,
+    kernel_support_execution: str,
+    gpu_device: int,
+    gpu_tile_size: int,
+    max_gpu_support_bytes: int | None,
 ) -> EntropyBandwidthSettings:
     if settings is not None:
         if any(value is not None for value in (mode, k, c, k_candidates, c_candidates)):
@@ -487,6 +491,10 @@ def _settings_from_arguments(
             max_neighbour_cache_bytes=max_neighbour_cache_bytes,
             max_calibration_work_bytes=max_calibration_work_bytes,
             calibration_batch_size=calibration_batch_size,
+            kernel_support_execution=kernel_support_execution,
+            gpu_device=gpu_device,
+            gpu_tile_size=gpu_tile_size,
+            max_gpu_support_bytes=max_gpu_support_bytes,
         )
     return EntropyBandwidthSettings(
         mode=selected_mode,
@@ -501,6 +509,10 @@ def _settings_from_arguments(
         max_neighbour_cache_bytes=max_neighbour_cache_bytes,
         max_calibration_work_bytes=max_calibration_work_bytes,
         calibration_batch_size=calibration_batch_size,
+        kernel_support_execution=kernel_support_execution,
+        gpu_device=gpu_device,
+        gpu_tile_size=gpu_tile_size,
+        max_gpu_support_bytes=max_gpu_support_bytes,
     )
 
 
@@ -606,6 +618,10 @@ def calibrate_bandwidth(
     max_neighbour_cache_bytes: int | None = None,
     max_calibration_work_bytes: int | None = None,
     calibration_batch_size: int | None = None,
+    kernel_support_execution: str = "cpu",
+    gpu_device: int = 0,
+    gpu_tile_size: int = 128,
+    max_gpu_support_bytes: int | None = None,
     resource_budget: ResourceBudgetService | None = None,
     checkpoint_path: str | Path | None = None,
     resume: bool = True,
@@ -640,6 +656,10 @@ def calibrate_bandwidth(
         max_neighbour_cache_bytes=max_neighbour_cache_bytes,
         max_calibration_work_bytes=max_calibration_work_bytes,
         calibration_batch_size=calibration_batch_size,
+        kernel_support_execution=kernel_support_execution,
+        gpu_device=gpu_device,
+        gpu_tile_size=gpu_tile_size,
+        max_gpu_support_bytes=max_gpu_support_bytes,
     )
     selected_settings, runtime_budget = _resolve_runtime_limits(
         selected_settings,
@@ -1110,6 +1130,10 @@ def calibrate_bandwidth(
                             checkpoint_name=f"loo-k{candidate_k}",
                             resume=resume,
                             diagnostics=operational_metrics,
+                            kernel_support_execution=selected_settings.kernel_support_execution,
+                            gpu_device=selected_settings.gpu_device,
+                            gpu_tile_size=selected_settings.gpu_tile_size,
+                            max_gpu_support_bytes=selected_settings.max_gpu_support_bytes,
                         ),
                     )
                 else:
@@ -1133,6 +1157,10 @@ def calibrate_bandwidth(
                         + "-".join(f"{value:g}" for value in c_batch),
                         resume=resume,
                         diagnostics=operational_metrics,
+                        kernel_support_execution=selected_settings.kernel_support_execution,
+                        gpu_device=selected_settings.gpu_device,
+                        gpu_tile_size=selected_settings.gpu_tile_size,
+                        max_gpu_support_bytes=selected_settings.max_gpu_support_bytes,
                     )
                 operational_metrics["loo_seconds"] += max(
                     0.0, time.perf_counter() - loo_started

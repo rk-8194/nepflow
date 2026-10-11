@@ -331,6 +331,12 @@ entropy_bandwidth_backend=exact_indexed_cpu
 entropy_bandwidth_metric=euclidean
 entropy_bandwidth_chunk_size=1024
 entropy_bandwidth_max_neighbour_cache_bytes=
+# Support execution is independent of neighbour determination.  The GPU mode
+# is explicit and requires optional CuPy plus the selected visible CUDA device.
+entropy_kernel_support_execution=cpu
+entropy_gpu_device=0
+entropy_gpu_tile_size=128
+entropy_max_gpu_support_bytes=
 # Atomic graph limits apply only to the bounded reference/debug graph API;
 # production information_entropy streams exact candidate contributions.
 

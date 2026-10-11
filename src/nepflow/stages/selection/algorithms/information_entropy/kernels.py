@@ -36,6 +36,10 @@ from .models import (
     INDEXED_NEIGHBOUR_BACKEND_VERSION,
     KERNEL_FAMILY,
     KERNEL_OPERATOR_SCHEMA_VERSION,
+    KERNEL_SUPPORT_EXECUTION_CPU,
+    KERNEL_SUPPORT_EXECUTION_GPU,
+    KERNEL_SUPPORT_EXECUTION_GPU_VERSION,
+    KERNEL_SUPPORT_EXECUTIONS,
     KERNEL_VERSION,
     NEIGHBOUR_BACKEND_ID,
     NEIGHBOUR_BACKEND_VERSION,
@@ -213,6 +217,10 @@ class _KernelSupportProvider:
         max_radius_query_bytes: int | None = None,
         resource_budget: ResourceBudgetService | None = None,
         capacity_context: str | None = None,
+        kernel_support_execution: str = KERNEL_SUPPORT_EXECUTION_CPU,
+        gpu_device: int = 0,
+        gpu_tile_size: int = 128,
+        max_gpu_support_bytes: int | None = None,
     ) -> None:
         self.descriptors = _validate_descriptors(descriptors)
         self.backend = backend
@@ -249,6 +257,19 @@ class _KernelSupportProvider:
                 if self.max_radius_query_bytes < 1:
                     raise ValueError("max_radius_query_bytes must be a positive integer")
         self.capacity_context = capacity_context
+        self.support_execution = str(kernel_support_execution).strip().lower()
+        if self.support_execution == "exact_cpu":
+            self.support_execution = KERNEL_SUPPORT_EXECUTION_CPU
+        if self.support_execution not in KERNEL_SUPPORT_EXECUTIONS:
+            raise ValueError(
+                "kernel_support_execution must be 'cpu' or 'exact_tiled_gpu'"
+            )
+        self.support_execution_version = (
+            KERNEL_SUPPORT_EXECUTION_GPU_VERSION
+            if self.support_execution == KERNEL_SUPPORT_EXECUTION_GPU
+            else "cpu-canonical-v1"
+        )
+        self.gpu_support: Any = None
         if backend in {INDEXED_NEIGHBOUR_BACKEND_ID, TILED_NEIGHBOUR_BACKEND_ID}:
             self.index = (
                 index
@@ -276,6 +297,21 @@ class _KernelSupportProvider:
             self.index = None
         else:
             raise ValueError(f"configured neighbour backend is unavailable: {backend!r}")
+        if self.support_execution == KERNEL_SUPPORT_EXECUTION_GPU:
+            from .gpu_support import ExactTiledGPUSupport
+
+            self.gpu_support = ExactTiledGPUSupport(
+                self.descriptors,
+                device=gpu_device,
+                tile_size=gpu_tile_size,
+                max_device_bytes=max_gpu_support_bytes,
+                max_host_bytes=self.max_radius_query_bytes,
+                resource_budget=self.resource_budget,
+                capacity_context=capacity_context,
+            )
+            self.support_batch_size = self.gpu_support.source_tile_size
+        else:
+            self.support_batch_size = self.chunk_size
         self.distance_evaluations = 0
         self.index_queries = 0
         self.radius_queries = 0
@@ -294,6 +330,25 @@ class _KernelSupportProvider:
     def support(self, source_index: int, radius: float) -> tuple[np.ndarray, np.ndarray]:
         scale = float(radius)
         started = time.perf_counter()
+        if self.gpu_support is not None:
+            offsets, targets, distances = self.gpu_support.support_many(
+                np.asarray([source_index], dtype=np.int64),
+                np.asarray([scale], dtype=np.float64),
+            )
+            result_targets = targets[: int(offsets[1])]
+            result_distances = distances[: int(offsets[1])]
+            self.support_entries += int(result_targets.size)
+            self.current_support_count = int(result_targets.size)
+            if self.min_support_count is None:
+                self.min_support_count = self.current_support_count
+            else:
+                self.min_support_count = min(self.min_support_count, self.current_support_count)
+            self.support_count_total += self.current_support_count
+            self.support_count_samples += 1
+            self.max_support_count = max(self.max_support_count, self.current_support_count)
+            self.support_query_count += 1
+            self.support_query_seconds += max(0.0, time.perf_counter() - started)
+            return result_targets, result_distances
         if self.index is not None:
             self.index_queries += 1
             target_indices, distances = self.index.radius_support(
@@ -360,6 +415,23 @@ class _KernelSupportProvider:
         if sources.size == 0:
             raise ValueError("support_many requires at least one source")
         started = time.perf_counter()
+        if self.gpu_support is not None:
+            offsets, targets, distances = self.gpu_support.support_many(sources, scales)
+            counts = np.diff(offsets)
+            for count in counts:
+                support_count = int(count)
+                self.current_support_count = support_count
+                if self.min_support_count is None:
+                    self.min_support_count = support_count
+                else:
+                    self.min_support_count = min(self.min_support_count, support_count)
+                self.support_count_total += support_count
+                self.support_count_samples += 1
+                self.max_support_count = max(self.max_support_count, support_count)
+            self.support_entries += int(targets.size)
+            self.support_query_count += int(sources.size)
+            self.support_query_seconds += max(0.0, time.perf_counter() - started)
+            return offsets, targets, distances
         indexed_batch = isinstance(self.index, IndexedCPUNeighbourIndex)
         if indexed_batch:
             offsets, targets, distances = self.index.radius_support_many(
@@ -442,7 +514,11 @@ class _KernelSupportProvider:
             "cgroup_memory_current_bytes": _process_memory_metrics().get(
                 "cgroup_memory_current_bytes"
             ),
+            "support_execution": self.support_execution,
+            "support_execution_version": self.support_execution_version,
         }
+        if self.gpu_support is not None:
+            metrics.update(self.gpu_support.operational_metrics())
         for key, value in index_metrics.items():
             metrics.setdefault(key, value)
         return metrics
@@ -480,6 +556,10 @@ def source_normalisers(
     max_radius_query_bytes: int | None = None,
     resource_budget: ResourceBudgetService | None = None,
     capacity_context: str | None = None,
+    kernel_support_execution: str = KERNEL_SUPPORT_EXECUTION_CPU,
+    gpu_device: int = 0,
+    gpu_tile_size: int = 128,
+    max_gpu_support_bytes: int | None = None,
 ) -> np.ndarray:
     """Return ``Z_b`` over the complete exact compact-kernel support."""
 
@@ -494,10 +574,15 @@ def source_normalisers(
         max_radius_query_bytes=max_radius_query_bytes,
         resource_budget=resource_budget,
         capacity_context=capacity_context,
+        kernel_support_execution=kernel_support_execution,
+        gpu_device=gpu_device,
+        gpu_tile_size=gpu_tile_size,
+        max_gpu_support_bytes=max_gpu_support_bytes,
     )
     normalisers = np.empty(values.shape[0], dtype=np.float64)
-    for start in range(0, values.shape[0], block):
-        stop = min(start + block, values.shape[0])
+    query_block = min(block, provider.support_batch_size)
+    for start in range(0, values.shape[0], query_block):
+        stop = min(start + query_block, values.shape[0])
         offsets, targets, distances = provider.support_many(
             np.arange(start, stop, dtype=np.int64),
             scales[start:stop],
@@ -528,6 +613,10 @@ def iter_normalized_kernel_columns(
     resource_budget: ResourceBudgetService | None = None,
     capacity_context: str | None = None,
     source_indices: Sequence[int] | np.ndarray | None = None,
+    kernel_support_execution: str = KERNEL_SUPPORT_EXECUTION_CPU,
+    gpu_device: int = 0,
+    gpu_tile_size: int = 128,
+    max_gpu_support_bytes: int | None = None,
 ) -> Iterator[NormalizedKernelColumn]:
     """Yield positive normalized source columns using bounded workspaces.
 
@@ -548,6 +637,10 @@ def iter_normalized_kernel_columns(
         max_radius_query_bytes=max_radius_query_bytes,
         resource_budget=resource_budget,
         capacity_context=capacity_context,
+        kernel_support_execution=kernel_support_execution,
+        gpu_device=gpu_device,
+        gpu_tile_size=gpu_tile_size,
+        max_gpu_support_bytes=max_gpu_support_bytes,
     )
     if source_indices is None:
         ordered_sources = range(values.shape[0])
@@ -557,8 +650,9 @@ def iter_normalized_kernel_columns(
             source_index < 0 or source_index >= values.shape[0] for source_index in ordered_sources
         ):
             raise ValueError("source_indices contains an out-of-range source row")
-    for start in range(0, len(ordered_sources), block):
-        source_batch = ordered_sources[start : start + block]
+    query_block = min(block, provider.support_batch_size)
+    for start in range(0, len(ordered_sources), query_block):
+        source_batch = ordered_sources[start : start + query_block]
         source_array = np.asarray(source_batch, dtype=np.int64)
         offsets, targets, distances = provider.support_many(
             source_array,
@@ -645,6 +739,10 @@ def evaluate_leave_one_out_objective(
     checkpoint_every_sources: int = 1,
     resume: bool = True,
     diagnostics: dict[str, Any] | None = None,
+    kernel_support_execution: str = KERNEL_SUPPORT_EXECUTION_CPU,
+    gpu_device: int = 0,
+    gpu_tile_size: int = 128,
+    max_gpu_support_bytes: int | None = None,
 ) -> LeaveOneOutObjective:
     """Evaluate the exact source-normalized finite-pool LOO objective."""
 
@@ -665,6 +763,10 @@ def evaluate_leave_one_out_objective(
             checkpoint_every_sources=checkpoint_every_sources,
             resume=resume,
             diagnostics=diagnostics,
+            kernel_support_execution=kernel_support_execution,
+            gpu_device=gpu_device,
+            gpu_tile_size=gpu_tile_size,
+            max_gpu_support_bytes=max_gpu_support_bytes,
         )
         return batched[0]
 
@@ -695,6 +797,10 @@ def evaluate_leave_one_out_objective(
         max_radius_query_bytes=max_radius_query_bytes,
         resource_budget=resource_budget,
         capacity_context=capacity_context,
+        kernel_support_execution=kernel_support_execution,
+        gpu_device=gpu_device,
+        gpu_tile_size=gpu_tile_size,
+        max_gpu_support_bytes=max_gpu_support_bytes,
     ):
         non_source = column.target_indices != column.source_index
         if np.any(non_source):
@@ -745,6 +851,10 @@ def evaluate_leave_one_out_objectives(
     checkpoint_every_sources: int = 1,
     resume: bool = True,
     diagnostics: dict[str, Any] | None = None,
+    kernel_support_execution: str = KERNEL_SUPPORT_EXECUTION_CPU,
+    gpu_device: int = 0,
+    gpu_tile_size: int = 128,
+    max_gpu_support_bytes: int | None = None,
 ) -> tuple[LeaveOneOutObjective, ...]:
     """Evaluate a bounded batch of exact LOO objectives source-by-source.
 
@@ -847,6 +957,10 @@ def evaluate_leave_one_out_objectives(
         max_radius_query_bytes=radius_limit,
         resource_budget=service,
         capacity_context=capacity_context,
+        kernel_support_execution=kernel_support_execution,
+        gpu_device=gpu_device,
+        gpu_tile_size=gpu_tile_size,
+        max_gpu_support_bytes=max_gpu_support_bytes,
     )
     loo_started = time.perf_counter()
     checkpoint_seconds = 0.0
@@ -883,6 +997,10 @@ def evaluate_leave_one_out_objectives(
             "backend_version": getattr(index, "backend_version", NEIGHBOUR_BACKEND_VERSION),
             "metric": getattr(index, "metric", NEIGHBOUR_METRIC),
             "backend_fingerprint": getattr(index, "fingerprint", ""),
+            "kernel_support_execution": kernel_support_execution,
+            "gpu_device": int(gpu_device),
+            "gpu_tile_size": int(gpu_tile_size),
+            "max_gpu_support_bytes": max_gpu_support_bytes,
             "source_order": "ascending-original-pool-row-index",
             "k_c_batch_shape": [batch_count, row_count],
             "numerical_tolerance": SPARSE_NUMERICAL_TOLERANCE,
@@ -926,8 +1044,9 @@ def evaluate_leave_one_out_objectives(
                 row_count,
             )
     source_phase_started = time.perf_counter()
-    for batch_start in range(source_start, row_count, block):
-        batch_stop = min(batch_start + block, row_count)
+    query_block = min(block, provider.support_batch_size)
+    for batch_start in range(source_start, row_count, query_block):
+        batch_stop = min(batch_start + query_block, row_count)
         source_indices = np.arange(batch_start, batch_stop, dtype=np.int64)
         maximum_scales = np.max(scales[:, batch_start:batch_stop], axis=0)
         support_offsets, support_targets, support_distances = provider.support_many(
@@ -1163,6 +1282,38 @@ def evaluate_leave_one_out_objectives(
         diagnostics["loo_distance_evaluations"] = diagnostics.get(
             "loo_distance_evaluations", 0
         ) + int(provider_metrics["distance_evaluations"])
+        cumulative_gpu_metrics = {
+            "gpu_source_tiles",
+            "gpu_target_tiles",
+            "gpu_fp64_evaluations",
+            "gpu_ambiguous_boundary_count",
+            "gpu_cpu_rescanned_count",
+            "gpu_h2d_bytes",
+            "gpu_d2h_bytes",
+            "gpu_seconds",
+            "gpu_cpu_verification_seconds",
+            "support_query_count",
+            "support_entries",
+            "support_query_seconds",
+        }
+        for metric_name, metric_value in provider_metrics.items():
+            if metric_name in {
+                "support_execution",
+                "support_execution_version",
+                "gpu_device",
+            }:
+                diagnostics[metric_name] = metric_value
+            elif isinstance(metric_value, bool):
+                diagnostics[metric_name] = metric_value
+            elif isinstance(metric_value, (int, float, np.integer, np.floating)):
+                if metric_name in cumulative_gpu_metrics:
+                    diagnostics[metric_name] = diagnostics.get(metric_name, 0) + metric_value
+                elif metric_name.endswith("_peak_bytes"):
+                    diagnostics[metric_name] = max(
+                        diagnostics.get(metric_name, 0), metric_value
+                    )
+                else:
+                    diagnostics[metric_name] = metric_value
     if checkpoint_store is not None:
         checkpoint_store.clear(checkpoint_name)
         checkpoint_store.clean_stale()
@@ -1789,6 +1940,10 @@ def build_streamed_candidate_contributions(
     checkpoint_path: str | Path | None = None,
     checkpoint_name: str = "candidate-aggregation",
     resume: bool = True,
+    kernel_support_execution: str = KERNEL_SUPPORT_EXECUTION_CPU,
+    gpu_device: int = 0,
+    gpu_tile_size: int = 128,
+    max_gpu_support_bytes: int | None = None,
 ) -> tuple[
     SparseCandidateContributions | OutOfCoreSparseCandidateContributions,
     StreamedKernelExecutionSummary,
@@ -2053,6 +2208,10 @@ def build_streamed_candidate_contributions(
             max_radius_query_bytes=max_radius_query_bytes,
             resource_budget=runtime_budget,
             capacity_context=(f"N={n_rows}, M={candidate_count}, operator={operator_fingerprint}"),
+            kernel_support_execution=kernel_support_execution,
+            gpu_device=gpu_device,
+            gpu_tile_size=gpu_tile_size,
+            max_gpu_support_bytes=max_gpu_support_bytes,
         )
         if (
             frozen.backend in {INDEXED_NEIGHBOUR_BACKEND_ID, TILED_NEIGHBOUR_BACKEND_ID}
@@ -2155,6 +2314,10 @@ def build_streamed_candidate_contributions(
             "target_order": "ascending-original-pool-row-index",
             "backend": frozen.backend,
             "backend_version": frozen.backend_version,
+            "kernel_support_execution": kernel_support_execution,
+            "gpu_device": int(gpu_device),
+            "gpu_tile_size": int(gpu_tile_size),
+            "max_gpu_support_bytes": max_gpu_support_bytes,
             "bandwidth": frozen.fingerprint,
             "entry_limit": int(entry_limit),
             "numerical_tolerance": SPARSE_NUMERICAL_TOLERANCE,
@@ -2365,6 +2528,10 @@ def build_streamed_candidate_contributions(
                     support_provider=support_provider,
                     max_radius_query_bytes=max_radius_query_bytes,
                     source_indices=candidate_source_indices,
+                    kernel_support_execution=kernel_support_execution,
+                    gpu_device=gpu_device,
+                    gpu_tile_size=gpu_tile_size,
+                    max_gpu_support_bytes=max_gpu_support_bytes,
                 ):
                     normalization_started = time.perf_counter()
                     source_index = int(column.source_index)
@@ -2778,6 +2945,13 @@ def build_streamed_candidate_contributions(
             contributions.resident_array_bytes
             if isinstance(contributions, OutOfCoreSparseCandidateContributions)
             else contributions.array_bytes
+        ),
+        support_execution=support_provider.support_execution,
+        support_execution_version=support_provider.support_execution_version,
+        gpu_device=(
+            int(gpu_device)
+            if support_provider.support_execution == KERNEL_SUPPORT_EXECUTION_GPU
+            else None
         ),
         operational_metrics=operational_metrics,
     )

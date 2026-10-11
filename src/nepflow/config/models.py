@@ -347,6 +347,10 @@ class EntropyBandwidthConfig:
     max_neighbour_cache_bytes: int | None = None
     max_calibration_work_bytes: int | None = None
     calibration_batch_size: int | None = None
+    kernel_support_execution: str = "cpu"
+    gpu_device: int = 0
+    gpu_tile_size: int = 128
+    max_gpu_support_bytes: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
