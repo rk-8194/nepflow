@@ -108,10 +108,13 @@ def _metric_delta(after: dict[str, Any], before: dict[str, Any]) -> dict[str, An
         "pilot_support_samples",
         "gpu_source_tiles",
         "gpu_target_tiles",
+        "gpu_reference_uploads",
+        "gpu_reference_shards",
         "gpu_fp64_evaluations",
         "gpu_certification_rescans",
         "gpu_ambiguous_boundary_count",
         "gpu_certified_tiles",
+        "gpu_final_certifications",
     }
     result: dict[str, Any] = {}
     for key, value in after.items():

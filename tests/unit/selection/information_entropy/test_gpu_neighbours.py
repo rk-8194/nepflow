@@ -42,10 +42,18 @@ def _fake_cupy(*, device_count: int = 1, free_bytes: int = 64 * 1024 * 1024):
     )
     return types.SimpleNamespace(
         float64=np.float64,
+        int64=np.int64,
         asarray=np.asarray,
         asnumpy=np.asarray,
         zeros=np.zeros,
+        full=np.full,
         sqrt=np.sqrt,
+        sum=np.sum,
+        max=np.max,
+        minimum=np.minimum,
+        concatenate=np.concatenate,
+        where=np.where,
+        nan=np.nan,
         isfinite=np.isfinite,
         all=np.all,
         argpartition=np.argpartition,
@@ -166,7 +174,88 @@ def test_fake_gpu_knn_reports_bounded_transfers_and_reuses_k_prefix(
     assert metrics["gpu_target_tiles"] > 0
     assert metrics["gpu_source_tiles"] == 4
     assert metrics["gpu_h2d_bytes"] < descriptors.nbytes * descriptors.shape[0]
+    assert metrics["gpu_reference_uploads"] == 1
+    assert metrics["gpu_reference_shards"] == 0
+    assert metrics["gpu_resident_reference_bytes"] == descriptors.nbytes
+    assert metrics["gpu_d2h_bytes"] == 12 * (6 * 16 + 16)
     assert metrics["gpu_operation_seconds_inclusive"] >= metrics["gpu_kernel_seconds"]
+    second = ExactTiledGPUNeighbourIndex(
+        descriptors,
+        gpu_tile_size=4,
+        max_device_bytes=4096,
+        resource_budget=_budget(),
+    )
+    assert second.fingerprint == index.fingerprint
+    second.close()
+    index.close()
+
+
+def test_fake_gpu_knn_rescans_ambiguous_ties_and_wide_values(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setitem(sys.modules, "cupy", _fake_cupy())
+    descriptors = np.asarray(
+        [
+            [0.0, 0.0],
+            [1.0, 0.0],
+            [-1.0, 0.0],
+            [0.0, 1.0],
+            [0.0, -1.0],
+            [np.nextafter(1.0, 2.0), 0.0],
+            [1.0e150, 0.0],
+            [-1.0e150, 0.0],
+        ],
+        dtype=np.float64,
+    )
+    budget = _budget()
+    reference = compute_exact_neighbours(
+        descriptors, 1, chunk_size=3, resource_budget=budget
+    )
+    from nepflow.stages.selection.algorithms.information_entropy.gpu_neighbours import (
+        ExactTiledGPUNeighbourIndex,
+    )
+
+    index = ExactTiledGPUNeighbourIndex(
+        descriptors,
+        gpu_tile_size=3,
+        max_device_bytes=8192,
+        resource_budget=budget,
+    )
+    _, rows, distances = index.query_neighbours(1, chunk_size=3)
+    np.testing.assert_array_equal(rows, reference.neighbour_indices)
+    np.testing.assert_array_equal(distances, reference.neighbour_distances)
+    assert index.memory_metrics()["gpu_certification_rescans"] > 0
+    index.close()
+
+
+def test_fake_gpu_knn_uses_bounded_reference_shards_when_pool_cannot_reside(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setitem(sys.modules, "cupy", _fake_cupy())
+    descriptors = np.asarray(
+        [[float(i), float(i % 3)] for i in range(12)], dtype=np.float64
+    )
+    budget = _budget()
+    from nepflow.stages.selection.algorithms.information_entropy.gpu_neighbours import (
+        ExactTiledGPUNeighbourIndex,
+    )
+
+    index = ExactTiledGPUNeighbourIndex(
+        descriptors,
+        gpu_tile_size=3,
+        max_device_bytes=1300,
+        resource_budget=budget,
+    )
+    _, rows, distances = index.query_neighbours(2, chunk_size=3)
+    reference = compute_exact_neighbours(
+        descriptors, 2, chunk_size=3, resource_budget=budget
+    )
+    np.testing.assert_array_equal(rows, reference.neighbour_indices)
+    np.testing.assert_array_equal(distances, reference.neighbour_distances)
+    metrics = index.memory_metrics()
+    assert metrics["gpu_resident_reference_bytes"] == 0
+    assert metrics["gpu_reference_uploads"] == metrics["gpu_reference_shards"]
+    assert metrics["gpu_reference_shards"] > 1
     index.close()
 
 
@@ -272,19 +361,38 @@ def test_cuda_gpu_knn_matches_cpu_oracle() -> None:
     cp = pytest.importorskip("cupy")
     if int(cp.cuda.runtime.getDeviceCount()) < 1:
         pytest.skip("no visible CUDA device")
-    descriptors = np.asarray(
-        [[float(i), float(i % 2), float((i * 7) % 5)] for i in range(20)],
-        dtype=np.float64,
-    )
     budget = _budget()
-    reference = compute_exact_neighbours(descriptors, 4, resource_budget=budget)
-    actual = compute_neighbours(
-        descriptors,
-        4,
-        backend=GPU_NEIGHBOUR_BACKEND_ID,
-        gpu_device=0,
-        gpu_tile_size=4,
-        resource_budget=budget,
-    )
-    np.testing.assert_array_equal(actual.neighbour_indices, reference.neighbour_indices)
-    np.testing.assert_array_equal(actual.radii, reference.radii)
+    rng = np.random.default_rng(20261011)
+    random_case = rng.normal(size=(24, 42)).astype(np.float64)
+    tie_case = np.zeros((24, 42), dtype=np.float64)
+    tie_case[:, 0] = np.arange(-12, 12, dtype=np.float64)
+    duplicate_case = random_case.copy()
+    duplicate_case[3] = duplicate_case[0]
+    duplicate_case[9] = duplicate_case[0]
+    wide_case = np.zeros((24, 42), dtype=np.float64)
+    wide_case[:, 0] = np.arange(-12, 12, dtype=np.float64) * 1.0e150
+    ulp_case = tie_case.copy()
+    ulp_case[12, 0] = np.nextafter(1.0, 2.0)
+    cases = (random_case, tie_case, duplicate_case, wide_case, ulp_case)
+    for descriptors in cases:
+        for tile_size in (3, 7):
+            for k in (1, 2, 4, 8):
+                reference = compute_exact_neighbours(
+                    descriptors, k, chunk_size=tile_size, resource_budget=budget
+                )
+                actual = compute_neighbours(
+                    descriptors,
+                    k,
+                    backend=GPU_NEIGHBOUR_BACKEND_ID,
+                    gpu_device=0,
+                    gpu_tile_size=tile_size,
+                    max_gpu_neighbour_bytes=1 << 20,
+                    resource_budget=budget,
+                )
+                np.testing.assert_array_equal(
+                    actual.neighbour_indices, reference.neighbour_indices
+                )
+                np.testing.assert_array_equal(
+                    actual.neighbour_distances, reference.neighbour_distances
+                )
+                np.testing.assert_array_equal(actual.radii, reference.radii)
