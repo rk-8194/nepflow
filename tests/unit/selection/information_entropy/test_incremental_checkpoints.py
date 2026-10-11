@@ -164,3 +164,69 @@ def test_incremental_store_admits_against_explicit_scratch_budget(tmp_path) -> N
             k_max=1,
             location_count=2,
         )
+
+
+def test_incremental_store_compacts_large_ordered_identity(tmp_path) -> None:
+    store = IncrementalCheckpointStore(tmp_path)
+    row_ids = [f"row-{index}" for index in range(1025)]
+    identity = {"ordered": True, "row_ids": row_ids}
+    indices, distances = _chunk(0, 1, 1)
+
+    store.write_chunk(
+        "knn",
+        identity=identity,
+        start=0,
+        neighbour_locations=indices,
+        neighbour_distances=distances,
+        k_max=1,
+        location_count=2,
+    )
+
+    pointer = json.loads(
+        (tmp_path / "knn.incremental.pointer.json").read_text(encoding="utf-8")
+    )
+    manifest = json.loads((tmp_path / pointer["manifest"]).read_text(encoding="utf-8"))
+    stored_identity = manifest["identity"]
+    assert "row_ids" not in stored_identity
+    assert stored_identity["row_ids_count"] == len(row_ids)
+    assert store.load("knn", expected_identity=identity)[1]["cursor"] == 1
+
+    with pytest.raises(CheckpointValidationError, match="ordered input"):
+        store.load("knn", expected_identity={"ordered": True, "row_ids": row_ids[::-1]})
+
+
+def test_incremental_store_rejects_corrupt_intermediate_cursor_metadata(tmp_path) -> None:
+    store = IncrementalCheckpointStore(tmp_path)
+    identity = {"ordered": True}
+    first_indices, first_distances = _chunk(0, 1, 1)
+    second_indices, second_distances = _chunk(1, 1, 1)
+    store.write_chunk(
+        "knn",
+        identity=identity,
+        start=0,
+        neighbour_locations=first_indices,
+        neighbour_distances=first_distances,
+        k_max=1,
+        location_count=2,
+    )
+    store.write_chunk(
+        "knn",
+        identity=identity,
+        start=1,
+        neighbour_locations=second_indices,
+        neighbour_distances=second_distances,
+        k_max=1,
+        location_count=2,
+    )
+
+    pointer = json.loads(
+        (tmp_path / "knn.incremental.pointer.json").read_text(encoding="utf-8")
+    )
+    latest = json.loads((tmp_path / pointer["manifest"]).read_text(encoding="utf-8"))
+    previous_path = tmp_path / latest["previous_manifest"]
+    previous = json.loads(previous_path.read_text(encoding="utf-8"))
+    previous["cursor"] = 2
+    previous_path.write_text(json.dumps(previous), encoding="utf-8")
+
+    with pytest.raises(CheckpointValidationError, match="cursor"):
+        store.load("knn", expected_identity=identity, k_max=1, location_count=2)

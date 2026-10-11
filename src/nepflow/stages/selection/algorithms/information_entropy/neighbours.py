@@ -1238,7 +1238,7 @@ class IndexedCPUNeighbourIndex:
                 checkpoint_store is not None
                 and checkpoint_identity is not None
                 and (
-                    stop % int(checkpoint_every_locations) == 0
+                    stop - checkpoint_cursor >= int(checkpoint_every_locations)
                     or stop == n_locations
                 )
             ):
@@ -2608,6 +2608,8 @@ def compute_indexed_cpu_neighbours_many(
     checkpoint_name: str = "knn",
     checkpoint_every_locations: int = 1,
     resume: bool = True,
+    checkpoint_metrics: dict[str, Any] | None = None,
+    preserve_checkpoint: bool = False,
 ) -> dict[int, ExactNeighbourResult]:
     """Calculate several indexed neighbour orders from one ``k_max`` pass."""
 
@@ -2686,7 +2688,12 @@ def compute_indexed_cpu_neighbours_many(
         checkpoint_identity=checkpoint_identity,
         checkpoint_every_locations=checkpoint_every_locations,
         resume=resume,
+        preserve_checkpoint=preserve_checkpoint,
     )
+    if checkpoint_metrics is not None:
+        checkpoint_metrics.clear()
+        if checkpoint_store is not None:
+            checkpoint_metrics.update(checkpoint_store.metrics())
     representation_id = (
         _array_fingerprint(values)
         if representation_fingerprint is None

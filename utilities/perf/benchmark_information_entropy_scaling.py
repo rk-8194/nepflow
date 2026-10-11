@@ -295,6 +295,13 @@ def _prepare(
             knn_checkpoint_metrics["restart_bytes_read"] = int(
                 restart_checkpoint_metrics.get("bytes_read", 0) or 0
             )
+            knn_checkpoint_metrics["restart_physical_bytes_read"] = int(
+                restart_checkpoint_metrics.get(
+                    "physical_bytes_read",
+                    restart_checkpoint_metrics.get("bytes_read", 0),
+                )
+                or 0
+            )
     # The diagnostic restart is deliberately excluded from the production kNN
     # wall time and from the full-selection estimate.
     knn_wall_seconds = knn_query_wall_seconds
@@ -311,6 +318,11 @@ def _prepare(
     checkpoint_metrics.setdefault("enabled", bool(checkpoint_enabled))
     checkpoint_metrics.setdefault("bytes_written", 0)
     checkpoint_metrics.setdefault("array_bytes_written", 0)
+    checkpoint_metrics.setdefault("metadata_bytes_written", 0)
+    checkpoint_metrics.setdefault("bytes_read", 0)
+    checkpoint_metrics.setdefault("array_bytes_read", 0)
+    checkpoint_metrics.setdefault("metadata_bytes_read", 0)
+    checkpoint_metrics.setdefault("physical_bytes_read", checkpoint_metrics["bytes_read"])
     checkpoint_metrics.setdefault("physical_bytes_written", checkpoint_metrics["bytes_written"])
     checkpoint_metrics.setdefault("fsync_seconds", 0.0)
     checkpoint_metrics.setdefault("digest_seconds", 0.0)
@@ -322,6 +334,17 @@ def _prepare(
     checkpoint_metrics["physical_bytes_written"] = int(
         checkpoint_metrics.get("physical_bytes_written", checkpoint_metrics.get("bytes_written", 0))
         or 0
+    )
+    checkpoint_metrics["metadata_bytes_written"] = int(
+        checkpoint_metrics.get(
+            "metadata_bytes_written",
+            0,
+        )
+        or max(
+            0,
+            int(checkpoint_metrics["physical_bytes_written"])
+            - int(checkpoint_metrics.get("array_bytes_written", 0) or 0),
+        )
     )
     checkpoint_metrics["chunk_count"] = int(checkpoint_metrics.get("commits", 0) or 0)
     checkpoint_metrics["peak_scratch_bytes"] = max(
@@ -854,6 +877,10 @@ def _profiling_summary(results: list[dict[str, Any]]) -> dict[str, Any]:
     kNN_checkpoint: dict[str, float | int] = {
         "physical_bytes_written": 0,
         "array_bytes_written": 0,
+        "metadata_bytes_written": 0,
+        "physical_bytes_read": 0,
+        "array_bytes_read": 0,
+        "metadata_bytes_read": 0,
         "fsync_seconds": 0.0,
         "digest_seconds": 0.0,
         "peak_retained_bytes": 0,
@@ -861,6 +888,7 @@ def _profiling_summary(results: list[dict[str, Any]]) -> dict[str, Any]:
         "chunk_count": 0,
         "restart_cost_seconds": 0.0,
         "restart_bytes_read": 0,
+        "restart_physical_bytes_read": 0,
     }
     contribution_checkpoint: dict[str, float | int] = {
         "bytes": 0,
@@ -917,6 +945,18 @@ def _profiling_summary(results: list[dict[str, Any]]) -> dict[str, Any]:
             kNN_checkpoint["array_bytes_written"] += int(
                 checkpoint.get("array_bytes_written", 0) or 0
             )
+            kNN_checkpoint["metadata_bytes_written"] += int(
+                checkpoint.get("metadata_bytes_written", 0) or 0
+            )
+            kNN_checkpoint["physical_bytes_read"] += int(
+                checkpoint.get("physical_bytes_read", checkpoint.get("bytes_read", 0)) or 0
+            )
+            kNN_checkpoint["array_bytes_read"] += int(
+                checkpoint.get("array_bytes_read", checkpoint.get("bytes_read", 0)) or 0
+            )
+            kNN_checkpoint["metadata_bytes_read"] += int(
+                checkpoint.get("metadata_bytes_read", 0) or 0
+            )
             kNN_checkpoint["fsync_seconds"] += float(checkpoint.get("fsync_seconds", 0.0) or 0.0)
             kNN_checkpoint["digest_seconds"] += float(
                 checkpoint.get("digest_seconds", 0.0) or 0.0
@@ -935,6 +975,9 @@ def _profiling_summary(results: list[dict[str, Any]]) -> dict[str, Any]:
             )
             kNN_checkpoint["restart_bytes_read"] += int(
                 checkpoint.get("restart_bytes_read", 0) or 0
+            )
+            kNN_checkpoint["restart_physical_bytes_read"] += int(
+                checkpoint.get("restart_physical_bytes_read", 0) or 0
             )
         if str(result.get("backend")) not in seen_calibration:
             seen_calibration.add(str(result.get("backend")))

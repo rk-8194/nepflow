@@ -18,6 +18,7 @@ from nepflow.resources.budget import ResourceBudgetService, ResourceCapacityErro
 
 CHECKPOINT_SCHEMA_VERSION = "entropy-checkpoint-v1"
 INCREMENTAL_KNN_CHECKPOINT_SCHEMA_VERSION = "entropy-knn-incremental-v1"
+_COMPACT_ROW_ID_LIMIT = 1024
 
 
 class CheckpointValidationError(ValueError):
@@ -36,6 +37,23 @@ def _safe_name(name: str) -> str:
     if not isinstance(name, str) or not name or Path(name).name != name:
         raise ValueError("checkpoint name must be a simple non-empty filename")
     return name
+
+
+def _compact_incremental_identity(identity: Mapping[str, Any]) -> dict[str, Any]:
+    """Keep large ordered row-id identities out of every chunk manifest.
+
+    The ordered row-id sequence remains part of the checkpoint identity, but a
+    digest is sufficient for resume validation and avoids repeating hundreds of
+    megabytes of metadata across a long incremental manifest chain.
+    """
+
+    compact = dict(identity)
+    row_ids = compact.get("row_ids")
+    if isinstance(row_ids, list) and len(row_ids) > _COMPACT_ROW_ID_LIMIT:
+        compact["row_ids_fingerprint"] = sha256_canonical_json(row_ids)
+        compact["row_ids_count"] = len(row_ids)
+        del compact["row_ids"]
+    return compact
 
 
 class VersionedCheckpointStore:
@@ -316,11 +334,17 @@ class IncrementalCheckpointStore:
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
         self.resource_budget = resource_budget
+        self._identity_cache: dict[str, tuple[Mapping[str, Any], dict[str, Any]]] = {}
+        self._validated_heads: dict[str, tuple[Mapping[str, Any], int, int]] = {}
         self._stats: dict[str, float | int] = {
             "bytes_written": 0,
             "array_bytes_written": 0,
             "physical_bytes_written": 0,
+            "metadata_bytes_written": 0,
             "bytes_read": 0,
+            "array_bytes_read": 0,
+            "physical_bytes_read": 0,
+            "metadata_bytes_read": 0,
             "fsync_seconds": 0.0,
             "digest_seconds": 0.0,
             "write_seconds": 0.0,
@@ -432,8 +456,12 @@ class IncrementalCheckpointStore:
 
     def _read_manifest_with_name(self, name: str) -> tuple[str, dict[str, Any]]:
         checkpoint_name = _safe_name(name)
+        pointer_path = self._pointer(checkpoint_name)
         try:
-            pointer = json.loads(self._pointer(checkpoint_name).read_text(encoding="utf-8"))
+            pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
+            pointer_bytes = int(pointer_path.stat().st_size)
+            self._add_stat("metadata_bytes_read", pointer_bytes)
+            self._add_stat("physical_bytes_read", pointer_bytes)
             if pointer.get("schema") != INCREMENTAL_KNN_CHECKPOINT_SCHEMA_VERSION:
                 raise CheckpointValidationError(
                     "incremental checkpoint pointer schema is incompatible"
@@ -441,9 +469,11 @@ class IncrementalCheckpointStore:
             manifest_name = pointer.get("manifest")
             if not self._safe_file_name(manifest_name):
                 raise CheckpointValidationError("incremental checkpoint manifest path is invalid")
-            manifest = json.loads(
-                (self.root / manifest_name).read_text(encoding="utf-8")
-            )
+            manifest_path = self.root / manifest_name
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest_bytes = int(manifest_path.stat().st_size)
+            self._add_stat("metadata_bytes_read", manifest_bytes)
+            self._add_stat("physical_bytes_read", manifest_bytes)
         except CheckpointValidationError:
             raise
         except (OSError, TypeError, ValueError) as exc:
@@ -461,20 +491,25 @@ class IncrementalCheckpointStore:
 
     @staticmethod
     def _validate_identity(
-        manifest: Mapping[str, Any], expected_identity: Mapping[str, Any] | None
+        manifest: Mapping[str, Any],
+        expected_identity: Mapping[str, Any] | None,
+        expected_fingerprints: set[str] | None = None,
     ) -> dict[str, Any]:
         identity = manifest.get("identity")
         if not isinstance(identity, dict):
             raise CheckpointValidationError("incremental checkpoint identity is missing")
         if sha256_canonical_json(identity) != manifest.get("identity_fingerprint"):
             raise CheckpointValidationError("incremental checkpoint identity checksum mismatch")
-        if expected_identity is not None and sha256_canonical_json(
-            dict(expected_identity)
-        ) != manifest.get("identity_fingerprint"):
-            raise CheckpointValidationError(
-                "incremental checkpoint identity does not match the ordered input"
-            )
-        return identity
+        if expected_identity is not None:
+            expected_fingerprints = expected_fingerprints or {
+                sha256_canonical_json(dict(expected_identity)),
+                sha256_canonical_json(_compact_incremental_identity(expected_identity)),
+            }
+            if manifest.get("identity_fingerprint") not in expected_fingerprints:
+                raise CheckpointValidationError(
+                    "incremental checkpoint identity does not match the ordered input"
+                )
+        return _compact_incremental_identity(identity)
 
     def _load_chain(
         self,
@@ -491,12 +526,23 @@ class IncrementalCheckpointStore:
         newest_cursor: int | None = None
         newest_chunk_count: int | None = None
         reverse_chunks: list[dict[str, Any]] = []
+        reverse_chunk_counts: list[int] = []
         seen: set[str] = set()
+        expected_fingerprints = None
+        if expected_identity is not None:
+            expected_fingerprints = {
+                sha256_canonical_json(dict(expected_identity)),
+                sha256_canonical_json(_compact_incremental_identity(expected_identity)),
+            }
         while True:
             if manifest_name in seen:
                 raise CheckpointValidationError("incremental checkpoint manifest chain loops")
             seen.add(manifest_name)
-            current_identity = self._validate_identity(manifest, expected_identity)
+            current_identity = self._validate_identity(
+                manifest,
+                expected_identity,
+                expected_fingerprints,
+            )
             current_k = manifest.get("k_max")
             current_count = manifest.get("location_count")
             current_cursor = manifest.get("cursor")
@@ -519,6 +565,15 @@ class IncrementalCheckpointStore:
                 or not isinstance(chunk, dict)
             ):
                 raise CheckpointValidationError("incremental checkpoint manifest header is invalid")
+            chunk_stop = chunk.get("stop")
+            if (
+                isinstance(chunk_stop, bool)
+                or not isinstance(chunk_stop, int)
+                or chunk_stop != current_cursor
+            ):
+                raise CheckpointValidationError(
+                    "incremental checkpoint cursor does not match its chunk"
+                )
             if identity is None:
                 identity = current_identity
                 saved_k = current_k
@@ -538,6 +593,7 @@ class IncrementalCheckpointStore:
             ):
                 raise CheckpointValidationError("incremental checkpoint manifest chain disagrees")
             reverse_chunks.append(chunk)
+            reverse_chunk_counts.append(current_chunk_count)
             previous = manifest.get("previous_manifest")
             if previous is None:
                 break
@@ -546,7 +602,11 @@ class IncrementalCheckpointStore:
                     "incremental checkpoint previous manifest is invalid"
                 )
             try:
-                manifest = json.loads((self.root / previous).read_text(encoding="utf-8"))
+                previous_path = self.root / previous
+                manifest = json.loads(previous_path.read_text(encoding="utf-8"))
+                previous_bytes = int(previous_path.stat().st_size)
+                self._add_stat("metadata_bytes_read", previous_bytes)
+                self._add_stat("physical_bytes_read", previous_bytes)
             except (OSError, TypeError, ValueError) as exc:
                 raise CheckpointValidationError(
                     "incremental checkpoint previous manifest is unreadable"
@@ -568,6 +628,11 @@ class IncrementalCheckpointStore:
         if reverse_chunks[-1].get("start") != 0:
             raise CheckpointValidationError("incremental checkpoint chain does not start at zero")
         chunks = list(reversed(reverse_chunks))
+        chunk_counts = list(reversed(reverse_chunk_counts))
+        if any(count != index for index, count in enumerate(chunk_counts, start=1)):
+            raise CheckpointValidationError(
+                "incremental checkpoint chunk count chain is not authoritative"
+            )
         expected_start = 0
         for chunk in chunks:
             start = chunk.get("start")
@@ -606,6 +671,12 @@ class IncrementalCheckpointStore:
         """Durably commit one new contiguous range."""
 
         checkpoint_name = _safe_name(name)
+        cached_identity = self._identity_cache.get(checkpoint_name)
+        if cached_identity is not None and cached_identity[0] is identity:
+            stored_identity = cached_identity[1]
+        else:
+            stored_identity = _compact_incremental_identity(identity)
+            self._identity_cache[checkpoint_name] = (identity, stored_identity)
         if (
             isinstance(start, bool)
             or not isinstance(start, (int, np.integer))
@@ -644,19 +715,28 @@ class IncrementalCheckpointStore:
         previous_manifest: str | None = None
         previous_chunk_count = 0
         if self.exists(checkpoint_name):
-            previous_manifest, manifest = self._read_manifest_with_name(checkpoint_name)
-            self._validate_identity(manifest, identity)
-            if manifest.get("k_max") != k_max or manifest.get("location_count") != location_count:
+            previous_manifest, _ = self._read_manifest_with_name(checkpoint_name)
+            validated_head = self._validated_heads.get(checkpoint_name)
+            if validated_head is None or validated_head[0] is not identity:
+                _, _, saved_count, saved_cursor, chunks = self._load_chain(
+                    checkpoint_name,
+                    expected_identity=identity,
+                    k_max=k_max,
+                    location_count=location_count,
+                )
+                self._validated_heads[checkpoint_name] = (
+                    identity,
+                    saved_cursor,
+                    len(chunks),
+                )
+                previous_chunk_count = len(chunks)
+            else:
+                _, saved_cursor, previous_chunk_count = validated_head
+                saved_count = location_count
+            if saved_count != location_count:
                 raise CheckpointValidationError("incremental checkpoint dimensions do not match")
-            if manifest.get("cursor") != start:
+            if saved_cursor != start:
                 raise CheckpointValidationError("incremental checkpoint chunk is not contiguous")
-            previous_chunk_count = manifest.get("chunk_count", 0)
-            if (
-                isinstance(previous_chunk_count, bool)
-                or not isinstance(previous_chunk_count, int)
-                or previous_chunk_count < 1
-            ):
-                raise CheckpointValidationError("incremental checkpoint chunk count is invalid")
         elif start != 0:
             raise CheckpointValidationError("incremental checkpoint is missing its initial chunk")
 
@@ -705,8 +785,8 @@ class IncrementalCheckpointStore:
             manifest_payload = {
                 "schema": INCREMENTAL_KNN_CHECKPOINT_SCHEMA_VERSION,
                 "name": checkpoint_name,
-                "identity": dict(identity),
-                "identity_fingerprint": sha256_canonical_json(dict(identity)),
+                "identity": stored_identity,
+                "identity_fingerprint": sha256_canonical_json(stored_identity),
                 "k_max": k_max,
                 "location_count": location_count,
                 "cursor": stop,
@@ -747,19 +827,32 @@ class IncrementalCheckpointStore:
                 self._add_stat("fsync_seconds", time.perf_counter() - sync_started)
             pointer_bytes = int(pointer_temporary.stat().st_size)
             os.replace(pointer_temporary, self._pointer(checkpoint_name))
+            self._validated_heads[checkpoint_name] = (
+                identity,
+                stop,
+                previous_chunk_count + 1,
+            )
             self._fsync_directory(self.root)
             bytes_written = array_bytes_written + manifest_bytes + pointer_bytes
+            metadata_bytes_written = manifest_bytes + pointer_bytes
             self._add_stat("array_bytes_written", array_bytes_written)
             self._add_stat("bytes_written", array_bytes_written)
             self._add_stat("physical_bytes_written", bytes_written)
+            self._add_stat("metadata_bytes_written", metadata_bytes_written)
             self._add_stat("commits", 1)
             self._add_stat("write_seconds", time.perf_counter() - started)
+            self._validated_heads[checkpoint_name] = (
+                identity,
+                stop,
+                previous_chunk_count + 1,
+            )
             self._stats["peak_retained_bytes"] = max(
                 int(self._stats.get("peak_retained_bytes", 0)), self._retained_bytes()
             )
             return {
                 "bytes_written": array_bytes_written,
                 "array_bytes_written": array_bytes_written,
+                "metadata_bytes_written": metadata_bytes_written,
                 "physical_bytes_written": bytes_written,
                 "write_seconds": max(0.0, time.perf_counter() - started),
             }
@@ -842,6 +935,8 @@ class IncrementalCheckpointStore:
                 byte_count = int(path.stat().st_size)
                 self._add_stat("digest_seconds", time.perf_counter() - digest_started)
                 self._add_stat("bytes_read", byte_count)
+                self._add_stat("array_bytes_read", byte_count)
+                self._add_stat("physical_bytes_read", byte_count)
                 if digest != entry.get("sha256") or byte_count != entry.get("bytes"):
                     raise CheckpointValidationError(
                         "incremental checkpoint array checksum mismatch"
@@ -875,6 +970,16 @@ class IncrementalCheckpointStore:
         distances = np.concatenate(distance_parts, axis=0)
         indices.setflags(write=False)
         distances.setflags(write=False)
+        cache_identity = expected_identity if expected_identity is not None else identity
+        self._identity_cache[_safe_name(name)] = (
+            cache_identity,
+            _compact_incremental_identity(cache_identity),
+        )
+        self._validated_heads[_safe_name(name)] = (
+            cache_identity,
+            cursor,
+            len(chunks),
+        )
         return (
             identity,
             {
@@ -892,7 +997,10 @@ class IncrementalCheckpointStore:
         return self._pointer(_safe_name(name)).is_file()
 
     def clear(self, name: str) -> None:
-        self._pointer(_safe_name(name)).unlink(missing_ok=True)
+        checkpoint_name = _safe_name(name)
+        self._identity_cache.pop(checkpoint_name, None)
+        self._validated_heads.pop(checkpoint_name, None)
+        self._pointer(checkpoint_name).unlink(missing_ok=True)
         self.clean_stale()
 
     def clean_stale(self, *, keep_names: set[str] | None = None) -> int:
