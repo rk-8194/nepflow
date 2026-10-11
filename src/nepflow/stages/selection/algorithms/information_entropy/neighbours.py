@@ -619,6 +619,10 @@ class IndexedCPUNeighbourIndex:
             metrics[f"{phase}_seconds"] = float(elapsed)
         for phase, count in self._phase_counts.items():
             metrics[f"{phase}_count"] = int(count)
+            if phase == "radius_preflight_count":
+                # Keep the historical flattened key above, but expose a name
+                # that cannot be mistaken for a count-of-counts counter.
+                metrics["radius_preflight_calls"] = int(count)
         for phase, byte_count in self._phase_bytes.items():
             metrics[f"{phase}_bytes"] = int(byte_count)
         aliases = {
@@ -917,6 +921,7 @@ class IndexedCPUNeighbourIndex:
         checkpoint_identity: dict[str, Any] | None = None,
         checkpoint_every_locations: int = 1,
         resume: bool = True,
+        preserve_checkpoint: bool = False,
     ) -> tuple[np.ndarray, np.ndarray]:
         """Compute one canonical widest result and derive narrower prefixes."""
 
@@ -1258,7 +1263,12 @@ class IndexedCPUNeighbourIndex:
                             "write_seconds", time.perf_counter() - checkpoint_started
                         )
                     ),
-                    bytes_written=int(write_metrics.get("bytes_written", 0)),
+                    bytes_written=int(
+                        write_metrics.get(
+                            "physical_bytes_written",
+                            write_metrics.get("bytes_written", 0),
+                        )
+                    ),
                 )
                 self._record_phase(
                     "checkpoint_fsync",
@@ -1311,7 +1321,7 @@ class IndexedCPUNeighbourIndex:
                     next_percent += 1
             start = stop
 
-        if checkpoint_store is not None:
+        if checkpoint_store is not None and not preserve_checkpoint:
             assert incremental_store is not None and legacy_store is not None
             incremental_store.clear(checkpoint_name)
             incremental_store.clean_stale()
@@ -1349,6 +1359,7 @@ class IndexedCPUNeighbourIndex:
         checkpoint_identity: dict[str, Any] | None = None,
         checkpoint_every_locations: int = 1,
         resume: bool = True,
+        preserve_checkpoint: bool = False,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Return radii, representative rows, and distances for all rows."""
 
@@ -1361,6 +1372,7 @@ class IndexedCPUNeighbourIndex:
             checkpoint_identity=checkpoint_identity,
             checkpoint_every_locations=checkpoint_every_locations,
             resume=resume,
+            preserve_checkpoint=preserve_checkpoint,
         )
         row_locations = self.row_to_location
         rows = np.asarray(
@@ -1380,6 +1392,7 @@ class IndexedCPUNeighbourIndex:
         checkpoint_identity: dict[str, Any] | None = None,
         checkpoint_every_locations: int = 1,
         resume: bool = True,
+        preserve_checkpoint: bool = False,
     ) -> dict[int, tuple[np.ndarray, np.ndarray, np.ndarray]]:
         """Return exact neighbour prefixes from one canonical ``k_max`` pass."""
 
@@ -1398,6 +1411,7 @@ class IndexedCPUNeighbourIndex:
             checkpoint_identity=checkpoint_identity,
             checkpoint_every_locations=checkpoint_every_locations,
             resume=resume,
+            preserve_checkpoint=preserve_checkpoint,
         )
         row_locations = self.row_to_location
         results: dict[int, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
@@ -1878,6 +1892,7 @@ class TiledCPUNeighbourIndex:
         checkpoint_identity: dict[str, Any] | None = None,
         checkpoint_every_locations: int = 1,
         resume: bool = True,
+        preserve_checkpoint: bool = False,
     ) -> tuple[np.ndarray, np.ndarray]:
         order_k = _validate_k(k)
         _validate_chunk_size(chunk_size)
@@ -1981,7 +1996,7 @@ class TiledCPUNeighbourIndex:
                         "neighbour_distances": distances_out[: source_location + 1],
                     },
                 )
-        if checkpoint_store is not None:
+        if checkpoint_store is not None and not preserve_checkpoint:
             checkpoint_store.clear(checkpoint_name)
             checkpoint_store.clean_stale()
         neighbours.setflags(write=False)
@@ -2007,6 +2022,7 @@ class TiledCPUNeighbourIndex:
         checkpoint_identity: dict[str, Any] | None = None,
         checkpoint_every_locations: int = 1,
         resume: bool = True,
+        preserve_checkpoint: bool = False,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         location_indices, location_distances = self._compute_location_neighbours(
             k,
@@ -2016,6 +2032,7 @@ class TiledCPUNeighbourIndex:
             checkpoint_identity=checkpoint_identity,
             checkpoint_every_locations=checkpoint_every_locations,
             resume=resume,
+            preserve_checkpoint=preserve_checkpoint,
         )
         rows = np.asarray(
             self.location_representatives[location_indices[self.row_to_location]], dtype=np.int64
@@ -2033,6 +2050,7 @@ class TiledCPUNeighbourIndex:
         checkpoint_identity: dict[str, Any] | None = None,
         checkpoint_every_locations: int = 1,
         resume: bool = True,
+        preserve_checkpoint: bool = False,
     ) -> dict[int, tuple[np.ndarray, np.ndarray, np.ndarray]]:
         ordered = tuple(_validate_k(value) for value in ks)
         if not ordered or len(set(ordered)) != len(ordered):
@@ -2045,6 +2063,7 @@ class TiledCPUNeighbourIndex:
             checkpoint_identity=checkpoint_identity,
             checkpoint_every_locations=checkpoint_every_locations,
             resume=resume,
+            preserve_checkpoint=preserve_checkpoint,
         )
         results: dict[int, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
         for order_k in ordered:
@@ -2172,6 +2191,8 @@ def compute_exact_neighbours(
     checkpoint_name: str = "knn",
     checkpoint_every_locations: int = 1,
     resume: bool = True,
+    checkpoint_metrics: dict[str, Any] | None = None,
+    preserve_checkpoint: bool = False,
 ) -> ExactNeighbourResult:
     """Calculate exact kth-neighbour radii without an ``N x N`` allocation.
 
@@ -2387,9 +2408,13 @@ def compute_exact_neighbours(
             )
     if not np.all(np.isfinite(radii)) or np.any(radii <= 0.0):
         raise ValueError("exact kth-neighbour radii must be finite and positive")
-    if checkpoint_store is not None:
+    if checkpoint_store is not None and not preserve_checkpoint:
         checkpoint_store.clear(checkpoint_name)
         checkpoint_store.clean_stale()
+    if checkpoint_metrics is not None:
+        checkpoint_metrics.clear()
+        if checkpoint_store is not None:
+            checkpoint_metrics.update(checkpoint_store.metrics())
 
     elapsed = max(0.0, time.perf_counter() - started)
     logger.info(
@@ -2450,6 +2475,8 @@ def compute_indexed_cpu_neighbours(
     checkpoint_name: str = "knn",
     checkpoint_every_locations: int = 1,
     resume: bool = True,
+    checkpoint_metrics: dict[str, Any] | None = None,
+    preserve_checkpoint: bool = False,
 ) -> ExactNeighbourResult:
     """Calculate exact kth other-location neighbours through the indexed CPU backend."""
 
@@ -2523,7 +2550,12 @@ def compute_indexed_cpu_neighbours(
         checkpoint_identity=checkpoint_identity,
         checkpoint_every_locations=checkpoint_every_locations,
         resume=resume,
+        preserve_checkpoint=preserve_checkpoint,
     )
+    if checkpoint_metrics is not None:
+        checkpoint_metrics.clear()
+        if checkpoint_store is not None:
+            checkpoint_metrics.update(checkpoint_store.metrics())
     representation_id = (
         _array_fingerprint(values)
         if representation_fingerprint is None
@@ -2711,6 +2743,8 @@ def compute_tiled_cpu_neighbours(
     checkpoint_name: str = "knn",
     checkpoint_every_locations: int = 1,
     resume: bool = True,
+    checkpoint_metrics: dict[str, Any] | None = None,
+    preserve_checkpoint: bool = False,
 ) -> ExactNeighbourResult:
     """Calculate exact neighbours with the explicit blocked CPU backend."""
 
@@ -2784,7 +2818,12 @@ def compute_tiled_cpu_neighbours(
         checkpoint_identity=checkpoint_identity,
         checkpoint_every_locations=checkpoint_every_locations,
         resume=resume,
+        preserve_checkpoint=preserve_checkpoint,
     )
+    if checkpoint_metrics is not None:
+        checkpoint_metrics.clear()
+        if checkpoint_store is not None:
+            checkpoint_metrics.update(checkpoint_store.metrics())
     representation_id = (
         _array_fingerprint(values)
         if representation_fingerprint is None

@@ -50,6 +50,50 @@ class VersionedCheckpointStore:
     def __init__(self, root: str | Path) -> None:
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
+        self._stats: dict[str, float | int] = {
+            "bytes_written": 0,
+            "array_bytes_written": 0,
+            "physical_bytes_written": 0,
+            "bytes_read": 0,
+            "fsync_seconds": 0.0,
+            "digest_seconds": 0.0,
+            "write_seconds": 0.0,
+            "commits": 0,
+            "peak_retained_bytes": 0,
+        }
+
+    def _add_stat(self, name: str, value: float | int) -> None:
+        if isinstance(value, float):
+            self._stats[name] = float(self._stats.get(name, 0.0)) + max(0.0, value)
+        else:
+            self._stats[name] = int(self._stats.get(name, 0)) + int(value)
+
+    def _retained_bytes(self) -> int:
+        total = 0
+        try:
+            for path in self.root.iterdir():
+                if path.is_dir() and ".generation-" in path.name:
+                    total += sum(
+                        int(child.stat().st_size)
+                        for child in path.rglob("*")
+                        if child.is_file()
+                    )
+                elif path.is_file() and path.name.endswith(".pointer.json"):
+                    total += int(path.stat().st_size)
+        except OSError as exc:
+            raise CheckpointValidationError(
+                "unable to inspect checkpoint volume"
+            ) from exc
+        return total
+
+    def metrics(self) -> dict[str, float | int]:
+        result: dict[str, float | int] = dict(self._stats)
+        result["retained_bytes"] = self._retained_bytes()
+        result["peak_retained_bytes"] = max(
+            int(result.get("peak_retained_bytes", 0)), int(result["retained_bytes"])
+        )
+        self._stats["peak_retained_bytes"] = int(result["peak_retained_bytes"])
+        return result
 
     def _pointer(self, name: str) -> Path:
         return self.root / f"{_safe_name(name)}.pointer.json"
@@ -65,6 +109,7 @@ class VersionedCheckpointStore:
         checkpoint_name = _safe_name(name)
         generation = f"{checkpoint_name}.generation-{uuid.uuid4().hex}"
         temporary = self.root / f".{generation}.tmp"
+        write_started = time.perf_counter()
         temporary.mkdir()
         try:
             array_entries: dict[str, dict[str, Any]] = {}
@@ -78,12 +123,22 @@ class VersionedCheckpointStore:
                 with array_path.open("wb") as handle:
                     np.save(handle, array, allow_pickle=False)
                     handle.flush()
+                    sync_started = time.perf_counter()
                     os.fsync(handle.fileno())
+                    self._add_stat("fsync_seconds", time.perf_counter() - sync_started)
+                array_bytes = int(array_path.stat().st_size)
+                self._add_stat("array_bytes_written", array_bytes)
+                self._add_stat("bytes_written", array_bytes)
+                self._add_stat("physical_bytes_written", array_bytes)
+                digest_started = time.perf_counter()
+                digest = _digest_file(array_path)
+                self._add_stat("digest_seconds", time.perf_counter() - digest_started)
                 array_entries[array_name] = {
                     "name": array_path.name,
                     "dtype": str(array.dtype),
                     "shape": list(array.shape),
-                    "sha256": _digest_file(array_path),
+                    "bytes": array_bytes,
+                    "sha256": digest,
                 }
             payload = {
                 "schema": CHECKPOINT_SCHEMA_VERSION,
@@ -98,7 +153,10 @@ class VersionedCheckpointStore:
                 json.dump(payload, handle, sort_keys=True, separators=(",", ":"))
                 handle.write("\n")
                 handle.flush()
+                sync_started = time.perf_counter()
                 os.fsync(handle.fileno())
+                self._add_stat("fsync_seconds", time.perf_counter() - sync_started)
+            self._add_stat("physical_bytes_written", int(manifest_path.stat().st_size))
             final = self.root / generation
             os.replace(temporary, final)
             pointer_temporary = self.root / f".{checkpoint_name}.pointer-{uuid.uuid4().hex}.tmp"
@@ -107,8 +165,16 @@ class VersionedCheckpointStore:
                 json.dump(pointer_payload, handle, sort_keys=True, separators=(",", ":"))
                 handle.write("\n")
                 handle.flush()
+                sync_started = time.perf_counter()
                 os.fsync(handle.fileno())
+                self._add_stat("fsync_seconds", time.perf_counter() - sync_started)
+            self._add_stat("physical_bytes_written", int(pointer_temporary.stat().st_size))
             os.replace(pointer_temporary, self._pointer(checkpoint_name))
+            self._add_stat("commits", 1)
+            self._add_stat("write_seconds", time.perf_counter() - write_started)
+            self._stats["peak_retained_bytes"] = max(
+                int(self._stats.get("peak_retained_bytes", 0)), self._retained_bytes()
+            )
             return generation
         except BaseException:
             shutil.rmtree(temporary, ignore_errors=True)
@@ -165,7 +231,11 @@ class VersionedCheckpointStore:
             path = generation_path / filename
             if not path.is_file():
                 raise CheckpointValidationError(f"checkpoint array is missing: {array_name}")
-            if _digest_file(path) != entry.get("sha256"):
+            digest_started = time.perf_counter()
+            digest = _digest_file(path)
+            self._add_stat("digest_seconds", time.perf_counter() - digest_started)
+            self._add_stat("bytes_read", int(path.stat().st_size))
+            if digest != entry.get("sha256"):
                 raise CheckpointValidationError(f"checkpoint array checksum mismatch: {array_name}")
             try:
                 array = np.load(path, allow_pickle=False)
@@ -231,8 +301,8 @@ class IncrementalCheckpointStore:
     Data chunks are immutable directories.  Every commit writes a new
     manifest which references the old chunks plus one new contiguous range;
     only after that manifest is durable is the pointer atomically promoted.
-    The existing :class:`VersionedCheckpointStore` remains unchanged for LOO
-    and candidate aggregation checkpoints.
+    The versioned store remains the compatibility path for LOO and candidate
+    aggregation checkpoints; both stores expose operational write diagnostics.
     """
 
     _ARRAYS = ("neighbour_locations", "neighbour_distances")
@@ -248,10 +318,14 @@ class IncrementalCheckpointStore:
         self.resource_budget = resource_budget
         self._stats: dict[str, float | int] = {
             "bytes_written": 0,
+            "array_bytes_written": 0,
+            "physical_bytes_written": 0,
             "bytes_read": 0,
             "fsync_seconds": 0.0,
             "digest_seconds": 0.0,
+            "write_seconds": 0.0,
             "commits": 0,
+            "peak_retained_bytes": 0,
         }
 
     def _pointer(self, name: str) -> Path:
@@ -300,6 +374,8 @@ class IncrementalCheckpointStore:
                         for child in path.rglob("*")
                         if child.is_file()
                     )
+                elif path.is_file() and path.name.endswith(".incremental.pointer.json"):
+                    total += int(path.stat().st_size)
         except OSError as exc:
             raise CheckpointValidationError(
                 "unable to inspect incremental checkpoint volume"
@@ -596,6 +672,7 @@ class IncrementalCheckpointStore:
         pointer_temporary: Path | None = None
         started = time.perf_counter()
         bytes_written = 0
+        array_bytes_written = 0
         try:
             array_entries: dict[str, dict[str, Any]] = {}
             for array_name, array in zip(self._ARRAYS, (indices, distances), strict=True):
@@ -610,7 +687,7 @@ class IncrementalCheckpointStore:
                 digest = _digest_file(path)
                 self._add_stat("digest_seconds", time.perf_counter() - digest_started)
                 byte_count = int(path.stat().st_size)
-                bytes_written += byte_count
+                array_bytes_written += byte_count
                 array_entries[array_name] = {
                     "name": f"{chunk_name}/{path.name}",
                     "dtype": str(array.dtype),
@@ -650,6 +727,7 @@ class IncrementalCheckpointStore:
                 sync_started = time.perf_counter()
                 os.fsync(handle.fileno())
                 self._add_stat("fsync_seconds", time.perf_counter() - sync_started)
+            manifest_bytes = int(manifest_temporary.stat().st_size)
             os.replace(manifest_temporary, self.root / manifest_name)
             self._fsync_directory(self.root)
 
@@ -667,12 +745,22 @@ class IncrementalCheckpointStore:
                 sync_started = time.perf_counter()
                 os.fsync(handle.fileno())
                 self._add_stat("fsync_seconds", time.perf_counter() - sync_started)
+            pointer_bytes = int(pointer_temporary.stat().st_size)
             os.replace(pointer_temporary, self._pointer(checkpoint_name))
             self._fsync_directory(self.root)
-            self._add_stat("bytes_written", bytes_written)
+            bytes_written = array_bytes_written + manifest_bytes + pointer_bytes
+            self._add_stat("array_bytes_written", array_bytes_written)
+            self._add_stat("bytes_written", array_bytes_written)
+            self._add_stat("physical_bytes_written", bytes_written)
             self._add_stat("commits", 1)
+            self._add_stat("write_seconds", time.perf_counter() - started)
+            self._stats["peak_retained_bytes"] = max(
+                int(self._stats.get("peak_retained_bytes", 0)), self._retained_bytes()
+            )
             return {
-                "bytes_written": bytes_written,
+                "bytes_written": array_bytes_written,
+                "array_bytes_written": array_bytes_written,
+                "physical_bytes_written": bytes_written,
                 "write_seconds": max(0.0, time.perf_counter() - started),
             }
         except BaseException:
