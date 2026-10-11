@@ -17,6 +17,11 @@ import numpy as np
 
 from nepflow.resources.budget import ResourceBudgetService, ResourceCapacityError
 
+from .gpu_devices import (
+    contiguous_gpu_ranges,
+    normalize_gpu_devices,
+    validate_visible_gpu_devices,
+)
 from .models import KERNEL_SUPPORT_EXECUTION_GPU_VERSION
 
 
@@ -82,6 +87,7 @@ class ExactTiledGPUSupport:
         descriptors: np.ndarray,
         *,
         device: int = 0,
+        gpu_devices: Sequence[int] | str | int | None = None,
         tile_size: int = 128,
         max_device_bytes: int | None = None,
         max_host_bytes: int | None = None,
@@ -98,18 +104,62 @@ class ExactTiledGPUSupport:
         if int(device) < 0:
             raise ValueError("gpu_device must be a non-negative integer")
         self.descriptors = np.ascontiguousarray(values, dtype=np.float64)
-        self.device = int(device)
+        self.gpu_devices = normalize_gpu_devices(gpu_devices, gpu_device=int(device))
+        self.device = int(self.gpu_devices[0])
         self.requested_tile_size = _validate_positive_int(tile_size, "gpu_tile_size")
         self.resource_budget = resource_budget
         self.capacity_context = capacity_context
         self._cp = self._load_cupy()
         self._validate_device()
 
+        # Construct every requested worker before the first query.  This makes
+        # a missing device or insufficient per-device capacity fail atomically
+        # and keeps the readonly descriptor pool complete on every worker.
+        self._workers: tuple[ExactTiledGPUSupport, ...] = ()
+        if len(self.gpu_devices) > 1:
+            worker_list: list[ExactTiledGPUSupport] = []
+            try:
+                for worker_device in self.gpu_devices:
+                    worker_list.append(
+                        ExactTiledGPUSupport(
+                            self.descriptors,
+                            device=worker_device,
+                            tile_size=tile_size,
+                            max_device_bytes=max_device_bytes,
+                            max_host_bytes=max_host_bytes,
+                            resource_budget=resource_budget,
+                            capacity_context=capacity_context,
+                        )
+                    )
+            except BaseException:
+                for worker in worker_list:
+                    worker.close()
+                raise
+            self._workers = tuple(worker_list)
+            self.source_tile_size = min(worker.source_tile_size for worker in self._workers)
+            self.max_device_bytes = max(worker.max_device_bytes for worker in self._workers)
+            self.max_host_bytes = max(worker.max_host_bytes for worker in self._workers)
+            self.device_total_bytes = max(worker.device_total_bytes for worker in self._workers)
+            self.device_free_bytes = max(worker.device_free_bytes for worker in self._workers)
+            self.device_workspace_peak_bytes = 0
+            self.host_workspace_peak_bytes = 0
+            self.source_tiles = 0
+            self.target_tiles = 0
+            self.fp64_evaluations = 0
+            self.ambiguous_boundary_count = 0
+            self.cpu_rescanned_count = 0
+            self.h2d_bytes = 0
+            self.d2h_bytes = 0
+            self.gpu_seconds = 0.0
+            self.cpu_verification_seconds = 0.0
+            self.support_query_count = 0
+            self.support_entries = 0
+            self.support_query_seconds = 0.0
+            return
+
         free_bytes, total_bytes = self._device_memory_info()
         if total_bytes < 1 or free_bytes < 1:
-            raise GPUDeviceValidationError(
-                f"CUDA device {self.device} reported no usable memory"
-            )
+            raise GPUDeviceValidationError(f"CUDA device {self.device} reported no usable memory")
         if max_device_bytes is not None:
             self.max_device_bytes = min(
                 _validate_positive_int(max_device_bytes, "max_gpu_support_bytes"),
@@ -138,8 +188,22 @@ class ExactTiledGPUSupport:
             )
         host_limit = max_host_bytes if max_host_bytes is not None else remaining_host
         if remaining_host is not None:
+            if host_limit is None:  # narrowed by the preceding allowance check
+                raise GPUCapacityError(
+                    "exact tiled GPU support has no allocatable host workspace",
+                    operation="exact tiled GPU support",
+                    requested_bytes=1,
+                    available_bytes=remaining_host,
+                )
             host_limit = min(int(host_limit), int(remaining_host))
-        if host_limit is None or int(host_limit) < 1:
+        if host_limit is None:
+            raise GPUCapacityError(
+                "exact tiled GPU support has no allocatable host workspace",
+                operation="exact tiled GPU support",
+                requested_bytes=1,
+                available_bytes=host_limit,
+            )
+        if int(host_limit) < 1:
             raise GPUCapacityError(
                 "exact tiled GPU support has no allocatable host workspace",
                 operation="exact tiled GPU support",
@@ -189,15 +253,12 @@ class ExactTiledGPUSupport:
 
     def _validate_device(self) -> None:
         try:
-            count = int(self._cp.cuda.runtime.getDeviceCount())
+            validate_visible_gpu_devices(self._cp, self.gpu_devices)
         except Exception as exc:  # pragma: no cover - depends on CUDA runtime
             raise GPUDeviceValidationError(
-                f"unable to query visible CUDA devices for gpu_device={self.device}: {exc}"
+                f"requested gpu_devices={self.gpu_devices} (gpu_device={self.device}) "
+                f"are not visible: {exc}"
             ) from exc
-        if self.device >= count:
-            raise GPUDeviceValidationError(
-                f"gpu_device={self.device} is not visible; CUDA device count is {count}"
-            )
 
     def _device_memory_info(self) -> tuple[int, int]:
         try:
@@ -256,9 +317,7 @@ class ExactTiledGPUSupport:
                 (source_indices.size, target_indices.size), dtype=cp.float64
             )
             for dimension in range(self.descriptors.shape[1]):
-                delta = (
-                    gpu_targets[None, :, dimension] - gpu_sources[:, None, dimension]
-                )
+                delta = gpu_targets[None, :, dimension] - gpu_sources[:, None, dimension]
                 distance_squared += delta * delta
             gpu_distances = cp.sqrt(distance_squared)
             host_distances = np.asarray(cp.asnumpy(gpu_distances), dtype=np.float64)
@@ -271,12 +330,8 @@ class ExactTiledGPUSupport:
         # squaring, summation and square-root in IEEE float64.  If scaling the
         # enclosure is itself unsafe, every candidate is CPU certified rather
         # than making an uncertified decision.
-        source_norm = np.sqrt(
-            np.sum(np.abs(source_values) ** 2, axis=1, dtype=np.float64)
-        )
-        target_norm = np.sqrt(
-            np.sum(np.abs(target_values) ** 2, axis=1, dtype=np.float64)
-        )
+        source_norm = np.sqrt(np.sum(np.abs(source_values) ** 2, axis=1, dtype=np.float64))
+        target_norm = np.sqrt(np.sum(np.abs(target_values) ** 2, axis=1, dtype=np.float64))
         scale = np.maximum(1.0, source_norm[:, None] + target_norm[None, :])
         with np.errstate(over="ignore", invalid="ignore"):
             bound = np.finfo(np.float64).eps * (1024.0 + 32.0 * self.descriptors.shape[1]) * scale
@@ -313,6 +368,31 @@ class ExactTiledGPUSupport:
             raise ValueError("source_indices contains an out-of-range row")
         if not np.all(np.isfinite(scales)) or np.any(scales <= 0.0):
             raise ValueError("GPU support radii must be finite and strictly positive")
+        if self._workers:
+            target_parts: list[np.ndarray] = []
+            distance_parts: list[np.ndarray] = []
+            offsets = np.zeros(sources.size + 1, dtype=np.int64)
+            for _device, start, stop in contiguous_gpu_ranges(int(sources.size), self.gpu_devices):
+                if start == stop:
+                    continue
+                worker_offsets, worker_targets, worker_distances = self._workers[
+                    self.gpu_devices.index(_device)
+                ].support_many(sources[start:stop], scales[start:stop])
+                target_parts.append(worker_targets)
+                distance_parts.append(worker_distances)
+                offsets[start + 1 : stop + 1] = worker_offsets[1:] + offsets[start]
+            targets = (
+                np.asarray(np.concatenate(target_parts), dtype=np.int64)
+                if target_parts
+                else np.empty(0, dtype=np.int64)
+            )
+            distances = (
+                np.asarray(np.concatenate(distance_parts), dtype=np.float64)
+                if distance_parts
+                else np.empty(0, dtype=np.float64)
+            )
+            self._aggregate_worker_metrics()
+            return offsets, targets, distances
         device_source_tile_size, _, _ = self._tile_shape(sources.size)
         source_tile_limit = min(self.source_tile_size, device_source_tile_size)
         if sources.size > source_tile_limit:
@@ -340,9 +420,7 @@ class ExactTiledGPUSupport:
                 )
                 target_parts.append(tile_targets)
                 distance_parts.append(tile_distances)
-                offsets[start + 1 : stop + 1] = (
-                    tile_offsets[1:] + offsets[start]
-                )
+                offsets[start + 1 : stop + 1] = tile_offsets[1:] + offsets[start]
             return (
                 offsets,
                 np.asarray(np.concatenate(target_parts), dtype=np.int64),
@@ -351,18 +429,22 @@ class ExactTiledGPUSupport:
         started = time.perf_counter()
         offsets = np.zeros(sources.size + 1, dtype=np.int64)
         target_count = int(self.descriptors.shape[0])
-        with self.resource_budget.acquire(
-            "exact tiled GPU support",
-            min(
-                self.max_host_bytes,
-                max(
-                    1,
-                    48 * sources.size * target_count
-                    + 16 * sources.size * self.descriptors.shape[1]
-                    + 32768,
+        with (
+            self.resource_budget.acquire(
+                "exact tiled GPU support",
+                min(
+                    self.max_host_bytes,
+                    max(
+                        1,
+                        48 * sources.size * target_count
+                        + 16 * sources.size * self.descriptors.shape[1]
+                        + 32768,
+                    ),
                 ),
-            ),
-        ) if self.resource_budget is not None else _NullLease():
+            )
+            if self.resource_budget is not None
+            else _NullLease()
+        ):
             source_targets: list[list[np.ndarray]] = [[] for _ in range(sources.size)]
             source_distances: list[list[np.ndarray]] = [[] for _ in range(sources.size)]
             _, target_tile_size, _ = self._tile_shape(sources.size)
@@ -432,11 +514,50 @@ class ExactTiledGPUSupport:
         return offsets, targets, distances
 
     def operational_metrics(self) -> dict[str, Any]:
+        if self._workers:
+            self._aggregate_worker_metrics()
+            per_device = [worker.operational_metrics() for worker in self._workers]
+            aggregate = {
+                "support_execution": self.backend,
+                "support_execution_version": self.backend_version,
+                "gpu_devices": list(self.gpu_devices),
+                "gpu_device_count": len(self.gpu_devices),
+                "gpu_device": self.device,
+                "gpu_tile_size": self.requested_tile_size,
+                "gpu_max_device_bytes": self.max_device_bytes,
+                "gpu_total_bytes": self.device_total_bytes,
+                "gpu_free_bytes": self.device_free_bytes,
+                "gpu_source_tile_size": self.source_tile_size,
+                "gpu_device_workspace_peak_bytes": self.device_workspace_peak_bytes,
+                "gpu_host_workspace_peak_bytes": self.host_workspace_peak_bytes,
+                "gpu_source_tiles": self.source_tiles,
+                "gpu_target_tiles": self.target_tiles,
+                "gpu_fp64_evaluations": self.fp64_evaluations,
+                "gpu_ambiguous_boundary_count": self.ambiguous_boundary_count,
+                "gpu_exact_boundary_recertifications": self.ambiguous_boundary_count,
+                "gpu_cpu_rescanned_count": self.cpu_rescanned_count,
+                "gpu_h2d_bytes": self.h2d_bytes,
+                "gpu_d2h_bytes": self.d2h_bytes,
+                "gpu_seconds": self.gpu_seconds,
+                "gpu_cpu_verification_seconds": self.cpu_verification_seconds,
+                "support_query_count": self.support_query_count,
+                "support_entries": self.support_entries,
+                "support_query_seconds": self.support_query_seconds,
+                "support_query_throughput_per_second": (
+                    self.support_query_count / self.support_query_seconds
+                    if self.support_query_seconds > 0.0
+                    else 0.0
+                ),
+                "gpu_per_device": per_device,
+            }
+            return aggregate
         free_bytes, total_bytes = self._device_memory_info()
         return {
             "support_execution": self.backend,
             "support_execution_version": self.backend_version,
             "gpu_device": self.device,
+            "gpu_devices": [self.device],
+            "gpu_device_count": 1,
             "gpu_tile_size": self.requested_tile_size,
             "gpu_max_device_bytes": self.max_device_bytes,
             "gpu_free_bytes": free_bytes,
@@ -451,6 +572,7 @@ class ExactTiledGPUSupport:
             "gpu_target_tiles": self.target_tiles,
             "gpu_fp64_evaluations": self.fp64_evaluations,
             "gpu_ambiguous_boundary_count": self.ambiguous_boundary_count,
+            "gpu_exact_boundary_recertifications": self.ambiguous_boundary_count,
             "gpu_cpu_rescanned_count": self.cpu_rescanned_count,
             "gpu_h2d_bytes": self.h2d_bytes,
             "gpu_d2h_bytes": self.d2h_bytes,
@@ -460,7 +582,81 @@ class ExactTiledGPUSupport:
             "support_query_count": self.support_query_count,
             "support_entries": self.support_entries,
             "support_query_seconds": self.support_query_seconds,
+            "support_query_throughput_per_second": (
+                self.support_query_count / self.support_query_seconds
+                if self.support_query_seconds > 0.0
+                else 0.0
+            ),
         }
+
+    def _aggregate_worker_metrics(self) -> None:
+        """Refresh bounded aggregate counters after a multi-device query."""
+
+        if not self._workers:
+            return
+        metrics = [worker.operational_metrics() for worker in self._workers]
+        for name in (
+            "source_tiles",
+            "target_tiles",
+            "fp64_evaluations",
+            "ambiguous_boundary_count",
+            "cpu_rescanned_count",
+            "h2d_bytes",
+            "d2h_bytes",
+            "support_query_count",
+            "support_entries",
+        ):
+            setattr(
+                self,
+                name,
+                sum(
+                    int(
+                        item.get(
+                            {
+                                "source_tiles": "gpu_source_tiles",
+                                "target_tiles": "gpu_target_tiles",
+                                "fp64_evaluations": "gpu_fp64_evaluations",
+                                "ambiguous_boundary_count": "gpu_ambiguous_boundary_count",
+                                "cpu_rescanned_count": "gpu_cpu_rescanned_count",
+                                "h2d_bytes": "gpu_h2d_bytes",
+                                "d2h_bytes": "gpu_d2h_bytes",
+                                "support_query_count": "support_query_count",
+                                "support_entries": "support_entries",
+                            }[name],
+                            0,
+                        )
+                        or 0
+                    )
+                    for item in metrics
+                ),
+            )
+        self.device_workspace_peak_bytes = max(
+            int(item.get("gpu_device_workspace_peak_bytes", 0) or 0) for item in metrics
+        )
+        self.host_workspace_peak_bytes = max(
+            int(item.get("gpu_host_workspace_peak_bytes", 0) or 0) for item in metrics
+        )
+        self.gpu_seconds = sum(float(item.get("gpu_seconds", 0.0) or 0.0) for item in metrics)
+        self.cpu_verification_seconds = sum(
+            float(item.get("gpu_cpu_verification_seconds", 0.0) or 0.0) for item in metrics
+        )
+        self.support_query_seconds = sum(
+            float(item.get("support_query_seconds", 0.0) or 0.0) for item in metrics
+        )
+
+    def close(self) -> None:
+        """Release device-pool allocations held by this provider and workers."""
+
+        for worker in self._workers:
+            worker.close()
+        try:
+            with self._cp.cuda.Device(self.device):
+                for name in ("get_default_memory_pool", "get_default_pinned_memory_pool"):
+                    pool_factory = getattr(self._cp, name, None)
+                    if pool_factory is not None:
+                        pool_factory().free_all_blocks()
+        except Exception:
+            pass
 
 
 class _NullLease:
@@ -469,4 +665,3 @@ class _NullLease:
 
     def __exit__(self, *_args: object) -> None:
         return None
-

@@ -700,6 +700,7 @@ def parse_selection(values: Mapping[str, str]) -> SelectionConfig:
             value("entropy_gpu_device", "0", "gpu_device"),
             "selection.entropy_gpu_device",
         ),
+        gpu_devices=(value("entropy_gpu_devices", "", "gpu_devices").strip() or None),
         gpu_tile_size=_parse_int(
             value("entropy_gpu_tile_size", "128", "gpu_tile_size"),
             "selection.entropy_gpu_tile_size",

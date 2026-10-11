@@ -349,6 +349,7 @@ class EntropyBandwidthConfig:
     calibration_batch_size: int | None = None
     kernel_support_execution: str = "cpu"
     gpu_device: int = 0
+    gpu_devices: tuple[int, ...] | str | None = None
     gpu_tile_size: int = 128
     max_gpu_support_bytes: int | None = None
     max_gpu_neighbour_bytes: int | None = None

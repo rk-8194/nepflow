@@ -584,9 +584,7 @@ class IndexedCPUNeighbourIndex:
     ) -> None:
         """Accumulate deterministic operational phase evidence."""
 
-        self._phase_seconds[name] = self._phase_seconds.get(name, 0.0) + max(
-            0.0, float(elapsed)
-        )
+        self._phase_seconds[name] = self._phase_seconds.get(name, 0.0) + max(0.0, float(elapsed))
         self._phase_counts[name] = self._phase_counts.get(name, 0) + int(count)
         if bytes_written:
             self._phase_bytes[name] = self._phase_bytes.get(name, 0) + int(bytes_written)
@@ -823,8 +821,7 @@ class IndexedCPUNeighbourIndex:
             block = available // bytes_per_row
             if block < 1:
                 raise RadiusQueryCapacityError(
-                    "indexed neighbour batched distance workspace exceeds "
-                    "max_radius_query_bytes"
+                    "indexed neighbour batched distance workspace exceeds max_radius_query_bytes"
                 )
             block = min(total, int(block))
 
@@ -845,9 +842,7 @@ class IndexedCPUNeighbourIndex:
                     targets = self.unique_locations[flat_candidates[start:stop]]
                     delta = targets - query_values[owners[start:stop]]
                     squared = delta**2
-                    distances[start:stop] = np.sqrt(
-                        np.sum(squared, axis=1, dtype=np.float64)
-                    )
+                    distances[start:stop] = np.sqrt(np.sum(squared, axis=1, dtype=np.float64))
             except FloatingPointError as exc:
                 raise ValueError(
                     "indexed neighbour batched distance evaluation overflowed or became invalid"
@@ -887,8 +882,7 @@ class IndexedCPUNeighbourIndex:
             )
             if row_block < 1:
                 raise RadiusQueryCapacityError(
-                    "indexed neighbour matrix distance workspace exceeds "
-                    "max_radius_query_bytes"
+                    "indexed neighbour matrix distance workspace exceeds max_radius_query_bytes"
                 )
             row_block = min(row_count, int(row_block))
         with np.errstate(over="raise", invalid="raise"):
@@ -898,9 +892,7 @@ class IndexedCPUNeighbourIndex:
                     targets = self.unique_locations[candidates[start:stop]]
                     delta = targets - query_values[start:stop, None, :]
                     squared = delta**2
-                    distances[start:stop] = np.sqrt(
-                        np.sum(squared, axis=2, dtype=np.float64)
-                    )
+                    distances[start:stop] = np.sqrt(np.sum(squared, axis=2, dtype=np.float64))
             except FloatingPointError as exc:
                 raise ValueError(
                     "indexed neighbour matrix distance evaluation overflowed or became invalid"
@@ -983,9 +975,7 @@ class IndexedCPUNeighbourIndex:
                 requested_bytes=self.max_radius_query_bytes + 1,
                 context="SciPy cKDTree does not support return_length preflight",
             ) from exc
-        self._record_phase(
-            "radius_preflight_count", time.perf_counter() - preflight_started
-        )
+        self._record_phase("radius_preflight_count", time.perf_counter() - preflight_started)
         candidate_estimate = _estimate_radius_workspace_bytes(
             candidate_count,
             0,
@@ -1162,9 +1152,7 @@ class IndexedCPUNeighbourIndex:
             return None
         with np.errstate(over="raise", under="raise", invalid="raise"):
             try:
-                delta = np.asarray(target, dtype=np.float64) - np.asarray(
-                    query, dtype=np.float64
-                )
+                delta = np.asarray(target, dtype=np.float64) - np.asarray(query, dtype=np.float64)
                 squared = delta * delta
                 squared_sum = np.sum(squared, dtype=np.float64)
             except FloatingPointError:
@@ -1283,10 +1271,7 @@ class IndexedCPUNeighbourIndex:
             or tree_excluded is None
         ):
             return False
-        return bool(
-            canonical_kth[1] < canonical_excluded[0]
-            and tree_kth[1] < tree_excluded[0]
-        )
+        return bool(canonical_kth[1] < canonical_excluded[0] and tree_kth[1] < tree_excluded[0])
 
     def _compute_location_neighbours(
         self,
@@ -1458,8 +1443,7 @@ class IndexedCPUNeighbourIndex:
                 checkpoint_store is not None
                 and checkpoint_identity is not None
                 and (
-                    completed_stop - checkpoint_cursor
-                    >= int(checkpoint_every_locations)
+                    completed_stop - checkpoint_cursor >= int(checkpoint_every_locations)
                     or completed_stop == n_locations
                 )
             ):
@@ -1480,9 +1464,7 @@ class IndexedCPUNeighbourIndex:
                 self._record_phase(
                     "checkpoint_serialization",
                     float(
-                        write_metrics.get(
-                            "write_seconds", time.perf_counter() - checkpoint_started
-                        )
+                        write_metrics.get("write_seconds", time.perf_counter() - checkpoint_started)
                     ),
                     bytes_written=int(
                         write_metrics.get(
@@ -1646,8 +1628,7 @@ class IndexedCPUNeighbourIndex:
                 )
                 if initial_rows < 1:
                     raise RadiusQueryCapacityError(
-                        "indexed kNN canonical distance workspace exceeds "
-                        "max_radius_query_bytes"
+                        "indexed kNN canonical distance workspace exceeds max_radius_query_bytes"
                     )
                 initial_workspace = int(initial_fixed + initial_tile * initial_rows)
                 self.query_workspace_peak_bytes = max(
@@ -1748,18 +1729,21 @@ class IndexedCPUNeighbourIndex:
                 ordered_distances = distances[order]
                 sorted_candidates.append(candidates[order])
                 sorted_distances.append(ordered_distances)
-                if not self._certified_knn_boundary(
-                    queries[offset],
-                    self.unique_locations[sorted_candidates[offset][-1]],
-                    self.unique_locations[excluded_candidates[offset, 0]],
-                    self.unique_locations[initial_candidates[offset, -1]],
-                    self.unique_locations[excluded_candidates[offset, 0]],
-                    ordered_distances[-1],
-                    excluded_distances[offset, 0],
-                    tree_kth_distances[offset],
-                    tree_excluded_distances[offset],
-                    dimension=int(self.unique_locations.shape[1]),
-                ) or not has_excluded_candidate[offset]:
+                if (
+                    not self._certified_knn_boundary(
+                        queries[offset],
+                        self.unique_locations[sorted_candidates[offset][-1]],
+                        self.unique_locations[excluded_candidates[offset, 0]],
+                        self.unique_locations[initial_candidates[offset, -1]],
+                        self.unique_locations[excluded_candidates[offset, 0]],
+                        ordered_distances[-1],
+                        excluded_distances[offset, 0],
+                        tree_kth_distances[offset],
+                        tree_excluded_distances[offset],
+                        dimension=int(self.unique_locations.shape[1]),
+                    )
+                    or not has_excluded_candidate[offset]
+                ):
                     boundary_certified[offset] = False
                     chunk_certified = False
             self._record_phase(
@@ -1833,10 +1817,7 @@ class IndexedCPUNeighbourIndex:
             )
             preflight_started = time.perf_counter()
             preflight_call_workspace = int(
-                8 * self.unique_locations.shape[1] * (stop - start)
-                + 32 * (stop - start)
-                + 8
-                + 1024
+                8 * self.unique_locations.shape[1] * (stop - start) + 32 * (stop - start) + 8 + 1024
             )
             try:
                 with self.resource_budget.acquire(
@@ -1994,9 +1975,7 @@ class IndexedCPUNeighbourIndex:
                 boundary_candidates,
                 persistent_workspace_bytes=boundary_persistent_bytes,
             )
-            boundary_total = int(
-                sum(int(candidate.size) for candidate in boundary_candidates)
-            )
+            boundary_total = int(sum(int(candidate.size) for candidate in boundary_candidates))
             boundary_available = self.max_radius_query_bytes - boundary_fixed
             if boundary_available < boundary_tile:
                 if stop - start <= 1:
@@ -2018,16 +1997,17 @@ class IndexedCPUNeighbourIndex:
                 boundary_total,
                 max(1, boundary_available // boundary_tile),
             )
-            boundary_distance_workspace = int(
-                boundary_fixed + boundary_tile_count * boundary_tile
-            )
+            boundary_distance_workspace = int(boundary_fixed + boundary_tile_count * boundary_tile)
             boundary_sort_workspace = int(
                 max(
-                    (_estimate_radius_workspace_bytes(
-                        int(count),
-                        0,
-                        self.descriptors.shape[1],
-                    ) for count in candidate_counts),
+                    (
+                        _estimate_radius_workspace_bytes(
+                            int(count),
+                            0,
+                            self.descriptors.shape[1],
+                        )
+                        for count in candidate_counts
+                    ),
                     default=0,
                 )
                 + queries.nbytes
@@ -2267,10 +2247,7 @@ class IndexedCPUNeighbourIndex:
                 batch_sources = source_rows[source_cursor:stop]
                 batch_radii = values[source_cursor:stop]
                 preflight_call_workspace = int(
-                    8 * dimension * batch_sources.size
-                    + 32 * batch_sources.size
-                    + 8
-                    + 1024
+                    8 * dimension * batch_sources.size + 32 * batch_sources.size + 8 + 1024
                 )
                 preflight_started = time.perf_counter()
                 try:
@@ -2298,8 +2275,7 @@ class IndexedCPUNeighbourIndex:
                         radius=float(batch_radii[0]),
                         requested_bytes=self.max_radius_query_bytes + 1,
                         context=(
-                            context
-                            or "SciPy cKDTree does not support vectorized radius preflight"
+                            context or "SciPy cKDTree does not support vectorized radius preflight"
                         ),
                     ) from exc
                 except ResourceCapacityError:
@@ -2385,8 +2361,7 @@ class IndexedCPUNeighbourIndex:
                 possible_support_counts = [
                     int(
                         np.sum(
-                            self.location_indptr[candidate + 1]
-                            - self.location_indptr[candidate],
+                            self.location_indptr[candidate + 1] - self.location_indptr[candidate],
                             dtype=np.int64,
                         )
                     )
@@ -2399,22 +2374,15 @@ class IndexedCPUNeighbourIndex:
                 # spacing/max temporaries and the tree's ragged container are
                 # admitted conservatively as well.
                 persistent_distance_bytes = int(
-                    candidate_storage_bytes
-                    + expanded.nbytes
-                    + 16 * batch_sources.size
-                    + 1024
+                    candidate_storage_bytes + expanded.nbytes + 16 * batch_sources.size + 1024
                 )
-                distance_fixed_bytes, distance_tile_bytes = (
-                    self._distance_values_many_workspace(
-                        queries,
-                        candidate_lists,
-                        persistent_workspace_bytes=persistent_distance_bytes,
-                    )
+                distance_fixed_bytes, distance_tile_bytes = self._distance_values_many_workspace(
+                    queries,
+                    candidate_lists,
+                    persistent_workspace_bytes=persistent_distance_bytes,
                 )
                 distance_total = int(np.sum(candidate_counts_actual, dtype=np.int64))
-                available_distance_bytes = (
-                    self.max_radius_query_bytes - distance_fixed_bytes
-                )
+                available_distance_bytes = self.max_radius_query_bytes - distance_fixed_bytes
                 if available_distance_bytes < distance_tile_bytes:
                     raise self._capacity_error(
                         source_index=int(batch_sources[0]),
@@ -2533,9 +2501,9 @@ class IndexedCPUNeighbourIndex:
                 self.distance_evaluations += int(sum(batch_support_counts))
                 self.atomic_distance_evaluations += int(sum(batch_support_counts))
                 for local_index, support_count in enumerate(batch_support_counts):
-                    offsets[source_cursor + local_index + 1] = offsets[
-                        source_cursor + local_index
-                    ] + support_count
+                    offsets[source_cursor + local_index + 1] = (
+                        offsets[source_cursor + local_index] + support_count
+                    )
                     self.current_support_count = support_count
                     if self.min_support_count is None:
                         self.min_support_count = support_count
@@ -2839,8 +2807,7 @@ class TiledCPUNeighbourIndex:
         available_workspace = self.max_radius_query_bytes - fixed_workspace
         if available_workspace < bytes_per_target:
             raise RadiusQueryCapacityError(
-                "tiled exact neighbour distance workspace exceeds "
-                "max_radius_query_bytes"
+                "tiled exact neighbour distance workspace exceeds max_radius_query_bytes"
             )
         tile = min(count, max(1, available_workspace // bytes_per_target))
         workspace = int(fixed_workspace + tile * bytes_per_target)
@@ -4122,6 +4089,7 @@ def build_neighbour_index(
     max_radius_query_bytes: int | None = None,
     max_neighbour_cache_bytes: int | None = DEFAULT_NEIGHBOUR_CACHE_BYTES,
     gpu_device: int = 0,
+    gpu_devices: Sequence[int] | str | int | None = None,
     gpu_tile_size: int = 128,
     max_gpu_neighbour_bytes: int | None = None,
     resource_budget: ResourceBudgetService | None = None,
@@ -4151,6 +4119,7 @@ def build_neighbour_index(
         return ExactTiledGPUNeighbourIndex(
             descriptors,
             device=gpu_device,
+            gpu_devices=gpu_devices,
             gpu_tile_size=gpu_tile_size,
             max_device_bytes=max_gpu_neighbour_bytes,
             tile_size=tile_size,
@@ -4174,6 +4143,7 @@ def compute_radius_support(
     chunk_size: int = 1024,
     max_radius_query_bytes: int | None = None,
     gpu_device: int = 0,
+    gpu_devices: Sequence[int] | str | int | None = None,
     gpu_tile_size: int = 128,
     max_gpu_neighbour_bytes: int | None = None,
     resource_budget: ResourceBudgetService | None = None,
@@ -4213,10 +4183,14 @@ def compute_radius_support(
                 remaining,
             )
         )
-    if backend in {
-        INDEXED_NEIGHBOUR_BACKEND_ID,
-        TILED_NEIGHBOUR_BACKEND_ID,
-    } or backend in GPU_NEIGHBOUR_BACKEND_ALIASES:
+    if (
+        backend
+        in {
+            INDEXED_NEIGHBOUR_BACKEND_ID,
+            TILED_NEIGHBOUR_BACKEND_ID,
+        }
+        or backend in GPU_NEIGHBOUR_BACKEND_ALIASES
+    ):
         active_index = (
             index
             if index is not None
@@ -4226,6 +4200,7 @@ def compute_radius_support(
                 tile_size=block,
                 max_radius_query_bytes=limit,
                 gpu_device=gpu_device,
+                gpu_devices=gpu_devices,
                 gpu_tile_size=gpu_tile_size,
                 max_gpu_neighbour_bytes=max_gpu_neighbour_bytes,
                 resource_budget=resource_budget,
@@ -4410,7 +4385,7 @@ __all__ = [
     "TiledCPUNeighbourIndex",
     "GPU_NEIGHBOUR_BACKEND_ID",
     "GPU_NEIGHBOUR_BACKEND_VERSION",
-    "ExactTiledGPUNeighbourIndex",
+    "ExactTiledGPUNeighbourIndex",  # noqa: F822 - lazy optional GPU export
     "NeighbourBackendCapabilities",
     "NeighbourResult",
     "RadiusQueryCapacityError",
@@ -4426,10 +4401,10 @@ __all__ = [
     "compute_kth_distinct_neighbour_radii",
     "compute_kth_distinct_neighbours",
     "compute_neighbours",
-    "compute_gpu_tiled_neighbours",
-    "compute_gpu_tiled_neighbours_many",
-    "compute_tiled_gpu_neighbours",
-    "compute_tiled_gpu_neighbours_many",
+    "compute_gpu_tiled_neighbours",  # noqa: F822 - lazy optional GPU export
+    "compute_gpu_tiled_neighbours_many",  # noqa: F822 - lazy optional GPU export
+    "compute_tiled_gpu_neighbours",  # noqa: F822 - lazy optional GPU export
+    "compute_tiled_gpu_neighbours_many",  # noqa: F822 - lazy optional GPU export
     "exact_neighbour_search",
     "exact_kth_distinct_neighbour_radii",
     "kth_distinct_neighbour_radii",

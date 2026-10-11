@@ -221,6 +221,7 @@ class _KernelSupportProvider:
         capacity_context: str | None = None,
         kernel_support_execution: str = KERNEL_SUPPORT_EXECUTION_CPU,
         gpu_device: int = 0,
+        gpu_devices: Sequence[int] | str | int | None = None,
         gpu_tile_size: int = 128,
         max_gpu_support_bytes: int | None = None,
         max_gpu_neighbour_bytes: int | None = None,
@@ -264,15 +265,16 @@ class _KernelSupportProvider:
         if self.support_execution == "exact_cpu":
             self.support_execution = KERNEL_SUPPORT_EXECUTION_CPU
         if self.support_execution not in KERNEL_SUPPORT_EXECUTIONS:
-            raise ValueError(
-                "kernel_support_execution must be 'cpu' or 'exact_tiled_gpu'"
-            )
+            raise ValueError("kernel_support_execution must be 'cpu' or 'exact_tiled_gpu'")
         self.support_execution_version = (
             KERNEL_SUPPORT_EXECUTION_GPU_VERSION
             if self.support_execution == KERNEL_SUPPORT_EXECUTION_GPU
             else "cpu-canonical-v1"
         )
         self.gpu_support: Any = None
+        from .gpu_devices import normalize_gpu_devices
+
+        self.gpu_devices = normalize_gpu_devices(gpu_devices, gpu_device=gpu_device)
         if max_gpu_neighbour_bytes is None and backend == GPU_NEIGHBOUR_BACKEND_ID:
             # Older public kernel entry points expose only the support limit.
             # Reusing it as a conservative device ceiling preserves their
@@ -293,6 +295,7 @@ class _KernelSupportProvider:
                     tile_size=chunk_size,
                     max_radius_query_bytes=self.max_radius_query_bytes,
                     gpu_device=gpu_device,
+                    gpu_devices=self.gpu_devices,
                     gpu_tile_size=gpu_tile_size,
                     max_gpu_neighbour_bytes=max_gpu_neighbour_bytes,
                     resource_budget=self.resource_budget,
@@ -324,6 +327,7 @@ class _KernelSupportProvider:
             self.gpu_support = ExactTiledGPUSupport(
                 self.descriptors,
                 device=gpu_device,
+                gpu_devices=self.gpu_devices,
                 tile_size=gpu_tile_size,
                 max_device_bytes=max_gpu_support_bytes,
                 max_host_bytes=self.max_radius_query_bytes,
@@ -508,9 +512,7 @@ class _KernelSupportProvider:
                 else 0.0
             ),
             "support_entries": int(self.support_entries),
-            "support_density_mean": total / (count * self.descriptors.shape[0])
-            if count
-            else 0.0,
+            "support_density_mean": total / (count * self.descriptors.shape[0]) if count else 0.0,
             "support_count_min": self.min_support_count,
             "support_count_mean": total / count if count else None,
             "support_count_max": int(self.max_support_count),
@@ -579,6 +581,7 @@ def source_normalisers(
     capacity_context: str | None = None,
     kernel_support_execution: str = KERNEL_SUPPORT_EXECUTION_CPU,
     gpu_device: int = 0,
+    gpu_devices: Sequence[int] | str | int | None = None,
     gpu_tile_size: int = 128,
     max_gpu_support_bytes: int | None = None,
 ) -> np.ndarray:
@@ -597,6 +600,7 @@ def source_normalisers(
         capacity_context=capacity_context,
         kernel_support_execution=kernel_support_execution,
         gpu_device=gpu_device,
+        gpu_devices=gpu_devices,
         gpu_tile_size=gpu_tile_size,
         max_gpu_support_bytes=max_gpu_support_bytes,
     )
@@ -636,6 +640,7 @@ def iter_normalized_kernel_columns(
     source_indices: Sequence[int] | np.ndarray | None = None,
     kernel_support_execution: str = KERNEL_SUPPORT_EXECUTION_CPU,
     gpu_device: int = 0,
+    gpu_devices: Sequence[int] | str | int | None = None,
     gpu_tile_size: int = 128,
     max_gpu_support_bytes: int | None = None,
 ) -> Iterator[NormalizedKernelColumn]:
@@ -660,6 +665,7 @@ def iter_normalized_kernel_columns(
         capacity_context=capacity_context,
         kernel_support_execution=kernel_support_execution,
         gpu_device=gpu_device,
+        gpu_devices=gpu_devices,
         gpu_tile_size=gpu_tile_size,
         max_gpu_support_bytes=max_gpu_support_bytes,
     )
@@ -762,6 +768,7 @@ def evaluate_leave_one_out_objective(
     diagnostics: dict[str, Any] | None = None,
     kernel_support_execution: str = KERNEL_SUPPORT_EXECUTION_CPU,
     gpu_device: int = 0,
+    gpu_devices: Sequence[int] | str | int | None = None,
     gpu_tile_size: int = 128,
     max_gpu_support_bytes: int | None = None,
 ) -> LeaveOneOutObjective:
@@ -786,6 +793,7 @@ def evaluate_leave_one_out_objective(
             diagnostics=diagnostics,
             kernel_support_execution=kernel_support_execution,
             gpu_device=gpu_device,
+            gpu_devices=gpu_devices,
             gpu_tile_size=gpu_tile_size,
             max_gpu_support_bytes=max_gpu_support_bytes,
         )
@@ -820,6 +828,7 @@ def evaluate_leave_one_out_objective(
         capacity_context=capacity_context,
         kernel_support_execution=kernel_support_execution,
         gpu_device=gpu_device,
+        gpu_devices=gpu_devices,
         gpu_tile_size=gpu_tile_size,
         max_gpu_support_bytes=max_gpu_support_bytes,
     ):
@@ -874,6 +883,7 @@ def evaluate_leave_one_out_objectives(
     diagnostics: dict[str, Any] | None = None,
     kernel_support_execution: str = KERNEL_SUPPORT_EXECUTION_CPU,
     gpu_device: int = 0,
+    gpu_devices: Sequence[int] | str | int | None = None,
     gpu_tile_size: int = 128,
     max_gpu_support_bytes: int | None = None,
 ) -> tuple[LeaveOneOutObjective, ...]:
@@ -980,6 +990,7 @@ def evaluate_leave_one_out_objectives(
         capacity_context=capacity_context,
         kernel_support_execution=kernel_support_execution,
         gpu_device=gpu_device,
+        gpu_devices=gpu_devices,
         gpu_tile_size=gpu_tile_size,
         max_gpu_support_bytes=max_gpu_support_bytes,
     )
@@ -1273,24 +1284,22 @@ def evaluate_leave_one_out_objectives(
         support_maxima.tolist(),
     )
     if diagnostics is not None:
-        diagnostics["loo_wall_seconds"] = (
-            diagnostics.get("loo_wall_seconds", 0.0) + total_seconds
+        diagnostics["loo_wall_seconds"] = diagnostics.get("loo_wall_seconds", 0.0) + total_seconds
+        diagnostics["loo_source_phase_seconds"] = (
+            diagnostics.get("loo_source_phase_seconds", 0.0) + source_phase_seconds
         )
-        diagnostics["loo_source_phase_seconds"] = diagnostics.get(
-            "loo_source_phase_seconds", 0.0
-        ) + source_phase_seconds
-        diagnostics["loo_normalization_seconds"] = diagnostics.get(
-            "loo_normalization_seconds", 0.0
-        ) + normalization_seconds
-        diagnostics["loo_objective_reduction_seconds"] = diagnostics.get(
-            "loo_objective_reduction_seconds", 0.0
-        ) + reduction_seconds
+        diagnostics["loo_normalization_seconds"] = (
+            diagnostics.get("loo_normalization_seconds", 0.0) + normalization_seconds
+        )
+        diagnostics["loo_objective_reduction_seconds"] = (
+            diagnostics.get("loo_objective_reduction_seconds", 0.0) + reduction_seconds
+        )
         diagnostics["loo_checkpoint_bytes"] = (
             diagnostics.get("loo_checkpoint_bytes", 0) + checkpoint_bytes
         )
-        diagnostics["loo_checkpoint_seconds"] = diagnostics.get(
-            "loo_checkpoint_seconds", 0.0
-        ) + checkpoint_seconds
+        diagnostics["loo_checkpoint_seconds"] = (
+            diagnostics.get("loo_checkpoint_seconds", 0.0) + checkpoint_seconds
+        )
         diagnostics["loo_peak_scratch_bytes"] = max(
             int(diagnostics.get("loo_peak_scratch_bytes", 0)), peak_scratch_bytes
         )
@@ -1330,9 +1339,7 @@ def evaluate_leave_one_out_objectives(
                 if metric_name in cumulative_gpu_metrics:
                     diagnostics[metric_name] = diagnostics.get(metric_name, 0) + metric_value
                 elif metric_name.endswith("_peak_bytes"):
-                    diagnostics[metric_name] = max(
-                        diagnostics.get(metric_name, 0), metric_value
-                    )
+                    diagnostics[metric_name] = max(diagnostics.get(metric_name, 0), metric_value)
                 else:
                     diagnostics[metric_name] = metric_value
     if checkpoint_store is not None:
@@ -1966,6 +1973,7 @@ def build_streamed_candidate_contributions(
     resume: bool = True,
     kernel_support_execution: str = KERNEL_SUPPORT_EXECUTION_CPU,
     gpu_device: int = 0,
+    gpu_devices: Sequence[int] | str | int | None = None,
     gpu_tile_size: int = 128,
     max_gpu_support_bytes: int | None = None,
 ) -> tuple[
@@ -2017,9 +2025,7 @@ def build_streamed_candidate_contributions(
     if entry_limit is None:
         entry_limit = maximum_entry_count
     runtime_budget = (
-        resource_budget
-        or getattr(index, "resource_budget", None)
-        or build_resource_budget()
+        resource_budget or getattr(index, "resource_budget", None) or build_resource_budget()
     )
     remaining_budget = runtime_budget.remaining_managed_budget
     if remaining_budget is None:
@@ -2234,6 +2240,7 @@ def build_streamed_candidate_contributions(
             capacity_context=(f"N={n_rows}, M={candidate_count}, operator={operator_fingerprint}"),
             kernel_support_execution=kernel_support_execution,
             gpu_device=gpu_device,
+            gpu_devices=gpu_devices,
             gpu_tile_size=gpu_tile_size,
             max_gpu_support_bytes=max_gpu_support_bytes,
         )
@@ -2559,6 +2566,7 @@ def build_streamed_candidate_contributions(
                     source_indices=candidate_source_indices,
                     kernel_support_execution=kernel_support_execution,
                     gpu_device=gpu_device,
+                    gpu_devices=gpu_devices,
                     gpu_tile_size=gpu_tile_size,
                     max_gpu_support_bytes=max_gpu_support_bytes,
                 ):
@@ -2758,7 +2766,8 @@ def build_streamed_candidate_contributions(
                     checkpoint_elapsed = max(0.0, time.perf_counter() - checkpoint_started)
                     checkpoint_seconds += checkpoint_elapsed
                     checkpoint_bytes += int(
-                        targets.nbytes + values_for_candidate.nbytes
+                        targets.nbytes
+                        + values_for_candidate.nbytes
                         + support_sizes[candidate_source_indices].nbytes
                     )
                     checkpoint_writes += 1
@@ -2979,6 +2988,11 @@ def build_streamed_candidate_contributions(
         support_execution_version=support_provider.support_execution_version,
         gpu_device=(
             int(gpu_device)
+            if support_provider.support_execution == KERNEL_SUPPORT_EXECUTION_GPU
+            else None
+        ),
+        gpu_devices=(
+            tuple(int(device) for device in support_provider.gpu_devices)
             if support_provider.support_execution == KERNEL_SUPPORT_EXECUTION_GPU
             else None
         ),

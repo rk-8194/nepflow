@@ -315,12 +315,24 @@ def validate_config(
         raise ConfigurationError("selection.entropy.bandwidth.gpu_device must be an integer")
     if bandwidth.gpu_device < 0:
         raise ConfigurationError("selection.entropy.bandwidth.gpu_device must be non-negative")
-    if isinstance(bandwidth.gpu_tile_size, bool) or not isinstance(
-        bandwidth.gpu_tile_size, int
-    ) or bandwidth.gpu_tile_size < 1:
-        raise ConfigurationError(
-            "selection.entropy.bandwidth.gpu_tile_size must be positive"
-        )
+    if bandwidth.gpu_devices is not None:
+        try:
+            from nepflow.stages.selection.algorithms.information_entropy.gpu_devices import (
+                normalize_gpu_devices,
+            )
+
+            normalize_gpu_devices(bandwidth.gpu_devices, gpu_device=bandwidth.gpu_device)
+        except (TypeError, ValueError) as exc:
+            raise ConfigurationError(
+                "selection.entropy.bandwidth.gpu_devices must be a non-empty list of "
+                "distinct non-negative visible ordinals"
+            ) from exc
+    if (
+        isinstance(bandwidth.gpu_tile_size, bool)
+        or not isinstance(bandwidth.gpu_tile_size, int)
+        or bandwidth.gpu_tile_size < 1
+    ):
+        raise ConfigurationError("selection.entropy.bandwidth.gpu_tile_size must be positive")
     if bandwidth.max_gpu_support_bytes is not None and (
         isinstance(bandwidth.max_gpu_support_bytes, bool)
         or not isinstance(bandwidth.max_gpu_support_bytes, int)

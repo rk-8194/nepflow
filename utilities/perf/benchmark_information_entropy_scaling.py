@@ -39,11 +39,11 @@ from nepflow.stages.selection.algorithms.information_entropy.kernels import (
     evaluate_leave_one_out_objectives,
 )
 from nepflow.stages.selection.algorithms.information_entropy.models import (
-    EntropyBandwidthSettings,
     GPU_NEIGHBOUR_BACKEND_ALIASES,
     INDEXED_NEIGHBOUR_BACKEND_ID,
     NEIGHBOUR_BACKEND_ID,
     TILED_NEIGHBOUR_BACKEND_ID,
+    EntropyBandwidthSettings,
 )
 from nepflow.stages.selection.algorithms.information_entropy.neighbours import (
     ExactNeighbourResult,
@@ -54,7 +54,6 @@ from nepflow.stages.selection.algorithms.information_entropy.neighbours import (
     compute_radius_support,
 )
 from nepflow.stages.selection.algorithms.information_entropy.selector import lazy_greedy
-
 
 CASE_NAMES = (
     "high_duplication",
@@ -171,9 +170,7 @@ def _exclusive_knn_phase_seconds(metrics: dict[str, Any]) -> dict[str, float]:
         for phase in phase_names
     }
     if raw_phases["gpu_distance_reduction"] == 0.0:
-        raw_phases["gpu_distance_reduction"] = float(
-            metrics.get("gpu_kernel_seconds", 0.0) or 0.0
-        )
+        raw_phases["gpu_distance_reduction"] = float(metrics.get("gpu_kernel_seconds", 0.0) or 0.0)
     publication = raw_phases["checkpoint_serialization"]
     fsync = raw_phases["checkpoint_fsync"]
     digest = raw_phases["checkpoint_digest"]
@@ -257,6 +254,7 @@ def _prepare(
     max_index_bytes: int | None,
     max_neighbour_cache_bytes: int | None,
     gpu_device: int = 0,
+    gpu_devices: str | None = None,
     gpu_tile_size: int = 128,
     max_gpu_neighbour_bytes: int | None = None,
     checkpoint_enabled: bool = False,
@@ -271,10 +269,14 @@ def _prepare(
     service = _budget(worker_count, memory_bytes, scratch_bytes)
     index = None
     index_build_started = time.perf_counter()
-    if backend in {
-        INDEXED_NEIGHBOUR_BACKEND_ID,
-        TILED_NEIGHBOUR_BACKEND_ID,
-    } or backend in GPU_NEIGHBOUR_BACKEND_ALIASES:
+    if (
+        backend
+        in {
+            INDEXED_NEIGHBOUR_BACKEND_ID,
+            TILED_NEIGHBOUR_BACKEND_ID,
+        }
+        or backend in GPU_NEIGHBOUR_BACKEND_ALIASES
+    ):
         index = build_neighbour_index(
             pool.descriptors,
             backend=backend,
@@ -283,6 +285,7 @@ def _prepare(
             max_radius_query_bytes=max_radius_query_bytes,
             max_neighbour_cache_bytes=max_neighbour_cache_bytes,
             gpu_device=gpu_device,
+            gpu_devices=gpu_devices,
             gpu_tile_size=gpu_tile_size,
             max_gpu_neighbour_bytes=max_gpu_neighbour_bytes,
             resource_budget=service,
@@ -364,9 +367,7 @@ def _prepare(
     else:
         frozen = None
         frozen_wall_seconds = 0.0
-    preparation_wall_seconds = (
-        index_build_wall_seconds + knn_wall_seconds + frozen_wall_seconds
-    )
+    preparation_wall_seconds = index_build_wall_seconds + knn_wall_seconds + frozen_wall_seconds
     knn_delta = _metric_delta(after_knn, before_knn)
     checkpoint_metrics = dict(knn_checkpoint_metrics)
     checkpoint_metrics.setdefault("enabled", bool(checkpoint_enabled))
@@ -485,6 +486,7 @@ def _run_stream(
     gpu_device: int,
     gpu_tile_size: int,
     max_gpu_support_bytes: int | None,
+    gpu_devices: str | None = None,
 ) -> dict[str, Any]:
     index_before = _snapshot_metrics(index)
     with tempfile.TemporaryDirectory(prefix="nepflow-entropy-bench-") as temporary:
@@ -504,6 +506,7 @@ def _run_stream(
             resume=False,
             kernel_support_execution=kernel_support_execution,
             gpu_device=gpu_device,
+            gpu_devices=gpu_devices,
             gpu_tile_size=gpu_tile_size,
             max_gpu_support_bytes=max_gpu_support_bytes,
         )
@@ -511,9 +514,7 @@ def _run_stream(
     operations = dict(summary.operational_metrics)
     index_after = _snapshot_metrics(index)
     cumulative_index_metrics = {
-        key: operations.pop(key)
-        for key in tuple(index_after)
-        if key in operations
+        key: operations.pop(key) for key in tuple(index_after) if key in operations
     }
     operations["cumulative_index_metrics"] = cumulative_index_metrics
     operations["per_run_index_metrics"] = _metric_delta(index_after, index_before)
@@ -547,6 +548,7 @@ def _production_calibration_timing(
     gpu_device: int,
     gpu_tile_size: int,
     max_gpu_support_bytes: int | None,
+    gpu_devices: str | None = None,
 ) -> dict[str, Any]:
     """Measure the production 16-pair LOO grid without an oracle allocation.
 
@@ -569,9 +571,7 @@ def _production_calibration_timing(
             prefix = replace(
                 neighbours,
                 radii=np.asarray(neighbours.distances[:, candidate_k - 1], dtype=np.float64),
-                neighbour_indices=np.asarray(
-                    neighbours.indices[:, :candidate_k], dtype=np.int64
-                ),
+                neighbour_indices=np.asarray(neighbours.indices[:, :candidate_k], dtype=np.int64),
                 neighbour_distances=np.asarray(
                     neighbours.distances[:, :candidate_k], dtype=np.float64
                 ),
@@ -606,6 +606,7 @@ def _production_calibration_timing(
         resource_budget=resource_budget,
         kernel_support_execution=kernel_support_execution,
         gpu_device=gpu_device,
+        gpu_devices=gpu_devices,
         gpu_tile_size=gpu_tile_size,
         max_gpu_support_bytes=max_gpu_support_bytes,
     )
@@ -637,6 +638,7 @@ def _correctness_checks(
     gpu_device: int,
     gpu_tile_size: int,
     max_gpu_support_bytes: int | None,
+    gpu_devices: str | None = None,
 ) -> dict[str, Any]:
     """Run independent bounded checks for the complete production calibration grid."""
 
@@ -653,6 +655,7 @@ def _correctness_checks(
             resource_budget=resource_budget,
             kernel_support_execution=kernel_support_execution,
             gpu_device=gpu_device,
+            gpu_devices=gpu_devices,
             gpu_tile_size=gpu_tile_size,
             max_gpu_support_bytes=max_gpu_support_bytes,
         )
@@ -1147,9 +1150,7 @@ def _profiling_summary(results: list[dict[str, Any]]) -> dict[str, Any]:
                 checkpoint.get("metadata_bytes_read", 0) or 0
             )
             kNN_checkpoint["fsync_seconds"] += float(checkpoint.get("fsync_seconds", 0.0) or 0.0)
-            kNN_checkpoint["digest_seconds"] += float(
-                checkpoint.get("digest_seconds", 0.0) or 0.0
-            )
+            kNN_checkpoint["digest_seconds"] += float(checkpoint.get("digest_seconds", 0.0) or 0.0)
             kNN_checkpoint["peak_retained_bytes"] = max(
                 int(kNN_checkpoint["peak_retained_bytes"]),
                 int(checkpoint.get("peak_retained_bytes", 0) or 0),
@@ -1276,6 +1277,11 @@ def main() -> None:
         default="cpu",
     )
     parser.add_argument("--gpu-device", type=int, default=0)
+    parser.add_argument(
+        "--gpu-devices",
+        default=None,
+        help="explicit comma-separated process-visible CUDA ordinals, e.g. 0,1,2,3",
+    )
     parser.add_argument("--gpu-tile-size", type=int, default=128)
     parser.add_argument("--max-gpu-support-bytes", type=int, default=None)
     parser.add_argument("--max-gpu-neighbour-bytes", type=int, default=None)
@@ -1326,6 +1332,7 @@ def main() -> None:
                     max_index_bytes=args.max_index_bytes,
                     max_neighbour_cache_bytes=args.max_neighbour_cache_bytes,
                     gpu_device=args.gpu_device,
+                    gpu_devices=args.gpu_devices,
                     gpu_tile_size=args.gpu_tile_size,
                     max_gpu_neighbour_bytes=args.max_gpu_neighbour_bytes,
                     checkpoint_enabled=checkpoint_enabled,
@@ -1356,6 +1363,7 @@ def main() -> None:
                     "scratch_budget_bytes": args.scratch_budget_bytes,
                     "kernel_support_execution": args.kernel_support_execution,
                     "gpu_device": args.gpu_device,
+                    "gpu_devices": args.gpu_devices,
                     "gpu_tile_size": args.gpu_tile_size,
                     "max_gpu_support_bytes": args.max_gpu_support_bytes,
                     "max_gpu_neighbour_bytes": args.max_gpu_neighbour_bytes,
@@ -1393,9 +1401,7 @@ def main() -> None:
                             "cold_cache": False,
                             "result": {
                                 "knn_only": True,
-                                "knn_only_wall_seconds": float(
-                                    preparation["knn_wall_seconds"]
-                                ),
+                                "knn_only_wall_seconds": float(preparation["knn_wall_seconds"]),
                                 "knn_only_elapsed_semantics": (
                                     "index construction and exact kNN are reported in "
                                     "preparation; frozen bandwidth materialization and all "
@@ -1421,6 +1427,7 @@ def main() -> None:
                     label=f"{backend}-{worker_count}-cold",
                     kernel_support_execution=args.kernel_support_execution,
                     gpu_device=args.gpu_device,
+                    gpu_devices=args.gpu_devices,
                     gpu_tile_size=args.gpu_tile_size,
                     max_gpu_support_bytes=args.max_gpu_support_bytes,
                 )
@@ -1436,6 +1443,7 @@ def main() -> None:
                     label=f"{backend}-{worker_count}-warm",
                     kernel_support_execution=args.kernel_support_execution,
                     gpu_device=args.gpu_device,
+                    gpu_devices=args.gpu_devices,
                     gpu_tile_size=args.gpu_tile_size,
                     max_gpu_support_bytes=args.max_gpu_support_bytes,
                 )
@@ -1471,6 +1479,7 @@ def main() -> None:
                         resource_budget=service,
                         kernel_support_execution=args.kernel_support_execution,
                         gpu_device=args.gpu_device,
+                        gpu_devices=args.gpu_devices,
                         gpu_tile_size=args.gpu_tile_size,
                         max_gpu_support_bytes=args.max_gpu_support_bytes,
                     )
@@ -1497,9 +1506,7 @@ def main() -> None:
                             "cache_state": cache_state,
                             "cold_cache": cache_state == "cold",
                             "result": {
-                                key: value
-                                for key, value in run.items()
-                                if key != "contributions"
+                                key: value for key, value in run.items() if key != "contributions"
                             },
                         }
                     )
@@ -1521,6 +1528,7 @@ def main() -> None:
             "pool_fingerprint": pool.fingerprint,
             "kernel_support_execution": args.kernel_support_execution,
             "gpu_device": args.gpu_device,
+            "gpu_devices": args.gpu_devices,
             "gpu_tile_size": args.gpu_tile_size,
             "max_gpu_support_bytes": args.max_gpu_support_bytes,
             "max_gpu_neighbour_bytes": args.max_gpu_neighbour_bytes,

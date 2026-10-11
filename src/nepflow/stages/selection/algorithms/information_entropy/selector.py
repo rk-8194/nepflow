@@ -849,10 +849,9 @@ class InformationEntropySelectionAlgorithm:
                     if bandwidth.calibration_batch_size is None
                     else int(bandwidth.calibration_batch_size)
                 ),
-                kernel_support_execution=str(
-                    getattr(bandwidth, "kernel_support_execution", "cpu")
-                ),
+                kernel_support_execution=str(getattr(bandwidth, "kernel_support_execution", "cpu")),
                 gpu_device=int(getattr(bandwidth, "gpu_device", 0)),
+                gpu_devices=getattr(bandwidth, "gpu_devices", None),
                 gpu_tile_size=int(getattr(bandwidth, "gpu_tile_size", 128)),
                 max_gpu_support_bytes=(
                     None
@@ -901,6 +900,7 @@ class InformationEntropySelectionAlgorithm:
             for name in (
                 "kernel_support_execution",
                 "gpu_device",
+                "gpu_devices",
                 "gpu_tile_size",
                 "max_gpu_support_bytes",
                 "max_gpu_neighbour_bytes",
@@ -921,6 +921,7 @@ class InformationEntropySelectionAlgorithm:
             resume=bool(request.options.get("resume_checkpoints", True)),
             kernel_support_execution=bandwidth_settings.kernel_support_execution,
             gpu_device=bandwidth_settings.gpu_device,
+            gpu_devices=bandwidth_settings.gpu_devices,
             gpu_tile_size=bandwidth_settings.gpu_tile_size,
             max_gpu_support_bytes=bandwidth_settings.max_gpu_support_bytes,
             max_gpu_neighbour_bytes=bandwidth_settings.max_gpu_neighbour_bytes,
@@ -958,6 +959,7 @@ class InformationEntropySelectionAlgorithm:
             resource_budget=runtime_budget,
             kernel_support_execution=bandwidth_settings.kernel_support_execution,
             gpu_device=bandwidth_settings.gpu_device,
+            gpu_devices=bandwidth_settings.gpu_devices,
             gpu_tile_size=bandwidth_settings.gpu_tile_size,
             max_gpu_support_bytes=bandwidth_settings.max_gpu_support_bytes,
             storage=str(self._entropy_value(request.options, "contribution_storage", "auto")),

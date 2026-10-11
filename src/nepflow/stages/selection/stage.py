@@ -401,6 +401,7 @@ class SelectionStage:
                 calibration_batch_size=entropy.bandwidth.calibration_batch_size,
                 kernel_support_execution=entropy.bandwidth.kernel_support_execution,
                 gpu_device=entropy.bandwidth.gpu_device,
+                gpu_devices=entropy.bandwidth.gpu_devices,
                 gpu_tile_size=entropy.bandwidth.gpu_tile_size,
                 max_gpu_support_bytes=entropy.bandwidth.max_gpu_support_bytes,
                 max_gpu_neighbour_bytes=entropy.bandwidth.max_gpu_neighbour_bytes,

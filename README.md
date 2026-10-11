@@ -134,6 +134,22 @@ or set an explicit lower count when memory is the limiting resource.
 Do not run heavy parallel generation or descriptor calculation on login nodes;
 submit it through SLURM with the required CPU allocation.
 
+For information-entropy GPU execution, select the backend and device list
+explicitly in the selection config. For example:
+
+```ini
+entropy_bandwidth_backend=exact_tiled_gpu_knn
+entropy_kernel_support_execution=exact_tiled_gpu
+entropy_gpu_devices=0,1,2,3
+```
+
+The ordinals are process-visible CUDA ordinals and are checked against
+`CUDA_VISIBLE_DEVICES` and the SLURM allocation. A missing or unallocated
+requested device fails the run; NEPFlow does not silently fall back to CPU or
+reduce the requested GPU count. kNN and strict-support work are partitioned in
+deterministic source order, and their per-device throughput and transfer/
+certification metrics are included in the execution diagnostics.
+
 ## Project Layout
 
 Each project lives under `projects/project_<name>/` and typically contains:

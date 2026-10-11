@@ -20,6 +20,11 @@ from nepflow.io.hashing import sha256_canonical_json
 from nepflow.resources.budget import ResourceBudgetService, ResourceCapacityError
 
 from .checkpointing import IncrementalCheckpointStore, VersionedCheckpointStore
+from .gpu_devices import (
+    contiguous_gpu_ranges,
+    normalize_gpu_devices,
+    validate_visible_gpu_devices,
+)
 from .gpu_support import GPUCapacityError, GPUCertificationError, GPUDeviceValidationError
 from .models import (
     GPU_NEIGHBOUR_BACKEND_ID,
@@ -64,9 +69,7 @@ def _gamma_bound(dimension: int) -> float:
     return float(np.nextafter(relative, np.inf))
 
 
-def _canonical_distances(
-    query: np.ndarray, targets: np.ndarray
-) -> np.ndarray:
+def _canonical_distances(query: np.ndarray, targets: np.ndarray) -> np.ndarray:
     """Compute the scientific CPU float64 distance primitive."""
 
     if targets.shape[0] == 0:
@@ -74,9 +77,7 @@ def _canonical_distances(
     with np.errstate(over="raise", invalid="raise"):
         try:
             delta = targets - query
-            distances = np.sqrt(
-                np.sum(delta * delta, axis=1, dtype=np.float64)
-            )
+            distances = np.sqrt(np.sum(delta * delta, axis=1, dtype=np.float64))
         except FloatingPointError as exc:
             raise GPUCertificationError(
                 "canonical CPU GPU-kNN verification overflowed or became invalid"
@@ -101,6 +102,7 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
         descriptors: np.ndarray,
         *,
         device: int = 0,
+        gpu_devices: Sequence[int] | str | int | None = None,
         gpu_tile_size: int = 128,
         max_device_bytes: int | None = None,
         tile_size: int | None = None,
@@ -113,25 +115,28 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
             raise ValueError("gpu_device must be a non-negative integer")
         if int(device) < 0:
             raise ValueError("gpu_device must be a non-negative integer")
-        if isinstance(gpu_tile_size, bool) or not isinstance(
-            gpu_tile_size, (int, np.integer)
-        ) or int(gpu_tile_size) < 1:
+        if (
+            isinstance(gpu_tile_size, bool)
+            or not isinstance(gpu_tile_size, (int, np.integer))
+            or int(gpu_tile_size) < 1
+        ):
             raise ValueError("gpu_tile_size must be a positive integer")
-        self.device = int(device)
+        self.gpu_devices = normalize_gpu_devices(gpu_devices, gpu_device=int(device))
+        self.device = int(self.gpu_devices[0])
         self.requested_tile_size = int(gpu_tile_size)
         self._cp = self._load_cupy()
         self._validate_device()
         free_bytes, total_bytes = self._device_memory_info()
         if free_bytes < 1 or total_bytes < 1:
-            raise GPUDeviceValidationError(
-                f"CUDA device {self.device} reported no usable memory"
-            )
+            raise GPUDeviceValidationError(f"CUDA device {self.device} reported no usable memory")
         if max_device_bytes is None:
             self.max_device_bytes = max(1, int(free_bytes * 0.80))
         else:
-            if isinstance(max_device_bytes, bool) or not isinstance(
-                max_device_bytes, (int, np.integer)
-            ) or int(max_device_bytes) < 1:
+            if (
+                isinstance(max_device_bytes, bool)
+                or not isinstance(max_device_bytes, (int, np.integer))
+                or int(max_device_bytes) < 1
+            ):
                 raise ValueError("max_gpu_neighbour_bytes must be positive when provided")
             self.max_device_bytes = min(int(max_device_bytes), int(free_bytes))
         self.device_total_bytes = int(total_bytes)
@@ -139,18 +144,12 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
         values = _validate_descriptors(descriptors)
         self.certification_relative_bound = _gamma_bound(int(values.shape[1]))
         float_info = np.finfo(np.float64)
-        max_safe_component = float(
-            np.sqrt(float_info.max / (4.0 * int(values.shape[1])))
-        )
-        min_safe_component = float(
-            np.sqrt(float_info.tiny) / (float_info.eps / 2.0)
-        )
+        max_safe_component = float(np.sqrt(float_info.max / (4.0 * int(values.shape[1]))))
+        min_safe_component = float(np.sqrt(float_info.tiny) / (float_info.eps / 2.0))
         magnitudes = np.abs(values)
         self._gpu_fp64_certification_safe = bool(
             np.all(magnitudes <= max_safe_component)
-            and not np.any(
-                (magnitudes > 0.0) & (magnitudes < min_safe_component)
-            )
+            and not np.any((magnitudes > 0.0) & (magnitudes < min_safe_component))
         )
         super().__init__(
             values,
@@ -212,6 +211,7 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
         self.ambiguous_boundary_count = 0
         self.certified_tiles = 0
         self.final_certifications = 0
+        self.per_device_metrics: dict[int, dict[str, Any]] = {}
 
     def _load_cupy(self) -> Any:
         try:
@@ -224,15 +224,12 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
 
     def _validate_device(self) -> None:
         try:
-            count = int(self._cp.cuda.runtime.getDeviceCount())
+            validate_visible_gpu_devices(self._cp, self.gpu_devices)
         except Exception as exc:  # pragma: no cover - CUDA runtime dependent
             raise GPUDeviceValidationError(
-                f"unable to query visible CUDA devices for gpu_device={self.device}: {exc}"
+                f"requested gpu_devices={self.gpu_devices} (gpu_device={self.device}) "
+                f"are not visible: {exc}"
             ) from exc
-        if self.device >= count:
-            raise GPUDeviceValidationError(
-                f"gpu_device={self.device} is not visible; CUDA device count is {count}"
-            )
 
     def _device_memory_info(self) -> tuple[int, int]:
         try:
@@ -343,9 +340,7 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
         return self._upload_descriptor_block(source, "exact tiled GPU kNN source batch")
 
     def _upload_reference_shard(self, reference: np.ndarray) -> Any:
-        return self._upload_descriptor_block(
-            reference, "exact tiled GPU kNN reference shard"
-        )
+        return self._upload_descriptor_block(reference, "exact tiled GPU kNN reference shard")
 
     def _gpu_top_candidates(
         self,
@@ -381,26 +376,20 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
                     kth=int(keep_count - 1),
                     axis=1,
                 )[:, :keep_count]
-                selected_squared = cp.take_along_axis(
-                    distance_squared, partition, axis=1
-                )
+                selected_squared = cp.take_along_axis(distance_squared, partition, axis=1)
                 selected_distances = cp.sqrt(selected_squared)
                 self._synchronize()
                 compute_elapsed = max(0.0, time.perf_counter() - compute_started)
                 self.gpu_distance_reduction_seconds += compute_elapsed
                 selected_indices = partition + int(target_offset)
-                local_bound = cp.full(
-                    (source_count,), np.inf, dtype=cp.float64
-                )
+                local_bound = cp.full((source_count,), np.inf, dtype=cp.float64)
                 if target_count > keep_count:
                     local_bound = cp.max(selected_distances, axis=1)
                 if isfinite is not None and all_values_finite is not None:
                     # Keep the uncertainty witness on the device.  Calling
                     # bool() on a CuPy reduction here would force a scalar
                     # D2H synchronization for every reference tile.
-                    finite_rows = all_values_finite(
-                        isfinite(distance_squared), axis=1
-                    )
+                    finite_rows = all_values_finite(isfinite(distance_squared), axis=1)
                     local_bound = cp.where(finite_rows, local_bound, cp.nan)
         except Exception as exc:
             if isinstance(exc, (GPUCapacityError, GPUCertificationError)):
@@ -426,9 +415,7 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
         self.fp64_evaluations += int(source_count * target_count)
         self.device_workspace_peak_bytes = max(
             self.device_workspace_peak_bytes,
-            self.global_candidate_state_bytes
-            + self.resident_reference_bytes
-            + reserved,
+            self.global_candidate_state_bytes + self.resident_reference_bytes + reserved,
         )
         return selected_indices, selected_distances, local_bound
 
@@ -482,12 +469,8 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
                 kth=int(keep_count - 1),
                 axis=1,
             )[:, :keep_count]
-            selected_indices = cp.take_along_axis(
-                combined_indices, partition, axis=1
-            )
-            selected_distances = cp.take_along_axis(
-                combined_distances, partition, axis=1
-            )
+            selected_indices = cp.take_along_axis(combined_indices, partition, axis=1)
+            selected_distances = cp.take_along_axis(combined_distances, partition, axis=1)
             merge_bounds[source_start:source_stop] = cp.minimum(
                 merge_bounds[source_start:source_stop],
                 cp.max(selected_distances, axis=1),
@@ -503,26 +486,18 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
 
         started = time.perf_counter()
         try:
-            distances = self._distance_values(
-                query, self.unique_locations
-            )
+            distances = self._distance_values(query, self.unique_locations)
         except RadiusQueryCapacityError:
             raise
         except (FloatingPointError, ValueError) as exc:
-            raise GPUCertificationError(
-                "canonical CPU GPU-kNN verification failed"
-            ) from exc
+            raise GPUCertificationError("canonical CPU GPU-kNN verification failed") from exc
         distances[int(source_location)] = np.inf
         sort_workspace = int(distances.nbytes + 8 * distances.size + 4096)
-        self.host_workspace_peak_bytes = max(
-            self.host_workspace_peak_bytes, sort_workspace
-        )
+        self.host_workspace_peak_bytes = max(self.host_workspace_peak_bytes, sort_workspace)
         with self.resource_budget.acquire(
             "exact tiled GPU kNN CPU rescan ordering", max(1, sort_workspace)
         ):
-            order = np.lexsort(
-                (self.location_representatives, distances)
-            )[: int(k)]
+            order = np.lexsort((self.location_representatives, distances))[: int(k)]
         elapsed = max(0.0, time.perf_counter() - started)
         return order.astype(np.int64, copy=False), distances[order], elapsed
 
@@ -545,18 +520,14 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
         def rescan() -> tuple[np.ndarray, np.ndarray]:
             nonlocal cpu_verification
             self.certification_rescans += 1
-            locations, distances, elapsed = self._exact_rescan(
-                query, source_location, k
-            )
+            locations, distances, elapsed = self._exact_rescan(query, source_location, k)
             cpu_verification += elapsed
             return locations, distances
 
         if not self._gpu_fp64_certification_safe:
             self.ambiguous_boundary_count += 1
             result = rescan()
-            self.certification_seconds += max(
-                0.0, time.perf_counter() - started - cpu_verification
-            )
+            self.certification_seconds += max(0.0, time.perf_counter() - started - cpu_verification)
             self.cpu_verification_seconds += cpu_verification
             return result
 
@@ -574,23 +545,17 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
         )
         if not valid:
             result = rescan()
-            self.certification_seconds += max(
-                0.0, time.perf_counter() - started - cpu_verification
-            )
+            self.certification_seconds += max(0.0, time.perf_counter() - started - cpu_verification)
             self.cpu_verification_seconds += cpu_verification
             return result
 
         canonical_started = time.perf_counter()
         try:
-            canonical = self._distance_values(
-                query, self.unique_locations[reported_locations]
-            )
+            canonical = self._distance_values(query, self.unique_locations[reported_locations])
         except RadiusQueryCapacityError:
             raise
         except (FloatingPointError, ValueError) as exc:
-            raise GPUCertificationError(
-                "canonical CPU GPU-kNN verification failed"
-            ) from exc
+            raise GPUCertificationError("canonical CPU GPU-kNN verification failed") from exc
         cpu_verification += max(0.0, time.perf_counter() - canonical_started)
         order = np.lexsort(
             (
@@ -622,12 +587,7 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
             lower = float(np.nextafter(lower, 0.0))
             upper = float(np.nextafter(upper, np.inf))
         certifiable = bool(
-            not omitted
-            or (
-                np.isfinite(lower)
-                and np.isfinite(upper)
-                and lower > upper
-            )
+            not omitted or (np.isfinite(lower) and np.isfinite(upper) and lower > upper)
         )
         if not certifiable:
             self.ambiguous_boundary_count += 1
@@ -638,9 +598,7 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
                 certified_locations[: int(k)],
                 certified_distances[: int(k)],
             )
-        self.certification_seconds += max(
-            0.0, time.perf_counter() - started - cpu_verification
-        )
+        self.certification_seconds += max(0.0, time.perf_counter() - started - cpu_verification)
         self.cpu_verification_seconds += cpu_verification
         return result
 
@@ -649,6 +607,7 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
         k: int,
         *,
         chunk_size: int = 1024,
+        source_range: tuple[int, int] | None = None,
         checkpoint_store: VersionedCheckpointStore | IncrementalCheckpointStore | None = None,
         checkpoint_name: str = "knn",
         checkpoint_identity: dict[str, Any] | None = None,
@@ -658,8 +617,20 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
     ) -> tuple[np.ndarray, np.ndarray]:
         order_k = _validate_k(k)
         block = _validate_chunk_size(chunk_size)
+        if len(self.gpu_devices) > 1 and source_range is None:
+            return self._compute_multi_location_neighbours(
+                order_k,
+                chunk_size=block,
+                checkpoint_store=checkpoint_store,
+                checkpoint_name=checkpoint_name,
+                checkpoint_identity=checkpoint_identity,
+                checkpoint_every_locations=checkpoint_every_locations,
+                resume=resume,
+                preserve_checkpoint=preserve_checkpoint,
+            )
         cached = self._cached_neighbour_prefix(order_k)
-        if cached is not None:
+        range_mode = source_range is not None
+        if cached is not None and not range_mode:
             return cached
         location_count = int(self.unique_locations.shape[0])
         if location_count - 1 < order_k:
@@ -667,21 +638,38 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
                 f"k={order_k} requires at least {order_k} other distinct descriptor locations; "
                 f"the pool contains only {location_count - 1}"
             )
+        if range_mode and checkpoint_store is not None:
+            raise ValueError("source-range GPU kNN queries do not accept a checkpoint store")
+        range_start, range_stop = (0, location_count) if source_range is None else source_range
+        if (
+            isinstance(range_start, bool)
+            or isinstance(range_stop, bool)
+            or not isinstance(range_start, (int, np.integer))
+            or not isinstance(range_stop, (int, np.integer))
+            or int(range_start) < 0
+            or int(range_stop) > location_count
+            or int(range_start) >= int(range_stop)
+        ):
+            raise ValueError("source_range must be a non-empty half-open location range")
+        range_start = int(range_start)
+        range_stop = int(range_stop)
         if checkpoint_store is not None and checkpoint_identity is None:
             raise ValueError("kNN checkpoint identity is required")
-        if isinstance(checkpoint_every_locations, bool) or not isinstance(
-            checkpoint_every_locations, (int, np.integer)
-        ) or int(checkpoint_every_locations) < 1:
+        if (
+            isinstance(checkpoint_every_locations, bool)
+            or not isinstance(checkpoint_every_locations, (int, np.integer))
+            or int(checkpoint_every_locations) < 1
+        ):
             raise ValueError("checkpoint_every_locations must be a positive integer")
         if checkpoint_store is not None and not resume:
             checkpoint_store.clear(checkpoint_name)
 
         neighbours = np.empty((location_count, order_k), dtype=np.int64)
         distances_out = np.empty((location_count, order_k), dtype=np.float64)
-        source_start = 0
+        source_start = range_start
         incremental_store: IncrementalCheckpointStore | None = None
         legacy_store: VersionedCheckpointStore | None = None
-        if checkpoint_store is not None:
+        if checkpoint_store is not None and not range_mode:
             if checkpoint_identity is None:
                 raise ValueError("kNN checkpoint identity is required")
             if isinstance(checkpoint_store, IncrementalCheckpointStore):
@@ -748,7 +736,7 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
                 neighbours[:source_start] = saved_locations
                 distances_out[:source_start] = saved_distances
 
-        if source_start == location_count:
+        if not range_mode and source_start == location_count:
             if incremental_store is not None and not preserve_checkpoint:
                 incremental_store.clear(checkpoint_name)
                 incremental_store.clean_stale()
@@ -762,9 +750,9 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
         requested_sources = min(self.requested_tile_size, block, location_count)
         keep_count = min(location_count, order_k + 2)
         dimension = int(self.descriptors.shape[1])
-        global_state_bytes = int(
-            location_count * keep_count * 16 + location_count * 16
-        )
+        state_offset = range_start if range_mode else 0
+        state_count = (range_stop - range_start) if range_mode else location_count
+        global_state_bytes = int(state_count * keep_count * 16 + state_count * 16)
         full_reference_bytes = int(self.unique_locations.nbytes)
         try:
             source_tile, target_tile, _ = self._tile_shape(
@@ -782,9 +770,7 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
         source_tile = max(1, min(source_tile, requested_sources))
         target_tile = max(1, min(target_tile, self.requested_tile_size, location_count))
         self.global_candidate_state_bytes = global_state_bytes
-        self.resident_reference_bytes = (
-            full_reference_bytes if resident_full_reference else 0
-        )
+        self.resident_reference_bytes = full_reference_bytes if resident_full_reference else 0
         checkpoint_cursor = source_start
 
         def finish_checkpoint(completed_stop: int) -> None:
@@ -824,18 +810,10 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
             cp = self._cp
             try:
                 with cp.cuda.Device(self.device):
-                    global_indices = cp.full(
-                        (location_count, keep_count), -1, dtype=cp.int64
-                    )
-                    global_distances = cp.full(
-                        (location_count, keep_count), np.inf, dtype=cp.float64
-                    )
-                    omission_bounds = cp.full(
-                        (location_count,), np.inf, dtype=cp.float64
-                    )
-                    merge_bounds = cp.full(
-                        (location_count,), np.inf, dtype=cp.float64
-                    )
+                    global_indices = cp.full((state_count, keep_count), -1, dtype=cp.int64)
+                    global_distances = cp.full((state_count, keep_count), np.inf, dtype=cp.float64)
+                    omission_bounds = cp.full((state_count,), np.inf, dtype=cp.float64)
+                    merge_bounds = cp.full((state_count,), np.inf, dtype=cp.float64)
                     self._synchronize()
             except Exception as exc:
                 if isinstance(exc, MemoryError) or "out of memory" in str(exc).lower():
@@ -868,10 +846,8 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
                         self.unique_locations[reference_start:reference_stop]
                     )
                     self.reference_shards += 1
-                for source_start_tile in range(
-                    source_start, location_count, source_tile
-                ):
-                    source_stop = min(source_start_tile + source_tile, location_count)
+                for source_start_tile in range(source_start, range_stop, source_tile):
+                    source_stop = min(source_start_tile + source_tile, range_stop)
                     batch_count = source_stop - source_start_tile
                     host_bytes = int(
                         2 * batch_count * dimension * 8
@@ -880,9 +856,7 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
                         + 2 * target_count * dimension * 8
                         + 4096
                     )
-                    self.host_workspace_peak_bytes = max(
-                        self.host_workspace_peak_bytes, host_bytes
-                    )
+                    self.host_workspace_peak_bytes = max(self.host_workspace_peak_bytes, host_bytes)
                     lease = self.resource_budget.acquire(
                         "exact tiled GPU kNN source-target tile", max(1, host_bytes)
                     )
@@ -890,22 +864,18 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
                     try:
                         if resident_full_reference:
                             assert gpu_reference is not None
-                            gpu_sources = gpu_reference[
-                                source_start_tile:source_stop
-                            ]
+                            gpu_sources = gpu_reference[source_start_tile:source_stop]
                         else:
                             gpu_sources = self._upload_source_batch(
                                 self.unique_locations[source_start_tile:source_stop]
                             )
                         local_keep = min(target_count, keep_count)
-                        local_indices, local_distances, local_bound = (
-                            self._gpu_top_candidates(
-                                gpu_sources,
-                                gpu_targets,
-                                local_keep,
-                                target_offset=reference_start,
-                                target_count=target_count,
-                            )
+                        local_indices, local_distances, local_bound = self._gpu_top_candidates(
+                            gpu_sources,
+                            gpu_targets,
+                            local_keep,
+                            target_offset=reference_start,
+                            target_count=target_count,
                         )
                         assert (
                             global_indices is not None
@@ -919,7 +889,7 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
                             global_distances,
                             omission_bounds,
                             merge_bounds,
-                            source_start_tile,
+                            source_start_tile - state_offset,
                             local_indices,
                             local_distances,
                             local_bound,
@@ -927,17 +897,13 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
                             keep_count,
                         )
                         merge_synchronization = self._synchronize()
-                        merge_elapsed = max(
-                            0.0, time.perf_counter() - merge_started
-                        )
+                        merge_elapsed = max(0.0, time.perf_counter() - merge_started)
                         self.gpu_operation_seconds += merge_elapsed
                         self.gpu_launch_allocation_seconds += max(
                             0.0, merge_elapsed - merge_synchronization
                         )
                     finally:
-                        self.gpu_tile_wall_seconds += max(
-                            0.0, time.perf_counter() - tile_started
-                        )
+                        self.gpu_tile_wall_seconds += max(0.0, time.perf_counter() - tile_started)
                         lease.close()
                         gpu_sources = None
                         local_indices = None
@@ -948,21 +914,15 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
                     self.unique_distance_evaluations += batch_count * target_count
                 if not resident_full_reference:
                     del gpu_targets
-            self.source_tiles += int(
-                (location_count - source_start + source_tile - 1) // source_tile
-            )
+            self.source_tiles += int((range_stop - source_start + source_tile - 1) // source_tile)
 
-            for source_start_tile in range(source_start, location_count, source_tile):
-                source_stop = min(source_start_tile + source_tile, location_count)
+            for source_start_tile in range(source_start, range_stop, source_tile):
+                source_stop = min(source_start_tile + source_tile, range_stop)
+                state_start = source_start_tile - state_offset
+                state_stop = source_stop - state_offset
                 batch_count = source_stop - source_start_tile
-                host_bytes = int(
-                    batch_count * keep_count * 16
-                    + batch_count * 16
-                    + 8192
-                )
-                self.host_workspace_peak_bytes = max(
-                    self.host_workspace_peak_bytes, host_bytes
-                )
+                host_bytes = int(batch_count * keep_count * 16 + batch_count * 16 + 8192)
+                self.host_workspace_peak_bytes = max(self.host_workspace_peak_bytes, host_bytes)
                 lease = self.resource_budget.acquire(
                     "exact tiled GPU kNN final certification", max(1, host_bytes)
                 )
@@ -976,27 +936,19 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
                     d2h_started = time.perf_counter()
                     with cp.cuda.Device(self.device):
                         host_indices = np.asarray(
-                            cp.asnumpy(
-                                global_indices[source_start_tile:source_stop]
-                            ),
+                            cp.asnumpy(global_indices[state_start:state_stop]),
                             dtype=np.int64,
                         )
                         host_distances = np.asarray(
-                            cp.asnumpy(
-                                global_distances[source_start_tile:source_stop]
-                            ),
+                            cp.asnumpy(global_distances[state_start:state_stop]),
                             dtype=np.float64,
                         )
                         host_omission = np.asarray(
-                            cp.asnumpy(
-                                omission_bounds[source_start_tile:source_stop]
-                            ),
+                            cp.asnumpy(omission_bounds[state_start:state_stop]),
                             dtype=np.float64,
                         )
                         host_merge = np.asarray(
-                            cp.asnumpy(
-                                merge_bounds[source_start_tile:source_stop]
-                            ),
+                            cp.asnumpy(merge_bounds[state_start:state_stop]),
                             dtype=np.float64,
                         )
                         synchronization = self._synchronize()
@@ -1008,12 +960,8 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
                         + host_merge.nbytes
                     )
                     self.gpu_d2h_seconds += d2h_elapsed
-                    self.gpu_launch_allocation_seconds += max(
-                        0.0, d2h_elapsed - synchronization
-                    )
-                    for offset, source_location in enumerate(
-                        range(source_start_tile, source_stop)
-                    ):
+                    self.gpu_launch_allocation_seconds += max(0.0, d2h_elapsed - synchronization)
+                    for offset, source_location in enumerate(range(source_start_tile, source_stop)):
                         locations, values = self._certify_final(
                             self.unique_locations[source_location],
                             source_location,
@@ -1063,16 +1011,306 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
         neighbours.setflags(write=False)
         distances_out.setflags(write=False)
         self._last_neighbour_compute_seconds = max(0.0, time.perf_counter() - started)
+        if range_mode:
+            return (
+                np.asarray(neighbours[range_start:range_stop], dtype=np.int64),
+                np.asarray(distances_out[range_start:range_stop], dtype=np.float64),
+            )
         self._store_neighbour_cache(order_k, neighbours, distances_out)
         return neighbours, distances_out
 
+    def query_neighbours_range(
+        self,
+        k: int,
+        start: int,
+        stop: int,
+        *,
+        chunk_size: int = 1024,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Compute one globally indexed contiguous unique-location range.
+
+        The complete unique-location pool remains readonly on this device;
+        only the source range is assigned to the worker.  This is the worker
+        primitive used by the explicit multi-device scheduler.
+        """
+
+        if len(self.gpu_devices) != 1:
+            raise ValueError("query_neighbours_range requires a single-device worker")
+        return self._compute_location_neighbours(
+            k,
+            chunk_size=chunk_size,
+            source_range=(start, stop),
+        )
+
+    def _compute_multi_location_neighbours(
+        self,
+        k: int,
+        *,
+        chunk_size: int,
+        checkpoint_store: VersionedCheckpointStore | IncrementalCheckpointStore | None,
+        checkpoint_name: str,
+        checkpoint_identity: dict[str, Any] | None,
+        checkpoint_every_locations: int,
+        resume: bool,
+        preserve_checkpoint: bool,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Run deterministic contiguous source ranges on explicit GPU workers.
+
+        Workers are created for every requested visible ordinal before any
+        range is published.  They are intentionally used through CuPy device
+        contexts rather than a process-wide automatic device selector; the
+        same exact screening, FP64 boundary proof and CPU canonical
+        certification is therefore applied independently on every range.
+        """
+
+        location_count = int(self.unique_locations.shape[0])
+        if checkpoint_store is not None and checkpoint_identity is None:
+            raise ValueError("kNN checkpoint identity is required")
+        if (
+            isinstance(checkpoint_every_locations, bool)
+            or not isinstance(checkpoint_every_locations, (int, np.integer))
+            or int(checkpoint_every_locations) < 1
+        ):
+            raise ValueError("checkpoint_every_locations must be a positive integer")
+        if checkpoint_store is not None and not resume:
+            checkpoint_store.clear(checkpoint_name)
+
+        neighbours = np.empty((location_count, k), dtype=np.int64)
+        distances = np.empty((location_count, k), dtype=np.float64)
+        cursor = 0
+        if checkpoint_store is not None and resume and checkpoint_store.exists(checkpoint_name):
+            if isinstance(checkpoint_store, IncrementalCheckpointStore):
+                _identity, state, arrays = checkpoint_store.load(
+                    checkpoint_name,
+                    expected_identity=checkpoint_identity,
+                    k_max=k,
+                    location_count=location_count,
+                )
+            elif isinstance(checkpoint_store, VersionedCheckpointStore):
+                _identity, state, arrays = checkpoint_store.load(
+                    checkpoint_name, expected_identity=checkpoint_identity
+                )
+            else:
+                raise TypeError("checkpoint_store must be a supported checkpoint store")
+            cursor = int(state.get("cursor", -1))
+            saved_locations = arrays.get("neighbour_locations")
+            saved_distances = arrays.get("neighbour_distances")
+            if (
+                cursor < 0
+                or cursor > location_count
+                or saved_locations is None
+                or saved_distances is None
+                or saved_locations.shape != (cursor, k)
+                or saved_distances.shape != (cursor, k)
+                or saved_locations.dtype != np.dtype(np.int64)
+                or saved_distances.dtype != np.dtype(np.float64)
+            ):
+                raise ValueError("multi-GPU kNN checkpoint cursor or arrays are incompatible")
+            neighbours[:cursor] = saved_locations
+            distances[:cursor] = saved_distances
+
+        # Construction is deliberately eager: device loss/capacity failure on
+        # any requested worker occurs before the first durable publication.
+        worker_list: list[ExactTiledGPUNeighbourIndex] = []
+        try:
+            for device in self.gpu_devices:
+                worker_list.append(
+                    ExactTiledGPUNeighbourIndex(
+                        self.descriptors,
+                        device=device,
+                        gpu_tile_size=self.requested_tile_size,
+                        max_device_bytes=self.max_device_bytes,
+                        tile_size=self.tile_size,
+                        max_index_bytes=self.index_bytes,
+                        max_radius_query_bytes=self.max_radius_query_bytes,
+                        max_neighbour_cache_bytes=self.max_neighbour_cache_bytes,
+                        resource_budget=self.resource_budget,
+                    )
+                )
+        except BaseException:
+            for worker in worker_list:
+                worker.close()
+            raise
+        workers = tuple(worker_list)
+        ranges = contiguous_gpu_ranges(location_count, self.gpu_devices)
+        block = min(int(chunk_size), int(checkpoint_every_locations))
+
+        def publish(start: int, stop: int) -> None:
+            if checkpoint_store is None or checkpoint_identity is None:
+                return
+            if isinstance(checkpoint_store, IncrementalCheckpointStore):
+                checkpoint_store.write_chunk(
+                    checkpoint_name,
+                    identity=checkpoint_identity,
+                    start=start,
+                    neighbour_locations=neighbours[start:stop],
+                    neighbour_distances=distances[start:stop],
+                    k_max=k,
+                    location_count=location_count,
+                )
+            elif isinstance(checkpoint_store, VersionedCheckpointStore):
+                checkpoint_store.write(
+                    checkpoint_name,
+                    identity=checkpoint_identity,
+                    state={"cursor": stop},
+                    arrays={
+                        "neighbour_locations": neighbours[:stop],
+                        "neighbour_distances": distances[:stop],
+                    },
+                )
+            else:
+                raise TypeError("checkpoint_store must be a supported checkpoint store")
+
+        started = time.perf_counter()
+        try:
+            for worker_index, (_device, range_start, range_stop) in enumerate(ranges):
+                if range_stop <= cursor:
+                    continue
+                start = max(range_start, cursor)
+                while start < range_stop:
+                    stop = min(start + block, range_stop)
+                    worker_locations, worker_distances = workers[
+                        worker_index
+                    ].query_neighbours_range(k, start, stop, chunk_size=chunk_size)
+                    neighbours[start:stop] = worker_locations
+                    distances[start:stop] = worker_distances
+                    publish(start, stop)
+                    cursor = stop
+                    start = stop
+        except BaseException:
+            raise
+        finally:
+            self.per_device_metrics = {
+                int(worker.device): worker.memory_metrics() for worker in workers
+            }
+            for worker in workers:
+                worker.close()
+        if checkpoint_store is not None and not preserve_checkpoint:
+            checkpoint_store.clear(checkpoint_name)
+            checkpoint_store.clean_stale()
+        neighbours.setflags(write=False)
+        distances.setflags(write=False)
+        self._last_neighbour_compute_seconds = max(0.0, time.perf_counter() - started)
+        self._merge_multi_metrics()
+        self._store_neighbour_cache(k, neighbours, distances)
+        return neighbours, distances
+
+    def _merge_multi_metrics(self) -> None:
+        """Aggregate operational worker diagnostics without changing science."""
+
+        if not self.per_device_metrics:
+            return
+        numeric_sum = (
+            "gpu_source_tiles",
+            "gpu_target_tiles",
+            "gpu_reference_uploads",
+            "gpu_reference_shards",
+            "gpu_fp64_evaluations",
+            "gpu_h2d_bytes",
+            "gpu_d2h_bytes",
+            "gpu_cpu_rescanned_count",
+            "gpu_exact_boundary_recertifications",
+        )
+        for name in numeric_sum:
+            setattr(
+                self,
+                name.replace("gpu_", ""),
+                sum(int(metrics.get(name, 0) or 0) for metrics in self.per_device_metrics.values()),
+            )
+        self.source_tiles = sum(
+            int(item.get("gpu_source_tiles", 0) or 0) for item in self.per_device_metrics.values()
+        )
+        self.target_tiles = sum(
+            int(item.get("gpu_target_tiles", 0) or 0) for item in self.per_device_metrics.values()
+        )
+        self.reference_uploads = sum(
+            int(item.get("gpu_reference_uploads", 0) or 0)
+            for item in self.per_device_metrics.values()
+        )
+        self.reference_shards = sum(
+            int(item.get("gpu_reference_shards", 0) or 0)
+            for item in self.per_device_metrics.values()
+        )
+        self.fp64_evaluations = sum(
+            int(item.get("gpu_fp64_evaluations", 0) or 0)
+            for item in self.per_device_metrics.values()
+        )
+        self.h2d_bytes = sum(
+            int(item.get("gpu_h2d_bytes", 0) or 0) for item in self.per_device_metrics.values()
+        )
+        self.d2h_bytes = sum(
+            int(item.get("gpu_d2h_bytes", 0) or 0) for item in self.per_device_metrics.values()
+        )
+        self.certification_rescans = sum(
+            int(item.get("gpu_cpu_rescanned_count", 0) or 0)
+            for item in self.per_device_metrics.values()
+        )
+        self.ambiguous_boundary_count = sum(
+            int(item.get("gpu_exact_boundary_recertifications", 0) or 0)
+            for item in self.per_device_metrics.values()
+        )
+        self.device_workspace_peak_bytes = max(
+            int(item.get("gpu_device_workspace_peak_bytes", 0) or 0)
+            for item in self.per_device_metrics.values()
+        )
+        self.host_workspace_peak_bytes = max(
+            int(item.get("gpu_host_workspace_peak_bytes", 0) or 0)
+            for item in self.per_device_metrics.values()
+        )
+        self.gpu_seconds = sum(
+            float(item.get("gpu_kernel_seconds", 0.0) or 0.0)
+            for item in self.per_device_metrics.values()
+        )
+        self.gpu_operation_seconds = sum(
+            float(item.get("gpu_operation_seconds_inclusive", 0.0) or 0.0)
+            for item in self.per_device_metrics.values()
+        )
+        self.gpu_h2d_seconds = sum(
+            float(item.get("gpu_h2d_seconds", 0.0) or 0.0)
+            for item in self.per_device_metrics.values()
+        )
+        self.gpu_d2h_seconds = sum(
+            float(item.get("gpu_d2h_seconds", 0.0) or 0.0)
+            for item in self.per_device_metrics.values()
+        )
+        self.gpu_synchronization_seconds = sum(
+            float(item.get("gpu_synchronization_seconds", 0.0) or 0.0)
+            for item in self.per_device_metrics.values()
+        )
+        self.gpu_launch_allocation_seconds = sum(
+            float(item.get("gpu_launch_allocation_seconds", 0.0) or 0.0)
+            for item in self.per_device_metrics.values()
+        )
+        self.gpu_tile_wall_seconds = sum(
+            float(item.get("gpu_tile_wall_seconds", 0.0) or 0.0)
+            for item in self.per_device_metrics.values()
+        )
+        self.cpu_verification_seconds = sum(
+            float(item.get("gpu_cpu_verification_seconds", 0.0) or 0.0)
+            for item in self.per_device_metrics.values()
+        )
+        self.certification_seconds = sum(
+            float(item.get("gpu_certification_seconds", 0.0) or 0.0)
+            for item in self.per_device_metrics.values()
+        )
+        self.certified_tiles = sum(
+            int(item.get("gpu_certified_tiles", 0) or 0)
+            for item in self.per_device_metrics.values()
+        )
+        self.final_certifications = sum(
+            int(item.get("gpu_final_certifications", 0) or 0)
+            for item in self.per_device_metrics.values()
+        )
+
     def memory_metrics(self) -> dict[str, Any]:
-        metrics = super().memory_metrics()
+        metrics: dict[str, Any] = dict(super().memory_metrics())
         metrics.update(
             {
                 "backend": self.backend,
                 "backend_version": self.backend_version,
                 "gpu_device": int(self.device),
+                "gpu_devices": [int(device) for device in self.gpu_devices],
+                "gpu_device_count": len(self.gpu_devices),
                 "gpu_tile_size": int(self.requested_tile_size),
                 "gpu_max_device_bytes": int(self.max_device_bytes),
                 "gpu_total_bytes": int(self.device_total_bytes),
@@ -1082,25 +1320,19 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
                 "gpu_reference_uploads": int(self.reference_uploads),
                 "gpu_reference_shards": int(self.reference_shards),
                 "gpu_resident_reference_bytes": int(self.resident_reference_bytes),
-                "gpu_global_candidate_state_bytes": int(
-                    self.global_candidate_state_bytes
-                ),
+                "gpu_global_candidate_state_bytes": int(self.global_candidate_state_bytes),
                 "gpu_fp64_evaluations": int(self.fp64_evaluations),
                 "gpu_h2d_bytes": int(self.h2d_bytes),
                 "gpu_d2h_bytes": int(self.d2h_bytes),
                 "gpu_device_workspace_peak_bytes": int(self.device_workspace_peak_bytes),
                 "gpu_host_workspace_peak_bytes": int(self.host_workspace_peak_bytes),
                 "gpu_kernel_seconds": float(self.gpu_seconds),
-                "gpu_distance_reduction_seconds": float(
-                    self.gpu_distance_reduction_seconds
-                ),
+                "gpu_distance_reduction_seconds": float(self.gpu_distance_reduction_seconds),
                 "gpu_operation_seconds_inclusive": float(self.gpu_operation_seconds),
                 "gpu_h2d_seconds": float(self.gpu_h2d_seconds),
                 "gpu_d2h_seconds": float(self.gpu_d2h_seconds),
                 "gpu_synchronization_seconds": float(self.gpu_synchronization_seconds),
-                "gpu_launch_allocation_seconds": float(
-                    self.gpu_launch_allocation_seconds
-                ),
+                "gpu_launch_allocation_seconds": float(self.gpu_launch_allocation_seconds),
                 "gpu_tile_wall_seconds": float(self.gpu_tile_wall_seconds),
                 "gpu_kernel_seconds_definition": (
                     "inclusive FP64 distance/reduction section wall time, including its "
@@ -1124,14 +1356,17 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
                 "gpu_cpu_verification_seconds": float(self.cpu_verification_seconds),
                 "gpu_certification_rescans": int(self.certification_rescans),
                 "gpu_ambiguous_boundary_count": int(self.ambiguous_boundary_count),
+                "gpu_exact_boundary_recertifications": int(self.ambiguous_boundary_count),
                 "gpu_certified_tiles": int(self.certified_tiles),
                 "gpu_final_certifications": int(self.final_certifications),
-                "gpu_certification_relative_bound": float(
-                    self.certification_relative_bound
-                ),
+                "gpu_certification_relative_bound": float(self.certification_relative_bound),
                 "gpu_certification_contract": "fp64-gamma-bound-v2",
-                "gpu_certification_fp64_safe": bool(
-                    self._gpu_fp64_certification_safe
+                "gpu_certification_fp64_safe": bool(self._gpu_fp64_certification_safe),
+                "gpu_per_device": [metrics for _device, metrics in self.per_device_metrics.items()],
+                "knn_throughput_locations_per_second": (
+                    self.unique_locations.shape[0] / self._last_neighbour_compute_seconds
+                    if self._last_neighbour_compute_seconds > 0.0
+                    else 0.0
                 ),
             }
         )
@@ -1163,9 +1398,7 @@ def _validate_gpu_result_limits(
     ):
         raise ValueError("max_neighbour_entries must be a positive integer when provided")
     if max_neighbour_entries is not None and required_entries > int(max_neighbour_entries):
-        raise ValueError(
-            "exact GPU neighbour result exceeds its explicit bounded-memory limit"
-        )
+        raise ValueError("exact GPU neighbour result exceeds its explicit bounded-memory limit")
     requested = int(values.nbytes + 16 * required_entries + 128 * values.shape[0])
     if remaining is None:
         raise ResourceCapacityError(
@@ -1194,11 +1427,7 @@ def _resolve_device_limit(
         raise ValueError(
             "max_device_bytes and max_gpu_neighbour_bytes must agree when both are provided"
         )
-    return (
-        max_gpu_neighbour_bytes
-        if max_gpu_neighbour_bytes is not None
-        else max_device_bytes
-    )
+    return max_gpu_neighbour_bytes if max_gpu_neighbour_bytes is not None else max_device_bytes
 
 
 def _build_result(
@@ -1253,6 +1482,7 @@ def compute_gpu_tiled_neighbours(
     max_device_bytes: int | None = None,
     max_gpu_neighbour_bytes: int | None = None,
     gpu_device: int = 0,
+    gpu_devices: Sequence[int] | str | int | None = None,
     gpu_tile_size: int = 128,
     max_index_bytes: int | None = None,
     max_radius_query_bytes: int | None = None,
@@ -1268,9 +1498,7 @@ def compute_gpu_tiled_neighbours(
     values = _validate_descriptors(descriptors)
     order_k = _validate_k(k)
     _validate_chunk_size(chunk_size)
-    service = resource_budget or (
-        index.resource_budget if index is not None else None
-    )
+    service = resource_budget or (index.resource_budget if index is not None else None)
     if service is None:
         from nepflow.resources.budget import build_resource_budget
 
@@ -1281,10 +1509,9 @@ def compute_gpu_tiled_neighbours(
     active_index = index or ExactTiledGPUNeighbourIndex(
         values,
         device=gpu_device,
+        gpu_devices=gpu_devices,
         gpu_tile_size=gpu_tile_size,
-        max_device_bytes=_resolve_device_limit(
-            max_device_bytes, max_gpu_neighbour_bytes
-        ),
+        max_device_bytes=_resolve_device_limit(max_device_bytes, max_gpu_neighbour_bytes),
         tile_size=chunk_size,
         max_index_bytes=max_index_bytes,
         max_radius_query_bytes=max_radius_query_bytes,
@@ -1358,6 +1585,7 @@ def compute_gpu_tiled_neighbours_many(
     max_device_bytes: int | None = None,
     max_gpu_neighbour_bytes: int | None = None,
     gpu_device: int = 0,
+    gpu_devices: Sequence[int] | str | int | None = None,
     gpu_tile_size: int = 128,
     max_index_bytes: int | None = None,
     max_radius_query_bytes: int | None = None,
@@ -1385,10 +1613,9 @@ def compute_gpu_tiled_neighbours_many(
     active_index = index or ExactTiledGPUNeighbourIndex(
         values,
         device=gpu_device,
+        gpu_devices=gpu_devices,
         gpu_tile_size=gpu_tile_size,
-        max_device_bytes=_resolve_device_limit(
-            max_device_bytes, max_gpu_neighbour_bytes
-        ),
+        max_device_bytes=_resolve_device_limit(max_device_bytes, max_gpu_neighbour_bytes),
         tile_size=chunk_size,
         max_index_bytes=max_index_bytes,
         max_radius_query_bytes=max_radius_query_bytes,

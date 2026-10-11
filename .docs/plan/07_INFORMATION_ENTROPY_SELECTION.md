@@ -1345,20 +1345,29 @@ nearest-neighbour determination:
 ```ini
 kernel_support_execution=exact_tiled_gpu
 gpu_device=0
+gpu_devices=0,1,2,3
 gpu_tile_size=128
 max_gpu_support_bytes=
 ```
 
 `neighbour_backend` remains an exact CPU backend (`exact_indexed_cpu` or
-`exact_tiled_cpu`). The explicit GPU provider uses CuPy FP64 only for bounded
-source/target screening on the selected visible CUDA ordinal. Every retained
+`exact_tiled_cpu`). The explicit GPU provider and `exact_tiled_gpu_knn` backend
+use the same explicit process-visible `gpu_devices` list. Each workstream
+partitions contiguous source/unique-location ranges, keeps the complete
+read-only reference pool on every selected device, and merges chunks in global
+order. CuPy FP64 is used only for bounded source/target screening on the
+selected visible CUDA ordinals. Every retained
 support distance is recomputed by the canonical CPU float64 primitive, and
 strict-boundary decisions are therefore identical to the CPU implementation.
-Unavailable CuPy/CUDA devices and workspace exhaustion fail explicitly; the
+CUDA visibility/SLURM allocation is validated before work begins. Unavailable
+or unallocated devices, device loss, and workspace exhaustion fail explicitly;
+the
 default `kernel_support_execution=cpu` path and CPU-only installations are
 unchanged. Execution evidence (tile counts, FP64 evaluations, H2D/D2H bytes,
 ambiguous/rescanned boundaries, and CPU certification time) is recorded in the
-streamed execution summary without changing scientific fingerprints.
+streamed execution summary, including separate per-device metrics, without
+changing scientific fingerprints. Checkpoint publication is centralized per
+workstream, and resumed ranges are not repeated or double-counted.
 
 The indexed exact CPU backend may also certify a kNN prefix without a radius
 enumeration. It requests one additional `cKDTree.query(eps=0)` location,

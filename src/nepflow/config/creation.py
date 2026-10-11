@@ -333,11 +333,15 @@ entropy_bandwidth_metric=euclidean
 entropy_bandwidth_chunk_size=1024
 entropy_bandwidth_max_neighbour_cache_bytes=
 # Support execution is independent of neighbour determination.  The GPU mode
-# is explicit and requires optional CuPy plus the selected visible CUDA device.
-# exact_tiled_gpu_knn uses the same explicit device only for exact kNN; the
+# is explicit and requires optional CuPy plus the selected visible CUDA device(s).
+# exact_tiled_gpu_knn uses the same explicit device list only for exact kNN; the
 # kernel support provider remains selected separately below.
 entropy_kernel_support_execution=cpu
 entropy_gpu_device=0
+# Explicit process-visible CUDA ordinals for both GPU workstreams, e.g. 0,1,2,3.
+# Blank uses gpu_device. Requested ordinals are validated against visibility and
+# SLURM allocation; unavailable devices fail instead of being silently reduced.
+entropy_gpu_devices=
 entropy_gpu_tile_size=128
 entropy_max_gpu_support_bytes=
 # Optional device-workspace ceiling for the explicit exact_tiled_gpu_knn backend.

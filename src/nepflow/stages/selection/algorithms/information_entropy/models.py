@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -18,21 +19,17 @@ INDEXED_NEIGHBOUR_BACKEND_VERSION = "exact-indexed-cpu-v1"
 TILED_NEIGHBOUR_BACKEND_ID = "exact_tiled_cpu"
 TILED_NEIGHBOUR_BACKEND_VERSION = "exact-tiled-cpu-v1"
 GPU_NEIGHBOUR_BACKEND_ID = "exact_tiled_gpu_knn"
-GPU_NEIGHBOUR_BACKEND_VERSION = "exact-tiled-gpu-knn-v2"
+GPU_NEIGHBOUR_BACKEND_VERSION = "exact-tiled-gpu-knn-v3"
 DEFAULT_NEIGHBOUR_BACKEND_ID = INDEXED_NEIGHBOUR_BACKEND_ID
 NEIGHBOUR_METRIC = "euclidean"
 KERNEL_SUPPORT_EXECUTION_CPU = "cpu"
 KERNEL_SUPPORT_EXECUTION_GPU = "exact_tiled_gpu"
-KERNEL_SUPPORT_EXECUTION_GPU_VERSION = "exact-tiled-gpu-v1"
-KERNEL_SUPPORT_EXECUTIONS = frozenset(
-    {KERNEL_SUPPORT_EXECUTION_CPU, KERNEL_SUPPORT_EXECUTION_GPU}
-)
+KERNEL_SUPPORT_EXECUTION_GPU_VERSION = "exact-tiled-gpu-v2"
+KERNEL_SUPPORT_EXECUTIONS = frozenset({KERNEL_SUPPORT_EXECUTION_CPU, KERNEL_SUPPORT_EXECUTION_GPU})
 # ``exact_tiled_gpu`` was used by early experimental callers.  It remains an
 # accepted spelling for the explicit kNN field, but is canonicalised to the
 # distinct backend identity so it cannot be confused with support execution.
-GPU_NEIGHBOUR_BACKEND_ALIASES = frozenset(
-    {GPU_NEIGHBOUR_BACKEND_ID, KERNEL_SUPPORT_EXECUTION_GPU}
-)
+GPU_NEIGHBOUR_BACKEND_ALIASES = frozenset({GPU_NEIGHBOUR_BACKEND_ID, KERNEL_SUPPORT_EXECUTION_GPU})
 NEIGHBOUR_DISTINCT_POLICY = "exact-coordinate-location-v1"
 BANDWIDTH_SCHEMA_VERSION = "entropy-bandwidth-v1"
 CALIBRATION_OPTIMIZER_ID = "bounded-grid"
@@ -107,6 +104,7 @@ class EntropyBandwidthSettings:
     calibration_batch_size: int | None = None
     kernel_support_execution: str = KERNEL_SUPPORT_EXECUTION_CPU
     gpu_device: int = 0
+    gpu_devices: Sequence[int] | str | int | None = None
     gpu_tile_size: int = 128
     max_gpu_support_bytes: int | None = None
     max_gpu_neighbour_bytes: int | None = None
@@ -127,16 +125,23 @@ class EntropyBandwidthSettings:
         if support_execution == "exact_cpu":
             support_execution = KERNEL_SUPPORT_EXECUTION_CPU
         if support_execution not in KERNEL_SUPPORT_EXECUTIONS:
-            raise ValueError(
-                "kernel_support_execution must be 'cpu' or 'exact_tiled_gpu'"
-            )
-        if isinstance(self.gpu_device, bool) or not isinstance(
-            self.gpu_device, (int, np.integer)
-        ) or int(self.gpu_device) < 0:
+            raise ValueError("kernel_support_execution must be 'cpu' or 'exact_tiled_gpu'")
+        if (
+            isinstance(self.gpu_device, bool)
+            or not isinstance(self.gpu_device, (int, np.integer))
+            or int(self.gpu_device) < 0
+        ):
             raise ValueError("gpu_device must be a non-negative integer")
-        if isinstance(self.gpu_tile_size, bool) or not isinstance(
-            self.gpu_tile_size, (int, np.integer)
-        ) or int(self.gpu_tile_size) < 1:
+        from .gpu_devices import normalize_gpu_devices
+
+        normalized_devices = normalize_gpu_devices(
+            self.gpu_devices, gpu_device=int(self.gpu_device)
+        )
+        if (
+            isinstance(self.gpu_tile_size, bool)
+            or not isinstance(self.gpu_tile_size, (int, np.integer))
+            or int(self.gpu_tile_size) < 1
+        ):
             raise ValueError("gpu_tile_size must be a positive integer")
         if self.max_gpu_support_bytes is not None and (
             isinstance(self.max_gpu_support_bytes, bool)
@@ -198,6 +203,7 @@ class EntropyBandwidthSettings:
             object.__setattr__(self, "backend", GPU_NEIGHBOUR_BACKEND_ID)
         object.__setattr__(self, "kernel_support_execution", support_execution)
         object.__setattr__(self, "gpu_device", int(self.gpu_device))
+        object.__setattr__(self, "gpu_devices", normalized_devices)
         object.__setattr__(self, "gpu_tile_size", int(self.gpu_tile_size))
         object.__setattr__(self, "k_candidates", k_candidates)
         object.__setattr__(self, "c_candidates", c_candidates)
@@ -219,13 +225,9 @@ class EntropyBandwidthSettings:
         if self.calibration_batch_size is not None:
             object.__setattr__(self, "calibration_batch_size", int(self.calibration_batch_size))
         if self.max_gpu_support_bytes is not None:
-            object.__setattr__(
-                self, "max_gpu_support_bytes", int(self.max_gpu_support_bytes)
-            )
+            object.__setattr__(self, "max_gpu_support_bytes", int(self.max_gpu_support_bytes))
         if self.max_gpu_neighbour_bytes is not None:
-            object.__setattr__(
-                self, "max_gpu_neighbour_bytes", int(self.max_gpu_neighbour_bytes)
-            )
+            object.__setattr__(self, "max_gpu_neighbour_bytes", int(self.max_gpu_neighbour_bytes))
 
     @property
     def operational_work_bytes(self) -> int:
@@ -795,6 +797,7 @@ class StreamedKernelExecutionSummary:
     support_execution: str = KERNEL_SUPPORT_EXECUTION_CPU
     support_execution_version: str = "cpu-canonical-v1"
     gpu_device: int | None = None
+    gpu_devices: tuple[int, ...] | None = None
 
     def __post_init__(self) -> None:
         for name in (
@@ -859,6 +862,17 @@ class StreamedKernelExecutionSummary:
             or self.gpu_device < 0
         ):
             raise ValueError("gpu_device must be non-negative when supplied")
+        if self.gpu_devices is not None:
+            if (
+                not isinstance(self.gpu_devices, tuple)
+                or not self.gpu_devices
+                or any(
+                    isinstance(device, bool) or not isinstance(device, int) or device < 0
+                    for device in self.gpu_devices
+                )
+                or len(set(self.gpu_devices)) != len(self.gpu_devices)
+            ):
+                raise ValueError("gpu_devices must be distinct non-negative integer ordinals")
         for name, value in (
             ("backend", self.backend),
             ("metric", self.metric),
@@ -962,6 +976,7 @@ class StreamedKernelExecutionSummary:
             "support_execution": self.support_execution,
             "support_execution_version": self.support_execution_version,
             "gpu_device": self.gpu_device,
+            "gpu_devices": self.gpu_devices,
             "source_query_count": self.source_query_count,
             "numerical_tolerance": self.numerical_tolerance,
             "operations": dict(self.operational_metrics),

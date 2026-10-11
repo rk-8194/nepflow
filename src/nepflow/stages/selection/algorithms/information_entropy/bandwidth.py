@@ -34,6 +34,7 @@ from .models import (
     CALIBRATION_OPTIMIZER_ID,
     CALIBRATION_OPTIMIZER_VERSION,
     DEFAULT_NEIGHBOUR_BACKEND_ID,
+    GPU_NEIGHBOUR_BACKEND_ALIASES,
     KERNEL_FAMILY,
     KERNEL_VERSION,
     NEIGHBOUR_METRIC,
@@ -389,6 +390,7 @@ def calculate_frozen_bandwidths(
     max_radius_query_bytes: int | None = None,
     max_neighbour_cache_bytes: int | None = None,
     gpu_device: int = 0,
+    gpu_devices: Sequence[int] | str | int | None = None,
     gpu_tile_size: int = 128,
     max_gpu_neighbour_bytes: int | None = None,
     resource_budget: ResourceBudgetService | None = None,
@@ -422,6 +424,14 @@ def calculate_frozen_bandwidths(
             available_bytes=remaining,
             reserved_headroom_bytes=service.budget.reserved_headroom_bytes,
         )
+    neighbour_kwargs: dict[str, Any] = {}
+    if backend in GPU_NEIGHBOUR_BACKEND_ALIASES:
+        neighbour_kwargs.update(
+            gpu_device=gpu_device,
+            gpu_devices=gpu_devices,
+            gpu_tile_size=gpu_tile_size,
+            max_gpu_neighbour_bytes=max_gpu_neighbour_bytes,
+        )
     index = build_neighbour_index(
         pool.descriptors,
         backend=backend,
@@ -433,9 +443,7 @@ def calculate_frozen_bandwidths(
             else min(max_radius_query_bytes, max(1, remaining))
         ),
         max_neighbour_cache_bytes=max_neighbour_cache_bytes,
-        gpu_device=gpu_device,
-        gpu_tile_size=gpu_tile_size,
-        max_gpu_neighbour_bytes=max_gpu_neighbour_bytes,
+        **neighbour_kwargs,
         resource_budget=service,
     )
     neighbours = compute_neighbours(
@@ -447,6 +455,7 @@ def calculate_frozen_bandwidths(
         chunk_size=chunk_size,
         representation_fingerprint=pool.representation_fingerprint,
         row_ids=_pool_row_ids(pool),
+        **neighbour_kwargs,
         resource_budget=service,
     )
     return _freeze_from_neighbours(pool, neighbours, c)
@@ -477,6 +486,7 @@ def _settings_from_arguments(
     calibration_batch_size: int | None,
     kernel_support_execution: str,
     gpu_device: int,
+    gpu_devices: Sequence[int] | str | int | None,
     gpu_tile_size: int,
     max_gpu_support_bytes: int | None,
     max_gpu_neighbour_bytes: int | None,
@@ -504,6 +514,7 @@ def _settings_from_arguments(
             calibration_batch_size=calibration_batch_size,
             kernel_support_execution=kernel_support_execution,
             gpu_device=gpu_device,
+            gpu_devices=gpu_devices,
             gpu_tile_size=gpu_tile_size,
             max_gpu_support_bytes=max_gpu_support_bytes,
             max_gpu_neighbour_bytes=max_gpu_neighbour_bytes,
@@ -523,6 +534,7 @@ def _settings_from_arguments(
         calibration_batch_size=calibration_batch_size,
         kernel_support_execution=kernel_support_execution,
         gpu_device=gpu_device,
+        gpu_devices=gpu_devices,
         gpu_tile_size=gpu_tile_size,
         max_gpu_support_bytes=max_gpu_support_bytes,
         max_gpu_neighbour_bytes=max_gpu_neighbour_bytes,
@@ -633,6 +645,7 @@ def calibrate_bandwidth(
     calibration_batch_size: int | None = None,
     kernel_support_execution: str = "cpu",
     gpu_device: int = 0,
+    gpu_devices: Sequence[int] | str | int | None = None,
     gpu_tile_size: int = 128,
     max_gpu_support_bytes: int | None = None,
     max_gpu_neighbour_bytes: int | None = None,
@@ -672,6 +685,7 @@ def calibrate_bandwidth(
         calibration_batch_size=calibration_batch_size,
         kernel_support_execution=kernel_support_execution,
         gpu_device=gpu_device,
+        gpu_devices=gpu_devices,
         gpu_tile_size=gpu_tile_size,
         max_gpu_support_bytes=max_gpu_support_bytes,
         max_gpu_neighbour_bytes=max_gpu_neighbour_bytes,
@@ -692,6 +706,7 @@ def calibrate_bandwidth(
         max_radius_query_bytes=selected_settings.radius_query_bytes,
         max_neighbour_cache_bytes=selected_settings.max_neighbour_cache_bytes,
         gpu_device=selected_settings.gpu_device,
+        gpu_devices=selected_settings.gpu_devices,
         gpu_tile_size=selected_settings.gpu_tile_size,
         max_gpu_neighbour_bytes=selected_settings.max_gpu_neighbour_bytes,
         resource_budget=runtime_budget,
@@ -1159,6 +1174,7 @@ def calibrate_bandwidth(
                             diagnostics=operational_metrics,
                             kernel_support_execution=selected_settings.kernel_support_execution,
                             gpu_device=selected_settings.gpu_device,
+                            gpu_devices=selected_settings.gpu_devices,
                             gpu_tile_size=selected_settings.gpu_tile_size,
                             max_gpu_support_bytes=selected_settings.max_gpu_support_bytes,
                         ),
@@ -1186,12 +1202,11 @@ def calibrate_bandwidth(
                         diagnostics=operational_metrics,
                         kernel_support_execution=selected_settings.kernel_support_execution,
                         gpu_device=selected_settings.gpu_device,
+                        gpu_devices=selected_settings.gpu_devices,
                         gpu_tile_size=selected_settings.gpu_tile_size,
                         max_gpu_support_bytes=selected_settings.max_gpu_support_bytes,
                     )
-                operational_metrics["loo_seconds"] += max(
-                    0.0, time.perf_counter() - loo_started
-                )
+                operational_metrics["loo_seconds"] += max(0.0, time.perf_counter() - loo_started)
                 operational_metrics["loo_pair_count"] += len(c_batch)
                 sample_resource_leases()
                 if isinstance(index, (IndexedCPUNeighbourIndex, TiledCPUNeighbourIndex)):
@@ -1295,9 +1310,7 @@ def calibrate_bandwidth(
                     index_metrics.get("radius_retrieval_seconds", 0.0) or 0.0
                 ),
                 "support_queries": int(index_metrics.get("radius_queries", 0) or 0),
-                "distance_evaluations": int(
-                    index_metrics.get("distance_evaluations", 0) or 0
-                ),
+                "distance_evaluations": int(index_metrics.get("distance_evaluations", 0) or 0),
                 "unique_distance_evaluations": int(
                     index_metrics.get("unique_distance_evaluations", 0) or 0
                 ),
@@ -1310,12 +1323,12 @@ def calibrate_bandwidth(
                     else None
                 ),
                 "process_peak_rss_bytes": index_metrics.get("process_peak_rss_bytes"),
-                "checkpoint_bytes": int(
-                    index_metrics.get("checkpoint_serialization_bytes", 0) or 0
-                ) + int(operational_metrics.get("loo_checkpoint_bytes", 0) or 0),
+                "checkpoint_bytes": int(index_metrics.get("checkpoint_serialization_bytes", 0) or 0)
+                + int(operational_metrics.get("loo_checkpoint_bytes", 0) or 0),
                 "checkpoint_seconds": float(
                     index_metrics.get("checkpoint_serialization_seconds", 0.0) or 0.0
-                ) + float(operational_metrics.get("loo_checkpoint_seconds", 0.0) or 0.0),
+                )
+                + float(operational_metrics.get("loo_checkpoint_seconds", 0.0) or 0.0),
             }
         )
     logger.info(
