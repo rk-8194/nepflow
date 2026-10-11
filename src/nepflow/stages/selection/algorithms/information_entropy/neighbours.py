@@ -721,6 +721,134 @@ class IndexedCPUNeighbourIndex:
             raise ValueError("indexed neighbour distances must be finite")
         return distances
 
+    def _distance_values_many(
+        self,
+        queries: np.ndarray,
+        candidate_lists: Sequence[np.ndarray],
+        *,
+        max_workspace_bytes: int | None = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Recompute canonical distances for a bounded ragged query batch.
+
+        ``cKDTree`` only supplies a conservative candidate set.  The returned
+        CSR offsets and distances are therefore always based on the canonical
+        float64 ``sqrt(sum(delta**2))`` operation, never on tree distances.
+        Flattening the admitted candidate lists lets NumPy evaluate several
+        sources per block without constructing a source-by-pool matrix.
+        """
+
+        query_values = np.asarray(queries, dtype=np.float64)
+        if query_values.ndim != 2 or query_values.shape[1] != self.unique_locations.shape[1]:
+            raise ValueError("batched radius queries have an incompatible shape")
+        query_count = int(query_values.shape[0])
+        if len(candidate_lists) != query_count:
+            raise ValueError("batched radius candidates do not align with queries")
+        counts = np.asarray(
+            [int(np.asarray(candidates, dtype=np.int64).size) for candidates in candidate_lists],
+            dtype=np.int64,
+        )
+        offsets = np.empty(query_count + 1, dtype=np.int64)
+        offsets[0] = 0
+        np.cumsum(counts, dtype=np.int64, out=offsets[1:])
+        total = int(offsets[-1])
+        distances = np.empty(total, dtype=np.float64)
+        if total == 0:
+            return offsets, distances
+
+        if query_count == 1:
+            distances[:] = self._distance_values(
+                query_values[0],
+                self.unique_locations[np.asarray(candidate_lists[0], dtype=np.int64)],
+                max_workspace_bytes=max_workspace_bytes,
+            )
+            return offsets, distances
+
+        flat_candidates = np.concatenate(
+            [np.asarray(candidates, dtype=np.int64) for candidates in candidate_lists]
+        )
+        owners = np.repeat(np.arange(query_count, dtype=np.int64), counts)
+        if max_workspace_bytes is None:
+            block = total
+        else:
+            fixed_bytes = int(flat_candidates.nbytes + owners.nbytes + distances.nbytes + 256)
+            bytes_per_row = max(8, 32 * int(self.unique_locations.shape[1]) + 8)
+            available = int(max_workspace_bytes) - fixed_bytes
+            block = available // bytes_per_row
+            if block < 1:
+                raise RadiusQueryCapacityError(
+                    "indexed neighbour batched distance workspace exceeds "
+                    "max_radius_query_bytes"
+                )
+            block = min(total, int(block))
+
+        with np.errstate(over="raise", invalid="raise"):
+            try:
+                for start in range(0, total, block):
+                    stop = min(start + block, total)
+                    targets = self.unique_locations[flat_candidates[start:stop]]
+                    delta = targets - query_values[owners[start:stop]]
+                    squared = delta**2
+                    distances[start:stop] = np.sqrt(
+                        np.sum(squared, axis=1, dtype=np.float64)
+                    )
+            except FloatingPointError as exc:
+                raise ValueError(
+                    "indexed neighbour batched distance evaluation overflowed or became invalid"
+                ) from exc
+        if not np.all(np.isfinite(distances)):
+            raise ValueError("indexed neighbour batched distances must be finite")
+        return offsets, distances
+
+    def _distance_values_matrix(
+        self,
+        queries: np.ndarray,
+        candidate_matrix: np.ndarray,
+        *,
+        max_workspace_bytes: int | None = None,
+    ) -> np.ndarray:
+        """Recompute canonical distances for a bounded dense candidate block."""
+
+        query_values = np.asarray(queries, dtype=np.float64)
+        candidates = np.asarray(candidate_matrix, dtype=np.int64)
+        if query_values.ndim != 2 or candidates.ndim != 2:
+            raise ValueError("batched neighbour distances require two-dimensional inputs")
+        if query_values.shape[0] != candidates.shape[0]:
+            raise ValueError("batched neighbour queries and candidates do not align")
+        row_count, candidate_count = (int(value) for value in candidates.shape)
+        distances = np.empty((row_count, candidate_count), dtype=np.float64)
+        if row_count == 0 or candidate_count == 0:
+            return distances
+        if max_workspace_bytes is None:
+            row_block = row_count
+        else:
+            dimension = int(self.unique_locations.shape[1])
+            fixed_per_row = max(1, 32 * dimension * candidate_count + 8 * candidate_count)
+            available = int(max_workspace_bytes) - 256
+            row_block = available // fixed_per_row
+            if row_block < 1:
+                raise RadiusQueryCapacityError(
+                    "indexed neighbour matrix distance workspace exceeds "
+                    "max_radius_query_bytes"
+                )
+            row_block = min(row_count, int(row_block))
+        with np.errstate(over="raise", invalid="raise"):
+            try:
+                for start in range(0, row_count, row_block):
+                    stop = min(start + row_block, row_count)
+                    targets = self.unique_locations[candidates[start:stop]]
+                    delta = targets - query_values[start:stop, None, :]
+                    squared = delta**2
+                    distances[start:stop] = np.sqrt(
+                        np.sum(squared, axis=2, dtype=np.float64)
+                    )
+            except FloatingPointError as exc:
+                raise ValueError(
+                    "indexed neighbour matrix distance evaluation overflowed or became invalid"
+                ) from exc
+        if not np.all(np.isfinite(distances)):
+            raise ValueError("indexed neighbour matrix distances must be finite")
+        return distances
+
     def _capacity_error(
         self,
         *,
@@ -1089,8 +1217,7 @@ class IndexedCPUNeighbourIndex:
             candidate_matrix = np.asarray(tree_indices, dtype=np.int64)
             if candidate_matrix.ndim == 1:
                 candidate_matrix = candidate_matrix.reshape(stop - start, order_k + 1)
-            initial_distances = np.empty((stop - start, order_k), dtype=np.float64)
-            verification_started = time.perf_counter()
+            initial_candidates = np.empty((stop - start, order_k), dtype=np.int64)
             for offset, query_location in enumerate(range(start, stop)):
                 candidates = candidate_matrix[offset]
                 candidates = candidates[candidates != query_location]
@@ -1099,13 +1226,15 @@ class IndexedCPUNeighbourIndex:
                         f"k={order_k} has insufficient distinct neighbours for location "
                         f"{query_location}"
                     )
-                distances = self._distance_values(
-                    self.unique_locations[query_location],
-                    self.unique_locations[candidates[:order_k]],
-                )
-                initial_distances[offset] = distances
-                self.distance_evaluations += int(distances.shape[0])
-                self.unique_distance_evaluations += int(distances.shape[0])
+                initial_candidates[offset] = candidates[:order_k]
+            verification_started = time.perf_counter()
+            initial_distances = self._distance_values_matrix(
+                queries,
+                initial_candidates,
+                max_workspace_bytes=self.max_radius_query_bytes,
+            )
+            self.distance_evaluations += int(initial_distances.size)
+            self.unique_distance_evaluations += int(initial_distances.size)
             self._record_phase(
                 "canonical_distance_verification",
                 time.perf_counter() - verification_started,
@@ -1202,16 +1331,22 @@ class IndexedCPUNeighbourIndex:
             )
             self.radius_queries += stop - start
             verification_started = time.perf_counter()
+            boundary_candidates = []
             for offset, query_location in enumerate(range(start, stop)):
                 boundary_indices = np.asarray(boundary_lists[offset], dtype=np.int64)
-                boundary_indices = boundary_indices[boundary_indices != query_location]
-                distances = self._distance_values(
-                    self.unique_locations[query_location],
-                    self.unique_locations[boundary_indices],
-                    max_workspace_bytes=self.max_radius_query_bytes,
-                )
-                self.distance_evaluations += int(boundary_indices.shape[0])
-                self.unique_distance_evaluations += int(boundary_indices.shape[0])
+                boundary_candidates.append(boundary_indices[boundary_indices != query_location])
+            boundary_offsets, boundary_distances = self._distance_values_many(
+                queries,
+                boundary_candidates,
+                max_workspace_bytes=self.max_radius_query_bytes,
+            )
+            self.distance_evaluations += int(boundary_distances.size)
+            self.unique_distance_evaluations += int(boundary_distances.size)
+            for offset, query_location in enumerate(range(start, stop)):
+                boundary_indices = boundary_candidates[offset]
+                distances = boundary_distances[
+                    boundary_offsets[offset] : boundary_offsets[offset + 1]
+                ]
                 positive = distances > 0.0
                 boundary_indices = boundary_indices[positive]
                 distances = distances[positive]
@@ -1430,6 +1565,259 @@ class IndexedCPUNeighbourIndex:
         )
         return results
 
+    def radius_support_many(
+        self,
+        source_indices: Sequence[int] | np.ndarray,
+        radii: Sequence[float] | np.ndarray,
+        *,
+        chunk_size: int = 1024,
+        context: str | None = None,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Return exact strict-radius supports in bounded CSR form.
+
+        Tree candidates are admitted in source batches, then canonical
+        float64 distances are recomputed over the ragged candidate blocks.
+        The CSR offsets preserve source order; each source's expanded atomic
+        rows are finally sorted by original row index, matching
+        :meth:`radius_support` exactly.
+        """
+
+        sources = np.asarray(source_indices)
+        if sources.ndim != 1 or sources.size == 0:
+            raise ValueError("source_indices must be a non-empty one-dimensional sequence")
+        if sources.dtype.kind not in "iu" or sources.dtype.kind == "b":
+            raise ValueError("source_indices must contain integer row indices")
+        source_rows = np.asarray(sources, dtype=np.int64)
+        if np.any(source_rows < 0) or np.any(source_rows >= self.descriptors.shape[0]):
+            raise IndexError("source_indices contain a row outside the descriptor rows")
+        values = np.asarray(radii, dtype=np.float64)
+        if values.ndim != 1 or values.shape[0] != source_rows.shape[0]:
+            raise ValueError("radii must align with source_indices")
+        if not np.all(np.isfinite(values)) or np.any(values <= 0.0):
+            raise ValueError("radii must be finite and positive")
+        batch_limit = _validate_chunk_size(chunk_size)
+        source_count = int(source_rows.size)
+        dimension = int(self.descriptors.shape[1])
+        offsets = np.zeros(source_count + 1, dtype=np.int64)
+        target_parts: list[np.ndarray] = []
+        distance_parts: list[np.ndarray] = []
+        source_cursor = 0
+        while source_cursor < source_count:
+            stop = min(source_cursor + batch_limit, source_count)
+            # A failed aggregate preflight is handled by reducing the batch;
+            # this keeps a dense support complete without ever allocating a
+            # source-by-pool matrix.
+            while True:
+                batch_sources = source_rows[source_cursor:stop]
+                batch_radii = values[source_cursor:stop]
+                queries = self.descriptors[batch_sources]
+                expanded = batch_radii + np.maximum(
+                    16.0 * np.spacing(batch_radii),
+                    1.0e-14,
+                )
+                preflight_started = time.perf_counter()
+                try:
+                    candidate_counts = np.asarray(
+                        self._tree.query_ball_point(
+                            queries,
+                            expanded,
+                            return_length=True,
+                            workers=self.worker_count,
+                        ),
+                        dtype=np.int64,
+                    ).reshape(-1)
+                except TypeError as exc:
+                    raise self._capacity_error(
+                        source_index=int(batch_sources[0]),
+                        radius=float(batch_radii[0]),
+                        requested_bytes=self.max_radius_query_bytes + 1,
+                        context=(
+                            context
+                            or "SciPy cKDTree does not support vectorized radius preflight"
+                        ),
+                    ) from exc
+                if candidate_counts.shape != batch_sources.shape:
+                    raise ValueError("cKDTree radius preflight returned an invalid batch shape")
+                self.radius_query_preflights += int(batch_sources.size)
+                self._record_phase(
+                    "radius_preflight_count",
+                    time.perf_counter() - preflight_started,
+                    count=int(batch_sources.size),
+                )
+                preflight_workspace = int(
+                    sum(
+                        _estimate_radius_workspace_bytes(int(count), 0, dimension)
+                        for count in candidate_counts
+                    )
+                    + 8 * self.descriptors.shape[0]
+                )
+                self.query_workspace_peak_bytes = max(
+                    self.query_workspace_peak_bytes,
+                    preflight_workspace,
+                )
+                if preflight_workspace > self.max_radius_query_bytes and stop - source_cursor > 1:
+                    stop = source_cursor + max(1, (stop - source_cursor) // 2)
+                    continue
+                if preflight_workspace > self.max_radius_query_bytes:
+                    offending = int(np.flatnonzero(candidate_counts)[0])
+                    raise self._capacity_error(
+                        source_index=int(batch_sources[offending]),
+                        radius=float(batch_radii[offending]),
+                        requested_bytes=preflight_workspace,
+                        context=context,
+                    )
+                break
+
+            retrieval_started = time.perf_counter()
+            try:
+                lease = self.resource_budget.acquire(
+                    context or "indexed exact batched radius query",
+                    max(1, preflight_workspace),
+                )
+            except (ResourceCapacityError, RadiusQueryCapacityError):
+                if stop - source_cursor <= 1:
+                    raise
+                batch_limit = max(1, (stop - source_cursor) // 2)
+                continue
+            try:
+                raw_candidates = self._tree.query_ball_point(
+                    queries,
+                    expanded,
+                    workers=self.worker_count,
+                )
+                candidate_lists = [
+                    np.asarray(candidate, dtype=np.int64)
+                    for candidate in np.atleast_1d(raw_candidates)
+                ]
+                if len(candidate_lists) != batch_sources.size:
+                    raise ValueError("cKDTree radius query returned an invalid batch shape")
+                if any(
+                    int(candidate.shape[0]) != int(expected)
+                    for candidate, expected in zip(candidate_lists, candidate_counts, strict=True)
+                ):
+                    raise ValueError("cKDTree radius preflight disagreed with its batch query")
+                self.radius_queries += int(batch_sources.size)
+                self._record_phase(
+                    "radius_retrieval",
+                    time.perf_counter() - retrieval_started,
+                    count=int(batch_sources.size),
+                )
+                actual_workspace = int(
+                    sum(
+                        _estimate_radius_workspace_bytes(
+                            int(candidate.shape[0]),
+                            int(
+                                np.sum(
+                                    self.location_indptr[candidate + 1]
+                                    - self.location_indptr[candidate],
+                                    dtype=np.int64,
+                                )
+                            ),
+                            dimension,
+                        )
+                        for candidate in candidate_lists
+                    )
+                    + 8 * self.descriptors.shape[0]
+                )
+                self.query_workspace_peak_bytes = max(
+                    self.query_workspace_peak_bytes,
+                    actual_workspace,
+                )
+                if actual_workspace > self.max_radius_query_bytes:
+                    raise self._capacity_error(
+                        source_index=int(batch_sources[0]),
+                        radius=float(batch_radii[0]),
+                        requested_bytes=actual_workspace,
+                        context=context,
+                    )
+                lease.resize(max(preflight_workspace, actual_workspace))
+                verification_started = time.perf_counter()
+                distance_offsets, candidate_distances = self._distance_values_many(
+                    queries,
+                    candidate_lists,
+                    max_workspace_bytes=self.max_radius_query_bytes,
+                )
+                self.distance_evaluations += int(candidate_distances.size)
+                self.unique_distance_evaluations += int(candidate_distances.size)
+                strict_radius_mask = candidate_distances < np.repeat(
+                    batch_radii,
+                    np.diff(distance_offsets),
+                )
+                batch_targets: list[np.ndarray] = []
+                batch_distances: list[np.ndarray] = []
+                batch_support_counts: list[int] = []
+                for local_index, source in enumerate(batch_sources):
+                    candidate = candidate_lists[local_index]
+                    distances = candidate_distances[
+                        distance_offsets[local_index] : distance_offsets[local_index + 1]
+                    ]
+                    included = strict_radius_mask[
+                        distance_offsets[local_index] : distance_offsets[local_index + 1]
+                    ]
+                    included_locations = candidate[included]
+                    included_distances = distances[included]
+                    if included_locations.size == 0:
+                        raise ValueError("positive kernel radius support omitted the source row")
+                    location_order = np.argsort(included_locations, kind="stable")
+                    ordered_locations = included_locations[location_order]
+                    ordered_distances = included_distances[location_order]
+                    row_parts = [
+                        self.rows_by_location[
+                            self.location_indptr[int(location)] : self.location_indptr[
+                                int(location) + 1
+                            ]
+                        ]
+                        for location in ordered_locations
+                    ]
+                    rows = np.concatenate(row_parts).astype(np.int64, copy=False)
+                    row_distances = np.repeat(
+                        ordered_distances,
+                        [int(part.shape[0]) for part in row_parts],
+                    )
+                    row_order = np.argsort(rows, kind="stable")
+                    rows = rows[row_order]
+                    row_distances = np.asarray(row_distances[row_order], dtype=np.float64)
+                    if not np.any(rows == int(source)):
+                        raise ValueError("positive kernel radius support omitted the source row")
+                    batch_targets.append(rows)
+                    batch_distances.append(row_distances)
+                    batch_support_counts.append(int(rows.size))
+                self._record_phase(
+                    "canonical_distance_verification",
+                    time.perf_counter() - verification_started,
+                    count=int(batch_sources.size),
+                )
+                self.distance_evaluations += int(sum(batch_support_counts))
+                self.atomic_distance_evaluations += int(sum(batch_support_counts))
+                for local_index, support_count in enumerate(batch_support_counts):
+                    offsets[source_cursor + local_index + 1] = offsets[
+                        source_cursor + local_index
+                    ] + support_count
+                    self.current_support_count = support_count
+                    if self.min_support_count is None:
+                        self.min_support_count = support_count
+                    else:
+                        self.min_support_count = min(self.min_support_count, support_count)
+                    self.support_count_total += support_count
+                    self.support_count_samples += 1
+                    self.max_support_count = max(self.max_support_count, support_count)
+                target_parts.extend(batch_targets)
+                distance_parts.extend(batch_distances)
+            except (ResourceCapacityError, RadiusQueryCapacityError):
+                if stop - source_cursor <= 1:
+                    raise
+                batch_limit = max(1, (stop - source_cursor) // 2)
+                continue
+            finally:
+                lease.close()
+            source_cursor = stop
+
+        targets = np.concatenate(target_parts).astype(np.int64, copy=False)
+        distances = np.asarray(np.concatenate(distance_parts), dtype=np.float64)
+        targets.setflags(write=False)
+        distances.setflags(write=False)
+        return offsets, targets, distances
+
     def radius_support(
         self,
         source_index: int,
@@ -1441,86 +1829,13 @@ class IndexedCPUNeighbourIndex:
 
         if isinstance(source_index, bool) or not isinstance(source_index, (int, np.integer)):
             raise ValueError("source_index must be a non-negative integer")
-        source = int(source_index)
-        if source < 0 or source >= self.descriptors.shape[0]:
-            raise IndexError("source_index is outside the descriptor rows")
-        value = float(radius)
-        if not np.isfinite(value) or value <= 0.0:
-            raise ValueError("radius must be finite and positive")
-        query = self.descriptors[source]
-        location_indices = self._query_location_candidates(
-            query,
-            value,
-            source_index=source,
-            row_count=self.descriptors.shape[0],
+        offsets, targets, distances = self.radius_support_many(
+            np.asarray([int(source_index)], dtype=np.int64),
+            np.asarray([float(radius)], dtype=np.float64),
+            chunk_size=1,
             context=context,
         )
-        verification_started = time.perf_counter()
-        location_targets = self.unique_locations[location_indices]
-        location_distances = self._distance_values(
-            query,
-            location_targets,
-            max_workspace_bytes=self.max_radius_query_bytes,
-        )
-        self.distance_evaluations += int(location_indices.shape[0])
-        self.unique_distance_evaluations += int(location_indices.shape[0])
-        included = location_distances < value
-        included_locations = location_indices[included]
-        included_distances = location_distances[included]
-        if included_locations.size == 0:
-            raise ValueError("positive kernel radius support omitted the source row")
-        support_count = sum(
-            int(self.location_indptr[int(location) + 1] - self.location_indptr[int(location)])
-            for location in included_locations
-        )
-        estimated_bytes = _estimate_radius_workspace_bytes(
-            int(location_indices.shape[0]),
-            support_count,
-            self.descriptors.shape[1],
-            self.descriptors.shape[0],
-        )
-        self.query_workspace_peak_bytes = max(self.query_workspace_peak_bytes, estimated_bytes)
-        if estimated_bytes > self.max_radius_query_bytes:
-            raise self._capacity_error(
-                source_index=source,
-                radius=value,
-                requested_bytes=estimated_bytes,
-                context=context,
-            )
-        location_order = np.argsort(included_locations, kind="stable")
-        ordered_locations = included_locations[location_order]
-        ordered_distances = included_distances[location_order]
-        row_parts = [
-            self.rows_by_location[
-                self.location_indptr[int(location)] : self.location_indptr[int(location) + 1]
-            ]
-            for location in ordered_locations
-        ]
-        target_indices = np.concatenate(row_parts).astype(np.int64, copy=False)
-        target_distances = np.repeat(ordered_distances, [part.shape[0] for part in row_parts])
-        row_order = np.argsort(target_indices, kind="stable")
-        target_indices = target_indices[row_order]
-        target_distances = np.asarray(target_distances[row_order], dtype=np.float64)
-        self._record_phase(
-            "canonical_distance_verification",
-            time.perf_counter() - verification_started,
-            count=1,
-        )
-        self.distance_evaluations += int(target_indices.shape[0])
-        self.atomic_distance_evaluations += int(target_indices.shape[0])
-        self.current_support_count = int(target_indices.shape[0])
-        if self.min_support_count is None:
-            self.min_support_count = self.current_support_count
-        else:
-            self.min_support_count = min(self.min_support_count, self.current_support_count)
-        self.support_count_total += self.current_support_count
-        self.support_count_samples += 1
-        self.max_support_count = max(self.max_support_count, self.current_support_count)
-        if not np.any(target_indices == source):
-            raise ValueError("positive kernel radius support omitted the source row")
-        target_indices.setflags(write=False)
-        target_distances.setflags(write=False)
-        return target_indices, target_distances
+        return targets[offsets[0] : offsets[1]], distances[offsets[0] : offsets[1]]
 
     query_radius_support = radius_support
     exact_radius_support = radius_support
@@ -2469,6 +2784,7 @@ def compute_indexed_cpu_neighbours(
     representation_fingerprint: str | None = None,
     row_ids: Sequence[str] | None = None,
     max_neighbour_entries: int | None = None,
+    max_radius_query_bytes: int | None = None,
     max_neighbour_cache_bytes: int | None = DEFAULT_NEIGHBOUR_CACHE_BYTES,
     resource_budget: ResourceBudgetService | None = None,
     checkpoint_path: str | os.PathLike[str] | None = None,
@@ -2497,6 +2813,7 @@ def compute_indexed_cpu_neighbours(
         )
     active_index = index or IndexedCPUNeighbourIndex(
         values,
+        max_radius_query_bytes=max_radius_query_bytes,
         max_neighbour_cache_bytes=max_neighbour_cache_bytes,
         resource_budget=resource_budget,
     )
@@ -2602,6 +2919,7 @@ def compute_indexed_cpu_neighbours_many(
     representation_fingerprint: str | None = None,
     row_ids: Sequence[str] | None = None,
     max_neighbour_entries: int | None = None,
+    max_radius_query_bytes: int | None = None,
     max_neighbour_cache_bytes: int | None = DEFAULT_NEIGHBOUR_CACHE_BYTES,
     resource_budget: ResourceBudgetService | None = None,
     checkpoint_path: str | os.PathLike[str] | None = None,
@@ -2635,6 +2953,7 @@ def compute_indexed_cpu_neighbours_many(
         )
     active_index = index or IndexedCPUNeighbourIndex(
         values,
+        max_radius_query_bytes=max_radius_query_bytes,
         max_neighbour_cache_bytes=max_neighbour_cache_bytes,
         resource_budget=resource_budget,
     )
@@ -2744,6 +3063,7 @@ def compute_tiled_cpu_neighbours(
     representation_fingerprint: str | None = None,
     row_ids: Sequence[str] | None = None,
     max_neighbour_entries: int | None = None,
+    max_radius_query_bytes: int | None = None,
     max_neighbour_cache_bytes: int | None = DEFAULT_NEIGHBOUR_CACHE_BYTES,
     resource_budget: ResourceBudgetService | None = None,
     checkpoint_path: str | os.PathLike[str] | None = None,
@@ -2794,6 +3114,7 @@ def compute_tiled_cpu_neighbours(
     active_index = index or TiledCPUNeighbourIndex(
         values,
         tile_size=chunk_size,
+        max_radius_query_bytes=max_radius_query_bytes,
         max_neighbour_cache_bytes=max_neighbour_cache_bytes,
         resource_budget=resource_budget,
     )
@@ -2877,6 +3198,7 @@ def compute_tiled_cpu_neighbours_many(
     representation_fingerprint: str | None = None,
     row_ids: Sequence[str] | None = None,
     max_neighbour_entries: int | None = None,
+    max_radius_query_bytes: int | None = None,
     max_neighbour_cache_bytes: int | None = DEFAULT_NEIGHBOUR_CACHE_BYTES,
     resource_budget: ResourceBudgetService | None = None,
     checkpoint_path: str | os.PathLike[str] | None = None,
@@ -2927,6 +3249,7 @@ def compute_tiled_cpu_neighbours_many(
     active_index = index or TiledCPUNeighbourIndex(
         values,
         tile_size=chunk_size,
+        max_radius_query_bytes=max_radius_query_bytes,
         max_neighbour_cache_bytes=max_neighbour_cache_bytes,
         resource_budget=resource_budget,
     )

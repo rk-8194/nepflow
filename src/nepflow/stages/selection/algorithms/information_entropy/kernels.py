@@ -340,6 +340,66 @@ class _KernelSupportProvider:
         self.support_query_seconds += max(0.0, time.perf_counter() - started)
         return targets, distances
 
+    def support_many(
+        self,
+        source_indices: Sequence[int] | np.ndarray,
+        radii: Sequence[float] | np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Return source supports as bounded CSR arrays.
+
+        Indexed CPU support queries share their tree preflight and canonical
+        distance pass.  Backends without a batched radius primitive retain the
+        exact source-by-source implementation and are assembled into the same
+        CSR representation for callers.
+        """
+
+        sources = np.asarray(source_indices, dtype=np.int64)
+        scales = np.asarray(radii, dtype=np.float64)
+        if sources.ndim != 1 or scales.ndim != 1 or sources.shape != scales.shape:
+            raise ValueError("source_indices and radii must be aligned one-dimensional arrays")
+        if sources.size == 0:
+            raise ValueError("support_many requires at least one source")
+        started = time.perf_counter()
+        indexed_batch = isinstance(self.index, IndexedCPUNeighbourIndex)
+        if indexed_batch:
+            offsets, targets, distances = self.index.radius_support_many(
+                sources,
+                scales,
+                chunk_size=self.chunk_size,
+                context=self.capacity_context,
+            )
+            self.index_queries += int(sources.size)
+            self.radius_queries = self.index.radius_queries
+            self.query_workspace_peak_bytes = self.index.query_workspace_peak_bytes
+        else:
+            target_parts: list[np.ndarray] = []
+            distance_parts: list[np.ndarray] = []
+            offsets = np.zeros(sources.size + 1, dtype=np.int64)
+            for offset, (source, scale) in enumerate(zip(sources, scales, strict=True)):
+                target, distance = self.support(int(source), float(scale))
+                target_parts.append(target)
+                distance_parts.append(distance)
+                offsets[offset + 1] = offsets[offset] + int(target.size)
+            targets = np.concatenate(target_parts).astype(np.int64, copy=False)
+            distances = np.asarray(np.concatenate(distance_parts), dtype=np.float64)
+
+        if indexed_batch:
+            counts = np.diff(offsets)
+            for count in counts:
+                support_count = int(count)
+                self.current_support_count = support_count
+                if self.min_support_count is None:
+                    self.min_support_count = support_count
+                else:
+                    self.min_support_count = min(self.min_support_count, support_count)
+                self.support_count_total += support_count
+                self.support_count_samples += 1
+                self.max_support_count = max(self.max_support_count, support_count)
+            self.support_entries += int(targets.size)
+            self.support_query_count += int(sources.size)
+            self.support_query_seconds += max(0.0, time.perf_counter() - started)
+        return offsets, targets, distances
+
     def operational_metrics(self) -> dict[str, Any]:
         """Return support/query evidence without exposing it to science IDs."""
 
@@ -436,14 +496,21 @@ def source_normalisers(
         capacity_context=capacity_context,
     )
     normalisers = np.empty(values.shape[0], dtype=np.float64)
-    for source_index, scale in enumerate(scales):
-        targets, distances = provider.support(source_index, float(scale))
-        normalisers[source_index] = provider.normaliser(
-            source_index,
-            float(scale),
-            targets,
-            distances,
+    for start in range(0, values.shape[0], block):
+        stop = min(start + block, values.shape[0])
+        offsets, targets, distances = provider.support_many(
+            np.arange(start, stop, dtype=np.int64),
+            scales[start:stop],
         )
+        for offset, source_index in enumerate(range(start, stop)):
+            begin = int(offsets[offset])
+            end = int(offsets[offset + 1])
+            normalisers[source_index] = provider.normaliser(
+                source_index,
+                float(scales[source_index]),
+                targets[begin:end],
+                distances[begin:end],
+            )
     normalisers.setflags(write=False)
     return normalisers
 
@@ -490,28 +557,40 @@ def iter_normalized_kernel_columns(
             source_index < 0 or source_index >= values.shape[0] for source_index in ordered_sources
         ):
             raise ValueError("source_indices contains an out-of-range source row")
-    for source_index in ordered_sources:
-        scale = scales[source_index]
-        target_indices, distances = provider.support(source_index, float(scale))
-        normaliser = provider.normaliser(
-            source_index,
-            float(scale),
-            target_indices,
-            distances,
+    for start in range(0, len(ordered_sources), block):
+        source_batch = ordered_sources[start : start + block]
+        source_array = np.asarray(source_batch, dtype=np.int64)
+        offsets, targets, distances = provider.support_many(
+            source_array,
+            scales[source_array],
         )
-        raw = np.asarray(wendland_kernel(distances / scale), dtype=np.float64)
-        positive = raw > 0.0
-        if not np.all(positive):
-            target_indices = target_indices[positive]
-            raw = raw[positive]
-        normalized = raw / normaliser
-        column_total = float(np.sum(normalized, dtype=np.float64))
-        if target_indices.size:
-            yield NormalizedKernelColumn(source_index, target_indices, normalized)
-        if not math.isclose(column_total, 1.0, rel_tol=0.0, abs_tol=1.0e-12):
-            raise ValueError(f"normalized source kernel column {source_index} does not sum to one")
-        if progress_callback is not None:
-            progress_callback(source_index + 1, values.shape[0])
+        for offset, source_index in enumerate(source_batch):
+            begin = int(offsets[offset])
+            end = int(offsets[offset + 1])
+            scale = scales[source_index]
+            target_indices = targets[begin:end]
+            source_distances = distances[begin:end]
+            normaliser = provider.normaliser(
+                source_index,
+                float(scale),
+                target_indices,
+                source_distances,
+            )
+            raw = np.asarray(wendland_kernel(source_distances / scale), dtype=np.float64)
+            positive = raw > 0.0
+            if not np.all(positive):
+                target_indices = target_indices[positive]
+                raw = raw[positive]
+            normalized = raw / normaliser
+            column_total = float(np.sum(normalized, dtype=np.float64))
+            if target_indices.size:
+                yield NormalizedKernelColumn(source_index, target_indices, normalized)
+            if not math.isclose(column_total, 1.0, rel_tol=0.0, abs_tol=1.0e-12):
+                raise ValueError(
+                    f"normalized source kernel column {source_index} does not sum to one"
+                )
+            if progress_callback is not None:
+                progress_callback(source_index + 1, values.shape[0])
 
 
 def normalized_kernel_matrix(
@@ -847,22 +926,25 @@ def evaluate_leave_one_out_objectives(
                 row_count,
             )
     source_phase_started = time.perf_counter()
-    for source_index in range(source_start, row_count):
-        source_scales = scales[:, source_index]
-        maximum_scale = float(np.max(source_scales))
-        target_indices, distances = provider.support(source_index, maximum_scale)
+    for batch_start in range(source_start, row_count, block):
+        batch_stop = min(batch_start + block, row_count)
+        source_indices = np.arange(batch_start, batch_stop, dtype=np.int64)
+        maximum_scales = np.max(scales[:, batch_start:batch_stop], axis=0)
+        support_offsets, support_targets, support_distances = provider.support_many(
+            source_indices,
+            maximum_scales,
+        )
         peak_scratch_bytes = max(peak_scratch_bytes, int(service.reserved_scratch_bytes))
         peak_lease_bytes = max(peak_lease_bytes, int(service.reserved_memory_bytes))
-        support_count = int(target_indices.shape[0])
         query_bytes = int(getattr(provider.index, "query_workspace_peak_bytes", 0))
-        requested_bytes = batch_arrays_bytes + query_bytes + 32 * support_count
+        requested_bytes = batch_arrays_bytes + query_bytes + 32 * int(support_targets.size)
         peak_workspace_bytes = max(peak_workspace_bytes, requested_bytes)
         if requested_bytes > work_limit:
             details = [
                 f"N={row_count}",
                 f"d'={values.shape[1]}",
-                f"source_row={source_index}",
-                f"radius={maximum_scale}",
+                f"source_row={batch_start}",
+                f"radius={float(np.max(maximum_scales))}",
                 f"requested_bytes={requested_bytes}",
                 f"max_calibration_work_bytes={work_limit}",
             ]
@@ -871,73 +953,80 @@ def evaluate_leave_one_out_objectives(
             raise RadiusQueryCapacityError(
                 "batched calibration workspace exceeds memory capacity: " + ", ".join(details)
             )
-        normalization_started = time.perf_counter()
-        for batch_index, scale in enumerate(source_scales):
-            if invalid_reasons[batch_index] is not None:
-                continue
-            try:
-                included = distances < float(scale)
-                selected_targets = target_indices[included]
-                selected_distances = distances[included]
-                support_size = int(selected_targets.shape[0])
-                support_totals[batch_index] += support_size
-                support_samples[batch_index] += 1
-                support_maxima[batch_index] = max(
-                    int(support_maxima[batch_index]),
-                    support_size,
+        for local_index, source_index_value in enumerate(source_indices):
+            source_index = int(source_index_value)
+            source_scales = scales[:, source_index]
+            begin = int(support_offsets[local_index])
+            end = int(support_offsets[local_index + 1])
+            target_indices = support_targets[begin:end]
+            distances = support_distances[begin:end]
+            normalization_started = time.perf_counter()
+            for batch_index, scale in enumerate(source_scales):
+                if invalid_reasons[batch_index] is not None:
+                    continue
+                try:
+                    included = distances < float(scale)
+                    selected_targets = target_indices[included]
+                    selected_distances = distances[included]
+                    support_size = int(selected_targets.shape[0])
+                    support_totals[batch_index] += support_size
+                    support_samples[batch_index] += 1
+                    support_maxima[batch_index] = max(
+                        int(support_maxima[batch_index]),
+                        support_size,
+                    )
+                    raw = np.asarray(
+                        wendland_kernel(selected_distances / float(scale)),
+                        dtype=np.float64,
+                    )
+                    positive = raw > 0.0
+                    if not np.all(positive):
+                        selected_targets = selected_targets[positive]
+                        raw = raw[positive]
+                    total = float(np.sum(raw, dtype=np.float64))
+                    if not math.isfinite(total) or total <= 0.0:
+                        raise ValueError(
+                            f"source kernel normaliser is invalid for source {source_index}"
+                        )
+                    normalized = raw / total
+                    column_total = float(np.sum(normalized, dtype=np.float64))
+                    if not math.isclose(column_total, 1.0, rel_tol=0.0, abs_tol=1.0e-12):
+                        raise ValueError(
+                            f"normalized source kernel column {source_index} does not sum to one"
+                        )
+                    non_source = selected_targets != source_index
+                    if np.any(non_source):
+                        numerator[batch_index, selected_targets[non_source]] += (
+                            masses[source_index] * normalized[non_source]
+                        )
+                except (FloatingPointError, OverflowError, ValueError) as exc:
+                    invalid_reasons[batch_index] = str(exc)
+            normalization_seconds += max(0.0, time.perf_counter() - normalization_started)
+            if progress_callback is not None:
+                progress_callback(source_index + 1, row_count)
+            if (
+                checkpoint_store is not None
+                and checkpoint_identity is not None
+                and (source_index + 1) % int(checkpoint_every_sources) == 0
+            ):
+                checkpoint_started = time.perf_counter()
+                checkpoint_store.write(
+                    checkpoint_name,
+                    identity=checkpoint_identity,
+                    state={
+                        "cursor": source_index + 1,
+                        "invalid_reasons": invalid_reasons,
+                        "support_totals": support_totals.tolist(),
+                        "support_samples": support_samples.tolist(),
+                        "support_maxima": support_maxima.tolist(),
+                    },
+                    arrays={"numerator": numerator},
                 )
-                raw = np.asarray(
-                    wendland_kernel(selected_distances / float(scale)),
-                    dtype=np.float64,
-                )
-                positive = raw > 0.0
-                if not np.all(positive):
-                    selected_targets = selected_targets[positive]
-                    raw = raw[positive]
-                total = float(np.sum(raw, dtype=np.float64))
-                if not math.isfinite(total) or total <= 0.0:
-                    raise ValueError(
-                        f"source kernel normaliser is invalid for source {source_index}"
-                    )
-                normalized = raw / total
-                column_total = float(np.sum(normalized, dtype=np.float64))
-                if not math.isclose(column_total, 1.0, rel_tol=0.0, abs_tol=1.0e-12):
-                    raise ValueError(
-                        f"normalized source kernel column {source_index} does not sum to one"
-                    )
-                non_source = selected_targets != source_index
-                if np.any(non_source):
-                    numerator[batch_index, selected_targets[non_source]] += (
-                        masses[source_index] * normalized[non_source]
-                    )
-            except (FloatingPointError, OverflowError, ValueError) as exc:
-                invalid_reasons[batch_index] = str(exc)
-        normalization_seconds += max(0.0, time.perf_counter() - normalization_started)
-        if progress_callback is not None:
-            progress_callback(source_index + 1, row_count)
-        if (
-            checkpoint_store is not None
-            and checkpoint_identity is not None
-            and (source_index + 1) % int(checkpoint_every_sources) == 0
-        ):
-            checkpoint_started = time.perf_counter()
-            checkpoint_store.write(
-                checkpoint_name,
-                identity=checkpoint_identity,
-                state={
-                    "cursor": source_index + 1,
-                    "invalid_reasons": invalid_reasons,
-                    "support_totals": support_totals.tolist(),
-                    "support_samples": support_samples.tolist(),
-                    "support_maxima": support_maxima.tolist(),
-                },
-                arrays={"numerator": numerator},
-            )
-            checkpoint_seconds += max(0.0, time.perf_counter() - checkpoint_started)
-            checkpoint_bytes += int(numerator.nbytes)
-            checkpoint_writes += 1
-            peak_scratch_bytes = max(peak_scratch_bytes, int(service.reserved_scratch_bytes))
-            peak_lease_bytes = max(peak_lease_bytes, int(service.reserved_memory_bytes))
+                checkpoint_seconds += max(0.0, time.perf_counter() - checkpoint_started)
+                checkpoint_bytes += int(numerator.nbytes)
+                checkpoint_writes += 1
+                peak_scratch_bytes = max(peak_scratch_bytes, int(service.reserved_scratch_bytes))
+                peak_lease_bytes = max(peak_lease_bytes, int(service.reserved_memory_bytes))
 
     source_phase_seconds = max(0.0, time.perf_counter() - source_phase_started)
 

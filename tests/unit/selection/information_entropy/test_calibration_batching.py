@@ -68,6 +68,34 @@ def test_indexed_support_matches_exact_reference_for_unsorted_duplicates() -> No
     np.testing.assert_array_equal(indexed_distances, reference_distances)
 
 
+def test_indexed_batched_support_preserves_strict_boundaries_and_row_order() -> None:
+    descriptors = np.asarray(
+        [[2.0, 0.0], [0.0, 0.0], [1.0, 0.0], [0.0, 0.0], [-1.0, 0.0]],
+        dtype=np.float64,
+    )
+    radii = np.asarray([2.0, 1.0, 3.0, 0.5, 2.0], dtype=np.float64)
+    batched_index = IndexedCPUNeighbourIndex(descriptors)
+    offsets, targets, distances = batched_index.radius_support_many(
+        np.arange(len(descriptors), dtype=np.int64),
+        radii,
+        chunk_size=3,
+    )
+
+    scalar_index = IndexedCPUNeighbourIndex(descriptors)
+    for source_index, radius in enumerate(radii):
+        begin = int(offsets[source_index])
+        end = int(offsets[source_index + 1])
+        expected_targets, expected_distances = scalar_index.radius_support(
+            source_index,
+            float(radius),
+        )
+        np.testing.assert_array_equal(targets[begin:end], expected_targets)
+        np.testing.assert_array_equal(distances[begin:end], expected_distances)
+
+    assert batched_index.radius_queries == len(descriptors)
+    assert batched_index.radius_query_preflights == len(descriptors)
+
+
 def test_batched_loo_matches_each_single_pair_reference() -> None:
     descriptors = np.asarray(
         [[2.0], [0.0], [1.0], [0.0], [2.0], [3.0]],

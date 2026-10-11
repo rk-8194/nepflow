@@ -50,6 +50,19 @@ def test_indexed_radius_support_expands_duplicates_and_excludes_boundary() -> No
     assert 3 not in targets
 
 
+def test_indexed_dispatch_accepts_radius_query_budget() -> None:
+    descriptors = np.arange(6, dtype=np.float64).reshape(-1, 1)
+
+    result = compute_neighbours(
+        descriptors,
+        1,
+        backend=INDEXED_NEIGHBOUR_BACKEND_ID,
+        max_radius_query_bytes=1_000_000,
+    )
+
+    assert result.neighbour_indices.shape == (len(descriptors), 1)
+
+
 def test_backend_dispatch_rejects_unknown_backend_without_reference_fallback() -> None:
     descriptors = np.asarray([[0.0], [1.0]], dtype=np.float64)
     with pytest.raises(ValueError, match="unavailable"):
