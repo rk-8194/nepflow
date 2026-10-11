@@ -59,6 +59,14 @@ PRODUCTION_C_VALUES = EntropyBandwidthSettings().c_candidates
 LOO_NUMERICAL_TOLERANCE = 1.0e-12
 
 
+def _json_default(value: Any) -> Any:
+    """Convert NumPy scalar diagnostics to native JSON scalar types."""
+
+    if isinstance(value, np.generic):
+        return value.item()
+    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
+
+
 def _snapshot_metrics(index: Any) -> dict[str, Any]:
     """Take a detached lifetime snapshot of an optional neighbour index."""
 
@@ -1180,8 +1188,14 @@ def main() -> None:
         ),
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(json.dumps(output, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    print(json.dumps(output, indent=2, sort_keys=True))
+    serialized = json.dumps(
+        output,
+        indent=2,
+        sort_keys=True,
+        default=_json_default,
+    )
+    args.output.write_text(serialized + "\n", encoding="utf-8")
+    print(serialized)
 
 
 if __name__ == "__main__":
