@@ -425,6 +425,9 @@ class IndexedCPUNeighbourIndex:
         self.index_queries = 0
         self.radius_queries = 0
         self.radius_query_preflights = 0
+        self.knn_fast_path_certified = 0
+        self.knn_fast_path_ambiguous = 0
+        self.knn_fast_path_fallback = 0
         self.distance_evaluations = 0
         self.unique_distance_evaluations = 0
         self.atomic_distance_evaluations = 0
@@ -610,6 +613,11 @@ class IndexedCPUNeighbourIndex:
             "index_queries": int(self.index_queries),
             "radius_queries": int(self.radius_queries),
             "radius_query_preflights": int(self.radius_query_preflights),
+            "knn_fast_path_certified": int(self.knn_fast_path_certified),
+            "knn_fast_path_ambiguous": int(self.knn_fast_path_ambiguous),
+            "knn_fast_path_certified_count": int(self.knn_fast_path_certified),
+            "knn_fast_path_ambiguous_count": int(self.knn_fast_path_ambiguous),
+            "knn_fast_path_fallback_count": int(self.knn_fast_path_fallback),
             "distance_evaluations": int(self.distance_evaluations),
             "unique_distance_evaluations": int(self.unique_distance_evaluations),
             "atomic_distance_evaluations": int(self.atomic_distance_evaluations),
@@ -1114,6 +1122,66 @@ class IndexedCPUNeighbourIndex:
             logger.info("Exact neighbour cache miss: requested_k=%d", k)
             return None
 
+    @staticmethod
+    def _certified_knn_boundary(
+        kth_distance: float,
+        excluded_distance: float,
+        *,
+        dimension: int,
+    ) -> bool:
+        """Return whether a kNN boundary is safely separated in float64.
+
+        ``cKDTree.query(eps=0)`` supplies the next excluded location from its
+        exact Euclidean search, but its returned distances are not the
+        canonical float64 distance values used by this module.  The guard
+        therefore compares conservative intervals around the independently
+        recomputed values.  The interval is intentionally wider than the
+        usual ``distance[k] != distance[k + 1]`` test: it covers a bounded
+        accumulation error for the ``d`` squared differences and the final
+        square root, plus several ulps of margin.  A non-finite, zero, or
+        interval-overlapping boundary is unresolved and must use the complete
+        radius enumeration path.
+
+        The cKDTree exact-query contract is the only tree fact used here: all
+        locations not returned in the first ``k + 1`` entries have a tree
+        distance no smaller than the returned excluded entry.  The canonical
+        interval check then certifies the scientific ordering of the retained
+        prefix.  No result from this method is used for strict support
+        screening; it only avoids enumerating a radius when the whole kNN
+        prefix is certified.
+        """
+
+        kth = float(kth_distance)
+        excluded = float(excluded_distance)
+        if (
+            dimension < 1
+            or not np.isfinite(kth)
+            or not np.isfinite(excluded)
+            or kth <= 0.0
+            or excluded <= 0.0
+            or excluded <= kth
+        ):
+            return False
+        scale = max(1.0, abs(kth), abs(excluded))
+        epsilon = np.finfo(np.float64).eps
+        # Squared-distance accumulation has d additions; the factor is a
+        # deliberately conservative operational guard, not a precision claim.
+        operations = max(32, 8 * (int(dimension) + 1))
+        margin = operations * epsilon * scale
+        spacing = abs(float(np.spacing(np.float64(scale))))
+        margin = max(margin, 8.0 * spacing)
+        if not np.isfinite(margin):
+            return False
+        upper = kth + margin
+        lower = excluded - margin
+        if not np.isfinite(upper) or not np.isfinite(lower):
+            return False
+        # nextafter closes the remaining one-ulp gap at the comparison edge.
+        return bool(
+            np.nextafter(np.float64(upper), np.float64(np.inf))
+            < np.nextafter(np.float64(lower), np.float64(-np.inf))
+        )
+
     def _compute_location_neighbours(
         self,
         k: int,
@@ -1277,15 +1345,105 @@ class IndexedCPUNeighbourIndex:
         last_log = started
         start = source_start
         checkpoint_cursor = source_start
+
+        def finish_chunk(completed_stop: int) -> None:
+            nonlocal checkpoint_cursor, last_log, next_percent
+            if (
+                checkpoint_store is not None
+                and checkpoint_identity is not None
+                and (
+                    completed_stop - checkpoint_cursor
+                    >= int(checkpoint_every_locations)
+                    or completed_stop == n_locations
+                )
+            ):
+                checkpoint_started = time.perf_counter()
+                assert incremental_store is not None
+                metrics_before = incremental_store.metrics()
+                write_metrics = incremental_store.write_chunk(
+                    checkpoint_name,
+                    identity=checkpoint_identity,
+                    start=checkpoint_cursor,
+                    neighbour_locations=neighbour_indices[checkpoint_cursor:completed_stop],
+                    neighbour_distances=neighbour_distances[checkpoint_cursor:completed_stop],
+                    k_max=order_k,
+                    location_count=n_locations,
+                )
+                checkpoint_cursor = completed_stop
+                metrics_after = incremental_store.metrics()
+                self._record_phase(
+                    "checkpoint_serialization",
+                    float(
+                        write_metrics.get(
+                            "write_seconds", time.perf_counter() - checkpoint_started
+                        )
+                    ),
+                    bytes_written=int(
+                        write_metrics.get(
+                            "physical_bytes_written",
+                            write_metrics.get("bytes_written", 0),
+                        )
+                    ),
+                )
+                self._record_phase(
+                    "checkpoint_fsync",
+                    float(metrics_after.get("fsync_seconds", 0.0))
+                    - float(metrics_before.get("fsync_seconds", 0.0)),
+                )
+                self._record_phase(
+                    "checkpoint_digest",
+                    float(metrics_after.get("digest_seconds", 0.0))
+                    - float(metrics_before.get("digest_seconds", 0.0)),
+                )
+                self._phase_bytes["checkpoint_retained"] = int(
+                    metrics_after.get("retained_bytes", 0)
+                )
+
+            now = time.perf_counter()
+            if (
+                n_locations < 100
+                or completed_stop * 100 >= next_percent * n_locations
+                or now - last_log >= 10.0
+                or completed_stop == n_locations
+            ):
+                elapsed = max(0.0, now - started)
+                rate = completed_stop / elapsed if elapsed > 0.0 else 0.0
+                eta = (n_locations - completed_stop) / rate if rate > 0.0 else 0.0
+                process_metrics = _process_memory_metrics()
+                logger.info(
+                    "Indexed exact neighbour search progress: %d/%d (%.1f%%), "
+                    "throughput=%.2f locations/s, elapsed=%.3fs, estimated remaining=%.3fs, "
+                    "k_max=%d, index_queries=%d, radius_queries=%d, "
+                    "unique_distance_evaluations=%d, index_bytes=%d, "
+                    "query_workspace_peak_bytes=%d, process_peak_rss_bytes=%s",
+                    completed_stop,
+                    n_locations,
+                    100.0 * completed_stop / n_locations,
+                    rate,
+                    elapsed,
+                    max(0.0, eta),
+                    order_k,
+                    self.index_queries,
+                    self.radius_queries,
+                    self.unique_distance_evaluations,
+                    self.index_bytes,
+                    self.query_workspace_peak_bytes,
+                    process_metrics.get("process_peak_rss_bytes"),
+                )
+                last_log = now
+                while next_percent <= 100 and completed_stop * 100 >= next_percent * n_locations:
+                    next_percent += 1
+
         while start < n_locations:
             stop = min(start + chunk_size, n_locations)
             queries = self.unique_locations[start:stop]
             query_count = stop - start
             tree_workspace = int(
                 queries.nbytes
-                + 16 * query_count * (order_k + 1)
+                + 16 * query_count * min(n_locations, order_k + 2)
                 + 8 * query_count * order_k
-                + 16 * query_count * (order_k + 1)
+                + 16 * query_count * min(n_locations, order_k + 2)
+                + 8 * query_count
                 + 8192
             )
             self.query_workspace_peak_bytes = max(
@@ -1315,9 +1473,11 @@ class IndexedCPUNeighbourIndex:
                     f"indexed kNN tree candidate tile [{start}:{stop})",
                     max(1, tree_workspace),
                 )
+                tree_query_count = min(n_locations, order_k + 2)
                 _tree_distances, tree_indices = self._tree.query(
                     queries,
-                    k=order_k + 1,
+                    k=tree_query_count,
+                    eps=0.0,
                     workers=self.worker_count,
                 )
                 self._record_phase("knn_tree_query", time.perf_counter() - tree_started)
@@ -1325,24 +1485,39 @@ class IndexedCPUNeighbourIndex:
                 del _tree_distances
                 candidate_matrix = np.asarray(tree_indices, dtype=np.int64)
                 if candidate_matrix.ndim == 1:
-                    candidate_matrix = candidate_matrix.reshape(query_count, order_k + 1)
+                    candidate_matrix = candidate_matrix.reshape(query_count, tree_query_count)
                 del tree_indices
                 initial_candidates = np.empty((query_count, order_k), dtype=np.int64)
+                excluded_candidates = np.empty((query_count, 1), dtype=np.int64)
+                has_excluded_candidate = np.ones(query_count, dtype=bool)
                 for offset, query_location in enumerate(range(start, stop)):
                     candidates = candidate_matrix[offset]
-                    candidates = candidates[candidates != query_location]
+                    candidates = candidates[(candidates >= 0) & (candidates != query_location)]
                     if candidates.shape[0] < order_k:
                         raise ValueError(
                             f"k={order_k} has insufficient distinct neighbours for location "
                             f"{query_location}"
                         )
                     initial_candidates[offset] = candidates[:order_k]
+                    if candidates.shape[0] > order_k:
+                        excluded_candidates[offset, 0] = candidates[order_k]
+                    else:
+                        # There is no excluded location when the pool has
+                        # exactly k other locations.  Keep the matrix shape
+                        # bounded and force the conservative guard to fall
+                        # back to complete radius verification.
+                        excluded_candidates[offset, 0] = query_location
+                        has_excluded_candidate[offset] = False
                 verification_started = time.perf_counter()
                 initial_fixed, initial_tile, initial_rows = self._matrix_distance_workspace(
                     queries,
                     initial_candidates,
                     max_workspace_bytes=self.max_radius_query_bytes,
-                    persistent_workspace_bytes=candidate_matrix.nbytes,
+                    persistent_workspace_bytes=(
+                        candidate_matrix.nbytes
+                        + initial_candidates.nbytes
+                        + excluded_candidates.nbytes
+                    ),
                 )
                 if initial_rows < 1:
                     raise RadiusQueryCapacityError(
@@ -1359,7 +1534,44 @@ class IndexedCPUNeighbourIndex:
                     queries,
                     initial_candidates,
                     max_workspace_bytes=self.max_radius_query_bytes,
-                    persistent_workspace_bytes=candidate_matrix.nbytes,
+                    persistent_workspace_bytes=(
+                        candidate_matrix.nbytes
+                        + initial_candidates.nbytes
+                        + excluded_candidates.nbytes
+                    ),
+                )
+                excluded_fixed, excluded_tile, excluded_rows = self._matrix_distance_workspace(
+                    queries,
+                    excluded_candidates,
+                    max_workspace_bytes=self.max_radius_query_bytes,
+                    persistent_workspace_bytes=(
+                        candidate_matrix.nbytes
+                        + initial_candidates.nbytes
+                        + excluded_candidates.nbytes
+                        + initial_distances.nbytes
+                    ),
+                )
+                if excluded_rows < 1:
+                    raise RadiusQueryCapacityError(
+                        "indexed kNN boundary certification workspace exceeds "
+                        "max_radius_query_bytes"
+                    )
+                excluded_workspace = int(excluded_fixed + excluded_tile * excluded_rows)
+                self.query_workspace_peak_bytes = max(
+                    self.query_workspace_peak_bytes,
+                    excluded_workspace,
+                )
+                tree_lease.resize(max(1, initial_workspace, excluded_workspace))
+                excluded_distances = self._distance_values_matrix(
+                    queries,
+                    excluded_candidates,
+                    max_workspace_bytes=self.max_radius_query_bytes,
+                    persistent_workspace_bytes=(
+                        candidate_matrix.nbytes
+                        + initial_candidates.nbytes
+                        + excluded_candidates.nbytes
+                        + initial_distances.nbytes
+                    ),
                 )
             except (ResourceCapacityError, RadiusQueryCapacityError):
                 if query_count <= 1:
@@ -1377,11 +1589,60 @@ class IndexedCPUNeighbourIndex:
                     tree_lease.close()
             self.distance_evaluations += int(initial_distances.size)
             self.unique_distance_evaluations += int(initial_distances.size)
+            self.distance_evaluations += int(excluded_distances.size)
+            self.unique_distance_evaluations += int(excluded_distances.size)
             self._record_phase(
                 "canonical_distance_verification",
                 time.perf_counter() - verification_started,
                 count=stop - start,
             )
+
+            certification_started = time.perf_counter()
+            chunk_certified = True
+            boundary_certified = np.ones(query_count, dtype=bool)
+            sorted_candidates: list[np.ndarray] = []
+            sorted_distances: list[np.ndarray] = []
+            for offset in range(query_count):
+                candidates = initial_candidates[offset]
+                distances = initial_distances[offset]
+                order = np.lexsort(
+                    (
+                        self.location_representatives[candidates],
+                        distances,
+                    )
+                )
+                ordered_distances = distances[order]
+                sorted_candidates.append(candidates[order])
+                sorted_distances.append(ordered_distances)
+                if not self._certified_knn_boundary(
+                    ordered_distances[-1],
+                    excluded_distances[offset, 0],
+                    dimension=int(self.unique_locations.shape[1]),
+                ) or not has_excluded_candidate[offset]:
+                    boundary_certified[offset] = False
+                    chunk_certified = False
+            self._record_phase(
+                "knn_boundary_certification",
+                time.perf_counter() - certification_started,
+                count=query_count,
+            )
+            if chunk_certified:
+                for offset, query_location in enumerate(range(start, stop)):
+                    neighbour_indices[query_location] = sorted_candidates[offset]
+                    neighbour_distances[query_location] = sorted_distances[offset]
+                self.knn_fast_path_certified += query_count
+                del (
+                    candidate_matrix,
+                    initial_candidates,
+                    initial_distances,
+                    excluded_candidates,
+                    excluded_distances,
+                )
+                finish_chunk(stop)
+                start = stop
+                continue
+            self.knn_fast_path_ambiguous += int(np.count_nonzero(~boundary_certified))
+            self.knn_fast_path_fallback += query_count
 
             boundary_prepare_workspace = int(initial_distances.nbytes + 24 * query_count + 1024)
             self.query_workspace_peak_bytes = max(
@@ -1414,7 +1675,15 @@ class IndexedCPUNeighbourIndex:
             # those references before the ragged support query keeps the
             # admission calculation tied to the arrays that are actually
             # live during the next vectorised operation.
-            del candidate_matrix, initial_candidates, initial_distances
+            del (
+                candidate_matrix,
+                initial_candidates,
+                initial_distances,
+                excluded_candidates,
+                excluded_distances,
+                sorted_candidates,
+                sorted_distances,
+            )
             preflight_started = time.perf_counter()
             preflight_call_workspace = int(
                 8 * self.unique_locations.shape[1] * (stop - start)
@@ -1693,91 +1962,7 @@ class IndexedCPUNeighbourIndex:
                 count=stop - start,
             )
 
-            if (
-                checkpoint_store is not None
-                and checkpoint_identity is not None
-                and (
-                    stop - checkpoint_cursor >= int(checkpoint_every_locations)
-                    or stop == n_locations
-                )
-            ):
-                checkpoint_started = time.perf_counter()
-                assert incremental_store is not None
-                metrics_before = incremental_store.metrics()
-                write_metrics = incremental_store.write_chunk(
-                    checkpoint_name,
-                    identity=checkpoint_identity,
-                    start=checkpoint_cursor,
-                    neighbour_locations=neighbour_indices[checkpoint_cursor:stop],
-                    neighbour_distances=neighbour_distances[checkpoint_cursor:stop],
-                    k_max=order_k,
-                    location_count=n_locations,
-                )
-                checkpoint_cursor = stop
-                metrics_after = incremental_store.metrics()
-                self._record_phase(
-                    "checkpoint_serialization",
-                    float(
-                        write_metrics.get(
-                            "write_seconds", time.perf_counter() - checkpoint_started
-                        )
-                    ),
-                    bytes_written=int(
-                        write_metrics.get(
-                            "physical_bytes_written",
-                            write_metrics.get("bytes_written", 0),
-                        )
-                    ),
-                )
-                self._record_phase(
-                    "checkpoint_fsync",
-                    float(metrics_after.get("fsync_seconds", 0.0))
-                    - float(metrics_before.get("fsync_seconds", 0.0)),
-                )
-                self._record_phase(
-                    "checkpoint_digest",
-                    float(metrics_after.get("digest_seconds", 0.0))
-                    - float(metrics_before.get("digest_seconds", 0.0)),
-                )
-                self._phase_bytes["checkpoint_retained"] = int(
-                    metrics_after.get("retained_bytes", 0)
-                )
-
-            completed = stop
-            now = time.perf_counter()
-            if (
-                n_locations < 100
-                or completed * 100 >= next_percent * n_locations
-                or now - last_log >= 10.0
-                or completed == n_locations
-            ):
-                elapsed = max(0.0, now - started)
-                rate = completed / elapsed if elapsed > 0.0 else 0.0
-                eta = (n_locations - completed) / rate if rate > 0.0 else 0.0
-                process_metrics = _process_memory_metrics()
-                logger.info(
-                    "Indexed exact neighbour search progress: %d/%d (%.1f%%), "
-                    "throughput=%.2f locations/s, elapsed=%.3fs, estimated remaining=%.3fs, "
-                    "k_max=%d, index_queries=%d, radius_queries=%d, "
-                    "unique_distance_evaluations=%d, index_bytes=%d, "
-                    "query_workspace_peak_bytes=%d, process_peak_rss_bytes=%s",
-                    completed,
-                    n_locations,
-                    100.0 * completed / n_locations,
-                    rate,
-                    elapsed,
-                    max(0.0, eta),
-                    order_k,
-                    self.index_queries,
-                    self.radius_queries,
-                    self.unique_distance_evaluations,
-                    self.index_bytes,
-                    self.query_workspace_peak_bytes,
-                    process_metrics.get("process_peak_rss_bytes"),
-                )
-                last_log = now
-                while next_percent <= 100 and completed * 100 >= next_percent * n_locations:
-                    next_percent += 1
+            finish_chunk(stop)
             start = stop
 
         if checkpoint_store is not None and not preserve_checkpoint:

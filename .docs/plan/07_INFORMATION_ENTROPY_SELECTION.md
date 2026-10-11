@@ -1360,6 +1360,19 @@ unchanged. Execution evidence (tile counts, FP64 evaluations, H2D/D2H bytes,
 ambiguous/rescanned boundaries, and CPU certification time) is recorded in the
 streamed execution summary without changing scientific fingerprints.
 
+The indexed exact CPU backend may also certify a kNN prefix without a radius
+enumeration. It requests one additional `cKDTree.query(eps=0)` location,
+recomputes the retained and excluded distances with the canonical float64
+primitive, and applies a conservative dimension-aware error interval. The
+fast path is used only when the entire query chunk is separated by those
+intervals; equal, ulp-near, underflow/overflow, and otherwise unresolved
+boundaries retain bounded radius preflight, materialisation, and canonical
+tie verification. `knn_fast_path_certified_count`,
+`knn_fast_path_ambiguous_count`, `radius_preflight_count`, and
+`radius_retrieval_count` are operational diagnostics; the additional
+`knn_fast_path_fallback_count` records whole chunks that retained the complete
+verification path. None of these counters enter scientific fingerprints.
+
 ---
 
 ## 25. Numerical requirements

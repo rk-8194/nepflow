@@ -111,3 +111,32 @@ def test_bandwidth_value_equivalence_is_not_reported_as_fingerprint_equality() -
     finally:
         if index is not None:
             index.close()
+
+
+def test_large_oracle_skip_still_times_production_sixteen_pair_calibration() -> None:
+    pool, service, index, frozen, neighbours, _ = _prepare_fixture(checkpoint_enabled=False)
+    try:
+        checks = _BENCHMARK["_correctness_checks"](
+            pool,
+            frozen,
+            neighbours,
+            None,
+            chunk_size=16,
+            oracle_limit=1,
+            max_radius_query_bytes=None,
+            backend=INDEXED_NEIGHBOUR_BACKEND_ID,
+            index=index,
+            resource_budget=service,
+            kernel_support_execution="cpu",
+            gpu_device=0,
+            gpu_tile_size=128,
+            max_gpu_support_bytes=None,
+        )
+        assert checks["status"] == "skipped"
+        assert checks["calibration_wall_seconds"] > 0.0
+        timing = checks["calibration_grid"]["production_timing"]
+        assert timing["pair_count"] == 16
+        assert timing["status"] == "measured"
+    finally:
+        if index is not None:
+            index.close()

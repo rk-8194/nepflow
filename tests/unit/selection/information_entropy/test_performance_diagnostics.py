@@ -37,8 +37,10 @@ def test_indexed_phase_counters_cover_exact_query_and_checkpoint(tmp_path) -> No
     np.testing.assert_array_equal(indexed[2].radii, reference.radii)
     metrics = index.memory_metrics()
     assert metrics["knn_tree_query_seconds"] >= 0.0
-    assert metrics["radius_preflight_count"] >= len(index.unique_locations)
-    assert metrics["radius_retrieval_count"] >= len(index.unique_locations)
+    assert metrics["knn_boundary_certification_count"] >= len(index.unique_locations)
+    certified = metrics["knn_fast_path_certified_count"]
+    assert metrics["radius_preflight_count"] + certified >= len(index.unique_locations)
+    assert metrics["radius_retrieval_count"] + certified >= len(index.unique_locations)
     assert metrics["canonical_distance_verification_count"] >= len(index.unique_locations)
     assert metrics["checkpoint_serialization_count"] == len(index.unique_locations) // 2 + (
         1 if len(index.unique_locations) % 2 else 0

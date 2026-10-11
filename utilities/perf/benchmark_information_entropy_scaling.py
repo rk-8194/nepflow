@@ -2,7 +2,8 @@
 
 The descriptor fixture is generated once in ordered pool-row order and reused
 for every comparison.  No ``N x N`` array is allocated; the independent
-correctness oracle is enabled only when ``N`` is below ``--oracle-limit``.
+correctness oracle is enabled only when ``N`` is below ``--oracle-limit``, while
+the production 16-pair LOO calibration is timed on every fixture.
 """
 
 from __future__ import annotations
@@ -11,11 +12,13 @@ import argparse
 import json
 import tempfile
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 
+from nepflow.io.hashing import sha256_canonical_json
 from nepflow.resources.budget import build_resource_budget
 from nepflow.stages.selection.algorithms.information_entropy.bandwidth import (
     _freeze_from_neighbours,
@@ -123,6 +126,7 @@ def _exclusive_knn_phase_seconds(metrics: dict[str, Any]) -> dict[str, float]:
 
     phase_names = (
         "knn_tree_query",
+        "knn_boundary_certification",
         "radius_preflight_count",
         "radius_retrieval",
         "canonical_distance_verification",
@@ -475,6 +479,93 @@ def _run_stream(
     }
 
 
+def _production_calibration_timing(
+    pool: Any,
+    neighbours: ExactNeighbourResult,
+    *,
+    chunk_size: int,
+    max_radius_query_bytes: int | None,
+    backend: str,
+    index: IndexedCPUNeighbourIndex | TiledCPUNeighbourIndex | None,
+    resource_budget: Any,
+    kernel_support_execution: str,
+    gpu_device: int,
+    gpu_tile_size: int,
+    max_gpu_support_bytes: int | None,
+) -> dict[str, Any]:
+    """Measure the production 16-pair LOO grid without an oracle allocation.
+
+    The widest kNN pass already contains every narrower production prefix.  A
+    prefix result is therefore sufficient for timing the actual calibration
+    workload on large fixtures, while the independent exact CPU oracle remains
+    separately bounded by ``oracle_limit``.
+    """
+
+    location_count = int(np.unique(neighbours.row_to_location).size)
+    supported_k = tuple(
+        k for k in PRODUCTION_K_VALUES if k <= location_count - 1 and k <= neighbours.k
+    )
+    bandwidths: list[np.ndarray] = []
+    pairs: list[tuple[int, float]] = []
+    for candidate_k in supported_k:
+        if candidate_k == neighbours.k:
+            prefix = neighbours
+        else:
+            prefix = replace(
+                neighbours,
+                radii=np.asarray(neighbours.distances[:, candidate_k - 1], dtype=np.float64),
+                neighbour_indices=np.asarray(
+                    neighbours.indices[:, :candidate_k], dtype=np.int64
+                ),
+                neighbour_distances=np.asarray(
+                    neighbours.distances[:, :candidate_k], dtype=np.float64
+                ),
+                k=candidate_k,
+                fingerprint=sha256_canonical_json(
+                    {
+                        "parent": neighbours.fingerprint,
+                        "prefix_k": candidate_k,
+                    }
+                ),
+            )
+        for candidate_c in PRODUCTION_C_VALUES:
+            frozen = _freeze_from_neighbours(pool, prefix, candidate_c)
+            bandwidths.append(np.asarray(frozen.bandwidths, dtype=np.float64))
+            pairs.append((candidate_k, candidate_c))
+    if not bandwidths:
+        return {
+            "status": "unsupported",
+            "pair_count": 0,
+            "wall_seconds": 0.0,
+            "reason": "fixture does not contain a supported production k value",
+        }
+    started = time.perf_counter()
+    outcomes = evaluate_leave_one_out_objectives(
+        pool.descriptors,
+        pool.probabilities,
+        np.stack(bandwidths),
+        chunk_size=chunk_size,
+        backend=backend,
+        index=index,
+        max_radius_query_bytes=max_radius_query_bytes,
+        resource_budget=resource_budget,
+        kernel_support_execution=kernel_support_execution,
+        gpu_device=gpu_device,
+        gpu_tile_size=gpu_tile_size,
+        max_gpu_support_bytes=max_gpu_support_bytes,
+    )
+    elapsed = max(0.0, time.perf_counter() - started)
+    return {
+        "status": "measured",
+        "pair_count": len(pairs),
+        "expected_pair_count": len(PRODUCTION_K_VALUES) * len(PRODUCTION_C_VALUES),
+        "supported_k_values": list(supported_k),
+        "valid_pair_count": sum(1 for outcome in outcomes if outcome.valid),
+        "wall_seconds": elapsed,
+        "pair_order": [f"k={k},c={c:g}" for k, c in pairs],
+    }
+
+
 def _correctness_checks(
     pool: Any,
     frozen: Any,
@@ -497,7 +588,30 @@ def _correctness_checks(
     n_rows = int(pool.descriptors.shape[0])
     calibration_started = time.perf_counter()
     if n_rows > oracle_limit:
-        return {"status": "skipped", "reason": f"N={n_rows} exceeds oracle_limit={oracle_limit}"}
+        production_timing = _production_calibration_timing(
+            pool,
+            neighbours,
+            chunk_size=chunk_size,
+            max_radius_query_bytes=max_radius_query_bytes,
+            backend=backend,
+            index=index,
+            resource_budget=resource_budget,
+            kernel_support_execution=kernel_support_execution,
+            gpu_device=gpu_device,
+            gpu_tile_size=gpu_tile_size,
+            max_gpu_support_bytes=max_gpu_support_bytes,
+        )
+        return {
+            "status": "skipped",
+            "reason": f"N={n_rows} exceeds oracle_limit={oracle_limit}",
+            "calibration_wall_seconds": float(production_timing["wall_seconds"]),
+            "calibration_grid": {
+                "independent_oracle": "skipped",
+                "production_timing": production_timing,
+                "all_16_pairs_tested": production_timing["pair_count"]
+                == len(PRODUCTION_K_VALUES) * len(PRODUCTION_C_VALUES),
+            },
+        }
     reference_by_k: dict[int, ExactNeighbourResult] = {}
     production_by_k: dict[int, ExactNeighbourResult] = {}
     location_count = int(np.unique(neighbours.row_to_location).size)
@@ -1016,6 +1130,7 @@ def _profiling_summary(results: list[dict[str, Any]]) -> dict[str, Any]:
         per_run_index = operations.get("per_run_index_metrics", {})
         for phase in (
             "knn_tree_query",
+            "knn_boundary_certification",
             "radius_preflight_count",
             "radius_retrieval",
             "canonical_distance_verification",
@@ -1023,6 +1138,7 @@ def _profiling_summary(results: list[dict[str, Any]]) -> dict[str, Any]:
             seconds = float(per_run_index.get(f"{phase}_seconds", 0.0) or 0.0)
             nested_name = {
                 "knn_tree_query": "kNN tree traversal",
+                "knn_boundary_certification": "kNN boundary certification",
                 "radius_preflight_count": "radius preflight",
                 "radius_retrieval": "radius materialisation",
                 "canonical_distance_verification": "canonical distance/tie verification",
@@ -1073,7 +1189,10 @@ def _profiling_summary(results: list[dict[str, Any]]) -> dict[str, Any]:
             "nested_inclusive_phase_seconds": (
                 "diagnostic child timers; intentionally excluded from the exclusive ranking"
             ),
-            "loo_calibration": "independent 16-pair correctness/calibration oracle timing",
+            "loo_calibration": (
+                "measured production 16-pair LOO calibration timing; independent "
+                "correctness checks are bounded separately"
+            ),
         },
         "interpretation": (
             "Dominant phases are summed from exclusive child timers. Inclusive stage wall times "
@@ -1218,9 +1337,10 @@ def main() -> None:
                         + calibration_seconds
                     )
                     run["full_selection_elapsed_semantics"] = (
-                        "preparation plus the measured independent 16-pair LOO calibration "
-                        "when oracle checks ran, plus streamed candidate contributions; "
-                        "contribution checkpoint I/O remains nested in the stream stage"
+                        "preparation plus the measured production 16-pair LOO calibration "
+                        "plus streamed candidate contributions; independent correctness "
+                        "checks may be skipped by oracle-limit, and contribution checkpoint "
+                        "I/O remains nested in the stream stage"
                     )
                 workload = {
                     "N": int(pool.descriptors.shape[0]),
@@ -1272,7 +1392,7 @@ def main() -> None:
                     index.close()
 
     output = {
-        "schema": "nepflow-information-entropy-scaling-benchmark-v4",
+        "schema": "nepflow-information-entropy-scaling-benchmark-v5",
         "fixture": {
             "case": args.case,
             "seed": 20261011,
