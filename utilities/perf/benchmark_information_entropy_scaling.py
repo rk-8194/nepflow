@@ -475,7 +475,6 @@ def _correctness_checks(
             representation_fingerprint=pool.representation_fingerprint,
             row_ids=_pool_row_ids(pool),
             resource_budget=resource_budget,
-            max_radius_query_bytes=max_radius_query_bytes,
         )
     reference = reference_by_k.get(max(supported_k, default=1), neighbours)
     indices_equal = bool(np.array_equal(neighbours.indices, reference.indices))
