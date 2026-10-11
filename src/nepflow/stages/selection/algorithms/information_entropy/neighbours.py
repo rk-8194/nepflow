@@ -1123,63 +1123,143 @@ class IndexedCPUNeighbourIndex:
             return None
 
     @staticmethod
+    def _euclidean_relative_error_bound(
+        query: np.ndarray,
+        target: np.ndarray,
+        *,
+        dimension: int,
+    ) -> float | None:
+        """Return a certified relative error bound for one FP64 norm.
+
+        The bound covers one rounded subtraction and square per component, a
+        worst-case sequential ``d``-term accumulation, and a rounded square
+        root.  It also covers an independent ``d``-term cKDTree distance
+        calculation and its rounded square root.  The interval is widened by
+        ``nextafter`` at both ends.  Any non-finite, subnormal,
+        underflow-prone, or overflow-prone operation is rejected so the
+        caller must use complete exact radius verification.
+        """
+
+        if dimension < 1 or query.shape != target.shape or query.size != dimension:
+            return None
+        with np.errstate(over="raise", under="raise", invalid="raise"):
+            try:
+                delta = np.asarray(target, dtype=np.float64) - np.asarray(
+                    query, dtype=np.float64
+                )
+                squared = delta * delta
+                squared_sum = np.sum(squared, dtype=np.float64)
+            except FloatingPointError:
+                return None
+        if not np.all(np.isfinite(delta)) or not np.all(np.isfinite(squared)):
+            return None
+        tiny = np.finfo(np.float64).tiny
+        nonzero = delta != 0.0
+        if np.any(nonzero & (np.abs(delta) < np.sqrt(tiny))):
+            return None
+        if np.any((squared != 0.0) & (squared < tiny)):
+            return None
+        if not np.isfinite(squared_sum) or float(squared_sum) <= 0.0:
+            return None
+        unit_roundoff = np.finfo(np.float64).eps / 2.0
+        # The exponent covers the canonical norm operations and an additional
+        # worst-case norm evaluation by cKDTree.  ``nextafter`` makes the
+        # interval outward-rounded rather than relying on a strict algebraic
+        # approximation to the IEEE error factor.
+        factor = (1.0 + unit_roundoff) ** (2 * int(dimension) + 8)
+        relative = float(np.nextafter(factor - 1.0, np.inf))
+        if not np.isfinite(relative) or relative >= 1.0:
+            return None
+        return relative
+
+    @staticmethod
+    def _distance_interval(value: float, relative_error: float) -> tuple[float, float] | None:
+        measured = float(value)
+        if (
+            not np.isfinite(measured)
+            or measured <= 0.0
+            or not np.isfinite(relative_error)
+            or relative_error < 0.0
+            or relative_error >= 1.0
+        ):
+            return None
+        with np.errstate(over="ignore", divide="ignore", invalid="ignore"):
+            lower = np.float64(measured) / np.float64(1.0 + relative_error)
+            upper = np.float64(measured) / np.float64(1.0 - relative_error)
+        if not np.isfinite(lower) or not np.isfinite(upper):
+            return None
+        return (
+            float(np.nextafter(np.float64(lower), np.float64(-np.inf))),
+            float(np.nextafter(np.float64(upper), np.float64(np.inf))),
+        )
+
+    @classmethod
     def _certified_knn_boundary(
+        cls,
+        query: np.ndarray,
+        kth_target: np.ndarray,
+        excluded_target: np.ndarray,
+        tree_kth_target: np.ndarray,
+        tree_excluded_target: np.ndarray,
         kth_distance: float,
         excluded_distance: float,
+        tree_kth_distance: float,
+        tree_excluded_distance: float,
         *,
         dimension: int,
     ) -> bool:
-        """Return whether a kNN boundary is safely separated in float64.
+        """Certify a kNN prefix using outward-rounded FP64 distance bounds.
 
-        ``cKDTree.query(eps=0)`` supplies the next excluded location from its
-        exact Euclidean search, but its returned distances are not the
-        canonical float64 distance values used by this module.  The guard
-        therefore compares conservative intervals around the independently
-        recomputed values.  The interval is intentionally wider than the
-        usual ``distance[k] != distance[k + 1]`` test: it covers a bounded
-        accumulation error for the ``d`` squared differences and the final
-        square root, plus several ulps of margin.  A non-finite, zero, or
-        interval-overlapping boundary is unresolved and must use the complete
-        radius enumeration path.
-
-        The cKDTree exact-query contract is the only tree fact used here: all
-        locations not returned in the first ``k + 1`` entries have a tree
-        distance no smaller than the returned excluded entry.  The canonical
-        interval check then certifies the scientific ordering of the retained
-        prefix.  No result from this method is used for strict support
-        screening; it only avoids enumerating a radius when the whole kNN
-        prefix is certified.
+        ``cKDTree.query(eps=0)`` promises an exact Euclidean nearest-neighbour
+        result.  Its returned boundary is nevertheless checked independently:
+        the returned tree distances and the canonical NumPy distances must
+        each have a non-overlapping k-th/excluded interval under the forward
+        error bound above.  Thus a numerically reordered tree boundary, a
+        canonical near-tie, and every underflow/overflow trap are rejected and
+        routed through the complete radius enumeration path.
         """
 
-        kth = float(kth_distance)
-        excluded = float(excluded_distance)
+        kth_error = cls._euclidean_relative_error_bound(
+            query,
+            kth_target,
+            dimension=dimension,
+        )
+        excluded_error = cls._euclidean_relative_error_bound(
+            query,
+            excluded_target,
+            dimension=dimension,
+        )
+        tree_kth_error = cls._euclidean_relative_error_bound(
+            query,
+            tree_kth_target,
+            dimension=dimension,
+        )
+        tree_excluded_error = cls._euclidean_relative_error_bound(
+            query,
+            tree_excluded_target,
+            dimension=dimension,
+        )
         if (
-            dimension < 1
-            or not np.isfinite(kth)
-            or not np.isfinite(excluded)
-            or kth <= 0.0
-            or excluded <= 0.0
-            or excluded <= kth
+            kth_error is None
+            or excluded_error is None
+            or tree_kth_error is None
+            or tree_excluded_error is None
         ):
             return False
-        scale = max(1.0, abs(kth), abs(excluded))
-        epsilon = np.finfo(np.float64).eps
-        # Squared-distance accumulation has d additions; the factor is a
-        # deliberately conservative operational guard, not a precision claim.
-        operations = max(32, 8 * (int(dimension) + 1))
-        margin = operations * epsilon * scale
-        spacing = abs(float(np.spacing(np.float64(scale))))
-        margin = max(margin, 8.0 * spacing)
-        if not np.isfinite(margin):
+        canonical_kth = cls._distance_interval(kth_distance, kth_error)
+        canonical_excluded = cls._distance_interval(excluded_distance, excluded_error)
+        tree_kth = cls._distance_interval(tree_kth_distance, tree_kth_error)
+        tree_excluded = cls._distance_interval(tree_excluded_distance, tree_excluded_error)
+        if (
+            canonical_kth is None
+            or canonical_excluded is None
+            or tree_kth is None
+            or tree_excluded is None
+        ):
             return False
-        upper = kth + margin
-        lower = excluded - margin
-        if not np.isfinite(upper) or not np.isfinite(lower):
-            return False
-        # nextafter closes the remaining one-ulp gap at the comparison edge.
         return bool(
-            np.nextafter(np.float64(upper), np.float64(np.inf))
-            < np.nextafter(np.float64(lower), np.float64(-np.inf))
+            canonical_kth[1] < canonical_excluded[0]
+            and tree_kth[1] < tree_excluded[0]
         )
 
     def _compute_location_neighbours(
@@ -1443,7 +1523,7 @@ class IndexedCPUNeighbourIndex:
                 + 16 * query_count * min(n_locations, order_k + 2)
                 + 8 * query_count * order_k
                 + 16 * query_count * min(n_locations, order_k + 2)
-                + 8 * query_count
+                + 24 * query_count
                 + 8192
             )
             self.query_workspace_peak_bytes = max(
@@ -1482,6 +1562,11 @@ class IndexedCPUNeighbourIndex:
                 )
                 self._record_phase("knn_tree_query", time.perf_counter() - tree_started)
                 self.index_queries += stop - start
+                tree_distance_matrix = np.asarray(_tree_distances, dtype=np.float64)
+                if tree_distance_matrix.ndim == 1:
+                    tree_distance_matrix = tree_distance_matrix.reshape(
+                        query_count, tree_query_count
+                    )
                 del _tree_distances
                 candidate_matrix = np.asarray(tree_indices, dtype=np.int64)
                 if candidate_matrix.ndim == 1:
@@ -1489,24 +1574,31 @@ class IndexedCPUNeighbourIndex:
                 del tree_indices
                 initial_candidates = np.empty((query_count, order_k), dtype=np.int64)
                 excluded_candidates = np.empty((query_count, 1), dtype=np.int64)
+                tree_kth_distances = np.empty(query_count, dtype=np.float64)
+                tree_excluded_distances = np.empty(query_count, dtype=np.float64)
                 has_excluded_candidate = np.ones(query_count, dtype=bool)
                 for offset, query_location in enumerate(range(start, stop)):
                     candidates = candidate_matrix[offset]
-                    candidates = candidates[(candidates >= 0) & (candidates != query_location)]
+                    valid = (candidates >= 0) & (candidates != query_location)
+                    candidates = candidates[valid]
+                    reported_distances = tree_distance_matrix[offset][valid]
                     if candidates.shape[0] < order_k:
                         raise ValueError(
                             f"k={order_k} has insufficient distinct neighbours for location "
                             f"{query_location}"
                         )
                     initial_candidates[offset] = candidates[:order_k]
+                    tree_kth_distances[offset] = reported_distances[order_k - 1]
                     if candidates.shape[0] > order_k:
                         excluded_candidates[offset, 0] = candidates[order_k]
+                        tree_excluded_distances[offset] = reported_distances[order_k]
                     else:
                         # There is no excluded location when the pool has
                         # exactly k other locations.  Keep the matrix shape
                         # bounded and force the conservative guard to fall
                         # back to complete radius verification.
                         excluded_candidates[offset, 0] = query_location
+                        tree_excluded_distances[offset] = 0.0
                         has_excluded_candidate[offset] = False
                 verification_started = time.perf_counter()
                 initial_fixed, initial_tile, initial_rows = self._matrix_distance_workspace(
@@ -1517,6 +1609,9 @@ class IndexedCPUNeighbourIndex:
                         candidate_matrix.nbytes
                         + initial_candidates.nbytes
                         + excluded_candidates.nbytes
+                        + tree_distance_matrix.nbytes
+                        + tree_kth_distances.nbytes
+                        + tree_excluded_distances.nbytes
                     ),
                 )
                 if initial_rows < 1:
@@ -1538,6 +1633,9 @@ class IndexedCPUNeighbourIndex:
                         candidate_matrix.nbytes
                         + initial_candidates.nbytes
                         + excluded_candidates.nbytes
+                        + tree_distance_matrix.nbytes
+                        + tree_kth_distances.nbytes
+                        + tree_excluded_distances.nbytes
                     ),
                 )
                 excluded_fixed, excluded_tile, excluded_rows = self._matrix_distance_workspace(
@@ -1548,6 +1646,9 @@ class IndexedCPUNeighbourIndex:
                         candidate_matrix.nbytes
                         + initial_candidates.nbytes
                         + excluded_candidates.nbytes
+                        + tree_distance_matrix.nbytes
+                        + tree_kth_distances.nbytes
+                        + tree_excluded_distances.nbytes
                         + initial_distances.nbytes
                     ),
                 )
@@ -1570,6 +1671,9 @@ class IndexedCPUNeighbourIndex:
                         candidate_matrix.nbytes
                         + initial_candidates.nbytes
                         + excluded_candidates.nbytes
+                        + tree_distance_matrix.nbytes
+                        + tree_kth_distances.nbytes
+                        + tree_excluded_distances.nbytes
                         + initial_distances.nbytes
                     ),
                 )
@@ -1615,8 +1719,15 @@ class IndexedCPUNeighbourIndex:
                 sorted_candidates.append(candidates[order])
                 sorted_distances.append(ordered_distances)
                 if not self._certified_knn_boundary(
+                    queries[offset],
+                    self.unique_locations[sorted_candidates[offset][-1]],
+                    self.unique_locations[excluded_candidates[offset, 0]],
+                    self.unique_locations[initial_candidates[offset, -1]],
+                    self.unique_locations[excluded_candidates[offset, 0]],
                     ordered_distances[-1],
                     excluded_distances[offset, 0],
+                    tree_kth_distances[offset],
+                    tree_excluded_distances[offset],
                     dimension=int(self.unique_locations.shape[1]),
                 ) or not has_excluded_candidate[offset]:
                     boundary_certified[offset] = False
@@ -1637,6 +1748,9 @@ class IndexedCPUNeighbourIndex:
                     initial_distances,
                     excluded_candidates,
                     excluded_distances,
+                    tree_distance_matrix,
+                    tree_kth_distances,
+                    tree_excluded_distances,
                 )
                 finish_chunk(stop)
                 start = stop
@@ -1681,6 +1795,9 @@ class IndexedCPUNeighbourIndex:
                 initial_distances,
                 excluded_candidates,
                 excluded_distances,
+                tree_distance_matrix,
+                tree_kth_distances,
+                tree_excluded_distances,
                 sorted_candidates,
                 sorted_distances,
             )

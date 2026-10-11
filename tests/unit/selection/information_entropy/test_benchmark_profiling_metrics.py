@@ -1,8 +1,13 @@
 """Regression tests for the issue #154 entropy profiling diagnostics."""
 
+import json
 import runpy
+import sys
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
+
+import numpy as np
 
 from nepflow.stages.selection.algorithms.information_entropy.bandwidth import (
     build_entropy_pool,
@@ -79,6 +84,10 @@ def test_bandwidth_value_equivalence_is_not_reported_as_fingerprint_equality() -
             max_radius_query_bytes=None,
             checkpoint_enabled=False,
             label="fingerprint-diagnostics",
+            kernel_support_execution="cpu",
+            gpu_device=0,
+            gpu_tile_size=128,
+            max_gpu_support_bytes=None,
         )
         correctness = _BENCHMARK["_correctness_checks"](
             pool,
@@ -91,6 +100,10 @@ def test_bandwidth_value_equivalence_is_not_reported_as_fingerprint_equality() -
             backend=INDEXED_NEIGHBOUR_BACKEND_ID,
             index=index,
             resource_budget=service,
+            kernel_support_execution="cpu",
+            gpu_device=0,
+            gpu_tile_size=128,
+            max_gpu_support_bytes=None,
         )
         grid = correctness["calibration_grid"]
         assert correctness["status"] == "passed"
@@ -140,3 +153,87 @@ def test_large_oracle_skip_still_times_production_sixteen_pair_calibration() -> 
     finally:
         if index is not None:
             index.close()
+
+
+def test_knn_only_mode_skips_contributions_and_loo(monkeypatch: Any, tmp_path: Path) -> None:
+    pool = SimpleNamespace(
+        descriptors=np.zeros((4, 42), dtype=np.float64),
+        candidate_ids=("candidate-0", "candidate-1"),
+        fingerprint="pool-fingerprint",
+    )
+    frozen = SimpleNamespace(fingerprint="frozen-fingerprint")
+    neighbours = SimpleNamespace(
+        neighbour_indices=np.zeros((4, 1), dtype=np.int64),
+        unique_locations=np.zeros((4, 42), dtype=np.float64),
+    )
+    index = SimpleNamespace(close=lambda: None)
+    preparation = {
+        "wall_seconds": 0.25,
+        "knn_wall_seconds": 0.2,
+        "stage_wall_seconds": {
+            "index_grouping_and_tree_construction": 0.05,
+            "exact_knn_query": 0.2,
+            "frozen_bandwidth_materialization": 0.01,
+        },
+        "exclusive_phase_seconds": {"knn_tree_query": 0.2},
+        "knn_phase_counters": {},
+        "knn_per_run_metrics": {},
+        "knn_checkpoint": {},
+    }
+
+    monkeypatch.setitem(_BENCHMARK, "_fixture", lambda *args: (None, (), ()))
+    monkeypatch.setitem(_BENCHMARK, "build_entropy_pool", lambda *args, **kwargs: pool)
+    prepare_calls: list[dict[str, Any]] = []
+
+    def fake_prepare(*args: Any, **kwargs: Any) -> tuple[Any, ...]:
+        prepare_calls.append(kwargs)
+        return SimpleNamespace(), index, frozen, neighbours, preparation
+
+    monkeypatch.setitem(
+        _BENCHMARK,
+        "_prepare",
+        fake_prepare,
+    )
+
+    def unexpected_stage(*args: Any, **kwargs: Any) -> None:
+        raise AssertionError("kNN-only mode invoked a full-selection stage")
+
+    monkeypatch.setitem(_BENCHMARK, "_run_stream", unexpected_stage)
+    monkeypatch.setitem(_BENCHMARK, "_correctness_checks", unexpected_stage)
+    output_path = tmp_path / "knn-only.json"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "benchmark_information_entropy_scaling.py",
+            "--rows",
+            "4",
+            "--dimension",
+            "42",
+            "--candidates",
+            "2",
+            "--backend",
+            INDEXED_NEIGHBOUR_BACKEND_ID,
+            "--workers",
+            "1",
+            "--k-max",
+            "1",
+            "--knn-only",
+            "--output",
+            str(output_path),
+        ],
+    )
+
+    _BENCHMARK["main"]()
+    output = json.loads(output_path.read_text(encoding="utf-8"))
+    assert output["fixture"]["benchmark_mode"] == "knn-only"
+    assert output["fixture"]["knn_only"] is True
+    assert len(output["results"]) == 2
+    assert all(call["materialize_frozen"] is False for call in prepare_calls)
+    for result in output["results"]:
+        assert result["knn_only"] is True
+        assert result["contribution_checkpoint_enabled"] is False
+        assert result["correctness"]["status"] == "not_run"
+        assert result["result"]["knn_only_wall_seconds"] == 0.2
+        assert "streamed_contribution_wall_seconds" not in result["result"]
+    assert output["profiling_summary"]["stage_wall_seconds"]["loo_calibration"] == 0.0

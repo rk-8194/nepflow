@@ -3,7 +3,10 @@
 The descriptor fixture is generated once in ordered pool-row order and reused
 for every comparison.  No ``N x N`` array is allocated; the independent
 correctness oracle is enabled only when ``N`` is below ``--oracle-limit``, while
-the production 16-pair LOO calibration is timed on every fixture.
+the production 16-pair LOO calibration is timed on every full-selection
+fixture.  ``--knn-only`` provides the separate high-N scaling workload: it
+reports index construction and exact kNN only, and does not run candidate
+contributions, LOO calibration, or correctness workloads.
 """
 
 from __future__ import annotations
@@ -221,6 +224,7 @@ def _prepare(
     max_index_bytes: int | None,
     max_neighbour_cache_bytes: int | None,
     checkpoint_enabled: bool,
+    materialize_frozen: bool = True,
 ) -> tuple[
     Any,
     IndexedCPUNeighbourIndex | TiledCPUNeighbourIndex | None,
@@ -311,9 +315,13 @@ def _prepare(
     knn_wall_seconds = knn_query_wall_seconds
     after_knn = after_initial_knn
     lifetime_index_metrics = _snapshot_metrics(index)
-    frozen_started = time.perf_counter()
-    frozen = _freeze_from_neighbours(pool, neighbours, c)
-    frozen_wall_seconds = max(0.0, time.perf_counter() - frozen_started)
+    if materialize_frozen:
+        frozen_started = time.perf_counter()
+        frozen = _freeze_from_neighbours(pool, neighbours, c)
+        frozen_wall_seconds = max(0.0, time.perf_counter() - frozen_started)
+    else:
+        frozen = None
+        frozen_wall_seconds = 0.0
     preparation_wall_seconds = (
         index_build_wall_seconds + knn_wall_seconds + frozen_wall_seconds
     )
@@ -408,8 +416,13 @@ def _prepare(
         "cumulative_index_metrics": lifetime_index_metrics,
         "knn_checkpoint": checkpoint_metrics,
         "selection_prepare_semantics": (
-            "index construction, exact kNN, and frozen bandwidth materialization; "
-            "does not include streamed candidate contributions"
+            "index construction and exact kNN"
+            + (
+                "; frozen bandwidth materialization; does not include streamed candidate "
+                "contributions"
+                if materialize_frozen
+                else "; frozen bandwidth materialization is intentionally omitted"
+            )
         ),
     }
     return service, index, frozen, neighbours, preparation
@@ -1226,6 +1239,14 @@ def main() -> None:
     parser.add_argument("--memory-budget-bytes", type=int, default=None)
     parser.add_argument("--scratch-budget-bytes", type=int, default=None)
     parser.add_argument("--oracle-limit", type=int, default=1024)
+    parser.add_argument(
+        "--knn-only",
+        action="store_true",
+        help=(
+            "measure only index construction and exact kNN; skip candidate "
+            "contributions, LOO calibration, and correctness workloads"
+        ),
+    )
     parser.add_argument("--output", type=Path, default=Path("information_entropy_scaling.json"))
     args = parser.parse_args()
     if args.rows < 2 or args.candidates < 1 or args.candidates > args.rows:
@@ -1262,7 +1283,83 @@ def main() -> None:
                     max_index_bytes=args.max_index_bytes,
                     max_neighbour_cache_bytes=args.max_neighbour_cache_bytes,
                     checkpoint_enabled=checkpoint_enabled,
+                    materialize_frozen=not args.knn_only,
                 )
+                workload = {
+                    "N": int(pool.descriptors.shape[0]),
+                    "M": len(pool.candidate_ids),
+                    "d_prime": int(pool.descriptors.shape[1]),
+                    "Q": int(neighbours.neighbour_indices.size) if args.knn_only else None,
+                    "Q_semantics": (
+                        "kNN neighbour entries"
+                        if args.knn_only
+                        else "streamed candidate-contribution entries"
+                    ),
+                    "k_max": int(args.k_max),
+                    "unique_locations": int(neighbours.unique_locations.shape[0]),
+                }
+                limits = {
+                    "chunk_size": args.chunk_size,
+                    "max_entries": args.max_entries,
+                    "max_radius_query_bytes": args.max_radius_query_bytes,
+                    "max_index_bytes": args.max_index_bytes,
+                    "max_neighbour_cache_bytes": args.max_neighbour_cache_bytes,
+                    "memory_budget_bytes": args.memory_budget_bytes,
+                    "scratch_budget_bytes": args.scratch_budget_bytes,
+                    "kernel_support_execution": args.kernel_support_execution,
+                    "gpu_device": args.gpu_device,
+                    "gpu_tile_size": args.gpu_tile_size,
+                    "max_gpu_support_bytes": args.max_gpu_support_bytes,
+                    "knn_only": bool(args.knn_only),
+                }
+                common = {
+                    "backend": backend,
+                    "worker_count": worker_count,
+                    "checkpoint_enabled": checkpoint_enabled,
+                    "knn_checkpoint_enabled": checkpoint_enabled,
+                    "contribution_checkpoint_enabled": (
+                        False if args.knn_only else checkpoint_enabled
+                    ),
+                    "knn_only": bool(args.knn_only),
+                    "exact_workload": workload,
+                    "operational_limits": limits,
+                    "pool_fingerprint": pool.fingerprint,
+                    "frozen_bandwidth_fingerprint": (
+                        frozen.fingerprint if frozen is not None else None
+                    ),
+                }
+                if args.knn_only:
+                    # This mode is intentionally a separate workload.  In
+                    # particular, do not call _run_stream or _correctness_checks:
+                    # at high N their support and LOO work would obscure the
+                    # exact-kNN scaling measurement.
+                    common["correctness"] = {
+                        "status": "not_run",
+                        "reason": "dedicated kNN-only benchmark mode",
+                    }
+                    results.append(
+                        {
+                            **common,
+                            "cache_state": "knn-only",
+                            "cold_cache": False,
+                            "result": {
+                                "knn_only": True,
+                                "knn_only_wall_seconds": float(
+                                    preparation["knn_wall_seconds"]
+                                ),
+                                "knn_only_elapsed_semantics": (
+                                    "index construction and exact kNN are reported in "
+                                    "preparation; frozen bandwidth materialization and all "
+                                    "full-selection stages are omitted; the timing above is "
+                                    "exact kNN query wall time only"
+                                ),
+                                "preparation": preparation,
+                            },
+                        }
+                    )
+                    if index is not None:
+                        index.close()
+                    continue
                 cold = _run_stream(
                     pool,
                     frozen,
@@ -1307,6 +1404,7 @@ def main() -> None:
                         "entries": int(run["operations"].get("support_entries", 0) or 0),
                     }
                     run["preparation"] = preparation
+                workload["Q"] = int(cold["summary"]["candidate_entry_count"])
                 if cold["contributions_fingerprint"] != warm["contributions_fingerprint"]:
                     raise AssertionError("warm-cache contribution fingerprint changed")
                 checks = correctness_cache.get(backend)
@@ -1342,39 +1440,7 @@ def main() -> None:
                         "checks may be skipped by oracle-limit, and contribution checkpoint "
                         "I/O remains nested in the stream stage"
                     )
-                workload = {
-                    "N": int(pool.descriptors.shape[0]),
-                    "M": len(pool.candidate_ids),
-                    "d_prime": int(pool.descriptors.shape[1]),
-                    "Q": int(cold["summary"]["candidate_entry_count"]),
-                    "k_max": int(args.k_max),
-                    "unique_locations": int(neighbours.unique_locations.shape[0]),
-                }
-                limits = {
-                    "chunk_size": args.chunk_size,
-                    "max_entries": args.max_entries,
-                    "max_radius_query_bytes": args.max_radius_query_bytes,
-                    "max_index_bytes": args.max_index_bytes,
-                    "max_neighbour_cache_bytes": args.max_neighbour_cache_bytes,
-                    "memory_budget_bytes": args.memory_budget_bytes,
-                    "scratch_budget_bytes": args.scratch_budget_bytes,
-                    "kernel_support_execution": args.kernel_support_execution,
-                    "gpu_device": args.gpu_device,
-                    "gpu_tile_size": args.gpu_tile_size,
-                    "max_gpu_support_bytes": args.max_gpu_support_bytes,
-                }
-                common = {
-                    "backend": backend,
-                    "worker_count": worker_count,
-                    "checkpoint_enabled": checkpoint_enabled,
-                    "knn_checkpoint_enabled": checkpoint_enabled,
-                    "contribution_checkpoint_enabled": checkpoint_enabled,
-                    "exact_workload": workload,
-                    "operational_limits": limits,
-                    "pool_fingerprint": pool.fingerprint,
-                    "frozen_bandwidth_fingerprint": frozen.fingerprint,
-                    "correctness": checks,
-                }
+                common["correctness"] = checks
                 for cache_state, run in (("cold", cold), ("warm", warm)):
                     results.append(
                         {
@@ -1408,6 +1474,8 @@ def main() -> None:
             "gpu_device": args.gpu_device,
             "gpu_tile_size": args.gpu_tile_size,
             "max_gpu_support_bytes": args.max_gpu_support_bytes,
+            "knn_only": bool(args.knn_only),
+            "benchmark_mode": "knn-only" if args.knn_only else "full-selection",
         },
         "results": results,
         "profiling_summary": _profiling_summary(results),
