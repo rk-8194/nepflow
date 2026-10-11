@@ -692,6 +692,7 @@ class IndexedCPUNeighbourIndex:
         targets: np.ndarray,
         *,
         max_workspace_bytes: int | None = None,
+        persistent_workspace_bytes: int = 0,
     ) -> np.ndarray:
         count = int(targets.shape[0])
         distances = np.empty(count, dtype=np.float64)
@@ -700,8 +701,14 @@ class IndexedCPUNeighbourIndex:
         if max_workspace_bytes is None:
             block = count
         else:
-            available = int(max_workspace_bytes) - int(targets.nbytes) - int(distances.nbytes) - 256
-            bytes_per_row = max(8, 16 * int(targets.shape[1]) + 8)
+            available = (
+                int(max_workspace_bytes)
+                - int(persistent_workspace_bytes)
+                - int(targets.nbytes)
+                - int(distances.nbytes)
+                - 256
+            )
+            bytes_per_row = max(8, 16 * int(targets.shape[1]) + 16)
             block = available // bytes_per_row
             if block < 1:
                 raise RadiusQueryCapacityError(
@@ -721,12 +728,41 @@ class IndexedCPUNeighbourIndex:
             raise ValueError("indexed neighbour distances must be finite")
         return distances
 
+    def _distance_values_many_workspace(
+        self,
+        queries: np.ndarray,
+        candidate_lists: Sequence[np.ndarray],
+        *,
+        persistent_workspace_bytes: int = 0,
+    ) -> tuple[int, int]:
+        """Return fixed and per-candidate temporary bytes for ragged distances."""
+
+        counts = np.asarray(
+            [int(np.asarray(candidates, dtype=np.int64).size) for candidates in candidate_lists],
+            dtype=np.int64,
+        )
+        total = int(np.sum(counts, dtype=np.int64))
+        dimension = int(self.unique_locations.shape[1])
+        # counts, CSR offsets, flattened candidate IDs, owner IDs, and the
+        # returned distance vector all remain live while a distance tile runs.
+        fixed = int(
+            persistent_workspace_bytes
+            + np.asarray(queries).nbytes
+            + counts.nbytes
+            + (counts.size + 1) * np.dtype(np.int64).itemsize
+            + counts.size * np.dtype(np.int64).itemsize
+            + 24 * total
+            + 256
+        )
+        return fixed, max(8, 32 * dimension + 16)
+
     def _distance_values_many(
         self,
         queries: np.ndarray,
         candidate_lists: Sequence[np.ndarray],
         *,
         max_workspace_bytes: int | None = None,
+        persistent_workspace_bytes: int = 0,
     ) -> tuple[np.ndarray, np.ndarray]:
         """Recompute canonical distances for a bounded ragged query batch.
 
@@ -751,27 +787,17 @@ class IndexedCPUNeighbourIndex:
         offsets[0] = 0
         np.cumsum(counts, dtype=np.int64, out=offsets[1:])
         total = int(offsets[-1])
-        distances = np.empty(total, dtype=np.float64)
         if total == 0:
-            return offsets, distances
+            return offsets, np.empty(0, dtype=np.float64)
 
-        if query_count == 1:
-            distances[:] = self._distance_values(
-                query_values[0],
-                self.unique_locations[np.asarray(candidate_lists[0], dtype=np.int64)],
-                max_workspace_bytes=max_workspace_bytes,
-            )
-            return offsets, distances
-
-        flat_candidates = np.concatenate(
-            [np.asarray(candidates, dtype=np.int64) for candidates in candidate_lists]
-        )
-        owners = np.repeat(np.arange(query_count, dtype=np.int64), counts)
         if max_workspace_bytes is None:
             block = total
         else:
-            fixed_bytes = int(flat_candidates.nbytes + owners.nbytes + distances.nbytes + 256)
-            bytes_per_row = max(8, 32 * int(self.unique_locations.shape[1]) + 8)
+            fixed_bytes, bytes_per_row = self._distance_values_many_workspace(
+                query_values,
+                candidate_lists,
+                persistent_workspace_bytes=persistent_workspace_bytes,
+            )
             available = int(max_workspace_bytes) - fixed_bytes
             block = available // bytes_per_row
             if block < 1:
@@ -780,6 +806,16 @@ class IndexedCPUNeighbourIndex:
                     "max_radius_query_bytes"
                 )
             block = min(total, int(block))
+
+        # Admit the fixed ragged vectors before materialising them.  The
+        # caller's persistent charge covers the candidate lists that are
+        # already live; this allocation adds only the flattened IDs, owners,
+        # and returned distances accounted for by the planner above.
+        distances = np.empty(total, dtype=np.float64)
+        flat_candidates = np.concatenate(
+            [np.asarray(candidates, dtype=np.int64) for candidates in candidate_lists]
+        )
+        owners = np.repeat(np.arange(query_count, dtype=np.int64), counts)
 
         with np.errstate(over="raise", invalid="raise"):
             try:
@@ -805,6 +841,7 @@ class IndexedCPUNeighbourIndex:
         candidate_matrix: np.ndarray,
         *,
         max_workspace_bytes: int | None = None,
+        persistent_workspace_bytes: int = 0,
     ) -> np.ndarray:
         """Recompute canonical distances for a bounded dense candidate block."""
 
@@ -821,10 +858,12 @@ class IndexedCPUNeighbourIndex:
         if max_workspace_bytes is None:
             row_block = row_count
         else:
-            dimension = int(self.unique_locations.shape[1])
-            fixed_per_row = max(1, 32 * dimension * candidate_count + 8 * candidate_count)
-            available = int(max_workspace_bytes) - 256
-            row_block = available // fixed_per_row
+            _fixed_bytes, _tile_bytes, row_block = self._matrix_distance_workspace(
+                query_values,
+                candidates,
+                max_workspace_bytes=int(max_workspace_bytes),
+                persistent_workspace_bytes=persistent_workspace_bytes,
+            )
             if row_block < 1:
                 raise RadiusQueryCapacityError(
                     "indexed neighbour matrix distance workspace exceeds "
@@ -848,6 +887,30 @@ class IndexedCPUNeighbourIndex:
         if not np.all(np.isfinite(distances)):
             raise ValueError("indexed neighbour matrix distances must be finite")
         return distances
+
+    def _matrix_distance_workspace(
+        self,
+        queries: np.ndarray,
+        candidates: np.ndarray,
+        *,
+        max_workspace_bytes: int,
+        persistent_workspace_bytes: int = 0,
+    ) -> tuple[int, int, int]:
+        """Plan matrix-distance temporaries and the largest admissible row tile."""
+
+        row_count, candidate_count = (int(value) for value in candidates.shape)
+        dimension = int(self.unique_locations.shape[1])
+        fixed_bytes = int(
+            persistent_workspace_bytes
+            + np.asarray(queries).nbytes
+            + candidates.nbytes
+            + 8 * row_count * candidate_count
+            + 256
+        )
+        tile_bytes = max(8, 32 * dimension * candidate_count + 16 * candidate_count)
+        available = int(max_workspace_bytes) - fixed_bytes
+        row_block = available // tile_bytes
+        return fixed_bytes, tile_bytes, min(row_count, max(0, int(row_block)))
 
     def _capacity_error(
         self,
@@ -917,10 +980,22 @@ class IndexedCPUNeighbourIndex:
                 context=context,
             )
         retrieval_started = time.perf_counter()
-        location_indices = np.asarray(
-            self._tree.query_ball_point(query, expanded_radius, workers=self.worker_count),
-            dtype=np.int64,
-        )
+        try:
+            with self.resource_budget.acquire(
+                context or "indexed exact radius candidate retrieval",
+                max(1, candidate_estimate),
+            ):
+                location_indices = np.asarray(
+                    self._tree.query_ball_point(query, expanded_radius, workers=self.worker_count),
+                    dtype=np.int64,
+                )
+        except ResourceCapacityError as exc:
+            raise self._capacity_error(
+                source_index=source_index,
+                radius=radius,
+                requested_bytes=candidate_estimate,
+                context=context,
+            ) from exc
         self._record_phase("radius_retrieval", time.perf_counter() - retrieval_started)
         self.radius_queries += 1
         if location_indices.size != candidate_count:
@@ -1205,34 +1280,101 @@ class IndexedCPUNeighbourIndex:
         while start < n_locations:
             stop = min(start + chunk_size, n_locations)
             queries = self.unique_locations[start:stop]
-            tree_started = time.perf_counter()
-            _tree_distances, tree_indices = self._tree.query(
-                queries,
-                k=order_k + 1,
-                workers=self.worker_count,
+            query_count = stop - start
+            tree_workspace = int(
+                queries.nbytes
+                + 16 * query_count * (order_k + 1)
+                + 8 * query_count * order_k
+                + 16 * query_count * (order_k + 1)
+                + 8192
             )
-            self._record_phase("knn_tree_query", time.perf_counter() - tree_started)
-            self.index_queries += stop - start
-            del _tree_distances
-            candidate_matrix = np.asarray(tree_indices, dtype=np.int64)
-            if candidate_matrix.ndim == 1:
-                candidate_matrix = candidate_matrix.reshape(stop - start, order_k + 1)
-            initial_candidates = np.empty((stop - start, order_k), dtype=np.int64)
-            for offset, query_location in enumerate(range(start, stop)):
-                candidates = candidate_matrix[offset]
-                candidates = candidates[candidates != query_location]
-                if candidates.shape[0] < order_k:
-                    raise ValueError(
-                        f"k={order_k} has insufficient distinct neighbours for location "
-                        f"{query_location}"
+            self.query_workspace_peak_bytes = max(
+                self.query_workspace_peak_bytes,
+                tree_workspace,
+            )
+            if tree_workspace > self.max_radius_query_bytes:
+                if query_count <= 1:
+                    raise self._capacity_error(
+                        source_index=start,
+                        radius=None,
+                        requested_bytes=tree_workspace,
+                        context=f"k={order_k}, location_chunk=[{start}:{stop})",
                     )
-                initial_candidates[offset] = candidates[:order_k]
-            verification_started = time.perf_counter()
-            initial_distances = self._distance_values_matrix(
-                queries,
-                initial_candidates,
-                max_workspace_bytes=self.max_radius_query_bytes,
-            )
+                chunk_size = max(1, query_count // 2)
+                logger.info(
+                    "Indexed exact kNN chunk reduced before tree allocation: "
+                    "location_start=%d, new_chunk_size=%d",
+                    start,
+                    chunk_size,
+                )
+                continue
+            tree_lease: Any | None = None
+            try:
+                tree_started = time.perf_counter()
+                tree_lease = self.resource_budget.acquire(
+                    f"indexed kNN tree candidate tile [{start}:{stop})",
+                    max(1, tree_workspace),
+                )
+                _tree_distances, tree_indices = self._tree.query(
+                    queries,
+                    k=order_k + 1,
+                    workers=self.worker_count,
+                )
+                self._record_phase("knn_tree_query", time.perf_counter() - tree_started)
+                self.index_queries += stop - start
+                del _tree_distances
+                candidate_matrix = np.asarray(tree_indices, dtype=np.int64)
+                if candidate_matrix.ndim == 1:
+                    candidate_matrix = candidate_matrix.reshape(query_count, order_k + 1)
+                del tree_indices
+                initial_candidates = np.empty((query_count, order_k), dtype=np.int64)
+                for offset, query_location in enumerate(range(start, stop)):
+                    candidates = candidate_matrix[offset]
+                    candidates = candidates[candidates != query_location]
+                    if candidates.shape[0] < order_k:
+                        raise ValueError(
+                            f"k={order_k} has insufficient distinct neighbours for location "
+                            f"{query_location}"
+                        )
+                    initial_candidates[offset] = candidates[:order_k]
+                verification_started = time.perf_counter()
+                initial_fixed, initial_tile, initial_rows = self._matrix_distance_workspace(
+                    queries,
+                    initial_candidates,
+                    max_workspace_bytes=self.max_radius_query_bytes,
+                    persistent_workspace_bytes=candidate_matrix.nbytes,
+                )
+                if initial_rows < 1:
+                    raise RadiusQueryCapacityError(
+                        "indexed kNN canonical distance workspace exceeds "
+                        "max_radius_query_bytes"
+                    )
+                initial_workspace = int(initial_fixed + initial_tile * initial_rows)
+                self.query_workspace_peak_bytes = max(
+                    self.query_workspace_peak_bytes,
+                    initial_workspace,
+                )
+                tree_lease.resize(max(1, initial_workspace))
+                initial_distances = self._distance_values_matrix(
+                    queries,
+                    initial_candidates,
+                    max_workspace_bytes=self.max_radius_query_bytes,
+                    persistent_workspace_bytes=candidate_matrix.nbytes,
+                )
+            except (ResourceCapacityError, RadiusQueryCapacityError):
+                if query_count <= 1:
+                    raise
+                chunk_size = max(1, query_count // 2)
+                logger.info(
+                    "Indexed exact kNN chunk reduced for canonical distance memory budget: "
+                    "location_start=%d, new_chunk_size=%d",
+                    start,
+                    chunk_size,
+                )
+                continue
+            finally:
+                if tree_lease is not None:
+                    tree_lease.close()
             self.distance_evaluations += int(initial_distances.size)
             self.unique_distance_evaluations += int(initial_distances.size)
             self._record_phase(
@@ -1241,24 +1383,65 @@ class IndexedCPUNeighbourIndex:
                 count=stop - start,
             )
 
-            boundaries = np.max(initial_distances, axis=1)
-            expanded = boundaries + np.maximum(
-                16.0 * np.spacing(boundaries),
-                1.0e-14,
+            boundary_prepare_workspace = int(initial_distances.nbytes + 24 * query_count + 1024)
+            self.query_workspace_peak_bytes = max(
+                self.query_workspace_peak_bytes,
+                boundary_prepare_workspace,
             )
-            preflight_started = time.perf_counter()
             try:
-                candidate_counts = np.atleast_1d(
-                    np.asarray(
-                        self._tree.query_ball_point(
-                            queries,
-                            expanded,
-                            return_length=True,
-                            workers=self.worker_count,
-                        ),
-                        dtype=np.int64,
+                with self.resource_budget.acquire(
+                    f"indexed kNN boundary preparation [{start}:{stop})",
+                    max(1, boundary_prepare_workspace),
+                ):
+                    boundaries = np.max(initial_distances, axis=1)
+                    expanded = boundaries + np.maximum(
+                        16.0 * np.spacing(boundaries),
+                        1.0e-14,
                     )
+            except ResourceCapacityError:
+                if query_count <= 1:
+                    raise
+                chunk_size = max(1, query_count // 2)
+                logger.info(
+                    "Indexed exact kNN chunk reduced before boundary preparation: "
+                    "location_start=%d, new_chunk_size=%d",
+                    start,
+                    chunk_size,
                 )
+                continue
+            # The dense candidate matrix and its canonical distances are no
+            # longer needed once the validated boundary is known.  Releasing
+            # those references before the ragged support query keeps the
+            # admission calculation tied to the arrays that are actually
+            # live during the next vectorised operation.
+            del candidate_matrix, initial_candidates, initial_distances
+            preflight_started = time.perf_counter()
+            preflight_call_workspace = int(
+                8 * self.unique_locations.shape[1] * (stop - start)
+                + 32 * (stop - start)
+                + 8
+                + 1024
+            )
+            try:
+                with self.resource_budget.acquire(
+                    f"indexed kNN radius preflight [{start}:{stop})",
+                    max(1, preflight_call_workspace),
+                ):
+                    expanded = boundaries + np.maximum(
+                        16.0 * np.spacing(boundaries),
+                        1.0e-14,
+                    )
+                    candidate_counts = np.atleast_1d(
+                        np.asarray(
+                            self._tree.query_ball_point(
+                                queries,
+                                expanded,
+                                return_length=True,
+                                workers=self.worker_count,
+                            ),
+                            dtype=np.int64,
+                        )
+                    )
             except TypeError as exc:
                 raise self._capacity_error(
                     source_index=None,
@@ -1269,6 +1452,17 @@ class IndexedCPUNeighbourIndex:
                         "SciPy cKDTree does not support vectorized preflight"
                     ),
                 ) from exc
+            except ResourceCapacityError:
+                if stop - start <= 1:
+                    raise
+                chunk_size = max(1, (stop - start) // 2)
+                logger.info(
+                    "Indexed exact kNN chunk reduced before radius preflight allocation: "
+                    "location_start=%d, new_chunk_size=%d",
+                    start,
+                    chunk_size,
+                )
+                continue
             self.radius_query_preflights += stop - start
             self._record_phase(
                 "radius_preflight_count",
@@ -1286,6 +1480,18 @@ class IndexedCPUNeighbourIndex:
                 ],
                 dtype=np.int64,
             )
+            # The tree returns a ragged object, but the subsequent canonical
+            # verification also retains one int64 candidate array per source,
+            # the expanded radii, CSR offsets and one full distance vector.
+            # Admit those arrays before asking cKDTree for the ragged lists.
+            preflight_workspace = int(
+                np.sum(estimates, dtype=np.int64)
+                + queries.nbytes
+                + expanded.nbytes
+                + 8 * (stop - start + 1)
+                + 8 * int(np.sum(candidate_counts, dtype=np.int64))
+                + 1024
+            )
             if np.any(estimates > self.max_radius_query_bytes):
                 offending = int(np.flatnonzero(estimates > self.max_radius_query_bytes)[0])
                 raise self._capacity_error(
@@ -1294,9 +1500,13 @@ class IndexedCPUNeighbourIndex:
                     requested_bytes=int(estimates[offending]),
                     context=f"k={order_k}, location_chunk=[{start}:{stop})",
                 )
-            total_workspace = int(np.sum(estimates, dtype=np.int64))
+            total_workspace = max(
+                preflight_workspace,
+                int(np.sum(estimates, dtype=np.int64)),
+            )
             self.query_workspace_peak_bytes = max(
                 self.query_workspace_peak_bytes,
+                preflight_workspace,
                 int(np.max(estimates)),
             )
             retrieval_started = time.perf_counter()
@@ -1331,38 +1541,152 @@ class IndexedCPUNeighbourIndex:
             )
             self.radius_queries += stop - start
             verification_started = time.perf_counter()
-            boundary_candidates = []
-            for offset, query_location in enumerate(range(start, stop)):
-                boundary_indices = np.asarray(boundary_lists[offset], dtype=np.int64)
-                boundary_candidates.append(boundary_indices[boundary_indices != query_location])
-            boundary_offsets, boundary_distances = self._distance_values_many(
+            try:
+                with self.resource_budget.acquire(
+                    f"indexed kNN boundary candidate materialisation [{start}:{stop})",
+                    max(1, preflight_workspace),
+                ):
+                    boundary_candidates = []
+                    for offset, query_location in enumerate(range(start, stop)):
+                        boundary_indices = np.asarray(boundary_lists[offset], dtype=np.int64)
+                        boundary_candidates.append(
+                            boundary_indices[boundary_indices != query_location]
+                        )
+            except ResourceCapacityError:
+                if stop - start <= 1:
+                    raise
+                chunk_size = max(1, (stop - start) // 2)
+                logger.info(
+                    "Indexed exact kNN chunk reduced before boundary candidate allocation: "
+                    "location_start=%d, new_chunk_size=%d",
+                    start,
+                    chunk_size,
+                )
+                continue
+            boundary_storage_bytes = int(
+                sum(int(candidate.nbytes) for candidate in boundary_candidates)
+            )
+            boundary_persistent_bytes = int(
+                boundary_storage_bytes
+                + 8 * int(np.sum(candidate_counts, dtype=np.int64))
+                + expanded.nbytes
+                + 8 * (stop - start + 1)
+                + 1024
+            )
+            boundary_fixed, boundary_tile = self._distance_values_many_workspace(
                 queries,
                 boundary_candidates,
-                max_workspace_bytes=self.max_radius_query_bytes,
+                persistent_workspace_bytes=boundary_persistent_bytes,
             )
-            self.distance_evaluations += int(boundary_distances.size)
-            self.unique_distance_evaluations += int(boundary_distances.size)
-            for offset, query_location in enumerate(range(start, stop)):
-                boundary_indices = boundary_candidates[offset]
-                distances = boundary_distances[
-                    boundary_offsets[offset] : boundary_offsets[offset + 1]
-                ]
-                positive = distances > 0.0
-                boundary_indices = boundary_indices[positive]
-                distances = distances[positive]
-                if distances.size < order_k:
-                    raise ValueError(
-                        "indexed neighbour boundary query returned fewer candidates than the "
-                        f"validated kth distance for location {query_location}"
+            boundary_total = int(
+                sum(int(candidate.size) for candidate in boundary_candidates)
+            )
+            boundary_available = self.max_radius_query_bytes - boundary_fixed
+            if boundary_available < boundary_tile:
+                if stop - start <= 1:
+                    raise self._capacity_error(
+                        source_index=start,
+                        radius=float(boundaries[0]),
+                        requested_bytes=boundary_fixed + boundary_tile,
+                        context=f"k={order_k}, location_chunk=[{start}:{stop})",
                     )
-                order = np.lexsort(
-                    (
-                        self.location_representatives[boundary_indices],
-                        distances,
+                chunk_size = max(1, (stop - start) // 2)
+                logger.info(
+                    "Indexed exact kNN chunk reduced for boundary distance memory budget: "
+                    "location_start=%d, new_chunk_size=%d",
+                    start,
+                    chunk_size,
+                )
+                continue
+            boundary_tile_count = min(
+                boundary_total,
+                max(1, boundary_available // boundary_tile),
+            )
+            boundary_distance_workspace = int(
+                boundary_fixed + boundary_tile_count * boundary_tile
+            )
+            boundary_sort_workspace = int(
+                max(
+                    (_estimate_radius_workspace_bytes(
+                        int(count),
+                        0,
+                        self.descriptors.shape[1],
+                    ) for count in candidate_counts),
+                    default=0,
+                )
+                + queries.nbytes
+                + expanded.nbytes
+                + boundary_storage_bytes
+                + 8 * (stop - start + 1)
+                + 1024
+            )
+            boundary_workspace = max(boundary_distance_workspace, boundary_sort_workspace)
+            self.query_workspace_peak_bytes = max(
+                self.query_workspace_peak_bytes,
+                boundary_workspace,
+            )
+            if boundary_workspace > self.max_radius_query_bytes:
+                if stop - start <= 1:
+                    raise self._capacity_error(
+                        source_index=start,
+                        radius=float(boundaries[0]),
+                        requested_bytes=boundary_workspace,
+                        context=f"k={order_k}, location_chunk=[{start}:{stop})",
                     )
-                )[:order_k]
-                neighbour_indices[query_location] = boundary_indices[order]
-                neighbour_distances[query_location] = distances[order]
+                chunk_size = max(1, (stop - start) // 2)
+                logger.info(
+                    "Indexed exact kNN chunk reduced for boundary sorting memory budget: "
+                    "location_start=%d, new_chunk_size=%d",
+                    start,
+                    chunk_size,
+                )
+                continue
+            try:
+                with self.resource_budget.acquire(
+                    f"indexed kNN canonical boundary distance tile [{start}:{stop})",
+                    max(1, boundary_workspace),
+                ):
+                    boundary_offsets, boundary_distances = self._distance_values_many(
+                        queries,
+                        boundary_candidates,
+                        max_workspace_bytes=self.max_radius_query_bytes,
+                        persistent_workspace_bytes=boundary_persistent_bytes,
+                    )
+                    self.distance_evaluations += int(boundary_distances.size)
+                    self.unique_distance_evaluations += int(boundary_distances.size)
+                    for offset, query_location in enumerate(range(start, stop)):
+                        boundary_indices = boundary_candidates[offset]
+                        distances = boundary_distances[
+                            boundary_offsets[offset] : boundary_offsets[offset + 1]
+                        ]
+                        positive = distances > 0.0
+                        boundary_indices = boundary_indices[positive]
+                        distances = distances[positive]
+                        if distances.size < order_k:
+                            raise ValueError(
+                                "indexed neighbour boundary query returned fewer candidates "
+                                "than the "
+                                f"validated kth distance for location {query_location}"
+                            )
+                        order = np.lexsort(
+                            (
+                                self.location_representatives[boundary_indices],
+                                distances,
+                            )
+                        )[:order_k]
+                        neighbour_indices[query_location] = boundary_indices[order]
+                        neighbour_distances[query_location] = distances[order]
+            except (ResourceCapacityError, RadiusQueryCapacityError):
+                if stop - start <= 1:
+                    raise
+                chunk_size = max(1, (stop - start) // 2)
+                logger.info(
+                    "Indexed exact kNN chunk reduced for boundary distance admission: "
+                    "location_start=%d, new_chunk_size=%d",
+                    start,
+                    chunk_size,
+                )
+                continue
             self._record_phase(
                 "canonical_distance_verification",
                 time.perf_counter() - verification_started,
@@ -1610,22 +1934,32 @@ class IndexedCPUNeighbourIndex:
             while True:
                 batch_sources = source_rows[source_cursor:stop]
                 batch_radii = values[source_cursor:stop]
-                queries = self.descriptors[batch_sources]
-                expanded = batch_radii + np.maximum(
-                    16.0 * np.spacing(batch_radii),
-                    1.0e-14,
+                preflight_call_workspace = int(
+                    8 * dimension * batch_sources.size
+                    + 32 * batch_sources.size
+                    + 8
+                    + 1024
                 )
                 preflight_started = time.perf_counter()
                 try:
-                    candidate_counts = np.asarray(
-                        self._tree.query_ball_point(
-                            queries,
-                            expanded,
-                            return_length=True,
-                            workers=self.worker_count,
-                        ),
-                        dtype=np.int64,
-                    ).reshape(-1)
+                    with self.resource_budget.acquire(
+                        context or "indexed exact batched radius preflight",
+                        max(1, preflight_call_workspace),
+                    ):
+                        queries = self.descriptors[batch_sources]
+                        expanded = batch_radii + np.maximum(
+                            16.0 * np.spacing(batch_radii),
+                            1.0e-14,
+                        )
+                        candidate_counts = np.asarray(
+                            self._tree.query_ball_point(
+                                queries,
+                                expanded,
+                                return_length=True,
+                                workers=self.worker_count,
+                            ),
+                            dtype=np.int64,
+                        ).reshape(-1)
                 except TypeError as exc:
                     raise self._capacity_error(
                         source_index=int(batch_sources[0]),
@@ -1636,6 +1970,11 @@ class IndexedCPUNeighbourIndex:
                             or "SciPy cKDTree does not support vectorized radius preflight"
                         ),
                     ) from exc
+                except ResourceCapacityError:
+                    if stop - source_cursor <= 1:
+                        raise
+                    batch_limit = max(1, (stop - source_cursor) // 2)
+                    continue
                 if candidate_counts.shape != batch_sources.shape:
                     raise ValueError("cKDTree radius preflight returned an invalid batch shape")
                 self.radius_query_preflights += int(batch_sources.size)
@@ -1649,7 +1988,12 @@ class IndexedCPUNeighbourIndex:
                         _estimate_radius_workspace_bytes(int(count), 0, dimension)
                         for count in candidate_counts
                     )
-                    + 8 * self.descriptors.shape[0]
+                    + queries.nbytes
+                    + expanded.nbytes
+                    + 8 * (batch_sources.size + 1)
+                    + 8 * int(np.sum(candidate_counts, dtype=np.int64))
+                    + 16 * int(np.sum(candidate_counts, dtype=np.int64))
+                    + 1024
                 )
                 self.query_workspace_peak_bytes = max(
                     self.query_workspace_peak_bytes,
@@ -1702,22 +2046,88 @@ class IndexedCPUNeighbourIndex:
                     time.perf_counter() - retrieval_started,
                     count=int(batch_sources.size),
                 )
-                actual_workspace = int(
+                candidate_counts_actual = np.asarray(
+                    [int(candidate.size) for candidate in candidate_lists],
+                    dtype=np.int64,
+                )
+                possible_support_counts = [
+                    int(
+                        np.sum(
+                            self.location_indptr[candidate + 1]
+                            - self.location_indptr[candidate],
+                            dtype=np.int64,
+                        )
+                    )
+                    for candidate in candidate_lists
+                ]
+                candidate_storage_bytes = int(
+                    sum(int(candidate.nbytes) for candidate in candidate_lists)
+                )
+                # ``expanded`` is retained through canonical verification;
+                # spacing/max temporaries and the tree's ragged container are
+                # admitted conservatively as well.
+                persistent_distance_bytes = int(
+                    candidate_storage_bytes
+                    + expanded.nbytes
+                    + 16 * batch_sources.size
+                    + 1024
+                )
+                distance_fixed_bytes, distance_tile_bytes = (
+                    self._distance_values_many_workspace(
+                        queries,
+                        candidate_lists,
+                        persistent_workspace_bytes=persistent_distance_bytes,
+                    )
+                )
+                distance_total = int(np.sum(candidate_counts_actual, dtype=np.int64))
+                available_distance_bytes = (
+                    self.max_radius_query_bytes - distance_fixed_bytes
+                )
+                if available_distance_bytes < distance_tile_bytes:
+                    raise self._capacity_error(
+                        source_index=int(batch_sources[0]),
+                        radius=float(batch_radii[0]),
+                        requested_bytes=distance_fixed_bytes + distance_tile_bytes,
+                        context=context,
+                    )
+                distance_tile_count = min(
+                    distance_total,
+                    max(1, available_distance_bytes // distance_tile_bytes),
+                )
+                distance_workspace = int(
+                    distance_fixed_bytes + distance_tile_count * distance_tile_bytes
+                )
+                support_workspace = int(
                     sum(
                         _estimate_radius_workspace_bytes(
-                            int(candidate.shape[0]),
-                            int(
-                                np.sum(
-                                    self.location_indptr[candidate + 1]
-                                    - self.location_indptr[candidate],
-                                    dtype=np.int64,
-                                )
-                            ),
+                            int(candidate_count),
+                            support_count,
                             dimension,
                         )
-                        for candidate in candidate_lists
+                        for candidate_count, support_count in zip(
+                            candidate_counts_actual,
+                            possible_support_counts,
+                            strict=True,
+                        )
                     )
-                    + 8 * self.descriptors.shape[0]
+                    + queries.nbytes
+                    + expanded.nbytes
+                    + candidate_storage_bytes
+                    + 8 * (batch_sources.size + 1)
+                    # The strict filter materialises a repeated radius vector
+                    # and a boolean mask alongside the canonical distance
+                    # vector.  Include both before those vectorised arrays are
+                    # created.
+                    + 17 * distance_total
+                    + 8 * batch_sources.size
+                    + 1024
+                    + 64 * sum(possible_support_counts)
+                    + 32 * distance_total
+                )
+                actual_workspace = max(
+                    preflight_workspace,
+                    distance_workspace,
+                    support_workspace,
                 )
                 self.query_workspace_peak_bytes = max(
                     self.query_workspace_peak_bytes,
@@ -1736,6 +2146,7 @@ class IndexedCPUNeighbourIndex:
                     queries,
                     candidate_lists,
                     max_workspace_bytes=self.max_radius_query_bytes,
+                    persistent_workspace_bytes=persistent_distance_bytes,
                 )
                 self.distance_evaluations += int(candidate_distances.size)
                 self.unique_distance_evaluations += int(candidate_distances.size)
@@ -1812,8 +2223,36 @@ class IndexedCPUNeighbourIndex:
                 lease.close()
             source_cursor = stop
 
-        targets = np.concatenate(target_parts).astype(np.int64, copy=False)
-        distances = np.asarray(np.concatenate(distance_parts), dtype=np.float64)
+        total_support = int(offsets[-1])
+        retained_part_bytes = int(
+            sum(int(part.nbytes) for part in target_parts)
+            + sum(int(part.nbytes) for part in distance_parts)
+        )
+        materialisation_workspace = int(
+            offsets.nbytes
+            + retained_part_bytes
+            + 2 * total_support * np.dtype(np.int64).itemsize
+            + 1024
+        )
+        self.query_workspace_peak_bytes = max(
+            self.query_workspace_peak_bytes,
+            materialisation_workspace,
+        )
+        with self.resource_budget.acquire(
+            context or "indexed exact batched radius result materialisation",
+            max(1, materialisation_workspace),
+        ):
+            # Fill the final CSR vectors in place.  This preserves source and
+            # row order while avoiding np.concatenate's additional full-size
+            # temporary alongside the returned arrays.
+            targets = np.empty(total_support, dtype=np.int64)
+            distances = np.empty(total_support, dtype=np.float64)
+            cursor = 0
+            for target_part, distance_part in zip(target_parts, distance_parts, strict=True):
+                stop = cursor + int(target_part.size)
+                targets[cursor:stop] = target_part
+                distances[cursor:stop] = distance_part
+                cursor = stop
         targets.setflags(write=False)
         distances.setflags(write=False)
         return offsets, targets, distances
@@ -2064,26 +2503,36 @@ class TiledCPUNeighbourIndex:
         if count == 0:
             return np.empty(0, dtype=np.float64)
         bytes_per_target = max(64, 32 * int(targets.shape[1]) + 64)
-        tile = max(1, min(count, (self.max_radius_query_bytes - 256) // bytes_per_target))
-        distances = np.empty(count, dtype=np.float64)
+        fixed_workspace = int(targets.nbytes + 8 * count + 256)
+        available_workspace = self.max_radius_query_bytes - fixed_workspace
+        if available_workspace < bytes_per_target:
+            raise RadiusQueryCapacityError(
+                "tiled exact neighbour distance workspace exceeds "
+                "max_radius_query_bytes"
+            )
+        tile = min(count, max(1, available_workspace // bytes_per_target))
+        workspace = int(fixed_workspace + tile * bytes_per_target)
         self.query_workspace_peak_bytes = max(
             self.query_workspace_peak_bytes,
-            int(tile * bytes_per_target + 256),
+            workspace,
         )
+        distances: np.ndarray | None = None
         with np.errstate(over="raise", invalid="raise"):
             try:
-                for start in range(0, count, tile):
-                    stop = min(start + tile, count)
-                    with self.resource_budget.acquire(
-                        "tiled exact neighbour distance tile",
-                        max(1, int((stop - start) * bytes_per_target + 256)),
-                    ):
+                with self.resource_budget.acquire(
+                    "tiled exact neighbour distance tile",
+                    max(1, workspace),
+                ):
+                    distances = np.empty(count, dtype=np.float64)
+                    for start in range(0, count, tile):
+                        stop = min(start + tile, count)
                         delta = targets[start:stop] - query
                         distances[start:stop] = np.sqrt(
                             np.sum(delta * delta, axis=1, dtype=np.float64)
                         )
             except FloatingPointError as exc:
                 raise ValueError("tiled neighbour distance overflowed or became invalid") from exc
+        assert distances is not None
         if not np.all(np.isfinite(distances)):
             raise ValueError("tiled neighbour distances must be finite")
         return distances
@@ -2416,9 +2865,18 @@ class TiledCPUNeighbourIndex:
             )
             self.distance_evaluations += int(locations.size)
             self.unique_distance_evaluations += int(locations.size)
-            selected = distances < value
-            included_locations.extend(int(item) for item in locations[selected])
-            included_distances.extend(float(item) for item in distances[selected])
+            filter_workspace = int(locations.nbytes + distances.nbytes + distances.size + 1024)
+            self.query_workspace_peak_bytes = max(
+                self.query_workspace_peak_bytes,
+                filter_workspace,
+            )
+            with self.resource_budget.acquire(
+                "tiled exact radius strict filter",
+                max(1, filter_workspace),
+            ):
+                selected = distances < value
+                included_locations.extend(int(item) for item in locations[selected])
+                included_distances.extend(float(item) for item in distances[selected])
         if not included_locations:
             raise ValueError("positive kernel radius support omitted the source row")
         support_count = sum(
