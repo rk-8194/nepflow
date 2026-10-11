@@ -30,7 +30,9 @@ from nepflow.stages.selection.algorithms.information_entropy.models import (
 )
 from nepflow.stages.selection.algorithms.information_entropy.neighbours import (
     build_neighbour_index,
+    compute_indexed_cpu_neighbours_many,
     compute_neighbours,
+    compute_tiled_cpu_neighbours_many,
 )
 from nepflow.stages.selection.algorithms.information_entropy.selector import lazy_greedy
 
@@ -46,7 +48,7 @@ def _timed(label: str, callback):
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--rows", type=int, default=1000)
-    parser.add_argument("--dimension", type=int, default=8)
+    parser.add_argument("--dimension", type=int, default=42)
     parser.add_argument("--candidates", type=int, default=100)
     parser.add_argument("--backend", default="exact_indexed_cpu")
     args = parser.parse_args()
@@ -54,7 +56,10 @@ def main() -> None:
         parser.error("rows must be >= 2, dimension and candidates must be positive")
 
     rng = np.random.default_rng(20261010)
-    descriptors = rng.normal(size=(args.rows, args.dimension)).astype(np.float64)
+    unique_count = min(args.rows, max(9, int(0.8 * args.rows)))
+    unique_descriptors = rng.normal(size=(unique_count, args.dimension)).astype(np.float64)
+    descriptors = unique_descriptors[np.arange(args.rows, dtype=np.int64) % unique_count]
+    neighbour_orders = tuple(order for order in (1, 2, 4, 8) if order < unique_count)
     owner_indices = np.arange(args.rows, dtype=np.int64) % args.candidates
     candidate_ids = tuple(f"candidate-{index:05d}" for index in range(args.candidates))
     owners = [candidate_ids[int(index)] for index in owner_indices]
@@ -65,26 +70,94 @@ def main() -> None:
     )
     print(
         f"workload: N={len(pool.descriptors)}, M={len(pool.candidate_ids)}, "
-        f"d'={pool.descriptors.shape[1]}, backend={args.backend}"
+        f"d'={pool.descriptors.shape[1]}, unique_locations={unique_count}, backend={args.backend}"
     )
     tracemalloc.start()
+    disabled_metrics = {}
 
     index = _timed(
         "index_build",
         lambda: build_neighbour_index(pool.descriptors, backend=args.backend),
     )
-    neighbours = _timed(
-        "neighbour_query",
-        lambda: compute_neighbours(
-            pool.descriptors,
-            1,
-            backend=args.backend,
-            index=index,
-            representation_fingerprint=pool.representation_fingerprint,
-        ),
-    )
+    if index is not None:
+        _timed(
+            "neighbour_query_k_max",
+            lambda: (
+                compute_indexed_cpu_neighbours_many(
+                    pool.descriptors,
+                    neighbour_orders,
+                    index=index,
+                    representation_fingerprint=pool.representation_fingerprint,
+                )
+                if args.backend == "exact_indexed_cpu"
+                else compute_tiled_cpu_neighbours_many(
+                    pool.descriptors,
+                    neighbour_orders,
+                    index=index,
+                    representation_fingerprint=pool.representation_fingerprint,
+                )
+            ),
+        )
+        _timed(
+            "neighbour_query_cached_prefixes",
+            lambda: (
+                compute_indexed_cpu_neighbours_many(
+                    pool.descriptors,
+                    neighbour_orders,
+                    index=index,
+                    representation_fingerprint=pool.representation_fingerprint,
+                )
+                if args.backend == "exact_indexed_cpu"
+                else compute_tiled_cpu_neighbours_many(
+                    pool.descriptors,
+                    neighbour_orders,
+                    index=index,
+                    representation_fingerprint=pool.representation_fingerprint,
+                )
+            ),
+        )
+        disabled_index = _timed(
+            "index_build_cache_disabled",
+            lambda: build_neighbour_index(
+                pool.descriptors,
+                backend=args.backend,
+                max_neighbour_cache_bytes=1,
+            ),
+        )
+        _timed(
+            "neighbour_query_cache_disabled",
+            lambda: (
+                compute_indexed_cpu_neighbours_many(
+                    pool.descriptors,
+                    neighbour_orders,
+                    index=disabled_index,
+                    representation_fingerprint=pool.representation_fingerprint,
+                )
+                if args.backend == "exact_indexed_cpu"
+                else compute_tiled_cpu_neighbours_many(
+                    pool.descriptors,
+                    neighbour_orders,
+                    index=disabled_index,
+                    representation_fingerprint=pool.representation_fingerprint,
+                )
+            ),
+        )
+        disabled_metrics = disabled_index.memory_metrics()
+        distinct_locations = int(index.unique_locations.shape[0])
+    else:
+        neighbour_result = _timed(
+            "neighbour_query",
+            lambda: compute_neighbours(
+                pool.descriptors,
+                1,
+                backend=args.backend,
+                index=index,
+                representation_fingerprint=pool.representation_fingerprint,
+            ),
+        )
+        distinct_locations = int(neighbour_result.unique_locations.shape[0])
     print(
-        f"neighbours: distinct_locations={len(neighbours.unique_locations)}, "
+        f"neighbours: distinct_locations={distinct_locations}, "
         f"index_bytes={getattr(index, 'index_bytes', 0)}"
     )
     index_metrics = index.memory_metrics() if index is not None else {}
@@ -94,15 +167,29 @@ def main() -> None:
         f"grouping_bytes={index_metrics.get('grouping_bytes', 'unavailable')}, "
         f"tree_seconds={index_metrics.get('tree_build_seconds', 'unavailable')}, "
         f"radius_queries={index_metrics.get('radius_queries', 'unavailable')}, "
+        f"index_queries={index_metrics.get('index_queries', 'unavailable')}, "
         f"unique_distance_evaluations="
         f"{index_metrics.get('unique_distance_evaluations', 'unavailable')}, "
         f"atomic_distance_evaluations="
-        f"{index_metrics.get('atomic_distance_evaluations', 'unavailable')}"
+        f"{index_metrics.get('atomic_distance_evaluations', 'unavailable')}, "
+        f"cache_hit={index_metrics.get('cache_hit', 'unavailable')}, "
+        f"cache_miss={index_metrics.get('cache_miss', 'unavailable')}, "
+        f"cache_eviction={index_metrics.get('cache_eviction', 'unavailable')}, "
+        f"cache_admission_rejected="
+        f"{index_metrics.get('cache_admission_rejected', 'unavailable')}, "
+        f"cache_bytes={index_metrics.get('cache_bytes', 'unavailable')}, "
+        f"cache_peak_bytes={index_metrics.get('cache_peak_bytes', 'unavailable')}, "
+        f"cache_time_saved_seconds="
+        f"{index_metrics.get('cache_time_saved_seconds', 'unavailable')}, "
+        f"disabled_cache_hit={disabled_metrics.get('cache_hit', 'unavailable')}, "
+        f"disabled_cache_miss={disabled_metrics.get('cache_miss', 'unavailable')}, "
+        f"disabled_cache_admission_rejected="
+        f"{disabled_metrics.get('cache_admission_rejected', 'unavailable')}"
     )
     settings = EntropyBandwidthSettings(
         mode="automatic",
-        k_candidates=(1, 2),
-        c_candidates=(1.5, 2.0),
+        k_candidates=neighbour_orders,
+        c_candidates=(1.5, 2.0, 4.0, 8.0),
         backend=args.backend,
     )
     calibration = _timed("calibration_loo", lambda: calibrate_bandwidth(pool, settings))

@@ -8,6 +8,7 @@ import math
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -40,10 +41,14 @@ from .models import (
 )
 from .neighbours import (
     ExactNeighbourResult,
+    IndexedCPUNeighbourIndex,
     RadiusQueryCapacityError,
+    TiledCPUNeighbourIndex,
     _estimate_radius_workspace_bytes,
     build_neighbour_index,
+    compute_indexed_cpu_neighbours_many,
     compute_neighbours,
+    compute_tiled_cpu_neighbours_many,
 )
 
 logger = logging.getLogger(__name__)
@@ -58,6 +63,9 @@ class BandwidthCalibrationError(ValueError):
 
 
 BandwidthCalibrationCapacityError = RadiusQueryCapacityError
+
+_C_BATCH_PILOT_VERSION = "support-ratio-pilot-v1"
+_C_BATCH_SUPPORT_RATIO_LIMIT = 2.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -375,6 +383,7 @@ def calculate_frozen_bandwidths(
     max_neighbour_entries: int | None = None,
     max_index_bytes: int | None = None,
     max_radius_query_bytes: int | None = None,
+    max_neighbour_cache_bytes: int | None = None,
     resource_budget: ResourceBudgetService | None = None,
 ) -> FrozenBandwidths:
     """Calculate and freeze exact full-pool ``r_k`` and ``h=c*r_k``."""
@@ -409,14 +418,14 @@ def calculate_frozen_bandwidths(
     index = build_neighbour_index(
         pool.descriptors,
         backend=backend,
-        max_index_bytes=(
-            remaining if max_index_bytes is None else min(max_index_bytes, remaining)
-        ),
+        tile_size=chunk_size,
+        max_index_bytes=(remaining if max_index_bytes is None else min(max_index_bytes, remaining)),
         max_radius_query_bytes=(
             max(1, remaining // 2)
             if max_radius_query_bytes is None
             else min(max_radius_query_bytes, max(1, remaining))
         ),
+        max_neighbour_cache_bytes=max_neighbour_cache_bytes,
         resource_budget=service,
     )
     neighbours = compute_neighbours(
@@ -453,6 +462,7 @@ def _settings_from_arguments(
     max_neighbour_entries: int | None,
     max_index_bytes: int | None,
     max_radius_query_bytes: int | None,
+    max_neighbour_cache_bytes: int | None,
     max_calibration_work_bytes: int | None,
     calibration_batch_size: int | None,
 ) -> EntropyBandwidthSettings:
@@ -474,6 +484,7 @@ def _settings_from_arguments(
             max_neighbour_entries=max_neighbour_entries,
             max_index_bytes=max_index_bytes,
             max_radius_query_bytes=max_radius_query_bytes,
+            max_neighbour_cache_bytes=max_neighbour_cache_bytes,
             max_calibration_work_bytes=max_calibration_work_bytes,
             calibration_batch_size=calibration_batch_size,
         )
@@ -487,6 +498,7 @@ def _settings_from_arguments(
         max_neighbour_entries=max_neighbour_entries,
         max_index_bytes=max_index_bytes,
         max_radius_query_bytes=max_radius_query_bytes,
+        max_neighbour_cache_bytes=max_neighbour_cache_bytes,
         max_calibration_work_bytes=max_calibration_work_bytes,
         calibration_batch_size=calibration_batch_size,
     )
@@ -555,6 +567,7 @@ def _resolve_runtime_limits(
         max_neighbour_entries=settings.max_neighbour_entries,
         max_index_bytes=index_bytes,
         max_radius_query_bytes=radius_bytes,
+        max_neighbour_cache_bytes=settings.max_neighbour_cache_bytes,
         max_calibration_work_bytes=work_bytes,
     )
     logger.info(
@@ -590,9 +603,12 @@ def calibrate_bandwidth(
     max_neighbour_entries: int | None = None,
     max_index_bytes: int | None = None,
     max_radius_query_bytes: int | None = None,
+    max_neighbour_cache_bytes: int | None = None,
     max_calibration_work_bytes: int | None = None,
     calibration_batch_size: int | None = None,
     resource_budget: ResourceBudgetService | None = None,
+    checkpoint_path: str | Path | None = None,
+    resume: bool = True,
 ) -> BandwidthCalibrationResult:
     """Run deterministic manual or bounded-grid finite-pool calibration."""
 
@@ -621,6 +637,7 @@ def calibrate_bandwidth(
         max_neighbour_entries=max_neighbour_entries,
         max_index_bytes=max_index_bytes,
         max_radius_query_bytes=max_radius_query_bytes,
+        max_neighbour_cache_bytes=max_neighbour_cache_bytes,
         max_calibration_work_bytes=max_calibration_work_bytes,
         calibration_batch_size=calibration_batch_size,
     )
@@ -635,8 +652,10 @@ def calibrate_bandwidth(
     index = build_neighbour_index(
         pool.descriptors,
         backend=selected_settings.backend,
+        tile_size=selected_settings.chunk_size,
         max_index_bytes=selected_settings.max_index_bytes,
         max_radius_query_bytes=selected_settings.radius_query_bytes,
+        max_neighbour_cache_bytes=selected_settings.max_neighbour_cache_bytes,
         resource_budget=runtime_budget,
     )
 
@@ -667,6 +686,61 @@ def calibrate_bandwidth(
 
     attempts: list[CalibrationAttempt] = []
     radii_by_k: dict[int, ExactNeighbourResult | str] = {}
+    if selected_settings.mode == "automatic" and index is not None:
+        indexed_orders: list[int] = []
+        location_limit = int(index.unique_locations.shape[0] - 1)
+        for candidate_k in domain_k:
+            if candidate_k > location_limit:
+                radii_by_k[candidate_k] = (
+                    f"k={candidate_k} requires at least {candidate_k} other distinct "
+                    f"descriptor locations; the pool contains only {location_limit}"
+                )
+            elif (
+                selected_settings.max_neighbour_entries is not None
+                and pool.descriptors.shape[0] * candidate_k
+                > selected_settings.max_neighbour_entries
+            ):
+                radii_by_k[candidate_k] = (
+                    "indexed exact neighbour result exceeds its explicit bounded-memory "
+                    f"limit: N={pool.descriptors.shape[0]}, "
+                    f"required_entries={pool.descriptors.shape[0] * candidate_k}, "
+                    f"max_entries={selected_settings.max_neighbour_entries}"
+                )
+            else:
+                indexed_orders.append(candidate_k)
+        if indexed_orders:
+            common_neighbour_options: dict[str, Any] = {
+                "chunk_size": selected_settings.chunk_size,
+                "max_neighbour_entries": selected_settings.max_neighbour_entries,
+                "representation_fingerprint": pool.representation_fingerprint,
+                "row_ids": _pool_row_ids(pool),
+                "resource_budget": runtime_budget,
+                "checkpoint_path": checkpoint_path,
+                "checkpoint_name": "knn",
+                "resume": resume,
+            }
+            if isinstance(index, TiledCPUNeighbourIndex):
+                radii_by_k.update(
+                    compute_tiled_cpu_neighbours_many(
+                        pool.descriptors,
+                        indexed_orders,
+                        index=index,
+                        **common_neighbour_options,
+                    )
+                )
+            elif isinstance(index, IndexedCPUNeighbourIndex):
+                radii_by_k.update(
+                    compute_indexed_cpu_neighbours_many(
+                        pool.descriptors,
+                        indexed_orders,
+                        index=index,
+                        **common_neighbour_options,
+                    )
+                )
+            else:
+                raise RuntimeError(
+                    "automatic entropy calibration has no compatible neighbour index"
+                )
     winner: tuple[float, FrozenBandwidths, np.ndarray] | None = None
     completed_combinations = 0
     valid_count = 0
@@ -729,16 +803,22 @@ def calibrate_bandwidth(
         pair_started = time.perf_counter()
         next_percent = 5
         last_completed = 0
+        last_log_time = pair_started
 
         def report(completed: int, total_sources: int) -> None:
-            nonlocal next_percent, last_completed
+            nonlocal next_percent, last_completed, last_log_time
             if completed <= last_completed:
                 return
             last_completed = completed
+            now = time.perf_counter()
             if total_sources < 20:
                 should_report = True
             else:
-                should_report = completed * 100 >= next_percent * total_sources
+                should_report = (
+                    completed * 100 >= next_percent * total_sources
+                    or now - last_log_time >= 10.0
+                    or completed == total_sources
+                )
             if not should_report:
                 return
             elapsed, remaining = _progress_timing(completed, total_sources, pair_started)
@@ -753,11 +833,15 @@ def calibrate_bandwidth(
 
             logger.info(
                 "Bandwidth calibration pair source progress: k=%d, %s, source=%d/%d "
-                "(%.1f%%), current_support=%d, min_support=%s, mean_support=%s, "
+                "(%.1f%%), phase=radius-support+loo, current_support=%d, "
+                "min_support=%s, mean_support=%s, "
                 "max_support=%d, "
                 "radius_queries=%d, unique_distance_evaluations=%d, "
                 "atomic_distance_evaluations=%d, "
                 "support_cache_bytes=0, "
+                "cache_hit=%d, cache_miss=%d, cache_eviction=%d, "
+                "cache_admission_rejected=%d, cache_bytes=%d, cache_peak_bytes=%d, "
+                "cache_time_saved_seconds=%.6f, "
                 "support_cache_peak_bytes=0, grouping_bytes=%d, grouping_build_seconds=%.3f, "
                 "tree_build_seconds=%.3f, index_bytes=%d, query_workspace_peak_bytes=%d, "
                 "process_peak_rss_bytes=%s, cgroup_memory_current_bytes=%s, "
@@ -774,6 +858,13 @@ def calibrate_bandwidth(
                 int(metric("radius_queries")),
                 int(metric("unique_distance_evaluations")),
                 int(metric("atomic_distance_evaluations")),
+                int(metric("cache_hit")),
+                int(metric("cache_miss")),
+                int(metric("cache_eviction")),
+                int(metric("cache_admission_rejected")),
+                int(metric("cache_bytes")),
+                int(metric("cache_peak_bytes")),
+                float(metric("cache_time_saved_seconds")),
                 int(metric("grouping_bytes")),
                 float(metric("grouping_build_seconds")),
                 float(metric("tree_build_seconds")),
@@ -784,13 +875,14 @@ def calibrate_bandwidth(
                 elapsed,
                 remaining,
             )
+            last_log_time = now
             if total_sources >= 20:
                 while next_percent <= 100 and completed * 100 >= next_percent * total_sources:
                     next_percent += 5
 
         return report
 
-    def c_batches() -> tuple[tuple[float, ...], ...]:
+    def c_batches(neighbours: ExactNeighbourResult) -> tuple[tuple[float, ...], ...]:
         ordered = tuple(float(value) for value in domain_c)
         if selected_settings.mode == "manual":
             return (ordered,)
@@ -821,18 +913,116 @@ def calibrate_bandwidth(
                 else len(ordered)
             ),
         )
+        predicted_support: dict[float, float | None] = {value: None for value in ordered}
+        if isinstance(index, IndexedCPUNeighbourIndex):
+            row_count = int(pool.descriptors.shape[0])
+            sample_count = min(16, row_count)
+            pilot_cost = sample_count * len(ordered)
+            maximum_saved_queries = max(
+                0,
+                (len(ordered) - (len(ordered) + width - 1) // width) * row_count,
+            )
+            if width > 1 and pilot_cost < maximum_saved_queries:
+                sample_rows = np.unique(np.linspace(0, row_count - 1, sample_count, dtype=np.int64))
+                logger.info(
+                    "Bandwidth c-batch pilot started: version=%s, k=%d, samples=%d, "
+                    "c_count=%d, estimated_pilot_queries=%d, maximum_saved_queries=%d",
+                    _C_BATCH_PILOT_VERSION,
+                    neighbours.k,
+                    sample_rows.size,
+                    len(ordered),
+                    pilot_cost,
+                    maximum_saved_queries,
+                )
+                for candidate_c in ordered:
+                    support_total = 0
+                    successful = 0
+                    try:
+                        for source_row in sample_rows:
+                            radius = float(candidate_c * neighbours.radii[int(source_row)])
+                            targets, _distances = index.radius_support(
+                                int(source_row),
+                                radius,
+                                context=(
+                                    f"c-batch pilot k={neighbours.k}, c={candidate_c:g}, "
+                                    f"source_row={int(source_row)}"
+                                ),
+                            )
+                            support_total += int(targets.shape[0])
+                            successful += 1
+                            index.pilot_support_queries += 1
+                            index.pilot_support_count_total += int(targets.shape[0])
+                            index.pilot_support_samples += 1
+                    except (FloatingPointError, OverflowError, ValueError, MemoryError) as exc:
+                        logger.info(
+                            "Bandwidth c-batch pilot unavailable: k=%d, c=%g, reason=%s",
+                            neighbours.k,
+                            candidate_c,
+                            exc,
+                        )
+                        predicted_support[candidate_c] = None
+                    else:
+                        if successful:
+                            predicted_support[candidate_c] = support_total / successful
+                logger.info(
+                    "Bandwidth c-batch pilot completed: version=%s, k=%d, predicted_support=%s",
+                    _C_BATCH_PILOT_VERSION,
+                    neighbours.k,
+                    ", ".join(f"c={value:g}:{predicted_support[value]}" for value in ordered),
+                )
+            else:
+                logger.info(
+                    "Bandwidth c-batch pilot skipped: version=%s, k=%d, "
+                    "estimated_pilot_queries=%d, maximum_saved_queries=%d",
+                    _C_BATCH_PILOT_VERSION,
+                    neighbours.k,
+                    pilot_cost,
+                    maximum_saved_queries,
+                )
+
+        # Preserve the configured c order.  Adjacent candidates share one
+        # radius query only while their measured support work is comparable;
+        # this prevents a wide c from forcing every narrow candidate through
+        # the widest support.  The batch size remains an upper bound.
+        grouped: list[tuple[float, ...]] = []
+        current: list[float] = []
+        for candidate_c in ordered:
+            if not current:
+                current.append(candidate_c)
+                continue
+            current_min = predicted_support.get(current[0])
+            candidate_estimate = predicted_support.get(candidate_c)
+            comparable = (
+                current_min is not None
+                and candidate_estimate is not None
+                and candidate_estimate / max(current_min, 1.0) <= _C_BATCH_SUPPORT_RATIO_LIMIT
+            )
+            if len(current) < width and comparable:
+                current.append(candidate_c)
+            else:
+                grouped.append(tuple(current))
+                current = [candidate_c]
+        if current:
+            grouped.append(tuple(current))
+        batches = tuple(grouped)
         logger.info(
-            "Bandwidth calibration c batching: batch_size=%d, c_count=%d, c_batches=%d, "
-            "estimated_batch_workspace_bytes=%d, max_calibration_work_bytes=%d",
+            "Bandwidth calibration c batching: version=%s, batch_size=%d, c_count=%d, "
+            "c_batches=%d, estimated_batch_workspace_bytes=%d, max_calibration_work_bytes=%d",
+            _C_BATCH_PILOT_VERSION,
             width,
             len(ordered),
-            (len(ordered) + width - 1) // width,
-            8192 + width * per_c_bytes + source_workspace_bound,
+            len(batches),
+            max(8192 + len(batch) * per_c_bytes + source_workspace_bound for batch in batches),
             selected_settings.operational_work_bytes,
         )
-        return tuple(ordered[start : start + width] for start in range(0, len(ordered), width))
-
-    batches = c_batches()
+        for batch in batches:
+            logger.info(
+                "Bandwidth calibration c-batch planned: k=%d, c_batch=%s, predicted_support=%s",
+                neighbours.k,
+                ",".join(f"{value:g}" for value in batch),
+                ",".join(str(predicted_support.get(value)) for value in batch),
+            )
+        return batches
 
     for candidate_k in domain_k:
         try:
@@ -848,6 +1038,9 @@ def calibrate_bandwidth(
                     representation_fingerprint=pool.representation_fingerprint,
                     row_ids=_pool_row_ids(pool),
                     resource_budget=runtime_budget,
+                    checkpoint_path=checkpoint_path,
+                    checkpoint_name=f"knn-k{candidate_k}",
+                    resume=resume,
                 )
                 radii_by_k[candidate_k] = neighbours
             if isinstance(neighbours, str):
@@ -861,7 +1054,13 @@ def calibrate_bandwidth(
                 )
             continue
 
+        batches = c_batches(neighbours)
         for c_batch in batches:
+            logger.info(
+                "Bandwidth calibration c-batch started: k=%d, c_batch=%s",
+                candidate_k,
+                ",".join(f"{value:g}" for value in c_batch),
+            )
             try:
                 frozen_batch = tuple(
                     _freeze_from_neighbours(pool, neighbours, candidate_c)
@@ -881,6 +1080,9 @@ def calibrate_bandwidth(
                             max_radius_query_bytes=selected_settings.radius_query_bytes,
                             resource_budget=runtime_budget,
                             capacity_context=f"k={candidate_k}, c={c_batch[0]:g}",
+                            checkpoint_path=checkpoint_path,
+                            checkpoint_name=f"loo-k{candidate_k}",
+                            resume=resume,
                         ),
                     )
                 else:
@@ -899,6 +1101,33 @@ def calibrate_bandwidth(
                             f"k={candidate_k}, c_batch="
                             + ",".join(f"{value:g}" for value in c_batch)
                         ),
+                        checkpoint_path=checkpoint_path,
+                        checkpoint_name=f"loo-k{candidate_k}-c-"
+                        + "-".join(f"{value:g}" for value in c_batch),
+                        resume=resume,
+                    )
+                if isinstance(index, (IndexedCPUNeighbourIndex, TiledCPUNeighbourIndex)):
+                    metrics = index.memory_metrics()
+                    logger.info(
+                        "Bandwidth calibration c-batch completed: k=%d, c_batch=%s, "
+                        "actual_support_mean=%s, actual_support_max=%s, "
+                        "radius_queries=%s, pilot_support_samples=%s, "
+                        "cache_hit=%s, cache_miss=%s, cache_eviction=%s, "
+                        "cache_admission_rejected=%s, cache_bytes=%s, "
+                        "cache_peak_bytes=%s, cache_time_saved_seconds=%s",
+                        candidate_k,
+                        ",".join(f"{value:g}" for value in c_batch),
+                        metrics.get("mean_support_count"),
+                        metrics.get("max_support_count"),
+                        metrics.get("radius_queries"),
+                        metrics.get("pilot_support_samples"),
+                        metrics.get("cache_hit"),
+                        metrics.get("cache_miss"),
+                        metrics.get("cache_eviction"),
+                        metrics.get("cache_admission_rejected"),
+                        metrics.get("cache_bytes"),
+                        metrics.get("cache_peak_bytes"),
+                        metrics.get("cache_time_saved_seconds"),
                     )
                 for candidate_c, frozen, objective in zip(
                     c_batch,

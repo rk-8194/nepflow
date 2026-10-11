@@ -26,6 +26,7 @@ from .models import (
     EntropySelectionPerformance,
     EntropySelectionResult,
     EntropySelectionStep,
+    OutOfCoreSparseCandidateContributions,
     SparseCandidateContributions,
 )
 from .objective import (
@@ -37,6 +38,7 @@ from .objective import (
 
 LOGGER = logging.getLogger(__name__)
 GREEDY_SELECTION_VERSION = "information-entropy-greedy-v1"
+CandidateContributionStore = SparseCandidateContributions | OutOfCoreSparseCandidateContributions
 
 
 class EntropySelectionError(ValueError):
@@ -78,7 +80,7 @@ class _SelectionCounters:
 @dataclass(frozen=True, slots=True)
 class _PreparedSelection:
     state: EntropyObjectiveState
-    contributions: SparseCandidateContributions
+    contributions: CandidateContributionStore
     anchor_ids: tuple[str, ...]
     structure_ids: tuple[str | None, ...]
 
@@ -153,7 +155,7 @@ def _structure_id_values(
 
 def _prepare_selection(
     pool: EntropyPool,
-    contributions: SparseCandidateContributions,
+    contributions: CandidateContributionStore,
     beta: float | int | None,
     budget: int | float | None,
     K: int | None,
@@ -180,7 +182,7 @@ def _prepare_selection(
 
 def _checked_gain(
     state: EntropyObjectiveState,
-    contributions: SparseCandidateContributions,
+    contributions: CandidateContributionStore,
     candidate_index: int,
     counters: _SelectionCounters,
     phase: str,
@@ -206,7 +208,7 @@ def _checked_gain(
 
 def _apply_selected_candidate(
     state: EntropyObjectiveState,
-    contributions: SparseCandidateContributions,
+    contributions: CandidateContributionStore,
     candidate_index: int,
     selected_gain: float,
     counters: _SelectionCounters,
@@ -678,7 +680,7 @@ def _run_lazy_greedy(
 def _run_optimizer(
     method: str,
     pool: EntropyPool,
-    contributions: SparseCandidateContributions,
+    contributions: CandidateContributionStore,
     beta: float | int | None,
     budget: int | float | None,
     K: int | None,
@@ -706,7 +708,7 @@ def _run_optimizer(
 
 def full_greedy(
     pool: EntropyPool,
-    contributions: SparseCandidateContributions,
+    contributions: CandidateContributionStore,
     beta: float | int | None = None,
     budget: int | float | None = None,
     anchors: Iterable[str] | str | None = (),
@@ -743,7 +745,7 @@ def full_greedy(
 
 def lazy_greedy(
     pool: EntropyPool,
-    contributions: SparseCandidateContributions,
+    contributions: CandidateContributionStore,
     beta: float | int | None = None,
     budget: int | float | None = None,
     anchors: Iterable[str] | str | None = (),
@@ -832,6 +834,11 @@ class InformationEntropySelectionAlgorithm:
                     if bandwidth.max_radius_query_bytes is None
                     else int(bandwidth.max_radius_query_bytes)
                 ),
+                max_neighbour_cache_bytes=(
+                    None
+                    if bandwidth.max_neighbour_cache_bytes is None
+                    else int(bandwidth.max_neighbour_cache_bytes)
+                ),
                 max_calibration_work_bytes=(
                     None
                     if bandwidth.max_calibration_work_bytes is None
@@ -882,12 +889,12 @@ class InformationEntropySelectionAlgorithm:
             pool,
             bandwidth_settings,
             resource_budget=runtime_budget,
+            checkpoint_path=request.options.get("calibration_checkpoint_path"),
+            resume=bool(request.options.get("resume_checkpoints", True)),
         )
         remaining_budget = runtime_budget.remaining_managed_budget
         if remaining_budget is None:
-            raise ValueError(
-                runtime_budget.unknown_memory_message("information-entropy selection")
-            )
+            raise ValueError(runtime_budget.unknown_memory_message("information-entropy selection"))
         radius_query_bytes = min(
             bandwidth_settings.max_radius_query_bytes or max(1, remaining_budget // 2),
             max(1, remaining_budget),
@@ -916,6 +923,12 @@ class InformationEntropySelectionAlgorithm:
             ),
             max_radius_query_bytes=radius_query_bytes,
             resource_budget=runtime_budget,
+            storage=str(self._entropy_value(request.options, "contribution_storage", "auto")),
+            storage_path=self._entropy_value(request.options, "contribution_storage_path", None),
+            checkpoint_path=self._entropy_value(
+                request.options, "contribution_checkpoint_path", None
+            ),
+            resume=bool(request.options.get("resume_checkpoints", True)),
         )
         method = str(self._entropy_value(request.options, "optimizer_method", "lazy_greedy"))
         optimizer = full_greedy if method == "full_greedy" else lazy_greedy

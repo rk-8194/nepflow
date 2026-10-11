@@ -11,7 +11,6 @@ from nepflow.resources.budget import (
     detect_resource_snapshot,
 )
 
-
 GIB = 1024**3
 
 

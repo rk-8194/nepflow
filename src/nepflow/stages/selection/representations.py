@@ -26,7 +26,7 @@ from nepflow.domain.identities import (
     calculate_structure_id,
 )
 from nepflow.errors import StateError
-from nepflow.io.atomic import atomic_write_bytes, atomic_write_stream
+from nepflow.io.atomic import atomic_write_stream
 from nepflow.io.hashing import sha256_bytes, sha256_canonical_json, sha256_file
 from nepflow.io.json import read_json_object, write_json
 from nepflow.resources.budget import (

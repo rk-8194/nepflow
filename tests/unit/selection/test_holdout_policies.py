@@ -171,9 +171,10 @@ def test_atom_weighting_is_explicit_and_identity_groups_are_leakage_safe() -> No
         structure_ids=("same", "same", "other"),
     )
     assert safe.indices == (2,)
-    assert "physical structure identity is in training" in safe.provenance[
-        "exclusion_reasons"
-    ].values()
+    assert (
+        "physical structure identity is in training"
+        in safe.provenance["exclusion_reasons"].values()
+    )
 
 
 def test_unsupported_policy_is_typed() -> None:

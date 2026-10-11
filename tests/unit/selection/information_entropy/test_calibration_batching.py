@@ -190,11 +190,9 @@ def test_calibration_batch_partition_preserves_attempts_and_winner() -> None:
     )
 
     assert [
-        (attempt.k, attempt.c, attempt.status, attempt.reason)
-        for attempt in one_at_a_time.attempts
+        (attempt.k, attempt.c, attempt.status, attempt.reason) for attempt in one_at_a_time.attempts
     ] == [
-        (attempt.k, attempt.c, attempt.status, attempt.reason)
-        for attempt in partitioned.attempts
+        (attempt.k, attempt.c, attempt.status, attempt.reason) for attempt in partitioned.attempts
     ]
     for first, second in zip(one_at_a_time.attempts, partitioned.attempts, strict=True):
         assert first.objective == pytest.approx(second.objective)

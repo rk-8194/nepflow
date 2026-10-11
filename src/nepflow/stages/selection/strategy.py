@@ -80,10 +80,11 @@ def _algorithm_options(
     composition_aware: bool | None = None,
     local_representation: Any | None = None,
     resource_budget: ResourceBudgetService | None = None,
+    checkpoint_root: Path | None = None,
 ) -> dict[str, Any]:
-    """Build the FPS options while retaining legacy mapping defaults."""
+    """Build algorithm options while retaining legacy mapping defaults."""
 
-    return {
+    options = {
         "ase_structures": tuple(ase_structures or ()),
         "composition_aware_fps": (
             _setting_or_default(settings, "composition_aware_fps", False)
@@ -111,6 +112,16 @@ def _algorithm_options(
         "entropy_config": getattr(settings, "entropy", None),
         "resource_budget": resource_budget,
     }
+    if checkpoint_root is not None:
+        entropy_root = Path(checkpoint_root)
+        options.update(
+            {
+                "calibration_checkpoint_path": entropy_root / "calibration",
+                "contribution_checkpoint_path": entropy_root / "contributions",
+                "contribution_storage_path": entropy_root / "candidate-contributions",
+            }
+        )
+    return options
 
 
 def select_training_set(
@@ -128,6 +139,7 @@ def select_training_set(
     local_representation: Any | None = None,
     candidate_structure_ids: Sequence[str] | None = None,
     resource_budget: ResourceBudgetService | None = None,
+    checkpoint_root: Path | None = None,
 ) -> TrainingSelection:
     """Dispatch one training-selection algorithm with mandatory anchors."""
 
@@ -180,6 +192,7 @@ def select_training_set(
         composition_aware=composition_aware,
         local_representation=local_representation,
         resource_budget=resource_budget,
+        checkpoint_root=checkpoint_root,
     )
     if candidate_structure_ids is not None:
         if len(candidate_structure_ids) != len(ordered_candidate_ids):

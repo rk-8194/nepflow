@@ -30,6 +30,7 @@ from .models import (
     EntropySelectionHistory,
     EntropySelectionResult,
     FrozenBandwidths,
+    OutOfCoreSparseCandidateContributions,
     SparseAtomicKernelGraph,
     SparseCandidateContributions,
     StreamedKernelExecutionSummary,
@@ -133,7 +134,9 @@ def _load_diagnostic_arrays(
         try:
             payload = base64.b64decode(artifact["payload"], validate=True)
         except (ValueError, TypeError) as exc:
-            raise ValueError("entropy diagnostics inline numeric artifact is not valid base64") from exc
+            raise ValueError(
+                "entropy diagnostics inline numeric artifact is not valid base64"
+            ) from exc
     elif storage == "file":
         path_value = artifact.get("path")
         if not isinstance(path_value, str) or not path_value.strip():
@@ -444,6 +447,9 @@ class GraphDiagnostics:
     atomic_graph_csr_bytes: int = -1
     kernel_operator_fingerprint: str | None = None
     contribution_spool_bytes: int | None = None
+    candidate_storage: str = "memory"
+    candidate_storage_path: str | None = None
+    candidate_resident_bytes: int = 0
 
     def __post_init__(self) -> None:
         for name in (
@@ -473,6 +479,7 @@ class GraphDiagnostics:
             "measured_peak_memory_bytes",
             "estimated_peak_memory_bytes",
             "contribution_spool_bytes",
+            "candidate_resident_bytes",
         ):
             value = getattr(self, name)
             if value is not None and int(value) < 0:
@@ -491,8 +498,17 @@ class GraphDiagnostics:
         if not self.atomic_graph_materialized and (atomic_bytes != 0 or self.csr_array_bytes != 0):
             raise ValueError("streamed diagnostics must report zero atomic graph CSR bytes")
         object.__setattr__(self, "atomic_graph_csr_bytes", atomic_bytes)
-        if self.kernel_operator_fingerprint is not None and not self.kernel_operator_fingerprint.strip():
+        if (
+            self.kernel_operator_fingerprint is not None
+            and not self.kernel_operator_fingerprint.strip()
+        ):
             raise ValueError("kernel_operator_fingerprint must be non-blank when supplied")
+        if self.candidate_storage not in {"memory", "disk"}:
+            raise ValueError("candidate_storage must be 'memory' or 'disk'")
+        if self.candidate_storage_path is not None and not isinstance(
+            self.candidate_storage_path, str
+        ):
+            raise ValueError("candidate_storage_path must be a string when supplied")
 
     def to_manifest(self) -> dict[str, Any]:
         return {
@@ -513,6 +529,9 @@ class GraphDiagnostics:
                 "measured_peak_memory_bytes": self.measured_peak_memory_bytes,
                 "estimated_peak_memory_bytes": self.estimated_peak_memory_bytes,
                 "contribution_spool_bytes": self.contribution_spool_bytes,
+                "candidate_storage": self.candidate_storage,
+                "candidate_storage_path": self.candidate_storage_path,
+                "candidate_resident_bytes": self.candidate_resident_bytes,
             },
             "backend": self.backend,
             "metric": self.metric,
@@ -579,8 +598,8 @@ class EntropyScientificDiagnostics:
     pool: EntropyPool | None = field(default=None, repr=False, compare=False)
     bandwidths: FrozenBandwidths | None = field(default=None, repr=False, compare=False)
     graph_record: SparseAtomicKernelGraph | None = field(default=None, repr=False, compare=False)
-    contributions: SparseCandidateContributions | None = field(
-        default=None, repr=False, compare=False
+    contributions: SparseCandidateContributions | OutOfCoreSparseCandidateContributions | None = (
+        field(default=None, repr=False, compare=False)
     )
     entropy_result: EntropySelectionResult | None = field(default=None, repr=False, compare=False)
     calibration_manifest_json: str = field(default="", repr=False, compare=False)
@@ -721,11 +740,13 @@ class EntropyScientificDiagnostics:
         graph_record = self.graph.to_manifest()
         graph_memory = graph_record.get("memory")
         if isinstance(graph_memory, dict):
-            # Spool size is publication telemetry, not scientific identity.
-            # Keep fingerprints compatible with v3 records written before the
-            # streamed-memory presentation field was exposed.
+            # Storage and spool values are publication telemetry, not scientific
+            # identity. Keep fingerprints compatible with earlier v3 records.
             graph_memory = dict(graph_memory)
             graph_memory.pop("contribution_spool_bytes", None)
+            graph_memory.pop("candidate_storage", None)
+            graph_memory.pop("candidate_storage_path", None)
+            graph_memory.pop("candidate_resident_bytes", None)
             graph_record["memory"] = graph_memory
         return {
             "schema_version": self.schema_version,
@@ -750,11 +771,7 @@ class EntropyScientificDiagnostics:
                     if calibration_record is None
                     else calibration_record.get("calibration_fingerprint")
                 ),
-                "graph": (
-                    None
-                    if self.graph_record is None
-                    else self.graph_record.fingerprint
-                ),
+                "graph": (None if self.graph_record is None else self.graph_record.fingerprint),
                 "kernel_operator": self.kernel_operator_fingerprint,
                 "contributions": self.contributions_source_fingerprint
                 if self.contributions_source_fingerprint is not None
@@ -957,11 +974,7 @@ class EntropyScientificDiagnostics:
                     if calibration_record is None
                     else calibration_record.get("calibration_fingerprint")
                 ),
-                "graph": (
-                    None
-                    if self.graph_record is None
-                    else self.graph_record.fingerprint
-                ),
+                "graph": (None if self.graph_record is None else self.graph_record.fingerprint),
                 "kernel_operator": self.kernel_operator_fingerprint,
                 "contributions": self.contributions_source_fingerprint
                 if self.contributions_source_fingerprint is not None
@@ -1046,10 +1059,14 @@ class EntropyScientificDiagnostics:
         if not isinstance(graph_manifest, Mapping) or not isinstance(bandwidth, Mapping):
             raise ValueError("entropy diagnostics graph/bandwidth payload is malformed")
         operator_source = source.get("kernel_operator", source.get("graph"))
-        if any(
-            not isinstance(source.get(name), str) or not str(source.get(name)).strip()
-            for name in ("representation", "pool", "transform", "calibration", "contributions")
-        ) or not isinstance(operator_source, str) or not operator_source.strip():
+        if (
+            any(
+                not isinstance(source.get(name), str) or not str(source.get(name)).strip()
+                for name in ("representation", "pool", "transform", "calibration", "contributions")
+            )
+            or not isinstance(operator_source, str)
+            or not operator_source.strip()
+        ):
             raise ValueError("entropy diagnostics source fingerprints are incomplete")
         atomic_graph_materialized = bool(graph_manifest.get("atomic_graph_materialized", True))
         if not atomic_graph_materialized and "kernel_operator" not in source:
@@ -1373,6 +1390,13 @@ def _graph_from_manifest(value: Mapping[str, Any]) -> GraphDiagnostics:
             if memory.get("contribution_spool_bytes") is None
             else int(memory["contribution_spool_bytes"])
         ),
+        candidate_storage=str(memory.get("candidate_storage", "memory")),
+        candidate_storage_path=(
+            None
+            if memory.get("candidate_storage_path") is None
+            else str(memory["candidate_storage_path"])
+        ),
+        candidate_resident_bytes=int(memory.get("candidate_resident_bytes", 0)),
         numerical_tolerance=float(
             value.get("numerical_tolerance", DIAGNOSTICS_NUMERICAL_TOLERANCE)
         ),
@@ -1567,7 +1591,7 @@ def build_entropy_diagnostics(
     pool: EntropyPool,
     calibration: BandwidthCalibrationResult,
     graph: SparseAtomicKernelGraph | StreamedKernelExecutionSummary,
-    contributions: SparseCandidateContributions,
+    contributions: SparseCandidateContributions | OutOfCoreSparseCandidateContributions,
     entropy_result: EntropySelectionResult,
     local_representation: Any,
     *,
@@ -1689,9 +1713,7 @@ def build_entropy_diagnostics(
         candidate_csr_array_bytes=contributions.array_bytes,
         indexed_workspace_bytes=None,
         measured_peak_memory_bytes=(
-            None
-            if isinstance(graph, SparseAtomicKernelGraph)
-            else graph.measured_peak_memory_bytes
+            None if isinstance(graph, SparseAtomicKernelGraph) else graph.measured_peak_memory_bytes
         ),
         estimated_peak_memory_bytes=(
             None
@@ -1708,6 +1730,17 @@ def build_entropy_diagnostics(
         kernel_operator_fingerprint=operator_fingerprint,
         contribution_spool_bytes=(
             None if isinstance(graph, SparseAtomicKernelGraph) else graph.contribution_spool_bytes
+        ),
+        candidate_storage=(
+            "memory" if isinstance(graph, SparseAtomicKernelGraph) else graph.candidate_storage
+        ),
+        candidate_storage_path=(
+            None if isinstance(graph, SparseAtomicKernelGraph) else graph.candidate_storage_path
+        ),
+        candidate_resident_bytes=(
+            contributions.array_bytes
+            if isinstance(graph, SparseAtomicKernelGraph)
+            else graph.candidate_resident_bytes
         ),
     )
     raw = np.asarray(local_representation.raw_descriptors, dtype=np.float64)

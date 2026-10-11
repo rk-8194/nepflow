@@ -1157,6 +1157,13 @@ Include:
 - (c);
 - ANN seed/settings where applicable.
 
+The exact CPU implementation may additionally retain one immutable,
+location-level canonical `k_max` neighbour result.  This is an operational
+cache, not a scientific input: its budget is planned from the shared runtime
+headroom and active leases, it may be rejected or evicted under pressure, and
+cache counters, workers, hardware memory, and eviction history are excluded
+from scientific identities.
+
 ### 20.4 Kernel-graph identity
 
 Include:
@@ -1599,6 +1606,19 @@ Additionally require:
 
 - add entropy, KL, marginal-gain, bandwidth, coverage, composition, provenance, and magnetic diagnostics;
 - add duplicate/thinning and sparse/dense sensitivity tooling.
+
+### Step 9a — Large-pool execution and recovery
+
+- The explicit `exact_tiled_cpu` backend evaluates canonical float64 distances
+  in bounded source/target tiles and preserves duplicate-location and
+  earliest-row tie semantics.
+- Long-running neighbour, LOO, and candidate-aggregation phases use versioned,
+  checksummed checkpoints with ordered scientific identities and atomic
+  promotion. Worker count and tile size are operational inputs only when the
+  ordered numerical accumulation is unchanged.
+- Candidate PMFs may be published as checksummed memory-mapped CSR arrays;
+  greedy access reads one candidate support at a time and keeps the finite-pool
+  objective unchanged.
 
 ---
 

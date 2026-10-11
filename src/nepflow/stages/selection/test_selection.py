@@ -81,8 +81,7 @@ def _validate_weighting(weighting: str) -> str:
 def _row_indices(representation: LocalEnvironmentRepresentation) -> dict[str, np.ndarray]:
     grouped: dict[str, list[int]] = defaultdict(list)
     candidate_positions = {
-        candidate_id: position
-        for position, candidate_id in enumerate(representation.candidate_ids)
+        candidate_id: position for position, candidate_id in enumerate(representation.candidate_ids)
     }
     for row_index, row in enumerate(representation.rows):
         position = candidate_positions.get(row.candidate_id)
@@ -100,9 +99,7 @@ def _row_indices(representation: LocalEnvironmentRepresentation) -> dict[str, np
         for candidate_id, indices in grouped.items()
     }
     missing = [
-        candidate_id
-        for candidate_id in representation.candidate_ids
-        if candidate_id not in result
+        candidate_id for candidate_id in representation.candidate_ids if candidate_id not in result
     ]
     if missing:
         raise TestSelectionPolicyError(
@@ -139,9 +136,9 @@ def _candidate_family(structure: Any) -> str:
 def _distribution_signature(values: np.ndarray) -> np.ndarray:
     if values.ndim != 2 or values.shape[0] == 0:
         raise TestSelectionPolicyError("candidate local environments must be non-empty 2D arrays")
-    return np.asarray(
-        np.quantile(values, SIGNATURE_QUANTILES, axis=0), dtype=np.float64
-    ).reshape(-1)
+    return np.asarray(np.quantile(values, SIGNATURE_QUANTILES, axis=0), dtype=np.float64).reshape(
+        -1
+    )
 
 
 def _signature_spread(signature: np.ndarray, dimension: int) -> float:
@@ -354,9 +351,7 @@ def _representative_holdout(
     selected_total_weight = sum(selected_weights.values())
     selected_fractions = {
         "/".join((key[0], key[1], str(key[2]))): (
-            selected_weights[key] / selected_total_weight
-            if selected_total_weight
-            else 0.0
+            selected_weights[key] / selected_total_weight if selected_total_weight else 0.0
         )
         for key in strata
     }

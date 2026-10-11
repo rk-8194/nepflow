@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-from nepflow.config.models import SelectionConfig, TEST_SELECTION_POLICIES
+from nepflow.config.models import TEST_SELECTION_POLICIES, SelectionConfig
 from nepflow.domain.identities import calculate_candidate_id, calculate_structure_id
 from nepflow.errors import ArtifactError, StateError
 from nepflow.io.hashing import sha256_canonical_json
@@ -133,6 +133,7 @@ def selection_policy(settings: SelectionConfig) -> dict[str, Any]:
                     "max_neighbour_entries",
                     "max_index_bytes",
                     "max_radius_query_bytes",
+                    "max_neighbour_cache_bytes",
                     "max_calibration_work_bytes",
                     "calibration_batch_size",
                 ):
@@ -229,9 +230,7 @@ def selection_parameters(
     train_indices = set(result.train_indices)
     test_indices = set(result.test_indices)
     anchor_indices = set(
-        result.seed_indices
-        + result.single_element_elastic_indices
-        + result.elastic_indices
+        result.seed_indices + result.single_element_elastic_indices + result.elastic_indices
     )
     if train_indices & test_indices:
         raise StateError("Selection result train/test candidate identities overlap")
@@ -439,9 +438,7 @@ def complete_selection_result(
     if not isinstance(parameters, Mapping):
         raise StateError("Persisted selection run has no structured parameters")
     if selection_run.get("status") not in {"pending", "completed"}:
-        raise StateError(
-            f"Cannot complete selection run in status {selection_run.get('status')!r}"
-        )
+        raise StateError(f"Cannot complete selection run in status {selection_run.get('status')!r}")
     return store.upsert_selection_run(
         selection_run_id_value,
         project_id,

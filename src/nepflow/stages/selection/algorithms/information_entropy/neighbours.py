@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
+import threading
 import time
+import weakref
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -18,6 +21,7 @@ from nepflow.resources.budget import (
     build_resource_budget,
 )
 
+from .checkpointing import CheckpointValidationError, VersionedCheckpointStore
 from .models import (
     DEFAULT_NEIGHBOUR_BACKEND_ID,
     DEFAULT_RADIUS_QUERY_BYTES,
@@ -27,6 +31,8 @@ from .models import (
     NEIGHBOUR_BACKEND_VERSION,
     NEIGHBOUR_DISTINCT_POLICY,
     NEIGHBOUR_METRIC,
+    TILED_NEIGHBOUR_BACKEND_ID,
+    TILED_NEIGHBOUR_BACKEND_VERSION,
 )
 
 logger = logging.getLogger(__name__)
@@ -39,7 +45,10 @@ class RadiusQueryCapacityError(MemoryError):
 CalibrationCapacityError = RadiusQueryCapacityError
 
 
-DEFAULT_NEIGHBOUR_CACHE_BYTES = 64 * 1024 * 1024
+# ``None`` means that the cache is planned from the shared runtime budget.
+# There is deliberately no machine-independent byte default: a cache is
+# optional, while neighbour workspaces remain required and fail fast.
+DEFAULT_NEIGHBOUR_CACHE_BYTES: int | None = None
 
 
 def _validate_memory_limit(value: Any, name: str) -> int:
@@ -49,6 +58,21 @@ def _validate_memory_limit(value: Any, name: str) -> int:
     if result < 1:
         raise ValueError(f"{name} must be a positive integer")
     return result
+
+
+def _resolve_neighbour_cache_budget(
+    *,
+    remaining_bytes: int,
+    index_bytes: int,
+    radius_query_bytes: int,
+    user_cap: int | None,
+) -> int:
+    """Plan optional cache headroom without changing required-work limits."""
+
+    available = max(0, int(remaining_bytes) - int(index_bytes) - int(radius_query_bytes))
+    if user_cap is None:
+        return available
+    return min(_validate_memory_limit(user_cap, "max_neighbour_cache_bytes"), available)
 
 
 def _estimate_radius_workspace_bytes(
@@ -118,6 +142,14 @@ _BACKEND_CAPABILITIES = {
     INDEXED_NEIGHBOUR_BACKEND_ID: NeighbourBackendCapabilities(
         backend=INDEXED_NEIGHBOUR_BACKEND_ID,
         version=INDEXED_NEIGHBOUR_BACKEND_VERSION,
+        metric=NEIGHBOUR_METRIC,
+        exact=True,
+        supports_radius_support=True,
+        supports_reusable_index=True,
+    ),
+    TILED_NEIGHBOUR_BACKEND_ID: NeighbourBackendCapabilities(
+        backend=TILED_NEIGHBOUR_BACKEND_ID,
+        version=TILED_NEIGHBOUR_BACKEND_VERSION,
         metric=NEIGHBOUR_METRIC,
         exact=True,
         supports_radius_support=True,
@@ -286,7 +318,7 @@ class IndexedCPUNeighbourIndex:
         *,
         max_index_bytes: int | None = None,
         max_radius_query_bytes: int | None = None,
-        max_neighbour_cache_bytes: int = DEFAULT_NEIGHBOUR_CACHE_BYTES,
+        max_neighbour_cache_bytes: int | None = DEFAULT_NEIGHBOUR_CACHE_BYTES,
         resource_budget: ResourceBudgetService | None = None,
     ) -> None:
         values = _validate_descriptors(descriptors)
@@ -311,16 +343,12 @@ class IndexedCPUNeighbourIndex:
             else _validate_memory_limit(max_index_bytes, "max_index_bytes")
         )
         effective_index_limit = (
-            remaining
-            if explicit_index_limit is None
-            else min(explicit_index_limit, remaining)
+            remaining if explicit_index_limit is None else min(explicit_index_limit, remaining)
         )
         # Preflight the worst-case unique-location/grouping/tree footprint before
         # np.unique and cKDTree can materialize their temporary arrays.  The
         # post-build estimate below remains the tighter check for duplicate rows.
-        estimated_peak_index_bytes = int(
-            2 * values.nbytes + 160 * values.shape[0] + 8192
-        )
+        estimated_peak_index_bytes = int(2 * values.nbytes + 160 * values.shape[0] + 8192)
         if estimated_peak_index_bytes > effective_index_limit:
             if (
                 explicit_index_limit is not None
@@ -349,6 +377,11 @@ class IndexedCPUNeighbourIndex:
             )
         )
         self.resource_budget = service
+        logger.info(
+            "Indexed neighbour grouping started: N=%d, d'=%d",
+            values.shape[0],
+            values.shape[1],
+        )
         locations, first_indices, row_to_location = np.unique(
             values,
             axis=0,
@@ -376,11 +409,15 @@ class IndexedCPUNeighbourIndex:
         self.location_indptr.setflags(write=False)
         self.grouping_build_seconds = max(0.0, time.perf_counter() - grouping_started)
         self.grouping_bytes = int(self.rows_by_location.nbytes + self.location_indptr.nbytes)
-        self.max_radius_query_bytes = radius_limit
-        self.max_neighbour_cache_bytes = _validate_memory_limit(
-            max_neighbour_cache_bytes, "max_neighbour_cache_bytes"
+        logger.info(
+            "Indexed neighbour grouping completed: N=%d, distinct locations=%d, "
+            "grouping_bytes=%d, elapsed=%.3fs",
+            values.shape[0],
+            location_count,
+            self.grouping_bytes,
+            self.grouping_build_seconds,
         )
-        self.neighbour_cache_bytes = 0
+        self.max_radius_query_bytes = radius_limit
         self.index_queries = 0
         self.radius_queries = 0
         self.radius_query_preflights = 0
@@ -392,6 +429,9 @@ class IndexedCPUNeighbourIndex:
         self.support_count_total = 0
         self.support_count_samples = 0
         self.max_support_count = 0
+        self.pilot_support_queries = 0
+        self.pilot_support_count_total = 0
+        self.pilot_support_samples = 0
         self.query_workspace_peak_bytes = 0
         self.index_bytes = self._estimate_index_bytes()
         if self.index_bytes > effective_index_limit:
@@ -412,16 +452,45 @@ class IndexedCPUNeighbourIndex:
                 available_bytes=remaining,
                 reserved_headroom_bytes=service.budget.reserved_headroom_bytes,
             )
+        self.max_neighbour_cache_bytes = _resolve_neighbour_cache_budget(
+            remaining_bytes=remaining,
+            index_bytes=self.index_bytes,
+            radius_query_bytes=self.max_radius_query_bytes,
+            user_cap=max_neighbour_cache_bytes,
+        )
+        self.cache_budget_bytes = int(self.max_neighbour_cache_bytes)
         try:
             from scipy.spatial import cKDTree  # pyright: ignore[reportAttributeAccessIssue]
         except ImportError as exc:
             raise ValueError(
                 f"neighbour backend {self.backend!r} is unavailable: scipy.spatial.cKDTree"
             ) from exc
+        logger.info(
+            "Indexed neighbour tree build started: distinct locations=%d, estimated_bytes=%d",
+            location_count,
+            self.index_bytes,
+        )
         tree_started = time.perf_counter()
         self._tree: Any = cKDTree(self.unique_locations, copy_data=True)
         self.tree_build_seconds = max(0.0, time.perf_counter() - tree_started)
+        logger.info(
+            "Indexed neighbour tree completed: distinct locations=%d, tree_bytes=%d, elapsed=%.3fs",
+            location_count,
+            self.index_bytes,
+            self.tree_build_seconds,
+        )
         self._neighbour_cache: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+        self._neighbour_cache_lease: Any | None = None
+        self._neighbour_cache_key: str | None = None
+        self._cache_lock = threading.RLock()
+        self.neighbour_cache_bytes = 0
+        self.cache_hit = 0
+        self.cache_miss = 0
+        self.cache_eviction = 0
+        self.cache_admission_rejected = 0
+        self.cache_peak_bytes = 0
+        self.cache_time_saved_seconds = 0.0
+        self._last_neighbour_compute_seconds = 0.0
         self.fingerprint = sha256_canonical_json(
             {
                 "backend": self.backend,
@@ -434,6 +503,35 @@ class IndexedCPUNeighbourIndex:
                 "row_to_location": _array_fingerprint(self.row_to_location),
             }
         )
+        owner = weakref.ref(self)
+
+        def evict() -> int:
+            instance = owner()
+            return 0 if instance is None else instance._evict_neighbour_cache()
+
+        self._cache_eviction_token = service.register_optional_eviction(evict)
+
+    def close(self) -> None:
+        """Release optional cache bytes and its runtime-budget registration."""
+
+        self.resource_budget.unregister_optional_eviction(self._cache_eviction_token)
+        self._evict_neighbour_cache()
+
+    def __del__(self) -> None:  # pragma: no cover - best-effort lifecycle cleanup
+        try:
+            self.close()
+        except Exception:
+            pass
+
+    @property
+    def worker_count(self) -> int:
+        """Return the bounded SciPy worker count for indexed queries."""
+
+        configured = self.resource_budget.budget.worker_cap
+        available = os.cpu_count() or 1
+        if configured is None:
+            return max(1, available)
+        return max(1, min(int(configured), available))
 
     def _estimate_index_bytes(self) -> int:
         n_locations = int(self.unique_locations.shape[0])
@@ -457,7 +555,16 @@ class IndexedCPUNeighbourIndex:
             "support_cache_bytes": 0,
             "support_cache_peak_bytes": 0,
             "neighbour_cache_bytes": int(self.neighbour_cache_bytes),
+            "cache_bytes": int(self.neighbour_cache_bytes),
+            "cache_peak_bytes": int(self.cache_peak_bytes),
+            "cache_hit": int(self.cache_hit),
+            "cache_miss": int(self.cache_miss),
+            "cache_eviction": int(self.cache_eviction),
+            "cache_admission_rejected": int(self.cache_admission_rejected),
+            "cache_time_saved_seconds": float(self.cache_time_saved_seconds),
+            "cache_budget_bytes": int(self.cache_budget_bytes),
             "index_bytes": int(self.index_bytes),
+            "worker_count": int(self.worker_count),
             "grouping_bytes": int(self.grouping_bytes),
             "grouping_build_seconds": float(self.grouping_build_seconds),
             "tree_build_seconds": float(self.tree_build_seconds),
@@ -470,6 +577,9 @@ class IndexedCPUNeighbourIndex:
                 else None
             ),
             "max_support_count": int(self.max_support_count),
+            "pilot_support_queries": int(self.pilot_support_queries),
+            "pilot_support_count_total": int(self.pilot_support_count_total),
+            "pilot_support_samples": int(self.pilot_support_samples),
             "index_queries": int(self.index_queries),
             "radius_queries": int(self.radius_queries),
             "radius_query_preflights": int(self.radius_query_preflights),
@@ -513,12 +623,14 @@ class IndexedCPUNeighbourIndex:
                     context=context,
                 )
             with self.resource_budget.acquire(context, max(1, estimated_bytes)):
-                _tree_distances, tree_indices = self._tree.query(block, k=1, workers=1)
+                _tree_distances, tree_indices = self._tree.query(
+                    block,
+                    k=1,
+                    workers=self.worker_count,
+                )
                 nearest = self.unique_locations[np.asarray(tree_indices, dtype=np.int64)]
                 delta = nearest - block
-                distances[start:stop] = np.sqrt(
-                    np.sum(delta * delta, axis=1, dtype=np.float64)
-                )
+                distances[start:stop] = np.sqrt(np.sum(delta * delta, axis=1, dtype=np.float64))
         if not np.all(np.isfinite(distances)):
             raise ValueError(f"{context} produced non-finite distances")
         return distances
@@ -593,7 +705,12 @@ class IndexedCPUNeighbourIndex:
         self.radius_query_preflights += 1
         try:
             candidate_count = int(
-                self._tree.query_ball_point(query, expanded_radius, return_length=True)
+                self._tree.query_ball_point(
+                    query,
+                    expanded_radius,
+                    return_length=True,
+                    workers=self.worker_count,
+                )
             )
         except TypeError as exc:
             raise self._capacity_error(
@@ -617,7 +734,7 @@ class IndexedCPUNeighbourIndex:
                 context=context,
             )
         location_indices = np.asarray(
-            self._tree.query_ball_point(query, expanded_radius),
+            self._tree.query_ball_point(query, expanded_radius, workers=self.worker_count),
             dtype=np.int64,
         )
         self.radius_queries += 1
@@ -625,112 +742,466 @@ class IndexedCPUNeighbourIndex:
             raise ValueError("cKDTree radius preflight disagreed with its candidate query")
         return location_indices
 
+    def _cache_key(self, k: int) -> str:
+        return sha256_canonical_json(
+            {
+                "schema": "exact-neighbour-cache-v1",
+                "representation": self.fingerprint,
+                "backend": self.backend,
+                "version": self.backend_version,
+                "k_max": int(k),
+            }
+        )
+
+    def _evict_neighbour_cache(self) -> int:
+        with self._cache_lock:
+            released = int(self.neighbour_cache_bytes)
+            if not self._neighbour_cache:
+                return 0
+            self._neighbour_cache.clear()
+            self._neighbour_cache_key = None
+            self.neighbour_cache_bytes = 0
+            lease = self._neighbour_cache_lease
+            self._neighbour_cache_lease = None
+            self.cache_eviction += 1
+            if lease is not None:
+                lease.close()
+            logger.info("Evicted optional exact neighbour cache: bytes=%d", released)
+            return released
+
     def _store_neighbour_cache(
         self,
         k: int,
         neighbour_indices: np.ndarray,
         neighbour_distances: np.ndarray,
     ) -> None:
-        entry_bytes = int(neighbour_indices.nbytes + neighbour_distances.nbytes + 256)
-        if self.neighbour_cache_bytes + entry_bytes > self.max_neighbour_cache_bytes:
-            logger.debug(
-                "Skipping exact neighbour cache entry: k=%d, entry_bytes=%d, "
-                "cache_bytes=%d, max_neighbour_cache_bytes=%d",
+        entry_bytes = int(neighbour_indices.nbytes + neighbour_distances.nbytes)
+        with self._cache_lock:
+            if entry_bytes > self.max_neighbour_cache_bytes:
+                self.cache_admission_rejected += 1
+                logger.info(
+                    "Rejected optional exact neighbour cache admission: k=%d, "
+                    "cache_bytes=%d, budget_bytes=%d, reason=budget",
+                    k,
+                    entry_bytes,
+                    self.max_neighbour_cache_bytes,
+                )
+                return
+            previous_key = self._neighbour_cache_key
+        try:
+            lease = self.resource_budget.acquire(
+                "optional exact neighbour cache", max(1, entry_bytes)
+            )
+        except ResourceCapacityError:
+            with self._cache_lock:
+                self.cache_admission_rejected += 1
+            logger.info(
+                "Rejected optional exact neighbour cache admission: k=%d, "
+                "cache_bytes=%d, reason=active-resource-pressure",
                 k,
                 entry_bytes,
-                self.neighbour_cache_bytes,
-                self.max_neighbour_cache_bytes,
             )
             return
-        neighbour_indices.setflags(write=False)
-        neighbour_distances.setflags(write=False)
-        self._neighbour_cache[k] = (neighbour_indices, neighbour_distances)
-        self.neighbour_cache_bytes += entry_bytes
+        with self._cache_lock:
+            if self._neighbour_cache_key != previous_key:
+                lease.close()
+                self.cache_admission_rejected += 1
+                logger.info(
+                    "Rejected optional exact neighbour cache admission: k=%d, "
+                    "cache_bytes=%d, reason=concurrent-cache-update",
+                    k,
+                    entry_bytes,
+                )
+                return
+            # Keep one canonical widest result.  A replacement is admitted
+            # while the old entry is still resident; if admission succeeds,
+            # the old lease is released immediately afterward.
+            old_lease = self._neighbour_cache_lease
+            if self._neighbour_cache:
+                self.cache_eviction += 1
+            if old_lease is not None:
+                old_lease.close()
+            neighbour_indices.setflags(write=False)
+            neighbour_distances.setflags(write=False)
+            self._neighbour_cache = {int(k): (neighbour_indices, neighbour_distances)}
+            self._neighbour_cache_key = self._cache_key(k)
+            self._neighbour_cache_lease = lease
+            self.neighbour_cache_bytes = entry_bytes
+            self.cache_peak_bytes = max(self.cache_peak_bytes, entry_bytes)
+            logger.info(
+                "Admitted optional exact neighbour cache: k=%d, cache_bytes=%d, "
+                "cache_budget_bytes=%d",
+                k,
+                entry_bytes,
+                self.max_neighbour_cache_bytes,
+            )
 
-    def _compute_location_neighbours(self, k: int) -> tuple[np.ndarray, np.ndarray]:
-        cached = self._neighbour_cache.get(k)
+    def _cached_neighbour_prefix(self, k: int) -> tuple[np.ndarray, np.ndarray] | None:
+        with self._cache_lock:
+            for cached_k, cached in self._neighbour_cache.items():
+                if cached_k >= k and self._neighbour_cache_key == self._cache_key(cached_k):
+                    self.cache_hit += 1
+                    self.cache_time_saved_seconds += self._last_neighbour_compute_seconds
+                    logger.info(
+                        "Exact neighbour cache hit: requested_k=%d, cached_k=%d, "
+                        "time_saved_seconds=%.6f",
+                        k,
+                        cached_k,
+                        self._last_neighbour_compute_seconds,
+                    )
+                    return cached[0][:, :k], cached[1][:, :k]
+            self.cache_miss += 1
+            logger.info("Exact neighbour cache miss: requested_k=%d", k)
+            return None
+
+    def _compute_location_neighbours(
+        self,
+        k: int,
+        *,
+        chunk_size: int = 1024,
+        checkpoint_store: VersionedCheckpointStore | None = None,
+        checkpoint_name: str = "knn",
+        checkpoint_identity: dict[str, Any] | None = None,
+        checkpoint_every_locations: int = 1,
+        resume: bool = True,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Compute one canonical widest result and derive narrower prefixes."""
+
+        order_k = _validate_k(k)
+        block_size = _validate_chunk_size(chunk_size)
+        cached = self._cached_neighbour_prefix(order_k)
         if cached is not None:
             return cached
         n_locations = self.unique_locations.shape[0]
-        if n_locations - 1 < k:
+        if n_locations - 1 < order_k:
             raise ValueError(
-                f"k={k} requires at least {k} other distinct descriptor locations; "
+                f"k={order_k} requires at least {order_k} other distinct descriptor locations; "
                 f"the pool contains only {n_locations - 1}"
             )
-        neighbour_indices = np.empty((n_locations, k), dtype=np.int64)
-        neighbour_distances = np.empty((n_locations, k), dtype=np.float64)
-        for query_location in range(n_locations):
-            query = self.unique_locations[query_location]
-            # The query point itself is one of the returned points.  The
-            # (k+1)-th tree distance is therefore a conservative kth-other
-            # boundary even when that boundary has many ties.
-            self.index_queries += 1
-            tree_distances, tree_indices = self._tree.query(query, k=k + 1, workers=1)
-            del tree_distances
-            candidate_indices = np.asarray(tree_indices, dtype=np.int64).reshape(-1)
-            non_self = candidate_indices != query_location
-            if not np.any(non_self):
-                raise ValueError(f"k={k} has insufficient distinct neighbours")
-            initial_indices = candidate_indices[non_self]
-            initial_distances = self._distance_values(
-                query,
-                self.unique_locations[initial_indices],
+        started = time.perf_counter()
+        logger.info(
+            "Indexed exact neighbour search started: N=%d, distinct locations=%d, "
+            "k_max=%d, workers=%d, chunk_size=%d",
+            self.descriptors.shape[0],
+            n_locations,
+            order_k,
+            self.worker_count,
+            min(block_size, n_locations),
+        )
+        # The cKDTree calls are vectorized by deterministic location chunk.  A
+        # single call lets SciPy use its bounded internal worker pool; all
+        # exact distance/tie work below is merged in location order.
+        chunk_size = min(block_size, n_locations)
+        neighbour_indices = np.empty((n_locations, order_k), dtype=np.int64)
+        neighbour_distances = np.empty((n_locations, order_k), dtype=np.float64)
+        source_start = 0
+        if checkpoint_store is not None:
+            if checkpoint_identity is None:
+                raise ValueError("kNN checkpoint identity is required")
+            if (
+                isinstance(checkpoint_every_locations, bool)
+                or not isinstance(checkpoint_every_locations, (int, np.integer))
+                or int(checkpoint_every_locations) < 1
+            ):
+                raise ValueError("checkpoint_every_locations must be a positive integer")
+            if not resume:
+                checkpoint_store.clear(checkpoint_name)
+            if resume and checkpoint_store.exists(checkpoint_name):
+                _identity, checkpoint_state, checkpoint_arrays = checkpoint_store.load(
+                    checkpoint_name,
+                    expected_identity=checkpoint_identity,
+                )
+                source_start = int(checkpoint_state.get("cursor", -1))
+                saved_neighbours = checkpoint_arrays.get("neighbour_locations")
+                saved_distances = checkpoint_arrays.get("neighbour_distances")
+                if (
+                    source_start < 0
+                    or source_start > n_locations
+                    or saved_neighbours is None
+                    or saved_distances is None
+                    or saved_neighbours.shape != (source_start, order_k)
+                    or saved_distances.shape != (source_start, order_k)
+                ):
+                    raise CheckpointValidationError(
+                        "kNN checkpoint cursor or arrays are incompatible"
+                    )
+                neighbour_indices[:source_start] = saved_neighbours
+                neighbour_distances[:source_start] = saved_distances
+        next_percent = 1
+        last_log = started
+        start = source_start
+        while start < n_locations:
+            stop = min(start + chunk_size, n_locations)
+            queries = self.unique_locations[start:stop]
+            _tree_distances, tree_indices = self._tree.query(
+                queries,
+                k=order_k + 1,
+                workers=self.worker_count,
             )
-            self.distance_evaluations += int(initial_indices.shape[0])
-            self.unique_distance_evaluations += int(initial_indices.shape[0])
-            kth_boundary = float(np.sort(initial_distances)[k - 1])
-            search_radius = kth_boundary + max(
-                16.0 * float(np.spacing(kth_boundary)),
+            self.index_queries += stop - start
+            del _tree_distances
+            candidate_matrix = np.asarray(tree_indices, dtype=np.int64)
+            if candidate_matrix.ndim == 1:
+                candidate_matrix = candidate_matrix.reshape(stop - start, order_k + 1)
+            initial_distances = np.empty((stop - start, order_k), dtype=np.float64)
+            for offset, query_location in enumerate(range(start, stop)):
+                candidates = candidate_matrix[offset]
+                candidates = candidates[candidates != query_location]
+                if candidates.shape[0] < order_k:
+                    raise ValueError(
+                        f"k={order_k} has insufficient distinct neighbours for location "
+                        f"{query_location}"
+                    )
+                distances = self._distance_values(
+                    self.unique_locations[query_location],
+                    self.unique_locations[candidates[:order_k]],
+                )
+                initial_distances[offset] = distances
+                self.distance_evaluations += int(distances.shape[0])
+                self.unique_distance_evaluations += int(distances.shape[0])
+
+            boundaries = np.max(initial_distances, axis=1)
+            expanded = boundaries + np.maximum(
+                16.0 * np.spacing(boundaries),
                 1.0e-14,
             )
-            boundary_indices = self._query_location_candidates(
-                query,
-                search_radius,
-                source_index=None,
-                context=f"k={k}",
-            )
-            boundary_indices = boundary_indices[boundary_indices != query_location]
-            location_targets = self.unique_locations[boundary_indices]
-            distances = self._distance_values(
-                query,
-                location_targets,
-                max_workspace_bytes=self.max_radius_query_bytes,
-            )
-            self.distance_evaluations += int(boundary_indices.shape[0])
-            self.unique_distance_evaluations += int(boundary_indices.shape[0])
-            positive = distances > 0.0
-            boundary_indices = boundary_indices[positive]
-            distances = distances[positive]
-            if distances.size < k:
-                raise ValueError(
-                    "indexed neighbour boundary query returned fewer candidates than the "
-                    "validated kth distance"
+            self.radius_query_preflights += stop - start
+            try:
+                candidate_counts = np.atleast_1d(
+                    np.asarray(
+                        self._tree.query_ball_point(
+                            queries,
+                            expanded,
+                            return_length=True,
+                            workers=self.worker_count,
+                        ),
+                        dtype=np.int64,
+                    )
                 )
-            order = np.lexsort(
-                (
-                    self.location_representatives[boundary_indices],
-                    distances,
+            except TypeError as exc:
+                raise self._capacity_error(
+                    source_index=None,
+                    radius=float(np.max(boundaries)),
+                    requested_bytes=self.max_radius_query_bytes + 1,
+                    context=(
+                        f"k={order_k}, location_chunk=[{start}:{stop}), "
+                        "SciPy cKDTree does not support vectorized preflight"
+                    ),
+                ) from exc
+            estimates = np.asarray(
+                [
+                    _estimate_radius_workspace_bytes(
+                        int(count),
+                        0,
+                        self.descriptors.shape[1],
+                    )
+                    for count in candidate_counts
+                ],
+                dtype=np.int64,
+            )
+            if np.any(estimates > self.max_radius_query_bytes):
+                offending = int(np.flatnonzero(estimates > self.max_radius_query_bytes)[0])
+                raise self._capacity_error(
+                    source_index=start + offending,
+                    radius=float(boundaries[offending]),
+                    requested_bytes=int(estimates[offending]),
+                    context=f"k={order_k}, location_chunk=[{start}:{stop})",
                 )
-            )[:k]
-            neighbour_indices[query_location] = self.location_representatives[
-                boundary_indices[order]
-            ]
-            neighbour_distances[query_location] = distances[order]
-        self._store_neighbour_cache(k, neighbour_indices, neighbour_distances)
+            total_workspace = int(np.sum(estimates, dtype=np.int64))
+            self.query_workspace_peak_bytes = max(
+                self.query_workspace_peak_bytes,
+                int(np.max(estimates)),
+            )
+            try:
+                with self.resource_budget.acquire(
+                    f"indexed kNN location chunk [{start}:{stop})",
+                    max(1, total_workspace),
+                ):
+                    boundary_lists = np.atleast_1d(
+                        self._tree.query_ball_point(
+                            queries,
+                            expanded,
+                            workers=self.worker_count,
+                        )
+                    )
+            except ResourceCapacityError:
+                if stop - start <= 1:
+                    raise
+                chunk_size = max(1, (stop - start) // 2)
+                logger.info(
+                    "Indexed exact neighbour chunk reduced for memory budget: "
+                    "location_start=%d, new_chunk_size=%d, requested_workspace_bytes=%d",
+                    start,
+                    chunk_size,
+                    total_workspace,
+                )
+                continue
+            self.radius_queries += stop - start
+            for offset, query_location in enumerate(range(start, stop)):
+                boundary_indices = np.asarray(boundary_lists[offset], dtype=np.int64)
+                boundary_indices = boundary_indices[boundary_indices != query_location]
+                distances = self._distance_values(
+                    self.unique_locations[query_location],
+                    self.unique_locations[boundary_indices],
+                    max_workspace_bytes=self.max_radius_query_bytes,
+                )
+                self.distance_evaluations += int(boundary_indices.shape[0])
+                self.unique_distance_evaluations += int(boundary_indices.shape[0])
+                positive = distances > 0.0
+                boundary_indices = boundary_indices[positive]
+                distances = distances[positive]
+                if distances.size < order_k:
+                    raise ValueError(
+                        "indexed neighbour boundary query returned fewer candidates than the "
+                        f"validated kth distance for location {query_location}"
+                    )
+                order = np.lexsort(
+                    (
+                        self.location_representatives[boundary_indices],
+                        distances,
+                    )
+                )[:order_k]
+                neighbour_indices[query_location] = boundary_indices[order]
+                neighbour_distances[query_location] = distances[order]
+
+            if (
+                checkpoint_store is not None
+                and checkpoint_identity is not None
+                and stop % int(checkpoint_every_locations) == 0
+            ):
+                checkpoint_store.write(
+                    checkpoint_name,
+                    identity=checkpoint_identity,
+                    state={"cursor": stop},
+                    arrays={
+                        "neighbour_locations": neighbour_indices[:stop],
+                        "neighbour_distances": neighbour_distances[:stop],
+                    },
+                )
+
+            completed = stop
+            now = time.perf_counter()
+            if (
+                n_locations < 100
+                or completed * 100 >= next_percent * n_locations
+                or now - last_log >= 10.0
+                or completed == n_locations
+            ):
+                elapsed = max(0.0, now - started)
+                rate = completed / elapsed if elapsed > 0.0 else 0.0
+                eta = (n_locations - completed) / rate if rate > 0.0 else 0.0
+                process_metrics = _process_memory_metrics()
+                logger.info(
+                    "Indexed exact neighbour search progress: %d/%d (%.1f%%), "
+                    "throughput=%.2f locations/s, elapsed=%.3fs, estimated remaining=%.3fs, "
+                    "k_max=%d, index_queries=%d, radius_queries=%d, "
+                    "unique_distance_evaluations=%d, index_bytes=%d, "
+                    "query_workspace_peak_bytes=%d, process_peak_rss_bytes=%s",
+                    completed,
+                    n_locations,
+                    100.0 * completed / n_locations,
+                    rate,
+                    elapsed,
+                    max(0.0, eta),
+                    order_k,
+                    self.index_queries,
+                    self.radius_queries,
+                    self.unique_distance_evaluations,
+                    self.index_bytes,
+                    self.query_workspace_peak_bytes,
+                    process_metrics.get("process_peak_rss_bytes"),
+                )
+                last_log = now
+                while next_percent <= 100 and completed * 100 >= next_percent * n_locations:
+                    next_percent += 1
+            start = stop
+
+        if checkpoint_store is not None:
+            checkpoint_store.clear(checkpoint_name)
+            checkpoint_store.clean_stale()
+        neighbour_indices.setflags(write=False)
+        neighbour_distances.setflags(write=False)
+        self._last_neighbour_compute_seconds = max(0.0, time.perf_counter() - started)
+        self._store_neighbour_cache(order_k, neighbour_indices, neighbour_distances)
+        logger.info(
+            "Indexed exact neighbour search completed: %d/%d (100.0%%), k_max=%d, elapsed=%.3fs",
+            n_locations,
+            n_locations,
+            order_k,
+            self._last_neighbour_compute_seconds,
+        )
         return neighbour_indices, neighbour_distances
 
-    def query_neighbours(self, k: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def query_neighbours(
+        self,
+        k: int,
+        *,
+        chunk_size: int = 1024,
+        checkpoint_store: VersionedCheckpointStore | None = None,
+        checkpoint_name: str = "knn",
+        checkpoint_identity: dict[str, Any] | None = None,
+        checkpoint_every_locations: int = 1,
+        resume: bool = True,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Return radii, representative rows, and distances for all rows."""
 
         order_k = _validate_k(k)
-        location_indices, location_distances = self._neighbour_cache.get(order_k, (None, None))
-        if location_indices is None or location_distances is None:
-            location_indices, location_distances = self._compute_location_neighbours(order_k)
+        location_indices, location_distances = self._compute_location_neighbours(
+            order_k,
+            chunk_size=chunk_size,
+            checkpoint_store=checkpoint_store,
+            checkpoint_name=checkpoint_name,
+            checkpoint_identity=checkpoint_identity,
+            checkpoint_every_locations=checkpoint_every_locations,
+            resume=resume,
+        )
         row_locations = self.row_to_location
-        rows = np.asarray(location_indices[row_locations], dtype=np.int64).copy()
+        rows = np.asarray(
+            self.location_representatives[location_indices[row_locations]], dtype=np.int64
+        ).copy()
         distances = np.asarray(location_distances[row_locations], dtype=np.float64).copy()
         radii = distances[:, -1].copy()
         return radii, rows, distances
+
+    def query_neighbours_many(
+        self,
+        ks: Sequence[int],
+        *,
+        chunk_size: int = 1024,
+        checkpoint_store: VersionedCheckpointStore | None = None,
+        checkpoint_name: str = "knn",
+        checkpoint_identity: dict[str, Any] | None = None,
+        checkpoint_every_locations: int = 1,
+        resume: bool = True,
+    ) -> dict[int, tuple[np.ndarray, np.ndarray, np.ndarray]]:
+        """Return exact neighbour prefixes from one canonical ``k_max`` pass."""
+
+        ordered = tuple(_validate_k(value) for value in ks)
+        if not ordered:
+            raise ValueError("ks must contain at least one positive integer")
+        if len(set(ordered)) != len(ordered):
+            raise ValueError("ks must contain unique neighbour orders")
+        maximum = max(ordered)
+        location_indices, location_distances = self._compute_location_neighbours(
+            maximum,
+            chunk_size=chunk_size,
+            checkpoint_store=checkpoint_store,
+            checkpoint_name=checkpoint_name,
+            checkpoint_identity=checkpoint_identity,
+            checkpoint_every_locations=checkpoint_every_locations,
+            resume=resume,
+        )
+        row_locations = self.row_to_location
+        results: dict[int, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
+        for order_k in ordered:
+            prefix_indices = location_indices[:, :order_k]
+            prefix_distances = location_distances[:, :order_k]
+            rows = np.asarray(
+                self.location_representatives[prefix_indices[row_locations]], dtype=np.int64
+            ).copy()
+            distances = np.asarray(prefix_distances[row_locations], dtype=np.float64).copy()
+            results[order_k] = (distances[:, -1].copy(), rows, distances)
+        return results
 
     def radius_support(
         self,
@@ -823,6 +1294,635 @@ class IndexedCPUNeighbourIndex:
     query_radius = radius_support
 
 
+class TiledCPUNeighbourIndex:
+    """Exact, dependency-light tiled CPU neighbour backend.
+
+    This backend deliberately performs the complete calculation.  It uses
+    deterministic source/target tiles and a bounded top-k reduction, so no
+    pairwise ``N x N`` distance matrix is ever allocated.  Unlike the indexed
+    backend it does not rely on a spatial tree or an approximate candidate
+    set; the explicit backend ID therefore remains inspectable in scientific
+    fingerprints and diagnostics.
+    """
+
+    backend = TILED_NEIGHBOUR_BACKEND_ID
+    backend_version = TILED_NEIGHBOUR_BACKEND_VERSION
+    metric = NEIGHBOUR_METRIC
+    distinct_location_policy = NEIGHBOUR_DISTINCT_POLICY
+
+    def __init__(
+        self,
+        descriptors: np.ndarray,
+        *,
+        tile_size: int = 256,
+        max_index_bytes: int | None = None,
+        max_radius_query_bytes: int | None = None,
+        max_neighbour_cache_bytes: int | None = DEFAULT_NEIGHBOUR_CACHE_BYTES,
+        resource_budget: ResourceBudgetService | None = None,
+    ) -> None:
+        values = _validate_descriptors(descriptors)
+        tile = _validate_chunk_size(tile_size)
+        service = resource_budget or build_resource_budget()
+        remaining = service.remaining_managed_budget
+        if remaining is None:
+            raise ResourceCapacityError(
+                service.unknown_memory_message("tiled neighbour construction"),
+                operation="tiled neighbour construction",
+            )
+        explicit_limit = (
+            None
+            if max_index_bytes is None
+            else _validate_memory_limit(max_index_bytes, "max_index_bytes")
+        )
+        temporary_peak_bytes = int(
+            2 * values.nbytes + 48 * values.shape[0] * np.dtype(np.int64).itemsize + 8192
+        )
+        if temporary_peak_bytes > remaining:
+            raise ResourceCapacityError(
+                "tiled exact neighbour grouping exceeds its runtime memory allowance: "
+                f"N={values.shape[0]}, d'={values.shape[1]}, "
+                f"estimated_peak_bytes={temporary_peak_bytes}, available_bytes={remaining}",
+                operation="tiled neighbour construction",
+                requested_bytes=temporary_peak_bytes,
+                available_bytes=remaining,
+                reserved_headroom_bytes=service.budget.reserved_headroom_bytes,
+            )
+        locations, first_indices, row_to_location = np.unique(
+            values,
+            axis=0,
+            return_index=True,
+            return_inverse=True,
+        )
+        self.resource_budget = service
+        self.descriptors = values
+        self.unique_locations = np.ascontiguousarray(locations, dtype=np.float64)
+        self.location_representatives = np.asarray(first_indices, dtype=np.int64)
+        self.row_to_location = np.asarray(row_to_location, dtype=np.int64)
+        location_count = int(self.unique_locations.shape[0])
+        self.rows_by_location = np.asarray(
+            np.argsort(self.row_to_location, kind="stable"), dtype=np.int64
+        )
+        location_counts = np.bincount(self.row_to_location, minlength=location_count).astype(
+            np.int64, copy=False
+        )
+        self.location_indptr = np.empty(location_count + 1, dtype=np.int64)
+        self.location_indptr[0] = 0
+        np.cumsum(location_counts, dtype=np.int64, out=self.location_indptr[1:])
+        self.rows_by_location.setflags(write=False)
+        self.location_indptr.setflags(write=False)
+        self.tile_size = tile
+        self.grouping_bytes = int(self.rows_by_location.nbytes + self.location_indptr.nbytes)
+        self.index_bytes = int(
+            self.unique_locations.nbytes
+            + self.location_representatives.nbytes
+            + self.row_to_location.nbytes
+            + self.grouping_bytes
+            + 4096
+        )
+        effective_limit = remaining if explicit_limit is None else min(explicit_limit, remaining)
+        if self.index_bytes > effective_limit:
+            message = (
+                "tiled exact neighbour backend exceeds max_index_bytes"
+                if explicit_limit is not None and self.index_bytes > explicit_limit
+                else "tiled exact neighbour backend exceeds its runtime memory allowance"
+            )
+            raise ResourceCapacityError(
+                f"{message}: N={values.shape[0]}, Q={location_count}, "
+                f"estimated_bytes={self.index_bytes}, available_bytes={effective_limit}",
+                operation="tiled neighbour construction",
+                requested_bytes=self.index_bytes,
+                available_bytes=remaining,
+                reserved_headroom_bytes=service.budget.reserved_headroom_bytes,
+            )
+        self.max_radius_query_bytes = (
+            max(1, remaining // 2)
+            if max_radius_query_bytes is None
+            else min(
+                _validate_memory_limit(max_radius_query_bytes, "max_radius_query_bytes"),
+                remaining,
+            )
+        )
+        self.max_neighbour_cache_bytes = _resolve_neighbour_cache_budget(
+            remaining_bytes=remaining,
+            index_bytes=self.index_bytes,
+            radius_query_bytes=self.max_radius_query_bytes,
+            user_cap=max_neighbour_cache_bytes,
+        )
+        self.cache_budget_bytes = int(self.max_neighbour_cache_bytes)
+        self.index_queries = 0
+        self.radius_queries = 0
+        self.radius_query_preflights = 0
+        self.distance_evaluations = 0
+        self.unique_distance_evaluations = 0
+        self.atomic_distance_evaluations = 0
+        self.current_support_count = 0
+        self.min_support_count: int | None = None
+        self.support_count_total = 0
+        self.support_count_samples = 0
+        self.max_support_count = 0
+        self.query_workspace_peak_bytes = 0
+        self._neighbour_cache: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+        self._neighbour_cache_lease: Any | None = None
+        self._neighbour_cache_key: str | None = None
+        self._cache_lock = threading.RLock()
+        self.neighbour_cache_bytes = 0
+        self.cache_hit = 0
+        self.cache_miss = 0
+        self.cache_eviction = 0
+        self.cache_admission_rejected = 0
+        self.cache_peak_bytes = 0
+        self.cache_time_saved_seconds = 0.0
+        self._last_neighbour_compute_seconds = 0.0
+        self.fingerprint = sha256_canonical_json(
+            {
+                "backend": self.backend,
+                "version": self.backend_version,
+                "metric": self.metric,
+                "distinct_location_policy": self.distinct_location_policy,
+                "tie_policy": "distance-then-earliest-original-representative-v1",
+                "radius_policy": "strict-float64-euclidean-less-than-v1",
+                "tile_size": self.tile_size,
+                "locations": _array_fingerprint(self.unique_locations),
+                "row_to_location": _array_fingerprint(self.row_to_location),
+            }
+        )
+        owner = weakref.ref(self)
+
+        def evict() -> int:
+            instance = owner()
+            return 0 if instance is None else instance._evict_neighbour_cache()
+
+        self._cache_eviction_token = service.register_optional_eviction(evict)
+
+    def close(self) -> None:
+        """Release optional cache bytes and its runtime-budget registration."""
+
+        self.resource_budget.unregister_optional_eviction(self._cache_eviction_token)
+        self._evict_neighbour_cache()
+
+    def __del__(self) -> None:  # pragma: no cover - best-effort lifecycle cleanup
+        try:
+            self.close()
+        except Exception:
+            pass
+
+    @property
+    def worker_count(self) -> int:
+        configured = self.resource_budget.budget.worker_cap
+        available = os.cpu_count() or 1
+        return max(1, available if configured is None else min(int(configured), available))
+
+    def memory_metrics(self) -> dict[str, int | float | None]:
+        return {
+            "support_cache_bytes": 0,
+            "support_cache_peak_bytes": 0,
+            "neighbour_cache_bytes": int(self.neighbour_cache_bytes),
+            "cache_bytes": int(self.neighbour_cache_bytes),
+            "cache_peak_bytes": int(self.cache_peak_bytes),
+            "cache_hit": int(self.cache_hit),
+            "cache_miss": int(self.cache_miss),
+            "cache_eviction": int(self.cache_eviction),
+            "cache_admission_rejected": int(self.cache_admission_rejected),
+            "cache_time_saved_seconds": float(self.cache_time_saved_seconds),
+            "cache_budget_bytes": int(self.cache_budget_bytes),
+            "index_bytes": self.index_bytes,
+            "worker_count": self.worker_count,
+            "grouping_bytes": self.grouping_bytes,
+            "grouping_build_seconds": 0.0,
+            "tree_build_seconds": 0.0,
+            "query_workspace_peak_bytes": self.query_workspace_peak_bytes,
+            "current_support_count": self.current_support_count,
+            "min_support_count": self.min_support_count,
+            "mean_support_count": (
+                self.support_count_total / self.support_count_samples
+                if self.support_count_samples
+                else None
+            ),
+            "max_support_count": self.max_support_count,
+            "pilot_support_queries": 0,
+            "pilot_support_count_total": 0,
+            "pilot_support_samples": 0,
+            "index_queries": self.index_queries,
+            "radius_queries": self.radius_queries,
+            "radius_query_preflights": self.radius_query_preflights,
+            "distance_evaluations": self.distance_evaluations,
+            "unique_distance_evaluations": self.unique_distance_evaluations,
+            "atomic_distance_evaluations": self.atomic_distance_evaluations,
+            **_process_memory_metrics(),
+        }
+
+    def _distance_values(self, query: np.ndarray, targets: np.ndarray) -> np.ndarray:
+        count = int(targets.shape[0])
+        if count == 0:
+            return np.empty(0, dtype=np.float64)
+        bytes_per_target = max(64, 32 * int(targets.shape[1]) + 64)
+        tile = max(1, min(count, (self.max_radius_query_bytes - 256) // bytes_per_target))
+        distances = np.empty(count, dtype=np.float64)
+        self.query_workspace_peak_bytes = max(
+            self.query_workspace_peak_bytes,
+            int(tile * bytes_per_target + 256),
+        )
+        with np.errstate(over="raise", invalid="raise"):
+            try:
+                for start in range(0, count, tile):
+                    stop = min(start + tile, count)
+                    with self.resource_budget.acquire(
+                        "tiled exact neighbour distance tile",
+                        max(1, int((stop - start) * bytes_per_target + 256)),
+                    ):
+                        delta = targets[start:stop] - query
+                        distances[start:stop] = np.sqrt(
+                            np.sum(delta * delta, axis=1, dtype=np.float64)
+                        )
+            except FloatingPointError as exc:
+                raise ValueError("tiled neighbour distance overflowed or became invalid") from exc
+        if not np.all(np.isfinite(distances)):
+            raise ValueError("tiled neighbour distances must be finite")
+        return distances
+
+    def _cache_key(self, k: int) -> str:
+        return sha256_canonical_json(
+            {
+                "schema": "exact-neighbour-cache-v1",
+                "representation": self.fingerprint,
+                "backend": self.backend,
+                "version": self.backend_version,
+                "k_max": int(k),
+            }
+        )
+
+    def _evict_neighbour_cache(self) -> int:
+        with self._cache_lock:
+            released = int(self.neighbour_cache_bytes)
+            if not self._neighbour_cache:
+                return 0
+            self._neighbour_cache.clear()
+            self._neighbour_cache_key = None
+            self.neighbour_cache_bytes = 0
+            lease = self._neighbour_cache_lease
+            self._neighbour_cache_lease = None
+            self.cache_eviction += 1
+            if lease is not None:
+                lease.close()
+            logger.info("Evicted optional exact neighbour cache: bytes=%d", released)
+            return released
+
+    def _store_neighbour_cache(
+        self,
+        k: int,
+        neighbour_indices: np.ndarray,
+        neighbour_distances: np.ndarray,
+    ) -> None:
+        entry_bytes = int(neighbour_indices.nbytes + neighbour_distances.nbytes)
+        with self._cache_lock:
+            if entry_bytes > self.max_neighbour_cache_bytes:
+                self.cache_admission_rejected += 1
+                logger.info(
+                    "Rejected optional exact neighbour cache admission: k=%d, "
+                    "cache_bytes=%d, budget_bytes=%d, reason=budget",
+                    k,
+                    entry_bytes,
+                    self.max_neighbour_cache_bytes,
+                )
+                return
+            previous_key = self._neighbour_cache_key
+        try:
+            lease = self.resource_budget.acquire(
+                "optional exact neighbour cache", max(1, entry_bytes)
+            )
+        except ResourceCapacityError:
+            with self._cache_lock:
+                self.cache_admission_rejected += 1
+            logger.info(
+                "Rejected optional exact neighbour cache admission: k=%d, "
+                "cache_bytes=%d, reason=active-resource-pressure",
+                k,
+                entry_bytes,
+            )
+            return
+        with self._cache_lock:
+            if self._neighbour_cache_key != previous_key:
+                lease.close()
+                self.cache_admission_rejected += 1
+                logger.info(
+                    "Rejected optional exact neighbour cache admission: k=%d, "
+                    "cache_bytes=%d, reason=concurrent-cache-update",
+                    k,
+                    entry_bytes,
+                )
+                return
+            old_lease = self._neighbour_cache_lease
+            if self._neighbour_cache:
+                self.cache_eviction += 1
+            if old_lease is not None:
+                old_lease.close()
+            neighbour_indices.setflags(write=False)
+            neighbour_distances.setflags(write=False)
+            self._neighbour_cache = {int(k): (neighbour_indices, neighbour_distances)}
+            self._neighbour_cache_key = self._cache_key(k)
+            self._neighbour_cache_lease = lease
+            self.neighbour_cache_bytes = entry_bytes
+            self.cache_peak_bytes = max(self.cache_peak_bytes, entry_bytes)
+            logger.info(
+                "Admitted optional exact neighbour cache: k=%d, cache_bytes=%d, "
+                "cache_budget_bytes=%d",
+                k,
+                entry_bytes,
+                self.max_neighbour_cache_bytes,
+            )
+
+    def _cached_neighbour_prefix(self, k: int) -> tuple[np.ndarray, np.ndarray] | None:
+        with self._cache_lock:
+            for cached_k, cached in self._neighbour_cache.items():
+                if cached_k >= k and self._neighbour_cache_key == self._cache_key(cached_k):
+                    self.cache_hit += 1
+                    self.cache_time_saved_seconds += self._last_neighbour_compute_seconds
+                    logger.info(
+                        "Exact neighbour cache hit: requested_k=%d, cached_k=%d, "
+                        "time_saved_seconds=%.6f",
+                        k,
+                        cached_k,
+                        self._last_neighbour_compute_seconds,
+                    )
+                    return cached[0][:, :k], cached[1][:, :k]
+            self.cache_miss += 1
+            logger.info("Exact neighbour cache miss: requested_k=%d", k)
+            return None
+
+    def _compute_location_neighbours(
+        self,
+        k: int,
+        *,
+        chunk_size: int = 1024,
+        checkpoint_store: VersionedCheckpointStore | None = None,
+        checkpoint_name: str = "knn",
+        checkpoint_identity: dict[str, Any] | None = None,
+        checkpoint_every_locations: int = 1,
+        resume: bool = True,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        order_k = _validate_k(k)
+        _validate_chunk_size(chunk_size)
+        cached = self._cached_neighbour_prefix(order_k)
+        if cached is not None:
+            return cached
+        n_locations = int(self.unique_locations.shape[0])
+        if n_locations - 1 < order_k:
+            raise ValueError(
+                f"k={order_k} requires at least {order_k} other distinct descriptor locations; "
+                f"the pool contains only {n_locations - 1}"
+            )
+        started = time.perf_counter()
+        neighbours = np.empty((n_locations, order_k), dtype=np.int64)
+        distances_out = np.empty((n_locations, order_k), dtype=np.float64)
+        source_start = 0
+        if checkpoint_store is not None:
+            if checkpoint_identity is None:
+                raise ValueError("kNN checkpoint identity is required")
+            if (
+                isinstance(checkpoint_every_locations, bool)
+                or not isinstance(checkpoint_every_locations, (int, np.integer))
+                or int(checkpoint_every_locations) < 1
+            ):
+                raise ValueError("checkpoint_every_locations must be a positive integer")
+            if not resume:
+                checkpoint_store.clear(checkpoint_name)
+            if resume and checkpoint_store.exists(checkpoint_name):
+                _identity, checkpoint_state, checkpoint_arrays = checkpoint_store.load(
+                    checkpoint_name,
+                    expected_identity=checkpoint_identity,
+                )
+                source_start = int(checkpoint_state.get("cursor", -1))
+                saved_neighbours = checkpoint_arrays.get("neighbour_locations")
+                saved_distances = checkpoint_arrays.get("neighbour_distances")
+                if (
+                    source_start < 0
+                    or source_start > n_locations
+                    or saved_neighbours is None
+                    or saved_distances is None
+                    or saved_neighbours.shape != (source_start, order_k)
+                    or saved_distances.shape != (source_start, order_k)
+                ):
+                    raise CheckpointValidationError(
+                        "kNN checkpoint cursor or arrays are incompatible"
+                    )
+                neighbours[:source_start] = saved_neighbours
+                distances_out[:source_start] = saved_distances
+        target_tile = max(
+            1,
+            min(self.tile_size, _validate_chunk_size(chunk_size), n_locations),
+        )
+        logger.info(
+            "Tiled exact neighbour search started: N=%d, distinct locations=%d, k=%d, "
+            "target_tile=%d, worker_cap=%d",
+            self.descriptors.shape[0],
+            n_locations,
+            order_k,
+            target_tile,
+            self.worker_count,
+        )
+        for source_location in range(source_start, n_locations):
+            best_distances = np.empty(0, dtype=np.float64)
+            best_locations = np.empty(0, dtype=np.int64)
+            query = self.unique_locations[source_location]
+            for start in range(0, n_locations, target_tile):
+                stop = min(start + target_tile, n_locations)
+                candidates = np.arange(start, stop, dtype=np.int64)
+                candidates = candidates[candidates != source_location]
+                if candidates.size == 0:
+                    continue
+                distances = self._distance_values(query, self.unique_locations[candidates])
+                self.distance_evaluations += int(candidates.size)
+                self.unique_distance_evaluations += int(candidates.size)
+                combined_locations = np.concatenate((best_locations, candidates))
+                combined_distances = np.concatenate((best_distances, distances))
+                order = np.lexsort(
+                    (
+                        self.location_representatives[combined_locations],
+                        combined_distances,
+                    )
+                )[:order_k]
+                best_locations = combined_locations[order]
+                best_distances = combined_distances[order]
+            if best_locations.size != order_k:
+                raise RuntimeError("tiled exact neighbour reduction returned an incomplete row")
+            neighbours[source_location] = best_locations
+            distances_out[source_location] = best_distances
+            self.index_queries += 1
+            if (
+                checkpoint_store is not None
+                and checkpoint_identity is not None
+                and (source_location + 1) % int(checkpoint_every_locations) == 0
+            ):
+                checkpoint_store.write(
+                    checkpoint_name,
+                    identity=checkpoint_identity,
+                    state={"cursor": source_location + 1},
+                    arrays={
+                        "neighbour_locations": neighbours[: source_location + 1],
+                        "neighbour_distances": distances_out[: source_location + 1],
+                    },
+                )
+        if checkpoint_store is not None:
+            checkpoint_store.clear(checkpoint_name)
+            checkpoint_store.clean_stale()
+        neighbours.setflags(write=False)
+        distances_out.setflags(write=False)
+        self._last_neighbour_compute_seconds = max(0.0, time.perf_counter() - started)
+        self._store_neighbour_cache(order_k, neighbours, distances_out)
+        logger.info(
+            "Tiled exact neighbour search completed: %d/%d (100.0%%), k_max=%d, elapsed=%.3fs",
+            n_locations,
+            n_locations,
+            order_k,
+            self._last_neighbour_compute_seconds,
+        )
+        return neighbours, distances_out
+
+    def query_neighbours(
+        self,
+        k: int,
+        *,
+        chunk_size: int = 1024,
+        checkpoint_store: VersionedCheckpointStore | None = None,
+        checkpoint_name: str = "knn",
+        checkpoint_identity: dict[str, Any] | None = None,
+        checkpoint_every_locations: int = 1,
+        resume: bool = True,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        location_indices, location_distances = self._compute_location_neighbours(
+            k,
+            chunk_size=chunk_size,
+            checkpoint_store=checkpoint_store,
+            checkpoint_name=checkpoint_name,
+            checkpoint_identity=checkpoint_identity,
+            checkpoint_every_locations=checkpoint_every_locations,
+            resume=resume,
+        )
+        rows = np.asarray(
+            self.location_representatives[location_indices[self.row_to_location]], dtype=np.int64
+        )
+        distances = np.asarray(location_distances[self.row_to_location], dtype=np.float64)
+        return distances[:, -1].copy(), rows.copy(), distances.copy()
+
+    def query_neighbours_many(
+        self,
+        ks: Sequence[int],
+        *,
+        chunk_size: int = 1024,
+        checkpoint_store: VersionedCheckpointStore | None = None,
+        checkpoint_name: str = "knn",
+        checkpoint_identity: dict[str, Any] | None = None,
+        checkpoint_every_locations: int = 1,
+        resume: bool = True,
+    ) -> dict[int, tuple[np.ndarray, np.ndarray, np.ndarray]]:
+        ordered = tuple(_validate_k(value) for value in ks)
+        if not ordered or len(set(ordered)) != len(ordered):
+            raise ValueError("ks must contain unique positive neighbour orders")
+        location_indices, location_distances = self._compute_location_neighbours(
+            max(ordered),
+            chunk_size=chunk_size,
+            checkpoint_store=checkpoint_store,
+            checkpoint_name=checkpoint_name,
+            checkpoint_identity=checkpoint_identity,
+            checkpoint_every_locations=checkpoint_every_locations,
+            resume=resume,
+        )
+        results: dict[int, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
+        for order_k in ordered:
+            distances = np.asarray(
+                location_distances[self.row_to_location, :order_k], dtype=np.float64
+            )
+            rows = np.asarray(
+                self.location_representatives[location_indices[self.row_to_location, :order_k]],
+                dtype=np.int64,
+            )
+            results[order_k] = (distances[:, -1].copy(), rows.copy(), distances.copy())
+        return results
+
+    def radius_support(
+        self, source_index: int, radius: float, *, context: str | None = None
+    ) -> tuple[np.ndarray, np.ndarray]:
+        if isinstance(source_index, bool) or not isinstance(source_index, (int, np.integer)):
+            raise ValueError("source_index must be a non-negative integer")
+        source = int(source_index)
+        if source < 0 or source >= self.descriptors.shape[0]:
+            raise IndexError("source_index is outside the descriptor rows")
+        value = float(radius)
+        if not np.isfinite(value) or value <= 0.0:
+            raise ValueError("radius must be finite and positive")
+        self.radius_queries += 1
+        self.radius_query_preflights += 1
+        source_location = int(self.row_to_location[source])
+        included_locations: list[int] = []
+        included_distances: list[float] = []
+        for start in range(0, self.unique_locations.shape[0], self.tile_size):
+            stop = min(start + self.tile_size, self.unique_locations.shape[0])
+            locations = np.arange(start, stop, dtype=np.int64)
+            distances = self._distance_values(
+                self.unique_locations[source_location], self.unique_locations[start:stop]
+            )
+            self.distance_evaluations += int(locations.size)
+            self.unique_distance_evaluations += int(locations.size)
+            selected = distances < value
+            included_locations.extend(int(item) for item in locations[selected])
+            included_distances.extend(float(item) for item in distances[selected])
+        if not included_locations:
+            raise ValueError("positive kernel radius support omitted the source row")
+        support_count = sum(
+            int(self.location_indptr[location + 1] - self.location_indptr[location])
+            for location in included_locations
+        )
+        estimated_bytes = _estimate_radius_workspace_bytes(
+            len(included_locations),
+            support_count,
+            self.descriptors.shape[1],
+            self.descriptors.shape[0],
+        )
+        self.query_workspace_peak_bytes = max(self.query_workspace_peak_bytes, estimated_bytes)
+        if estimated_bytes > self.max_radius_query_bytes:
+            detail = (
+                f"N={self.descriptors.shape[0]}, d'={self.descriptors.shape[1]}, "
+                f"source_row={source}, radius={value}, requested_bytes={estimated_bytes}, "
+                f"max_radius_query_bytes={self.max_radius_query_bytes}"
+            )
+            if context:
+                detail += f", {context}"
+            raise RadiusQueryCapacityError(
+                "exact tiled radius query exceeds memory capacity: " + detail
+            )
+        rows: list[int] = []
+        row_distances: list[float] = []
+        for location, distance in zip(included_locations, included_distances, strict=True):
+            start = int(self.location_indptr[location])
+            stop = int(self.location_indptr[location + 1])
+            rows.extend(int(item) for item in self.rows_by_location[start:stop])
+            row_distances.extend([distance] * (stop - start))
+        order = np.argsort(np.asarray(rows, dtype=np.int64), kind="stable")
+        target_indices = np.asarray(rows, dtype=np.int64)[order]
+        target_distances = np.asarray(row_distances, dtype=np.float64)[order]
+        self.atomic_distance_evaluations += int(target_indices.size)
+        self.current_support_count = int(target_indices.size)
+        self.min_support_count = (
+            self.current_support_count
+            if self.min_support_count is None
+            else min(self.min_support_count, self.current_support_count)
+        )
+        self.support_count_total += self.current_support_count
+        self.support_count_samples += 1
+        self.max_support_count = max(self.max_support_count, self.current_support_count)
+        if not np.any(target_indices == source):
+            raise ValueError("positive kernel radius support omitted the source row")
+        if context:
+            logger.debug("Tiled radius support completed: %s", context)
+        target_indices.setflags(write=False)
+        target_distances.setflags(write=False)
+        return target_indices, target_distances
+
+    query_radius_support = radius_support
+    exact_radius_support = radius_support
+    query_radius = radius_support
+
+
 def _top_k(
     best_distances: np.ndarray,
     best_representatives: np.ndarray,
@@ -849,6 +1949,10 @@ def compute_exact_neighbours(
     row_ids: Sequence[str] | None = None,
     max_neighbour_entries: int | None = None,
     resource_budget: ResourceBudgetService | None = None,
+    checkpoint_path: str | os.PathLike[str] | None = None,
+    checkpoint_name: str = "knn",
+    checkpoint_every_locations: int = 1,
+    resume: bool = True,
 ) -> ExactNeighbourResult:
     """Calculate exact kth-neighbour radii without an ``N x N`` allocation.
 
@@ -924,6 +2028,54 @@ def compute_exact_neighbours(
     radii = np.empty(n_rows, dtype=np.float64)
     neighbour_indices = np.empty((n_rows, order_k), dtype=np.int64)
     neighbour_distances = np.empty((n_rows, order_k), dtype=np.float64)
+    checkpoint_store = (
+        None if checkpoint_path is None else VersionedCheckpointStore(checkpoint_path)
+    )
+    checkpoint_identity = {
+        "phase": "exact-knn",
+        "schema": "exact-knn-checkpoint-v1",
+        "backend": NEIGHBOUR_BACKEND_ID,
+        "backend_version": NEIGHBOUR_BACKEND_VERSION,
+        "descriptors": _array_fingerprint(values),
+        "row_ids": list(ordered_row_ids),
+        "unique_locations": _array_fingerprint(locations),
+        "row_to_location": _array_fingerprint(row_to_location),
+        "k": order_k,
+        "tie_policy": "distance-then-earliest-original-representative-v1",
+    }
+    query_start = 0
+    if checkpoint_store is not None:
+        if (
+            isinstance(checkpoint_every_locations, bool)
+            or not isinstance(checkpoint_every_locations, (int, np.integer))
+            or int(checkpoint_every_locations) < 1
+        ):
+            raise ValueError("checkpoint_every_locations must be a positive integer")
+        if not resume:
+            checkpoint_store.clear(checkpoint_name)
+        if resume and checkpoint_store.exists(checkpoint_name):
+            _identity, checkpoint_state, checkpoint_arrays = checkpoint_store.load(
+                checkpoint_name,
+                expected_identity=checkpoint_identity,
+            )
+            query_start = int(checkpoint_state.get("cursor", -1))
+            saved_radii = checkpoint_arrays.get("radii")
+            saved_indices = checkpoint_arrays.get("neighbour_indices")
+            saved_distances = checkpoint_arrays.get("neighbour_distances")
+            if (
+                query_start < 0
+                or query_start > n_rows
+                or saved_radii is None
+                or saved_indices is None
+                or saved_distances is None
+                or saved_radii.shape != (query_start,)
+                or saved_indices.shape != (query_start, order_k)
+                or saved_distances.shape != (query_start, order_k)
+            ):
+                raise CheckpointValidationError("kNN checkpoint cursor or arrays are incompatible")
+            radii[:query_start] = saved_radii
+            neighbour_indices[:query_start] = saved_indices
+            neighbour_distances[:query_start] = saved_distances
     next_percent = 1
 
     def report_query_progress(completed: int) -> None:
@@ -951,7 +2103,7 @@ def compute_exact_neighbours(
             while next_percent <= 100 and completed * 100 >= next_percent * n_rows:
                 next_percent += 1
 
-    for query_index in range(n_rows):
+    for query_index in range(query_start, n_rows):
         logger.debug("Exact neighbour query %d/%d started", query_index + 1, n_rows)
         query_location = int(row_to_location[query_index])
         query = values[query_index]
@@ -1000,8 +2152,25 @@ def compute_exact_neighbours(
         neighbour_distances[query_index] = best_distances
         logger.debug("Exact neighbour query %d/%d completed", query_index + 1, n_rows)
         report_query_progress(query_index + 1)
+        if (
+            checkpoint_store is not None
+            and (query_index + 1) % int(checkpoint_every_locations) == 0
+        ):
+            checkpoint_store.write(
+                checkpoint_name,
+                identity=checkpoint_identity,
+                state={"cursor": query_index + 1},
+                arrays={
+                    "radii": radii[: query_index + 1],
+                    "neighbour_indices": neighbour_indices[: query_index + 1],
+                    "neighbour_distances": neighbour_distances[: query_index + 1],
+                },
+            )
     if not np.all(np.isfinite(radii)) or np.any(radii <= 0.0):
         raise ValueError("exact kth-neighbour radii must be finite and positive")
+    if checkpoint_store is not None:
+        checkpoint_store.clear(checkpoint_name)
+        checkpoint_store.clean_stale()
 
     elapsed = max(0.0, time.perf_counter() - started)
     logger.info(
@@ -1056,7 +2225,12 @@ def compute_indexed_cpu_neighbours(
     representation_fingerprint: str | None = None,
     row_ids: Sequence[str] | None = None,
     max_neighbour_entries: int | None = None,
+    max_neighbour_cache_bytes: int | None = DEFAULT_NEIGHBOUR_CACHE_BYTES,
     resource_budget: ResourceBudgetService | None = None,
+    checkpoint_path: str | os.PathLike[str] | None = None,
+    checkpoint_name: str = "knn",
+    checkpoint_every_locations: int = 1,
+    resume: bool = True,
 ) -> ExactNeighbourResult:
     """Calculate exact kth other-location neighbours through the indexed CPU backend."""
 
@@ -1069,25 +2243,23 @@ def compute_indexed_cpu_neighbours(
         or int(max_neighbour_entries) < 1
     ):
         raise ValueError("max_neighbour_entries must be a positive integer when provided")
-    if max_neighbour_entries is not None and values.shape[0] * order_k > int(
-        max_neighbour_entries
-    ):
+    if max_neighbour_entries is not None and values.shape[0] * order_k > int(max_neighbour_entries):
         raise ValueError(
             "indexed exact neighbour result exceeds its explicit bounded-memory limit: "
             f"N={values.shape[0]}, required_entries={values.shape[0] * order_k}, "
             f"max_entries={int(max_neighbour_entries)}"
         )
-    active_index = (
-        index
-        if index is not None
-        else IndexedCPUNeighbourIndex(values, resource_budget=resource_budget)
+    active_index = index or IndexedCPUNeighbourIndex(
+        values,
+        max_neighbour_cache_bytes=max_neighbour_cache_bytes,
+        resource_budget=resource_budget,
     )
+    if not isinstance(active_index, IndexedCPUNeighbourIndex):
+        raise ValueError("indexed neighbour calculation requires an indexed CPU backend")
     if not np.array_equal(active_index.descriptors, values):
         raise ValueError("indexed neighbour index belongs to different descriptors")
     service = (
-        resource_budget
-        or getattr(active_index, "resource_budget", None)
-        or build_resource_budget()
+        resource_budget or getattr(active_index, "resource_budget", None) or build_resource_budget()
     )
     remaining = service.remaining_managed_budget
     if remaining is None:
@@ -1107,7 +2279,30 @@ def compute_indexed_cpu_neighbours(
             reserved_headroom_bytes=service.budget.reserved_headroom_bytes,
         )
     ordered_row_ids = _validate_row_ids(row_ids, values.shape[0])
-    radii, neighbour_indices, neighbour_distances = active_index.query_neighbours(order_k)
+    checkpoint_store = (
+        None if checkpoint_path is None else VersionedCheckpointStore(checkpoint_path)
+    )
+    checkpoint_identity = {
+        "phase": "exact-knn",
+        "schema": "exact-knn-checkpoint-v1",
+        "backend": INDEXED_NEIGHBOUR_BACKEND_ID,
+        "backend_version": INDEXED_NEIGHBOUR_BACKEND_VERSION,
+        "descriptors": _array_fingerprint(values),
+        "row_ids": list(ordered_row_ids),
+        "unique_locations": _array_fingerprint(active_index.unique_locations),
+        "row_to_location": _array_fingerprint(active_index.row_to_location),
+        "k": order_k,
+        "tie_policy": "distance-then-earliest-original-representative-v1",
+    }
+    radii, neighbour_indices, neighbour_distances = active_index.query_neighbours(
+        order_k,
+        chunk_size=chunk_size,
+        checkpoint_store=checkpoint_store,
+        checkpoint_name=checkpoint_name,
+        checkpoint_identity=checkpoint_identity,
+        checkpoint_every_locations=checkpoint_every_locations,
+        resume=resume,
+    )
     representation_id = (
         _array_fingerprint(values)
         if representation_fingerprint is None
@@ -1145,14 +2340,407 @@ def compute_indexed_cpu_neighbours(
     )
 
 
+def compute_indexed_cpu_neighbours_many(
+    descriptors: np.ndarray,
+    ks: Sequence[int],
+    *,
+    index: IndexedCPUNeighbourIndex | None = None,
+    chunk_size: int = 1024,
+    representation_fingerprint: str | None = None,
+    row_ids: Sequence[str] | None = None,
+    max_neighbour_entries: int | None = None,
+    max_neighbour_cache_bytes: int | None = DEFAULT_NEIGHBOUR_CACHE_BYTES,
+    resource_budget: ResourceBudgetService | None = None,
+    checkpoint_path: str | os.PathLike[str] | None = None,
+    checkpoint_name: str = "knn",
+    checkpoint_every_locations: int = 1,
+    resume: bool = True,
+) -> dict[int, ExactNeighbourResult]:
+    """Calculate several indexed neighbour orders from one ``k_max`` pass."""
+
+    values = _validate_descriptors(descriptors)
+    ordered = tuple(_validate_k(value) for value in ks)
+    if not ordered:
+        raise ValueError("ks must contain at least one positive integer")
+    if len(set(ordered)) != len(ordered):
+        raise ValueError("ks must contain unique neighbour orders")
+    _validate_chunk_size(chunk_size)
+    if max_neighbour_entries is not None and (
+        isinstance(max_neighbour_entries, bool)
+        or not isinstance(max_neighbour_entries, (int, np.integer))
+        or int(max_neighbour_entries) < 1
+    ):
+        raise ValueError("max_neighbour_entries must be a positive integer when provided")
+    maximum = max(ordered)
+    if max_neighbour_entries is not None and values.shape[0] * maximum > int(max_neighbour_entries):
+        raise ValueError(
+            "indexed exact neighbour result exceeds its explicit bounded-memory limit: "
+            f"N={values.shape[0]}, required_entries={values.shape[0] * maximum}, "
+            f"max_entries={int(max_neighbour_entries)}"
+        )
+    active_index = index or IndexedCPUNeighbourIndex(
+        values,
+        max_neighbour_cache_bytes=max_neighbour_cache_bytes,
+        resource_budget=resource_budget,
+    )
+    if not isinstance(active_index, IndexedCPUNeighbourIndex):
+        raise ValueError("indexed neighbour calculation requires an indexed CPU backend")
+    if not np.array_equal(active_index.descriptors, values):
+        raise ValueError("indexed neighbour index belongs to different descriptors")
+    service = (
+        resource_budget or getattr(active_index, "resource_budget", None) or build_resource_budget()
+    )
+    remaining = service.remaining_managed_budget
+    if remaining is None:
+        raise ResourceCapacityError(
+            service.unknown_memory_message("indexed neighbour calculation"),
+            operation="indexed neighbour calculation",
+        )
+    requested_bytes = int(16 * values.shape[0] * maximum + 128 * values.shape[0])
+    if requested_bytes > remaining:
+        raise ResourceCapacityError(
+            "indexed neighbour result exceeds its runtime memory allowance: "
+            f"N={values.shape[0]}, k={maximum}, requested_bytes={requested_bytes}, "
+            f"available_bytes={remaining}",
+            operation="indexed neighbour calculation",
+            requested_bytes=requested_bytes,
+            available_bytes=remaining,
+            reserved_headroom_bytes=service.budget.reserved_headroom_bytes,
+        )
+    ordered_row_ids = _validate_row_ids(row_ids, values.shape[0])
+    checkpoint_store = (
+        None if checkpoint_path is None else VersionedCheckpointStore(checkpoint_path)
+    )
+    checkpoint_identity = {
+        "phase": "exact-knn",
+        "schema": "exact-knn-checkpoint-v1",
+        "backend": INDEXED_NEIGHBOUR_BACKEND_ID,
+        "backend_version": INDEXED_NEIGHBOUR_BACKEND_VERSION,
+        "descriptors": _array_fingerprint(values),
+        "row_ids": list(ordered_row_ids),
+        "unique_locations": _array_fingerprint(active_index.unique_locations),
+        "row_to_location": _array_fingerprint(active_index.row_to_location),
+        "k": maximum,
+        "tie_policy": "distance-then-earliest-original-representative-v1",
+    }
+    queried = active_index.query_neighbours_many(
+        ordered,
+        chunk_size=chunk_size,
+        checkpoint_store=checkpoint_store,
+        checkpoint_name=checkpoint_name,
+        checkpoint_identity=checkpoint_identity,
+        checkpoint_every_locations=checkpoint_every_locations,
+        resume=resume,
+    )
+    representation_id = (
+        _array_fingerprint(values)
+        if representation_fingerprint is None
+        else representation_fingerprint
+    )
+    if not isinstance(representation_id, str) or not representation_id.strip():
+        raise ValueError("representation_fingerprint must be a non-blank string")
+    results: dict[int, ExactNeighbourResult] = {}
+    for order_k in ordered:
+        radii, neighbour_indices, neighbour_distances = queried[order_k]
+        identity = {
+            "schema": active_index.backend_version,
+            "representation": representation_id,
+            "row_ids": list(ordered_row_ids),
+            "metric": active_index.metric,
+            "backend": active_index.backend,
+            "backend_fingerprint": active_index.fingerprint,
+            "distinct_location_policy": active_index.distinct_location_policy,
+            "tie_policy": "distance-then-earliest-original-representative-v1",
+            "k": order_k,
+        }
+        results[order_k] = ExactNeighbourResult(
+            radii=radii,
+            neighbour_indices=neighbour_indices,
+            neighbour_distances=neighbour_distances,
+            row_to_location=active_index.row_to_location,
+            unique_locations=active_index.unique_locations,
+            location_representatives=active_index.location_representatives,
+            k=order_k,
+            representation_fingerprint=representation_id,
+            row_ids=ordered_row_ids,
+            fingerprint=sha256_canonical_json(identity),
+            backend=active_index.backend,
+            backend_version=active_index.backend_version,
+            metric=active_index.metric,
+            distinct_location_policy=active_index.distinct_location_policy,
+            backend_fingerprint=active_index.fingerprint,
+        )
+    return results
+
+
+def compute_tiled_cpu_neighbours(
+    descriptors: np.ndarray,
+    k: int,
+    *,
+    index: TiledCPUNeighbourIndex | None = None,
+    chunk_size: int = 1024,
+    representation_fingerprint: str | None = None,
+    row_ids: Sequence[str] | None = None,
+    max_neighbour_entries: int | None = None,
+    max_neighbour_cache_bytes: int | None = DEFAULT_NEIGHBOUR_CACHE_BYTES,
+    resource_budget: ResourceBudgetService | None = None,
+    checkpoint_path: str | os.PathLike[str] | None = None,
+    checkpoint_name: str = "knn",
+    checkpoint_every_locations: int = 1,
+    resume: bool = True,
+) -> ExactNeighbourResult:
+    """Calculate exact neighbours with the explicit blocked CPU backend."""
+
+    values = _validate_descriptors(descriptors)
+    order_k = _validate_k(k)
+    _validate_chunk_size(chunk_size)
+    if max_neighbour_entries is not None and (
+        isinstance(max_neighbour_entries, bool)
+        or not isinstance(max_neighbour_entries, (int, np.integer))
+        or int(max_neighbour_entries) < 1
+    ):
+        raise ValueError("max_neighbour_entries must be a positive integer when provided")
+    required_entries = int(values.shape[0]) * order_k
+    if max_neighbour_entries is not None and required_entries > int(max_neighbour_entries):
+        raise ValueError(
+            "tiled exact neighbour result exceeds its explicit bounded-memory limit: "
+            f"N={values.shape[0]}, required_entries={required_entries}, "
+            f"max_entries={int(max_neighbour_entries)}"
+        )
+    service = resource_budget or (
+        index.resource_budget if index is not None else build_resource_budget()
+    )
+    remaining = service.remaining_managed_budget
+    requested_bytes = int(values.nbytes + 16 * required_entries + 128 * values.shape[0])
+    if remaining is None:
+        raise ResourceCapacityError(
+            service.unknown_memory_message("tiled exact neighbour calculation"),
+            operation="tiled exact neighbour calculation",
+        )
+    if requested_bytes > remaining:
+        raise ResourceCapacityError(
+            "tiled exact neighbour result exceeds its runtime memory allowance: "
+            f"N={values.shape[0]}, k={order_k}, requested_bytes={requested_bytes}, "
+            f"available_bytes={remaining}",
+            operation="tiled exact neighbour calculation",
+            requested_bytes=requested_bytes,
+            available_bytes=remaining,
+            reserved_headroom_bytes=service.budget.reserved_headroom_bytes,
+        )
+    active_index = index or TiledCPUNeighbourIndex(
+        values,
+        tile_size=chunk_size,
+        max_neighbour_cache_bytes=max_neighbour_cache_bytes,
+        resource_budget=resource_budget,
+    )
+    if not isinstance(active_index, TiledCPUNeighbourIndex):
+        raise ValueError("tiled neighbour calculation requires the tiled CPU backend")
+    if not np.array_equal(active_index.descriptors, values):
+        raise ValueError("tiled neighbour index belongs to different descriptors")
+    ordered_row_ids = _validate_row_ids(row_ids, values.shape[0])
+    checkpoint_store = (
+        None if checkpoint_path is None else VersionedCheckpointStore(checkpoint_path)
+    )
+    checkpoint_identity = {
+        "phase": "exact-knn",
+        "schema": "exact-knn-checkpoint-v1",
+        "backend": TILED_NEIGHBOUR_BACKEND_ID,
+        "backend_version": TILED_NEIGHBOUR_BACKEND_VERSION,
+        "descriptors": _array_fingerprint(values),
+        "row_ids": list(ordered_row_ids),
+        "unique_locations": _array_fingerprint(active_index.unique_locations),
+        "row_to_location": _array_fingerprint(active_index.row_to_location),
+        "k": order_k,
+        "tie_policy": "distance-then-earliest-original-representative-v1",
+    }
+    radii, neighbour_indices, neighbour_distances = active_index.query_neighbours(
+        order_k,
+        chunk_size=chunk_size,
+        checkpoint_store=checkpoint_store,
+        checkpoint_name=checkpoint_name,
+        checkpoint_identity=checkpoint_identity,
+        checkpoint_every_locations=checkpoint_every_locations,
+        resume=resume,
+    )
+    representation_id = (
+        _array_fingerprint(values)
+        if representation_fingerprint is None
+        else representation_fingerprint
+    )
+    if not isinstance(representation_id, str) or not representation_id.strip():
+        raise ValueError("representation_fingerprint must be a non-blank string")
+    identity = {
+        "schema": active_index.backend_version,
+        "representation": representation_id,
+        "row_ids": list(ordered_row_ids),
+        "metric": active_index.metric,
+        "backend": active_index.backend,
+        "backend_fingerprint": active_index.fingerprint,
+        "distinct_location_policy": active_index.distinct_location_policy,
+        "tie_policy": "distance-then-earliest-original-representative-v1",
+        "k": order_k,
+    }
+    return ExactNeighbourResult(
+        radii=radii,
+        neighbour_indices=neighbour_indices,
+        neighbour_distances=neighbour_distances,
+        row_to_location=active_index.row_to_location,
+        unique_locations=active_index.unique_locations,
+        location_representatives=active_index.location_representatives,
+        k=order_k,
+        representation_fingerprint=representation_id,
+        row_ids=ordered_row_ids,
+        fingerprint=sha256_canonical_json(identity),
+        backend=active_index.backend,
+        backend_version=active_index.backend_version,
+        metric=active_index.metric,
+        distinct_location_policy=active_index.distinct_location_policy,
+        backend_fingerprint=active_index.fingerprint,
+    )
+
+
+def compute_tiled_cpu_neighbours_many(
+    descriptors: np.ndarray,
+    ks: Sequence[int],
+    *,
+    index: TiledCPUNeighbourIndex | None = None,
+    chunk_size: int = 1024,
+    representation_fingerprint: str | None = None,
+    row_ids: Sequence[str] | None = None,
+    max_neighbour_entries: int | None = None,
+    max_neighbour_cache_bytes: int | None = DEFAULT_NEIGHBOUR_CACHE_BYTES,
+    resource_budget: ResourceBudgetService | None = None,
+    checkpoint_path: str | os.PathLike[str] | None = None,
+    checkpoint_name: str = "knn",
+    checkpoint_every_locations: int = 1,
+    resume: bool = True,
+) -> dict[int, ExactNeighbourResult]:
+    """Calculate several exact tiled neighbour orders in one bounded pass."""
+
+    values = _validate_descriptors(descriptors)
+    ordered = tuple(_validate_k(value) for value in ks)
+    if not ordered or len(set(ordered)) != len(ordered):
+        raise ValueError("ks must contain unique positive neighbour orders")
+    maximum = max(ordered)
+    required_entries = int(values.shape[0]) * maximum
+    if max_neighbour_entries is not None and (
+        isinstance(max_neighbour_entries, bool)
+        or not isinstance(max_neighbour_entries, (int, np.integer))
+        or int(max_neighbour_entries) < 1
+    ):
+        raise ValueError("max_neighbour_entries must be a positive integer when provided")
+    if max_neighbour_entries is not None and required_entries > int(max_neighbour_entries):
+        raise ValueError(
+            "tiled exact neighbour result exceeds its explicit bounded-memory limit: "
+            f"N={values.shape[0]}, required_entries={required_entries}, "
+            f"max_entries={int(max_neighbour_entries)}"
+        )
+    service = resource_budget or (
+        index.resource_budget if index is not None else build_resource_budget()
+    )
+    remaining = service.remaining_managed_budget
+    requested_bytes = int(values.nbytes + 16 * required_entries + 128 * values.shape[0])
+    if remaining is None:
+        raise ResourceCapacityError(
+            service.unknown_memory_message("tiled exact neighbour calculation"),
+            operation="tiled exact neighbour calculation",
+        )
+    if requested_bytes > remaining:
+        raise ResourceCapacityError(
+            "tiled exact neighbour result exceeds its runtime memory allowance: "
+            f"N={values.shape[0]}, k={maximum}, requested_bytes={requested_bytes}, "
+            f"available_bytes={remaining}",
+            operation="tiled exact neighbour calculation",
+            requested_bytes=requested_bytes,
+            available_bytes=remaining,
+            reserved_headroom_bytes=service.budget.reserved_headroom_bytes,
+        )
+    active_index = index or TiledCPUNeighbourIndex(
+        values,
+        tile_size=chunk_size,
+        max_neighbour_cache_bytes=max_neighbour_cache_bytes,
+        resource_budget=resource_budget,
+    )
+    if not isinstance(active_index, TiledCPUNeighbourIndex):
+        raise ValueError("tiled neighbour calculation requires the tiled CPU backend")
+    if not np.array_equal(active_index.descriptors, values):
+        raise ValueError("tiled neighbour index belongs to different descriptors")
+    ordered_row_ids = _validate_row_ids(row_ids, values.shape[0])
+    checkpoint_store = (
+        None if checkpoint_path is None else VersionedCheckpointStore(checkpoint_path)
+    )
+    checkpoint_identity = {
+        "phase": "exact-knn",
+        "schema": "exact-knn-checkpoint-v1",
+        "backend": TILED_NEIGHBOUR_BACKEND_ID,
+        "backend_version": TILED_NEIGHBOUR_BACKEND_VERSION,
+        "descriptors": _array_fingerprint(values),
+        "row_ids": list(ordered_row_ids),
+        "unique_locations": _array_fingerprint(active_index.unique_locations),
+        "row_to_location": _array_fingerprint(active_index.row_to_location),
+        "k": maximum,
+        "tie_policy": "distance-then-earliest-original-representative-v1",
+    }
+    queried = active_index.query_neighbours_many(
+        ordered,
+        chunk_size=chunk_size,
+        checkpoint_store=checkpoint_store,
+        checkpoint_name=checkpoint_name,
+        checkpoint_identity=checkpoint_identity,
+        checkpoint_every_locations=checkpoint_every_locations,
+        resume=resume,
+    )
+    representation_id = (
+        _array_fingerprint(values)
+        if representation_fingerprint is None
+        else representation_fingerprint
+    )
+    if not isinstance(representation_id, str) or not representation_id.strip():
+        raise ValueError("representation_fingerprint must be a non-blank string")
+    results: dict[int, ExactNeighbourResult] = {}
+    for order_k in ordered:
+        radii, neighbour_indices, neighbour_distances = queried[order_k]
+        identity = {
+            "schema": active_index.backend_version,
+            "representation": representation_id,
+            "row_ids": list(ordered_row_ids),
+            "metric": active_index.metric,
+            "backend": active_index.backend,
+            "backend_fingerprint": active_index.fingerprint,
+            "distinct_location_policy": active_index.distinct_location_policy,
+            "tie_policy": "distance-then-earliest-original-representative-v1",
+            "k": order_k,
+        }
+        results[order_k] = ExactNeighbourResult(
+            radii=radii,
+            neighbour_indices=neighbour_indices,
+            neighbour_distances=neighbour_distances,
+            row_to_location=active_index.row_to_location,
+            unique_locations=active_index.unique_locations,
+            location_representatives=active_index.location_representatives,
+            k=order_k,
+            representation_fingerprint=representation_id,
+            row_ids=ordered_row_ids,
+            fingerprint=sha256_canonical_json(identity),
+            backend=active_index.backend,
+            backend_version=active_index.backend_version,
+            metric=active_index.metric,
+            distinct_location_policy=active_index.distinct_location_policy,
+            backend_fingerprint=active_index.fingerprint,
+        )
+    return results
+
+
 def build_neighbour_index(
     descriptors: np.ndarray,
     *,
     backend: str = DEFAULT_NEIGHBOUR_BACKEND_ID,
+    tile_size: int = 256,
     max_index_bytes: int | None = None,
     max_radius_query_bytes: int | None = None,
+    max_neighbour_cache_bytes: int | None = DEFAULT_NEIGHBOUR_CACHE_BYTES,
     resource_budget: ResourceBudgetService | None = None,
-) -> IndexedCPUNeighbourIndex | None:
+) -> IndexedCPUNeighbourIndex | TiledCPUNeighbourIndex | None:
     """Build the explicitly requested reusable index, with no fallback."""
 
     if backend == INDEXED_NEIGHBOUR_BACKEND_ID:
@@ -1160,6 +2748,16 @@ def build_neighbour_index(
             descriptors,
             max_index_bytes=max_index_bytes,
             max_radius_query_bytes=max_radius_query_bytes,
+            max_neighbour_cache_bytes=max_neighbour_cache_bytes,
+            resource_budget=resource_budget,
+        )
+    if backend == TILED_NEIGHBOUR_BACKEND_ID:
+        return TiledCPUNeighbourIndex(
+            descriptors,
+            tile_size=tile_size,
+            max_index_bytes=max_index_bytes,
+            max_radius_query_bytes=max_radius_query_bytes,
+            max_neighbour_cache_bytes=max_neighbour_cache_bytes,
             resource_budget=resource_budget,
         )
     if backend == NEIGHBOUR_BACKEND_ID:
@@ -1173,7 +2771,7 @@ def compute_radius_support(
     radius: float,
     *,
     backend: str = DEFAULT_NEIGHBOUR_BACKEND_ID,
-    index: IndexedCPUNeighbourIndex | None = None,
+    index: IndexedCPUNeighbourIndex | TiledCPUNeighbourIndex | None = None,
     chunk_size: int = 1024,
     max_radius_query_bytes: int | None = None,
     resource_budget: ResourceBudgetService | None = None,
@@ -1213,18 +2811,27 @@ def compute_radius_support(
                 remaining,
             )
         )
-    if backend == INDEXED_NEIGHBOUR_BACKEND_ID:
+    if backend in {INDEXED_NEIGHBOUR_BACKEND_ID, TILED_NEIGHBOUR_BACKEND_ID}:
         active_index = (
             index
             if index is not None
-            else IndexedCPUNeighbourIndex(
+            else build_neighbour_index(
                 values,
+                backend=backend,
+                tile_size=block,
                 max_radius_query_bytes=limit,
                 resource_budget=resource_budget,
             )
         )
-        if not np.array_equal(active_index.descriptors, values):
-            raise ValueError("indexed radius-support index belongs to different descriptors")
+        expected_type = (
+            IndexedCPUNeighbourIndex
+            if backend == INDEXED_NEIGHBOUR_BACKEND_ID
+            else TiledCPUNeighbourIndex
+        )
+        if not isinstance(active_index, expected_type) or not np.array_equal(
+            active_index.descriptors, values
+        ):
+            raise ValueError("radius-support index belongs to different descriptors")
         if active_index.max_radius_query_bytes != limit:
             raise ValueError("indexed radius-support limit does not match the active index")
         return active_index.radius_support(source_index, radius, context=context)
@@ -1317,7 +2924,7 @@ def compute_neighbours(
     k: int,
     *,
     backend: str = DEFAULT_NEIGHBOUR_BACKEND_ID,
-    index: IndexedCPUNeighbourIndex | None = None,
+    index: IndexedCPUNeighbourIndex | TiledCPUNeighbourIndex | None = None,
     **kwargs: Any,
 ) -> ExactNeighbourResult:
     """Dispatch to the explicitly configured neighbour backend."""
@@ -1327,7 +2934,13 @@ def compute_neighbours(
             raise ValueError("exact_cpu does not accept an indexed neighbour index")
         return compute_exact_neighbours(descriptors, k, **kwargs)
     if backend == INDEXED_NEIGHBOUR_BACKEND_ID:
+        if index is not None and not isinstance(index, IndexedCPUNeighbourIndex):
+            raise ValueError("exact_indexed_cpu requires an indexed CPU backend")
         return compute_indexed_cpu_neighbours(descriptors, k, index=index, **kwargs)
+    if backend == TILED_NEIGHBOUR_BACKEND_ID:
+        if index is not None and not isinstance(index, TiledCPUNeighbourIndex):
+            raise ValueError("exact_tiled_cpu requires the tiled CPU backend")
+        return compute_tiled_cpu_neighbours(descriptors, k, index=index, **kwargs)
     raise ValueError(f"configured neighbour backend is unavailable: {backend!r}")
 
 
@@ -1356,6 +2969,7 @@ __all__ = [
     "DEFAULT_RADIUS_QUERY_BYTES",
     "ExactNeighbourResult",
     "IndexedCPUNeighbourIndex",
+    "TiledCPUNeighbourIndex",
     "NeighbourBackendCapabilities",
     "NeighbourResult",
     "RadiusQueryCapacityError",
@@ -1363,6 +2977,9 @@ __all__ = [
     "neighbour_backend_capabilities",
     "compute_exact_neighbours",
     "compute_indexed_cpu_neighbours",
+    "compute_indexed_cpu_neighbours_many",
+    "compute_tiled_cpu_neighbours",
+    "compute_tiled_cpu_neighbours_many",
     "compute_radius_support",
     "build_neighbour_index",
     "compute_kth_distinct_neighbour_radii",

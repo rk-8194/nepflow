@@ -806,6 +806,20 @@ A restart should:
 
 Partial cache reuse is permitted only when exact identity can be established.
 
+For information-entropy selection, long-running exact numerical phases use
+versioned, checksummed checkpoint generations.  kNN/radius work, ordered
+leave-one-out accumulation, and candidate-row aggregation may be resumed only
+when the ordered pool, representation, bandwidth, kernel/backend, tolerance,
+and candidate identities match.  A checkpoint is promoted atomically and is
+not evidence of a completed selection until the final artifacts have been
+verified.
+
+The finite-pool candidate PMFs have a storage-independent interface.  The
+implementation may use immutable in-memory CSR or an atomically promoted,
+checksummed memory-mapped CSR store.  Both preserve positive normalized
+supports, original target ordering, objective arithmetic, and greedy tie
+breaking; storage choice is operational provenance, not a scientific change.
+
 ---
 
 ## 26. Parallelism
@@ -842,8 +856,18 @@ completion and failure, and raise a typed capacity error before an unsafe
 allocation.  Low resources may reduce exact operational batch or worker
 widths, but may not change kernels, bandwidth candidates, candidate
 probabilities, acquisition order, or scientific fingerprints.  Generated
-configuration shall expose these settings only in `[resources]`; per-kernel
-entry and byte ceilings are not part of the normal scientific configuration.
+configuration shall expose normal runtime settings in `[resources]`; an
+optional expert neighbour-cache cap may be supplied in the entropy bandwidth
+profile, but it remains operational and is not part of the scientific
+selection identity.
+
+The exact indexed and tiled neighbour backends may retain one immutable
+canonical `k_max` location-level result as an optional acceleration.  Its
+automatic byte budget is derived from current managed headroom after the
+required index and query workspace, so memory-rich hosts can retain larger
+results while constrained laptops simply reject or evict the cache.  Cache
+admission, eviction, and query scratch use separate runtime accounting; a
+cache decision can never change an exact result or its scientific fingerprint.
 
 ### 26.2 Independent local-environment test holdouts
 

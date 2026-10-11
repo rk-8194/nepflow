@@ -24,6 +24,7 @@ from .algorithms.information_entropy import (
     EntropyBandwidthSettings,
     EntropyPool,
     FrozenBandwidths,
+    OutOfCoreSparseCandidateContributions,
     SparseAtomicKernelGraph,
     SparseCandidateContributions,
     StreamedKernelExecutionSummary,
@@ -186,12 +187,8 @@ class SelectionStage:
                 execution_mode=getattr(resource_config, "execution_mode", "auto"),
                 memory_budget_bytes=getattr(resource_config, "memory_budget_bytes", None),
                 scratch_budget_bytes=getattr(resource_config, "scratch_budget_bytes", None),
-                reserved_headroom_bytes=getattr(
-                    resource_config, "reserved_headroom_bytes", None
-                ),
-                safety_margin_fraction=getattr(
-                    resource_config, "safety_margin_fraction", 0.10
-                ),
+                reserved_headroom_bytes=getattr(resource_config, "reserved_headroom_bytes", None),
+                safety_margin_fraction=getattr(resource_config, "safety_margin_fraction", 0.10),
                 scratch_path=getattr(resource_config, "scratch_path", None) or None,
                 worker_cap=getattr(resource_config, "worker_cap", None),
             )
@@ -396,7 +393,12 @@ class SelectionStage:
                 backend=entropy.bandwidth.backend,
                 metric=entropy.bandwidth.metric,
                 chunk_size=entropy.bandwidth.chunk_size,
-                calibration_batch_size=None,
+                max_neighbour_entries=entropy.bandwidth.max_neighbour_entries,
+                max_index_bytes=entropy.bandwidth.max_index_bytes,
+                max_radius_query_bytes=entropy.bandwidth.max_radius_query_bytes,
+                max_neighbour_cache_bytes=entropy.bandwidth.max_neighbour_cache_bytes,
+                max_calibration_work_bytes=entropy.bandwidth.max_calibration_work_bytes,
+                calibration_batch_size=entropy.bandwidth.calibration_batch_size,
             )
             local_representation = load_or_calculate_local_representations(
                 project_dir,
@@ -521,6 +523,11 @@ class SelectionStage:
             local_representation=local_representation,
             candidate_structure_ids=physical_structure_ids,
             resource_budget=runtime_budget,
+            checkpoint_root=(
+                project_dir / "selection" / "entropy-checkpoints"
+                if settings.algorithm == "information_entropy"
+                else None
+            ),
         )
         if isinstance(training, TrainingSelection):
             train_indices = training.indices
@@ -626,6 +633,9 @@ class SelectionStage:
                 "contributions_fingerprint": entropy_result.contributions_fingerprint,
                 "contribution_entry_count": getattr(contributions, "entry_count", None),
                 "contribution_array_bytes": getattr(contributions, "array_bytes", None),
+                "candidate_storage": getattr(graph, "candidate_storage", None),
+                "candidate_storage_path": getattr(graph, "candidate_storage_path", None),
+                "candidate_resident_bytes": getattr(graph, "candidate_resident_bytes", None),
             }
             if not isinstance(pool, EntropyPool):
                 raise StateError("Information-entropy selection did not retain its pool")
@@ -633,7 +643,10 @@ class SelectionStage:
                 raise StateError("Information-entropy selection did not retain calibration")
             if not isinstance(graph, (SparseAtomicKernelGraph, StreamedKernelExecutionSummary)):
                 raise StateError("Information-entropy selection did not retain kernel execution")
-            if not isinstance(contributions, SparseCandidateContributions):
+            if not isinstance(
+                contributions,
+                (SparseCandidateContributions, OutOfCoreSparseCandidateContributions),
+            ):
                 raise StateError("Information-entropy selection did not retain contributions")
             if not isinstance(local_representation, LocalEnvironmentRepresentation):
                 raise StateError("Information-entropy selection did not retain closure inputs")
@@ -770,9 +783,8 @@ class SelectionStage:
                 result.entropy_diagnostics,
                 active.project_dir / "reports" / "entropy_diagnostics.md",
             )
-            if (
-                isinstance(result.entropy_diagnostics.pool, EntropyPool)
-                and isinstance(result.entropy_diagnostics.bandwidths, FrozenBandwidths)
+            if isinstance(result.entropy_diagnostics.pool, EntropyPool) and isinstance(
+                result.entropy_diagnostics.bandwidths, FrozenBandwidths
             ):
                 write_entropy_presentation_reports(
                     result.entropy_diagnostics,

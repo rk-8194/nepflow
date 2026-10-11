@@ -344,6 +344,7 @@ class EntropyBandwidthConfig:
     max_neighbour_entries: int | None = None
     max_index_bytes: int | None = None
     max_radius_query_bytes: int | None = None
+    max_neighbour_cache_bytes: int | None = None
     max_calibration_work_bytes: int | None = None
     calibration_batch_size: int | None = None
 

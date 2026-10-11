@@ -326,9 +326,11 @@ entropy_bandwidth_k=
 entropy_bandwidth_c=
 entropy_bandwidth_k_candidates=1,2,4,8
 entropy_bandwidth_c_candidates=1.5,2.0,4.0,8.0
+# Exact choices: exact_cpu, exact_indexed_cpu, or exact_tiled_cpu.
 entropy_bandwidth_backend=exact_indexed_cpu
 entropy_bandwidth_metric=euclidean
 entropy_bandwidth_chunk_size=1024
+entropy_bandwidth_max_neighbour_cache_bytes=
 # Atomic graph limits apply only to the bounded reference/debug graph API;
 # production information_entropy streams exact candidate contributions.
 

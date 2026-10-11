@@ -293,9 +293,14 @@ def validate_config(
     bandwidth = entropy.bandwidth
     if bandwidth.mode not in {"automatic", "manual"}:
         raise ConfigurationError("selection.entropy.bandwidth.mode must be automatic or manual")
-    if bandwidth.backend not in {"exact_cpu", "exact_indexed_cpu"}:
+    if bandwidth.backend not in {
+        "exact_cpu",
+        "exact_indexed_cpu",
+        "exact_tiled_cpu",
+    }:
         raise ConfigurationError(
-            "selection.entropy.bandwidth.backend must be exact_cpu or exact_indexed_cpu"
+            "selection.entropy.bandwidth.backend must be exact_cpu, exact_indexed_cpu, "
+            "or exact_tiled_cpu"
         )
     if bandwidth.metric != "euclidean":
         raise ConfigurationError("selection.entropy.bandwidth.metric only supports euclidean")
@@ -306,6 +311,13 @@ def validate_config(
     ):
         raise ConfigurationError(
             "selection.entropy.bandwidth.max_index_bytes must be positive when provided"
+        )
+    if bandwidth.max_neighbour_cache_bytes is not None and (
+        not isinstance(bandwidth.max_neighbour_cache_bytes, int)
+        or bandwidth.max_neighbour_cache_bytes < 1
+    ):
+        raise ConfigurationError(
+            "selection.entropy.bandwidth.max_neighbour_cache_bytes must be positive when provided"
         )
     if bandwidth.calibration_batch_size is not None and (
         not isinstance(bandwidth.calibration_batch_size, int)
@@ -423,9 +435,10 @@ def validate_config(
         raise ConfigurationError(
             "resources.reserved_headroom_bytes must be non-negative when provided"
         )
-    if not math.isfinite(resources.safety_margin_fraction) or not 0.0 <= (
-        resources.safety_margin_fraction
-    ) < 1.0:
+    if (
+        not math.isfinite(resources.safety_margin_fraction)
+        or not 0.0 <= (resources.safety_margin_fraction) < 1.0
+    ):
         raise ConfigurationError("resources.safety_margin_fraction must be in [0, 1)")
 
     if config.vasp.kspacing <= 0.0 or not math.isfinite(config.vasp.kspacing):

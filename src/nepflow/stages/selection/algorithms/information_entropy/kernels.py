@@ -3,12 +3,17 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import math
+import os
+import shutil
 import tempfile
 import time
+import uuid
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -20,24 +25,32 @@ from nepflow.resources.budget import (
     build_resource_budget,
 )
 
+from .checkpointing import (
+    CandidateAggregationCheckpoint,
+    CheckpointValidationError,
+    VersionedCheckpointStore,
+)
 from .models import (
     DEFAULT_RADIUS_QUERY_BYTES,
     INDEXED_NEIGHBOUR_BACKEND_ID,
     INDEXED_NEIGHBOUR_BACKEND_VERSION,
-    KERNEL_OPERATOR_SCHEMA_VERSION,
     KERNEL_FAMILY,
+    KERNEL_OPERATOR_SCHEMA_VERSION,
     KERNEL_VERSION,
     NEIGHBOUR_BACKEND_ID,
     NEIGHBOUR_BACKEND_VERSION,
     NEIGHBOUR_METRIC,
     SPARSE_CANDIDATE_CONTRIBUTION_SCHEMA_VERSION,
-    SPARSE_STREAMED_CANDIDATE_CONTRIBUTION_SCHEMA_VERSION,
     SPARSE_KERNEL_GRAPH_SCHEMA_VERSION,
     SPARSE_NUMERICAL_TOLERANCE,
+    SPARSE_STREAMED_CANDIDATE_CONTRIBUTION_SCHEMA_VERSION,
+    TILED_NEIGHBOUR_BACKEND_ID,
+    TILED_NEIGHBOUR_BACKEND_VERSION,
     BandwidthCalibrationResult,
     EntropyPool,
     FrozenBandwidths,
     KernelMetadata,
+    OutOfCoreSparseCandidateContributions,
     SparseAtomicKernelGraph,
     SparseCandidateContributions,
     StreamedKernelExecutionSummary,
@@ -45,7 +58,7 @@ from .models import (
 from .neighbours import (
     IndexedCPUNeighbourIndex,
     RadiusQueryCapacityError,
-    _estimate_radius_workspace_bytes,
+    TiledCPUNeighbourIndex,
     _validate_chunk_size,
     _validate_descriptors,
     _validate_memory_limit,
@@ -195,7 +208,7 @@ class _KernelSupportProvider:
         *,
         backend: str,
         chunk_size: int,
-        index: IndexedCPUNeighbourIndex | None = None,
+        index: IndexedCPUNeighbourIndex | TiledCPUNeighbourIndex | None = None,
         max_radius_query_bytes: int | None = None,
         resource_budget: ResourceBudgetService | None = None,
         capacity_context: str | None = None,
@@ -204,9 +217,7 @@ class _KernelSupportProvider:
         self.backend = backend
         self.chunk_size = _validate_chunk_size(chunk_size)
         self.resource_budget = (
-            resource_budget
-            or getattr(index, "resource_budget", None)
-            or build_resource_budget()
+            resource_budget or getattr(index, "resource_budget", None) or build_resource_budget()
         )
         if max_radius_query_bytes is None and index is not None:
             self.max_radius_query_bytes = index.max_radius_query_bytes
@@ -237,19 +248,25 @@ class _KernelSupportProvider:
                 if self.max_radius_query_bytes < 1:
                     raise ValueError("max_radius_query_bytes must be a positive integer")
         self.capacity_context = capacity_context
-        if backend == INDEXED_NEIGHBOUR_BACKEND_ID:
+        if backend in {INDEXED_NEIGHBOUR_BACKEND_ID, TILED_NEIGHBOUR_BACKEND_ID}:
             self.index = (
                 index
                 if index is not None
                 else build_neighbour_index(
                     self.descriptors,
                     backend=backend,
+                    tile_size=chunk_size,
                     max_radius_query_bytes=self.max_radius_query_bytes,
                     resource_budget=self.resource_budget,
                 )
             )
-            if not isinstance(self.index, IndexedCPUNeighbourIndex):
-                raise ValueError("indexed exact kernel support requires its indexed CPU backend")
+            expected_type = (
+                IndexedCPUNeighbourIndex
+                if backend == INDEXED_NEIGHBOUR_BACKEND_ID
+                else TiledCPUNeighbourIndex
+            )
+            if not isinstance(self.index, expected_type):
+                raise ValueError("exact kernel support requires its configured CPU backend")
             if not np.array_equal(self.index.descriptors, self.descriptors):
                 raise ValueError("indexed kernel support index belongs to different descriptors")
         elif backend == NEIGHBOUR_BACKEND_ID:
@@ -342,7 +359,7 @@ def source_normalisers(
     *,
     chunk_size: int = 1024,
     backend: str = NEIGHBOUR_BACKEND_ID,
-    index: IndexedCPUNeighbourIndex | None = None,
+    index: IndexedCPUNeighbourIndex | TiledCPUNeighbourIndex | None = None,
     support_provider: _KernelSupportProvider | None = None,
     max_radius_query_bytes: int | None = None,
     resource_budget: ResourceBudgetService | None = None,
@@ -382,7 +399,7 @@ def iter_normalized_kernel_columns(
     chunk_size: int = 1024,
     progress_callback: SourceProgressCallback | None = None,
     backend: str = NEIGHBOUR_BACKEND_ID,
-    index: IndexedCPUNeighbourIndex | None = None,
+    index: IndexedCPUNeighbourIndex | TiledCPUNeighbourIndex | None = None,
     support_provider: _KernelSupportProvider | None = None,
     max_radius_query_bytes: int | None = None,
     resource_budget: ResourceBudgetService | None = None,
@@ -414,8 +431,7 @@ def iter_normalized_kernel_columns(
     else:
         ordered_sources = tuple(int(source_index) for source_index in source_indices)
         if any(
-            source_index < 0 or source_index >= values.shape[0]
-            for source_index in ordered_sources
+            source_index < 0 or source_index >= values.shape[0] for source_index in ordered_sources
         ):
             raise ValueError("source_indices contains an out-of-range source row")
     for source_index in ordered_sources:
@@ -485,12 +501,35 @@ def evaluate_leave_one_out_objective(
     chunk_size: int = 1024,
     progress_callback: SourceProgressCallback | None = None,
     backend: str = NEIGHBOUR_BACKEND_ID,
-    index: IndexedCPUNeighbourIndex | None = None,
+    index: IndexedCPUNeighbourIndex | TiledCPUNeighbourIndex | None = None,
     max_radius_query_bytes: int | None = None,
     resource_budget: ResourceBudgetService | None = None,
     capacity_context: str | None = None,
+    checkpoint_path: str | Path | None = None,
+    checkpoint_name: str = "loo",
+    checkpoint_every_sources: int = 1,
+    resume: bool = True,
 ) -> LeaveOneOutObjective:
     """Evaluate the exact source-normalized finite-pool LOO objective."""
+
+    if checkpoint_path is not None:
+        batched = evaluate_leave_one_out_objectives(
+            descriptors,
+            probabilities,
+            np.asarray(bandwidths, dtype=np.float64).reshape(1, -1),
+            chunk_size=chunk_size,
+            progress_callback=progress_callback,
+            backend=backend,
+            index=index,
+            max_radius_query_bytes=max_radius_query_bytes,
+            resource_budget=resource_budget,
+            capacity_context=capacity_context,
+            checkpoint_path=checkpoint_path,
+            checkpoint_name=checkpoint_name,
+            checkpoint_every_sources=checkpoint_every_sources,
+            resume=resume,
+        )
+        return batched[0]
 
     values = _validate_descriptors(descriptors)
     masses = np.asarray(probabilities)
@@ -559,11 +598,15 @@ def evaluate_leave_one_out_objectives(
     chunk_size: int = 1024,
     progress_callback: BatchSourceProgressCallback | None = None,
     backend: str = NEIGHBOUR_BACKEND_ID,
-    index: IndexedCPUNeighbourIndex | None = None,
+    index: IndexedCPUNeighbourIndex | TiledCPUNeighbourIndex | None = None,
     max_radius_query_bytes: int | None = None,
     max_calibration_work_bytes: int | None = None,
     resource_budget: ResourceBudgetService | None = None,
     capacity_context: str | None = None,
+    checkpoint_path: str | Path | None = None,
+    checkpoint_name: str = "loo",
+    checkpoint_every_sources: int = 1,
+    resume: bool = True,
 ) -> tuple[LeaveOneOutObjective, ...]:
     """Evaluate a bounded batch of exact LOO objectives source-by-source.
 
@@ -649,7 +692,10 @@ def evaluate_leave_one_out_objectives(
         raise RadiusQueryCapacityError(
             "batched calibration workspace exceeds memory capacity: " + ", ".join(details)
         )
-    if isinstance(index, IndexedCPUNeighbourIndex) and index.max_radius_query_bytes > radius_limit:
+    if (
+        isinstance(index, (IndexedCPUNeighbourIndex, TiledCPUNeighbourIndex))
+        and index.max_radius_query_bytes > radius_limit
+    ):
         raise RadiusQueryCapacityError(
             "indexed radius-query limit exceeds batched calibration workspace: "
             f"configured_max_radius_query_bytes={index.max_radius_query_bytes}, "
@@ -666,8 +712,75 @@ def evaluate_leave_one_out_objectives(
     )
     numerator = np.zeros((batch_count, row_count), dtype=np.float64)
     invalid_reasons: list[str | None] = [None] * batch_count
+    support_totals = np.zeros(batch_count, dtype=np.int64)
+    support_samples = np.zeros(batch_count, dtype=np.int64)
+    support_maxima = np.zeros(batch_count, dtype=np.int64)
     peak_workspace_bytes = batch_arrays_bytes
-    for source_index in range(row_count):
+    checkpoint_store = (
+        None if checkpoint_path is None else VersionedCheckpointStore(checkpoint_path)
+    )
+    if (
+        isinstance(checkpoint_every_sources, bool)
+        or not isinstance(checkpoint_every_sources, (int, np.integer))
+        or int(checkpoint_every_sources) < 1
+    ):
+        raise ValueError("checkpoint_every_sources must be a positive integer")
+    checkpoint_identity: dict[str, Any] | None = None
+    source_start = 0
+    if checkpoint_store is not None:
+        checkpoint_identity = {
+            "phase": "leave-one-out",
+            "schema": "loo-checkpoint-v1",
+            "descriptors": _array_digest(values),
+            "probabilities": _array_digest(masses),
+            "bandwidths": _array_digest(scales),
+            "backend": backend,
+            "backend_version": getattr(index, "backend_version", NEIGHBOUR_BACKEND_VERSION),
+            "metric": getattr(index, "metric", NEIGHBOUR_METRIC),
+            "backend_fingerprint": getattr(index, "fingerprint", ""),
+            "source_order": "ascending-original-pool-row-index",
+            "k_c_batch_shape": [batch_count, row_count],
+            "numerical_tolerance": SPARSE_NUMERICAL_TOLERANCE,
+        }
+        if not resume:
+            checkpoint_store.clear(checkpoint_name)
+        if resume and checkpoint_store.exists(checkpoint_name):
+            _identity, checkpoint_state, checkpoint_arrays = checkpoint_store.load(
+                checkpoint_name,
+                expected_identity=checkpoint_identity,
+            )
+            source_start = int(checkpoint_state.get("cursor", -1))
+            if source_start < 0 or source_start > row_count:
+                raise CheckpointValidationError("LOO checkpoint cursor is outside the source order")
+            saved_numerator = checkpoint_arrays.get("numerator")
+            if saved_numerator is None or saved_numerator.shape != numerator.shape:
+                raise CheckpointValidationError("LOO checkpoint numerator shape is incompatible")
+            numerator[...] = saved_numerator
+            saved_invalid = checkpoint_state.get("invalid_reasons", invalid_reasons)
+            saved_totals = checkpoint_state.get("support_totals", support_totals.tolist())
+            saved_samples = checkpoint_state.get("support_samples", support_samples.tolist())
+            saved_maxima = checkpoint_state.get("support_maxima", support_maxima.tolist())
+            if not (
+                isinstance(saved_invalid, list)
+                and len(saved_invalid) == batch_count
+                and len(saved_totals) == batch_count
+                and len(saved_samples) == batch_count
+                and len(saved_maxima) == batch_count
+            ):
+                raise CheckpointValidationError("LOO checkpoint cumulative state is incompatible")
+            invalid_reasons = [
+                value if value is None or isinstance(value, str) else str(value)
+                for value in saved_invalid
+            ]
+            support_totals[...] = np.asarray(saved_totals, dtype=np.int64)
+            support_samples[...] = np.asarray(saved_samples, dtype=np.int64)
+            support_maxima[...] = np.asarray(saved_maxima, dtype=np.int64)
+            logger.info(
+                "Resuming exact batched leave-one-out from source %d/%d",
+                source_start,
+                row_count,
+            )
+    for source_index in range(source_start, row_count):
         source_scales = scales[:, source_index]
         maximum_scale = float(np.max(source_scales))
         target_indices, distances = provider.support(source_index, maximum_scale)
@@ -687,8 +800,7 @@ def evaluate_leave_one_out_objectives(
             if capacity_context:
                 details.append(capacity_context)
             raise RadiusQueryCapacityError(
-                "batched calibration workspace exceeds memory capacity: "
-                + ", ".join(details)
+                "batched calibration workspace exceeds memory capacity: " + ", ".join(details)
             )
         for batch_index, scale in enumerate(source_scales):
             if invalid_reasons[batch_index] is not None:
@@ -697,6 +809,13 @@ def evaluate_leave_one_out_objectives(
                 included = distances < float(scale)
                 selected_targets = target_indices[included]
                 selected_distances = distances[included]
+                support_size = int(selected_targets.shape[0])
+                support_totals[batch_index] += support_size
+                support_samples[batch_index] += 1
+                support_maxima[batch_index] = max(
+                    int(support_maxima[batch_index]),
+                    support_size,
+                )
                 raw = np.asarray(
                     wendland_kernel(selected_distances / float(scale)),
                     dtype=np.float64,
@@ -725,6 +844,23 @@ def evaluate_leave_one_out_objectives(
                 invalid_reasons[batch_index] = str(exc)
         if progress_callback is not None:
             progress_callback(source_index + 1, row_count)
+        if (
+            checkpoint_store is not None
+            and checkpoint_identity is not None
+            and (source_index + 1) % int(checkpoint_every_sources) == 0
+        ):
+            checkpoint_store.write(
+                checkpoint_name,
+                identity=checkpoint_identity,
+                state={
+                    "cursor": source_index + 1,
+                    "invalid_reasons": invalid_reasons,
+                    "support_totals": support_totals.tolist(),
+                    "support_samples": support_samples.tolist(),
+                    "support_maxima": support_maxima.tolist(),
+                },
+                arrays={"numerator": numerator},
+            )
 
     results: list[LeaveOneOutObjective] = []
     for batch_index in range(batch_count):
@@ -789,6 +925,18 @@ def evaluate_leave_one_out_objectives(
             else provider.distance_evaluations
         ),
     )
+    logger.info(
+        "Batched leave-one-out support work by candidate: samples=%s, mean=%s, max=%s",
+        support_samples.tolist(),
+        [
+            float(total) / int(samples) if int(samples) else None
+            for total, samples in zip(support_totals, support_samples, strict=True)
+        ],
+        support_maxima.tolist(),
+    )
+    if checkpoint_store is not None:
+        checkpoint_store.clear(checkpoint_name)
+        checkpoint_store.clean_stale()
     return tuple(results)
 
 
@@ -810,10 +958,14 @@ def _validate_sparse_limit(value: Any, name: str) -> int:
 
 def _array_digest(values: np.ndarray) -> dict[str, Any]:
     contiguous = np.ascontiguousarray(values)
+    flat = contiguous.reshape(-1)
+    digest = hashlib.sha256()
+    for start in range(0, flat.size, 131_072):
+        digest.update(flat[start : start + 131_072].tobytes())
     return {
         "dtype": str(contiguous.dtype),
         "shape": list(contiguous.shape),
-        "sha256": hashlib.sha256(contiguous.tobytes()).hexdigest(),
+        "sha256": digest.hexdigest(),
     }
 
 
@@ -847,16 +999,20 @@ def _validate_sparse_graph_inputs(
         raise ValueError("frozen bandwidth count must equal the atomic row count")
     if not np.all(np.isfinite(frozen.bandwidths)) or np.any(frozen.bandwidths <= 0.0):
         raise ValueError("frozen bandwidths must be finite and strictly positive")
-    if frozen.backend not in {NEIGHBOUR_BACKEND_ID, INDEXED_NEIGHBOUR_BACKEND_ID}:
+    if frozen.backend not in {
+        NEIGHBOUR_BACKEND_ID,
+        INDEXED_NEIGHBOUR_BACKEND_ID,
+        TILED_NEIGHBOUR_BACKEND_ID,
+    }:
         raise ValueError(
             "sparse kernel construction requires a supported exact neighbour backend; "
             f"received {frozen.backend!r}"
         )
-    expected_version = (
-        NEIGHBOUR_BACKEND_VERSION
-        if frozen.backend == NEIGHBOUR_BACKEND_ID
-        else INDEXED_NEIGHBOUR_BACKEND_VERSION
-    )
+    expected_version = {
+        NEIGHBOUR_BACKEND_ID: NEIGHBOUR_BACKEND_VERSION,
+        INDEXED_NEIGHBOUR_BACKEND_ID: INDEXED_NEIGHBOUR_BACKEND_VERSION,
+        TILED_NEIGHBOUR_BACKEND_ID: TILED_NEIGHBOUR_BACKEND_VERSION,
+    }[frozen.backend]
     if frozen.backend_version != expected_version:
         raise ValueError(
             "sparse kernel construction requires the configured backend version; "
@@ -1038,7 +1194,7 @@ def build_sparse_atomic_kernel_graph(
         max_radius_query_bytes=max_radius_query_bytes,
     )
     if (
-        frozen.backend == INDEXED_NEIGHBOUR_BACKEND_ID
+        frozen.backend in {INDEXED_NEIGHBOUR_BACKEND_ID, TILED_NEIGHBOUR_BACKEND_ID}
         and frozen.backend_fingerprint
         and support_provider.index is not None
         and frozen.backend_fingerprint != support_provider.index.fingerprint
@@ -1130,7 +1286,9 @@ def build_sparse_atomic_kernel_graph(
                 spool_bytes = prospective_spool_bytes
                 materialized_spool_bytes = spool_bytes
             if int(np.sum(edge_counts, dtype=np.int64)) != edge_count:
-                raise ValueError("sparse graph source enumeration produced inconsistent edge counts")
+                raise ValueError(
+                    "sparse graph source enumeration produced inconsistent edge counts"
+                )
             spool.flush()
             spool.seek(0)
             if spool.read(len(_EDGE_SPOOL_HEADER)) != _EDGE_SPOOL_HEADER:
@@ -1151,9 +1309,8 @@ def build_sparse_atomic_kernel_graph(
                 # from edge_counts; populate by consuming source-sized slices.
                 offset = 0
                 while offset < count:
-                    while (
-                        source_cursor < n_rows
-                        and edge_cursor >= int(source_indptr[source_cursor + 1])
+                    while source_cursor < n_rows and edge_cursor >= int(
+                        source_indptr[source_cursor + 1]
                     ):
                         source_cursor += 1
                     if source_cursor >= n_rows:
@@ -1230,6 +1387,162 @@ def _measured_peak_memory_bytes() -> int | None:
     return None
 
 
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _publish_out_of_core_candidate_store(
+    *,
+    directory: str | Path | None,
+    scratch_directory: str | Path | None,
+    spool: Any,
+    spool_digest: Any,
+    entry_count: int,
+    candidate_indptr: np.ndarray,
+    candidate_ids: tuple[str, ...],
+    source_counts: np.ndarray,
+    pool: EntropyPool,
+    operator_fingerprint: str,
+    spool_header: bytes,
+    implicit_edge_count: int,
+    source_support_min: int,
+    source_support_mean: float,
+    source_support_max: int,
+    self_edge_count: int,
+    source_mass_max_deviation: float,
+    candidate_support_min: int,
+    candidate_support_mean: float,
+    candidate_support_max: int,
+    contribution_spool_bytes: int,
+    estimated_peak_memory_bytes: int,
+) -> OutOfCoreSparseCandidateContributions:
+    """Promote a verified candidate spool into memory-mapped CSR arrays."""
+
+    if directory is None:
+        seed = Path(tempfile.mkdtemp(prefix="nepflow-candidate-store-", dir=scratch_directory))
+        seed.rmdir()
+        root = seed
+        root_created = True
+    else:
+        root = Path(directory)
+        if root.exists():
+            raise ValueError(f"out-of-core candidate store path already exists: {root}")
+        root.parent.mkdir(parents=True, exist_ok=True)
+        root_created = False
+    temporary = root.parent / f".{root.name}.tmp-{uuid.uuid4().hex}"
+    temporary.mkdir(parents=False)
+    try:
+        indptr_path = temporary / "candidate_indptr.npy"
+        counts_path = temporary / "candidate_source_counts.npy"
+        target_path = temporary / "target_indices.npy"
+        values_path = temporary / "values.npy"
+        with indptr_path.open("wb") as handle:
+            np.save(handle, np.asarray(candidate_indptr, dtype=np.int64), allow_pickle=False)
+            handle.flush()
+            os.fsync(handle.fileno())
+        with counts_path.open("wb") as handle:
+            np.save(handle, np.asarray(source_counts, dtype=np.int64), allow_pickle=False)
+            handle.flush()
+            os.fsync(handle.fileno())
+        targets = np.lib.format.open_memmap(
+            target_path, mode="w+", dtype=np.int64, shape=(entry_count,)
+        )
+        values = np.lib.format.open_memmap(
+            values_path, mode="w+", dtype=np.float64, shape=(entry_count,)
+        )
+        spool.seek(0)
+        if spool.read(len(spool_header)) != spool_header:
+            raise ValueError("candidate contribution spool has an invalid version header")
+        read_digest = hashlib.sha256()
+        read_digest.update(spool_header)
+        cursor = 0
+        for records in _spool_read_records(spool, read_digest, entry_count):
+            count = records.shape[0]
+            targets[cursor : cursor + count] = records["target"]
+            values[cursor : cursor + count] = records["value"]
+            cursor += count
+        if spool.read(1) or cursor != entry_count:
+            raise ValueError("candidate contribution spool contains an invalid record count")
+        if read_digest.digest() != spool_digest.digest():
+            raise ValueError("candidate contribution spool checksum validation failed")
+        targets.flush()
+        values.flush()
+        del targets, values
+        persisted_indptr = np.load(indptr_path, allow_pickle=False)
+        persisted_values = np.load(values_path, mmap_mode="r", allow_pickle=False)
+        candidate_pmf_max_deviation = float(
+            np.max(np.abs(np.add.reduceat(persisted_values, persisted_indptr[:-1]) - 1.0))
+        )
+        file_entries: dict[str, dict[str, Any]] = {}
+        for name, path in (
+            ("candidate_indptr", indptr_path),
+            ("candidate_source_counts", counts_path),
+            ("target_indices", target_path),
+            ("values", values_path),
+        ):
+            array = np.load(path, mmap_mode="r", allow_pickle=False)
+            file_entries[name] = {
+                "name": path.name,
+                "dtype": str(array.dtype),
+                "shape": list(array.shape),
+                "sha256": _file_sha256(path),
+            }
+        candidate_fingerprint = sha256_canonical_json(
+            {
+                "schema": SPARSE_STREAMED_CANDIDATE_CONTRIBUTION_SCHEMA_VERSION,
+                "kernel_operator": operator_fingerprint,
+                "candidate_ids": list(candidate_ids),
+                "candidate_indptr": _array_digest(np.load(indptr_path, allow_pickle=False)),
+                "target_indices": _array_digest(
+                    np.load(target_path, mmap_mode="r", allow_pickle=False)
+                ),
+                "values": _array_digest(np.load(values_path, mmap_mode="r", allow_pickle=False)),
+                "candidate_source_counts": _array_digest(np.load(counts_path, allow_pickle=False)),
+            }
+        )
+        manifest = {
+            "schema": OutOfCoreSparseCandidateContributions.SCHEMA_VERSION,
+            "candidate_ids": list(candidate_ids),
+            "row_count": int(pool.descriptors.shape[0]),
+            "graph_fingerprint": "",
+            "fingerprint": candidate_fingerprint,
+            "pool_fingerprint": pool.fingerprint,
+            "sparse_schema_version": SPARSE_STREAMED_CANDIDATE_CONTRIBUTION_SCHEMA_VERSION,
+            "numerical_tolerance": SPARSE_NUMERICAL_TOLERANCE,
+            "kernel_operator_fingerprint": operator_fingerprint,
+            "implicit_edge_count": int(implicit_edge_count),
+            "source_support_min": int(source_support_min),
+            "source_support_mean": float(source_support_mean),
+            "source_support_max": int(source_support_max),
+            "self_edge_count": int(self_edge_count),
+            "source_mass_max_deviation": float(source_mass_max_deviation),
+            "candidate_support_min": int(candidate_support_min),
+            "candidate_support_mean": float(candidate_support_mean),
+            "candidate_support_max": int(candidate_support_max),
+            "candidate_pmf_max_deviation": candidate_pmf_max_deviation,
+            "contribution_spool_bytes": int(contribution_spool_bytes),
+            "estimated_peak_memory_bytes": int(estimated_peak_memory_bytes),
+            "files": file_entries,
+        }
+        manifest_path = temporary / "manifest.json"
+        with manifest_path.open("w", encoding="utf-8", newline="\n") as handle:
+            json.dump(manifest, handle, sort_keys=True, separators=(",", ":"))
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, root)
+        return OutOfCoreSparseCandidateContributions(root)
+    except BaseException:
+        shutil.rmtree(temporary, ignore_errors=True)
+        if root_created:
+            shutil.rmtree(root, ignore_errors=True)
+        raise
+
+
 def build_streamed_candidate_contributions(
     pool: EntropyPool,
     bandwidths: FrozenBandwidths | BandwidthCalibrationResult,
@@ -1241,7 +1554,15 @@ def build_streamed_candidate_contributions(
     progress_callback: SourceProgressCallback | None = None,
     max_radius_query_bytes: int | None = None,
     resource_budget: ResourceBudgetService | None = None,
-) -> tuple[SparseCandidateContributions, StreamedKernelExecutionSummary]:
+    storage: str = "auto",
+    storage_path: str | Path | None = None,
+    checkpoint_path: str | Path | None = None,
+    checkpoint_name: str = "candidate-aggregation",
+    resume: bool = True,
+) -> tuple[
+    SparseCandidateContributions | OutOfCoreSparseCandidateContributions,
+    StreamedKernelExecutionSummary,
+]:
     """Build exact candidate PMFs by streaming normalized source columns.
 
     Sources are queried once, in candidate-ID/source-row order.  A reusable
@@ -1266,6 +1587,11 @@ def build_streamed_candidate_contributions(
         )
     if progress_callback is not None and not callable(progress_callback):
         raise TypeError("progress_callback must be callable")
+    storage_mode = str(storage).strip().lower()
+    if storage_mode not in {"auto", "memory", "disk"}:
+        raise ValueError("storage must be 'auto', 'memory', or 'disk'")
+    if storage_path is not None and storage_mode == "memory":
+        raise ValueError("storage_path is only valid for disk-backed contributions")
 
     n_rows = int(values.shape[0])
     candidate_ids = tuple(pool.candidate_ids)
@@ -1320,6 +1646,53 @@ def build_streamed_candidate_contributions(
         raise ValueError(
             "max_contribution_spool_bytes is too small for the candidate contribution spool header"
         )
+    prospective_final_bytes = int(8 * (candidate_count + 1 + candidate_count))
+    prospective_final_bytes += int(16 * maximum_entry_count)
+    if storage_mode == "auto":
+        storage_mode = (
+            "disk"
+            if storage_path is not None
+            or (byte_limit is not None and prospective_final_bytes > byte_limit)
+            or prospective_final_bytes > max(1, remaining_budget // 2)
+            else "memory"
+        )
+    if storage_mode == "memory" and prospective_final_bytes > remaining_budget:
+        raise ResourceCapacityError(
+            "in-memory candidate contribution plan exceeds the runtime memory allowance; "
+            "select storage='disk' for the exact out-of-core plan: "
+            f"N={n_rows}, M={candidate_count}, Q_max={maximum_entry_count}, "
+            f"required_bytes={prospective_final_bytes}, available_bytes={remaining_budget}",
+            operation="entropy streamed candidate contributions planning",
+            requested_bytes=prospective_final_bytes,
+            available_bytes=remaining_budget,
+        )
+    if derived_spool_limit:
+        prospective_scratch_bytes = int(len(_EDGE_SPOOL_HEADER) + 16 * int(entry_limit))
+        if storage_mode == "disk":
+            prospective_scratch_bytes += 8 * (candidate_count + 1 + candidate_count)
+        if prospective_scratch_bytes > spool_limit:
+            raise ResourceCapacityError(
+                "candidate contribution plan exceeds available scratch capacity: "
+                f"N={n_rows}, M={candidate_count}, Q_max={int(entry_limit)}, "
+                f"required_scratch_bytes={prospective_scratch_bytes}, "
+                f"scratch_available_bytes={spool_limit}",
+                operation="entropy streamed candidate contributions planning",
+                requested_bytes=prospective_scratch_bytes,
+                available_bytes=remaining_budget,
+                scratch_needed_bytes=prospective_scratch_bytes,
+                scratch_available_bytes=spool_limit,
+            )
+    logger.info(
+        "Candidate contribution storage plan: storage=%s, N=%d, M=%d, Q_max=%d, "
+        "prospective_final_bytes=%d, memory_limit=%s, scratch_limit=%d",
+        storage_mode,
+        n_rows,
+        candidate_count,
+        maximum_entry_count,
+        prospective_final_bytes,
+        byte_limit if byte_limit is not None else "unbounded",
+        spool_limit,
+    )
     owners = np.asarray(pool.row_candidate_indices, dtype=np.int64)
     source_counts = np.bincount(owners, minlength=candidate_count).astype(np.int64)
     if np.any(source_counts <= 0):
@@ -1334,6 +1707,88 @@ def build_streamed_candidate_contributions(
         16 * values.nbytes + owners.nbytes + source_order.nbytes + 256 * n_rows
     )
     operator_fingerprint = _kernel_operator_fingerprint(pool, frozen)
+    if storage_mode == "disk" and storage_path is not None:
+        existing_path = Path(storage_path)
+        if existing_path.is_dir():
+            try:
+                existing = OutOfCoreSparseCandidateContributions(existing_path)
+            except ValueError as exc:
+                raise ValueError(
+                    "existing out-of-core candidate contribution store cannot be reused; "
+                    f"validation failed for {existing_path}"
+                ) from exc
+            if (
+                existing.pool_fingerprint != pool.fingerprint
+                or existing.kernel_operator_fingerprint != operator_fingerprint
+                or tuple(existing.candidate_ids) != candidate_ids
+                or existing.row_count != n_rows
+            ):
+                raise ValueError(
+                    "existing out-of-core candidate contribution store belongs to a "
+                    "different ordered entropy computation"
+                )
+            if existing.entry_count > entry_limit:
+                raise ValueError(
+                    "existing out-of-core candidate contribution store exceeds max_entries: "
+                    f"Q={existing.entry_count}, max_entries={entry_limit}"
+                )
+            metadata = existing.manifest
+            required_metadata = (
+                "implicit_edge_count",
+                "source_support_min",
+                "source_support_mean",
+                "source_support_max",
+                "self_edge_count",
+                "source_mass_max_deviation",
+                "candidate_support_min",
+                "candidate_support_mean",
+                "candidate_support_max",
+                "candidate_pmf_max_deviation",
+                "contribution_spool_bytes",
+                "estimated_peak_memory_bytes",
+            )
+            if any(name not in metadata for name in required_metadata):
+                raise ValueError(
+                    "existing out-of-core candidate contribution store has no complete "
+                    "execution summary and cannot be resumed safely"
+                )
+            if checkpoint_path is not None:
+                CandidateAggregationCheckpoint(Path(checkpoint_path) / checkpoint_name).clear()
+            summary = StreamedKernelExecutionSummary(
+                atomic_row_count=n_rows,
+                implicit_edge_count=int(metadata["implicit_edge_count"]),
+                source_support_min=int(metadata["source_support_min"]),
+                source_support_mean=float(metadata["source_support_mean"]),
+                source_support_max=int(metadata["source_support_max"]),
+                self_edge_count=int(metadata["self_edge_count"]),
+                source_mass_max_deviation=float(metadata["source_mass_max_deviation"]),
+                candidate_entry_count=existing.entry_count,
+                candidate_support_min=int(metadata["candidate_support_min"]),
+                candidate_support_mean=float(metadata["candidate_support_mean"]),
+                candidate_support_max=int(metadata["candidate_support_max"]),
+                candidate_pmf_max_deviation=float(metadata["candidate_pmf_max_deviation"]),
+                candidate_csr_array_bytes=existing.array_bytes,
+                contribution_spool_bytes=int(metadata["contribution_spool_bytes"]),
+                estimated_peak_memory_bytes=int(metadata["estimated_peak_memory_bytes"]),
+                measured_peak_memory_bytes=_measured_peak_memory_bytes(),
+                pool_fingerprint=pool.fingerprint,
+                bandwidth_fingerprint=frozen.fingerprint,
+                transform_fingerprint=pool.transform_fingerprint,
+                backend=frozen.backend,
+                metric=frozen.metric,
+                backend_version=frozen.backend_version,
+                kernel_operator_fingerprint=operator_fingerprint,
+                source_query_count=n_rows,
+                candidate_storage="disk",
+                candidate_storage_path=str(existing.directory),
+                candidate_resident_bytes=existing.resident_array_bytes,
+            )
+            logger.info(
+                "Reusing verified out-of-core candidate contributions: path=%s, Q=%d",
+                existing.directory,
+                existing.entry_count,
+            )
+            return existing, summary
     try:
         lease = runtime_budget.acquire(
             "entropy streamed candidate contributions",
@@ -1362,12 +1817,10 @@ def build_streamed_candidate_contributions(
             chunk_size=block,
             max_radius_query_bytes=max_radius_query_bytes,
             resource_budget=runtime_budget,
-            capacity_context=(
-                f"N={n_rows}, M={candidate_count}, operator={operator_fingerprint}"
-            ),
+            capacity_context=(f"N={n_rows}, M={candidate_count}, operator={operator_fingerprint}"),
         )
         if (
-            frozen.backend == INDEXED_NEIGHBOUR_BACKEND_ID
+            frozen.backend in {INDEXED_NEIGHBOUR_BACKEND_ID, TILED_NEIGHBOUR_BACKEND_ID}
             and frozen.backend_fingerprint
             and support_provider.index is not None
             and frozen.backend_fingerprint != support_provider.index.fingerprint
@@ -1378,7 +1831,10 @@ def build_streamed_candidate_contributions(
         raise
 
     def estimated_peak_bytes(entry_count: int, support_count: int) -> int:
-        final_arrays = 8 * (candidate_count + 1 + entry_count + entry_count + candidate_count)
+        resident_entry_count = entry_count if storage_mode == "memory" else 0
+        final_arrays = 8 * (
+            candidate_count + 1 + resident_entry_count + resident_entry_count + candidate_count
+        )
         workspace = (
             values.nbytes
             + owners.nbytes
@@ -1414,6 +1870,117 @@ def build_streamed_candidate_contributions(
     q_active = 0
     q_observed = 0
     last_q_observed = 0
+    aggregation_checkpoint = (
+        None
+        if checkpoint_path is None
+        else CandidateAggregationCheckpoint(Path(checkpoint_path) / checkpoint_name)
+    )
+    completed_rows: dict[int, tuple[np.ndarray, np.ndarray, dict[str, Any]]] = {}
+    resume_candidate_count = 0
+    resumed_sources = 0
+    if aggregation_checkpoint is not None:
+        if not resume and aggregation_checkpoint.manifest_path.is_file():
+            aggregation_checkpoint.clear()
+        checkpoint_identity = {
+            "phase": "candidate-aggregation",
+            "schema": "candidate-aggregation-checkpoint-v2",
+            "pool": pool.fingerprint,
+            "operator": operator_fingerprint,
+            "candidate_ids": list(candidate_ids),
+            "source_order": "candidate-id-then-original-source-index",
+            "target_order": "ascending-original-pool-row-index",
+            "backend": frozen.backend,
+            "backend_version": frozen.backend_version,
+            "bandwidth": frozen.fingerprint,
+            "entry_limit": int(entry_limit),
+            "numerical_tolerance": SPARSE_NUMERICAL_TOLERANCE,
+        }
+        aggregation_checkpoint.initialize(checkpoint_identity, candidate_ids)
+        aggregation_checkpoint.clean_stale()
+        if resume and aggregation_checkpoint.manifest_path.is_file():
+            completed_rows = aggregation_checkpoint.load_rows()
+            while resume_candidate_count in completed_rows:
+                targets, values_for_candidate, row_manifest = completed_rows[resume_candidate_count]
+                if row_manifest.get("candidate_id") != candidate_ids[resume_candidate_count]:
+                    raise CheckpointValidationError(
+                        "candidate aggregation checkpoint row ID does not match candidate order"
+                    )
+                expected_source_cursor = int(candidate_offsets[resume_candidate_count + 1])
+                if int(row_manifest.get("source_cursor", -1)) != expected_source_cursor:
+                    raise CheckpointValidationError(
+                        "candidate aggregation checkpoint source cursor does not match the pool"
+                    )
+                if targets.dtype != np.dtype(np.int64) or values_for_candidate.dtype != np.dtype(
+                    np.float64
+                ):
+                    raise CheckpointValidationError(
+                        "candidate aggregation checkpoint row dtype is invalid"
+                    )
+                if (
+                    targets.ndim != 1
+                    or values_for_candidate.shape != targets.shape
+                    or targets.size == 0
+                    or np.any(targets < 0)
+                    or np.any(targets >= n_rows)
+                    or np.any(np.diff(targets) <= 0)
+                    or not np.all(np.isfinite(values_for_candidate))
+                    or np.any(values_for_candidate <= 0.0)
+                    or not math.isclose(
+                        float(np.sum(values_for_candidate, dtype=np.float64)),
+                        1.0,
+                        rel_tol=0.0,
+                        abs_tol=SPARSE_NUMERICAL_TOLERANCE,
+                    )
+                ):
+                    raise CheckpointValidationError(
+                        "candidate aggregation checkpoint row is not canonical CSR"
+                    )
+                support = int(targets.size)
+                candidate_support_sizes[resume_candidate_count] = support
+                q_completed += support
+                if int(row_manifest.get("q_completed", -1)) != q_completed:
+                    raise CheckpointValidationError(
+                        "candidate aggregation checkpoint Q cursor is not cumulative"
+                    )
+                candidate_source_indices = source_order[
+                    int(candidate_offsets[resume_candidate_count]) : int(
+                        candidate_offsets[resume_candidate_count + 1]
+                    )
+                ]
+                saved_source_support = row_manifest.get("_source_support")
+                if not isinstance(saved_source_support, np.ndarray) or (
+                    saved_source_support.dtype != np.dtype(np.int64)
+                    or saved_source_support.shape != candidate_source_indices.shape
+                    or np.any(saved_source_support < 1)
+                ):
+                    raise CheckpointValidationError(
+                        "candidate aggregation checkpoint source support is incomplete"
+                    )
+                support_sizes[candidate_source_indices] = saved_source_support
+                self_edges += int(row_manifest.get("self_edge_count", 0))
+                source_mass_deviation = max(
+                    source_mass_deviation,
+                    float(row_manifest.get("source_mass_max_deviation", 0.0)),
+                )
+                restored_implicit_edges = int(row_manifest.get("implicit_edges", -1))
+                if restored_implicit_edges < implicit_edges:
+                    raise CheckpointValidationError(
+                        "candidate aggregation checkpoint E cursor is not cumulative"
+                    )
+                implicit_edges = restored_implicit_edges
+                resume_candidate_count += 1
+            if len(completed_rows) != resume_candidate_count:
+                raise CheckpointValidationError(
+                    "candidate aggregation checkpoint has a non-contiguous completed prefix"
+                )
+            q_observed = q_completed
+            last_q_observed = q_completed
+            resumed_sources = int(np.sum(source_counts[:resume_candidate_count], dtype=np.int64))
+            logger.info(
+                "Resuming exact candidate aggregation from candidate %d/%d",
+                resume_candidate_count,
+                candidate_count,
+            )
 
     def resize_workspace(
         requested_bytes: int,
@@ -1470,7 +2037,7 @@ def build_streamed_candidate_contributions(
             f"limit={byte_limit}"
         )
     spool_bytes = len(_EDGE_SPOOL_HEADER)
-    completed_sources = 0
+    completed_sources = resumed_sources
     next_percent = [1]
 
     def report_source(source_index: int, support_count: int) -> None:
@@ -1498,7 +2065,15 @@ def build_streamed_candidate_contributions(
         scratch_directory = runtime_budget.budget.snapshot.scratch_path or None
         with tempfile.TemporaryFile(mode="w+b", dir=scratch_directory) as spool:
             spool_digest = _spool_write_header(spool)
-            for candidate_index in range(candidate_count):
+            for completed_index in range(resume_candidate_count):
+                records = np.empty(
+                    int(completed_rows[completed_index][0].size), dtype=_EDGE_SPOOL_DTYPE
+                )
+                records["target"] = completed_rows[completed_index][0]
+                records["value"] = completed_rows[completed_index][1]
+                _spool_write_records(spool, spool_digest, records)
+                spool_bytes += int(records.nbytes)
+            for candidate_index in range(resume_candidate_count, candidate_count):
                 accumulator.fill(0.0)
                 touched.fill(False)
                 q_active = 0
@@ -1508,6 +2083,8 @@ def build_streamed_candidate_contributions(
                 stop_source = int(candidate_offsets[candidate_index + 1])
                 candidate_source_indices = source_order[start_source:stop_source]
                 last_source_index = int(candidate_source_indices[-1])
+                candidate_self_edges = 0
+                candidate_source_mass_deviation = 0.0
                 for column in iter_normalized_kernel_columns(
                     values,
                     frozen.bandwidths,
@@ -1557,8 +2134,14 @@ def build_streamed_candidate_contributions(
                     support_count = int(target_indices.size)
                     support_sizes[source_index] = support_count
                     implicit_edges += support_count
-                    self_edges += int(np.count_nonzero(target_indices == source_index))
-                    source_mass_deviation = max(source_mass_deviation, abs(column_mass - 1.0))
+                    source_self_edges = int(np.count_nonzero(target_indices == source_index))
+                    self_edges += source_self_edges
+                    candidate_self_edges += source_self_edges
+                    source_deviation = abs(column_mass - 1.0)
+                    source_mass_deviation = max(source_mass_deviation, source_deviation)
+                    candidate_source_mass_deviation = max(
+                        candidate_source_mass_deviation, source_deviation
+                    )
                     previously_touched = touched[target_indices]
                     q_active += int(np.count_nonzero(~previously_touched))
                     touched[target_indices] = True
@@ -1610,9 +2193,7 @@ def build_streamed_candidate_contributions(
                         "streamed candidate contribution is non-finite or non-positive"
                     )
                 mass = float(np.sum(values_for_candidate, dtype=np.float64))
-                if not math.isclose(
-                    mass, 1.0, rel_tol=0.0, abs_tol=SPARSE_NUMERICAL_TOLERANCE
-                ):
+                if not math.isclose(mass, 1.0, rel_tol=0.0, abs_tol=SPARSE_NUMERICAL_TOLERANCE):
                     raise ValueError(
                         f"candidate {candidate_ids[candidate_index]!r} contribution is not "
                         "normalized"
@@ -1673,6 +2254,19 @@ def build_streamed_candidate_contributions(
                 q_active = 0
                 q_observed = q_completed
                 validate_q_invariants(candidate_index, last_source_index)
+                if aggregation_checkpoint is not None:
+                    aggregation_checkpoint.write_row(
+                        candidate_index,
+                        candidate_ids[candidate_index],
+                        targets,
+                        values_for_candidate,
+                        source_cursor=stop_source,
+                        q_completed=q_completed,
+                        implicit_edges=implicit_edges,
+                        source_support=support_sizes[candidate_source_indices].copy(),
+                        self_edge_count=candidate_self_edges,
+                        source_mass_max_deviation=candidate_source_mass_deviation,
+                    )
                 resize_workspace(
                     estimated_peak_bytes(q_completed, 0),
                     spool_bytes,
@@ -1698,56 +2292,90 @@ def build_streamed_candidate_contributions(
                 )
             final_bytes = estimated_peak_bytes(entry_count, 0)
             peak_estimated_bytes = max(peak_estimated_bytes, final_bytes)
-            resize_workspace(final_bytes, spool_bytes)
-            if byte_limit is not None and final_bytes > byte_limit:
+            final_scratch_bytes = spool_bytes
+            if storage_mode == "disk":
+                final_scratch_bytes += int(
+                    8 * (candidate_count + 1 + candidate_count) + 16 * entry_count
+                )
+            resize_workspace(final_bytes, final_scratch_bytes)
+            if byte_limit is not None and final_bytes > byte_limit and storage_mode == "memory":
                 raise ValueError(
                     "streamed candidate contributions exceed max_contribution_bytes "
                     "before final CSR: "
                     f"N={n_rows}, M={candidate_count}, Q={entry_count}, E={implicit_edges}, "
                     f"requested_bytes={final_bytes}, limit={byte_limit}"
                 )
-            target_indices = np.empty(entry_count, dtype=np.int64)
-            contribution_values = np.empty(entry_count, dtype=np.float64)
-            spool.seek(0)
-            if spool.read(len(_EDGE_SPOOL_HEADER)) != _EDGE_SPOOL_HEADER:
-                raise ValueError("candidate contribution spool has an invalid version header")
-            read_digest = hashlib.sha256()
-            read_digest.update(_EDGE_SPOOL_HEADER)
-            cursor = 0
-            for records in _spool_read_records(spool, read_digest, entry_count):
-                count = records.shape[0]
-                target_indices[cursor : cursor + count] = records["target"]
-                contribution_values[cursor : cursor + count] = records["value"]
-                cursor += count
-            if spool.read(1) or cursor != entry_count:
-                raise ValueError("candidate contribution spool contains an invalid record count")
-            if read_digest.digest() != spool_digest.digest():
-                raise ValueError("candidate contribution spool checksum validation failed")
-
-        candidate_fingerprint = sha256_canonical_json(
-            {
-                "schema": SPARSE_STREAMED_CANDIDATE_CONTRIBUTION_SCHEMA_VERSION,
-                "kernel_operator": operator_fingerprint,
-                "candidate_ids": list(candidate_ids),
-                "candidate_indptr": _array_digest(candidate_indptr),
-                "target_indices": _array_digest(target_indices),
-                "values": _array_digest(contribution_values),
-                "candidate_source_counts": _array_digest(source_counts),
-            }
-        )
-        contributions = SparseCandidateContributions(
-            candidate_indptr=candidate_indptr,
-            target_indices=target_indices,
-            values=contribution_values,
-            candidate_ids=candidate_ids,
-            graph_fingerprint="",
-            kernel_operator_fingerprint=operator_fingerprint,
-            fingerprint=candidate_fingerprint,
-            row_count=n_rows,
-            candidate_source_counts=source_counts,
-            pool_fingerprint=pool.fingerprint,
-            sparse_schema_version=SPARSE_STREAMED_CANDIDATE_CONTRIBUTION_SCHEMA_VERSION,
-        )
+            if storage_mode == "memory":
+                target_indices = np.empty(entry_count, dtype=np.int64)
+                contribution_values = np.empty(entry_count, dtype=np.float64)
+                spool.seek(0)
+                if spool.read(len(_EDGE_SPOOL_HEADER)) != _EDGE_SPOOL_HEADER:
+                    raise ValueError("candidate contribution spool has an invalid version header")
+                read_digest = hashlib.sha256()
+                read_digest.update(_EDGE_SPOOL_HEADER)
+                cursor = 0
+                for records in _spool_read_records(spool, read_digest, entry_count):
+                    count = records.shape[0]
+                    target_indices[cursor : cursor + count] = records["target"]
+                    contribution_values[cursor : cursor + count] = records["value"]
+                    cursor += count
+                if spool.read(1) or cursor != entry_count:
+                    raise ValueError(
+                        "candidate contribution spool contains an invalid record count"
+                    )
+                if read_digest.digest() != spool_digest.digest():
+                    raise ValueError("candidate contribution spool checksum validation failed")
+                candidate_fingerprint = sha256_canonical_json(
+                    {
+                        "schema": SPARSE_STREAMED_CANDIDATE_CONTRIBUTION_SCHEMA_VERSION,
+                        "kernel_operator": operator_fingerprint,
+                        "candidate_ids": list(candidate_ids),
+                        "candidate_indptr": _array_digest(candidate_indptr),
+                        "target_indices": _array_digest(target_indices),
+                        "values": _array_digest(contribution_values),
+                        "candidate_source_counts": _array_digest(source_counts),
+                    }
+                )
+                contributions = SparseCandidateContributions(
+                    candidate_indptr=candidate_indptr,
+                    target_indices=target_indices,
+                    values=contribution_values,
+                    candidate_ids=candidate_ids,
+                    graph_fingerprint="",
+                    kernel_operator_fingerprint=operator_fingerprint,
+                    fingerprint=candidate_fingerprint,
+                    row_count=n_rows,
+                    candidate_source_counts=source_counts,
+                    pool_fingerprint=pool.fingerprint,
+                    sparse_schema_version=SPARSE_STREAMED_CANDIDATE_CONTRIBUTION_SCHEMA_VERSION,
+                )
+            else:
+                contributions = _publish_out_of_core_candidate_store(
+                    directory=storage_path,
+                    scratch_directory=scratch_directory,
+                    spool=spool,
+                    spool_digest=spool_digest,
+                    entry_count=entry_count,
+                    candidate_indptr=candidate_indptr,
+                    candidate_ids=candidate_ids,
+                    source_counts=source_counts,
+                    pool=pool,
+                    operator_fingerprint=operator_fingerprint,
+                    spool_header=_EDGE_SPOOL_HEADER,
+                    implicit_edge_count=implicit_edges,
+                    source_support_min=int(np.min(support_sizes)),
+                    source_support_mean=float(np.mean(support_sizes)),
+                    source_support_max=int(np.max(support_sizes)),
+                    self_edge_count=self_edges,
+                    source_mass_max_deviation=source_mass_deviation,
+                    candidate_support_min=int(np.min(candidate_support_sizes)),
+                    candidate_support_mean=float(np.mean(candidate_support_sizes)),
+                    candidate_support_max=int(np.max(candidate_support_sizes)),
+                    contribution_spool_bytes=spool_bytes,
+                    estimated_peak_memory_bytes=peak_estimated_bytes,
+                )
+        if aggregation_checkpoint is not None:
+            aggregation_checkpoint.clear()
     except BaseException as exc:
         logger.error("Streamed candidate contributions failed: %s", exc)
         lease.close()
@@ -1782,10 +2410,7 @@ def build_streamed_candidate_contributions(
         candidate_pmf_max_deviation=float(
             np.max(
                 np.abs(
-                    np.add.reduceat(
-                        contributions.values, contributions.candidate_indptr[:-1]
-                    )
-                    - 1.0
+                    np.add.reduceat(contributions.values, contributions.candidate_indptr[:-1]) - 1.0
                 )
             )
         ),
@@ -1801,6 +2426,17 @@ def build_streamed_candidate_contributions(
         backend_version=frozen.backend_version,
         kernel_operator_fingerprint=operator_fingerprint,
         source_query_count=completed_sources,
+        candidate_storage=storage_mode,
+        candidate_storage_path=(
+            str(contributions.directory)
+            if isinstance(contributions, OutOfCoreSparseCandidateContributions)
+            else None
+        ),
+        candidate_resident_bytes=(
+            contributions.resident_array_bytes
+            if isinstance(contributions, OutOfCoreSparseCandidateContributions)
+            else contributions.array_bytes
+        ),
     )
     logger.info(
         "Streamed candidate contributions completed: E=%d (implicit), Q=%d, "
@@ -1963,7 +2599,9 @@ def aggregate_candidate_contributions(
             else len(_EDGE_SPOOL_HEADER) + entry_limit * _EDGE_SPOOL_RECORD_BYTES
         )
         if spool_limit < len(_EDGE_SPOOL_HEADER):
-            raise ValueError("max_spool_bytes is too small for the candidate contribution spool header")
+            raise ValueError(
+                "max_spool_bytes is too small for the candidate contribution spool header"
+            )
 
         # One graph walk per candidate is enough.  The normalized, sorted
         # candidate rows are streamed to a bounded scratch spool while the

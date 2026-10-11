@@ -77,9 +77,7 @@ def write_selected_structures(
         raise ArtifactError("Selection artifact test-selection policy is unsupported")
     if not isinstance(test_selection_version, str) or not test_selection_version.strip():
         raise ArtifactError("Selection artifact test-selection version is blank")
-    if test_selection_provenance is not None and not isinstance(
-        test_selection_provenance, Mapping
-    ):
+    if test_selection_provenance is not None and not isinstance(test_selection_provenance, Mapping):
         raise ArtifactError("Selection artifact test-selection provenance is malformed")
     if all(
         candidate_id == structure_id
@@ -133,12 +131,9 @@ def write_selected_structures(
                 numeric_path.resolve().relative_to(selected_dir.resolve())
             except ValueError as exc:
                 raise ArtifactError(
-                    "Selection entropy diagnostics artifact path escapes the artifact "
-                    "directory"
+                    "Selection entropy diagnostics artifact path escapes the artifact directory"
                 ) from exc
-            previous[numeric_path] = (
-                numeric_path.read_bytes() if numeric_path.is_file() else None
-            )
+            previous[numeric_path] = numeric_path.read_bytes() if numeric_path.is_file() else None
     try:
         write_extxyz(train_path, selected_structures(train_indices))
         logger.info("  Training set saved to %s", train_path)
@@ -206,9 +201,7 @@ def write_selected_structures(
                     all_candidate_ids[index] for index in sorted(set(train_anchor_indices or []))
                 ],
                 "train_acquisition_order": list(train_acquisition_order or []),
-                "entropy_diagnostics": (
-                    diagnostics_payload
-                ),
+                "entropy_diagnostics": (diagnostics_payload),
                 "artifacts": artifact_records,
             },
         )

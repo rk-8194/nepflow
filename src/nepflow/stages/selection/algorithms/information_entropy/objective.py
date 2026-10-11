@@ -13,16 +13,18 @@ from nepflow.io.hashing import sha256_canonical_json
 from .models import (
     ENTROPY_OBJECTIVE_SCHEMA_VERSION,
     SPARSE_CANDIDATE_CONTRIBUTION_SCHEMA_VERSION,
-    SPARSE_STREAMED_CANDIDATE_CONTRIBUTION_SCHEMA_VERSION,
     SPARSE_NUMERICAL_TOLERANCE,
+    SPARSE_STREAMED_CANDIDATE_CONTRIBUTION_SCHEMA_VERSION,
     EntropyObjectiveDiagnostics,
     EntropyObjectiveState,
     EntropyPool,
+    OutOfCoreSparseCandidateContributions,
     SparseCandidateContributionRow,
     SparseCandidateContributions,
 )
 
 ObjectiveCandidate = int | str
+CandidateContributionStore = SparseCandidateContributions | OutOfCoreSparseCandidateContributions
 
 
 def _validate_beta(beta: Any) -> float:
@@ -54,12 +56,15 @@ def _validate_identity(value: Any, *, name: str) -> str:
 
 def _validate_objective_inputs(
     pool: EntropyPool,
-    contributions: SparseCandidateContributions,
+    contributions: CandidateContributionStore,
 ) -> tuple[int, tuple[str, ...], str]:
     if not isinstance(pool, EntropyPool):
         raise TypeError("objective requires an EntropyPool")
-    if not isinstance(contributions, SparseCandidateContributions):
-        raise TypeError("objective requires SparseCandidateContributions")
+    if not isinstance(
+        contributions,
+        (SparseCandidateContributions, OutOfCoreSparseCandidateContributions),
+    ):
+        raise TypeError("objective requires a candidate contribution store")
     pool_fingerprint = _validate_identity(pool.fingerprint, name="pool fingerprint")
     contribution_pool_fingerprint = _validate_identity(
         contributions.pool_fingerprint,
@@ -270,12 +275,15 @@ def _select_candidate_argument(
 
 def _validate_state_compatibility(
     state: EntropyObjectiveState,
-    contributions: SparseCandidateContributions,
+    contributions: CandidateContributionStore,
 ) -> None:
     if not isinstance(state, EntropyObjectiveState):
         raise TypeError("objective operation requires EntropyObjectiveState")
-    if not isinstance(contributions, SparseCandidateContributions):
-        raise TypeError("objective operation requires SparseCandidateContributions")
+    if not isinstance(
+        contributions,
+        (SparseCandidateContributions, OutOfCoreSparseCandidateContributions),
+    ):
+        raise TypeError("objective operation requires a candidate contribution store")
     if state.contributions_fingerprint != contributions.fingerprint:
         raise ValueError("objective state belongs to different candidate contributions")
     if state.pool_fingerprint != contributions.pool_fingerprint:
@@ -317,7 +325,7 @@ def _support_gain(
 
 def initialize_entropy_objective(
     pool: EntropyPool,
-    contributions: SparseCandidateContributions,
+    contributions: CandidateContributionStore,
     beta: float,
     anchors: Iterable[str] | None = (),
     budget: int | None = None,
@@ -448,7 +456,7 @@ def recompute_objective(state: EntropyObjectiveState) -> float:
 
 def marginal_gain(
     state: EntropyObjectiveState,
-    contributions: SparseCandidateContributions,
+    contributions: CandidateContributionStore,
     candidate: ObjectiveCandidate | None = None,
     *,
     candidate_id: ObjectiveCandidate | None = None,
@@ -466,7 +474,7 @@ def marginal_gain(
 
 def apply_candidate(
     state: EntropyObjectiveState,
-    contributions: SparseCandidateContributions,
+    contributions: CandidateContributionStore,
     candidate: ObjectiveCandidate | None = None,
     *,
     candidate_id: ObjectiveCandidate | None = None,

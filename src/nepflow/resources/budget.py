@@ -18,7 +18,7 @@ import tempfile
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Mapping
+from typing import Callable, Mapping
 
 try:
     import resource as _resource
@@ -83,10 +83,7 @@ class ResourceSnapshot:
             object.__setattr__(self, name, _optional_nonnegative(getattr(self, name), name))
         status = str(self.cgroup_status).strip().lower()
         if status not in _CGROUP_STATUSES:
-            raise ValueError(
-                "cgroup_status must be one of: "
-                f"{', '.join(sorted(_CGROUP_STATUSES))}"
-            )
+            raise ValueError(f"cgroup_status must be one of: {', '.join(sorted(_CGROUP_STATUSES))}")
         if status == "absent" and self.effective_cgroup_memory_limit_bytes is not None:
             status = "finite" if self.effective_cgroup_current_bytes is not None else "unknown"
         if status == "finite" and (
@@ -98,8 +95,7 @@ class ResourceSnapshot:
         object.__setattr__(self, "cgroup_paths", tuple(map(str, self.cgroup_paths)))
         if self.effective_cgroup_current_bytes is not None and (
             self.effective_cgroup_memory_limit_bytes is not None
-            and self.effective_cgroup_current_bytes
-            > self.effective_cgroup_memory_limit_bytes
+            and self.effective_cgroup_current_bytes > self.effective_cgroup_memory_limit_bytes
         ):
             raise ValueError("cgroup current usage cannot exceed its effective limit")
         candidates: list[int] = []
@@ -182,9 +178,7 @@ class ResourceBudget:
             "memory_budget_bytes",
             _optional_nonnegative(self.memory_budget_bytes, "memory_budget_bytes"),
         )
-        reserve = _optional_nonnegative(
-            self.reserved_headroom_bytes, "reserved_headroom_bytes"
-        )
+        reserve = _optional_nonnegative(self.reserved_headroom_bytes, "reserved_headroom_bytes")
         assert reserve is not None
         object.__setattr__(self, "reserved_headroom_bytes", reserve)
         object.__setattr__(
@@ -245,8 +239,7 @@ class WorkspaceLease:
         self.granted_bytes = requested_peak_bytes
         self.scratch_bytes = scratch_bytes
         self._memory_charge_bytes = (
-            requested_peak_bytes
-            + (scratch_bytes if service.budget.scratch_is_memory_backed else 0)
+            requested_peak_bytes + (scratch_bytes if service.budget.scratch_is_memory_backed else 0)
             if memory_charge_bytes is None
             else memory_charge_bytes
         )
@@ -288,7 +281,43 @@ class ResourceBudgetService:
         self._reserved_memory = 0
         self._reserved_scratch = 0
         self._leases: set[WorkspaceLease] = set()
+        self._optional_eviction_callbacks: dict[int, Callable[[], int]] = {}
+        self._next_optional_eviction_id = 0
         self._lock = threading.RLock()
+
+    def register_optional_eviction(self, callback: Callable[[], int]) -> int:
+        """Register an optional allocation that may be dropped under pressure.
+
+        Required workspace leases remain authoritative.  When a required lease
+        cannot be admitted, registered optional owners are given an opportunity
+        to release memory before the request fails.  The callback must return
+        the number of bytes it released and must not raise for normal eviction.
+        """
+
+        if not callable(callback):
+            raise TypeError("optional eviction callback must be callable")
+        with self._lock:
+            token = self._next_optional_eviction_id
+            self._next_optional_eviction_id += 1
+            self._optional_eviction_callbacks[token] = callback
+            return token
+
+    def unregister_optional_eviction(self, token: int) -> None:
+        """Remove an optional eviction callback when its owner is disposed."""
+
+        with self._lock:
+            self._optional_eviction_callbacks.pop(int(token), None)
+
+    def _evict_optional_memory_locked(self, requested_memory: int, available: int) -> None:
+        """Release optional allocations until ``requested_memory`` can fit."""
+
+        for token, callback in tuple(self._optional_eviction_callbacks.items()):
+            if self._reserved_memory + requested_memory <= available:
+                break
+            try:
+                callback()
+            except Exception:  # pragma: no cover - defensive isolation
+                logger.exception("optional resource eviction callback failed: token=%d", token)
 
     @property
     def reserved_memory_bytes(self) -> int:
@@ -361,6 +390,8 @@ class ResourceBudgetService:
                     scratch_available_bytes=self.budget.scratch_budget_bytes,
                 )
             if self._reserved_memory + memory_request > available:
+                self._evict_optional_memory_locked(memory_request, available)
+            if self._reserved_memory + memory_request > available:
                 raise ResourceCapacityError(
                     f"{operation} exceeds the managed runtime memory budget: "
                     f"requested_bytes={memory_request}, "
@@ -373,9 +404,7 @@ class ResourceBudgetService:
                     scratch_needed_bytes=scratch,
                     scratch_available_bytes=self.budget.scratch_budget_bytes,
                 )
-            if (
-                scratch > 0 and self.budget.scratch_budget_bytes is None
-            ):
+            if scratch > 0 and self.budget.scratch_budget_bytes is None:
                 raise ResourceCapacityError(
                     f"{operation} requires scratch capacity, but scratch availability is unknown",
                     operation=operation,
@@ -441,6 +470,8 @@ class ResourceBudgetService:
                     reserved_headroom_bytes=self.budget.reserved_headroom_bytes,
                 )
             if self._reserved_memory - old_memory + new_memory > available:
+                self._evict_optional_memory_locked(max(0, new_memory - old_memory), available)
+            if self._reserved_memory - old_memory + new_memory > available:
                 raise ResourceCapacityError(
                     f"{lease.operation} exceeds the managed runtime memory budget while "
                     f"resizing: requested_bytes={new_memory}, "
@@ -452,9 +483,7 @@ class ResourceBudgetService:
                     scratch_needed_bytes=scratch,
                     scratch_available_bytes=self.budget.scratch_budget_bytes,
                 )
-            if (
-                scratch > 0 and self.budget.scratch_budget_bytes is None
-            ):
+            if scratch > 0 and self.budget.scratch_budget_bytes is None:
                 raise ResourceCapacityError(
                     f"{lease.operation} requires scratch capacity, but scratch "
                     "availability is unknown",
@@ -523,9 +552,7 @@ def _parse_size(value: str, *, default_unit: str = "b") -> int | None:
         ("tb", 1024**4),
         ("t", 1024**4),
     )
-    multiplier = {"b": 1, "kb": 1024, "mb": 1024**2, "gb": 1024**3}.get(
-        default_unit.lower(), 1
-    )
+    multiplier = {"b": 1, "kb": 1024, "mb": 1024**2, "gb": 1024**3}.get(default_unit.lower(), 1)
     for suffix, candidate_multiplier in suffixes:
         if token.endswith(suffix):
             token = token[: -len(suffix)].strip()
@@ -551,9 +578,7 @@ def _unescape_mountinfo(value: str) -> str:
     return value.replace("\\040", " ").replace("\\011", "\t").replace("\\134", "\\")
 
 
-def _linux_cgroup_paths(
-    proc_root: Path, cgroup_root: Path
-) -> list[tuple[Path, Path, str]]:
+def _linux_cgroup_paths(proc_root: Path, cgroup_root: Path) -> list[tuple[Path, Path, str]]:
     membership = _safe_read(proc_root / "self" / "cgroup") or ""
     mountinfo = _safe_read(proc_root / "self" / "mountinfo") or ""
     paths: list[tuple[Path, Path, str]] = []
@@ -706,9 +731,7 @@ def _ancestor_memory_metrics(
 ) -> list[tuple[int, int | None]]:
     """Compatibility wrapper for callers that only need finite metrics."""
 
-    return list(
-        _probe_ancestor_memory_metrics(path, mount_root, limit_name, current_name).metrics
-    )
+    return list(_probe_ancestor_memory_metrics(path, mount_root, limit_name, current_name).metrics)
 
 
 def _detect_linux_cgroup(
@@ -977,11 +1000,7 @@ def detect_resource_snapshot(
     if host_available is not None:
         candidates.append(host_available)
     cgroup_headroom = None
-    if (
-        cgroup_status == "finite"
-        and cgroup_limit is not None
-        and cgroup_current is not None
-    ):
+    if cgroup_status == "finite" and cgroup_limit is not None and cgroup_current is not None:
         cgroup_headroom = max(0, cgroup_limit - cgroup_current)
         candidates.append(cgroup_headroom)
     if scheduler_bytes is not None:
@@ -1056,9 +1075,7 @@ def build_resource_budget(
         memory_budget_bytes = _optional_positive(memory_budget_bytes, "memory_budget_bytes")
         detected = memory_budget_bytes if detected is None else min(detected, memory_budget_bytes)
     if reserved_headroom_bytes is None:
-        reserve = (
-            math.ceil(detected * safety_margin_fraction) if detected is not None else 0
-        )
+        reserve = math.ceil(detected * safety_margin_fraction) if detected is not None else 0
     else:
         reserve = _optional_nonnegative(reserved_headroom_bytes, "reserved_headroom_bytes")
         assert reserve is not None

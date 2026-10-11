@@ -230,6 +230,7 @@ _ALLOWED_KEYS: dict[str, frozenset[str]] = {
             "entropy_bandwidth_backend",
             "entropy_bandwidth_metric",
             "entropy_bandwidth_chunk_size",
+            "entropy_bandwidth_max_neighbour_cache_bytes",
             "beta",
             "optimizer_method",
             "local_cutoff",

@@ -683,6 +683,14 @@ def parse_selection(values: Mapping[str, str]) -> SelectionConfig:
         max_neighbour_entries=None,
         max_index_bytes=None,
         max_radius_query_bytes=None,
+        max_neighbour_cache_bytes=_parse_optional_int(
+            value(
+                "entropy_bandwidth_max_neighbour_cache_bytes",
+                "",
+                "max_neighbour_cache_bytes",
+            ),
+            "selection.entropy_bandwidth_max_neighbour_cache_bytes",
+        ),
         max_calibration_work_bytes=None,
         calibration_batch_size=None,
     )
@@ -782,9 +790,7 @@ def parse_selection(values: Mapping[str, str]) -> SelectionConfig:
         target_tolerance=_parse_int(
             values.get("target_tolerance", "50"), "selection.target_tolerance"
         ),
-        test_selection_policy=values.get(
-            "test_selection_policy", "representative"
-        ).strip().lower(),
+        test_selection_policy=values.get("test_selection_policy", "representative").strip().lower(),
         test_atom_weighting=values.get("test_atom_weighting", "candidate").strip().lower(),
         test_signature_bins=_parse_int(
             values.get("test_signature_bins", "4"), "selection.test_signature_bins"

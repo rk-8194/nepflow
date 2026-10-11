@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -12,6 +15,8 @@ NEIGHBOUR_BACKEND_ID = "exact_cpu"
 NEIGHBOUR_BACKEND_VERSION = "exact-cpu-v1"
 INDEXED_NEIGHBOUR_BACKEND_ID = "exact_indexed_cpu"
 INDEXED_NEIGHBOUR_BACKEND_VERSION = "exact-indexed-cpu-v1"
+TILED_NEIGHBOUR_BACKEND_ID = "exact_tiled_cpu"
+TILED_NEIGHBOUR_BACKEND_VERSION = "exact-tiled-cpu-v1"
 DEFAULT_NEIGHBOUR_BACKEND_ID = INDEXED_NEIGHBOUR_BACKEND_ID
 NEIGHBOUR_METRIC = "euclidean"
 NEIGHBOUR_DISTINCT_POLICY = "exact-coordinate-location-v1"
@@ -22,9 +27,8 @@ KERNEL_FAMILY = "wendland_c2"
 KERNEL_VERSION = "wendland-c2-v1"
 SPARSE_KERNEL_GRAPH_SCHEMA_VERSION = "sparse-atomic-kernel-graph-v1"
 SPARSE_CANDIDATE_CONTRIBUTION_SCHEMA_VERSION = "sparse-candidate-contributions-v1"
-SPARSE_STREAMED_CANDIDATE_CONTRIBUTION_SCHEMA_VERSION = (
-    "sparse-candidate-contributions-streamed-v1"
-)
+SPARSE_STREAMED_CANDIDATE_CONTRIBUTION_SCHEMA_VERSION = "sparse-candidate-contributions-streamed-v1"
+OUT_OF_CORE_CANDIDATE_CONTRIBUTION_SCHEMA_VERSION = "out-of-core-sparse-candidate-contributions-v1"
 KERNEL_OPERATOR_SCHEMA_VERSION = "kernel-operator-v1"
 SPARSE_NUMERICAL_TOLERANCE = 1.0e-12
 ENTROPY_OBJECTIVE_SCHEMA_VERSION = "entropy-objective-v1"
@@ -84,6 +88,7 @@ class EntropyBandwidthSettings:
     max_neighbour_entries: int | None = None
     max_index_bytes: int | None = None
     max_radius_query_bytes: int | None = None
+    max_neighbour_cache_bytes: int | None = None
     max_calibration_work_bytes: int | None = None
     calibration_batch_size: int | None = None
 
@@ -91,7 +96,11 @@ class EntropyBandwidthSettings:
         mode = str(self.mode).strip().lower()
         if mode not in {"manual", "automatic"}:
             raise ValueError("bandwidth mode must be 'manual' or 'automatic'")
-        if self.backend not in {NEIGHBOUR_BACKEND_ID, INDEXED_NEIGHBOUR_BACKEND_ID}:
+        if self.backend not in {
+            NEIGHBOUR_BACKEND_ID,
+            INDEXED_NEIGHBOUR_BACKEND_ID,
+            TILED_NEIGHBOUR_BACKEND_ID,
+        }:
             raise ValueError(f"unsupported neighbour backend: {self.backend!r}")
         if self.metric != NEIGHBOUR_METRIC:
             raise ValueError(f"unsupported neighbour metric: {self.metric!r}")
@@ -111,7 +120,11 @@ class EntropyBandwidthSettings:
             or int(self.max_index_bytes) < 1
         ):
             raise ValueError("max_index_bytes must be a positive integer when provided")
-        for name in ("max_radius_query_bytes", "max_calibration_work_bytes"):
+        for name in (
+            "max_radius_query_bytes",
+            "max_neighbour_cache_bytes",
+            "max_calibration_work_bytes",
+        ):
             value = getattr(self, name)
             if value is not None and (
                 isinstance(value, bool)
@@ -144,6 +157,10 @@ class EntropyBandwidthSettings:
             object.__setattr__(self, "max_radius_query_bytes", int(self.max_radius_query_bytes))
         if self.max_index_bytes is not None:
             object.__setattr__(self, "max_index_bytes", int(self.max_index_bytes))
+        if self.max_neighbour_cache_bytes is not None:
+            object.__setattr__(
+                self, "max_neighbour_cache_bytes", int(self.max_neighbour_cache_bytes)
+            )
         if self.max_calibration_work_bytes is not None:
             object.__setattr__(
                 self, "max_calibration_work_bytes", int(self.max_calibration_work_bytes)
@@ -296,9 +313,17 @@ class FrozenBandwidths:
         expected_backend_version = (
             INDEXED_NEIGHBOUR_BACKEND_VERSION
             if self.backend == INDEXED_NEIGHBOUR_BACKEND_ID
-            else NEIGHBOUR_BACKEND_VERSION
+            else (
+                TILED_NEIGHBOUR_BACKEND_VERSION
+                if self.backend == TILED_NEIGHBOUR_BACKEND_ID
+                else NEIGHBOUR_BACKEND_VERSION
+            )
         )
-        if self.backend not in {NEIGHBOUR_BACKEND_ID, INDEXED_NEIGHBOUR_BACKEND_ID}:
+        if self.backend not in {
+            NEIGHBOUR_BACKEND_ID,
+            INDEXED_NEIGHBOUR_BACKEND_ID,
+            TILED_NEIGHBOUR_BACKEND_ID,
+        }:
             raise ValueError(f"unsupported neighbour backend: {self.backend!r}")
         if self.backend_version != expected_backend_version:
             raise ValueError(
@@ -685,6 +710,9 @@ class StreamedKernelExecutionSummary:
     atomic_graph_csr_bytes: int = 0
     source_query_count: int = 0
     numerical_tolerance: float = SPARSE_NUMERICAL_TOLERANCE
+    candidate_storage: str = "memory"
+    candidate_storage_path: str | None = None
+    candidate_resident_bytes: int = 0
 
     def __post_init__(self) -> None:
         for name in (
@@ -701,6 +729,7 @@ class StreamedKernelExecutionSummary:
             "estimated_peak_memory_bytes",
             "atomic_graph_csr_bytes",
             "source_query_count",
+            "candidate_resident_bytes",
         ):
             value = _exact_integer(getattr(self, name), name=name)
             if value < 0:
@@ -734,6 +763,12 @@ class StreamedKernelExecutionSummary:
             raise ValueError("streamed execution summary cannot claim a materialized graph")
         if self.atomic_graph_csr_bytes != 0:
             raise ValueError("streamed execution must report zero atomic graph CSR bytes")
+        if self.candidate_storage not in {"memory", "disk"}:
+            raise ValueError("candidate_storage must be 'memory' or 'disk'")
+        if self.candidate_storage_path is not None and not isinstance(
+            self.candidate_storage_path, str
+        ):
+            raise ValueError("candidate_storage_path must be a string when supplied")
         for name, value in (
             ("backend", self.backend),
             ("metric", self.metric),
@@ -817,6 +852,9 @@ class StreamedKernelExecutionSummary:
                 "csr_array_bytes": 0,
                 "atomic_graph_csr_bytes": 0,
                 "candidate_csr_array_bytes": self.candidate_csr_array_bytes,
+                "candidate_storage": self.candidate_storage,
+                "candidate_storage_path": self.candidate_storage_path,
+                "candidate_resident_bytes": self.candidate_resident_bytes,
                 "measured_peak_memory_bytes": self.measured_peak_memory_bytes,
                 "estimated_peak_memory_bytes": self.estimated_peak_memory_bytes,
                 "contribution_spool_bytes": self.contribution_spool_bytes,
@@ -986,9 +1024,8 @@ class SparseCandidateContributions:
         operator_fingerprint = self.kernel_operator_fingerprint or self.graph_fingerprint
         if not isinstance(operator_fingerprint, str) or not operator_fingerprint.strip():
             raise ValueError("kernel_operator_fingerprint must be non-blank")
-        if (
-            self.sparse_schema_version == SPARSE_CANDIDATE_CONTRIBUTION_SCHEMA_VERSION
-            and (not isinstance(self.graph_fingerprint, str) or not self.graph_fingerprint.strip())
+        if self.sparse_schema_version == SPARSE_CANDIDATE_CONTRIBUTION_SCHEMA_VERSION and (
+            not isinstance(self.graph_fingerprint, str) or not self.graph_fingerprint.strip()
         ):
             raise ValueError("graph_fingerprint is required for graph-backed contributions")
         object.__setattr__(self, "kernel_operator_fingerprint", operator_fingerprint)
@@ -1062,6 +1099,232 @@ class SparseCandidateContributions:
             candidate_id=self.candidate_ids[index],
             target_indices=self.target_indices[start:stop],
             values=self.values[start:stop],
+        )
+
+    get_candidate = candidate_row
+
+    def iter_candidates(self):
+        for candidate_index in range(self.n_candidates):
+            yield self.candidate_row(candidate_index)
+
+
+class OutOfCoreSparseCandidateContributions:
+    """Validated memory-mapped candidate PMFs.
+
+    The manifest is the publication boundary.  Array files are opened only
+    after every recorded digest and shape has been verified, so a selector
+    cannot accidentally consume a partially promoted contribution store.
+    ``candidate_indptr`` is intentionally kept as a small read-only array;
+    target indices and values remain memory mapped and are sliced per greedy
+    access rather than loaded as one ``M x N`` object.
+    """
+
+    SCHEMA_VERSION = OUT_OF_CORE_CANDIDATE_CONTRIBUTION_SCHEMA_VERSION
+
+    def __init__(self, directory: str | Path) -> None:
+        root = Path(directory)
+        manifest_path = root / "manifest.json"
+        if not root.is_dir() or not manifest_path.is_file():
+            raise ValueError(f"candidate contribution store is incomplete: {root}")
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise ValueError("candidate contribution store manifest is unreadable") from exc
+        if manifest.get("schema") != self.SCHEMA_VERSION:
+            raise ValueError("unsupported out-of-core candidate contribution schema")
+        files = manifest.get("files")
+        if not isinstance(files, dict):
+            raise ValueError("candidate contribution store has no file manifest")
+
+        def load_array(name: str, dtype: np.dtype[Any]) -> np.ndarray:
+            entry = files.get(name)
+            if not isinstance(entry, dict):
+                raise ValueError(f"candidate contribution store is missing {name}")
+            filename = entry.get("name")
+            if not isinstance(filename, str) or Path(filename).name != filename:
+                raise ValueError(f"candidate contribution store has an invalid {name} path")
+            path = root / filename
+            if not path.is_file():
+                raise ValueError(f"candidate contribution store is missing {name} data")
+            digest = hashlib.sha256()
+            try:
+                with path.open("rb") as handle:
+                    for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                        digest.update(chunk)
+            except OSError as exc:
+                raise ValueError(f"candidate contribution store cannot read {name}") from exc
+            if digest.hexdigest() != entry.get("sha256"):
+                raise ValueError(f"candidate contribution store checksum mismatch for {name}")
+            try:
+                array = np.load(path, mmap_mode="r", allow_pickle=False)
+            except (OSError, ValueError) as exc:
+                raise ValueError(f"candidate contribution store has invalid {name} data") from exc
+            if array.dtype != dtype or tuple(array.shape) != tuple(entry.get("shape", ())):
+                raise ValueError(f"candidate contribution store has invalid {name} metadata")
+            return array
+
+        candidate_ids = tuple(manifest.get("candidate_ids", ()))
+        if not candidate_ids or any(
+            not isinstance(value, str) or not value.strip() for value in candidate_ids
+        ):
+            raise ValueError("candidate contribution store has invalid candidate IDs")
+        if len(set(candidate_ids)) != len(candidate_ids):
+            raise ValueError("candidate contribution store candidate IDs are not unique")
+        indptr = load_array("candidate_indptr", np.dtype(np.int64))
+        targets = load_array("target_indices", np.dtype(np.int64))
+        values = load_array("values", np.dtype(np.float64))
+        source_counts = None
+        if "candidate_source_counts" in files:
+            source_counts = load_array("candidate_source_counts", np.dtype(np.int64))
+        if indptr.ndim != 1 or indptr.shape[0] != len(candidate_ids) + 1:
+            raise ValueError("candidate contribution store has invalid CSR offsets")
+        if targets.ndim != 1 or values.ndim != 1 or targets.shape != values.shape:
+            raise ValueError("candidate contribution store has misaligned CSR arrays")
+        if (
+            int(indptr[0]) != 0
+            or int(indptr[-1]) != targets.shape[0]
+            or np.any(np.diff(indptr) < 0)
+        ):
+            raise ValueError("candidate contribution store has invalid CSR offsets")
+        row_count = _exact_integer(manifest.get("row_count"), name="store row_count")
+        if row_count < 1 or np.any(targets < 0) or np.any(targets >= row_count):
+            raise ValueError("candidate contribution store has invalid target rows")
+        if source_counts is not None and (
+            source_counts.shape != (len(candidate_ids),) or np.any(source_counts <= 0)
+        ):
+            raise ValueError("candidate contribution store has invalid source counts")
+        for index in range(len(candidate_ids)):
+            start = int(indptr[index])
+            stop = int(indptr[index + 1])
+            row_values = values[start:stop]
+            if stop <= start or np.any(np.diff(targets[start:stop]) <= 0):
+                raise ValueError("candidate contribution store contains an empty or unsorted row")
+            if not np.all(np.isfinite(row_values)) or np.any(row_values <= 0.0):
+                raise ValueError("candidate contribution store contains invalid values")
+            if not math.isclose(
+                float(np.sum(row_values, dtype=np.float64)),
+                1.0,
+                rel_tol=0.0,
+                abs_tol=SPARSE_NUMERICAL_TOLERANCE,
+            ):
+                raise ValueError("candidate contribution store row is not normalized")
+        for name in ("fingerprint", "kernel_operator_fingerprint", "pool_fingerprint"):
+            if not isinstance(manifest.get(name), str) or not manifest[name].strip():
+                raise ValueError(f"candidate contribution store has no {name}")
+        self.directory = root
+        self.candidate_indptr = indptr
+        self.target_indices = targets
+        self.values = values
+        self.candidate_source_counts = source_counts
+        self.candidate_ids = candidate_ids
+        self.graph_fingerprint = str(manifest.get("graph_fingerprint", ""))
+        self.fingerprint = str(manifest["fingerprint"])
+        self.row_count = row_count
+        self.pool_fingerprint = str(manifest["pool_fingerprint"])
+        self.sparse_schema_version = str(manifest.get("sparse_schema_version", ""))
+        self.numerical_tolerance = float(manifest.get("numerical_tolerance", 0.0))
+        self.kernel_operator_fingerprint = str(manifest["kernel_operator_fingerprint"])
+        if self.sparse_schema_version != SPARSE_STREAMED_CANDIDATE_CONTRIBUTION_SCHEMA_VERSION:
+            raise ValueError("unsupported out-of-core sparse contribution schema")
+        if not math.isfinite(self.numerical_tolerance) or not math.isclose(
+            self.numerical_tolerance,
+            SPARSE_NUMERICAL_TOLERANCE,
+            rel_tol=0.0,
+            abs_tol=0.0,
+        ):
+            raise ValueError("unsupported out-of-core sparse contribution tolerance")
+        self.manifest = dict(manifest)
+
+    @property
+    def n_candidates(self) -> int:
+        return len(self.candidate_ids)
+
+    @property
+    def n_targets(self) -> int:
+        return self.row_count
+
+    @property
+    def entry_count(self) -> int:
+        return int(self.target_indices.shape[0])
+
+    @property
+    def nnz(self) -> int:
+        return self.entry_count
+
+    @property
+    def kernel_source_fingerprint(self) -> str:
+        return self.kernel_operator_fingerprint
+
+    @property
+    def array_bytes(self) -> int:
+        return int(
+            self.candidate_indptr.nbytes
+            + self.target_indices.nbytes
+            + self.values.nbytes
+            + (
+                self.candidate_source_counts.nbytes
+                if self.candidate_source_counts is not None
+                else 0
+            )
+        )
+
+    @property
+    def resident_array_bytes(self) -> int:
+        return int(
+            self.candidate_indptr.nbytes
+            + (
+                self.candidate_source_counts.nbytes
+                if self.candidate_source_counts is not None
+                else 0
+            )
+        )
+
+    @property
+    def storage_bytes(self) -> int:
+        return self.array_bytes
+
+    @property
+    def support_sizes(self) -> np.ndarray:
+        values = np.diff(np.asarray(self.candidate_indptr, dtype=np.int64)).astype(
+            np.int64, copy=True
+        )
+        values.setflags(write=False)
+        return values
+
+    @property
+    def indptr(self) -> np.ndarray:
+        return self.candidate_indptr
+
+    @property
+    def indices(self) -> np.ndarray:
+        return self.target_indices
+
+    @property
+    def data(self) -> np.ndarray:
+        return self.values
+
+    def candidate_index(self, candidate: int | str) -> int:
+        if isinstance(candidate, bool):
+            raise TypeError("candidate selector must be an index or candidate ID")
+        if isinstance(candidate, str):
+            try:
+                return self.candidate_ids.index(candidate)
+            except ValueError as exc:
+                raise KeyError(candidate) from exc
+        index = _exact_integer(candidate, name="candidate selector")
+        if index < 0 or index >= self.n_candidates:
+            raise IndexError("candidate index is outside the contribution record")
+        return index
+
+    def candidate_row(self, candidate: int | str) -> SparseCandidateContributionRow:
+        index = self.candidate_index(candidate)
+        start = int(self.candidate_indptr[index])
+        stop = int(self.candidate_indptr[index + 1])
+        return SparseCandidateContributionRow(
+            candidate_index=index,
+            candidate_id=self.candidate_ids[index],
+            target_indices=np.asarray(self.target_indices[start:stop], dtype=np.int64),
+            values=np.asarray(self.values[start:stop], dtype=np.float64),
         )
 
     get_candidate = candidate_row
@@ -1641,12 +1904,15 @@ __all__ = [
     "NEIGHBOUR_BACKEND_VERSION",
     "INDEXED_NEIGHBOUR_BACKEND_ID",
     "INDEXED_NEIGHBOUR_BACKEND_VERSION",
+    "TILED_NEIGHBOUR_BACKEND_ID",
+    "TILED_NEIGHBOUR_BACKEND_VERSION",
     "DEFAULT_NEIGHBOUR_BACKEND_ID",
     "DEFAULT_RADIUS_QUERY_BYTES",
     "NEIGHBOUR_DISTINCT_POLICY",
     "NEIGHBOUR_METRIC",
     "SPARSE_CANDIDATE_CONTRIBUTION_SCHEMA_VERSION",
     "SPARSE_STREAMED_CANDIDATE_CONTRIBUTION_SCHEMA_VERSION",
+    "OUT_OF_CORE_CANDIDATE_CONTRIBUTION_SCHEMA_VERSION",
     "KERNEL_OPERATOR_SCHEMA_VERSION",
     "ENTROPY_OBJECTIVE_SCHEMA_VERSION",
     "SPARSE_KERNEL_GRAPH_SCHEMA_VERSION",
@@ -1655,6 +1921,7 @@ __all__ = [
     "SparseAtomicKernelRow",
     "SparseCandidateContributionRow",
     "SparseCandidateContributions",
+    "OutOfCoreSparseCandidateContributions",
     "StreamedKernelExecutionSummary",
     "GreedySelectionHistory",
     "GreedySelectionPerformance",
