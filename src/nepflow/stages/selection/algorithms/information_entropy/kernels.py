@@ -32,6 +32,8 @@ from .checkpointing import (
 )
 from .models import (
     DEFAULT_RADIUS_QUERY_BYTES,
+    GPU_NEIGHBOUR_BACKEND_ID,
+    GPU_NEIGHBOUR_BACKEND_VERSION,
     INDEXED_NEIGHBOUR_BACKEND_ID,
     INDEXED_NEIGHBOUR_BACKEND_VERSION,
     KERNEL_FAMILY,
@@ -221,6 +223,7 @@ class _KernelSupportProvider:
         gpu_device: int = 0,
         gpu_tile_size: int = 128,
         max_gpu_support_bytes: int | None = None,
+        max_gpu_neighbour_bytes: int | None = None,
     ) -> None:
         self.descriptors = _validate_descriptors(descriptors)
         self.backend = backend
@@ -270,7 +273,17 @@ class _KernelSupportProvider:
             else "cpu-canonical-v1"
         )
         self.gpu_support: Any = None
-        if backend in {INDEXED_NEIGHBOUR_BACKEND_ID, TILED_NEIGHBOUR_BACKEND_ID}:
+        if max_gpu_neighbour_bytes is None and backend == GPU_NEIGHBOUR_BACKEND_ID:
+            # Older public kernel entry points expose only the support limit.
+            # Reusing it as a conservative device ceiling preserves their
+            # bounded-memory contract; the dedicated bandwidth configuration
+            # passes max_gpu_neighbour_bytes explicitly at index construction.
+            max_gpu_neighbour_bytes = max_gpu_support_bytes
+        if backend in {
+            INDEXED_NEIGHBOUR_BACKEND_ID,
+            TILED_NEIGHBOUR_BACKEND_ID,
+            GPU_NEIGHBOUR_BACKEND_ID,
+        }:
             self.index = (
                 index
                 if index is not None
@@ -279,14 +292,22 @@ class _KernelSupportProvider:
                     backend=backend,
                     tile_size=chunk_size,
                     max_radius_query_bytes=self.max_radius_query_bytes,
+                    gpu_device=gpu_device,
+                    gpu_tile_size=gpu_tile_size,
+                    max_gpu_neighbour_bytes=max_gpu_neighbour_bytes,
                     resource_budget=self.resource_budget,
                 )
             )
-            expected_type = (
-                IndexedCPUNeighbourIndex
-                if backend == INDEXED_NEIGHBOUR_BACKEND_ID
-                else TiledCPUNeighbourIndex
-            )
+            if backend == GPU_NEIGHBOUR_BACKEND_ID:
+                from .gpu_neighbours import ExactTiledGPUNeighbourIndex
+
+                expected_type = ExactTiledGPUNeighbourIndex
+            else:
+                expected_type = (
+                    IndexedCPUNeighbourIndex
+                    if backend == INDEXED_NEIGHBOUR_BACKEND_ID
+                    else TiledCPUNeighbourIndex
+                )
             if not isinstance(self.index, expected_type):
                 raise ValueError("exact kernel support requires its configured CPU backend")
             if not np.array_equal(self.index.descriptors, self.descriptors):
@@ -1383,6 +1404,7 @@ def _validate_sparse_graph_inputs(
         NEIGHBOUR_BACKEND_ID,
         INDEXED_NEIGHBOUR_BACKEND_ID,
         TILED_NEIGHBOUR_BACKEND_ID,
+        GPU_NEIGHBOUR_BACKEND_ID,
     }:
         raise ValueError(
             "sparse kernel construction requires a supported exact neighbour backend; "
@@ -1392,6 +1414,7 @@ def _validate_sparse_graph_inputs(
         NEIGHBOUR_BACKEND_ID: NEIGHBOUR_BACKEND_VERSION,
         INDEXED_NEIGHBOUR_BACKEND_ID: INDEXED_NEIGHBOUR_BACKEND_VERSION,
         TILED_NEIGHBOUR_BACKEND_ID: TILED_NEIGHBOUR_BACKEND_VERSION,
+        GPU_NEIGHBOUR_BACKEND_ID: GPU_NEIGHBOUR_BACKEND_VERSION,
     }[frozen.backend]
     if frozen.backend_version != expected_version:
         raise ValueError(
@@ -1574,7 +1597,8 @@ def build_sparse_atomic_kernel_graph(
         max_radius_query_bytes=max_radius_query_bytes,
     )
     if (
-        frozen.backend in {INDEXED_NEIGHBOUR_BACKEND_ID, TILED_NEIGHBOUR_BACKEND_ID}
+        frozen.backend
+        in {INDEXED_NEIGHBOUR_BACKEND_ID, TILED_NEIGHBOUR_BACKEND_ID, GPU_NEIGHBOUR_BACKEND_ID}
         and frozen.backend_fingerprint
         and support_provider.index is not None
         and frozen.backend_fingerprint != support_provider.index.fingerprint
@@ -2214,7 +2238,12 @@ def build_streamed_candidate_contributions(
             max_gpu_support_bytes=max_gpu_support_bytes,
         )
         if (
-            frozen.backend in {INDEXED_NEIGHBOUR_BACKEND_ID, TILED_NEIGHBOUR_BACKEND_ID}
+            frozen.backend
+            in {
+                INDEXED_NEIGHBOUR_BACKEND_ID,
+                TILED_NEIGHBOUR_BACKEND_ID,
+                GPU_NEIGHBOUR_BACKEND_ID,
+            }
             and frozen.backend_fingerprint
             and support_provider.index is not None
             and frozen.backend_fingerprint != support_provider.index.fingerprint

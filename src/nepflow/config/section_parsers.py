@@ -708,6 +708,10 @@ def parse_selection(values: Mapping[str, str]) -> SelectionConfig:
             value("entropy_max_gpu_support_bytes", "", "max_gpu_support_bytes"),
             "selection.entropy_max_gpu_support_bytes",
         ),
+        max_gpu_neighbour_bytes=_parse_optional_int(
+            value("entropy_max_gpu_neighbour_bytes", "", "max_gpu_neighbour_bytes"),
+            "selection.entropy_max_gpu_neighbour_bytes",
+        ),
     )
     entropy = EntropySelectionConfig(
         beta=_parse_float(value("entropy_beta", "1.0", "beta"), "selection.entropy_beta"),

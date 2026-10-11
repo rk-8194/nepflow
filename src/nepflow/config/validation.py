@@ -297,10 +297,12 @@ def validate_config(
         "exact_cpu",
         "exact_indexed_cpu",
         "exact_tiled_cpu",
+        "exact_tiled_gpu_knn",
+        "exact_tiled_gpu",
     }:
         raise ConfigurationError(
             "selection.entropy.bandwidth.backend must be exact_cpu, exact_indexed_cpu, "
-            "or exact_tiled_cpu"
+            "or exact_tiled_cpu, exact_tiled_gpu_knn, or exact_tiled_gpu"
         )
     if bandwidth.metric != "euclidean":
         raise ConfigurationError("selection.entropy.bandwidth.metric only supports euclidean")
@@ -326,6 +328,14 @@ def validate_config(
     ):
         raise ConfigurationError(
             "selection.entropy.bandwidth.max_gpu_support_bytes must be positive when provided"
+        )
+    if bandwidth.max_gpu_neighbour_bytes is not None and (
+        isinstance(bandwidth.max_gpu_neighbour_bytes, bool)
+        or not isinstance(bandwidth.max_gpu_neighbour_bytes, int)
+        or bandwidth.max_gpu_neighbour_bytes < 1
+    ):
+        raise ConfigurationError(
+            "selection.entropy.bandwidth.max_gpu_neighbour_bytes must be positive when provided"
         )
     if not isinstance(bandwidth.chunk_size, int) or bandwidth.chunk_size < 1:
         raise ConfigurationError("selection.entropy.bandwidth.chunk_size must be positive")

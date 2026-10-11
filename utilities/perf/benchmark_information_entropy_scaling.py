@@ -37,6 +37,7 @@ from nepflow.stages.selection.algorithms.information_entropy.kernels import (
 )
 from nepflow.stages.selection.algorithms.information_entropy.models import (
     EntropyBandwidthSettings,
+    GPU_NEIGHBOUR_BACKEND_ALIASES,
     INDEXED_NEIGHBOUR_BACKEND_ID,
     NEIGHBOUR_BACKEND_ID,
     TILED_NEIGHBOUR_BACKEND_ID,
@@ -60,6 +61,7 @@ CASE_NAMES = (
     "wide_support",
 )
 BACKENDS = (INDEXED_NEIGHBOUR_BACKEND_ID, TILED_NEIGHBOUR_BACKEND_ID, NEIGHBOUR_BACKEND_ID)
+AVAILABLE_BACKENDS = (*BACKENDS, *sorted(GPU_NEIGHBOUR_BACKEND_ALIASES))
 PRODUCTION_K_VALUES = EntropyBandwidthSettings().k_candidates
 PRODUCTION_C_VALUES = EntropyBandwidthSettings().c_candidates
 LOO_NUMERICAL_TOLERANCE = 1.0e-12
@@ -68,6 +70,8 @@ LOO_NUMERICAL_TOLERANCE = 1.0e-12
 def _json_default(value: Any) -> Any:
     """Convert NumPy scalar diagnostics to native JSON scalar types."""
 
+    if isinstance(value, (bool, np.bool_)):
+        return bool(value)
     if isinstance(value, np.generic):
         return value.item()
     raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
@@ -99,6 +103,12 @@ def _metric_delta(after: dict[str, Any], before: dict[str, Any]) -> dict[str, An
         "pilot_support_queries",
         "pilot_support_count_total",
         "pilot_support_samples",
+        "gpu_source_tiles",
+        "gpu_target_tiles",
+        "gpu_fp64_evaluations",
+        "gpu_certification_rescans",
+        "gpu_ambiguous_boundary_count",
+        "gpu_certified_tiles",
     }
     result: dict[str, Any] = {}
     for key, value in after.items():
@@ -133,13 +143,23 @@ def _exclusive_knn_phase_seconds(metrics: dict[str, Any]) -> dict[str, float]:
         "radius_preflight_count",
         "radius_retrieval",
         "canonical_distance_verification",
+        "gpu_kernel",
+        "gpu_certification",
+        "gpu_cpu_verification",
         "checkpoint_serialization",
         "checkpoint_fsync",
         "checkpoint_digest",
         "checkpoint_read",
     )
     raw_phases = {
-        phase: float(metrics.get(f"{phase}_seconds", 0.0) or 0.0) for phase in phase_names
+        phase: float(
+            metrics.get(
+                f"{phase}_seconds",
+                metrics.get(f"{phase}_time_seconds", 0.0),
+            )
+            or 0.0
+        )
+        for phase in phase_names
     }
     publication = raw_phases["checkpoint_serialization"]
     fsync = raw_phases["checkpoint_fsync"]
@@ -223,7 +243,10 @@ def _prepare(
     max_radius_query_bytes: int | None,
     max_index_bytes: int | None,
     max_neighbour_cache_bytes: int | None,
-    checkpoint_enabled: bool,
+    gpu_device: int = 0,
+    gpu_tile_size: int = 128,
+    max_gpu_neighbour_bytes: int | None = None,
+    checkpoint_enabled: bool = False,
     materialize_frozen: bool = True,
 ) -> tuple[
     Any,
@@ -235,7 +258,10 @@ def _prepare(
     service = _budget(worker_count, memory_bytes, scratch_bytes)
     index = None
     index_build_started = time.perf_counter()
-    if backend in {INDEXED_NEIGHBOUR_BACKEND_ID, TILED_NEIGHBOUR_BACKEND_ID}:
+    if backend in {
+        INDEXED_NEIGHBOUR_BACKEND_ID,
+        TILED_NEIGHBOUR_BACKEND_ID,
+    } or backend in GPU_NEIGHBOUR_BACKEND_ALIASES:
         index = build_neighbour_index(
             pool.descriptors,
             backend=backend,
@@ -243,6 +269,9 @@ def _prepare(
             max_index_bytes=max_index_bytes,
             max_radius_query_bytes=max_radius_query_bytes,
             max_neighbour_cache_bytes=max_neighbour_cache_bytes,
+            gpu_device=gpu_device,
+            gpu_tile_size=gpu_tile_size,
+            max_gpu_neighbour_bytes=max_gpu_neighbour_bytes,
             resource_budget=service,
         )
     index_build_wall_seconds = (
@@ -1220,7 +1249,7 @@ def main() -> None:
     parser.add_argument("--dimension", type=int, default=42)
     parser.add_argument("--candidates", type=int, default=100)
     parser.add_argument("--case", choices=CASE_NAMES, default="low_duplication")
-    parser.add_argument("--backend", choices=("all", *BACKENDS), default="all")
+    parser.add_argument("--backend", choices=("all", *AVAILABLE_BACKENDS), default="all")
     parser.add_argument("--workers", nargs="+", type=int, default=[1, 8, 64])
     parser.add_argument("--k-max", type=int, default=8)
     parser.add_argument("--chunk-size", type=int, default=256)
@@ -1236,6 +1265,7 @@ def main() -> None:
     parser.add_argument("--gpu-device", type=int, default=0)
     parser.add_argument("--gpu-tile-size", type=int, default=128)
     parser.add_argument("--max-gpu-support-bytes", type=int, default=None)
+    parser.add_argument("--max-gpu-neighbour-bytes", type=int, default=None)
     parser.add_argument("--memory-budget-bytes", type=int, default=None)
     parser.add_argument("--scratch-budget-bytes", type=int, default=None)
     parser.add_argument("--oracle-limit", type=int, default=1024)
@@ -1282,6 +1312,9 @@ def main() -> None:
                     max_radius_query_bytes=args.max_radius_query_bytes,
                     max_index_bytes=args.max_index_bytes,
                     max_neighbour_cache_bytes=args.max_neighbour_cache_bytes,
+                    gpu_device=args.gpu_device,
+                    gpu_tile_size=args.gpu_tile_size,
+                    max_gpu_neighbour_bytes=args.max_gpu_neighbour_bytes,
                     checkpoint_enabled=checkpoint_enabled,
                     materialize_frozen=not args.knn_only,
                 )
@@ -1297,6 +1330,8 @@ def main() -> None:
                     ),
                     "k_max": int(args.k_max),
                     "unique_locations": int(neighbours.unique_locations.shape[0]),
+                    "backend_version": neighbours.backend_version,
+                    "backend_fingerprint": neighbours.backend_fingerprint,
                 }
                 limits = {
                     "chunk_size": args.chunk_size,
@@ -1310,6 +1345,7 @@ def main() -> None:
                     "gpu_device": args.gpu_device,
                     "gpu_tile_size": args.gpu_tile_size,
                     "max_gpu_support_bytes": args.max_gpu_support_bytes,
+                    "max_gpu_neighbour_bytes": args.max_gpu_neighbour_bytes,
                     "knn_only": bool(args.knn_only),
                 }
                 common = {
@@ -1458,7 +1494,7 @@ def main() -> None:
                     index.close()
 
     output = {
-        "schema": "nepflow-information-entropy-scaling-benchmark-v5",
+        "schema": "nepflow-information-entropy-scaling-benchmark-v6",
         "fixture": {
             "case": args.case,
             "seed": 20261011,
@@ -1474,6 +1510,7 @@ def main() -> None:
             "gpu_device": args.gpu_device,
             "gpu_tile_size": args.gpu_tile_size,
             "max_gpu_support_bytes": args.max_gpu_support_bytes,
+            "max_gpu_neighbour_bytes": args.max_gpu_neighbour_bytes,
             "knn_only": bool(args.knn_only),
             "benchmark_mode": "knn-only" if args.knn_only else "full-selection",
         },

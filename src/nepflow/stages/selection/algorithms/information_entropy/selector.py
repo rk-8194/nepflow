@@ -859,6 +859,11 @@ class InformationEntropySelectionAlgorithm:
                     if getattr(bandwidth, "max_gpu_support_bytes", None) is None
                     else int(bandwidth.max_gpu_support_bytes)
                 ),
+                max_gpu_neighbour_bytes=(
+                    None
+                    if getattr(bandwidth, "max_gpu_neighbour_bytes", None) is None
+                    else int(bandwidth.max_gpu_neighbour_bytes)
+                ),
             )
         return EntropyBandwidthSettings()
 
@@ -898,6 +903,7 @@ class InformationEntropySelectionAlgorithm:
                 "gpu_device",
                 "gpu_tile_size",
                 "max_gpu_support_bytes",
+                "max_gpu_neighbour_bytes",
             )
             if name in request.options
         }
@@ -917,6 +923,7 @@ class InformationEntropySelectionAlgorithm:
             gpu_device=bandwidth_settings.gpu_device,
             gpu_tile_size=bandwidth_settings.gpu_tile_size,
             max_gpu_support_bytes=bandwidth_settings.max_gpu_support_bytes,
+            max_gpu_neighbour_bytes=bandwidth_settings.max_gpu_neighbour_bytes,
         )
         remaining_budget = runtime_budget.remaining_managed_budget
         if remaining_budget is None:

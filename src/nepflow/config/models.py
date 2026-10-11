@@ -351,6 +351,7 @@ class EntropyBandwidthConfig:
     gpu_device: int = 0
     gpu_tile_size: int = 128
     max_gpu_support_bytes: int | None = None
+    max_gpu_neighbour_bytes: int | None = None
 
 
 @dataclass(frozen=True, slots=True)

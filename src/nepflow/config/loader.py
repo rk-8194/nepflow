@@ -235,6 +235,7 @@ _ALLOWED_KEYS: dict[str, frozenset[str]] = {
             "entropy_gpu_device",
             "entropy_gpu_tile_size",
             "entropy_max_gpu_support_bytes",
+            "entropy_max_gpu_neighbour_bytes",
             "beta",
             "optimizer_method",
             "local_cutoff",
@@ -256,6 +257,7 @@ _ALLOWED_KEYS: dict[str, frozenset[str]] = {
             "gpu_device",
             "gpu_tile_size",
             "max_gpu_support_bytes",
+            "max_gpu_neighbour_bytes",
             "neighbour_metric",
             "bandwidth_chunk_size",
         }

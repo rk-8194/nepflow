@@ -326,17 +326,22 @@ entropy_bandwidth_k=
 entropy_bandwidth_c=
 entropy_bandwidth_k_candidates=1,2,4,8
 entropy_bandwidth_c_candidates=1.5,2.0,4.0,8.0
-# Exact choices: exact_cpu, exact_indexed_cpu, or exact_tiled_cpu.
+# Exact choices: exact_cpu, exact_indexed_cpu, exact_tiled_cpu, or
+# exact_tiled_gpu_knn (the last requires explicit CUDA/CuPy configuration).
 entropy_bandwidth_backend=exact_indexed_cpu
 entropy_bandwidth_metric=euclidean
 entropy_bandwidth_chunk_size=1024
 entropy_bandwidth_max_neighbour_cache_bytes=
 # Support execution is independent of neighbour determination.  The GPU mode
 # is explicit and requires optional CuPy plus the selected visible CUDA device.
+# exact_tiled_gpu_knn uses the same explicit device only for exact kNN; the
+# kernel support provider remains selected separately below.
 entropy_kernel_support_execution=cpu
 entropy_gpu_device=0
 entropy_gpu_tile_size=128
 entropy_max_gpu_support_bytes=
+# Optional device-workspace ceiling for the explicit exact_tiled_gpu_knn backend.
+entropy_max_gpu_neighbour_bytes=
 # Atomic graph limits apply only to the bounded reference/debug graph API;
 # production information_entropy streams exact candidate contributions.
 

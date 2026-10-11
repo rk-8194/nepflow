@@ -29,6 +29,9 @@ from .checkpointing import (
 from .models import (
     DEFAULT_NEIGHBOUR_BACKEND_ID,
     DEFAULT_RADIUS_QUERY_BYTES,
+    GPU_NEIGHBOUR_BACKEND_ALIASES,
+    GPU_NEIGHBOUR_BACKEND_ID,
+    GPU_NEIGHBOUR_BACKEND_VERSION,
     INDEXED_NEIGHBOUR_BACKEND_ID,
     INDEXED_NEIGHBOUR_BACKEND_VERSION,
     NEIGHBOUR_BACKEND_ID,
@@ -159,12 +162,22 @@ _BACKEND_CAPABILITIES = {
         supports_radius_support=True,
         supports_reusable_index=True,
     ),
+    GPU_NEIGHBOUR_BACKEND_ID: NeighbourBackendCapabilities(
+        backend=GPU_NEIGHBOUR_BACKEND_ID,
+        version=GPU_NEIGHBOUR_BACKEND_VERSION,
+        metric=NEIGHBOUR_METRIC,
+        exact=True,
+        supports_radius_support=True,
+        supports_reusable_index=True,
+    ),
 }
 
 
 def neighbour_backend_capabilities(backend: str) -> NeighbourBackendCapabilities:
     """Return capabilities for a configured backend without fallback."""
 
+    if backend in GPU_NEIGHBOUR_BACKEND_ALIASES:
+        backend = GPU_NEIGHBOUR_BACKEND_ID
     try:
         return _BACKEND_CAPABILITIES[backend]
     except KeyError as exc:
@@ -4108,8 +4121,11 @@ def build_neighbour_index(
     max_index_bytes: int | None = None,
     max_radius_query_bytes: int | None = None,
     max_neighbour_cache_bytes: int | None = DEFAULT_NEIGHBOUR_CACHE_BYTES,
+    gpu_device: int = 0,
+    gpu_tile_size: int = 128,
+    max_gpu_neighbour_bytes: int | None = None,
     resource_budget: ResourceBudgetService | None = None,
-) -> IndexedCPUNeighbourIndex | TiledCPUNeighbourIndex | None:
+) -> Any:
     """Build the explicitly requested reusable index, with no fallback."""
 
     if backend == INDEXED_NEIGHBOUR_BACKEND_ID:
@@ -4123,6 +4139,20 @@ def build_neighbour_index(
     if backend == TILED_NEIGHBOUR_BACKEND_ID:
         return TiledCPUNeighbourIndex(
             descriptors,
+            tile_size=tile_size,
+            max_index_bytes=max_index_bytes,
+            max_radius_query_bytes=max_radius_query_bytes,
+            max_neighbour_cache_bytes=max_neighbour_cache_bytes,
+            resource_budget=resource_budget,
+        )
+    if backend in GPU_NEIGHBOUR_BACKEND_ALIASES:
+        from .gpu_neighbours import ExactTiledGPUNeighbourIndex
+
+        return ExactTiledGPUNeighbourIndex(
+            descriptors,
+            device=gpu_device,
+            gpu_tile_size=gpu_tile_size,
+            max_device_bytes=max_gpu_neighbour_bytes,
             tile_size=tile_size,
             max_index_bytes=max_index_bytes,
             max_radius_query_bytes=max_radius_query_bytes,
@@ -4143,6 +4173,9 @@ def compute_radius_support(
     index: IndexedCPUNeighbourIndex | TiledCPUNeighbourIndex | None = None,
     chunk_size: int = 1024,
     max_radius_query_bytes: int | None = None,
+    gpu_device: int = 0,
+    gpu_tile_size: int = 128,
+    max_gpu_neighbour_bytes: int | None = None,
     resource_budget: ResourceBudgetService | None = None,
     context: str | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -4180,7 +4213,10 @@ def compute_radius_support(
                 remaining,
             )
         )
-    if backend in {INDEXED_NEIGHBOUR_BACKEND_ID, TILED_NEIGHBOUR_BACKEND_ID}:
+    if backend in {
+        INDEXED_NEIGHBOUR_BACKEND_ID,
+        TILED_NEIGHBOUR_BACKEND_ID,
+    } or backend in GPU_NEIGHBOUR_BACKEND_ALIASES:
         active_index = (
             index
             if index is not None
@@ -4189,14 +4225,22 @@ def compute_radius_support(
                 backend=backend,
                 tile_size=block,
                 max_radius_query_bytes=limit,
+                gpu_device=gpu_device,
+                gpu_tile_size=gpu_tile_size,
+                max_gpu_neighbour_bytes=max_gpu_neighbour_bytes,
                 resource_budget=resource_budget,
             )
         )
-        expected_type = (
-            IndexedCPUNeighbourIndex
-            if backend == INDEXED_NEIGHBOUR_BACKEND_ID
-            else TiledCPUNeighbourIndex
-        )
+        if backend in GPU_NEIGHBOUR_BACKEND_ALIASES:
+            from .gpu_neighbours import ExactTiledGPUNeighbourIndex
+
+            expected_type = ExactTiledGPUNeighbourIndex
+        else:
+            expected_type = (
+                IndexedCPUNeighbourIndex
+                if backend == INDEXED_NEIGHBOUR_BACKEND_ID
+                else TiledCPUNeighbourIndex
+            )
         if not isinstance(active_index, expected_type) or not np.array_equal(
             active_index.descriptors, values
         ):
@@ -4310,6 +4354,15 @@ def compute_neighbours(
         if index is not None and not isinstance(index, TiledCPUNeighbourIndex):
             raise ValueError("exact_tiled_cpu requires the tiled CPU backend")
         return compute_tiled_cpu_neighbours(descriptors, k, index=index, **kwargs)
+    if backend in GPU_NEIGHBOUR_BACKEND_ALIASES:
+        from .gpu_neighbours import (
+            ExactTiledGPUNeighbourIndex,
+            compute_gpu_tiled_neighbours,
+        )
+
+        if index is not None and not isinstance(index, ExactTiledGPUNeighbourIndex):
+            raise ValueError("exact_tiled_gpu_knn requires the GPU kNN backend")
+        return compute_gpu_tiled_neighbours(descriptors, k, index=index, **kwargs)
     raise ValueError(f"configured neighbour backend is unavailable: {backend!r}")
 
 
@@ -4332,6 +4385,22 @@ exact_kth_distinct_neighbour_radii = kth_distinct_neighbour_radii
 NeighbourResult = ExactNeighbourResult
 
 
+def __getattr__(name: str) -> Any:
+    """Lazily expose optional GPU kNN symbols without importing CuPy."""
+
+    if name in {
+        "ExactTiledGPUNeighbourIndex",
+        "compute_gpu_tiled_neighbours",
+        "compute_gpu_tiled_neighbours_many",
+        "compute_tiled_gpu_neighbours",
+        "compute_tiled_gpu_neighbours_many",
+    }:
+        from . import gpu_neighbours
+
+        return getattr(gpu_neighbours, name)
+    raise AttributeError(name)
+
+
 __all__ = [
     "CalibrationCapacityError",
     "DEFAULT_NEIGHBOUR_CACHE_BYTES",
@@ -4339,6 +4408,9 @@ __all__ = [
     "ExactNeighbourResult",
     "IndexedCPUNeighbourIndex",
     "TiledCPUNeighbourIndex",
+    "GPU_NEIGHBOUR_BACKEND_ID",
+    "GPU_NEIGHBOUR_BACKEND_VERSION",
+    "ExactTiledGPUNeighbourIndex",
     "NeighbourBackendCapabilities",
     "NeighbourResult",
     "RadiusQueryCapacityError",
@@ -4354,6 +4426,10 @@ __all__ = [
     "compute_kth_distinct_neighbour_radii",
     "compute_kth_distinct_neighbours",
     "compute_neighbours",
+    "compute_gpu_tiled_neighbours",
+    "compute_gpu_tiled_neighbours_many",
+    "compute_tiled_gpu_neighbours",
+    "compute_tiled_gpu_neighbours_many",
     "exact_neighbour_search",
     "exact_kth_distinct_neighbour_radii",
     "kth_distinct_neighbour_radii",

@@ -41,6 +41,13 @@ from .diagnostics import (
     validate_calibration_manifest,
     weighted_quantile,
 )
+from .gpu_neighbours import (
+    ExactTiledGPUNeighbourIndex,
+    compute_gpu_tiled_neighbours,
+    compute_gpu_tiled_neighbours_many,
+    compute_tiled_gpu_neighbours,
+    compute_tiled_gpu_neighbours_many,
+)
 from .gpu_support import (
     ExactTiledGPUSupport,
     GPUCapacityError,
@@ -75,6 +82,9 @@ from .kernels import (
 from .models import (
     DEFAULT_NEIGHBOUR_BACKEND_ID,
     DEFAULT_RADIUS_QUERY_BYTES,
+    GPU_NEIGHBOUR_BACKEND_ALIASES,
+    GPU_NEIGHBOUR_BACKEND_ID,
+    GPU_NEIGHBOUR_BACKEND_VERSION,
     ENTROPY_OBJECTIVE_SCHEMA_VERSION,
     INDEXED_NEIGHBOUR_BACKEND_ID,
     INDEXED_NEIGHBOUR_BACKEND_VERSION,
@@ -218,6 +228,7 @@ __all__ = [
     "ExactNeighbourResult",
     "IndexedCPUNeighbourIndex",
     "TiledCPUNeighbourIndex",
+    "ExactTiledGPUNeighbourIndex",
     "NeighbourBackendCapabilities",
     "CalibrationCapacityError",
     "RadiusQueryCapacityError",
@@ -231,6 +242,10 @@ __all__ = [
     "GPUCertificationError",
     "GPUDeviceValidationError",
     "GPUSupportError",
+    "compute_gpu_tiled_neighbours",
+    "compute_gpu_tiled_neighbours_many",
+    "compute_tiled_gpu_neighbours",
+    "compute_tiled_gpu_neighbours_many",
     "DiagnosticDistribution",
     "GraphDiagnostics",
     "ScientificDiagnostics",
@@ -245,6 +260,9 @@ __all__ = [
     "INDEXED_NEIGHBOUR_BACKEND_VERSION",
     "TILED_NEIGHBOUR_BACKEND_ID",
     "TILED_NEIGHBOUR_BACKEND_VERSION",
+    "GPU_NEIGHBOUR_BACKEND_ID",
+    "GPU_NEIGHBOUR_BACKEND_VERSION",
+    "GPU_NEIGHBOUR_BACKEND_ALIASES",
     "InformationEntropySelectionAlgorithm",
     "KernelMetadata",
     "NEIGHBOUR_BACKEND_ID",

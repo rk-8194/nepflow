@@ -21,6 +21,10 @@ from nepflow.resources.budget import (
 )
 from nepflow.stages.selection.representations import LocalEnvironmentRepresentation
 
+from .gpu_neighbours import (
+    ExactTiledGPUNeighbourIndex,
+    compute_gpu_tiled_neighbours_many,
+)
 from .kernels import (
     evaluate_leave_one_out_objective,
     evaluate_leave_one_out_objectives,
@@ -384,6 +388,9 @@ def calculate_frozen_bandwidths(
     max_index_bytes: int | None = None,
     max_radius_query_bytes: int | None = None,
     max_neighbour_cache_bytes: int | None = None,
+    gpu_device: int = 0,
+    gpu_tile_size: int = 128,
+    max_gpu_neighbour_bytes: int | None = None,
     resource_budget: ResourceBudgetService | None = None,
 ) -> FrozenBandwidths:
     """Calculate and freeze exact full-pool ``r_k`` and ``h=c*r_k``."""
@@ -426,6 +433,9 @@ def calculate_frozen_bandwidths(
             else min(max_radius_query_bytes, max(1, remaining))
         ),
         max_neighbour_cache_bytes=max_neighbour_cache_bytes,
+        gpu_device=gpu_device,
+        gpu_tile_size=gpu_tile_size,
+        max_gpu_neighbour_bytes=max_gpu_neighbour_bytes,
         resource_budget=service,
     )
     neighbours = compute_neighbours(
@@ -469,6 +479,7 @@ def _settings_from_arguments(
     gpu_device: int,
     gpu_tile_size: int,
     max_gpu_support_bytes: int | None,
+    max_gpu_neighbour_bytes: int | None,
 ) -> EntropyBandwidthSettings:
     if settings is not None:
         if any(value is not None for value in (mode, k, c, k_candidates, c_candidates)):
@@ -495,6 +506,7 @@ def _settings_from_arguments(
             gpu_device=gpu_device,
             gpu_tile_size=gpu_tile_size,
             max_gpu_support_bytes=max_gpu_support_bytes,
+            max_gpu_neighbour_bytes=max_gpu_neighbour_bytes,
         )
     return EntropyBandwidthSettings(
         mode=selected_mode,
@@ -513,6 +525,7 @@ def _settings_from_arguments(
         gpu_device=gpu_device,
         gpu_tile_size=gpu_tile_size,
         max_gpu_support_bytes=max_gpu_support_bytes,
+        max_gpu_neighbour_bytes=max_gpu_neighbour_bytes,
     )
 
 
@@ -622,6 +635,7 @@ def calibrate_bandwidth(
     gpu_device: int = 0,
     gpu_tile_size: int = 128,
     max_gpu_support_bytes: int | None = None,
+    max_gpu_neighbour_bytes: int | None = None,
     resource_budget: ResourceBudgetService | None = None,
     checkpoint_path: str | Path | None = None,
     resume: bool = True,
@@ -660,6 +674,7 @@ def calibrate_bandwidth(
         gpu_device=gpu_device,
         gpu_tile_size=gpu_tile_size,
         max_gpu_support_bytes=max_gpu_support_bytes,
+        max_gpu_neighbour_bytes=max_gpu_neighbour_bytes,
     )
     selected_settings, runtime_budget = _resolve_runtime_limits(
         selected_settings,
@@ -676,6 +691,9 @@ def calibrate_bandwidth(
         max_index_bytes=selected_settings.max_index_bytes,
         max_radius_query_bytes=selected_settings.radius_query_bytes,
         max_neighbour_cache_bytes=selected_settings.max_neighbour_cache_bytes,
+        gpu_device=selected_settings.gpu_device,
+        gpu_tile_size=selected_settings.gpu_tile_size,
+        max_gpu_neighbour_bytes=selected_settings.max_gpu_neighbour_bytes,
         resource_budget=runtime_budget,
     )
 
@@ -760,7 +778,16 @@ def calibrate_bandwidth(
                 "resume": resume,
             }
             neighbour_started = time.perf_counter()
-            if isinstance(index, TiledCPUNeighbourIndex):
+            if isinstance(index, ExactTiledGPUNeighbourIndex):
+                radii_by_k.update(
+                    compute_gpu_tiled_neighbours_many(
+                        pool.descriptors,
+                        indexed_orders,
+                        index=index,
+                        **common_neighbour_options,
+                    )
+                )
+            elif isinstance(index, TiledCPUNeighbourIndex):
                 radii_by_k.update(
                     compute_tiled_cpu_neighbours_many(
                         pool.descriptors,

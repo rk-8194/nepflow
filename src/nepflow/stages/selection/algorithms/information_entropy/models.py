@@ -17,6 +17,8 @@ INDEXED_NEIGHBOUR_BACKEND_ID = "exact_indexed_cpu"
 INDEXED_NEIGHBOUR_BACKEND_VERSION = "exact-indexed-cpu-v1"
 TILED_NEIGHBOUR_BACKEND_ID = "exact_tiled_cpu"
 TILED_NEIGHBOUR_BACKEND_VERSION = "exact-tiled-cpu-v1"
+GPU_NEIGHBOUR_BACKEND_ID = "exact_tiled_gpu_knn"
+GPU_NEIGHBOUR_BACKEND_VERSION = "exact-tiled-gpu-knn-v1"
 DEFAULT_NEIGHBOUR_BACKEND_ID = INDEXED_NEIGHBOUR_BACKEND_ID
 NEIGHBOUR_METRIC = "euclidean"
 KERNEL_SUPPORT_EXECUTION_CPU = "cpu"
@@ -24,6 +26,12 @@ KERNEL_SUPPORT_EXECUTION_GPU = "exact_tiled_gpu"
 KERNEL_SUPPORT_EXECUTION_GPU_VERSION = "exact-tiled-gpu-v1"
 KERNEL_SUPPORT_EXECUTIONS = frozenset(
     {KERNEL_SUPPORT_EXECUTION_CPU, KERNEL_SUPPORT_EXECUTION_GPU}
+)
+# ``exact_tiled_gpu`` was used by early experimental callers.  It remains an
+# accepted spelling for the explicit kNN field, but is canonicalised to the
+# distinct backend identity so it cannot be confused with support execution.
+GPU_NEIGHBOUR_BACKEND_ALIASES = frozenset(
+    {GPU_NEIGHBOUR_BACKEND_ID, KERNEL_SUPPORT_EXECUTION_GPU}
 )
 NEIGHBOUR_DISTINCT_POLICY = "exact-coordinate-location-v1"
 BANDWIDTH_SCHEMA_VERSION = "entropy-bandwidth-v1"
@@ -101,12 +109,13 @@ class EntropyBandwidthSettings:
     gpu_device: int = 0
     gpu_tile_size: int = 128
     max_gpu_support_bytes: int | None = None
+    max_gpu_neighbour_bytes: int | None = None
 
     def __post_init__(self) -> None:
         mode = str(self.mode).strip().lower()
         if mode not in {"manual", "automatic"}:
             raise ValueError("bandwidth mode must be 'manual' or 'automatic'")
-        if self.backend not in {
+        if self.backend not in GPU_NEIGHBOUR_BACKEND_ALIASES and self.backend not in {
             NEIGHBOUR_BACKEND_ID,
             INDEXED_NEIGHBOUR_BACKEND_ID,
             TILED_NEIGHBOUR_BACKEND_ID,
@@ -135,6 +144,12 @@ class EntropyBandwidthSettings:
             or int(self.max_gpu_support_bytes) < 1
         ):
             raise ValueError("max_gpu_support_bytes must be positive when provided")
+        if self.max_gpu_neighbour_bytes is not None and (
+            isinstance(self.max_gpu_neighbour_bytes, bool)
+            or not isinstance(self.max_gpu_neighbour_bytes, (int, np.integer))
+            or int(self.max_gpu_neighbour_bytes) < 1
+        ):
+            raise ValueError("max_gpu_neighbour_bytes must be positive when provided")
         if isinstance(self.chunk_size, bool) or not isinstance(self.chunk_size, (int, np.integer)):
             raise ValueError("chunk_size must be a positive integer")
         if self.chunk_size < 1:
@@ -179,6 +194,8 @@ class EntropyBandwidthSettings:
         elif self.k is not None or self.c is not None:
             raise ValueError("automatic bandwidth mode does not accept manual k or c")
         object.__setattr__(self, "mode", mode)
+        if self.backend in GPU_NEIGHBOUR_BACKEND_ALIASES:
+            object.__setattr__(self, "backend", GPU_NEIGHBOUR_BACKEND_ID)
         object.__setattr__(self, "kernel_support_execution", support_execution)
         object.__setattr__(self, "gpu_device", int(self.gpu_device))
         object.__setattr__(self, "gpu_tile_size", int(self.gpu_tile_size))
@@ -204,6 +221,10 @@ class EntropyBandwidthSettings:
         if self.max_gpu_support_bytes is not None:
             object.__setattr__(
                 self, "max_gpu_support_bytes", int(self.max_gpu_support_bytes)
+            )
+        if self.max_gpu_neighbour_bytes is not None:
+            object.__setattr__(
+                self, "max_gpu_neighbour_bytes", int(self.max_gpu_neighbour_bytes)
             )
 
     @property
@@ -348,19 +369,29 @@ class FrozenBandwidths:
         _validate_positive_float(self.c, "c")
         if not self.neighbour_fingerprint or not self.pool_fingerprint:
             raise ValueError("bandwidth identities must not be blank")
+        backend = (
+            GPU_NEIGHBOUR_BACKEND_ID
+            if self.backend in GPU_NEIGHBOUR_BACKEND_ALIASES
+            else self.backend
+        )
         expected_backend_version = (
             INDEXED_NEIGHBOUR_BACKEND_VERSION
-            if self.backend == INDEXED_NEIGHBOUR_BACKEND_ID
+            if backend == INDEXED_NEIGHBOUR_BACKEND_ID
             else (
                 TILED_NEIGHBOUR_BACKEND_VERSION
-                if self.backend == TILED_NEIGHBOUR_BACKEND_ID
-                else NEIGHBOUR_BACKEND_VERSION
+                if backend == TILED_NEIGHBOUR_BACKEND_ID
+                else (
+                    GPU_NEIGHBOUR_BACKEND_VERSION
+                    if backend == GPU_NEIGHBOUR_BACKEND_ID
+                    else NEIGHBOUR_BACKEND_VERSION
+                )
             )
         )
-        if self.backend not in {
+        if backend not in {
             NEIGHBOUR_BACKEND_ID,
             INDEXED_NEIGHBOUR_BACKEND_ID,
             TILED_NEIGHBOUR_BACKEND_ID,
+            GPU_NEIGHBOUR_BACKEND_ID,
         }:
             raise ValueError(f"unsupported neighbour backend: {self.backend!r}")
         if self.backend_version != expected_backend_version:
@@ -368,6 +399,7 @@ class FrozenBandwidths:
                 "bandwidth backend version does not match its configured backend: "
                 f"{self.backend!r} requires {expected_backend_version!r}"
             )
+        object.__setattr__(self, "backend", backend)
         object.__setattr__(self, "radii", radii)
         object.__setattr__(self, "bandwidths", bandwidths)
         object.__setattr__(self, "k", int(self.k))
@@ -1971,6 +2003,9 @@ __all__ = [
     "INDEXED_NEIGHBOUR_BACKEND_VERSION",
     "TILED_NEIGHBOUR_BACKEND_ID",
     "TILED_NEIGHBOUR_BACKEND_VERSION",
+    "GPU_NEIGHBOUR_BACKEND_ID",
+    "GPU_NEIGHBOUR_BACKEND_VERSION",
+    "GPU_NEIGHBOUR_BACKEND_ALIASES",
     "DEFAULT_NEIGHBOUR_BACKEND_ID",
     "DEFAULT_RADIUS_QUERY_BYTES",
     "KERNEL_SUPPORT_EXECUTION_CPU",
