@@ -335,7 +335,7 @@ class IncrementalCheckpointStore:
         self.root.mkdir(parents=True, exist_ok=True)
         self.resource_budget = resource_budget
         self._identity_cache: dict[str, tuple[Mapping[str, Any], dict[str, Any]]] = {}
-        self._validated_heads: dict[str, tuple[Mapping[str, Any], int, int]] = {}
+        self._validated_heads: dict[str, tuple[Mapping[str, Any], int, int, str]] = {}
         self._stats: dict[str, float | int] = {
             "bytes_written": 0,
             "array_bytes_written": 0,
@@ -518,8 +518,9 @@ class IncrementalCheckpointStore:
         expected_identity: Mapping[str, Any] | None,
         k_max: int | None,
         location_count: int | None,
-    ) -> tuple[dict[str, Any], int, int, int, list[dict[str, Any]]]:
+    ) -> tuple[str, dict[str, Any], int, int, int, list[dict[str, Any]]]:
         manifest_name, manifest = self._read_manifest_with_name(name)
+        head_manifest_name = manifest_name
         identity: dict[str, Any] | None = None
         saved_k: int | None = None
         saved_count: int | None = None
@@ -655,7 +656,7 @@ class IncrementalCheckpointStore:
             expected_start = int(chunk["stop"])
         if expected_start != newest_cursor:
             raise CheckpointValidationError("incremental checkpoint cursor is not authoritative")
-        return identity, saved_k, saved_count, newest_cursor, chunks
+        return head_manifest_name, identity, saved_k, saved_count, newest_cursor, chunks
 
     def write_chunk(
         self,
@@ -715,10 +716,11 @@ class IncrementalCheckpointStore:
         previous_manifest: str | None = None
         previous_chunk_count = 0
         if self.exists(checkpoint_name):
-            previous_manifest, _ = self._read_manifest_with_name(checkpoint_name)
+            current_manifest_name, _ = self._read_manifest_with_name(checkpoint_name)
+            previous_manifest = current_manifest_name
             validated_head = self._validated_heads.get(checkpoint_name)
             if validated_head is None or validated_head[0] is not identity:
-                _, _, saved_count, saved_cursor, chunks = self._load_chain(
+                validated_manifest_name, _, _, saved_count, saved_cursor, chunks = self._load_chain(
                     checkpoint_name,
                     expected_identity=identity,
                     k_max=k_max,
@@ -728,10 +730,15 @@ class IncrementalCheckpointStore:
                     identity,
                     saved_cursor,
                     len(chunks),
+                    validated_manifest_name,
                 )
                 previous_chunk_count = len(chunks)
             else:
-                _, saved_cursor, previous_chunk_count = validated_head
+                _, saved_cursor, previous_chunk_count, validated_manifest_name = validated_head
+                if validated_manifest_name != current_manifest_name:
+                    raise CheckpointValidationError(
+                        "incremental checkpoint pointer changed since the cached head was validated"
+                    )
                 saved_count = location_count
             if saved_count != location_count:
                 raise CheckpointValidationError("incremental checkpoint dimensions do not match")
@@ -831,6 +838,7 @@ class IncrementalCheckpointStore:
                 identity,
                 stop,
                 previous_chunk_count + 1,
+                manifest_name,
             )
             self._fsync_directory(self.root)
             bytes_written = array_bytes_written + manifest_bytes + pointer_bytes
@@ -845,6 +853,7 @@ class IncrementalCheckpointStore:
                 identity,
                 stop,
                 previous_chunk_count + 1,
+                manifest_name,
             )
             self._stats["peak_retained_bytes"] = max(
                 int(self._stats.get("peak_retained_bytes", 0)), self._retained_bytes()
@@ -875,7 +884,7 @@ class IncrementalCheckpointStore:
     ) -> tuple[dict[str, Any], dict[str, Any], dict[str, np.ndarray]]:
         """Validate and restore the complete committed prefix read-only."""
 
-        identity, saved_k, saved_count, cursor, chunks = self._load_chain(
+        manifest_name, identity, saved_k, saved_count, cursor, chunks = self._load_chain(
             name,
             expected_identity=expected_identity,
             k_max=k_max,
@@ -979,6 +988,7 @@ class IncrementalCheckpointStore:
             cache_identity,
             cursor,
             len(chunks),
+            manifest_name,
         )
         return (
             identity,

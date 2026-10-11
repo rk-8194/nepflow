@@ -109,6 +109,43 @@ def test_failed_pointer_promotion_keeps_last_good_generation(tmp_path, monkeypat
     assert removed >= 2
 
 
+def test_incremental_store_rejects_pointer_swap_with_cached_cursor(tmp_path) -> None:
+    store = IncrementalCheckpointStore(tmp_path)
+    identity = {"ordered": True}
+    indices, distances = _chunk(0, 1, 1)
+    store.write_chunk(
+        "knn",
+        identity=identity,
+        start=0,
+        neighbour_locations=indices,
+        neighbour_distances=distances,
+        k_max=1,
+        location_count=2,
+    )
+
+    pointer_path = tmp_path / "knn.incremental.pointer.json"
+    pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
+    original_manifest = tmp_path / pointer["manifest"]
+    alternate_name = "knn.incremental.manifest-alternate.json"
+    (tmp_path / alternate_name).write_text(
+        original_manifest.read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    pointer["manifest"] = alternate_name
+    pointer_path.write_text(json.dumps(pointer), encoding="utf-8")
+
+    with pytest.raises(CheckpointValidationError, match="pointer changed"):
+        store.write_chunk(
+            "knn",
+            identity=identity,
+            start=1,
+            neighbour_locations=indices,
+            neighbour_distances=distances,
+            k_max=1,
+            location_count=2,
+        )
+
+
 def test_incremental_store_rejects_gap_and_corrupt_chunk(tmp_path) -> None:
     store = IncrementalCheckpointStore(tmp_path)
     identity = {"ordered": True}
