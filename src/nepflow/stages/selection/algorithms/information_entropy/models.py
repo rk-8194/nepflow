@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -368,6 +368,9 @@ class BandwidthCalibrationResult:
     backend: str = NEIGHBOUR_BACKEND_ID
     backend_version: str = NEIGHBOUR_BACKEND_VERSION
     backend_fingerprint: str = ""
+    # Operational evidence is intentionally excluded from calibration
+    # fingerprints and scientific equality decisions.
+    operational_metrics: dict[str, Any] = field(default_factory=dict, compare=False, repr=False)
 
     @property
     def k(self) -> int:
@@ -422,6 +425,9 @@ class BandwidthCalibrationResult:
                 raise ValueError("loo_probabilities must be finite and positive")
             values.setflags(write=False)
             object.__setattr__(self, "loo_probabilities", values)
+        if not isinstance(self.operational_metrics, dict):
+            raise ValueError("operational_metrics must be a dictionary")
+        object.__setattr__(self, "operational_metrics", dict(self.operational_metrics))
 
 
 @dataclass(frozen=True, slots=True)
@@ -713,6 +719,9 @@ class StreamedKernelExecutionSummary:
     candidate_storage: str = "memory"
     candidate_storage_path: str | None = None
     candidate_resident_bytes: int = 0
+    # Timings/counters are diagnostic evidence only; they are not part of the
+    # kernel operator or pool fingerprints.
+    operational_metrics: dict[str, Any] = field(default_factory=dict, compare=False, repr=False)
 
     def __post_init__(self) -> None:
         for name in (
@@ -787,6 +796,9 @@ class StreamedKernelExecutionSummary:
             if value < 0:
                 raise ValueError("measured_peak_memory_bytes must be non-negative")
             object.__setattr__(self, "measured_peak_memory_bytes", value)
+        if not isinstance(self.operational_metrics, dict):
+            raise ValueError("operational_metrics must be a dictionary")
+        object.__setattr__(self, "operational_metrics", dict(self.operational_metrics))
 
     @property
     def E(self) -> int:
@@ -868,6 +880,7 @@ class StreamedKernelExecutionSummary:
             "kernel_operator_fingerprint": self.kernel_operator_fingerprint,
             "source_query_count": self.source_query_count,
             "numerical_tolerance": self.numerical_tolerance,
+            "operations": dict(self.operational_metrics),
         }
 
 

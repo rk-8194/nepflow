@@ -59,6 +59,7 @@ from .neighbours import (
     IndexedCPUNeighbourIndex,
     RadiusQueryCapacityError,
     TiledCPUNeighbourIndex,
+    _process_memory_metrics,
     _validate_chunk_size,
     _validate_descriptors,
     _validate_memory_limit,
@@ -286,9 +287,13 @@ class _KernelSupportProvider:
         self.support_count_samples = 0
         self.max_support_count = 0
         self.query_workspace_peak_bytes = 0
+        self.support_query_count = 0
+        self.support_query_seconds = 0.0
+        self.support_query_peak_scratch_bytes = 0
 
     def support(self, source_index: int, radius: float) -> tuple[np.ndarray, np.ndarray]:
         scale = float(radius)
+        started = time.perf_counter()
         if self.index is not None:
             self.index_queries += 1
             target_indices, distances = self.index.radius_support(
@@ -307,6 +312,8 @@ class _KernelSupportProvider:
             self.support_count_total += self.current_support_count
             self.support_count_samples += 1
             self.max_support_count = max(self.max_support_count, self.current_support_count)
+            self.support_query_count += 1
+            self.support_query_seconds += max(0.0, time.perf_counter() - started)
             return target_indices, distances
         self.radius_queries += 1
         targets, distances = compute_radius_support(
@@ -329,7 +336,56 @@ class _KernelSupportProvider:
         self.support_count_total += self.current_support_count
         self.support_count_samples += 1
         self.max_support_count = max(self.max_support_count, self.current_support_count)
+        self.support_query_count += 1
+        self.support_query_seconds += max(0.0, time.perf_counter() - started)
         return targets, distances
+
+    def operational_metrics(self) -> dict[str, Any]:
+        """Return support/query evidence without exposing it to science IDs."""
+
+        index_metrics = self.index.memory_metrics() if self.index is not None else {}
+        count = int(self.support_count_samples)
+        total = int(self.support_count_total)
+        metrics: dict[str, Any] = {
+            "support_query_count": int(self.support_query_count),
+            "support_query_seconds": float(self.support_query_seconds),
+            "support_query_throughput_per_second": (
+                self.support_query_count / self.support_query_seconds
+                if self.support_query_seconds > 0.0
+                else 0.0
+            ),
+            "support_entries": int(self.support_entries),
+            "support_density_mean": total / (count * self.descriptors.shape[0])
+            if count
+            else 0.0,
+            "support_count_min": self.min_support_count,
+            "support_count_mean": total / count if count else None,
+            "support_count_max": int(self.max_support_count),
+            "query_workspace_peak_bytes": int(
+                max(
+                    self.query_workspace_peak_bytes,
+                    int(index_metrics.get("query_workspace_peak_bytes", 0) or 0),
+                )
+            ),
+            "distance_evaluations": int(
+                index_metrics.get("distance_evaluations", self.distance_evaluations) or 0
+            ),
+            "unique_distance_evaluations": int(
+                index_metrics.get("unique_distance_evaluations", 0) or 0
+            ),
+            "atomic_distance_evaluations": int(
+                index_metrics.get("atomic_distance_evaluations", 0) or 0
+            ),
+            "radius_queries": int(index_metrics.get("radius_queries", self.radius_queries) or 0),
+            "index_queries": int(index_metrics.get("index_queries", self.index_queries) or 0),
+            "process_peak_rss_bytes": _process_memory_metrics().get("process_peak_rss_bytes"),
+            "cgroup_memory_current_bytes": _process_memory_metrics().get(
+                "cgroup_memory_current_bytes"
+            ),
+        }
+        for key, value in index_metrics.items():
+            metrics.setdefault(key, value)
+        return metrics
 
     def normaliser(
         self,
@@ -509,6 +565,7 @@ def evaluate_leave_one_out_objective(
     checkpoint_name: str = "loo",
     checkpoint_every_sources: int = 1,
     resume: bool = True,
+    diagnostics: dict[str, Any] | None = None,
 ) -> LeaveOneOutObjective:
     """Evaluate the exact source-normalized finite-pool LOO objective."""
 
@@ -528,6 +585,7 @@ def evaluate_leave_one_out_objective(
             checkpoint_name=checkpoint_name,
             checkpoint_every_sources=checkpoint_every_sources,
             resume=resume,
+            diagnostics=diagnostics,
         )
         return batched[0]
 
@@ -607,6 +665,7 @@ def evaluate_leave_one_out_objectives(
     checkpoint_name: str = "loo",
     checkpoint_every_sources: int = 1,
     resume: bool = True,
+    diagnostics: dict[str, Any] | None = None,
 ) -> tuple[LeaveOneOutObjective, ...]:
     """Evaluate a bounded batch of exact LOO objectives source-by-source.
 
@@ -710,6 +769,13 @@ def evaluate_leave_one_out_objectives(
         resource_budget=service,
         capacity_context=capacity_context,
     )
+    loo_started = time.perf_counter()
+    checkpoint_seconds = 0.0
+    checkpoint_bytes = 0
+    checkpoint_writes = 0
+    peak_scratch_bytes = int(service.reserved_scratch_bytes)
+    peak_lease_bytes = int(service.reserved_memory_bytes)
+    normalization_seconds = 0.0
     numerator = np.zeros((batch_count, row_count), dtype=np.float64)
     invalid_reasons: list[str | None] = [None] * batch_count
     support_totals = np.zeros(batch_count, dtype=np.int64)
@@ -780,10 +846,13 @@ def evaluate_leave_one_out_objectives(
                 source_start,
                 row_count,
             )
+    source_phase_started = time.perf_counter()
     for source_index in range(source_start, row_count):
         source_scales = scales[:, source_index]
         maximum_scale = float(np.max(source_scales))
         target_indices, distances = provider.support(source_index, maximum_scale)
+        peak_scratch_bytes = max(peak_scratch_bytes, int(service.reserved_scratch_bytes))
+        peak_lease_bytes = max(peak_lease_bytes, int(service.reserved_memory_bytes))
         support_count = int(target_indices.shape[0])
         query_bytes = int(getattr(provider.index, "query_workspace_peak_bytes", 0))
         requested_bytes = batch_arrays_bytes + query_bytes + 32 * support_count
@@ -802,6 +871,7 @@ def evaluate_leave_one_out_objectives(
             raise RadiusQueryCapacityError(
                 "batched calibration workspace exceeds memory capacity: " + ", ".join(details)
             )
+        normalization_started = time.perf_counter()
         for batch_index, scale in enumerate(source_scales):
             if invalid_reasons[batch_index] is not None:
                 continue
@@ -842,6 +912,7 @@ def evaluate_leave_one_out_objectives(
                     )
             except (FloatingPointError, OverflowError, ValueError) as exc:
                 invalid_reasons[batch_index] = str(exc)
+        normalization_seconds += max(0.0, time.perf_counter() - normalization_started)
         if progress_callback is not None:
             progress_callback(source_index + 1, row_count)
         if (
@@ -849,6 +920,7 @@ def evaluate_leave_one_out_objectives(
             and checkpoint_identity is not None
             and (source_index + 1) % int(checkpoint_every_sources) == 0
         ):
+            checkpoint_started = time.perf_counter()
             checkpoint_store.write(
                 checkpoint_name,
                 identity=checkpoint_identity,
@@ -861,7 +933,15 @@ def evaluate_leave_one_out_objectives(
                 },
                 arrays={"numerator": numerator},
             )
+            checkpoint_seconds += max(0.0, time.perf_counter() - checkpoint_started)
+            checkpoint_bytes += int(numerator.nbytes)
+            checkpoint_writes += 1
+            peak_scratch_bytes = max(peak_scratch_bytes, int(service.reserved_scratch_bytes))
+            peak_lease_bytes = max(peak_lease_bytes, int(service.reserved_memory_bytes))
 
+    source_phase_seconds = max(0.0, time.perf_counter() - source_phase_started)
+
+    reduction_started = time.perf_counter()
     results: list[LeaveOneOutObjective] = []
     for batch_index in range(batch_count):
         if invalid_reasons[batch_index] is not None:
@@ -904,11 +984,33 @@ def evaluate_leave_one_out_objectives(
             )
         else:
             results.append(LeaveOneOutObjective(valid=True, objective=objective, probabilities=loo))
+    reduction_seconds = max(0.0, time.perf_counter() - reduction_started)
+    provider_metrics = provider.operational_metrics()
+    total_seconds = max(0.0, time.perf_counter() - loo_started)
+    operational_metrics = {
+        "wall_seconds": total_seconds,
+        "source_phase_seconds": source_phase_seconds,
+        "objective_reduction_seconds": reduction_seconds,
+        "normalization_seconds": normalization_seconds,
+        "source_throughput_per_second": (
+            row_count / source_phase_seconds if source_phase_seconds > 0.0 else 0.0
+        ),
+        "batch_count": batch_count,
+        "source_count": row_count,
+        "checkpoint_writes": checkpoint_writes,
+        "checkpoint_bytes": checkpoint_bytes,
+        "checkpoint_seconds": checkpoint_seconds,
+        "peak_scratch_bytes": peak_scratch_bytes,
+        "resource_lease_peak_bytes": peak_lease_bytes,
+        **provider_metrics,
+    }
     logger.info(
         "Batched leave-one-out calibration completed: batch_count=%d, "
         "peak_calibration_workspace_bytes=%d, support_count_min=%s, "
         "support_count_mean=%s, support_count_max=%d, radius_queries=%d, "
-        "distance_evaluations=%d",
+        "distance_evaluations=%d, wall_seconds=%.6f, source_throughput=%.3f, "
+        "support_density=%.6g, support_query_seconds=%.6f, "
+        "checkpoint_bytes=%d, checkpoint_seconds=%.6f, process_peak_rss_bytes=%s",
         batch_count,
         peak_workspace_bytes,
         str(provider.min_support_count),
@@ -924,6 +1026,13 @@ def evaluate_leave_one_out_objectives(
             if provider.index is not None
             else provider.distance_evaluations
         ),
+        total_seconds,
+        operational_metrics["source_throughput_per_second"],
+        operational_metrics["support_density_mean"],
+        operational_metrics["support_query_seconds"],
+        checkpoint_bytes,
+        checkpoint_seconds,
+        operational_metrics.get("process_peak_rss_bytes"),
     )
     logger.info(
         "Batched leave-one-out support work by candidate: samples=%s, mean=%s, max=%s",
@@ -934,6 +1043,37 @@ def evaluate_leave_one_out_objectives(
         ],
         support_maxima.tolist(),
     )
+    if diagnostics is not None:
+        diagnostics["loo_wall_seconds"] = (
+            diagnostics.get("loo_wall_seconds", 0.0) + total_seconds
+        )
+        diagnostics["loo_source_phase_seconds"] = diagnostics.get(
+            "loo_source_phase_seconds", 0.0
+        ) + source_phase_seconds
+        diagnostics["loo_normalization_seconds"] = diagnostics.get(
+            "loo_normalization_seconds", 0.0
+        ) + normalization_seconds
+        diagnostics["loo_objective_reduction_seconds"] = diagnostics.get(
+            "loo_objective_reduction_seconds", 0.0
+        ) + reduction_seconds
+        diagnostics["loo_checkpoint_bytes"] = (
+            diagnostics.get("loo_checkpoint_bytes", 0) + checkpoint_bytes
+        )
+        diagnostics["loo_checkpoint_seconds"] = diagnostics.get(
+            "loo_checkpoint_seconds", 0.0
+        ) + checkpoint_seconds
+        diagnostics["loo_peak_scratch_bytes"] = max(
+            int(diagnostics.get("loo_peak_scratch_bytes", 0)), peak_scratch_bytes
+        )
+        diagnostics["loo_resource_lease_peak_bytes"] = max(
+            int(diagnostics.get("loo_resource_lease_peak_bytes", 0)), peak_lease_bytes
+        )
+        diagnostics["loo_support_query_seconds"] = diagnostics.get(
+            "loo_support_query_seconds", 0.0
+        ) + float(provider_metrics["support_query_seconds"])
+        diagnostics["loo_distance_evaluations"] = diagnostics.get(
+            "loo_distance_evaluations", 0
+        ) + int(provider_metrics["distance_evaluations"])
     if checkpoint_store is not None:
         checkpoint_store.clear(checkpoint_name)
         checkpoint_store.clean_stale()
@@ -1554,6 +1694,7 @@ def build_streamed_candidate_contributions(
     progress_callback: SourceProgressCallback | None = None,
     max_radius_query_bytes: int | None = None,
     resource_budget: ResourceBudgetService | None = None,
+    index: IndexedCPUNeighbourIndex | TiledCPUNeighbourIndex | None = None,
     storage: str = "auto",
     storage_path: str | Path | None = None,
     checkpoint_path: str | Path | None = None,
@@ -1607,7 +1748,11 @@ def build_streamed_candidate_contributions(
         )
     if entry_limit is None:
         entry_limit = maximum_entry_count
-    runtime_budget = resource_budget or build_resource_budget()
+    runtime_budget = (
+        resource_budget
+        or getattr(index, "resource_budget", None)
+        or build_resource_budget()
+    )
     remaining_budget = runtime_budget.remaining_managed_budget
     if remaining_budget is None:
         raise ResourceCapacityError(
@@ -1815,6 +1960,7 @@ def build_streamed_candidate_contributions(
             values,
             backend=frozen.backend,
             chunk_size=block,
+            index=index,
             max_radius_query_bytes=max_radius_query_bytes,
             resource_budget=runtime_budget,
             capacity_context=(f"N={n_rows}, M={candidate_count}, operator={operator_fingerprint}"),
@@ -1859,6 +2005,35 @@ def build_streamed_candidate_contributions(
         spool_limit,
     )
     started = time.perf_counter()
+    phase_seconds: dict[str, float] = {}
+    phase_counts: dict[str, int] = {}
+    phase_bytes: dict[str, int] = {}
+    checkpoint_seconds = 0.0
+    checkpoint_bytes = 0
+    checkpoint_writes = 0
+    peak_lease_bytes = int(runtime_budget.reserved_memory_bytes)
+    peak_scratch_bytes = max(
+        int(runtime_budget.reserved_scratch_bytes),
+        len(_EDGE_SPOOL_HEADER),
+    )
+    spool_bytes = len(_EDGE_SPOOL_HEADER)
+
+    def record_phase(name: str, elapsed: float, *, count: int = 1, bytes_count: int = 0) -> None:
+        phase_seconds[name] = phase_seconds.get(name, 0.0) + max(0.0, float(elapsed))
+        phase_counts[name] = phase_counts.get(name, 0) + int(count)
+        if bytes_count:
+            phase_bytes[name] = phase_bytes.get(name, 0) + int(bytes_count)
+
+    def sample_lease() -> None:
+        nonlocal peak_lease_bytes, peak_scratch_bytes
+        peak_lease_bytes = max(peak_lease_bytes, int(runtime_budget.reserved_memory_bytes))
+        peak_scratch_bytes = max(
+            peak_scratch_bytes,
+            int(runtime_budget.reserved_scratch_bytes),
+            int(spool_bytes),
+        )
+
+    source_loop_seconds = 0.0
     support_sizes = np.zeros(n_rows, dtype=np.int64)
     candidate_support_sizes = np.zeros(candidate_count, dtype=np.int64)
     accumulator = np.zeros(n_rows, dtype=np.float64)
@@ -1990,6 +2165,7 @@ def build_streamed_candidate_contributions(
     ) -> None:
         try:
             lease.resize(requested_bytes, scratch_bytes=scratch_bytes)
+            sample_lease()
         except ResourceCapacityError as exc:
             raise ResourceCapacityError(
                 "streamed candidate contributions exceed the runtime resource budget: "
@@ -2061,6 +2237,7 @@ def build_streamed_candidate_contributions(
         if progress_callback is not None:
             progress_callback(completed_sources, n_rows)
 
+    source_phase_started = time.perf_counter()
     try:
         scratch_directory = runtime_budget.budget.snapshot.scratch_path or None
         with tempfile.TemporaryFile(mode="w+b", dir=scratch_directory) as spool:
@@ -2071,7 +2248,13 @@ def build_streamed_candidate_contributions(
                 )
                 records["target"] = completed_rows[completed_index][0]
                 records["value"] = completed_rows[completed_index][1]
+                spool_started = time.perf_counter()
                 _spool_write_records(spool, spool_digest, records)
+                record_phase(
+                    "spool_serialization",
+                    time.perf_counter() - spool_started,
+                    bytes_count=int(records.nbytes),
+                )
                 spool_bytes += int(records.nbytes)
             for candidate_index in range(resume_candidate_count, candidate_count):
                 accumulator.fill(0.0)
@@ -2094,6 +2277,7 @@ def build_streamed_candidate_contributions(
                     max_radius_query_bytes=max_radius_query_bytes,
                     source_indices=candidate_source_indices,
                 ):
+                    normalization_started = time.perf_counter()
                     source_index = int(column.source_index)
                     scale = float(frozen.bandwidths[source_index])
                     target_indices = np.asarray(column.target_indices, dtype=np.int64)
@@ -2181,8 +2365,14 @@ def build_streamed_candidate_contributions(
                             f"limit={byte_limit}"
                         )
                     report_source(source_index, support_count)
+                    record_phase(
+                        "source_normalization_and_accumulation",
+                        time.perf_counter() - normalization_started,
+                        count=1,
+                    )
 
                 targets = np.flatnonzero(touched).astype(np.int64, copy=False)
+                reduction_started = time.perf_counter()
                 values_for_candidate = np.asarray(
                     accumulator[targets] / float(source_counts[candidate_index]), dtype=np.float64
                 )
@@ -2206,6 +2396,11 @@ def build_streamed_candidate_contributions(
                         f"source={last_source_index}, "
                         f"Q_completed={q_completed}, Q_active={q_active}, support={support}"
                     )
+                record_phase(
+                    "candidate_reduction",
+                    time.perf_counter() - reduction_started,
+                    count=1,
+                )
                 completed_entries = q_completed + support
                 if completed_entries > entry_limit:
                     raise ValueError(
@@ -2247,14 +2442,22 @@ def build_streamed_candidate_contributions(
                 records = np.empty(support, dtype=_EDGE_SPOOL_DTYPE)
                 records["target"] = targets
                 records["value"] = values_for_candidate
+                spool_started = time.perf_counter()
                 _spool_write_records(spool, spool_digest, records)
+                record_phase(
+                    "spool_serialization",
+                    time.perf_counter() - spool_started,
+                    bytes_count=int(records.nbytes),
+                )
                 spool_bytes = prospective_spool_bytes
+                sample_lease()
                 candidate_support_sizes[candidate_index] = support
                 q_completed = completed_entries
                 q_active = 0
                 q_observed = q_completed
                 validate_q_invariants(candidate_index, last_source_index)
                 if aggregation_checkpoint is not None:
+                    checkpoint_started = time.perf_counter()
                     aggregation_checkpoint.write_row(
                         candidate_index,
                         candidate_ids[candidate_index],
@@ -2267,6 +2470,23 @@ def build_streamed_candidate_contributions(
                         self_edge_count=candidate_self_edges,
                         source_mass_max_deviation=candidate_source_mass_deviation,
                     )
+                    checkpoint_elapsed = max(0.0, time.perf_counter() - checkpoint_started)
+                    checkpoint_seconds += checkpoint_elapsed
+                    checkpoint_bytes += int(
+                        targets.nbytes + values_for_candidate.nbytes
+                        + support_sizes[candidate_source_indices].nbytes
+                    )
+                    checkpoint_writes += 1
+                    record_phase(
+                        "checkpoint_serialization",
+                        checkpoint_elapsed,
+                        bytes_count=int(
+                            targets.nbytes
+                            + values_for_candidate.nbytes
+                            + support_sizes[candidate_source_indices].nbytes
+                        ),
+                    )
+                    sample_lease()
                 resize_workspace(
                     estimated_peak_bytes(q_completed, 0),
                     spool_bytes,
@@ -2305,6 +2525,7 @@ def build_streamed_candidate_contributions(
                     f"N={n_rows}, M={candidate_count}, Q={entry_count}, E={implicit_edges}, "
                     f"requested_bytes={final_bytes}, limit={byte_limit}"
                 )
+            finalization_started = time.perf_counter()
             if storage_mode == "memory":
                 target_indices = np.empty(entry_count, dtype=np.int64)
                 contribution_values = np.empty(entry_count, dtype=np.float64)
@@ -2374,8 +2595,15 @@ def build_streamed_candidate_contributions(
                     contribution_spool_bytes=spool_bytes,
                     estimated_peak_memory_bytes=peak_estimated_bytes,
                 )
+            record_phase(
+                "candidate_csr_finalization",
+                time.perf_counter() - finalization_started,
+                count=1,
+                bytes_count=int(contributions.array_bytes),
+            )
         if aggregation_checkpoint is not None:
             aggregation_checkpoint.clear()
+        source_loop_seconds = max(0.0, time.perf_counter() - source_phase_started)
     except BaseException as exc:
         logger.error("Streamed candidate contributions failed: %s", exc)
         lease.close()
@@ -2394,6 +2622,31 @@ def build_streamed_candidate_contributions(
             ) from exc
         raise
 
+    sample_lease()
+    provider_metrics = support_provider.operational_metrics()
+    operational_metrics = {
+        "wall_seconds": max(0.0, time.perf_counter() - started),
+        "source_loop_seconds": source_loop_seconds,
+        "source_throughput_per_second": (
+            completed_sources / source_loop_seconds if source_loop_seconds > 0.0 else 0.0
+        ),
+        "candidate_count": candidate_count,
+        "source_count": n_rows,
+        "entry_count": int(q_completed),
+        "source_support_density_mean": float(np.mean(support_sizes)) / n_rows,
+        "candidate_support_density_mean": float(np.mean(candidate_support_sizes)) / n_rows,
+        "peak_estimated_workspace_bytes": int(peak_estimated_bytes),
+        "peak_scratch_bytes": int(max(peak_scratch_bytes, spool_bytes)),
+        "resource_lease_peak_bytes": int(peak_lease_bytes),
+        "checkpoint_writes": checkpoint_writes,
+        "checkpoint_bytes": checkpoint_bytes,
+        "checkpoint_seconds": checkpoint_seconds,
+        "process_peak_rss_bytes": _measured_peak_memory_bytes(),
+        "phase_seconds": dict(phase_seconds),
+        "phase_counts": dict(phase_counts),
+        "phase_bytes": dict(phase_bytes),
+        **provider_metrics,
+    }
     lease.close()
     summary = StreamedKernelExecutionSummary(
         atomic_row_count=n_rows,
@@ -2437,17 +2690,30 @@ def build_streamed_candidate_contributions(
             if isinstance(contributions, OutOfCoreSparseCandidateContributions)
             else contributions.array_bytes
         ),
+        operational_metrics=operational_metrics,
     )
     logger.info(
         "Streamed candidate contributions completed: E=%d (implicit), Q=%d, "
         "atomic_graph_materialized=false, final_csr_bytes=%d, spool_bytes=%d, "
-        "peak_estimated_bytes=%d, elapsed=%.3fs",
+        "peak_estimated_bytes=%d, elapsed=%.3fs, source_throughput=%.3f, "
+        "source_support_density=%.6g, candidate_support_density=%.6g, "
+        "support_query_seconds=%.6f, distance_evaluations=%s, "
+        "checkpoint_bytes=%d, checkpoint_seconds=%.6f, "
+        "peak_scratch_bytes=%d, process_peak_rss_bytes=%s",
         summary.E,
         summary.Q,
         summary.candidate_csr_array_bytes,
         summary.contribution_spool_bytes,
         summary.estimated_peak_memory_bytes,
-        max(0.0, time.perf_counter() - started),
+        operational_metrics["source_throughput_per_second"],
+        operational_metrics["source_support_density_mean"],
+        operational_metrics["candidate_support_density_mean"],
+        operational_metrics["support_query_seconds"],
+        operational_metrics.get("distance_evaluations"),
+        checkpoint_bytes,
+        checkpoint_seconds,
+        operational_metrics["peak_scratch_bytes"],
+        operational_metrics["process_peak_rss_bytes"],
     )
     return contributions, summary
 

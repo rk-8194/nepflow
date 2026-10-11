@@ -670,6 +670,26 @@ def calibrate_bandwidth(
 
     total_combinations = len(domain_k) * len(domain_c)
     calibration_started = time.perf_counter()
+    operational_metrics: dict[str, Any] = {
+        "wall_seconds": 0.0,
+        "neighbour_query_seconds": 0.0,
+        "loo_seconds": 0.0,
+        "support_query_seconds": 0.0,
+        "loo_pair_count": 0,
+        "resource_lease_peak_bytes": 0,
+        "scratch_peak_bytes": 0,
+    }
+
+    def sample_resource_leases() -> None:
+        operational_metrics["resource_lease_peak_bytes"] = max(
+            int(operational_metrics["resource_lease_peak_bytes"]),
+            int(runtime_budget.reserved_memory_bytes),
+        )
+        operational_metrics["scratch_peak_bytes"] = max(
+            int(operational_metrics["scratch_peak_bytes"]),
+            int(runtime_budget.reserved_scratch_bytes),
+        )
+
     logger.info(
         "Bandwidth calibration started: mode=%s, ordered combinations=%d",
         selected_settings.mode,
@@ -719,6 +739,7 @@ def calibrate_bandwidth(
                 "checkpoint_name": "knn",
                 "resume": resume,
             }
+            neighbour_started = time.perf_counter()
             if isinstance(index, TiledCPUNeighbourIndex):
                 radii_by_k.update(
                     compute_tiled_cpu_neighbours_many(
@@ -741,6 +762,10 @@ def calibrate_bandwidth(
                 raise RuntimeError(
                     "automatic entropy calibration has no compatible neighbour index"
                 )
+            operational_metrics["neighbour_query_seconds"] += max(
+                0.0, time.perf_counter() - neighbour_started
+            )
+            sample_resource_leases()
     winner: tuple[float, FrozenBandwidths, np.ndarray] | None = None
     completed_combinations = 0
     valid_count = 0
@@ -1066,6 +1091,7 @@ def calibrate_bandwidth(
                     _freeze_from_neighbours(pool, neighbours, candidate_c)
                     for candidate_c in c_batch
                 )
+                loo_started = time.perf_counter()
                 if selected_settings.mode == "manual":
                     frozen = frozen_batch[0]
                     objectives = (
@@ -1083,6 +1109,7 @@ def calibrate_bandwidth(
                             checkpoint_path=checkpoint_path,
                             checkpoint_name=f"loo-k{candidate_k}",
                             resume=resume,
+                            diagnostics=operational_metrics,
                         ),
                     )
                 else:
@@ -1105,7 +1132,13 @@ def calibrate_bandwidth(
                         checkpoint_name=f"loo-k{candidate_k}-c-"
                         + "-".join(f"{value:g}" for value in c_batch),
                         resume=resume,
+                        diagnostics=operational_metrics,
                     )
+                operational_metrics["loo_seconds"] += max(
+                    0.0, time.perf_counter() - loo_started
+                )
+                operational_metrics["loo_pair_count"] += len(c_batch)
+                sample_resource_leases()
                 if isinstance(index, (IndexedCPUNeighbourIndex, TiledCPUNeighbourIndex)):
                     metrics = index.memory_metrics()
                     logger.info(
@@ -1195,9 +1228,47 @@ def calibrate_bandwidth(
         total_combinations,
         calibration_started,
     )
+    operational_metrics["wall_seconds"] = elapsed
+    operational_metrics["pair_throughput_per_second"] = (
+        completed_combinations / elapsed if elapsed > 0.0 else 0.0
+    )
+    if isinstance(index, (IndexedCPUNeighbourIndex, TiledCPUNeighbourIndex)):
+        index_metrics = index.memory_metrics()
+        operational_metrics.update(
+            {
+                "support_query_seconds": float(
+                    index_metrics.get("radius_retrieval_seconds", 0.0) or 0.0
+                ),
+                "support_queries": int(index_metrics.get("radius_queries", 0) or 0),
+                "distance_evaluations": int(
+                    index_metrics.get("distance_evaluations", 0) or 0
+                ),
+                "unique_distance_evaluations": int(
+                    index_metrics.get("unique_distance_evaluations", 0) or 0
+                ),
+                "support_count_min": index_metrics.get("min_support_count"),
+                "support_count_mean": index_metrics.get("mean_support_count"),
+                "support_count_max": index_metrics.get("max_support_count"),
+                "support_density_mean": (
+                    float(index_metrics.get("mean_support_count")) / pool.descriptors.shape[0]
+                    if index_metrics.get("mean_support_count") is not None
+                    else None
+                ),
+                "process_peak_rss_bytes": index_metrics.get("process_peak_rss_bytes"),
+                "checkpoint_bytes": int(
+                    index_metrics.get("checkpoint_serialization_bytes", 0) or 0
+                ) + int(operational_metrics.get("loo_checkpoint_bytes", 0) or 0),
+                "checkpoint_seconds": float(
+                    index_metrics.get("checkpoint_serialization_seconds", 0.0) or 0.0
+                ) + float(operational_metrics.get("loo_checkpoint_seconds", 0.0) or 0.0),
+            }
+        )
     logger.info(
         "Bandwidth calibration completed: selected k=%d, c=%g, objective=%.12g, "
-        "attempted=%d/%d (100.0%%), valid=%d, invalid=%d, elapsed=%.3fs",
+        "attempted=%d/%d (100.0%%), valid=%d, invalid=%d, elapsed=%.3fs, "
+        "wall_seconds=%.6f, pair_throughput=%.3f, support_queries=%s, "
+        "distance_evaluations=%s, process_peak_rss_bytes=%s, "
+        "resource_lease_peak_bytes=%d, scratch_peak_bytes=%d",
         selected_bandwidths.k,
         selected_bandwidths.c,
         objective_value,
@@ -1206,6 +1277,13 @@ def calibrate_bandwidth(
         valid_count,
         invalid_count,
         elapsed,
+        operational_metrics["wall_seconds"],
+        operational_metrics["pair_throughput_per_second"],
+        operational_metrics.get("support_queries"),
+        operational_metrics.get("distance_evaluations"),
+        operational_metrics.get("process_peak_rss_bytes"),
+        operational_metrics["resource_lease_peak_bytes"],
+        operational_metrics["scratch_peak_bytes"],
     )
     calibration_payload = {
         "schema": "entropy-calibration-v1",
@@ -1259,6 +1337,7 @@ def calibrate_bandwidth(
         backend=selected_bandwidths.backend,
         backend_version=selected_bandwidths.backend_version,
         backend_fingerprint=selected_bandwidths.backend_fingerprint,
+        operational_metrics=operational_metrics,
     )
 
 

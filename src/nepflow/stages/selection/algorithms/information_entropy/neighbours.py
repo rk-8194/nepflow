@@ -433,6 +433,12 @@ class IndexedCPUNeighbourIndex:
         self.pilot_support_count_total = 0
         self.pilot_support_samples = 0
         self.query_workspace_peak_bytes = 0
+        # These are operational-only counters.  They are deliberately updated
+        # at chunk/query boundaries rather than inside the per-point loops so
+        # diagnostics cannot change the scientific ordering or add log noise.
+        self._phase_seconds: dict[str, float] = {}
+        self._phase_counts: dict[str, int] = {}
+        self._phase_bytes: dict[str, int] = {}
         self.index_bytes = self._estimate_index_bytes()
         if self.index_bytes > effective_index_limit:
             if explicit_index_limit is not None and self.index_bytes > explicit_index_limit:
@@ -548,10 +554,27 @@ class IndexedCPUNeighbourIndex:
             + 4096
         )
 
-    def memory_metrics(self) -> dict[str, int | float | None]:
+    def _record_phase(
+        self,
+        name: str,
+        elapsed: float,
+        *,
+        count: int = 1,
+        bytes_written: int = 0,
+    ) -> None:
+        """Accumulate deterministic operational phase evidence."""
+
+        self._phase_seconds[name] = self._phase_seconds.get(name, 0.0) + max(
+            0.0, float(elapsed)
+        )
+        self._phase_counts[name] = self._phase_counts.get(name, 0) + int(count)
+        if bytes_written:
+            self._phase_bytes[name] = self._phase_bytes.get(name, 0) + int(bytes_written)
+
+    def memory_metrics(self) -> dict[str, Any]:
         """Return operational memory counters for progress diagnostics."""
 
-        return {
+        metrics: dict[str, Any] = {
             "support_cache_bytes": 0,
             "support_cache_peak_bytes": 0,
             "neighbour_cache_bytes": int(self.neighbour_cache_bytes),
@@ -588,6 +611,26 @@ class IndexedCPUNeighbourIndex:
             "atomic_distance_evaluations": int(self.atomic_distance_evaluations),
             **_process_memory_metrics(),
         }
+        for phase, elapsed in self._phase_seconds.items():
+            metrics[f"{phase}_seconds"] = float(elapsed)
+        for phase, count in self._phase_counts.items():
+            metrics[f"{phase}_count"] = int(count)
+        for phase, byte_count in self._phase_bytes.items():
+            metrics[f"{phase}_bytes"] = int(byte_count)
+        aliases = {
+            "tree_query": "knn_tree_query",
+            "preflight": "radius_preflight_count",
+            "canonical_distance": "canonical_distance_verification",
+            "checkpoint_fsync": "checkpoint_serialization",
+        }
+        for alias, phase in aliases.items():
+            if f"{phase}_seconds" in metrics:
+                metrics[f"{alias}_seconds"] = metrics[f"{phase}_seconds"]
+            if f"{phase}_count" in metrics:
+                metrics[f"{alias}_count"] = metrics[f"{phase}_count"]
+            if f"{phase}_bytes" in metrics:
+                metrics[f"{alias}_bytes"] = metrics[f"{phase}_bytes"]
+        return metrics
 
     def query_nearest_distances(
         self,
@@ -702,6 +745,7 @@ class IndexedCPUNeighbourIndex:
         context: str | None = None,
     ) -> np.ndarray:
         expanded_radius = radius + max(16.0 * float(np.spacing(radius)), 1.0e-14)
+        preflight_started = time.perf_counter()
         self.radius_query_preflights += 1
         try:
             candidate_count = int(
@@ -719,6 +763,9 @@ class IndexedCPUNeighbourIndex:
                 requested_bytes=self.max_radius_query_bytes + 1,
                 context="SciPy cKDTree does not support return_length preflight",
             ) from exc
+        self._record_phase(
+            "radius_preflight_count", time.perf_counter() - preflight_started
+        )
         candidate_estimate = _estimate_radius_workspace_bytes(
             candidate_count,
             0,
@@ -733,10 +780,12 @@ class IndexedCPUNeighbourIndex:
                 requested_bytes=candidate_estimate,
                 context=context,
             )
+        retrieval_started = time.perf_counter()
         location_indices = np.asarray(
             self._tree.query_ball_point(query, expanded_radius, workers=self.worker_count),
             dtype=np.int64,
         )
+        self._record_phase("radius_retrieval", time.perf_counter() - retrieval_started)
         self.radius_queries += 1
         if location_indices.size != candidate_count:
             raise ValueError("cKDTree radius preflight disagreed with its candidate query")
@@ -933,17 +982,20 @@ class IndexedCPUNeighbourIndex:
         while start < n_locations:
             stop = min(start + chunk_size, n_locations)
             queries = self.unique_locations[start:stop]
+            tree_started = time.perf_counter()
             _tree_distances, tree_indices = self._tree.query(
                 queries,
                 k=order_k + 1,
                 workers=self.worker_count,
             )
+            self._record_phase("knn_tree_query", time.perf_counter() - tree_started)
             self.index_queries += stop - start
             del _tree_distances
             candidate_matrix = np.asarray(tree_indices, dtype=np.int64)
             if candidate_matrix.ndim == 1:
                 candidate_matrix = candidate_matrix.reshape(stop - start, order_k + 1)
             initial_distances = np.empty((stop - start, order_k), dtype=np.float64)
+            verification_started = time.perf_counter()
             for offset, query_location in enumerate(range(start, stop)):
                 candidates = candidate_matrix[offset]
                 candidates = candidates[candidates != query_location]
@@ -959,13 +1011,18 @@ class IndexedCPUNeighbourIndex:
                 initial_distances[offset] = distances
                 self.distance_evaluations += int(distances.shape[0])
                 self.unique_distance_evaluations += int(distances.shape[0])
+            self._record_phase(
+                "canonical_distance_verification",
+                time.perf_counter() - verification_started,
+                count=stop - start,
+            )
 
             boundaries = np.max(initial_distances, axis=1)
             expanded = boundaries + np.maximum(
                 16.0 * np.spacing(boundaries),
                 1.0e-14,
             )
-            self.radius_query_preflights += stop - start
+            preflight_started = time.perf_counter()
             try:
                 candidate_counts = np.atleast_1d(
                     np.asarray(
@@ -988,6 +1045,12 @@ class IndexedCPUNeighbourIndex:
                         "SciPy cKDTree does not support vectorized preflight"
                     ),
                 ) from exc
+            self.radius_query_preflights += stop - start
+            self._record_phase(
+                "radius_preflight_count",
+                time.perf_counter() - preflight_started,
+                count=stop - start,
+            )
             estimates = np.asarray(
                 [
                     _estimate_radius_workspace_bytes(
@@ -1012,6 +1075,7 @@ class IndexedCPUNeighbourIndex:
                 self.query_workspace_peak_bytes,
                 int(np.max(estimates)),
             )
+            retrieval_started = time.perf_counter()
             try:
                 with self.resource_budget.acquire(
                     f"indexed kNN location chunk [{start}:{stop})",
@@ -1036,7 +1100,13 @@ class IndexedCPUNeighbourIndex:
                     total_workspace,
                 )
                 continue
+            self._record_phase(
+                "radius_retrieval",
+                time.perf_counter() - retrieval_started,
+                count=stop - start,
+            )
             self.radius_queries += stop - start
+            verification_started = time.perf_counter()
             for offset, query_location in enumerate(range(start, stop)):
                 boundary_indices = np.asarray(boundary_lists[offset], dtype=np.int64)
                 boundary_indices = boundary_indices[boundary_indices != query_location]
@@ -1063,12 +1133,18 @@ class IndexedCPUNeighbourIndex:
                 )[:order_k]
                 neighbour_indices[query_location] = boundary_indices[order]
                 neighbour_distances[query_location] = distances[order]
+            self._record_phase(
+                "canonical_distance_verification",
+                time.perf_counter() - verification_started,
+                count=stop - start,
+            )
 
             if (
                 checkpoint_store is not None
                 and checkpoint_identity is not None
                 and stop % int(checkpoint_every_locations) == 0
             ):
+                checkpoint_started = time.perf_counter()
                 checkpoint_store.write(
                     checkpoint_name,
                     identity=checkpoint_identity,
@@ -1077,6 +1153,13 @@ class IndexedCPUNeighbourIndex:
                         "neighbour_locations": neighbour_indices[:stop],
                         "neighbour_distances": neighbour_distances[:stop],
                     },
+                )
+                self._record_phase(
+                    "checkpoint_serialization",
+                    time.perf_counter() - checkpoint_started,
+                    bytes_written=int(
+                        neighbour_indices[:stop].nbytes + neighbour_distances[:stop].nbytes
+                    ),
                 )
 
             completed = stop
@@ -1123,12 +1206,21 @@ class IndexedCPUNeighbourIndex:
         neighbour_distances.setflags(write=False)
         self._last_neighbour_compute_seconds = max(0.0, time.perf_counter() - started)
         self._store_neighbour_cache(order_k, neighbour_indices, neighbour_distances)
+        phase_metrics = self.memory_metrics()
         logger.info(
-            "Indexed exact neighbour search completed: %d/%d (100.0%%), k_max=%d, elapsed=%.3fs",
+            "Indexed exact neighbour search completed: %d/%d (100.0%%), k_max=%d, "
+            "elapsed=%.3fs, tree_query=%.6fs, preflight=%.6fs, radius_retrieval=%.6fs, "
+            "canonical_verification=%.6fs, checkpoint_fsync=%.6fs, checkpoint_bytes=%d",
             n_locations,
             n_locations,
             order_k,
             self._last_neighbour_compute_seconds,
+            float(phase_metrics.get("knn_tree_query_seconds", 0.0) or 0.0),
+            float(phase_metrics.get("radius_preflight_count_seconds", 0.0) or 0.0),
+            float(phase_metrics.get("radius_retrieval_seconds", 0.0) or 0.0),
+            float(phase_metrics.get("canonical_distance_verification_seconds", 0.0) or 0.0),
+            float(phase_metrics.get("checkpoint_serialization_seconds", 0.0) or 0.0),
+            int(phase_metrics.get("checkpoint_serialization_bytes", 0) or 0),
         )
         return neighbour_indices, neighbour_distances
 
@@ -1176,6 +1268,7 @@ class IndexedCPUNeighbourIndex:
     ) -> dict[int, tuple[np.ndarray, np.ndarray, np.ndarray]]:
         """Return exact neighbour prefixes from one canonical ``k_max`` pass."""
 
+        query_many_started = time.perf_counter()
         ordered = tuple(_validate_k(value) for value in ks)
         if not ordered:
             raise ValueError("ks must contain at least one positive integer")
@@ -1201,6 +1294,11 @@ class IndexedCPUNeighbourIndex:
             ).copy()
             distances = np.asarray(prefix_distances[row_locations], dtype=np.float64).copy()
             results[order_k] = (distances[:, -1].copy(), rows, distances)
+        self._record_phase(
+            "query_neighbours_many_projection",
+            time.perf_counter() - query_many_started,
+            count=len(ordered),
+        )
         return results
 
     def radius_support(
@@ -1228,6 +1326,7 @@ class IndexedCPUNeighbourIndex:
             row_count=self.descriptors.shape[0],
             context=context,
         )
+        verification_started = time.perf_counter()
         location_targets = self.unique_locations[location_indices]
         location_distances = self._distance_values(
             query,
@@ -1273,6 +1372,11 @@ class IndexedCPUNeighbourIndex:
         row_order = np.argsort(target_indices, kind="stable")
         target_indices = target_indices[row_order]
         target_distances = np.asarray(target_distances[row_order], dtype=np.float64)
+        self._record_phase(
+            "canonical_distance_verification",
+            time.perf_counter() - verification_started,
+            count=1,
+        )
         self.distance_evaluations += int(target_indices.shape[0])
         self.atomic_distance_evaluations += int(target_indices.shape[0])
         self.current_support_count = int(target_indices.shape[0])
