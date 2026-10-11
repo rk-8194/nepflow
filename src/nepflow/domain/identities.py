@@ -15,6 +15,7 @@ from typing import Any, cast
 
 from nepflow.io.hashing import sha256_bytes, sha256_canonical_json
 from nepflow.io.json import to_jsonable
+from nepflow.io.paths import project_relative_path
 
 STRUCTURE_IDENTITY_SCHEMA = "structure-v1"
 CANDIDATE_IDENTITY_SCHEMA = "candidate-v1"
@@ -305,7 +306,12 @@ class StructureIdentity:
 
 @dataclass(frozen=True)
 class ArtifactIdentity:
-    """Content hash and provenance for one persisted artifact."""
+    """Content identity plus optional, non-identity storage metadata.
+
+    ``artifact_id`` and ``sha256`` are derived only from artifact type and
+    bytes.  ``path`` is operational metadata and may be rendered relative to a
+    project root at the persistence boundary.
+    """
 
     artifact_id: str
     artifact_type: str
@@ -329,13 +335,62 @@ class ArtifactIdentity:
         return cls(artifact_id, artifact_type, digest, path)
 
     @classmethod
-    def from_file(cls, artifact_type: str, path: str | Path) -> "ArtifactIdentity":
-        """Hash a file into an artifact identity without guessing on I/O failure."""
-        resolved = Path(path).resolve()
-        return cls.from_bytes(artifact_type, resolved.read_bytes(), path=str(resolved))
+    def from_digest(
+        cls,
+        artifact_type: str,
+        sha256: str,
+        *,
+        path: str | None = None,
+    ) -> "ArtifactIdentity":
+        """Create the content identity for a previously verified digest."""
 
-    def to_dict(self) -> dict[str, str]:
-        """Serialize the artifact type, digest, schema, and optional path."""
+        digest = str(sha256).lower()
+        if len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest):
+            raise ValueError("sha256 must be a 64-character hexadecimal digest")
+        artifact_id = "artifact_" + sha256_canonical_json(
+            {
+                "schema_version": ARTIFACT_IDENTITY_SCHEMA,
+                "artifact_type": artifact_type,
+                "sha256": digest,
+            }
+        )
+        return cls(artifact_id, artifact_type, digest, path)
+
+    @classmethod
+    def from_file(
+        cls,
+        artifact_type: str,
+        path: str | Path,
+        *,
+        project_root: str | Path | None = None,
+    ) -> "ArtifactIdentity":
+        """Hash a file while keeping storage location separate from identity.
+
+        Without ``project_root`` the runtime path is retained for backwards
+        compatibility.  Supplying a root stores the location in its validated
+        project-relative form.
+        """
+        resolved = Path(path).resolve()
+        persisted_path = (
+            project_relative_path(resolved, project_root, field="artifact path")
+            if project_root is not None
+            else str(resolved)
+        )
+        return cls.from_bytes(artifact_type, resolved.read_bytes(), path=persisted_path)
+
+    def with_path(self, path: str | Path | None) -> "ArtifactIdentity":
+        """Return this identity with replacement operational path metadata."""
+
+        return ArtifactIdentity(
+            artifact_id=self.artifact_id,
+            artifact_type=self.artifact_type,
+            sha256=self.sha256,
+            path=None if path is None else str(path),
+            schema_version=self.schema_version,
+        )
+
+    def to_dict(self, *, project_root: str | Path | None = None) -> dict[str, str]:
+        """Serialize identity and optionally project-relative location metadata."""
         result = {
             "artifact_id": self.artifact_id,
             "artifact_type": self.artifact_type,
@@ -343,7 +398,11 @@ class ArtifactIdentity:
             "schema_version": self.schema_version,
         }
         if self.path is not None:
-            result["path"] = self.path
+            result["path"] = (
+                project_relative_path(self.path, project_root, field="artifact path")
+                if project_root is not None
+                else self.path
+            )
         return result
 
 

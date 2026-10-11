@@ -6,6 +6,7 @@ import sqlite3
 import threading
 from collections.abc import Callable, Sequence
 from contextlib import AbstractContextManager
+from pathlib import Path
 from typing import Any, TypeVar
 
 from nepflow.domain.identities import ArtifactIdentity
@@ -51,6 +52,7 @@ class StateStoreMixinSupport:
         originating_attempt_id: str | None,
         retention_status: str,
         metadata: Any,
+        project_root: str | Path | None = None,
     ) -> dict[str, Any]:
         raise NotImplementedError
 

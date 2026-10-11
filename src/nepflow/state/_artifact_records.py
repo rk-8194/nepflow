@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import sqlite3
+from pathlib import Path
 from typing import Any
 
 from nepflow.domain.identities import ArtifactIdentity
 from nepflow.errors import StateError
+from nepflow.io.paths import project_relative_path
 
 from ._record_codec import decode_row, encode_json, now
 from ._typing import StateStoreMixinSupport
@@ -22,15 +24,33 @@ class ArtifactRecordsMixin(StateStoreMixinSupport):
         originating_attempt_id: str | None = None,
         retention_status: str = "active",
         metadata: Any = None,
+        project_root: str | Path | None = None,
     ) -> dict[str, Any]:
-        """Record one content-addressed artifact identity."""
+        """Record one content-addressed artifact identity.
+
+        When ``project_root`` is supplied, only the operational path metadata
+        is normalised to a project-relative value; the content identity is
+        untouched.
+        """
+
+        persisted_artifact = artifact
+        if project_root is not None and artifact.path is not None:
+            persisted_artifact = artifact.with_path(
+                project_relative_path(
+                    artifact.path,
+                    project_root,
+                    field="artifact path",
+                    error_type=StateError,
+                )
+            )
 
         return self._write(
             lambda: self._record_artifact(
-                artifact,
+                persisted_artifact,
                 originating_attempt_id=originating_attempt_id,
                 retention_status=retention_status,
                 metadata=metadata,
+                project_root=project_root,
             )
         )
 
@@ -41,6 +61,7 @@ class ArtifactRecordsMixin(StateStoreMixinSupport):
         originating_attempt_id: str | None,
         retention_status: str,
         metadata: Any,
+        project_root: str | Path | None = None,
     ) -> dict[str, Any]:
         existing = self._connection.execute(
             "SELECT * FROM artifacts WHERE artifact_id = ?", (artifact.artifact_id,)
@@ -51,6 +72,17 @@ class ArtifactRecordsMixin(StateStoreMixinSupport):
                 or existing["sha256"] != artifact.sha256
             ):
                 raise StateError(f"Artifact identity conflict: {artifact.artifact_id}")
+            if project_root is not None and artifact.path is not None:
+                existing_path = existing["path"]
+                if existing_path != artifact.path:
+                    self._connection.execute(
+                        "UPDATE artifacts SET path = ? WHERE artifact_id = ?",
+                        (artifact.path, artifact.artifact_id),
+                    )
+                    existing = self._connection.execute(
+                        "SELECT * FROM artifacts WHERE artifact_id = ?",
+                        (artifact.artifact_id,),
+                    ).fetchone()
             return decode_row(existing, ("metadata_json",))
         try:
             self._connection.execute(

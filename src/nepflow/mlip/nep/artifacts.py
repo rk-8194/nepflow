@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 from collections.abc import Mapping
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any
 
 from nepflow.domain.identities import ArtifactIdentity, ModelRunIdentity
@@ -13,6 +13,7 @@ from nepflow.domain.models import ModelArtifactMetadata, ModelRunRecord
 from nepflow.errors import ArtifactError
 from nepflow.io.hashing import sha256_file
 from nepflow.io.json import read_json_object, write_json
+from nepflow.io.paths import resolve_project_path
 
 MODEL_RUN_MANIFEST_FILENAME = "model_run_manifest.json"
 MODEL_RUN_MANIFEST_SCHEMA = "nepflow.model_run_manifest.v1"
@@ -297,6 +298,7 @@ def validate_model_run_manifest(
     *,
     expected_model_run_id: str | None = None,
     state_store: Any | None = None,
+    project_dir: Path | None = None,
 ) -> dict[str, Any]:
     manifest_path = Path(manifest_path)
     manifest = read_model_run_manifest(manifest_path)
@@ -318,6 +320,34 @@ def validate_model_run_manifest(
         raise NepArtifactError(
             f"Model-run manifest {manifest_path} is missing: {', '.join(missing)}"
         )
+    if project_dir is not None:
+        project_dir = Path(project_dir).resolve()
+        model_run_id = str(manifest["model_run_id"])
+        dataset_path = _resolve_known_manifest_path(
+            str(manifest["dataset_path"]),
+            project_dir,
+            project_dir / "nep" / "datasets" / str(manifest["dataset_id"]),
+            field="model manifest dataset path",
+        )
+        potential_name = _portable_basename(str(manifest["potential_artifact_path"]))
+        nep_in_name = _portable_basename(str(manifest["nep_in_path"]))
+        if not potential_name or not nep_in_name:
+            raise NepArtifactError("Model manifest contains an unsafe artifact filename")
+        potential_path = _resolve_known_manifest_path(
+            str(manifest["potential_artifact_path"]),
+            project_dir,
+            project_dir / "nep" / "potentials" / model_run_id / potential_name,
+            field="model manifest potential artifact path",
+        )
+        nep_in_path = _resolve_known_manifest_path(
+            str(manifest["nep_in_path"]),
+            project_dir,
+            project_dir / "nep" / "potentials" / model_run_id / nep_in_name,
+            field="model manifest nep.in path",
+        )
+        manifest["dataset_path"] = str(dataset_path)
+        manifest["potential_artifact_path"] = str(potential_path)
+        manifest["nep_in_path"] = str(nep_in_path)
     if manifest.get("schema_version") != MODEL_RUN_MANIFEST_SCHEMA:
         raise NepArtifactError(
             f"Unsupported model-run manifest schema: {manifest.get('schema_version')}"
@@ -360,14 +390,21 @@ def validate_model_run_manifest(
         stored_dataset_path = (
             execution_metadata.get("dataset_path") if isinstance(execution_metadata, dict) else None
         )
-        if (
-            stored_dataset_path
-            and Path(str(manifest["dataset_path"])).resolve()
-            != Path(str(stored_dataset_path)).resolve()
-        ):
-            raise NepArtifactError(
-                "Filesystem model-run manifest dataset path conflicts with StateStore"
+        if stored_dataset_path:
+            stored_dataset = (
+                _resolve_known_manifest_path(
+                    str(stored_dataset_path),
+                    project_dir,
+                    Path(str(manifest["dataset_path"])),
+                    field="StateStore model dataset path",
+                )
+                if project_dir is not None
+                else Path(str(stored_dataset_path)).resolve()
             )
+            if stored_dataset != Path(str(manifest["dataset_path"])).resolve():
+                raise NepArtifactError(
+                    "Filesystem model-run manifest dataset path conflicts with StateStore"
+                )
         list_model_artifacts = getattr(state_store, "list_model_artifacts", None)
         if callable(list_model_artifacts):
             linked = list_model_artifacts(str(manifest["model_run_id"]))
@@ -443,6 +480,41 @@ def validate_model_run_manifest(
         ):
             raise NepArtifactError(f"Manifest hash mismatch for {artifact}")
     return manifest
+
+
+def _portable_basename(value: str) -> str:
+    raw = str(value)
+    return PureWindowsPath(raw).name if PureWindowsPath(raw).is_absolute() else Path(raw).name
+
+
+def _resolve_known_manifest_path(
+    value: str,
+    project_dir: Path,
+    canonical_path: Path,
+    *,
+    field: str,
+) -> Path:
+    raw = str(value)
+    is_absolute = Path(raw).is_absolute() or PureWindowsPath(raw).is_absolute()
+    canonical_path = canonical_path.resolve()
+    if not is_absolute:
+        resolved = resolve_project_path(raw, project_dir, field=field, error_type=NepArtifactError)
+        if resolved != canonical_path:
+            raise NepArtifactError(f"{field} conflicts with canonical storage: {resolved}")
+        return resolved
+    try:
+        resolved = resolve_project_path(
+            raw,
+            project_dir,
+            field=field,
+            allow_legacy_absolute=True,
+            error_type=NepArtifactError,
+        )
+    except NepArtifactError:
+        return canonical_path
+    if resolved != canonical_path:
+        raise NepArtifactError(f"{field} conflicts with canonical storage: {resolved}")
+    return resolved
 
 
 def find_model_run_manifest(project_dir: Path, model_run_id: str) -> Path:

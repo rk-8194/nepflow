@@ -209,11 +209,6 @@ class ProjectCreationService:
             existing = store.get_project(self.project_name)
             if existing is not None:
                 existing_root = existing.get("root_path")
-                if existing_root and str(Path(existing_root).resolve()) != project_root:
-                    raise StateError(
-                        "Existing project state belongs to a different project root: "
-                        f"{existing_root}"
-                    )
                 if existing.get("config_fingerprint") != config_fingerprint:
                     raise StateError(
                         "Existing project has a different configuration fingerprint; "
@@ -226,6 +221,16 @@ class ProjectCreationService:
                     raise StateError(
                         "Existing project metadata is incomplete or incompatible; "
                         "perform an explicit state migration"
+                    )
+                if existing_root and str(Path(existing_root).resolve()) != project_root:
+                    # A copied project is expected to move between checkout
+                    # roots.  Migrate only the mutable location metadata; the
+                    # stable project identity, artifact IDs, provenance, and
+                    # append-only history are preserved by StateStore.
+                    store.relocate_project_root(
+                        self.project_name,
+                        project_root,
+                        expected_previous_root=existing_root,
                     )
 
                 latest = store.get_latest_stage_run(self.project_name)

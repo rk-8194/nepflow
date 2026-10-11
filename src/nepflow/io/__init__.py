@@ -11,6 +11,7 @@ from .json import (
     to_jsonable,
     write_json,
 )
+from .paths import project_relative_path, resolve_project_path, validate_project_relative_path
 
 __all__ = [
     "atomic_write_bytes",
@@ -24,6 +25,9 @@ __all__ = [
     "sha256_canonical_json",
     "sha256_file",
     "sha256_text",
+    "project_relative_path",
+    "resolve_project_path",
     "to_jsonable",
+    "validate_project_relative_path",
     "write_json",
 ]

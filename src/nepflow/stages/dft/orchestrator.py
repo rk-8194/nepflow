@@ -289,6 +289,8 @@ class VaspPreparationOrchestrator:
                 resolved = current_evidence or self._resolve_historical_output(
                     state_store,
                     calculation,
+                    canonical_path=spec.working_directory / "OUTCAR",
+                    project_dir=project_dir,
                 )
                 if current_match and persisted_status == "failed":
                     status = "failed"
@@ -318,7 +320,7 @@ class VaspPreparationOrchestrator:
                     )
                 )
 
-        self._persist(state_store, prepared)
+        self._persist(state_store, prepared, project_root=project_dir)
         logger.info(
             "Prepared %d DFT calculations (%d reused)",
             len(prepared),
@@ -354,16 +356,24 @@ class VaspPreparationOrchestrator:
     def _resolve_historical_output(
         state_store: StateStore,
         calculation: DftCalculationIdentity,
+        *,
+        canonical_path: Path | None = None,
+        project_dir: Path | None = None,
     ) -> ResolvedVaspOutput | None:
         return VaspPreparationOrchestrator._resolve_state_artifact(
             state_store,
             calculation,
+            canonical_path=canonical_path,
+            project_dir=project_dir,
         )
 
     @staticmethod
     def _resolve_state_artifact(
         state_store: StateStore,
         calculation: DftCalculationIdentity,
+        *,
+        canonical_path: Path | None = None,
+        project_dir: Path | None = None,
     ) -> ResolvedVaspOutput | None:
         row = state_store.get_dft_calculation(calculation.calculation_id)
         if row is None or row.get("status") != "completed":
@@ -377,7 +387,19 @@ class VaspPreparationOrchestrator:
             path_value = artifact.get("path")
             if not isinstance(path_value, str) or not path_value.strip():
                 continue
-            outcar = Path(path_value)
+            if canonical_path is not None:
+                outcar = Path(canonical_path).resolve()
+            elif project_dir is not None:
+                try:
+                    outcar = state_store.resolve_artifact_path(
+                        artifact,
+                        project_dir,
+                        allow_legacy_absolute=True,
+                    )
+                except StateError:
+                    continue
+            else:
+                outcar = Path(path_value)
             if not outcar_is_complete(outcar):
                 continue
             if artifact.get("sha256") != sha256_file(outcar):
@@ -395,6 +417,8 @@ class VaspPreparationOrchestrator:
     def _persist(
         state_store: StateStore,
         prepared: Sequence[PreparedCalculation],
+        *,
+        project_root: Path | None = None,
     ) -> None:
         with state_store.transaction():
             for item in prepared:
@@ -446,6 +470,7 @@ class VaspPreparationOrchestrator:
                     artifact = ArtifactIdentity.from_file(
                         "vasp_outcar",
                         item.reused_output.outcar_path,
+                        project_root=project_root,
                     )
                     state_store.register_completed_result(
                         calculation.calculation_id,

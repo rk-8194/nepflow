@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any, Mapping
 
 import numpy as np
@@ -18,6 +18,7 @@ from nepflow.domain.units import (
 from nepflow.errors import StateError
 from nepflow.io.hashing import sha256_file
 from nepflow.io.json import read_json_object
+from nepflow.io.paths import resolve_project_path
 from nepflow.mlip.nep.artifacts import (
     NepArtifactError,
     find_model_run_manifest,
@@ -196,6 +197,7 @@ def _resolve_with_store(
             manifest_path,
             expected_model_run_id=model_run_id,
             state_store=state_store,
+            project_dir=project_dir,
         )
     except (FileNotFoundError, NepArtifactError) as exc:
         raise StateError(f"Invalid authoritative model-run manifest: {model_run_id}") from exc
@@ -209,13 +211,15 @@ def _resolve_with_store(
     ) or model_manifest.get("dataset_path")
     if not isinstance(dataset_path_value, str) or not dataset_path_value.strip():
         raise StateError("Authoritative model run has no dataset path")
-    dataset_path = Path(dataset_path_value).resolve()
-    canonical_dataset_dir = (project_dir / "nep" / "datasets").resolve()
-    try:
-        if dataset_path.parent != canonical_dataset_dir:
-            raise StateError(f"Authoritative dataset is outside canonical storage: {dataset_path}")
-    except OSError as exc:
-        raise StateError(f"Could not resolve authoritative dataset path: {dataset_path}") from exc
+    canonical_dataset_path = (
+        project_dir / "nep" / "datasets" / identity.dataset_id
+    ).resolve()
+    dataset_path = _resolve_known_project_artifact_path(
+        dataset_path_value,
+        project_dir,
+        canonical_dataset_path,
+        field="authoritative dataset path",
+    )
     metadata_path = dataset_path / ".dataset"
     if not metadata_path.is_file():
         raise FileNotFoundError(f"Materialized dataset is missing: {dataset_path}")
@@ -234,10 +238,17 @@ def _resolve_with_store(
     model_path_value = artifact_row.get("path") or model_manifest.get("potential_artifact_path")
     if not isinstance(model_path_value, str) or not model_path_value.strip():
         raise StateError("Authoritative model artifact has no path")
-    model_path = Path(model_path_value).resolve()
     canonical_model_dir = (project_dir / "nep" / "potentials").resolve()
-    if model_path.parent.parent != canonical_model_dir:
-        raise StateError(f"Authoritative model artifact is outside canonical storage: {model_path}")
+    model_filename = _portable_basename(model_path_value)
+    if not model_filename or model_filename in {".", ".."}:
+        raise StateError("Authoritative model artifact path has no safe filename")
+    canonical_model_path = canonical_model_dir / model_run_id / model_filename
+    model_path = _resolve_known_project_artifact_path(
+        model_path_value,
+        project_dir,
+        canonical_model_path,
+        field="authoritative model artifact path",
+    )
     if not model_path.is_file():
         raise FileNotFoundError(f"Authoritative model artifact is missing: {model_path}")
     if sha256_file(model_path) != artifact_row.get("sha256"):
@@ -254,6 +265,47 @@ def _resolve_with_store(
         execution_metadata=execution if isinstance(execution, Mapping) else None,
     )
     return ResolvedModelDataset(record, dataset, model_path, dataset_path, model_manifest)
+
+
+def _portable_basename(value: str) -> str:
+    """Return a basename for native or legacy Windows manifest paths."""
+
+    raw = str(value)
+    return PureWindowsPath(raw).name if PureWindowsPath(raw).is_absolute() else Path(raw).name
+
+
+def _resolve_known_project_artifact_path(
+    value: str,
+    project_dir: Path,
+    canonical_path: Path,
+    *,
+    field: str,
+) -> Path:
+    """Resolve a known artifact location, including checksum-verified legacy paths."""
+
+    raw = str(value)
+    is_absolute = Path(raw).is_absolute() or PureWindowsPath(raw).is_absolute()
+    if not is_absolute:
+        resolved = resolve_project_path(raw, project_dir, field=field, error_type=StateError)
+        if resolved != canonical_path:
+            raise StateError(f"{field} conflicts with canonical storage: {resolved}")
+        return resolved
+    try:
+        resolved = resolve_project_path(
+            raw,
+            project_dir,
+            field=field,
+            allow_legacy_absolute=True,
+            error_type=StateError,
+        )
+    except StateError:
+        # Legacy absolute paths are location metadata only.  The active
+        # project owns the canonical destination; callers verify its digest or
+        # materialized identity immediately after this resolution.
+        return canonical_path
+    if resolved != canonical_path:
+        raise StateError(f"{field} conflicts with canonical storage: {resolved}")
+    return resolved
 
 
 def resolve_model_dataset(

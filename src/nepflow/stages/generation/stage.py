@@ -25,6 +25,7 @@ from nepflow.errors import ArtifactError, StateError
 from nepflow.io.atomic import atomic_write_text
 from nepflow.io.hashing import sha256_canonical_json, sha256_file
 from nepflow.io.json import write_json
+from nepflow.io.paths import project_relative_path, resolve_project_path
 from nepflow.workflow.controller import StageContext
 
 from .generators.base import ConfigurationalGenerator
@@ -424,10 +425,17 @@ class GenerationStage:
                 path=path,
                 structure_ids=tuple(str(base.info["structure_id"]) for base in canonical_bases),
                 count=len(canonical_bases),
+                project_root=request.project_dir,
             )
             self._persist_manifest(request, manifest)
             return canonical_bases, manifest
-        return [], GenerationManifest(artifact=None, path=path, structure_ids=tuple(), count=0)
+        return [], GenerationManifest(
+            artifact=None,
+            path=path,
+            structure_ids=tuple(),
+            count=0,
+            project_root=request.project_dir,
+        )
 
     def _persist_candidate_artifact(
         self,
@@ -509,6 +517,7 @@ class GenerationStage:
             ),
             config_fingerprint=self._generation_config_fingerprint(request),
             manifest_path=self._generation_manifest_path(request, candidate_path),
+            project_root=request.project_dir,
         )
         store = request.state_store if request.state_store is not None else self.state_store
         manifest_path = final_manifest.manifest_path
@@ -519,44 +528,48 @@ class GenerationStage:
         if store is not None:
             store.record_artifact(
                 artifact,
+                project_root=request.project_dir,
                 metadata={
                     "project_name": request.project_name,
                     "seed_artifact": None
                     if manifest.artifact is None
-                    else manifest.artifact.to_dict(),
+                    else manifest.artifact.to_dict(project_root=request.project_dir),
                     "generation_manifest": final_manifest.to_dict(),
-                    "manifest_artifact": manifest_artifact.to_dict(),
+                    "manifest_artifact": manifest_artifact.to_dict(
+                        project_root=request.project_dir
+                    ),
                 },
             )
             store.record_artifact(
                 manifest_artifact,
+                project_root=request.project_dir,
                 metadata={
                     "project_name": request.project_name,
-                    "candidate_artifact": artifact.to_dict(),
+                    "candidate_artifact": artifact.to_dict(project_root=request.project_dir),
                     "generation_manifest": final_manifest.to_dict(),
                 },
             )
             store.append_event(
-                f"generation:{request.project_name}:candidate:{artifact.artifact_id}",
+                f"generation:{request.project_name}:candidate:{artifact.artifact_id}:v2",
                 "generation",
                 request.project_name,
                 "candidate_artifact_persisted",
                 {
-                    "artifact": artifact.to_dict(),
+                    "artifact": artifact.to_dict(project_root=request.project_dir),
                     "seed_artifact": None
                     if manifest.artifact is None
-                    else manifest.artifact.to_dict(),
+                    else manifest.artifact.to_dict(project_root=request.project_dir),
                     "generation_manifest": final_manifest.to_dict(),
                 },
             )
             store.append_event(
-                f"generation:{request.project_name}:manifest:{manifest_artifact.artifact_id}",
+                f"generation:{request.project_name}:manifest:{manifest_artifact.artifact_id}:v2",
                 "generation",
                 request.project_name,
                 "generation_manifest_persisted",
                 {
-                    "artifact": manifest_artifact.to_dict(),
-                    "candidate_artifact": artifact.to_dict(),
+                    "artifact": manifest_artifact.to_dict(project_root=request.project_dir),
+                    "candidate_artifact": artifact.to_dict(project_root=request.project_dir),
                     "manifest": final_manifest.to_dict(),
                 },
             )
@@ -576,7 +589,12 @@ class GenerationStage:
             structure_ids=tuple(str(base.info["structure_id"]) for base in bases),
             count=len(bases),
             resumed=True,
+            project_root=request.project_dir,
         )
+        # Re-persist the verified canonical location using a new location
+        # contract event.  Legacy absolute-path events remain immutable for
+        # provenance, while the compatibility projection becomes portable.
+        self._persist_manifest(request, manifest)
         return manifest
 
     def _reconcile_resumed_base_records(
@@ -750,7 +768,12 @@ class GenerationStage:
         return value
 
     def _resolve_seed_path(self, request: GenerationRequest) -> Path | None:
-        """Resolve a prior seed artifact through the authoritative event ledger."""
+        """Resolve the canonical seed location through authoritative state.
+
+        The event identifies the expected content, while ``GenerationRequest``
+        owns the only accepted project-local location.  A legacy absolute path
+        is compatibility evidence only; it is never opened after relocation.
+        """
 
         store = request.state_store if request.state_store is not None else self.state_store
         if store is not None and hasattr(store, "list_events"):
@@ -770,26 +793,117 @@ class GenerationStage:
                     continue
                 payload = event.get("payload") or {}
                 artifact = payload.get("artifact") if isinstance(payload, Mapping) else None
-                path = artifact.get("path") if isinstance(artifact, Mapping) else None
-                expected_hash = artifact.get("sha256") if isinstance(artifact, Mapping) else None
-                if path:
-                    resolved_path = Path(path)
-                    if not resolved_path.is_file():
+                if not isinstance(artifact, Mapping):
+                    raise ArtifactError(
+                        "Authoritative base_artifact_persisted event has no artifact payload"
+                    )
+                if artifact.get("artifact_type") != "generation_seed_structures":
+                    raise ArtifactError(
+                        "Authoritative generation seed event has an unexpected artifact type"
+                    )
+                expected_hash = artifact.get("sha256")
+                if not isinstance(expected_hash, str) or not expected_hash:
+                    raise ArtifactError(
+                        "Authoritative generation seed event has no SHA-256 digest"
+                    )
+                expected_hash = expected_hash.lower()
+                expected_id = artifact.get("artifact_id")
+                if expected_id is not None and not isinstance(expected_id, str):
+                    raise ArtifactError(
+                        "Authoritative generation seed event has a malformed artifact ID"
+                    )
+                try:
+                    expected_identity = ArtifactIdentity.from_digest(
+                        "generation_seed_structures", expected_hash
+                    ).artifact_id
+                except ValueError as exc:
+                    raise ArtifactError(
+                        "Authoritative generation seed event has an invalid SHA-256 digest"
+                    ) from exc
+                if isinstance(expected_id, str) and expected_id != expected_identity:
+                    raise ArtifactError(
+                        "Authoritative generation seed event has a conflicting artifact ID"
+                    )
+                try:
+                    resolved_path = resolve_project_path(
+                        request.seeds_relative_path,
+                        request.project_dir,
+                        field="canonical generation seed path",
+                        error_type=ArtifactError,
+                    )
+                except (ArtifactError, ValueError) as exc:
+                    raise ArtifactError(
+                        "Cannot resolve canonical generation seed path: "
+                        f"{request.seeds_relative_path}"
+                    ) from exc
+                if not resolved_path.is_file():
+                    raise ArtifactError(
+                        "Persisted generation artifact is missing at the canonical project "
+                        f"location: {resolved_path}"
+                    )
+                actual_hash = sha256_file(resolved_path, required=True)
+                if actual_hash != expected_hash:
+                    raise ArtifactError(
+                        "Persisted generation artifact digest mismatch at canonical project "
+                        f"location {resolved_path}: expected {expected_hash}, got {actual_hash}"
+                    )
+                actual_identity = ArtifactIdentity.from_file(
+                    "generation_seed_structures", resolved_path
+                )
+                if isinstance(expected_id, str) and actual_identity.artifact_id != expected_id:
+                    raise ArtifactError(
+                        "Persisted generation artifact identity mismatch at canonical project "
+                        f"location: {resolved_path}"
+                    )
+                persisted_path = artifact.get("path")
+                if isinstance(persisted_path, str) and self._is_legacy_absolute_path(
+                    persisted_path
+                ):
+                    if Path(persisted_path).is_absolute():
+                        try:
+                            legacy_current_path = resolve_project_path(
+                                persisted_path,
+                                request.project_dir,
+                                field="legacy generation seed path",
+                                allow_legacy_absolute=True,
+                                error_type=ArtifactError,
+                            )
+                        except (ArtifactError, ValueError):
+                            # An absolute path outside the current root is the
+                            # expected pre-relocation form.  It is never read.
+                            legacy_current_path = None
+                        if legacy_current_path is not None and legacy_current_path != resolved_path:
+                            raise ArtifactError(
+                                "Authoritative generation seed event points to a conflicting "
+                                f"absolute path: {persisted_path!r}"
+                            )
+                elif isinstance(persisted_path, str):
+                    expected_relative = project_relative_path(
+                        resolved_path,
+                        request.project_dir,
+                        field="canonical generation seed path",
+                        error_type=ArtifactError,
+                    )
+                    if persisted_path.replace("\\", "/") != expected_relative:
                         raise ArtifactError(
-                            f"Persisted generation artifact is missing: {resolved_path}"
+                            "Authoritative generation seed event points to a conflicting "
+                            f"project-relative path: {persisted_path!r}"
                         )
-                    actual_hash = sha256_file(resolved_path, required=True)
-                    if not expected_hash or actual_hash != expected_hash:
-                        raise ArtifactError(
-                            f"Persisted generation artifact changed: {resolved_path}"
-                        )
-                    return resolved_path
+                return resolved_path
         # With an authoritative store, absence of a persisted artifact event
         # means there is no runtime authority to reuse a filesystem-only seed.
         # The explicit migration utilities are the only route for adopting
         # historical files.  A store-less debug/compatibility caller may still
         # use the established seed path.
         return request.seeds_file if store is None else None
+
+    @staticmethod
+    def _is_legacy_absolute_path(value: str) -> bool:
+        """Recognise old native/Windows absolute paths without resolving them."""
+
+        from pathlib import PureWindowsPath
+
+        return Path(value).is_absolute() or PureWindowsPath(value).is_absolute()
 
     def _persist_structure_records(self, request: GenerationRequest, bases: list[Any]) -> None:
         store = request.state_store if request.state_store is not None else self.state_store
@@ -896,19 +1010,25 @@ class GenerationStage:
         store = request.state_store if request.state_store is not None else self.state_store
         if store is None or manifest.artifact is None:
             return
+        persisted_manifest = manifest.to_dict()
+        # Resume status is runtime context, not part of the durable seed
+        # artifact event.  Keeping it stable makes the compatibility event
+        # idempotent across repeated resumes.
+        persisted_manifest["resumed"] = False
         store.record_artifact(
             manifest.artifact,
+            project_root=request.project_dir,
             metadata={
                 "project_name": request.project_name,
-                "generation_manifest": manifest.to_dict(),
+                "generation_manifest": persisted_manifest,
             },
         )
         store.append_event(
-            f"generation:{request.project_name}:{manifest.artifact.artifact_id}",
+            f"generation:{request.project_name}:{manifest.artifact.artifact_id}:v2",
             "generation",
             request.project_name,
             "base_artifact_persisted",
-            manifest.to_dict(),
+            persisted_manifest,
         )
 
     def _extend_with_gas_phase_bases(

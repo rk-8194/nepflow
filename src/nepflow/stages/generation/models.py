@@ -9,6 +9,7 @@ from typing import Any, Mapping
 
 from nepflow.config.models import CompositionConfig, GenerationConfig, MagnetismConfig
 from nepflow.domain.identities import ArtifactIdentity
+from nepflow.io.paths import project_relative_path, validate_project_relative_path
 
 GENERATION_MANIFEST_SCHEMA = "nepflow.generation_manifest.v2"
 
@@ -59,6 +60,17 @@ class GenerationRequest:
     execution_mode: GenerationExecutionMode = GenerationExecutionMode.RESUME
     magnetism: MagnetismConfig = field(default_factory=MagnetismConfig)
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "project_dir", Path(self.project_dir).resolve())
+        object.__setattr__(
+            self,
+            "structures_path",
+            validate_project_relative_path(
+                self.structures_path,
+                field="GenerationRequest.structures_path",
+            ),
+        )
+
     @property
     def execution_intent(self) -> GenerationExecutionMode:
         """Compatibility spelling for the generation execution mode."""
@@ -67,7 +79,13 @@ class GenerationRequest:
 
     @property
     def seeds_file(self) -> Path:
-        return self.project_dir / self.structures_path / "seeds" / "base_structures.xyz"
+        return self.project_dir / self.seeds_relative_path
+
+    @property
+    def seeds_relative_path(self) -> Path:
+        """Canonical persisted location for the project seed artifact."""
+
+        return self.structures_path / "seeds" / "base_structures.xyz"
 
 
 @dataclass(frozen=True, slots=True)
@@ -100,9 +118,12 @@ class GenerationManifest:
     coverage: Mapping[str, Any] = field(default_factory=dict)
     config_fingerprint: str | None = None
     manifest_path: Path | None = None
+    project_root: Path | None = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "structure_ids", tuple(str(value) for value in self.structure_ids))
+        if self.project_root is not None:
+            object.__setattr__(self, "project_root", Path(self.project_root).resolve())
         object.__setattr__(self, "candidate_ids", tuple(str(value) for value in self.candidate_ids))
         object.__setattr__(
             self,
@@ -198,18 +219,33 @@ class GenerationManifest:
 
         return self.duplicates_removed
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self, *, project_root: str | Path | None = None) -> dict[str, Any]:
+        root = self.project_root if project_root is None else Path(project_root).resolve()
+
+        def persisted_path(value: Path | None) -> str | None:
+            if value is None:
+                return None
+            return (
+                project_relative_path(value, root, field="generation manifest path")
+                if root is not None
+                else str(value)
+            )
+
         return {
             "schema_version": GENERATION_MANIFEST_SCHEMA,
-            "artifact": None if self.artifact is None else self.artifact.to_dict(),
-            "path": str(self.path),
+            "artifact": None
+            if self.artifact is None
+            else self.artifact.to_dict(project_root=root),
+            "path": persisted_path(self.path),
             "structure_ids": list(self.structure_ids),
             "count": self.count,
             "resumed": self.resumed,
             "candidate_artifact": (
-                None if self.candidate_artifact is None else self.candidate_artifact.to_dict()
+                None
+                if self.candidate_artifact is None
+                else self.candidate_artifact.to_dict(project_root=root)
             ),
-            "candidate_path": None if self.candidate_path is None else str(self.candidate_path),
+            "candidate_path": persisted_path(self.candidate_path),
             "candidate_ids": list(self.candidate_ids),
             "candidate_structure_ids": list(self.candidate_structure_ids),
             "accepted_candidate_count": self.accepted_candidate_count,
@@ -224,7 +260,7 @@ class GenerationManifest:
             "realised_family_counts": dict(self.realised_family_counts),
             "coverage": dict(self.coverage),
             "config_fingerprint": self.config_fingerprint,
-            "manifest_path": (None if self.manifest_path is None else str(self.manifest_path)),
+            "manifest_path": persisted_path(self.manifest_path),
         }
 
 

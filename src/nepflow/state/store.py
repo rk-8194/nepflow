@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import sqlite3
 import threading
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, TypeVar
 
 from nepflow.errors import StateError
+from nepflow.io.paths import resolve_project_path
 
 from ._artifact_records import ArtifactRecordsMixin
 from ._dataset_records import DatasetRecordsMixin
@@ -134,6 +135,59 @@ class StateStore(
     ) -> list[sqlite3.Row]:
         with self._lock:
             return list(self._connection.execute(query, parameters).fetchall())
+
+    def resolve_artifact_path(
+        self,
+        artifact: Mapping[str, Any],
+        project_root: str | Path,
+        *,
+        allow_legacy_absolute: bool = False,
+    ) -> Path:
+        """Resolve and validate an artifact row's project-scoped path."""
+
+        value = artifact.get("path")
+        if not isinstance(value, str) or not value.strip():
+            raise StateError("Authoritative artifact has no persisted path")
+        return resolve_project_path(
+            value,
+            project_root,
+            field="authoritative artifact path",
+            allow_legacy_absolute=allow_legacy_absolute,
+            error_type=StateError,
+        )
+
+    def relocate_project_root(
+        self,
+        project_id: str,
+        project_root: str | Path,
+        *,
+        expected_previous_root: str | Path | None = None,
+    ) -> dict[str, Any]:
+        """Migrate only mutable project-location metadata after relocation.
+
+        Project identity, stage history, artifact IDs, and provenance remain
+        untouched.  The optional previous-root check makes the compatibility
+        operation deterministic instead of silently adopting an unrelated DB.
+        """
+
+        existing = self.get_project(project_id)
+        if existing is None:
+            raise StateError(f"Cannot relocate unknown project {project_id!r}")
+        current_root = Path(project_root).resolve()
+        stored_root = existing.get("root_path")
+        if expected_previous_root is not None:
+            expected = Path(expected_previous_root).resolve()
+            if stored_root and Path(str(stored_root)).resolve() != expected:
+                raise StateError(
+                    f"Project {project_id!r} root changed unexpectedly: {stored_root}"
+                )
+        return self.upsert_project(
+            project_id,
+            name=str(existing.get("name") or project_id),
+            root_path=str(current_root),
+            config_fingerprint=existing.get("config_fingerprint"),
+            metadata=existing.get("metadata", {}),
+        )
 
 
 __all__ = ["StateStore", "CURRENT_SCHEMA_VERSION"]
