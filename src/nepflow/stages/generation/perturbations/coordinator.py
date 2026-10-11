@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import math
 import multiprocessing as mp
 import os
 import tempfile
@@ -27,6 +26,7 @@ from nepflow.domain.identities import (
     calculate_structure_id,
 )
 from nepflow.domain.structures import GeneratedStructureRecord
+from nepflow.resources.cpu import effective_cpu_allocation
 from nepflow.stages.generation.supercell import build_target_supercell, require_parent_topology
 from nepflow.stages.generation.validation import (
     CandidateValidationIssue,
@@ -59,7 +59,6 @@ from .surfaces import surface_slot_count, surfaces
 from .volume import volume_profile
 
 logger = logging.getLogger(__name__)
-_AUTO_WORKER_CAP = 8
 _HEARTBEAT_INTERVAL_SECONDS = 30.0
 _SAFE_POSIX_START_METHOD = "forkserver"
 _SAFE_WINDOWS_START_METHOD = "spawn"
@@ -842,44 +841,37 @@ class PerturbationCoordinator:
     def _available_cpu_count() -> int:
         """Return the smallest reliable local CPU allocation visible to the process."""
 
-        limits = [max(1, os.cpu_count() or 1)]
-        try:
-            limits.append(max(1, len(os.sched_getaffinity(0))))
-        except (AttributeError, OSError):
-            pass
-        for variable in ("SLURM_CPUS_PER_TASK", "SLURM_CPUS_ON_NODE", "SLURM_JOB_CPUS_PER_NODE"):
-            value = os.environ.get(variable, "").split("(", 1)[0].strip()
-            if value.isdigit() and int(value) > 0:
-                limits.append(int(value))
-        for quota_path, period_path in (
-            ("/sys/fs/cgroup/cpu.max", None),
-            ("/sys/fs/cgroup/cpu/cpu.cfs_quota_us", "/sys/fs/cgroup/cpu/cpu.cfs_period_us"),
-        ):
-            try:
-                if period_path is None:
-                    quota, period = Path(quota_path).read_text(encoding="utf-8").split()[:2]
-                    if quota == "max":
-                        continue
-                else:
-                    quota = Path(quota_path).read_text(encoding="utf-8").strip()
-                    period = Path(period_path).read_text(encoding="utf-8").strip()
-                quota_value = int(quota)
-                period_value = int(period)
-                if quota_value > 0 and period_value > 0:
-                    limits.append(max(1, math.floor(quota_value / period_value)))
-            except (OSError, ValueError, IndexError):
-                continue
-        return min(limits)
+        return effective_cpu_allocation()
 
     @classmethod
-    def _effective_worker_count(cls, requested_workers: int, task_count: int) -> int:
+    def _effective_worker_count(
+        cls,
+        requested_workers: int,
+        task_count: int,
+        *,
+        cpu_allocation: int | None = None,
+    ) -> int:
         """Apply the documented auto-worker allocation and runnable-task bounds."""
 
-        if requested_workers < 0:
+        if (
+            isinstance(requested_workers, bool)
+            or not isinstance(requested_workers, int)
+            or requested_workers < 0
+        ):
             raise ValueError("n_workers must be non-negative or at least one")
         runnable_tasks = max(1, task_count)
+        allocation = (
+            cls._available_cpu_count()
+            if cpu_allocation is None
+            else max(1, int(cpu_allocation))
+        )
         if requested_workers == 0:
-            return min(cls._available_cpu_count(), _AUTO_WORKER_CAP, runnable_tasks)
+            return max(1, min(allocation, runnable_tasks))
+        if requested_workers > allocation:
+            raise ValueError(
+                f"n_workers={requested_workers} exceeds the effective CPU allocation "
+                f"({allocation}); reduce the value or use 0 for automatic selection"
+            )
         return min(requested_workers, runnable_tasks)
 
     @staticmethod
@@ -1241,7 +1233,13 @@ class PerturbationCoordinator:
             n_grain_boundaries=n_grain_boundaries,
         )
         batch_task_count = self._batch_task_count(base_structures, counts)
-        n_workers = self._effective_worker_count(n_workers, batch_task_count)
+        requested_workers = n_workers
+        cpu_allocation = self._available_cpu_count()
+        n_workers = self._effective_worker_count(
+            requested_workers,
+            batch_task_count,
+            cpu_allocation=cpu_allocation,
+        )
         self._total = 0
         self._by_type = {}
         self._by_config = {}
@@ -1257,16 +1255,36 @@ class PerturbationCoordinator:
         atom_counts = [len(base) for base in base_structures]
         atom_count_summary = "0" if not atom_counts else f"{min(atom_counts)}-{max(atom_counts)}"
         family_plan = ", ".join(self._planned_families(counts, self.settings))
+        submission_window = 1 if n_workers == 1 else 2 * n_workers
         logger.info(
-            "Starting perturbations: tasks=%s, workers=%s, submission_window=%s, "
+            "Starting perturbations: tasks=%s, requested_workers=%s, workers=%s, "
+            "cpu_allocation=%s, configured_worker_cap=%s, submission_window=%s, "
             "base_atoms=%s, families=%s, output=%s",
             batch_task_count,
+            requested_workers,
             n_workers,
-            1 if n_workers == 1 else 2 * n_workers,
+            cpu_allocation,
+            None,
+            submission_window,
             atom_count_summary,
             family_plan,
             output_file,
         )
+        if n_workers == 1:
+            if requested_workers == 1:
+                constraints = ["explicit serial configuration"]
+            else:
+                constraints = []
+                if batch_task_count <= 1:
+                    constraints.append("runnable task count")
+                if cpu_allocation <= 1:
+                    constraints.append("per-process CPU allocation")
+                if not constraints:
+                    constraints.append("combined worker limits")
+            logger.info(
+                "Perturbation worker limit: effective_workers=1, limiting_constraint=%s",
+                ", ".join(constraints),
+            )
         if self.magnetic_generator is None:
             logger.info("Magnetic expansion disabled")
         else:
@@ -1281,7 +1299,7 @@ class PerturbationCoordinator:
         progress_tracker = _ProgressTracker(
             batch_task_count,
             n_workers,
-            1 if n_workers == 1 else 2 * n_workers,
+            submission_window,
         )
         progress_tracker.snapshot(reason="initial")
         temporary_path: Path | None = None

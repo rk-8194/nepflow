@@ -119,11 +119,20 @@ tasks from being published out of order. It is not a success message and does
 not mean a partial artifact has been promoted.
 
 `generation.n_workers=1` is serial and is the best choice for debugging or a
-small WSL machine. `0` selects automatic parallelism, bounded by the detected
-CPU allocation (including affinity, cgroups, and SLURM values where exposed),
-the runnable task count, and a conservative cap of eight workers. On HPC,
-request CPUs from the scheduler first and leave `n_workers=0`, or explicitly
-set a lower worker count when each structure needs substantial memory.
+small WSL machine. `0` selects automatic parallelism using every CPU granted
+to the current process, bounded by affinity, cgroup quota/cpuset, the SLURM
+`--cpus-per-task` allocation, and runnable task count. Information-entropy
+selection follows the same policy for `selection.local_descriptor_workers=0`;
+descriptor generation is CPU-only, even when later training or labelling uses
+GPUs. An optional `[resources] worker_cap` remains an explicit upper bound.
+
+On a full Pitagora Booster node (64 physical CPU cores and four GPUs), request
+the resources you intend to use, for example
+`--cpus-per-task=64 --gres=gpu:4`. `--gres=gpu:4` reserves four GPUs but does
+not grant 64 CPUs. Leave both worker settings at `0` after requesting the CPUs,
+or set an explicit lower count when memory is the limiting resource.
+Do not run heavy parallel generation or descriptor calculation on login nodes;
+submit it through SLURM with the required CPU allocation.
 
 ## Project Layout
 

@@ -15,7 +15,7 @@ from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, wai
 from dataclasses import dataclass, field
 from multiprocessing.context import BaseContext
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 
 import numpy as np
 from ase.neighborlist import neighbor_list
@@ -34,6 +34,7 @@ from nepflow.resources.budget import (
     ResourceCapacityError,
     build_resource_budget,
 )
+from nepflow.resources.cpu import effective_cpu_allocation
 
 logger = logging.getLogger(__name__)
 DESCRIPTOR_CACHE_SCHEMA_VERSION = DESCRIPTOR_CACHE_SCHEMA
@@ -986,40 +987,25 @@ def _limit_local_worker_threads() -> None:
 def _effective_local_cpu_allocation() -> int:
     """Return the CPUs available to this process and its scheduler allocation."""
 
-    limits: list[int] = []
-    affinity = cast(Any, getattr(os, "sched_getaffinity", None))
-    if callable(affinity):
-        try:
-            limits.append(len(cast(Any, affinity(0))))
-        except OSError:
-            pass
-    for name in (
-        "SLURM_CPUS_PER_TASK",
-        "SLURM_CPUS_ON_NODE",
-        "SLURM_JOB_CPUS_PER_NODE",
-    ):
-        value = os.environ.get(name, "").strip()
-        if not value:
-            continue
-        token = value.split(",", 1)[0].split("(", 1)[0].strip()
-        try:
-            limits.append(int(token))
-        except ValueError:
-            continue
-    limits.append(os.cpu_count() or 1)
-    return max(1, min(limit for limit in limits if limit > 0))
+    return effective_cpu_allocation()
 
 
 def _resolve_local_descriptor_workers(
     requested: int,
     candidate_count: int,
     worker_cap: int | None = None,
+    *,
+    cpu_allocation: int | None = None,
 ) -> int:
     """Resolve worker policy without exceeding the effective CPU allocation."""
 
     if isinstance(requested, bool) or not isinstance(requested, int) or requested < 0:
         raise ValueError("local_descriptor_workers must be a non-negative integer")
-    allocation = _effective_local_cpu_allocation()
+    allocation = (
+        _effective_local_cpu_allocation()
+        if cpu_allocation is None
+        else max(1, int(cpu_allocation))
+    )
     if worker_cap is not None:
         if isinstance(worker_cap, bool) or not isinstance(worker_cap, int) or worker_cap < 1:
             raise ValueError("worker_cap must be a positive integer when provided")
@@ -1035,7 +1021,7 @@ def _resolve_local_descriptor_workers(
     if requested == 1:
         return 1
     if requested == 0:
-        return max(1, min(8, allocation, candidate_count))
+        return max(1, min(allocation, candidate_count))
     return min(requested, candidate_count)
 
 
@@ -1114,10 +1100,13 @@ def _compute_local_raw_descriptors(
     """Compute raw rows serially or with bounded candidate-level processes."""
 
     runtime_budget = resource_budget or build_resource_budget()
+    cpu_allocation = _effective_local_cpu_allocation()
+    configured_worker_cap = runtime_budget.budget.worker_cap
     worker_count = _resolve_local_descriptor_workers(
         local_descriptor_workers,
         len(candidates),
-        runtime_budget.budget.worker_cap,
+        configured_worker_cap,
+        cpu_allocation=cpu_allocation,
     )
     managed_budget = runtime_budget.remaining_managed_budget
     if managed_budget is None:
@@ -1135,11 +1124,41 @@ def _compute_local_raw_descriptors(
         inflight_limit = _validate_local_descriptor_inflight_bytes(
             max_local_descriptor_inflight_bytes
         )
-    logger.info(
-        "Local descriptor workers: %d (effective allocation %d)",
-        worker_count,
-        _effective_local_cpu_allocation(),
+    effective_allocation = (
+        min(cpu_allocation, configured_worker_cap)
+        if configured_worker_cap is not None
+        else cpu_allocation
     )
+    submission_window = 1 if worker_count == 1 else 2 * worker_count
+    logger.info(
+        "Local descriptor workers: requested=%d, effective=%d, cpu_allocation=%d, "
+        "configured_worker_cap=%s, candidate_count=%d, submission_window=%d, "
+        "inflight_limit_bytes=%d",
+        local_descriptor_workers,
+        worker_count,
+        cpu_allocation,
+        configured_worker_cap,
+        len(candidates),
+        submission_window,
+        inflight_limit,
+    )
+    if worker_count == 1:
+        if local_descriptor_workers == 1:
+            constraints = ["explicit serial configuration"]
+        else:
+            constraints = []
+            if len(candidates) <= 1:
+                constraints.append("candidate count")
+            if configured_worker_cap == 1:
+                constraints.append("configured worker cap")
+            if effective_allocation <= 1:
+                constraints.append("per-process CPU allocation")
+            if not constraints:
+                constraints.append("combined worker limits")
+        logger.info(
+            "Local descriptor worker limit: effective_workers=1, limiting_constraint=%s",
+            ", ".join(constraints),
+        )
     feature_width = _local_feature_width(config, species)
     total_atoms = sum(len(candidate) for candidate in candidates)
     base_workspace_bytes = int(total_atoms * feature_width * 8)
@@ -1247,7 +1266,7 @@ def _compute_local_raw_descriptors(
             mp_context=_local_process_context(),
             initializer=_limit_local_worker_threads,
         )
-        bound = max(worker_count, 2 * worker_count)
+        bound = submission_window
 
         def submit_available() -> None:
             nonlocal next_to_submit, inflight_bytes

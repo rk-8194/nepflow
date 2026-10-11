@@ -889,13 +889,26 @@ def test_auto_workers_respect_cpu_allocation_cap_and_runnable_tasks(
     monkeypatch.setattr(
         PerturbationCoordinator,
         "_available_cpu_count",
-        staticmethod(lambda: 12),
+        staticmethod(lambda: 64),
     )
 
-    assert PerturbationCoordinator._effective_worker_count(0, 100) == 8
+    assert PerturbationCoordinator._effective_worker_count(0, 100) == 64
     assert PerturbationCoordinator._effective_worker_count(0, 3) == 3
     assert PerturbationCoordinator._effective_worker_count(1, 100) == 1
     assert PerturbationCoordinator._effective_worker_count(12, 2) == 2
+
+
+def test_explicit_workers_cannot_exceed_the_effective_cpu_allocation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        PerturbationCoordinator,
+        "_available_cpu_count",
+        staticmethod(lambda: 4),
+    )
+
+    with pytest.raises(ValueError, match="effective CPU allocation"):
+        PerturbationCoordinator._effective_worker_count(5, 100)
 
 
 def test_process_logs_one_concise_line_per_published_task(

@@ -335,7 +335,8 @@ entropy_bandwidth_max_neighbour_cache_bytes=
 # production information_entropy streams exact candidate contributions.
 
 [resources]
-# Runtime-only resource policy.  "auto" discovers process-local host/cgroup limits.
+# Runtime-only resource policy. "auto" discovers process-local host, affinity,
+# cgroup, and SLURM per-task limits; it never assumes the whole node allocation.
 execution_mode=auto
 memory_budget_bytes=
 scratch_budget_bytes=

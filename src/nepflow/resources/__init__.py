@@ -11,6 +11,7 @@ from .budget import (
     build_resource_budget,
     detect_resource_snapshot,
 )
+from .cpu import effective_cpu_allocation
 
 __all__ = [
     "DEFAULT_SAFETY_MARGIN_FRACTION",
@@ -22,4 +23,5 @@ __all__ = [
     "WorkspaceLease",
     "build_resource_budget",
     "detect_resource_snapshot",
+    "effective_cpu_allocation",
 ]
