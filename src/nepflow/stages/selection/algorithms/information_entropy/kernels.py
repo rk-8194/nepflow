@@ -1137,6 +1137,9 @@ def evaluate_leave_one_out_objectives(
     checkpoint_identity: dict[str, Any] | None = None
     source_start = 0
     if checkpoint_store is not None:
+        normalized_support_execution = str(kernel_support_execution).strip().lower()
+        if normalized_support_execution == "exact_cpu":
+            normalized_support_execution = KERNEL_SUPPORT_EXECUTION_CPU
         checkpoint_identity = {
             "phase": "leave-one-out",
             "schema": "loo-checkpoint-v1",
@@ -1152,6 +1155,10 @@ def evaluate_leave_one_out_objectives(
             "k_c_batch_shape": [batch_count, row_count],
             "numerical_tolerance": SPARSE_NUMERICAL_TOLERANCE,
         }
+        if normalized_support_execution == KERNEL_SUPPORT_EXECUTION_GPU:
+            checkpoint_identity["kernel_support_execution_version"] = (
+                KERNEL_SUPPORT_EXECUTION_GPU_VERSION
+            )
         if not resume:
             checkpoint_store.clear(checkpoint_name)
         if resume and checkpoint_store.exists(checkpoint_name):
@@ -1562,13 +1569,22 @@ def evaluate_leave_one_out_objectives(
             "gpu_cpu_tile_refinements",
             "gpu_h2d_bytes",
             "gpu_d2h_bytes",
+            "gpu_full_tile_d2h_bytes",
+            "gpu_compact_candidate_d2h_bytes",
+            "gpu_full_tile_d2h_transfer_count",
+            "gpu_compact_candidate_d2h_transfer_count",
             "gpu_seconds",
+            "gpu_screening_seconds",
+            "gpu_kernel_wall_seconds",
+            "gpu_candidate_compaction_seconds",
+            "gpu_synchronization_seconds",
             "gpu_active_kernel_seconds_sum",
             "gpu_active_operation_seconds_sum",
             "gpu_operation_seconds_inclusive",
             "gpu_h2d_seconds",
             "gpu_d2h_seconds",
-            "gpu_synchronization_seconds",
+            "gpu_full_tile_d2h_seconds",
+            "gpu_compact_candidate_d2h_seconds",
             "gpu_launch_allocation_seconds",
             "gpu_certification_seconds",
             "gpu_cpu_verification_seconds",
@@ -1601,6 +1617,12 @@ def evaluate_leave_one_out_objectives(
                     diagnostics[metric_name] = max(diagnostics.get(metric_name, 0), metric_value)
                 else:
                     diagnostics[metric_name] = metric_value
+        gpu_pairs = int(diagnostics.get("gpu_fp64_evaluations", 0) or 0)
+        if gpu_pairs:
+            diagnostics["gpu_conservative_candidate_density"] = (
+                int(diagnostics.get("gpu_conservative_candidate_count", 0) or 0)
+                / gpu_pairs
+            )
         diagnostics["support_size_per_candidate"] = provider_metrics.get(
             "support_size_per_candidate", operational_metrics["support_size_per_candidate"]
         )
@@ -2628,6 +2650,13 @@ def build_streamed_candidate_contributions(
             "entry_limit": int(entry_limit),
             "numerical_tolerance": SPARSE_NUMERICAL_TOLERANCE,
         }
+        normalized_support_execution = str(kernel_support_execution).strip().lower()
+        if normalized_support_execution == "exact_cpu":
+            normalized_support_execution = KERNEL_SUPPORT_EXECUTION_CPU
+        if normalized_support_execution == KERNEL_SUPPORT_EXECUTION_GPU:
+            checkpoint_identity["kernel_support_execution_version"] = (
+                KERNEL_SUPPORT_EXECUTION_GPU_VERSION
+            )
         aggregation_checkpoint.initialize(checkpoint_identity, candidate_ids)
         aggregation_checkpoint.clean_stale()
         if resume and aggregation_checkpoint.manifest_path.is_file():

@@ -26,6 +26,10 @@ from .gpu_devices import (
 from .models import KERNEL_SUPPORT_EXECUTION_GPU_VERSION
 
 
+_FLOAT64_UNIT_ROUNDOFF = np.finfo(np.float64).eps / 2.0
+_FLOAT64_MIN_SUBNORMAL = float(np.nextafter(np.float64(0.0), np.float64(1.0)))
+
+
 class GPUSupportError(RuntimeError):
     """Base error for an explicitly requested GPU support execution."""
 
@@ -153,9 +157,18 @@ class ExactTiledGPUSupport:
             self.cpu_rescanned_count = 0
             self.h2d_bytes = 0
             self.d2h_bytes = 0
+            self.full_tile_d2h_bytes = 0
+            self.compact_candidate_d2h_bytes = 0
+            self.full_tile_d2h_transfer_count = 0
+            self.compact_candidate_d2h_transfer_count = 0
             self.h2d_seconds = 0.0
             self.d2h_seconds = 0.0
+            self.full_tile_d2h_seconds = 0.0
+            self.compact_candidate_d2h_seconds = 0.0
             self.gpu_seconds = 0.0
+            self.gpu_screening_seconds = 0.0
+            self.gpu_candidate_compaction_seconds = 0.0
+            self.gpu_synchronization_seconds = 0.0
             self.cpu_verification_seconds = 0.0
             self.support_query_count = 0
             self.support_entries = 0
@@ -251,11 +264,20 @@ class ExactTiledGPUSupport:
         self.cpu_rescanned_count = 0
         self.h2d_bytes = 0
         self.d2h_bytes = 0
+        self.full_tile_d2h_bytes = 0
+        self.compact_candidate_d2h_bytes = 0
+        self.full_tile_d2h_transfer_count = 0
+        self.compact_candidate_d2h_transfer_count = 0
         self.h2d_seconds = 0.0
         self.d2h_seconds = 0.0
+        self.full_tile_d2h_seconds = 0.0
+        self.compact_candidate_d2h_seconds = 0.0
         self.device_workspace_peak_bytes = 0
         self.host_workspace_peak_bytes = 0
         self.gpu_seconds = 0.0
+        self.gpu_screening_seconds = 0.0
+        self.gpu_candidate_compaction_seconds = 0.0
+        self.gpu_synchronization_seconds = 0.0
         self.cpu_verification_seconds = 0.0
         self.support_query_count = 0
         self.support_entries = 0
@@ -299,10 +321,15 @@ class ExactTiledGPUSupport:
         target_count = min(self.requested_tile_size, int(self.descriptors.shape[0]))
 
         def required(sources: int, targets: int) -> int:
-            # dist2, sqrt output, square/delta temporaries, plus transferred
-            # descriptor tiles.  The dimension loop never creates an N x N x d
-            # array, and this estimate reserves its largest temporary.
-            return int(40 * sources * targets + 8 * (sources + targets) * dimension)
+            # Reserve distance-square, certified-error, lower-bound, mask and
+            # compact-index workspaces.  The dimension loop never creates an
+            # N x N x d array, and the compact index output is bounded by the
+            # tile itself even for dense supports.
+            # The coefficient includes overlapping CuPy temporaries created
+            # by the interval arithmetic and compact payload construction;
+            # conservative over-reservation is preferable to an allocator
+            # failure after a tile has already been launched.
+            return int(160 * sources * targets + 8 * (sources + targets) * dimension)
 
         while required(source_count, target_count) > self.max_device_bytes:
             if target_count > 1:
@@ -320,68 +347,193 @@ class ExactTiledGPUSupport:
                 )
         return source_count, target_count, required(source_count, target_count)
 
+    def _synchronize_current_stream(self) -> None:
+        """Synchronize when the runtime exposes a stream primitive.
+
+        The production CuPy path uses this to separate device screening and
+        candidate compaction timing.  Tiny CPU-only CuPy fakes used by tests
+        need not implement a stream object, so the absence of one is a
+        deliberate no-op rather than a fallback to host screening.
+        """
+
+        get_stream = getattr(self._cp.cuda, "get_current_stream", None)
+        if get_stream is None:
+            return
+        stream = get_stream()
+        synchronize = getattr(stream, "synchronize", None)
+        if synchronize is None:
+            return
+        started = time.perf_counter()
+        synchronize()
+        self.gpu_synchronization_seconds += max(0.0, time.perf_counter() - started)
+
     def _screen_tile(
         self,
         source_indices: np.ndarray,
         target_indices: np.ndarray,
         radii: np.ndarray,
+        *,
+        source_values: np.ndarray | None = None,
+        gpu_sources: Any | None = None,
     ) -> np.ndarray:
+        """Return flattened source-major candidate positions for one tile.
+
+        Only compact candidate indices cross the device boundary.  The
+        screening lower bound is formed on-device from an explicit FP64
+        roundoff enclosure for coordinate subtraction, squaring, summation,
+        and square root.  Any non-finite intermediate marks the whole tile as
+        a candidate tile; canonical CPU verification then remains authoritative.
+        """
+
         cp = self._cp
         source_count, target_count, reserved_bytes = self._tile_shape(source_indices.size)
         del source_count, target_count
-        source_values = np.ascontiguousarray(self.descriptors[source_indices])
+        if source_values is None:
+            source_values = np.ascontiguousarray(self.descriptors[source_indices])
         target_values = np.ascontiguousarray(self.descriptors[target_indices])
-        self.h2d_bytes += int(source_values.nbytes + target_values.nbytes)
+        radii_values = np.ascontiguousarray(radii, dtype=np.float64)
+        if radii_values.ndim != 1 or radii_values.size != source_indices.size:
+            raise ValueError("screening radii must align with the source tile")
         gpu_started = time.perf_counter()
         with cp.cuda.Device(self.device):
             transfer_started = time.perf_counter()
-            gpu_sources = cp.asarray(source_values, dtype=cp.float64)
+            if gpu_sources is None:
+                gpu_sources = cp.asarray(source_values, dtype=cp.float64)
+                self.h2d_bytes += int(source_values.nbytes)
             gpu_targets = cp.asarray(target_values, dtype=cp.float64)
+            gpu_radii = cp.asarray(radii_values, dtype=cp.float64)
             self.h2d_seconds += max(0.0, time.perf_counter() - transfer_started)
+            self.h2d_bytes += int(target_values.nbytes + radii_values.nbytes)
+            screening_started = time.perf_counter()
             distance_squared = cp.zeros(
                 (source_indices.size, target_indices.size), dtype=cp.float64
             )
+            square_error = cp.zeros(
+                (source_indices.size, target_indices.size), dtype=cp.float64
+            )
+            dimension_count = int(self.descriptors.shape[1])
+            unit_roundoff = _FLOAT64_UNIT_ROUNDOFF
+            min_subnormal = _FLOAT64_MIN_SUBNORMAL
             for dimension in range(self.descriptors.shape[1]):
                 delta = gpu_targets[None, :, dimension] - gpu_sources[:, None, dimension]
+                coordinate_scale = cp.abs(
+                    gpu_targets[None, :, dimension]
+                ) + cp.abs(gpu_sources[:, None, dimension])
+                # Inflate the rounded absolute-coordinate sum before using it
+                # as the subtraction scale; this also covers subnormal
+                # addition and cancellation cases.
+                coordinate_scale = (
+                    coordinate_scale
+                    + 2.0 * unit_roundoff * coordinate_scale
+                    + 2.0 * min_subnormal
+                )
+                subtraction_error = unit_roundoff * coordinate_scale + min_subnormal
+                computed_scale = coordinate_scale + subtraction_error
                 distance_squared += delta * delta
-            gpu_distances = cp.sqrt(distance_squared)
-            transfer_started = time.perf_counter()
-            host_distances = np.asarray(cp.asnumpy(gpu_distances), dtype=np.float64)
-            self.d2h_seconds += max(0.0, time.perf_counter() - transfer_started)
+                square_error += (
+                    (2.0 * coordinate_scale + subtraction_error) * subtraction_error
+                    + unit_roundoff * computed_scale * computed_scale
+                    + min_subnormal
+                )
+            if dimension_count * unit_roundoff < 1.0:
+                summation_gamma = (dimension_count * unit_roundoff) / (
+                    1.0 - dimension_count * unit_roundoff
+                )
+                sum_upper = (
+                    distance_squared
+                    + 2.0 * square_error
+                    + 2.0 * dimension_count * min_subnormal
+                )
+                square_error = (
+                    2.0 * square_error
+                    + 2.0 * summation_gamma * sum_upper
+                    + (2.0 * dimension_count + 1.0) * min_subnormal
+                )
+            else:  # pragma: no cover - impossible for practical descriptor widths
+                square_error = cp.ones_like(distance_squared) * np.inf
+
+            finite = cp.isfinite(distance_squared) & cp.isfinite(square_error)
+            # The interval endpoints are themselves rounded FP64
+            # operations.  Inflate both sides by a derived absolute enclosure
+            # before taking the monotone square root so endpoint rounding
+            # cannot turn a true candidate into an exclusion.
+            interval_roundoff = (
+                4.0
+                * unit_roundoff
+                * (cp.abs(distance_squared) + cp.abs(square_error))
+                + 4.0 * min_subnormal
+            )
+            finite = finite & cp.isfinite(interval_roundoff)
+            lower_squared = cp.maximum(
+                0.0,
+                distance_squared - square_error - interval_roundoff,
+            )
+            lower_distance = cp.sqrt(lower_squared)
+            upper_distance = cp.sqrt(
+                cp.maximum(
+                    0.0,
+                    distance_squared + square_error + interval_roundoff,
+                )
+            )
+            # Cover the rounded lower-root evaluation and the independent
+            # canonical CPU square-root evaluation, using the upper interval
+            # endpoint for the absolute scale.
+            sqrt_error = (
+                3.0 * unit_roundoff * cp.maximum(1.0, upper_distance)
+                + 3.0 * min_subnormal
+            )
+            lower_distance = cp.maximum(0.0, lower_distance - sqrt_error)
+            finite = finite & cp.isfinite(lower_distance) & cp.isfinite(upper_distance)
+            potential = lower_distance < gpu_radii[:, None]
+            boundary = potential & (upper_distance >= gpu_radii[:, None])
+            # A non-finite or uncertifiable interval is retained for CPU
+            # certification instead of being excluded by a NaN comparison.
+            potential = potential | ~finite
+            boundary = boundary | ~finite
+            self._synchronize_current_stream()
+        screening_seconds = max(0.0, time.perf_counter() - screening_started)
+        self.gpu_screening_seconds += screening_seconds
+
+        compaction_started = time.perf_counter()
+        with cp.cuda.Device(self.device):
+            candidate_device = cp.flatnonzero(potential)
+            candidate_boundary_device = boundary.ravel()[candidate_device]
+            stack = getattr(cp, "stack", None)
+            candidate_payload = (
+                stack((candidate_device, candidate_boundary_device), axis=1)
+                if stack is not None
+                else candidate_device
+            )
+            self._synchronize_current_stream()
+        self.gpu_candidate_compaction_seconds += max(
+            0.0, time.perf_counter() - compaction_started
+        )
+        transfer_started = time.perf_counter()
+        with cp.cuda.Device(self.device):
+            candidate_host = np.asarray(cp.asnumpy(candidate_payload), dtype=np.int64)
+        transfer_seconds = max(0.0, time.perf_counter() - transfer_started)
+        if candidate_host.ndim == 1:
+            candidate_flat = candidate_host
+        else:
+            candidate_flat = candidate_host[:, 0]
+            self.ambiguous_boundary_count += int(np.count_nonzero(candidate_host[:, 1]))
+        self.compact_candidate_d2h_seconds += transfer_seconds
+        self.d2h_seconds += transfer_seconds
+        self.compact_candidate_d2h_bytes += int(candidate_host.nbytes)
+        self.d2h_bytes += int(candidate_host.nbytes)
+        self.compact_candidate_d2h_transfer_count += 1
         self.gpu_seconds += max(0.0, time.perf_counter() - gpu_started)
         self.gpu_launch_count += 1
         self.d2h_transfer_count += 1
-        self.d2h_bytes += int(host_distances.nbytes)
         self.fp64_evaluations += int(source_indices.size * target_indices.size)
         self.device_workspace_peak_bytes = max(self.device_workspace_peak_bytes, reserved_bytes)
 
-        # This is a conservative absolute-error enclosure for subtraction,
-        # squaring, summation and square-root in IEEE float64.  If scaling the
-        # enclosure is itself unsafe, every candidate is CPU certified rather
-        # than making an uncertified decision.
-        source_norm = np.sqrt(np.sum(np.abs(source_values) ** 2, axis=1, dtype=np.float64))
-        target_norm = np.sqrt(np.sum(np.abs(target_values) ** 2, axis=1, dtype=np.float64))
-        scale = np.maximum(1.0, source_norm[:, None] + target_norm[None, :])
-        with np.errstate(over="ignore", invalid="ignore"):
-            bound = np.finfo(np.float64).eps * (1024.0 + 32.0 * self.descriptors.shape[1]) * scale
-        bound = np.asarray(bound, dtype=np.float64)
-        bound[~np.isfinite(bound)] = np.inf
-        lower = np.maximum(0.0, host_distances - bound)
-        potential = lower < radii[:, None]
-        if not np.all(np.isfinite(host_distances)):
-            # The canonical CPU primitive is authoritative for overflow or
-            # invalid device results; force certification rather than allowing
-            # a NaN comparison to become an exclusion.
-            potential = np.ones_like(host_distances, dtype=bool)
-        self.ambiguous_boundary_count += int(
-            np.count_nonzero(np.abs(host_distances - radii[:, None]) <= bound)
-        )
-        self.conservative_candidate_count += int(np.count_nonzero(potential))
+        self.conservative_candidate_count += int(candidate_flat.size)
         self.host_workspace_peak_bytes = max(
             self.host_workspace_peak_bytes,
-            int(source_values.nbytes + target_values.nbytes + host_distances.nbytes + bound.nbytes),
+            int(source_values.nbytes + target_values.nbytes + candidate_host.nbytes),
         )
-        return potential
+        return candidate_flat
 
     def support_many(
         self,
@@ -535,14 +687,36 @@ class ExactTiledGPUSupport:
         ):
             source_targets: list[list[np.ndarray]] = [[] for _ in range(sources.size)]
             source_distances: list[list[np.ndarray]] = [[] for _ in range(sources.size)]
+            source_values = np.ascontiguousarray(self.descriptors[sources])
+            source_upload_started = time.perf_counter()
+            with self._cp.cuda.Device(self.device):
+                gpu_sources = self._cp.asarray(source_values, dtype=self._cp.float64)
+            self.h2d_bytes += int(source_values.nbytes)
+            self.h2d_seconds += max(0.0, time.perf_counter() - source_upload_started)
             _, target_tile_size, _ = self._tile_shape(sources.size)
             target_cursor = 0
             while target_cursor < target_count:
                 target_stop = min(target_cursor + target_tile_size, target_count)
                 target_tile = np.arange(target_cursor, target_stop, dtype=np.int64)
-                potential = self._screen_tile(sources, target_tile, scales)
+                candidate_flat = self._screen_tile(
+                    sources,
+                    target_tile,
+                    scales,
+                    source_values=source_values,
+                    gpu_sources=gpu_sources,
+                )
+                local_sources = candidate_flat // target_tile.size
+                local_targets = candidate_flat % target_tile.size
+                candidate_counts = np.bincount(
+                    local_sources,
+                    minlength=sources.size,
+                )
+                cursor = 0
                 for local_source, source_index in enumerate(sources):
-                    candidates = target_tile[potential[local_source]]
+                    count = int(candidate_counts[local_source])
+                    next_cursor = cursor + count
+                    candidates = target_tile[local_targets[cursor:next_cursor]]
+                    cursor = next_cursor
                     if candidates.size == 0:
                         continue
                     verification_started = time.perf_counter()
@@ -637,14 +811,31 @@ class ExactTiledGPUSupport:
                 "gpu_exact_boundary_recertifications": self.ambiguous_boundary_count,
                 "gpu_cpu_rescanned_count": self.cpu_rescanned_count,
                 "gpu_conservative_candidate_count": self.conservative_candidate_count,
+                "gpu_conservative_candidate_density": (
+                    self.conservative_candidate_count / self.fp64_evaluations
+                    if self.fp64_evaluations
+                    else 0.0
+                ),
                 "gpu_grouped_radius_query_count": self.grouped_radius_query_count,
                 "gpu_reused_radius_scans": self.reused_radius_scans,
                 "gpu_h2d_bytes": self.h2d_bytes,
                 "gpu_d2h_bytes": self.d2h_bytes,
+                "gpu_full_tile_d2h_bytes": self.full_tile_d2h_bytes,
+                "gpu_compact_candidate_d2h_bytes": self.compact_candidate_d2h_bytes,
+                "gpu_full_tile_d2h_transfer_count": self.full_tile_d2h_transfer_count,
+                "gpu_compact_candidate_d2h_transfer_count": (
+                    self.compact_candidate_d2h_transfer_count
+                ),
                 "gpu_h2d_seconds": self.h2d_seconds,
                 "gpu_d2h_seconds": self.d2h_seconds,
+                "gpu_full_tile_d2h_seconds": self.full_tile_d2h_seconds,
+                "gpu_compact_candidate_d2h_seconds": self.compact_candidate_d2h_seconds,
                 "gpu_seconds": self.gpu_seconds,
-                "gpu_strict_radius_screening_seconds": self.gpu_seconds,
+                "gpu_screening_seconds": self.gpu_screening_seconds,
+                "gpu_kernel_wall_seconds": self.gpu_screening_seconds,
+                "gpu_candidate_compaction_seconds": self.gpu_candidate_compaction_seconds,
+                "gpu_synchronization_seconds": self.gpu_synchronization_seconds,
+                "gpu_strict_radius_screening_seconds": self.gpu_screening_seconds,
                 "gpu_active_seconds_sum": float(self.gpu_seconds),
                 "gpu_wall_seconds": float(self.support_wall_seconds),
                 "gpu_parallelism_estimate": (
@@ -691,14 +882,31 @@ class ExactTiledGPUSupport:
             "gpu_exact_boundary_recertifications": self.ambiguous_boundary_count,
             "gpu_cpu_rescanned_count": self.cpu_rescanned_count,
             "gpu_conservative_candidate_count": self.conservative_candidate_count,
+            "gpu_conservative_candidate_density": (
+                self.conservative_candidate_count / self.fp64_evaluations
+                if self.fp64_evaluations
+                else 0.0
+            ),
             "gpu_grouped_radius_query_count": self.grouped_radius_query_count,
             "gpu_reused_radius_scans": self.reused_radius_scans,
             "gpu_h2d_bytes": self.h2d_bytes,
             "gpu_d2h_bytes": self.d2h_bytes,
+            "gpu_full_tile_d2h_bytes": self.full_tile_d2h_bytes,
+            "gpu_compact_candidate_d2h_bytes": self.compact_candidate_d2h_bytes,
+            "gpu_full_tile_d2h_transfer_count": self.full_tile_d2h_transfer_count,
+            "gpu_compact_candidate_d2h_transfer_count": (
+                self.compact_candidate_d2h_transfer_count
+            ),
             "gpu_h2d_seconds": self.h2d_seconds,
             "gpu_d2h_seconds": self.d2h_seconds,
+            "gpu_full_tile_d2h_seconds": self.full_tile_d2h_seconds,
+            "gpu_compact_candidate_d2h_seconds": self.compact_candidate_d2h_seconds,
             "gpu_seconds": self.gpu_seconds,
-            "gpu_strict_radius_screening_seconds": self.gpu_seconds,
+            "gpu_screening_seconds": self.gpu_screening_seconds,
+            "gpu_kernel_wall_seconds": self.gpu_screening_seconds,
+            "gpu_candidate_compaction_seconds": self.gpu_candidate_compaction_seconds,
+            "gpu_synchronization_seconds": self.gpu_synchronization_seconds,
+            "gpu_strict_radius_screening_seconds": self.gpu_screening_seconds,
             "gpu_active_seconds_sum": float(self.gpu_seconds),
             "gpu_wall_seconds": float(self.support_query_seconds),
             "gpu_parallelism_estimate": 1.0 if self.support_query_seconds > 0.0 else 0.0,
@@ -734,6 +942,10 @@ class ExactTiledGPUSupport:
             "conservative_candidate_count",
             "h2d_bytes",
             "d2h_bytes",
+            "full_tile_d2h_bytes",
+            "compact_candidate_d2h_bytes",
+            "full_tile_d2h_transfer_count",
+            "compact_candidate_d2h_transfer_count",
             "support_query_count",
             "support_entries",
         ):
@@ -754,6 +966,14 @@ class ExactTiledGPUSupport:
                                 "conservative_candidate_count": "gpu_conservative_candidate_count",
                                 "h2d_bytes": "gpu_h2d_bytes",
                                 "d2h_bytes": "gpu_d2h_bytes",
+                                "full_tile_d2h_bytes": "gpu_full_tile_d2h_bytes",
+                                "compact_candidate_d2h_bytes": "gpu_compact_candidate_d2h_bytes",
+                                "full_tile_d2h_transfer_count": (
+                                    "gpu_full_tile_d2h_transfer_count"
+                                ),
+                                "compact_candidate_d2h_transfer_count": (
+                                    "gpu_compact_candidate_d2h_transfer_count"
+                                ),
                                 "support_query_count": "support_query_count",
                                 "support_entries": "support_entries",
                             }[name],
@@ -770,6 +990,13 @@ class ExactTiledGPUSupport:
         self.d2h_seconds = sum(
             float(item.get("gpu_d2h_seconds", 0.0) or 0.0) for item in metrics
         )
+        self.full_tile_d2h_seconds = sum(
+            float(item.get("gpu_full_tile_d2h_seconds", 0.0) or 0.0) for item in metrics
+        )
+        self.compact_candidate_d2h_seconds = sum(
+            float(item.get("gpu_compact_candidate_d2h_seconds", 0.0) or 0.0)
+            for item in metrics
+        )
         self.device_workspace_peak_bytes = max(
             int(item.get("gpu_device_workspace_peak_bytes", 0) or 0) for item in metrics
         )
@@ -777,6 +1004,17 @@ class ExactTiledGPUSupport:
             int(item.get("gpu_host_workspace_peak_bytes", 0) or 0) for item in metrics
         )
         self.gpu_seconds = sum(float(item.get("gpu_seconds", 0.0) or 0.0) for item in metrics)
+        self.gpu_screening_seconds = sum(
+            float(item.get("gpu_screening_seconds", 0.0) or 0.0) for item in metrics
+        )
+        self.gpu_candidate_compaction_seconds = sum(
+            float(item.get("gpu_candidate_compaction_seconds", 0.0) or 0.0)
+            for item in metrics
+        )
+        self.gpu_synchronization_seconds = sum(
+            float(item.get("gpu_synchronization_seconds", 0.0) or 0.0)
+            for item in metrics
+        )
         self.cpu_verification_seconds = sum(
             float(item.get("gpu_cpu_verification_seconds", 0.0) or 0.0) for item in metrics
         )

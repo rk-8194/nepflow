@@ -57,6 +57,12 @@ def _fake_cupy(*, device_count: int = 1, free_bytes: int = 64 * 1024 * 1024):
         asarray=np.asarray,
         asnumpy=np.asarray,
         zeros=np.zeros,
+        ones_like=np.ones_like,
+        abs=np.abs,
+        maximum=np.maximum,
+        isfinite=np.isfinite,
+        flatnonzero=np.flatnonzero,
+        stack=np.stack,
         sqrt=np.sqrt,
         cuda=types.SimpleNamespace(Device=Device, runtime=runtime),
     )
@@ -240,6 +246,9 @@ def test_fake_gpu_support_shared_radius_matrix_matches_isolated_queries(
     assert metrics["gpu_grouped_radius_query_count"] == 1
     assert metrics["gpu_reused_radius_scans"] == radii.shape[0] - 1
     assert metrics["gpu_launch_count"] == metrics["gpu_d2h_transfer_count"]
+    assert metrics["gpu_full_tile_d2h_bytes"] == 0
+    assert metrics["gpu_compact_candidate_d2h_bytes"] == metrics["gpu_d2h_bytes"]
+    assert metrics["gpu_compact_candidate_d2h_bytes"] > 0
     shared.close()
 
 

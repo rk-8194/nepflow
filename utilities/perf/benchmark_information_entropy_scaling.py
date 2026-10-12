@@ -146,6 +146,13 @@ def _metric_delta(after: dict[str, Any], before: dict[str, Any]) -> dict[str, An
         result["radius_preflight_count"] = result["radius_preflight_calls"]
     if "radius_preflight_count_count" in result:
         result["radius_preflight_count"] = result["radius_preflight_count_count"]
+    for key in (
+        "gpu_conservative_candidate_density",
+        "gpu_device_workspace_peak_bytes",
+        "gpu_host_workspace_peak_bytes",
+    ):
+        if key in after:
+            result[key] = after[key]
     return result
 
 
@@ -553,6 +560,16 @@ def _summarize_gpu_observations(
                         float(aggregate["gpu_active_operation_seconds_sum"])
                         / float(aggregate["gpu_wall_seconds"])
                         if float(aggregate["gpu_wall_seconds"]) > 0.0
+                        else 0.0
+                    )
+                if (
+                    "gpu_conservative_candidate_count" in aggregate
+                    and "gpu_fp64_evaluations" in aggregate
+                ):
+                    aggregate["gpu_conservative_candidate_density"] = (
+                        float(aggregate["gpu_conservative_candidate_count"])
+                        / float(aggregate["gpu_fp64_evaluations"])
+                        if float(aggregate["gpu_fp64_evaluations"]) > 0.0
                         else 0.0
                     )
         return [by_device[device] for device in requested_devices if device in by_device]

@@ -41,6 +41,9 @@ from .models import (
     GPU_NEIGHBOUR_BACKEND_ALIASES,
     KERNEL_FAMILY,
     KERNEL_OPERATOR_SCHEMA_VERSION,
+    KERNEL_SUPPORT_EXECUTION_CPU,
+    KERNEL_SUPPORT_EXECUTION_GPU,
+    KERNEL_SUPPORT_EXECUTION_GPU_VERSION,
     KERNEL_VERSION,
     NEIGHBOUR_DISTINCT_POLICY,
     NEIGHBOUR_METRIC,
@@ -610,7 +613,10 @@ def _calibration_grid_identity(
     backend = str(getattr(index, "backend", settings.backend))
     backend_version = str(getattr(index, "backend_version", ""))
     backend_fingerprint = str(getattr(index, "fingerprint", ""))
-    return {
+    support_execution = str(settings.kernel_support_execution).strip().lower()
+    if support_execution == "exact_cpu":
+        support_execution = KERNEL_SUPPORT_EXECUTION_CPU
+    identity = {
         "phase": "calibration-grid",
         "schema": _CALIBRATION_GRID_SCHEMA,
         "pool_fingerprint": pool.fingerprint,
@@ -648,6 +654,10 @@ def _calibration_grid_identity(
         "ordered_c_domain": [float(value) for value in domain_c],
         "tie_policy": "first-canonical-minimum-strict-less-than",
     }
+    if support_execution == KERNEL_SUPPORT_EXECUTION_GPU:
+        identity["kernel_support_execution"] = support_execution
+        identity["kernel_support_execution_version"] = KERNEL_SUPPORT_EXECUTION_GPU_VERSION
+    return identity
 
 
 def _restore_calibration_grid_state(
@@ -1809,6 +1819,18 @@ def calibrate_bandwidth(
                         pilot_gpu_metrics.get("gpu_launch_count", 0) or 0
                     ),
                     "pilot_d2h_bytes": int(pilot_gpu_metrics.get("gpu_d2h_bytes", 0) or 0),
+                    "pilot_full_tile_d2h_bytes": int(
+                        pilot_gpu_metrics.get("gpu_full_tile_d2h_bytes", 0) or 0
+                    ),
+                    "pilot_compact_candidate_d2h_bytes": int(
+                        pilot_gpu_metrics.get("gpu_compact_candidate_d2h_bytes", 0) or 0
+                    ),
+                    "pilot_gpu_candidate_compaction_seconds": float(
+                        pilot_gpu_metrics.get("gpu_candidate_compaction_seconds", 0.0) or 0.0
+                    ),
+                    "pilot_gpu_conservative_candidate_density": float(
+                        pilot_gpu_metrics.get("gpu_conservative_candidate_density", 0.0) or 0.0
+                    ),
                     "gpu": is_gpu,
                 }
             )
@@ -2085,6 +2107,38 @@ def calibrate_bandwidth(
                         ),
                         "gpu_d2h_bytes": int(
                             actual_d2h_bytes
+                        ),
+                        "gpu_full_tile_d2h_bytes": int(
+                            active_support_metrics.get("gpu_full_tile_d2h_bytes", 0) or 0
+                        ),
+                        "gpu_compact_candidate_d2h_bytes": int(
+                            active_support_metrics.get("gpu_compact_candidate_d2h_bytes", 0)
+                            or 0
+                        ),
+                        "gpu_screening_seconds": float(
+                            active_support_metrics.get("gpu_screening_seconds", 0.0) or 0.0
+                        ),
+                        "gpu_candidate_compaction_seconds": float(
+                            active_support_metrics.get(
+                                "gpu_candidate_compaction_seconds", 0.0
+                            )
+                            or 0.0
+                        ),
+                        "gpu_synchronization_seconds": float(
+                            active_support_metrics.get("gpu_synchronization_seconds", 0.0)
+                            or 0.0
+                        ),
+                        "gpu_conservative_candidate_count": int(
+                            active_support_metrics.get(
+                                "gpu_conservative_candidate_count", 0
+                            )
+                            or 0
+                        ),
+                        "gpu_conservative_candidate_density": float(
+                            active_support_metrics.get(
+                                "gpu_conservative_candidate_density", 0.0
+                            )
+                            or 0.0
                         ),
                         "gpu_cpu_verification_seconds": float(
                             active_support_metrics.get("gpu_cpu_verification_seconds", 0.0)

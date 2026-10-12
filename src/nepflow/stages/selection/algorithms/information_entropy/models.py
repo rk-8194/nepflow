@@ -24,7 +24,7 @@ DEFAULT_NEIGHBOUR_BACKEND_ID = INDEXED_NEIGHBOUR_BACKEND_ID
 NEIGHBOUR_METRIC = "euclidean"
 KERNEL_SUPPORT_EXECUTION_CPU = "cpu"
 KERNEL_SUPPORT_EXECUTION_GPU = "exact_tiled_gpu"
-KERNEL_SUPPORT_EXECUTION_GPU_VERSION = "exact-tiled-gpu-v2"
+KERNEL_SUPPORT_EXECUTION_GPU_VERSION = "exact-tiled-gpu-v3"
 KERNEL_SUPPORT_EXECUTIONS = frozenset({KERNEL_SUPPORT_EXECUTION_CPU, KERNEL_SUPPORT_EXECUTION_GPU})
 # ``exact_tiled_gpu`` was used by early experimental callers.  It remains an
 # accepted spelling for the explicit kNN field, but is canonicalised to the
