@@ -21,6 +21,7 @@ from nepflow.resources.budget import (
 )
 from nepflow.stages.selection.representations import LocalEnvironmentRepresentation
 
+from .checkpointing import CheckpointValidationError, VersionedCheckpointStore
 from .gpu_neighbours import (
     ExactTiledGPUNeighbourIndex,
     compute_gpu_tiled_neighbours_many,
@@ -35,9 +36,12 @@ from .models import (
     CALIBRATION_OPTIMIZER_VERSION,
     DEFAULT_LOO_CHECKPOINT_EVERY_SOURCES,
     DEFAULT_NEIGHBOUR_BACKEND_ID,
+    ENTROPY_OBJECTIVE_SCHEMA_VERSION,
     GPU_NEIGHBOUR_BACKEND_ALIASES,
     KERNEL_FAMILY,
+    KERNEL_OPERATOR_SCHEMA_VERSION,
     KERNEL_VERSION,
+    NEIGHBOUR_DISTINCT_POLICY,
     NEIGHBOUR_METRIC,
     BandwidthCalibrationResult,
     CalibrationAttempt,
@@ -569,12 +573,262 @@ def _settings_from_arguments(
 
 def _attempt_payload(attempt: CalibrationAttempt) -> dict[str, Any]:
     return {
-        "k": attempt.k,
-        "c": attempt.c,
+        "k": int(attempt.k),
+        "c": float(attempt.c),
         "status": attempt.status,
-        "objective": attempt.objective,
+        "objective": None if attempt.objective is None else float(attempt.objective),
         "reason": attempt.reason,
         "bandwidth_fingerprint": attempt.bandwidth_fingerprint,
+    }
+
+
+_CALIBRATION_GRID_CHECKPOINT_NAME = "calibration-grid"
+_CALIBRATION_GRID_SCHEMA = "entropy-calibration-grid-v1"
+
+
+def _loo_checkpoint_name(mode: str, candidate_k: int, candidate_cs: Sequence[float]) -> str:
+    ordered_cs = tuple(float(value) for value in candidate_cs)
+    if mode == "manual":
+        return f"loo-k{int(candidate_k)}"
+    return f"loo-k{int(candidate_k)}-c-" + "-".join(f"{value:g}" for value in ordered_cs)
+
+
+def _calibration_grid_identity(
+    pool: EntropyPool,
+    settings: EntropyBandwidthSettings,
+    domain_k: Sequence[int],
+    domain_c: Sequence[float],
+    index: Any,
+) -> dict[str, Any]:
+    """Return the scientific identity for the completed calibration grid."""
+
+    backend = str(getattr(index, "backend", settings.backend))
+    backend_version = str(getattr(index, "backend_version", ""))
+    backend_fingerprint = str(getattr(index, "fingerprint", ""))
+    return {
+        "phase": "calibration-grid",
+        "schema": _CALIBRATION_GRID_SCHEMA,
+        "pool_fingerprint": pool.fingerprint,
+        "descriptor_fingerprint": _array_fingerprint(pool.descriptors),
+        "ordered_row_fingerprint": sha256_canonical_json(list(_pool_row_ids(pool))),
+        "candidate_ids_fingerprint": sha256_canonical_json(list(pool.candidate_ids)),
+        "row_candidate_indices_fingerprint": _array_fingerprint(pool.row_candidate_indices),
+        "probability_fingerprint": _array_fingerprint(pool.probabilities),
+        "transform_fingerprint": pool.transform_fingerprint,
+        "representation_fingerprint": pool.representation_fingerprint,
+        "source_order": "ascending-original-pool-row-index",
+        "target_order": "ascending-original-pool-row-index",
+        "distinct_location_policy": str(
+            getattr(index, "distinct_location_policy", NEIGHBOUR_DISTINCT_POLICY)
+        ),
+        "backend": backend,
+        "backend_version": backend_version,
+        "backend_numerical_fingerprint": backend_fingerprint,
+        "metric": str(getattr(index, "metric", settings.metric)),
+        "kernel_family": KERNEL_FAMILY,
+        "kernel_version": KERNEL_VERSION,
+        "kernel_operator_schema": KERNEL_OPERATOR_SCHEMA_VERSION,
+        "loo_schema": "loo-checkpoint-v1",
+        "normalization": "source-column-all-targets-including-self",
+        "loo_exclusion": "source-row-only",
+        "objective_schema": ENTROPY_OBJECTIVE_SCHEMA_VERSION,
+        "objective_semantics": "-sum(p_a*log(loo_a)), float64 source-normalized LOO",
+        "validity_semantics": "finite-positive-loo-and-finite-objective",
+        "optimizer": "manual" if settings.mode == "manual" else CALIBRATION_OPTIMIZER_ID,
+        "optimizer_version": (
+            "manual-v1" if settings.mode == "manual" else CALIBRATION_OPTIMIZER_VERSION
+        ),
+        "mode": settings.mode,
+        "ordered_k_domain": [int(value) for value in domain_k],
+        "ordered_c_domain": [float(value) for value in domain_c],
+        "tie_policy": "first-canonical-minimum-strict-less-than",
+    }
+
+
+def _restore_calibration_grid_state(
+    state: Mapping[str, Any],
+    arrays: Mapping[str, np.ndarray],
+    *,
+    pool: EntropyPool,
+    mode: str,
+    domain_k: Sequence[int],
+    domain_c: Sequence[float],
+) -> dict[str, Any]:
+    """Validate and decode a grid commit without trusting restored objects."""
+
+    if state.get("schema") != _CALIBRATION_GRID_SCHEMA:
+        raise CheckpointValidationError("calibration grid state schema is incompatible")
+    total = len(domain_k) * len(domain_c)
+    raw_attempts = state.get("attempts")
+    if not isinstance(raw_attempts, list) or len(raw_attempts) > total:
+        raise CheckpointValidationError("calibration grid attempts are incomplete or invalid")
+    if state.get("cursor") != len(raw_attempts):
+        raise CheckpointValidationError("calibration grid attempt cursor is invalid")
+    attempts: list[CalibrationAttempt] = []
+    for position, raw in enumerate(raw_attempts):
+        if not isinstance(raw, dict):
+            raise CheckpointValidationError("calibration grid attempt record is invalid")
+        expected_k = int(domain_k[position // len(domain_c)])
+        expected_c = float(domain_c[position % len(domain_c)])
+        try:
+            actual_k = int(raw["k"])
+            actual_c = float(raw["c"])
+        except (KeyError, TypeError, ValueError, OverflowError) as exc:
+            raise CheckpointValidationError(
+                "calibration grid attempt coordinate is invalid"
+            ) from exc
+        if actual_k != expected_k or actual_c != expected_c:
+            raise CheckpointValidationError(
+                "calibration grid attempt order does not match the canonical search domain"
+            )
+        status = raw.get("status")
+        if status not in {"valid", "invalid"}:
+            raise CheckpointValidationError("calibration grid attempt status is invalid")
+        fingerprint = raw.get("bandwidth_fingerprint")
+        if fingerprint is not None and (
+            not isinstance(fingerprint, str) or not fingerprint.strip()
+        ):
+            raise CheckpointValidationError("calibration grid bandwidth fingerprint is invalid")
+        if status == "valid":
+            objective = raw.get("objective")
+            if isinstance(objective, bool) or not isinstance(objective, (int, float)):
+                raise CheckpointValidationError("valid calibration objective is invalid")
+            objective = float(objective)
+            if not math.isfinite(objective) or raw.get("reason") is not None or not fingerprint:
+                raise CheckpointValidationError("valid calibration attempt proof is incomplete")
+            reason = None
+        else:
+            if raw.get("objective") is not None:
+                raise CheckpointValidationError("invalid calibration attempt has an objective")
+            reason_value = raw.get("reason")
+            if not isinstance(reason_value, str) or not reason_value.strip():
+                raise CheckpointValidationError("invalid calibration attempt has no reason")
+            objective = None
+            reason = reason_value
+        attempts.append(
+            CalibrationAttempt(
+                actual_k,
+                actual_c,
+                status,
+                objective=objective,
+                reason=reason,
+                bandwidth_fingerprint=fingerprint,
+            )
+        )
+
+    raw_times = state.get("pair_wall_seconds")
+    if not isinstance(raw_times, list) or len(raw_times) != len(attempts):
+        raise CheckpointValidationError("calibration grid pair timing state is invalid")
+    pair_wall_seconds: list[float] = []
+    for value in raw_times:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise CheckpointValidationError("calibration grid pair timing is invalid")
+        seconds = float(value)
+        if not math.isfinite(seconds) or seconds < 0.0:
+            raise CheckpointValidationError("calibration grid pair timing is invalid")
+        pair_wall_seconds.append(seconds)
+
+    active_raw = state.get("active_batch")
+    active_batch: dict[str, Any] | None = None
+    if active_raw is not None:
+        if not isinstance(active_raw, dict) or len(attempts) >= total:
+            raise CheckpointValidationError("calibration grid active batch is invalid")
+        next_position = len(attempts)
+        expected_k = int(domain_k[next_position // len(domain_c)])
+        expected_c = float(domain_c[next_position % len(domain_c)])
+        values = active_raw.get("c_values")
+        try:
+            active_k = int(active_raw["k"])
+            active_cs = tuple(float(value) for value in values)
+        except (KeyError, TypeError, ValueError, OverflowError) as exc:
+            raise CheckpointValidationError(
+                "calibration grid active batch coordinates are invalid"
+            ) from exc
+        if (
+            active_k != expected_k
+            or not active_cs
+            or active_cs[0] != expected_c
+            or len(set(active_cs)) != len(active_cs)
+            or any(value not in tuple(float(item) for item in domain_c) for value in active_cs)
+            or _loo_checkpoint_name(mode, active_k, active_cs)
+            != active_raw.get("checkpoint_name")
+        ):
+            raise CheckpointValidationError("calibration grid active batch is not canonical")
+        active_batch = {
+            "k": active_k,
+            "c_values": active_cs,
+            "checkpoint_name": str(active_raw["checkpoint_name"]),
+        }
+
+    valid_attempts = [attempt for attempt in attempts if attempt.status == "valid"]
+    winner_raw = state.get("winner")
+    winner: dict[str, Any] | None = None
+    winner_array = arrays.get("winner_loo_probabilities")
+    if not valid_attempts:
+        if winner_raw is not None or winner_array is not None:
+            raise CheckpointValidationError("calibration grid has a winner without a valid attempt")
+    else:
+        if not isinstance(winner_raw, dict) or winner_array is None:
+            raise CheckpointValidationError("calibration grid winner proof is incomplete")
+        if winner_array.dtype != np.dtype(np.float64) or winner_array.shape != (
+            pool.descriptors.shape[0],
+        ):
+            raise CheckpointValidationError("calibration grid winner probability array is invalid")
+        if not np.all(np.isfinite(winner_array)) or np.any(winner_array <= 0.0):
+            raise CheckpointValidationError("calibration grid winner probabilities are invalid")
+        expected = valid_attempts[0]
+        for attempt in valid_attempts[1:]:
+            if (
+                attempt.objective is not None
+                and expected.objective is not None
+                and attempt.objective < expected.objective
+            ):
+                expected = attempt
+        try:
+            winner_k = int(winner_raw["k"])
+            winner_c = float(winner_raw["c"])
+            winner_objective = float(winner_raw["objective"])
+        except (KeyError, TypeError, ValueError, OverflowError) as exc:
+            raise CheckpointValidationError("calibration grid winner metadata is invalid") from exc
+        if (
+            winner_k != expected.k
+            or winner_c != expected.c
+            or winner_objective != expected.objective
+            or winner_raw.get("bandwidth_fingerprint") != expected.bandwidth_fingerprint
+            or winner_raw.get("probabilities_fingerprint") != _array_fingerprint(winner_array)
+        ):
+            raise CheckpointValidationError(
+                "calibration grid winner is not the first canonical minimum"
+            )
+        winner = {
+            "k": winner_k,
+            "c": winner_c,
+            "objective": winner_objective,
+            "bandwidth_fingerprint": expected.bandwidth_fingerprint,
+            "probabilities": winner_array,
+        }
+    elapsed = state.get("elapsed_wall_seconds", 0.0)
+    if (
+        isinstance(elapsed, bool)
+        or not isinstance(elapsed, (int, float))
+        or not math.isfinite(float(elapsed))
+        or float(elapsed) < 0.0
+    ):
+        raise CheckpointValidationError("calibration grid elapsed walltime is invalid")
+    retire_name = state.get("retire_checkpoint_name")
+    if retire_name is not None and (
+        not isinstance(retire_name, str)
+        or not retire_name
+        or Path(retire_name).name != retire_name
+    ):
+        raise CheckpointValidationError("calibration grid retirement handoff is invalid")
+    return {
+        "attempts": attempts,
+        "pair_wall_seconds": pair_wall_seconds,
+        "active_batch": active_batch,
+        "winner": winner,
+        "elapsed_wall_seconds": float(elapsed),
+        "retire_checkpoint_name": retire_name,
     }
 
 
@@ -753,6 +1007,43 @@ def calibrate_bandwidth(
 
     total_combinations = len(domain_k) * len(domain_c)
     calibration_started = time.perf_counter()
+    grid_store: VersionedCheckpointStore | None = None
+    grid_identity: dict[str, Any] | None = None
+    restored_grid: dict[str, Any] | None = None
+    if checkpoint_path is not None:
+        grid_store = VersionedCheckpointStore(
+            checkpoint_path,
+            retention_generations=2,
+            resource_budget=runtime_budget,
+            retention_name=_CALIBRATION_GRID_CHECKPOINT_NAME,
+        )
+        grid_identity = _calibration_grid_identity(
+            pool,
+            selected_settings,
+            domain_k,
+            domain_c,
+            index,
+        )
+        if not resume:
+            grid_store.clear(_CALIBRATION_GRID_CHECKPOINT_NAME)
+            grid_store.clean_stale(checkpoint_names={_CALIBRATION_GRID_CHECKPOINT_NAME})
+        elif grid_store.exists(_CALIBRATION_GRID_CHECKPOINT_NAME):
+            _stored_identity, stored_state, stored_arrays = grid_store.load(
+                _CALIBRATION_GRID_CHECKPOINT_NAME,
+                expected_identity=grid_identity,
+            )
+            restored_grid = _restore_calibration_grid_state(
+                stored_state,
+                stored_arrays,
+                pool=pool,
+                mode=selected_settings.mode,
+                domain_k=domain_k,
+                domain_c=domain_c,
+            )
+        elif grid_store.has_artifacts(_CALIBRATION_GRID_CHECKPOINT_NAME):
+            raise CheckpointValidationError(
+                "calibration grid checkpoint has retained data but no durable pointer"
+            )
     operational_metrics: dict[str, Any] = {
         "wall_seconds": 0.0,
         "neighbour_query_seconds": 0.0,
@@ -787,7 +1078,23 @@ def calibrate_bandwidth(
         )
         raise BandwidthCalibrationError("leave-one-out calibration requires at least two rows")
 
-    attempts: list[CalibrationAttempt] = []
+    attempts: list[CalibrationAttempt] = (
+        [] if restored_grid is None else list(restored_grid["attempts"])
+    )
+    pair_wall_seconds: list[float] = (
+        [] if restored_grid is None else list(restored_grid["pair_wall_seconds"])
+    )
+    pairs_reused = len(attempts)
+    pairs_computed = 0
+    grid_completed_commits = 0
+    resumed_elapsed_wall_seconds = (
+        0.0 if restored_grid is None else float(restored_grid["elapsed_wall_seconds"])
+    )
+    restored_retire_checkpoint_name = (
+        None if restored_grid is None else restored_grid["retire_checkpoint_name"]
+    )
+    active_grid_batch = None if restored_grid is None else restored_grid["active_batch"]
+    active_grid_batch_consumed = active_grid_batch is None
     radii_by_k: dict[int, ExactNeighbourResult | str] = {}
     if selected_settings.mode == "automatic" and index is not None:
         indexed_orders: list[int] = []
@@ -858,14 +1165,54 @@ def calibrate_bandwidth(
                 0.0, time.perf_counter() - neighbour_started
             )
             sample_resource_leases()
+
     winner: tuple[float, FrozenBandwidths, np.ndarray] | None = None
-    completed_combinations = 0
-    valid_count = 0
-    invalid_count = 0
+    restored_winner = None if restored_grid is None else restored_grid["winner"]
+    if restored_winner is not None and selected_settings.mode == "automatic":
+        winner_k = int(restored_winner["k"])
+        restored_neighbours = radii_by_k.get(winner_k)
+        if not isinstance(restored_neighbours, ExactNeighbourResult):
+            raise CheckpointValidationError(
+                "calibration grid winner cannot be reconstructed from current neighbour results"
+            )
+        restored_frozen = _freeze_from_neighbours(
+            pool,
+            restored_neighbours,
+            float(restored_winner["c"]),
+        )
+        if restored_frozen.fingerprint != restored_winner["bandwidth_fingerprint"]:
+            raise CheckpointValidationError(
+                "calibration grid winner bandwidth fingerprint does not match current neighbours"
+            )
+        restored_probabilities = np.asarray(restored_winner["probabilities"], dtype=np.float64)
+        if restored_probabilities.shape != (pool.descriptors.shape[0],):
+            raise CheckpointValidationError(
+                "calibration grid winner probabilities have the wrong shape"
+            )
+        winner = (
+            float(restored_winner["objective"]),
+            restored_frozen,
+            restored_probabilities,
+        )
+    completed_combinations = len(attempts)
+    valid_count = sum(attempt.status == "valid" for attempt in attempts)
+    invalid_count = sum(attempt.status == "invalid" for attempt in attempts)
 
     def record_attempt(attempt: CalibrationAttempt) -> None:
-        nonlocal completed_combinations, valid_count, invalid_count
+        nonlocal completed_combinations, valid_count, invalid_count, pairs_computed
+        if len(attempts) >= total_combinations:
+            raise CheckpointValidationError("calibration grid received an extra attempt")
+        expected_position = len(attempts)
+        expected_pair = (
+            int(domain_k[expected_position // len(domain_c)]),
+            float(domain_c[expected_position % len(domain_c)]),
+        )
+        if (int(attempt.k), float(attempt.c)) != expected_pair:
+            raise CheckpointValidationError(
+                "calibration grid attempt is not the first unfinished canonical pair"
+            )
         attempts.append(attempt)
+        pairs_computed += 1
         completed_combinations += 1
         if attempt.status == "valid":
             valid_count += 1
@@ -892,7 +1239,7 @@ def calibrate_bandwidth(
             logger.info(
                 "Bandwidth calibration pair completed: k=%d, c=%g, J(k,c)=%.12g, "
                 "%d/%d combinations (%.1f%%), valid=%d, invalid=%d, elapsed=%.3fs, "
-                "estimated remaining=%.3fs",
+                "estimated remaining=%.3fs, reused=false, evaluated=true",
                 *progress_values[:2],
                 attempt.objective,
                 *progress_values[2:],
@@ -901,11 +1248,90 @@ def calibrate_bandwidth(
             logger.info(
                 "Bandwidth calibration pair completed: k=%d, c=%g, invalid=%s, "
                 "%d/%d combinations (%.1f%%), valid=%d, invalid=%d, elapsed=%.3fs, "
-                "estimated remaining=%.3fs",
+                "estimated remaining=%.3fs, reused=false, evaluated=true",
                 *progress_values[:2],
                 attempt.reason or "unspecified invalidity",
                 *progress_values[2:],
             )
+
+    def _grid_winner_payload() -> dict[str, Any] | None:
+        if winner is None:
+            return None
+        objective_value, frozen, _probabilities = winner
+        matching = next(
+            (
+                attempt
+                for attempt in attempts
+                if attempt.status == "valid"
+                and attempt.k == frozen.k
+                and attempt.c == frozen.c
+                and attempt.objective == objective_value
+            ),
+            None,
+        )
+        if matching is None or matching.bandwidth_fingerprint != frozen.fingerprint:
+            raise CheckpointValidationError("calibration grid winner has no matching attempt proof")
+        return {
+            "k": frozen.k,
+            "c": frozen.c,
+            "objective": float(objective_value),
+            "bandwidth_fingerprint": frozen.fingerprint,
+            "probabilities_fingerprint": _array_fingerprint(_probabilities),
+        }
+
+    def publish_grid(
+        active_batch: Mapping[str, Any] | None,
+        *,
+        retire_checkpoint_name: str | None = None,
+    ) -> None:
+        if grid_store is None or grid_identity is None:
+            return
+        winner_payload = _grid_winner_payload()
+        state: dict[str, Any] = {
+            "schema": _CALIBRATION_GRID_SCHEMA,
+            "cursor": len(attempts),
+            "attempts": [_attempt_payload(attempt) for attempt in attempts],
+            "pair_wall_seconds": [float(value) for value in pair_wall_seconds],
+            "active_batch": None if active_batch is None else dict(active_batch),
+            "retire_checkpoint_name": retire_checkpoint_name,
+            "winner": winner_payload,
+            "elapsed_wall_seconds": resumed_elapsed_wall_seconds
+            + max(0.0, time.perf_counter() - calibration_started),
+        }
+        arrays: dict[str, np.ndarray] = {}
+        if winner is not None:
+            arrays["winner_loo_probabilities"] = np.asarray(winner[2], dtype=np.float64)
+        grid_store.write(
+            _CALIBRATION_GRID_CHECKPOINT_NAME,
+            identity=grid_identity,
+            state=state,
+            arrays=arrays,
+        )
+
+    loo_cleanup_store: VersionedCheckpointStore | None = None
+
+    def retire_loo_checkpoint(checkpoint_name: str) -> None:
+        nonlocal loo_cleanup_store
+        if checkpoint_path is None:
+            return
+        if loo_cleanup_store is None:
+            loo_cleanup_store = VersionedCheckpointStore(
+                checkpoint_path,
+                resource_budget=runtime_budget,
+            )
+        loo_cleanup_store.clear(checkpoint_name)
+        loo_cleanup_store.clean_stale(checkpoint_names={checkpoint_name})
+
+    if restored_retire_checkpoint_name is not None:
+        retire_loo_checkpoint(restored_retire_checkpoint_name)
+
+    def append_pair_timings(start_position: int, started: float) -> None:
+        added = len(attempts) - start_position
+        if added < 0:
+            raise CheckpointValidationError("calibration grid attempt cursor moved backwards")
+        if added:
+            per_pair = max(0.0, time.perf_counter() - started) / added
+            pair_wall_seconds.extend([per_pair] * added)
 
     def source_progress_logger(
         candidate_k: int,
@@ -1005,8 +1431,23 @@ def calibrate_bandwidth(
 
         return report
 
-    def c_batches(neighbours: ExactNeighbourResult) -> tuple[tuple[float, ...], ...]:
-        ordered = tuple(float(value) for value in domain_c)
+    for reused_attempt in attempts:
+        logger.info(
+            "Bandwidth calibration pair reused: k=%d, c=%g, status=%s, objective=%s, "
+            "reused=true, evaluated=false",
+            reused_attempt.k,
+            reused_attempt.c,
+            reused_attempt.status,
+            reused_attempt.objective,
+        )
+
+    def c_batches(
+        neighbours: ExactNeighbourResult,
+        candidate_cs: Sequence[float] | None = None,
+    ) -> tuple[tuple[float, ...], ...]:
+        ordered = tuple(
+            float(value) for value in (domain_c if candidate_cs is None else candidate_cs)
+        )
         if selected_settings.mode == "manual":
             return (ordered,)
         row_count = int(pool.descriptors.shape[0])
@@ -1148,6 +1589,22 @@ def calibrate_bandwidth(
         return batches
 
     for candidate_k in domain_k:
+        completed_for_k = {
+            attempt.c
+            for attempt in attempts
+            if attempt.k == candidate_k
+        }
+        pending_for_k = tuple(
+            float(candidate_c)
+            for candidate_c in domain_c
+            if float(candidate_c) not in completed_for_k
+        )
+        if not pending_for_k and not (
+            restored_winner is not None
+            and winner is None
+            and int(restored_winner["k"]) == int(candidate_k)
+        ):
+            continue
         try:
             neighbours = radii_by_k.get(candidate_k)
             if neighbours is None:
@@ -1171,23 +1628,88 @@ def calibrate_bandwidth(
         except (ValueError, TypeError) as exc:
             reason = str(exc)
             radii_by_k[candidate_k] = reason
-            for candidate_c in domain_c:
+            started = time.perf_counter()
+            start_position = len(attempts)
+            for candidate_c in pending_for_k:
                 record_attempt(
                     CalibrationAttempt(candidate_k, float(candidate_c), "invalid", reason=reason)
                 )
+            append_pair_timings(start_position, started)
+            publish_grid(None)
             continue
 
-        batches = c_batches(neighbours)
-        for c_batch in batches:
+        if (
+            restored_winner is not None
+            and winner is None
+            and int(restored_winner["k"]) == int(candidate_k)
+        ):
+            restored_frozen = _freeze_from_neighbours(
+                pool,
+                neighbours,
+                float(restored_winner["c"]),
+            )
+            if restored_frozen.fingerprint != restored_winner["bandwidth_fingerprint"]:
+                raise CheckpointValidationError(
+                    "calibration grid winner bandwidth fingerprint does not match "
+                    "current neighbours"
+                )
+            winner = (
+                float(restored_winner["objective"]),
+                restored_frozen,
+                np.asarray(restored_winner["probabilities"], dtype=np.float64),
+            )
+
+        if not pending_for_k:
+            continue
+
+        planned_batches = c_batches(neighbours, pending_for_k)
+        if (
+            active_grid_batch is not None
+            and not active_grid_batch_consumed
+            and int(active_grid_batch["k"]) == int(candidate_k)
+        ):
+            active_values = tuple(float(value) for value in active_grid_batch["c_values"])
+            remaining_planned: list[tuple[float, ...]] = []
+            for planned in planned_batches:
+                remainder = tuple(value for value in planned if value not in active_values)
+                if remainder:
+                    remaining_planned.append(remainder)
+            batches = (active_values, *remaining_planned)
+            active_grid_batch_consumed = True
+        else:
+            batches = planned_batches
+        for planned_batch in batches:
+            c_batch = tuple(
+                float(candidate_c)
+                for candidate_c in planned_batch
+                if float(candidate_c) not in completed_for_k
+            )
+            if not c_batch:
+                continue
             logger.info(
                 "Bandwidth calibration c-batch started: k=%d, c_batch=%s",
                 candidate_k,
                 ",".join(f"{value:g}" for value in c_batch),
             )
+            loo_checkpoint_name = _loo_checkpoint_name(
+                selected_settings.mode,
+                candidate_k,
+                c_batch,
+            )
+            pair_started = time.perf_counter()
+            start_position = len(attempts)
+            frozen_batch: tuple[FrozenBandwidths, ...] = ()
             try:
                 frozen_batch = tuple(
                     _freeze_from_neighbours(pool, neighbours, candidate_c)
                     for candidate_c in c_batch
+                )
+                publish_grid(
+                    {
+                        "k": int(candidate_k),
+                        "c_values": list(c_batch),
+                        "checkpoint_name": loo_checkpoint_name,
+                    }
                 )
                 loo_started = time.perf_counter()
                 if selected_settings.mode == "manual":
@@ -1205,10 +1727,11 @@ def calibrate_bandwidth(
                             resource_budget=runtime_budget,
                             capacity_context=f"k={candidate_k}, c={c_batch[0]:g}",
                             checkpoint_path=checkpoint_path,
-                            checkpoint_name=f"loo-k{candidate_k}",
+                            checkpoint_name=loo_checkpoint_name,
                             checkpoint_every_sources=selected_settings.loo_checkpoint_every_sources,
                             checkpoint_every_seconds=selected_settings.loo_checkpoint_every_seconds,
                             resume=resume,
+                            preserve_checkpoint=grid_store is not None,
                             diagnostics=operational_metrics,
                             kernel_support_execution=selected_settings.kernel_support_execution,
                             gpu_device=selected_settings.gpu_device,
@@ -1234,11 +1757,11 @@ def calibrate_bandwidth(
                             + ",".join(f"{value:g}" for value in c_batch)
                         ),
                         checkpoint_path=checkpoint_path,
-                        checkpoint_name=f"loo-k{candidate_k}-c-"
-                        + "-".join(f"{value:g}" for value in c_batch),
+                        checkpoint_name=loo_checkpoint_name,
                         checkpoint_every_sources=selected_settings.loo_checkpoint_every_sources,
                         checkpoint_every_seconds=selected_settings.loo_checkpoint_every_seconds,
                         resume=resume,
+                        preserve_checkpoint=grid_store is not None,
                         diagnostics=operational_metrics,
                         kernel_support_execution=selected_settings.kernel_support_execution,
                         gpu_device=selected_settings.gpu_device,
@@ -1299,17 +1822,36 @@ def calibrate_bandwidth(
                     record_attempt(attempt)
                     if winner is None or objective.objective < winner[0]:
                         winner = (objective.objective, frozen, objective.probabilities)
+                append_pair_timings(start_position, pair_started)
+                publish_grid(None, retire_checkpoint_name=loo_checkpoint_name)
+                grid_completed_commits += 1
+                retire_loo_checkpoint(loo_checkpoint_name)
+            except CheckpointValidationError:
+                raise
             except (FloatingPointError, OverflowError, ValueError) as exc:
-                for candidate_c in c_batch:
+                for batch_index, candidate_c in enumerate(c_batch):
                     record_attempt(
                         CalibrationAttempt(
                             candidate_k,
                             float(candidate_c),
                             "invalid",
                             reason=str(exc),
+                            bandwidth_fingerprint=(
+                                frozen_batch[batch_index].fingerprint
+                                if batch_index < len(frozen_batch)
+                                else None
+                            ),
                         )
                     )
+                append_pair_timings(start_position, pair_started)
+                publish_grid(None, retire_checkpoint_name=loo_checkpoint_name)
+                grid_completed_commits += 1
+                retire_loo_checkpoint(loo_checkpoint_name)
 
+    if completed_combinations != total_combinations:
+        raise CheckpointValidationError(
+            "calibration grid terminated before every ordered pair was durably completed"
+        )
     if winner is None:
         elapsed, _ = _progress_timing(
             completed_combinations,
@@ -1339,6 +1881,34 @@ def calibrate_bandwidth(
         calibration_started,
     )
     operational_metrics["wall_seconds"] = elapsed
+    operational_metrics.update(
+        {
+            "pairs_reused": pairs_reused,
+            "pairs_computed": pairs_computed,
+            "resumed_elapsed_wall_seconds": resumed_elapsed_wall_seconds,
+            "process_elapsed_wall_seconds": elapsed,
+            "estimated_time_saved_seconds": float(sum(pair_wall_seconds[:pairs_reused])),
+        }
+    )
+    if grid_store is not None:
+        grid_metrics = grid_store.metrics()
+        for metric_name, metric_value in grid_metrics.items():
+            key = (
+                metric_name
+                if metric_name.startswith("grid_checkpoint_")
+                else f"grid_checkpoint_{metric_name}"
+            )
+            if metric_name == "checkpoint_wall_seconds":
+                key = "grid_checkpoint_wall_seconds"
+            operational_metrics[key] = metric_value
+        operational_metrics["grid_checkpoint_commits"] = grid_completed_commits
+        operational_metrics["grid_checkpoint_pointer_promotions"] = int(
+            grid_metrics.get("commits", 0) or 0
+        )
+        operational_metrics["grid_checkpoint_bytes"] = int(
+            grid_metrics.get("physical_bytes_written", 0) or 0
+        )
+        operational_metrics["grid_checkpoint_retention_generations"] = 2
     operational_metrics["pair_throughput_per_second"] = (
         completed_combinations / elapsed if elapsed > 0.0 else 0.0
     )
@@ -1374,6 +1944,8 @@ def calibrate_bandwidth(
     logger.info(
         "Bandwidth calibration completed: selected k=%d, c=%g, objective=%.12g, "
         "attempted=%d/%d (100.0%%), valid=%d, invalid=%d, elapsed=%.3fs, "
+        "pairs_reused=%d, pairs_computed=%d, resumed_elapsed_wall_seconds=%.3f, "
+        "estimated_time_saved_seconds=%.3f, grid_checkpoint_commits=%s, "
         "wall_seconds=%.6f, pair_throughput=%.3f, support_queries=%s, "
         "distance_evaluations=%s, process_peak_rss_bytes=%s, "
         "resource_lease_peak_bytes=%d, scratch_peak_bytes=%d",
@@ -1385,6 +1957,11 @@ def calibrate_bandwidth(
         valid_count,
         invalid_count,
         elapsed,
+        pairs_reused,
+        pairs_computed,
+        resumed_elapsed_wall_seconds,
+        operational_metrics.get("estimated_time_saved_seconds", 0.0),
+        operational_metrics.get("grid_checkpoint_commits", 0),
         operational_metrics["wall_seconds"],
         operational_metrics["pair_throughput_per_second"],
         operational_metrics.get("support_queries"),

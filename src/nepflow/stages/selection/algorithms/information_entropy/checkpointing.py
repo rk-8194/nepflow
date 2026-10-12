@@ -52,6 +52,20 @@ def _fsync_directory(path: Path) -> None:
         os.close(descriptor)
 
 
+def _atomic_replace(source: Path, destination: Path) -> None:
+    """Replace a path, tolerating short-lived Windows scanner locks."""
+
+    attempts = 8 if os.name == "nt" else 1
+    for attempt in range(attempts):
+        try:
+            os.replace(source, destination)
+            return
+        except PermissionError:
+            if attempt + 1 >= attempts:
+                raise
+            time.sleep(0.01 * (attempt + 1))
+
+
 def _safe_name(name: str) -> str:
     if not isinstance(name, str) or not name or Path(name).name != name:
         raise ValueError("checkpoint name must be a simple non-empty filename")
@@ -246,7 +260,7 @@ class VersionedCheckpointStore:
                 self._add_stat("fsync_seconds", time.perf_counter() - sync_started)
             self._add_stat("physical_bytes_written", int(temporary.stat().st_size))
             self._add_stat("metadata_bytes_written", int(temporary.stat().st_size))
-            os.replace(temporary, path)
+            _atomic_replace(temporary, path)
             _fsync_directory(self.root)
         finally:
             temporary.unlink(missing_ok=True)
@@ -492,6 +506,7 @@ class VersionedCheckpointStore:
                 "identity": dict(identity),
                 "identity_fingerprint": sha256_canonical_json(dict(identity)),
                 "state": dict(state),
+                "state_fingerprint": sha256_canonical_json(dict(state)),
                 "arrays": array_entries,
             }
             manifest_path = temporary / "manifest.json"
@@ -504,7 +519,7 @@ class VersionedCheckpointStore:
                 self._add_stat("fsync_seconds", time.perf_counter() - sync_started)
             self._add_stat("physical_bytes_written", int(manifest_path.stat().st_size))
             self._add_stat("metadata_bytes_written", int(manifest_path.stat().st_size))
-            os.replace(temporary, final)
+            _atomic_replace(temporary, final)
             _fsync_directory(self.root)
             pointer_temporary = self.root / f".{checkpoint_name}.pointer-{uuid.uuid4().hex}.tmp"
             pointer_payload = {"schema": CHECKPOINT_SCHEMA_VERSION, "generation": generation}
@@ -517,7 +532,7 @@ class VersionedCheckpointStore:
                 self._add_stat("fsync_seconds", time.perf_counter() - sync_started)
             self._add_stat("physical_bytes_written", int(pointer_temporary.stat().st_size))
             self._add_stat("metadata_bytes_written", int(pointer_temporary.stat().st_size))
-            os.replace(pointer_temporary, self._pointer(checkpoint_name))
+            _atomic_replace(pointer_temporary, self._pointer(checkpoint_name))
             _fsync_directory(self.root)
 
             if self.retention_generations is not None:
@@ -627,12 +642,27 @@ class VersionedCheckpointStore:
         state = manifest.get("state")
         if not isinstance(state, dict):
             raise CheckpointValidationError("checkpoint state is invalid")
+        if sha256_canonical_json(state) != manifest.get("state_fingerprint"):
+            raise CheckpointValidationError("checkpoint state checksum mismatch")
         return identity, state, arrays
 
     restore = load
 
     def exists(self, name: str) -> bool:
         return self._pointer(_safe_name(name)).is_file()
+
+    def has_artifacts(self, name: str) -> bool:
+        """Return whether a pointer or unpublished retained generation exists."""
+
+        checkpoint_name = _safe_name(name)
+        if self._pointer(checkpoint_name).is_file() or self._retention_path(
+            checkpoint_name
+        ).is_file():
+            return True
+        return any(
+            path.is_dir() and path.name.startswith(f"{checkpoint_name}.generation-")
+            for path in self.root.iterdir()
+        )
 
     def clear(self, name: str) -> None:
         checkpoint_name = _safe_name(name)
@@ -1169,7 +1199,7 @@ class IncrementalCheckpointStore:
                     "sha256": digest,
                 }
             self._fsync_directory(temporary)
-            os.replace(temporary, final)
+            _atomic_replace(temporary, final)
             self._fsync_directory(self.root)
 
             manifest_name = f"{checkpoint_name}.incremental.manifest-{uuid.uuid4().hex}.json"
@@ -1199,7 +1229,7 @@ class IncrementalCheckpointStore:
                 os.fsync(handle.fileno())
                 self._add_stat("fsync_seconds", time.perf_counter() - sync_started)
             manifest_bytes = int(manifest_temporary.stat().st_size)
-            os.replace(manifest_temporary, self.root / manifest_name)
+            _atomic_replace(manifest_temporary, self.root / manifest_name)
             self._fsync_directory(self.root)
 
             pointer_payload = {
@@ -1217,7 +1247,7 @@ class IncrementalCheckpointStore:
                 os.fsync(handle.fileno())
                 self._add_stat("fsync_seconds", time.perf_counter() - sync_started)
             pointer_bytes = int(pointer_temporary.stat().st_size)
-            os.replace(pointer_temporary, self._pointer(checkpoint_name))
+            _atomic_replace(pointer_temporary, self._pointer(checkpoint_name))
             self._validated_heads[checkpoint_name] = (
                 identity,
                 stop,
@@ -1521,7 +1551,7 @@ class CandidateAggregationCheckpoint:
                 handle.write("\n")
                 handle.flush()
                 os.fsync(handle.fileno())
-            os.replace(temporary, self.manifest_path)
+            _atomic_replace(temporary, self.manifest_path)
         finally:
             temporary.unlink(missing_ok=True)
 
@@ -1582,7 +1612,7 @@ class CandidateAggregationCheckpoint:
                 os.fsync(handle.fileno())
             if final.exists():
                 shutil.rmtree(final)
-            os.replace(temporary, final)
+            _atomic_replace(temporary, final)
             completed = dict(manifest.get("completed", {}))
             completed[str(int(candidate_index))] = row_manifest
             manifest["completed"] = completed

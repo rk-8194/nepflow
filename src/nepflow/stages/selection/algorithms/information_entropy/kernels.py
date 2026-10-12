@@ -794,6 +794,7 @@ def evaluate_leave_one_out_objective(
     checkpoint_every_sources: int = DEFAULT_LOO_CHECKPOINT_EVERY_SOURCES,
     checkpoint_every_seconds: float | None = None,
     resume: bool = True,
+    preserve_checkpoint: bool = False,
     diagnostics: dict[str, Any] | None = None,
     kernel_support_execution: str = KERNEL_SUPPORT_EXECUTION_CPU,
     gpu_device: int = 0,
@@ -820,6 +821,7 @@ def evaluate_leave_one_out_objective(
             checkpoint_every_sources=checkpoint_every_sources,
             checkpoint_every_seconds=checkpoint_every_seconds,
             resume=resume,
+            preserve_checkpoint=preserve_checkpoint,
             diagnostics=diagnostics,
             kernel_support_execution=kernel_support_execution,
             gpu_device=gpu_device,
@@ -952,6 +954,7 @@ def evaluate_leave_one_out_objectives(
     checkpoint_every_sources: int = DEFAULT_LOO_CHECKPOINT_EVERY_SOURCES,
     checkpoint_every_seconds: float | None = None,
     resume: bool = True,
+    preserve_checkpoint: bool = False,
     diagnostics: dict[str, Any] | None = None,
     kernel_support_execution: str = KERNEL_SUPPORT_EXECUTION_CPU,
     gpu_device: int = 0,
@@ -1120,9 +1123,6 @@ def evaluate_leave_one_out_objectives(
             "metric": getattr(index, "metric", NEIGHBOUR_METRIC),
             "backend_fingerprint": getattr(index, "fingerprint", ""),
             "kernel_support_execution": kernel_support_execution,
-            "gpu_device": int(gpu_device),
-            "gpu_tile_size": int(gpu_tile_size),
-            "max_gpu_support_bytes": max_gpu_support_bytes,
             "source_order": "ascending-original-pool-row-index",
             "k_c_batch_shape": [batch_count, row_count],
             "numerical_tolerance": SPARSE_NUMERICAL_TOLERANCE,
@@ -1370,7 +1370,7 @@ def evaluate_leave_one_out_objectives(
         else:
             results.append(LeaveOneOutObjective(valid=True, objective=objective, probabilities=loo))
     reduction_seconds = max(0.0, time.perf_counter() - reduction_started)
-    if checkpoint_store is not None:
+    if checkpoint_store is not None and not preserve_checkpoint:
         checkpoint_store.clear(checkpoint_name)
         checkpoint_store.clean_stale(checkpoint_names={checkpoint_name})
     provider_metrics = provider.operational_metrics()
