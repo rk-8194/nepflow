@@ -542,6 +542,11 @@ class _KernelSupportProvider:
         }
         if self.gpu_support is not None:
             metrics.update(self.gpu_support.operational_metrics())
+            if "gpu_per_device" in index_metrics:
+                # The support provider owns the generic per-device key.  Keep
+                # the neighbour scheduler's independent device timings as a
+                # separate field so neither execution stage is hidden.
+                metrics["knn_gpu_per_device"] = index_metrics["gpu_per_device"]
         for key, value in index_metrics.items():
             metrics.setdefault(key, value)
         return metrics
@@ -815,7 +820,22 @@ def evaluate_leave_one_out_objective(
     if not np.all(np.isfinite(denominators)) or np.any(denominators <= 0.0):
         raise ValueError("leave-one-out requires 1 - p_a to be strictly positive")
 
+    provider = _KernelSupportProvider(
+        values,
+        backend=backend,
+        chunk_size=chunk_size,
+        index=index,
+        max_radius_query_bytes=max_radius_query_bytes,
+        resource_budget=resource_budget,
+        capacity_context=capacity_context,
+        kernel_support_execution=kernel_support_execution,
+        gpu_device=gpu_device,
+        gpu_devices=gpu_devices,
+        gpu_tile_size=gpu_tile_size,
+        max_gpu_support_bytes=max_gpu_support_bytes,
+    )
     numerator = np.zeros(values.shape[0], dtype=np.float64)
+    loo_started = time.perf_counter()
     for column in iter_normalized_kernel_columns(
         values,
         _validate_bandwidths(bandwidths, values.shape[0]),
@@ -823,6 +843,7 @@ def evaluate_leave_one_out_objective(
         progress_callback=progress_callback,
         backend=backend,
         index=index,
+        support_provider=provider,
         max_radius_query_bytes=max_radius_query_bytes,
         resource_budget=resource_budget,
         capacity_context=capacity_context,
@@ -837,6 +858,30 @@ def evaluate_leave_one_out_objective(
             numerator[column.target_indices[non_source]] += (
                 masses[column.source_index] * column.values[non_source]
             )
+    provider_metrics = provider.operational_metrics()
+    if diagnostics is not None:
+        diagnostics["loo_wall_seconds"] = max(0.0, time.perf_counter() - loo_started)
+        diagnostics["loo_support_query_seconds"] = float(
+            provider_metrics.get("support_query_seconds", 0.0) or 0.0
+        )
+        diagnostics["loo_distance_evaluations"] = int(
+            provider_metrics.get("distance_evaluations", 0) or 0
+        )
+        for metric_name, metric_value in provider_metrics.items():
+            if metric_name in {
+                "support_execution",
+                "support_execution_version",
+                "gpu_device",
+                "gpu_devices",
+                "gpu_device_count",
+                "gpu_per_device",
+                "knn_gpu_per_device",
+            }:
+                diagnostics[metric_name] = metric_value
+            elif isinstance(metric_value, bool):
+                diagnostics[metric_name] = metric_value
+            elif isinstance(metric_value, (int, float, np.integer, np.floating)):
+                diagnostics[metric_name] = metric_value
     with np.errstate(divide="ignore", invalid="ignore", over="raise"):
         try:
             loo = numerator / denominators
@@ -1331,6 +1376,10 @@ def evaluate_leave_one_out_objectives(
                 "support_execution",
                 "support_execution_version",
                 "gpu_device",
+                "gpu_devices",
+                "gpu_device_count",
+                "gpu_per_device",
+                "knn_gpu_per_device",
             }:
                 diagnostics[metric_name] = metric_value
             elif isinstance(metric_value, bool):

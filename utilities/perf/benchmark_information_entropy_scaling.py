@@ -28,6 +28,9 @@ from nepflow.stages.selection.algorithms.information_entropy.bandwidth import (
     _pool_row_ids,
     build_entropy_pool,
 )
+from nepflow.stages.selection.algorithms.information_entropy.gpu_devices import (
+    normalize_gpu_devices,
+)
 from nepflow.stages.selection.algorithms.information_entropy.gpu_neighbours import (
     ExactTiledGPUNeighbourIndex,
 )
@@ -471,6 +474,70 @@ def _prepare(
     return service, index, frozen, neighbours, preparation
 
 
+def _summarize_gpu_observations(
+    observations: list[dict[str, Any]], requested_devices: tuple[int, ...]
+) -> dict[str, Any]:
+    """Aggregate production GPU diagnostics without hiding device-local work."""
+
+    def merge_stage(stage_name: str) -> list[dict[str, Any]]:
+        by_device: dict[int, dict[str, Any]] = {}
+        for observation in observations:
+            records = observation.get(stage_name, [])
+            if not isinstance(records, list):
+                continue
+            for record in records:
+                if not isinstance(record, dict) or "gpu_device" not in record:
+                    continue
+                device = int(record["gpu_device"])
+                aggregate = by_device.setdefault(device, {})
+                for key, value in record.items():
+                    if key == "gpu_device" or isinstance(value, (list, dict, bool, str)):
+                        if key != "gpu_device":
+                            aggregate[key] = value
+                        continue
+                    if not isinstance(value, (int, float, np.integer, np.floating)):
+                        continue
+                    if key.endswith("_peak_bytes") or key in {
+                        "gpu_total_bytes",
+                        "gpu_free_bytes",
+                        "gpu_max_device_bytes",
+                        "gpu_device_count",
+                        "gpu_tile_size",
+                        "gpu_source_tile_size",
+                        "gpu_device_occupancy_fraction",
+                    }:
+                        aggregate[key] = max(float(aggregate.get(key, 0.0)), float(value))
+                    elif key.endswith("_throughput_per_second") or key in {
+                        "gpu_parallelism_estimate",
+                    }:
+                        aggregate[key] = float(value)
+                    else:
+                        aggregate[key] = float(aggregate.get(key, 0.0)) + float(value)
+                aggregate["gpu_device"] = device
+                if "support_query_count" in aggregate and "support_query_seconds" in aggregate:
+                    aggregate["support_query_throughput_per_second"] = (
+                        float(aggregate["support_query_count"])
+                        / float(aggregate["support_query_seconds"])
+                        if float(aggregate["support_query_seconds"]) > 0.0
+                        else 0.0
+                    )
+                if "gpu_active_seconds_sum" in aggregate and "gpu_wall_seconds" in aggregate:
+                    aggregate["gpu_parallelism_estimate"] = (
+                        float(aggregate["gpu_active_seconds_sum"])
+                        / float(aggregate["gpu_wall_seconds"])
+                        if float(aggregate["gpu_wall_seconds"]) > 0.0
+                        else 0.0
+                    )
+        return [by_device[device] for device in requested_devices if device in by_device]
+
+    return {
+        "requested_devices": list(requested_devices),
+        "support": merge_stage("gpu_per_device"),
+        "knn": merge_stage("knn_gpu_per_device"),
+        "observation_count": len(observations),
+    }
+
+
 def _run_stream(
     pool: Any,
     frozen: Any,
@@ -716,6 +783,8 @@ def _correctness_checks(
         )
 
     pair_results: list[dict[str, Any]] = []
+    production_gpu_observations: list[dict[str, Any]] = []
+    production_gpu_scalar_devices: list[tuple[int, ...]] = []
     production_winner: tuple[float, int, float, str] | None = None
     reference_winner: tuple[float, int, float, str] | None = None
     for candidate_k in PRODUCTION_K_VALUES:
@@ -742,6 +811,7 @@ def _correctness_checks(
             reference_frozen = _freeze_from_neighbours(
                 pool, reference_by_k[candidate_k], candidate_c
             )
+            production_batch_diagnostics: dict[str, Any] = {}
             production_batch = evaluate_leave_one_out_objectives(
                 pool.descriptors,
                 pool.probabilities,
@@ -753,8 +823,10 @@ def _correctness_checks(
                 resource_budget=resource_budget,
                 kernel_support_execution=kernel_support_execution,
                 gpu_device=gpu_device,
+                gpu_devices=gpu_devices,
                 gpu_tile_size=gpu_tile_size,
                 max_gpu_support_bytes=max_gpu_support_bytes,
+                diagnostics=production_batch_diagnostics,
             )[0]
             reference_independent_batch = evaluate_leave_one_out_objectives(
                 pool.descriptors,
@@ -764,6 +836,7 @@ def _correctness_checks(
                 backend=NEIGHBOUR_BACKEND_ID,
                 max_radius_query_bytes=max_radius_query_bytes,
             )[0]
+            production_scalar_diagnostics: dict[str, Any] = {}
             production_scalar = evaluate_leave_one_out_objective(
                 pool.descriptors,
                 pool.probabilities,
@@ -775,8 +848,16 @@ def _correctness_checks(
                 resource_budget=resource_budget,
                 kernel_support_execution=kernel_support_execution,
                 gpu_device=gpu_device,
+                gpu_devices=gpu_devices,
                 gpu_tile_size=gpu_tile_size,
                 max_gpu_support_bytes=max_gpu_support_bytes,
+                diagnostics=production_scalar_diagnostics,
+            )
+            production_gpu_observations.append(production_batch_diagnostics)
+            production_gpu_scalar_devices.append(
+                tuple(
+                    int(device) for device in production_scalar_diagnostics.get("gpu_devices", ())
+                )
             )
             reference_scalar = evaluate_leave_one_out_objective(
                 pool.descriptors,
@@ -982,6 +1063,27 @@ def _correctness_checks(
         and reference_winner is not None
         and production_winner[1:3] == reference_winner[1:3]
     )
+    requested_gpu_devices = normalize_gpu_devices(gpu_devices, gpu_device=gpu_device)
+    gpu_support_requested = kernel_support_execution == "exact_tiled_gpu"
+    observed_batch_devices = [
+        tuple(int(device) for device in observation.get("gpu_devices", ()))
+        for observation in production_gpu_observations
+    ]
+    production_gpu_execution_verified = bool(
+        not gpu_support_requested
+        or (
+            production_gpu_observations
+            and all(devices == requested_gpu_devices for devices in observed_batch_devices)
+            and all(devices == requested_gpu_devices for devices in production_gpu_scalar_devices)
+            and all(
+                len(observation.get("gpu_per_device", ())) == len(requested_gpu_devices)
+                for observation in production_gpu_observations
+            )
+        )
+    )
+    production_gpu_diagnostics = _summarize_gpu_observations(
+        production_gpu_observations, requested_gpu_devices
+    )
     checks_passed = all(
         (
             indices_equal,
@@ -995,6 +1097,7 @@ def _correctness_checks(
             strict_boundary,
             all_pairs_passed,
             winner_match,
+            production_gpu_execution_verified,
         )
     )
     return {
@@ -1034,6 +1137,13 @@ def _correctness_checks(
                 "fingerprint": reference_winner[3],
             },
             "numerical_tolerance": LOO_NUMERICAL_TOLERANCE,
+            "production_gpu_execution_verified": production_gpu_execution_verified,
+            "production_gpu_devices_requested": list(requested_gpu_devices),
+            "production_gpu_devices_observed": observed_batch_devices,
+            "production_gpu_scalar_devices_observed": [
+                list(devices) for devices in production_gpu_scalar_devices
+            ],
+            "production_gpu_per_device": production_gpu_diagnostics,
         },
         "adversarial_checks": {
             "duplicate_locations_present": duplicate_rows,

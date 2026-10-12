@@ -12,6 +12,7 @@ from __future__ import annotations
 import os
 import time
 from collections.abc import Sequence
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import numpy as np
@@ -212,6 +213,7 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
         self.certified_tiles = 0
         self.final_certifications = 0
         self.per_device_metrics: dict[int, dict[str, Any]] = {}
+        self._last_neighbour_location_count = 0
 
     def _load_cupy(self) -> Any:
         try:
@@ -284,18 +286,19 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
     def _synchronize(self) -> float:
         """Synchronize the selected stream and return its wall-clock cost."""
 
-        stream_getter = getattr(self._cp.cuda, "get_current_stream", None)
-        if stream_getter is None:
-            return 0.0
-        stream = stream_getter()
-        synchronize = getattr(stream, "synchronize", None)
-        if synchronize is None:
-            return 0.0
-        started = time.perf_counter()
-        synchronize()
-        elapsed = max(0.0, time.perf_counter() - started)
-        self.gpu_synchronization_seconds += elapsed
-        return elapsed
+        with self._cp.cuda.Device(self.device):
+            stream_getter = getattr(self._cp.cuda, "get_current_stream", None)
+            if stream_getter is None:
+                return 0.0
+            stream = stream_getter()
+            synchronize = getattr(stream, "synchronize", None)
+            if synchronize is None:
+                return 0.0
+            started = time.perf_counter()
+            synchronize()
+            elapsed = max(0.0, time.perf_counter() - started)
+            self.gpu_synchronization_seconds += elapsed
+            return elapsed
 
     def _upload_descriptor_block(self, values: np.ndarray, operation: str) -> Any:
         """Upload one bounded descriptor block and record its transfer cost."""
@@ -433,6 +436,35 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
         keep_count: int,
     ) -> None:
         """Merge one reference tile into persistent GPU top-k state."""
+
+        with self._cp.cuda.Device(self.device):
+            self._merge_gpu_candidates_on_device(
+                global_indices,
+                global_distances,
+                omission_bounds,
+                merge_bounds,
+                source_start,
+                local_indices,
+                local_distances,
+                local_bound,
+                existing_count,
+                keep_count,
+            )
+
+    def _merge_gpu_candidates_on_device(
+        self,
+        global_indices: Any,
+        global_distances: Any,
+        omission_bounds: Any,
+        merge_bounds: Any,
+        source_start: int,
+        local_indices: Any,
+        local_distances: Any,
+        local_bound: Any,
+        existing_count: int,
+        keep_count: int,
+    ) -> None:
+        """Merge candidates while the owning CUDA device is current."""
 
         cp = self._cp
         source_stop = source_start + int(local_indices.shape[0])
@@ -653,6 +685,7 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
             raise ValueError("source_range must be a non-empty half-open location range")
         range_start = int(range_start)
         range_stop = int(range_stop)
+        self._last_neighbour_location_count = range_stop - range_start
         if checkpoint_store is not None and checkpoint_identity is None:
             raise ValueError("kNN checkpoint identity is required")
         if (
@@ -1036,11 +1069,16 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
 
         if len(self.gpu_devices) != 1:
             raise ValueError("query_neighbours_range requires a single-device worker")
-        return self._compute_location_neighbours(
-            k,
-            chunk_size=chunk_size,
-            source_range=(start, stop),
-        )
+        # Keep the device current for the complete worker lifetime.  The
+        # lower-level helpers also retain local guards, so this covers slices,
+        # merges, reductions, transfers, and pool cleanup without relying on
+        # CuPy's implicit peer-access behavior.
+        with self._cp.cuda.Device(self.device):
+            return self._compute_location_neighbours(
+                k,
+                chunk_size=chunk_size,
+                source_range=(start, stop),
+            )
 
     def _compute_multi_location_neighbours(
         self,
@@ -1133,6 +1171,7 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
             raise
         workers = tuple(worker_list)
         ranges = contiguous_gpu_ranges(location_count, self.gpu_devices)
+        self._last_neighbour_location_count = max(0, location_count - cursor)
         block = min(int(chunk_size), int(checkpoint_every_locations))
 
         def publish(start: int, stop: int) -> None:
@@ -1162,24 +1201,49 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
                 raise TypeError("checkpoint_store must be a supported checkpoint store")
 
         started = time.perf_counter()
+        executor: ThreadPoolExecutor | None = None
+        futures: dict[int, Any] = {}
         try:
+            # Each worker owns one device and runs in its own thread.  CuPy's
+            # current device and stream are thread-local, and every worker
+            # operation enters its device context before touching a CuPy
+            # object.  This avoids CUDA fork hazards while allowing the
+            # explicitly requested devices to execute concurrently.
+            executor = ThreadPoolExecutor(max_workers=len(workers))
+            futures = {
+                worker_index: executor.submit(
+                    workers[worker_index].query_neighbours_range,
+                    k,
+                    max(range_start, cursor),
+                    range_stop,
+                    chunk_size=chunk_size,
+                )
+                for worker_index, (_device, range_start, range_stop) in enumerate(ranges)
+                if range_stop > cursor
+            }
             for worker_index, (_device, range_start, range_stop) in enumerate(ranges):
                 if range_stop <= cursor:
                     continue
+                worker_locations, worker_distances = futures[worker_index].result()
                 start = max(range_start, cursor)
+                offset = 0
                 while start < range_stop:
                     stop = min(start + block, range_stop)
-                    worker_locations, worker_distances = workers[
-                        worker_index
-                    ].query_neighbours_range(k, start, stop, chunk_size=chunk_size)
-                    neighbours[start:stop] = worker_locations
-                    distances[start:stop] = worker_distances
+                    length = stop - start
+                    neighbours[start:stop] = worker_locations[offset : offset + length]
+                    distances[start:stop] = worker_distances[offset : offset + length]
                     publish(start, stop)
                     cursor = stop
                     start = stop
+                    offset += length
         except BaseException:
+            if executor is not None:
+                for future in futures.values():
+                    future.cancel()
             raise
         finally:
+            if executor is not None:
+                executor.shutdown(wait=True, cancel_futures=True)
             self.per_device_metrics = {
                 int(worker.device): worker.memory_metrics() for worker in workers
             }
@@ -1327,8 +1391,10 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
                 "gpu_device_workspace_peak_bytes": int(self.device_workspace_peak_bytes),
                 "gpu_host_workspace_peak_bytes": int(self.host_workspace_peak_bytes),
                 "gpu_kernel_seconds": float(self.gpu_seconds),
+                "gpu_active_kernel_seconds_sum": float(self.gpu_seconds),
                 "gpu_distance_reduction_seconds": float(self.gpu_distance_reduction_seconds),
                 "gpu_operation_seconds_inclusive": float(self.gpu_operation_seconds),
+                "gpu_active_operation_seconds_sum": float(self.gpu_operation_seconds),
                 "gpu_h2d_seconds": float(self.gpu_h2d_seconds),
                 "gpu_d2h_seconds": float(self.gpu_d2h_seconds),
                 "gpu_synchronization_seconds": float(self.gpu_synchronization_seconds),
@@ -1352,6 +1418,17 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
                     "diagnostic and not an exclusive phase"
                 ),
                 "knn_wall_seconds": float(self._last_neighbour_compute_seconds),
+                "gpu_wall_seconds": float(self._last_neighbour_compute_seconds),
+                "gpu_parallelism_estimate": (
+                    self.gpu_operation_seconds / self._last_neighbour_compute_seconds
+                    if self._last_neighbour_compute_seconds > 0.0
+                    else 0.0
+                ),
+                "gpu_active_time_definition": (
+                    "gpu_active_*_seconds_sum is the sum of independently timed per-device "
+                    "operation sections; gpu_wall_seconds is the central scheduler makespan. "
+                    "They are intentionally not interchangeable."
+                ),
                 "gpu_certification_seconds": float(self.certification_seconds),
                 "gpu_cpu_verification_seconds": float(self.cpu_verification_seconds),
                 "gpu_certification_rescans": int(self.certification_rescans),
@@ -1364,7 +1441,7 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
                 "gpu_certification_fp64_safe": bool(self._gpu_fp64_certification_safe),
                 "gpu_per_device": [metrics for _device, metrics in self.per_device_metrics.items()],
                 "knn_throughput_locations_per_second": (
-                    self.unique_locations.shape[0] / self._last_neighbour_compute_seconds
+                    self._last_neighbour_location_count / self._last_neighbour_compute_seconds
                     if self._last_neighbour_compute_seconds > 0.0
                     else 0.0
                 ),

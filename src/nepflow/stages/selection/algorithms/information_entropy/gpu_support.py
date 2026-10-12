@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Sequence
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import numpy as np
@@ -155,11 +156,16 @@ class ExactTiledGPUSupport:
             self.support_query_count = 0
             self.support_entries = 0
             self.support_query_seconds = 0.0
+            self.support_wall_seconds = 0.0
             return
 
         free_bytes, total_bytes = self._device_memory_info()
         if total_bytes < 1 or free_bytes < 1:
             raise GPUDeviceValidationError(f"CUDA device {self.device} reported no usable memory")
+        # These fields are part of the worker availability contract and are
+        # also consumed by the aggregate multi-device provider.
+        self.device_free_bytes = int(free_bytes)
+        self.device_total_bytes = int(total_bytes)
         if max_device_bytes is not None:
             self.max_device_bytes = min(
                 _validate_positive_int(max_device_bytes, "max_gpu_support_bytes"),
@@ -241,6 +247,7 @@ class ExactTiledGPUSupport:
         self.support_query_count = 0
         self.support_entries = 0
         self.support_query_seconds = 0.0
+        self.support_wall_seconds = 0.0
 
     def _load_cupy(self) -> Any:
         try:
@@ -369,18 +376,41 @@ class ExactTiledGPUSupport:
         if not np.all(np.isfinite(scales)) or np.any(scales <= 0.0):
             raise ValueError("GPU support radii must be finite and strictly positive")
         if self._workers:
+            started = time.perf_counter()
             target_parts: list[np.ndarray] = []
             distance_parts: list[np.ndarray] = []
             offsets = np.zeros(sources.size + 1, dtype=np.int64)
-            for _device, start, stop in contiguous_gpu_ranges(int(sources.size), self.gpu_devices):
-                if start == stop:
-                    continue
-                worker_offsets, worker_targets, worker_distances = self._workers[
-                    self.gpu_devices.index(_device)
-                ].support_many(sources[start:stop], scales[start:stop])
-                target_parts.append(worker_targets)
-                distance_parts.append(worker_distances)
-                offsets[start + 1 : stop + 1] = worker_offsets[1:] + offsets[start]
+            ranges = contiguous_gpu_ranges(int(sources.size), self.gpu_devices)
+            executor = ThreadPoolExecutor(max_workers=len(self._workers))
+            futures: dict[int, Any] = {}
+            try:
+                # One thread owns one explicitly selected worker.  Every
+                # worker enters its own CUDA context for all CuPy operations;
+                # no peer access or cross-device array operation is needed.
+                for worker_index, (_device, start, stop) in enumerate(ranges):
+                    if start == stop:
+                        continue
+                    futures[worker_index] = executor.submit(
+                        self._workers[worker_index]._support_many_on_device,
+                        sources[start:stop],
+                        scales[start:stop],
+                    )
+                for worker_index, (_device, start, stop) in enumerate(ranges):
+                    if start == stop:
+                        continue
+                    worker_offsets, worker_targets, worker_distances = futures[
+                        worker_index
+                    ].result()
+                    target_parts.append(worker_targets)
+                    distance_parts.append(worker_distances)
+                    offsets[start + 1 : stop + 1] = worker_offsets[1:] + offsets[start]
+            except BaseException:
+                for future in futures.values():
+                    future.cancel()
+                raise
+            finally:
+                executor.shutdown(wait=True, cancel_futures=True)
+            self.support_wall_seconds += max(0.0, time.perf_counter() - started)
             targets = (
                 np.asarray(np.concatenate(target_parts), dtype=np.int64)
                 if target_parts
@@ -513,6 +543,16 @@ class ExactTiledGPUSupport:
         self.support_query_seconds += max(0.0, time.perf_counter() - started)
         return offsets, targets, distances
 
+    def _support_many_on_device(
+        self,
+        source_indices: np.ndarray,
+        radii: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Run one single-device worker while its CUDA context is current."""
+
+        with self._cp.cuda.Device(self.device):
+            return self.support_many(source_indices, radii)
+
     def operational_metrics(self) -> dict[str, Any]:
         if self._workers:
             self._aggregate_worker_metrics()
@@ -539,10 +579,18 @@ class ExactTiledGPUSupport:
                 "gpu_h2d_bytes": self.h2d_bytes,
                 "gpu_d2h_bytes": self.d2h_bytes,
                 "gpu_seconds": self.gpu_seconds,
+                "gpu_active_seconds_sum": float(self.gpu_seconds),
+                "gpu_wall_seconds": float(self.support_wall_seconds),
+                "gpu_parallelism_estimate": (
+                    self.gpu_seconds / self.support_wall_seconds
+                    if self.support_wall_seconds > 0.0
+                    else 0.0
+                ),
                 "gpu_cpu_verification_seconds": self.cpu_verification_seconds,
                 "support_query_count": self.support_query_count,
                 "support_entries": self.support_entries,
                 "support_query_seconds": self.support_query_seconds,
+                "support_query_wall_seconds": self.support_wall_seconds,
                 "support_query_throughput_per_second": (
                     self.support_query_count / self.support_query_seconds
                     if self.support_query_seconds > 0.0
@@ -552,7 +600,7 @@ class ExactTiledGPUSupport:
             }
             return aggregate
         free_bytes, total_bytes = self._device_memory_info()
-        return {
+        metrics = {
             "support_execution": self.backend,
             "support_execution_version": self.backend_version,
             "gpu_device": self.device,
@@ -577,17 +625,23 @@ class ExactTiledGPUSupport:
             "gpu_h2d_bytes": self.h2d_bytes,
             "gpu_d2h_bytes": self.d2h_bytes,
             "gpu_seconds": self.gpu_seconds,
+            "gpu_active_seconds_sum": float(self.gpu_seconds),
+            "gpu_wall_seconds": float(self.support_query_seconds),
+            "gpu_parallelism_estimate": 1.0 if self.support_query_seconds > 0.0 else 0.0,
             "gpu_cpu_verification_seconds": self.cpu_verification_seconds,
             "gpu_host_workspace_peak_bytes": self.host_workspace_peak_bytes,
             "support_query_count": self.support_query_count,
             "support_entries": self.support_entries,
             "support_query_seconds": self.support_query_seconds,
+            "support_query_wall_seconds": self.support_query_seconds,
             "support_query_throughput_per_second": (
                 self.support_query_count / self.support_query_seconds
                 if self.support_query_seconds > 0.0
                 else 0.0
             ),
         }
+        metrics["gpu_per_device"] = [dict(metrics)]
+        return metrics
 
     def _aggregate_worker_metrics(self) -> None:
         """Refresh bounded aggregate counters after a multi-device query."""

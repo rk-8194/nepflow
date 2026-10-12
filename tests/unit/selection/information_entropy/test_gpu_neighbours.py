@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+import threading
 import types
 from pathlib import Path
 from typing import Any
@@ -15,8 +16,8 @@ from nepflow.stages.selection.algorithms.information_entropy.checkpointing impor
     IncrementalCheckpointStore,
 )
 from nepflow.stages.selection.algorithms.information_entropy.models import (
-    EntropyBandwidthSettings,
     GPU_NEIGHBOUR_BACKEND_ID,
+    EntropyBandwidthSettings,
 )
 from nepflow.stages.selection.algorithms.information_entropy.neighbours import (
     compute_exact_neighbours,
@@ -60,9 +61,7 @@ def _fake_cupy(*, device_count: int = 1, free_bytes: int = 64 * 1024 * 1024):
         take_along_axis=np.take_along_axis,
         cuda=types.SimpleNamespace(Device=Device, runtime=runtime),
         get_default_memory_pool=lambda: types.SimpleNamespace(free_all_blocks=lambda: None),
-        get_default_pinned_memory_pool=lambda: types.SimpleNamespace(
-            free_all_blocks=lambda: None
-        ),
+        get_default_pinned_memory_pool=lambda: types.SimpleNamespace(free_all_blocks=lambda: None),
     )
 
 
@@ -81,9 +80,12 @@ def test_gpu_backend_is_explicit_and_has_distinct_capability_identity() -> None:
     capabilities = neighbour_backend_capabilities(GPU_NEIGHBOUR_BACKEND_ID)
     assert capabilities.exact
     assert capabilities.supports_radius_support
-    assert EntropyBandwidthSettings(
-        backend=GPU_NEIGHBOUR_BACKEND_ID, kernel_support_execution="cpu"
-    ).kernel_support_execution == "cpu"
+    assert (
+        EntropyBandwidthSettings(
+            backend=GPU_NEIGHBOUR_BACKEND_ID, kernel_support_execution="cpu"
+        ).kernel_support_execution
+        == "cpu"
+    )
 
 
 def test_gpu_knn_missing_cupy_fails_without_cpu_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -190,6 +192,47 @@ def test_fake_gpu_knn_reports_bounded_transfers_and_reuses_k_prefix(
     index.close()
 
 
+@pytest.mark.parametrize("device_count", (2, 4))
+def test_fake_multi_gpu_knn_scheduler_preserves_order_and_device_metrics(
+    monkeypatch: pytest.MonkeyPatch, device_count: int
+) -> None:
+    monkeypatch.setitem(sys.modules, "cupy", _fake_cupy(device_count=device_count))
+    descriptors = np.asarray(
+        [[float(i), float(i % 5), float((i * 11) % 7)] for i in range(24)],
+        dtype=np.float64,
+    )
+    reference = compute_exact_neighbours(descriptors, 4, chunk_size=3, resource_budget=_budget())
+    from nepflow.stages.selection.algorithms.information_entropy.gpu_neighbours import (
+        ExactTiledGPUNeighbourIndex,
+    )
+
+    barrier = threading.Barrier(device_count)
+    original_query = ExactTiledGPUNeighbourIndex.query_neighbours_range
+
+    def synchronized_query(self: Any, *args: Any, **kwargs: Any):
+        barrier.wait(timeout=5.0)
+        return original_query(self, *args, **kwargs)
+
+    monkeypatch.setattr(ExactTiledGPUNeighbourIndex, "query_neighbours_range", synchronized_query)
+
+    index = ExactTiledGPUNeighbourIndex(
+        descriptors,
+        gpu_devices=tuple(range(device_count)),
+        gpu_tile_size=3,
+        max_device_bytes=32 * 1024,
+        resource_budget=_budget(),
+    )
+    _, rows, distances = index.query_neighbours(4, chunk_size=3)
+    np.testing.assert_array_equal(rows, reference.neighbour_indices)
+    np.testing.assert_array_equal(distances, reference.neighbour_distances)
+    metrics = index.memory_metrics()
+    assert metrics["gpu_devices"] == list(range(device_count))
+    assert len(metrics["gpu_per_device"]) == device_count
+    assert metrics["gpu_wall_seconds"] > 0.0
+    assert metrics["gpu_active_kernel_seconds_sum"] >= 0.0
+    index.close()
+
+
 def test_fake_gpu_knn_rescans_ambiguous_ties_and_wide_values(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -208,9 +251,7 @@ def test_fake_gpu_knn_rescans_ambiguous_ties_and_wide_values(
         dtype=np.float64,
     )
     budget = _budget()
-    reference = compute_exact_neighbours(
-        descriptors, 1, chunk_size=3, resource_budget=budget
-    )
+    reference = compute_exact_neighbours(descriptors, 1, chunk_size=3, resource_budget=budget)
     from nepflow.stages.selection.algorithms.information_entropy.gpu_neighbours import (
         ExactTiledGPUNeighbourIndex,
     )
@@ -232,9 +273,7 @@ def test_fake_gpu_knn_uses_bounded_reference_shards_when_pool_cannot_reside(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setitem(sys.modules, "cupy", _fake_cupy())
-    descriptors = np.asarray(
-        [[float(i), float(i % 3)] for i in range(12)], dtype=np.float64
-    )
+    descriptors = np.asarray([[float(i), float(i % 3)] for i in range(12)], dtype=np.float64)
     budget = _budget()
     from nepflow.stages.selection.algorithms.information_entropy.gpu_neighbours import (
         ExactTiledGPUNeighbourIndex,
@@ -247,9 +286,7 @@ def test_fake_gpu_knn_uses_bounded_reference_shards_when_pool_cannot_reside(
         resource_budget=budget,
     )
     _, rows, distances = index.query_neighbours(2, chunk_size=3)
-    reference = compute_exact_neighbours(
-        descriptors, 2, chunk_size=3, resource_budget=budget
-    )
+    reference = compute_exact_neighbours(descriptors, 2, chunk_size=3, resource_budget=budget)
     np.testing.assert_array_equal(rows, reference.neighbour_indices)
     np.testing.assert_array_equal(distances, reference.neighbour_distances)
     metrics = index.memory_metrics()
@@ -270,9 +307,7 @@ def test_fake_gpu_knn_checkpoint_resume_publishes_only_new_ranges(
             super().__init__(root)
             self.interrupted = False
 
-        def write_chunk(
-            self, *args: Any, **kwargs: Any
-        ) -> dict[str, float | int]:
+        def write_chunk(self, *args: Any, **kwargs: Any) -> dict[str, float | int]:
             result = super().write_chunk(*args, **kwargs)
             if not self.interrupted:
                 self.interrupted = True
@@ -320,9 +355,7 @@ def test_fake_gpu_knn_checkpoint_resume_publishes_only_new_ranges(
         checkpoint_every_locations=1,
         preserve_checkpoint=True,
     )
-    reference = compute_exact_neighbours(
-        descriptors, 3, chunk_size=4, resource_budget=budget
-    )
+    reference = compute_exact_neighbours(descriptors, 3, chunk_size=4, resource_budget=budget)
     np.testing.assert_array_equal(resumed_indices, reference.neighbour_indices)
     np.testing.assert_array_equal(resumed_distances, reference.neighbour_distances)
     state = store.load(
@@ -389,9 +422,7 @@ def test_cuda_gpu_knn_matches_cpu_oracle() -> None:
                     max_gpu_neighbour_bytes=1 << 20,
                     resource_budget=budget,
                 )
-                np.testing.assert_array_equal(
-                    actual.neighbour_indices, reference.neighbour_indices
-                )
+                np.testing.assert_array_equal(actual.neighbour_indices, reference.neighbour_indices)
                 np.testing.assert_array_equal(
                     actual.neighbour_distances, reference.neighbour_distances
                 )

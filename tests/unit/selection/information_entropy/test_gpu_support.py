@@ -5,7 +5,9 @@ from __future__ import annotations
 import builtins
 import importlib
 import sys
+import threading
 import types
+from typing import Any
 
 import numpy as np
 import pytest
@@ -15,6 +17,9 @@ from nepflow.stages.selection.algorithms.information_entropy.bandwidth import (
     build_entropy_pool,
     calibrate_bandwidth,
 )
+from nepflow.stages.selection.algorithms.information_entropy.gpu_devices import (
+    contiguous_gpu_ranges,
+)
 from nepflow.stages.selection.algorithms.information_entropy.gpu_support import (
     ExactTiledGPUSupport,
     GPUCapacityError,
@@ -23,6 +28,7 @@ from nepflow.stages.selection.algorithms.information_entropy.gpu_support import 
 )
 from nepflow.stages.selection.algorithms.information_entropy.kernels import (
     build_streamed_candidate_contributions,
+    evaluate_leave_one_out_objective,
     evaluate_leave_one_out_objectives,
 )
 from nepflow.stages.selection.algorithms.information_entropy.models import (
@@ -77,6 +83,20 @@ def test_explicit_gpu_settings_validate_without_cuda():
         EntropyBandwidthSettings(kernel_support_execution="exact_tiled_gpu", gpu_device=-1)
 
 
+def test_gpu_scheduler_partitions_balanced_and_empty_ranges():
+    assert contiguous_gpu_ranges(7, (0, 1, 2)) == (
+        (0, 0, 3),
+        (1, 3, 5),
+        (2, 5, 7),
+    )
+    assert contiguous_gpu_ranges(2, (0, 1, 2, 3)) == (
+        (0, 0, 1),
+        (1, 1, 2),
+        (2, 2, 2),
+        (3, 2, 2),
+    )
+
+
 def test_missing_cupy_fails_explicitly(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setitem(sys.modules, "cupy", None)
     with pytest.raises(GPUSupportError, match="requires optional CuPy"):
@@ -98,6 +118,57 @@ def test_gpu_device_and_tile_capacity_are_explicit(monkeypatch: pytest.MonkeyPat
         ExactTiledGPUSupport(
             np.zeros((2, 2), dtype=np.float64),
             max_device_bytes=39,
+            max_host_bytes=1_000_000,
+        )
+
+
+@pytest.mark.parametrize("device_count", (1, 2, 4))
+def test_fake_gpu_support_initializes_each_requested_device_capacity(
+    monkeypatch: pytest.MonkeyPatch, device_count: int
+):
+    monkeypatch.setitem(
+        sys.modules,
+        "cupy",
+        _fake_cupy(device_count=device_count, free_bytes=64 * 1024 * 1024),
+    )
+    devices = tuple(range(device_count))
+    provider = ExactTiledGPUSupport(
+        np.zeros((4, 2), dtype=np.float64),
+        gpu_devices=devices,
+        tile_size=2,
+        max_device_bytes=64 * 1024,
+        max_host_bytes=1_000_000,
+    )
+    metrics = provider.operational_metrics()
+    assert metrics["gpu_devices"] == list(devices)
+    assert metrics["gpu_device_count"] == device_count
+    assert metrics["gpu_total_bytes"] == 64 * 1024 * 1024
+    assert all(item["gpu_total_bytes"] == 64 * 1024 * 1024 for item in metrics["gpu_per_device"])
+    provider.close()
+
+
+@pytest.mark.parametrize("device_count", (1, 2, 4))
+def test_fake_gpu_support_rejects_insufficient_capacity_on_every_requested_device(
+    monkeypatch: pytest.MonkeyPatch, device_count: int
+):
+    monkeypatch.setitem(sys.modules, "cupy", _fake_cupy(device_count=device_count))
+    with pytest.raises(GPUCapacityError, match="at least 40 bytes"):
+        ExactTiledGPUSupport(
+            np.zeros((4, 2), dtype=np.float64),
+            gpu_devices=tuple(range(device_count)),
+            max_device_bytes=39,
+            max_host_bytes=1_000_000,
+        )
+
+
+def test_fake_gpu_support_rejects_one_unavailable_requested_ordinal(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setitem(sys.modules, "cupy", _fake_cupy(device_count=4))
+    with pytest.raises(GPUDeviceValidationError, match=r"requested=\(0, 1, 4\)"):
+        ExactTiledGPUSupport(
+            np.zeros((4, 2), dtype=np.float64),
+            gpu_devices=(0, 1, 4),
             max_host_bytes=1_000_000,
         )
 
@@ -131,6 +202,78 @@ def test_fake_gpu_support_preserves_strict_ulp_duplicates_and_original_rows(
     np.testing.assert_array_equal(targets, np.asarray(expected_targets, dtype=np.int64))
     np.testing.assert_array_equal(distances, np.asarray(expected_distances, dtype=np.float64))
     assert provider.operational_metrics()["gpu_cpu_rescanned_count"] >= len(expected_targets)
+
+
+def test_fake_multi_gpu_support_merges_contiguous_ranges_deterministically(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setitem(sys.modules, "cupy", _fake_cupy(device_count=4))
+    descriptors = np.asarray([[float(i), float(i % 3)] for i in range(12)], dtype=np.float64)
+    sources = np.arange(descriptors.shape[0], dtype=np.int64)
+    radii = np.full(sources.size, 3.5, dtype=np.float64)
+    single = ExactTiledGPUSupport(
+        descriptors,
+        gpu_devices=(0,),
+        tile_size=3,
+        max_device_bytes=64 * 1024,
+        max_host_bytes=1_000_000,
+    )
+    multi = ExactTiledGPUSupport(
+        descriptors,
+        gpu_devices=(0, 1, 2, 3),
+        tile_size=3,
+        max_device_bytes=64 * 1024,
+        max_host_bytes=1_000_000,
+    )
+    barrier = threading.Barrier(4)
+    original_worker_query = ExactTiledGPUSupport._support_many_on_device
+
+    def synchronized_worker_query(self: object, *args: object, **kwargs: object):
+        barrier.wait(timeout=5.0)
+        return original_worker_query(self, *args, **kwargs)
+
+    monkeypatch.setattr(ExactTiledGPUSupport, "_support_many_on_device", synchronized_worker_query)
+    expected = single.support_many(sources, radii)
+    actual = multi.support_many(sources, radii)
+    for left, right in zip(expected, actual, strict=True):
+        np.testing.assert_array_equal(left, right)
+    metrics = multi.operational_metrics()
+    assert metrics["gpu_device_count"] == 4
+    assert metrics["gpu_wall_seconds"] > 0.0
+    assert metrics["gpu_active_seconds_sum"] > 0.0
+    assert len(metrics["gpu_per_device"]) == 4
+    single.close()
+    multi.close()
+
+
+def test_scalar_loo_diagnostics_report_the_requested_gpu_devices(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setitem(sys.modules, "cupy", _fake_cupy(device_count=2))
+    descriptors = np.asarray([[float(i), float(i % 2)] for i in range(6)], dtype=np.float64)
+    probabilities = np.full(6, 1.0 / 6.0, dtype=np.float64)
+    diagnostics: dict[str, Any] = {}
+    budget = build_resource_budget(
+        execution_mode="explicit",
+        memory_budget_bytes=64 * 1024 * 1024,
+        scratch_budget_bytes=8 * 1024 * 1024,
+        safety_margin_fraction=0.0,
+    )
+    outcome = evaluate_leave_one_out_objective(
+        descriptors,
+        probabilities,
+        np.full(6, 2.0, dtype=np.float64),
+        chunk_size=2,
+        max_radius_query_bytes=1_000_000,
+        resource_budget=budget,
+        kernel_support_execution="exact_tiled_gpu",
+        gpu_devices=(0, 1),
+        max_gpu_support_bytes=64 * 1024,
+        diagnostics=diagnostics,
+    )
+    assert outcome.valid
+    assert diagnostics["gpu_devices"] == [0, 1]
+    assert len(diagnostics["gpu_per_device"]) == 2
 
 
 def test_gpu_mode_checkpoint_resume_keeps_execution_identity(
