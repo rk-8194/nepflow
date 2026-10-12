@@ -192,6 +192,80 @@ def test_fake_gpu_knn_reports_bounded_transfers_and_reuses_k_prefix(
     index.close()
 
 
+def test_fake_gpu_knn_uses_first_excluded_witness_across_reference_tiles(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A distant omitted point must not create a false boundary rescan."""
+
+    monkeypatch.setitem(sys.modules, "cupy", _fake_cupy())
+    descriptors = np.zeros((11, 42), dtype=np.float64)
+    descriptors[:, 0] = np.asarray([0, 1, 2, 3, 4, 5, 6, 7, 8, -8, 20], dtype=np.float64)
+    budget = _budget()
+    reference = compute_exact_neighbours(descriptors, 8, chunk_size=4, resource_budget=budget)
+    from nepflow.stages.selection.algorithms.information_entropy.gpu_neighbours import (
+        ExactTiledGPUNeighbourIndex,
+    )
+
+    index = ExactTiledGPUNeighbourIndex(
+        descriptors,
+        gpu_tile_size=4,
+        max_device_bytes=64 * 1024,
+        resource_budget=budget,
+    )
+    source_location = int(index.row_to_location[0])
+    rescanned_sources: list[int] = []
+    original_rescan = index._exact_rescan
+
+    def record_rescan(query: np.ndarray, source: int, k: int):
+        rescanned_sources.append(int(source))
+        return original_rescan(query, source, k)
+
+    monkeypatch.setattr(index, "_exact_rescan", record_rescan)
+    _, rows, distances = index.query_neighbours(8, chunk_size=4)
+    np.testing.assert_array_equal(rows, reference.neighbour_indices)
+    np.testing.assert_array_equal(distances, reference.neighbour_distances)
+    assert source_location not in rescanned_sources
+    metrics = index.memory_metrics()
+    assert metrics["gpu_false_ambiguity_avoided"] >= 1
+    assert metrics["gpu_first_excluded_gap_max"] >= 12.0
+    index.close()
+
+
+def test_fake_gpu_knn_adaptively_resolves_kth_boundary_ties(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ties beyond the retained prefix are CPU-canonicalized after GPU filtering."""
+
+    monkeypatch.setitem(sys.modules, "cupy", _fake_cupy())
+    descriptors = np.zeros((7, 42), dtype=np.float64)
+    descriptors[1:7, 0] = np.asarray([1, -1, 0, 0, 0, 0], dtype=np.float64)
+    descriptors[3, 1] = 1.0
+    descriptors[4, 1] = -1.0
+    descriptors[5, 2] = 1.0
+    descriptors[6, 2] = -1.0
+    budget = _budget()
+    reference = compute_exact_neighbours(descriptors, 2, chunk_size=3, resource_budget=budget)
+    from nepflow.stages.selection.algorithms.information_entropy.gpu_neighbours import (
+        ExactTiledGPUNeighbourIndex,
+    )
+
+    index = ExactTiledGPUNeighbourIndex(
+        descriptors,
+        gpu_tile_size=3,
+        max_device_bytes=64 * 1024,
+        resource_budget=budget,
+    )
+    _, rows, distances = index.query_neighbours(2, chunk_size=3)
+    np.testing.assert_array_equal(rows, reference.neighbour_indices)
+    np.testing.assert_array_equal(distances, reference.neighbour_distances)
+    metrics = index.memory_metrics()
+    assert metrics["gpu_genuine_unresolved_boundary_count"] > 0
+    assert metrics["gpu_boundary_refinements"] > 0
+    assert metrics["gpu_boundary_refinement_candidate_count"] >= 4
+    assert metrics["gpu_certification_rescans"] == 0
+    index.close()
+
+
 @pytest.mark.parametrize("device_count", (2, 4))
 def test_fake_multi_gpu_knn_scheduler_preserves_order_and_device_metrics(
     monkeypatch: pytest.MonkeyPatch, device_count: int
@@ -294,7 +368,7 @@ def test_checkpoint_interval_does_not_shrink_multi_gpu_compute_tiles(
     index.close()
 
 
-def test_fake_gpu_knn_rescans_ambiguous_ties_and_wide_values(
+def test_fake_gpu_knn_adaptively_resolves_ambiguous_ties_and_wide_values(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setitem(sys.modules, "cupy", _fake_cupy())
@@ -326,7 +400,9 @@ def test_fake_gpu_knn_rescans_ambiguous_ties_and_wide_values(
     _, rows, distances = index.query_neighbours(1, chunk_size=3)
     np.testing.assert_array_equal(rows, reference.neighbour_indices)
     np.testing.assert_array_equal(distances, reference.neighbour_distances)
-    assert index.memory_metrics()["gpu_certification_rescans"] > 0
+    metrics = index.memory_metrics()
+    assert metrics["gpu_boundary_refinements"] > 0
+    assert metrics["gpu_certification_rescans"] == 0
     index.close()
 
 
