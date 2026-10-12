@@ -353,6 +353,9 @@ class EntropyBandwidthConfig:
     gpu_tile_size: int = 128
     max_gpu_support_bytes: int | None = None
     max_gpu_neighbour_bytes: int | None = None
+    # Operational LOO persistence cadence; it does not enter scientific IDs.
+    loo_checkpoint_every_sources: int = 4096
+    loo_checkpoint_every_seconds: float | None = None
 
 
 @dataclass(frozen=True, slots=True)

@@ -405,6 +405,8 @@ class SelectionStage:
                 gpu_tile_size=entropy.bandwidth.gpu_tile_size,
                 max_gpu_support_bytes=entropy.bandwidth.max_gpu_support_bytes,
                 max_gpu_neighbour_bytes=entropy.bandwidth.max_gpu_neighbour_bytes,
+                loo_checkpoint_every_sources=entropy.bandwidth.loo_checkpoint_every_sources,
+                loo_checkpoint_every_seconds=entropy.bandwidth.loo_checkpoint_every_seconds,
             )
             local_representation = load_or_calculate_local_representations(
                 project_dir,

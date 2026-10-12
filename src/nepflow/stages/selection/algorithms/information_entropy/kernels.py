@@ -31,6 +31,7 @@ from .checkpointing import (
     VersionedCheckpointStore,
 )
 from .models import (
+    DEFAULT_LOO_CHECKPOINT_EVERY_SOURCES,
     DEFAULT_RADIUS_QUERY_BYTES,
     GPU_NEIGHBOUR_BACKEND_ID,
     GPU_NEIGHBOUR_BACKEND_VERSION,
@@ -516,6 +517,7 @@ class _KernelSupportProvider:
             "support_count_min": self.min_support_count,
             "support_count_mean": total / count if count else None,
             "support_count_max": int(self.max_support_count),
+            "current_support_count": int(self.current_support_count),
             "query_workspace_peak_bytes": int(
                 max(
                     self.query_workspace_peak_bytes,
@@ -542,11 +544,32 @@ class _KernelSupportProvider:
         }
         if self.gpu_support is not None:
             metrics.update(self.gpu_support.operational_metrics())
+            metrics["support_provider"] = "active_gpu_support"
+            metrics["support_provider_stats_status"] = "active"
+            metrics["support_provider_radius_queries"] = None
+            metrics["support_provider_distance_evaluations"] = int(
+                metrics.get("gpu_fp64_evaluations", 0) or 0
+            )
+            metrics["support_provider_unique_distance_evaluations"] = None
+            metrics["support_provider_atomic_distance_evaluations"] = None
             if "gpu_per_device" in index_metrics:
                 # The support provider owns the generic per-device key.  Keep
                 # the neighbour scheduler's independent device timings as a
                 # separate field so neither execution stage is hidden.
                 metrics["knn_gpu_per_device"] = index_metrics["gpu_per_device"]
+        else:
+            metrics["support_provider"] = "active_cpu_support"
+            metrics["support_provider_stats_status"] = "active"
+            metrics["support_provider_radius_queries"] = int(self.radius_queries)
+            metrics["support_provider_distance_evaluations"] = int(
+                index_metrics.get("distance_evaluations", self.distance_evaluations) or 0
+            )
+            metrics["support_provider_unique_distance_evaluations"] = int(
+                index_metrics.get("unique_distance_evaluations", 0) or 0
+            )
+            metrics["support_provider_atomic_distance_evaluations"] = int(
+                index_metrics.get("atomic_distance_evaluations", 0) or 0
+            )
         for key, value in index_metrics.items():
             metrics.setdefault(key, value)
         return metrics
@@ -768,7 +791,8 @@ def evaluate_leave_one_out_objective(
     capacity_context: str | None = None,
     checkpoint_path: str | Path | None = None,
     checkpoint_name: str = "loo",
-    checkpoint_every_sources: int = 1,
+    checkpoint_every_sources: int = DEFAULT_LOO_CHECKPOINT_EVERY_SOURCES,
+    checkpoint_every_seconds: float | None = None,
     resume: bool = True,
     diagnostics: dict[str, Any] | None = None,
     kernel_support_execution: str = KERNEL_SUPPORT_EXECUTION_CPU,
@@ -794,6 +818,7 @@ def evaluate_leave_one_out_objective(
             checkpoint_path=checkpoint_path,
             checkpoint_name=checkpoint_name,
             checkpoint_every_sources=checkpoint_every_sources,
+            checkpoint_every_seconds=checkpoint_every_seconds,
             resume=resume,
             diagnostics=diagnostics,
             kernel_support_execution=kernel_support_execution,
@@ -924,7 +949,8 @@ def evaluate_leave_one_out_objectives(
     capacity_context: str | None = None,
     checkpoint_path: str | Path | None = None,
     checkpoint_name: str = "loo",
-    checkpoint_every_sources: int = 1,
+    checkpoint_every_sources: int = DEFAULT_LOO_CHECKPOINT_EVERY_SOURCES,
+    checkpoint_every_seconds: float | None = None,
     resume: bool = True,
     diagnostics: dict[str, Any] | None = None,
     kernel_support_execution: str = KERNEL_SUPPORT_EXECUTION_CPU,
@@ -938,7 +964,10 @@ def evaluate_leave_one_out_objectives(
     ``bandwidths`` has shape ``(C, N)``.  The maximum source radius is queried
     once and filtered independently for each of the ``C`` bandwidth vectors.
     Each numerator row is updated in source-major order, matching the
-    single-bandwidth reference evaluator.
+    single-bandwidth reference evaluator.  Checkpoint publication is an
+    operational row/elapsed-time trigger (4096 completed sources by default),
+    with a final durable cursor and a bounded rolling retention policy; it
+    never changes the accumulation order.
     """
 
     values = _validate_descriptors(descriptors)
@@ -1054,7 +1083,14 @@ def evaluate_leave_one_out_objectives(
     support_maxima = np.zeros(batch_count, dtype=np.int64)
     peak_workspace_bytes = batch_arrays_bytes
     checkpoint_store = (
-        None if checkpoint_path is None else VersionedCheckpointStore(checkpoint_path)
+        None
+        if checkpoint_path is None
+        else VersionedCheckpointStore(
+            checkpoint_path,
+            retention_generations=2,
+            resource_budget=service,
+            retention_name=checkpoint_name,
+        )
     )
     if (
         isinstance(checkpoint_every_sources, bool)
@@ -1062,6 +1098,14 @@ def evaluate_leave_one_out_objectives(
         or int(checkpoint_every_sources) < 1
     ):
         raise ValueError("checkpoint_every_sources must be a positive integer")
+    if checkpoint_every_seconds is not None:
+        if isinstance(checkpoint_every_seconds, bool):
+            raise ValueError("checkpoint_every_seconds must be finite and positive")
+        checkpoint_seconds_limit = float(checkpoint_every_seconds)
+        if not math.isfinite(checkpoint_seconds_limit) or checkpoint_seconds_limit <= 0.0:
+            raise ValueError("checkpoint_every_seconds must be finite and positive")
+    else:
+        checkpoint_seconds_limit = None
     checkpoint_identity: dict[str, Any] | None = None
     source_start = 0
     if checkpoint_store is not None:
@@ -1123,6 +1167,44 @@ def evaluate_leave_one_out_objectives(
             )
     source_phase_started = time.perf_counter()
     query_block = min(block, provider.support_batch_size)
+    if diagnostics is not None:
+        diagnostics["loo_active_support_metrics"] = {}
+    last_completed_source = source_start
+    last_checkpoint_cursor = source_start if source_start > 0 else -1
+    last_checkpoint_started = time.perf_counter()
+
+    def commit_checkpoint(cursor: int) -> None:
+        """Publish one complete rolling snapshot and account for its I/O."""
+
+        nonlocal checkpoint_seconds, checkpoint_bytes, checkpoint_writes
+        nonlocal last_checkpoint_cursor, last_checkpoint_started
+        if checkpoint_store is None or checkpoint_identity is None:
+            return
+        checkpoint_started = time.perf_counter()
+        before = checkpoint_store.metrics()
+        checkpoint_store.write(
+            checkpoint_name,
+            identity=checkpoint_identity,
+            state={
+                "cursor": int(cursor),
+                "invalid_reasons": invalid_reasons,
+                "support_totals": support_totals.tolist(),
+                "support_samples": support_samples.tolist(),
+                "support_maxima": support_maxima.tolist(),
+            },
+            arrays={"numerator": numerator},
+        )
+        after = checkpoint_store.metrics()
+        checkpoint_seconds += max(0.0, time.perf_counter() - checkpoint_started)
+        checkpoint_bytes += max(
+            0,
+            int(after.get("array_bytes_written", 0))
+            - int(before.get("array_bytes_written", 0)),
+        )
+        checkpoint_writes += 1
+        last_checkpoint_cursor = int(cursor)
+        last_checkpoint_started = time.perf_counter()
+
     for batch_start in range(source_start, row_count, query_block):
         batch_stop = min(batch_start + query_block, row_count)
         source_indices = np.arange(batch_start, batch_stop, dtype=np.int64)
@@ -1199,31 +1281,48 @@ def evaluate_leave_one_out_objectives(
                 except (FloatingPointError, OverflowError, ValueError) as exc:
                     invalid_reasons[batch_index] = str(exc)
             normalization_seconds += max(0.0, time.perf_counter() - normalization_started)
+            last_completed_source = source_index + 1
+            if diagnostics is not None and (
+                last_completed_source == source_start + 1
+                or last_completed_source == row_count
+                or last_completed_source % max(64, query_block) == 0
+            ):
+                # This is the active LOO provider, not the neighbour index
+                # used to construct the frozen bandwidths.
+                diagnostics["loo_active_support_metrics"] = provider.operational_metrics()
             if progress_callback is not None:
-                progress_callback(source_index + 1, row_count)
+                try:
+                    progress_callback(source_index + 1, row_count)
+                except (KeyboardInterrupt, SystemExit):
+                    if last_completed_source > last_checkpoint_cursor:
+                        commit_checkpoint(last_completed_source)
+                    raise
+            elapsed_since_checkpoint = time.perf_counter() - last_checkpoint_started
             if (
                 checkpoint_store is not None
                 and checkpoint_identity is not None
-                and (source_index + 1) % int(checkpoint_every_sources) == 0
-            ):
-                checkpoint_started = time.perf_counter()
-                checkpoint_store.write(
-                    checkpoint_name,
-                    identity=checkpoint_identity,
-                    state={
-                        "cursor": source_index + 1,
-                        "invalid_reasons": invalid_reasons,
-                        "support_totals": support_totals.tolist(),
-                        "support_samples": support_samples.tolist(),
-                        "support_maxima": support_maxima.tolist(),
-                    },
-                    arrays={"numerator": numerator},
+                and last_completed_source > last_checkpoint_cursor
+                and (
+                    last_completed_source % int(checkpoint_every_sources) == 0
+                    or (
+                        checkpoint_seconds_limit is not None
+                        and elapsed_since_checkpoint >= checkpoint_seconds_limit
+                    )
                 )
-                checkpoint_seconds += max(0.0, time.perf_counter() - checkpoint_started)
-                checkpoint_bytes += int(numerator.nbytes)
-                checkpoint_writes += 1
+            ):
+                commit_checkpoint(last_completed_source)
                 peak_scratch_bytes = max(peak_scratch_bytes, int(service.reserved_scratch_bytes))
                 peak_lease_bytes = max(peak_lease_bytes, int(service.reserved_memory_bytes))
+
+    # The final source cursor is durable before objective reduction.  This is
+    # useful for preemption during reduction and is cleared only after the
+    # complete calibration pair has returned successfully.
+    if (
+        checkpoint_store is not None
+        and checkpoint_identity is not None
+        and last_completed_source > last_checkpoint_cursor
+    ):
+        commit_checkpoint(last_completed_source)
 
     source_phase_seconds = max(0.0, time.perf_counter() - source_phase_started)
 
@@ -1271,6 +1370,9 @@ def evaluate_leave_one_out_objectives(
         else:
             results.append(LeaveOneOutObjective(valid=True, objective=objective, probabilities=loo))
     reduction_seconds = max(0.0, time.perf_counter() - reduction_started)
+    if checkpoint_store is not None:
+        checkpoint_store.clear(checkpoint_name)
+        checkpoint_store.clean_stale(checkpoint_names={checkpoint_name})
     provider_metrics = provider.operational_metrics()
     total_seconds = max(0.0, time.perf_counter() - loo_started)
     operational_metrics = {
@@ -1290,13 +1392,28 @@ def evaluate_leave_one_out_objectives(
         "resource_lease_peak_bytes": peak_lease_bytes,
         **provider_metrics,
     }
+    if checkpoint_store is not None:
+        checkpoint_diagnostics = checkpoint_store.metrics()
+        for metric_name, metric_value in checkpoint_diagnostics.items():
+            key = (
+                metric_name
+                if metric_name.startswith("checkpoint_")
+                else f"checkpoint_{metric_name}"
+            )
+            operational_metrics[key] = metric_value
     logger.info(
         "Batched leave-one-out calibration completed: batch_count=%d, "
         "peak_calibration_workspace_bytes=%d, support_count_min=%s, "
         "support_count_mean=%s, support_count_max=%d, radius_queries=%d, "
         "distance_evaluations=%d, wall_seconds=%.6f, source_throughput=%.3f, "
         "support_density=%.6g, support_query_seconds=%.6f, "
-        "checkpoint_bytes=%d, checkpoint_seconds=%.6f, process_peak_rss_bytes=%s",
+        "normalization_seconds=%.6f, gpu_strict_radius_screening_seconds=%.6f, "
+        "gpu_h2d_seconds=%.6f, gpu_d2h_seconds=%.6f, "
+        "gpu_cpu_verification_seconds=%.6f, checkpoint_bytes=%d, "
+        "checkpoint_seconds=%.6f, checkpoint_wall_seconds=%.6f, "
+        "checkpoint_fsync_seconds=%.6f, checkpoint_digest_seconds=%.6f, "
+        "checkpoint_cleanup_seconds=%.6f, checkpoint_stale_generations=%d, "
+        "checkpoint_stale_generation_bytes=%d, process_peak_rss_bytes=%s",
         batch_count,
         peak_workspace_bytes,
         str(provider.min_support_count),
@@ -1316,8 +1433,19 @@ def evaluate_leave_one_out_objectives(
         operational_metrics["source_throughput_per_second"],
         operational_metrics["support_density_mean"],
         operational_metrics["support_query_seconds"],
+        operational_metrics["normalization_seconds"],
+        float(provider_metrics.get("gpu_strict_radius_screening_seconds", 0.0) or 0.0),
+        float(provider_metrics.get("gpu_h2d_seconds", 0.0) or 0.0),
+        float(provider_metrics.get("gpu_d2h_seconds", 0.0) or 0.0),
+        float(provider_metrics.get("gpu_cpu_verification_seconds", 0.0) or 0.0),
         checkpoint_bytes,
         checkpoint_seconds,
+        float(operational_metrics.get("checkpoint_wall_seconds", 0.0) or 0.0),
+        float(operational_metrics.get("checkpoint_fsync_seconds", 0.0) or 0.0),
+        float(operational_metrics.get("checkpoint_digest_seconds", 0.0) or 0.0),
+        float(operational_metrics.get("checkpoint_cleanup_seconds", 0.0) or 0.0),
+        int(operational_metrics.get("checkpoint_stale_generation_count", 0) or 0),
+        int(operational_metrics.get("checkpoint_stale_generation_bytes", 0) or 0),
         operational_metrics.get("process_peak_rss_bytes"),
     )
     logger.info(
@@ -1346,6 +1474,14 @@ def evaluate_leave_one_out_objectives(
         diagnostics["loo_checkpoint_seconds"] = (
             diagnostics.get("loo_checkpoint_seconds", 0.0) + checkpoint_seconds
         )
+        if checkpoint_store is not None:
+            for metric_name, metric_value in checkpoint_store.metrics().items():
+                key = (
+                    metric_name
+                    if metric_name.startswith("checkpoint_")
+                    else f"checkpoint_{metric_name}"
+                )
+                diagnostics[f"loo_{key}"] = metric_value
         diagnostics["loo_peak_scratch_bytes"] = max(
             int(diagnostics.get("loo_peak_scratch_bytes", 0)), peak_scratch_bytes
         )
@@ -1407,9 +1543,6 @@ def evaluate_leave_one_out_objectives(
                     diagnostics[metric_name] = max(diagnostics.get(metric_name, 0), metric_value)
                 else:
                     diagnostics[metric_name] = metric_value
-    if checkpoint_store is not None:
-        checkpoint_store.clear(checkpoint_name)
-        checkpoint_store.clean_stale()
     return tuple(results)
 
 

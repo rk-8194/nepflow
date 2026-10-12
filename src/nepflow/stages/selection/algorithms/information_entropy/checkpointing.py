@@ -33,6 +33,25 @@ def _digest_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _fsync_directory(path: Path) -> None:
+    """Durably publish directory-entry replacements where the platform allows it."""
+
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    try:
+        descriptor = os.open(str(path), flags)
+    except (OSError, ValueError):
+        return
+    try:
+        try:
+            os.fsync(descriptor)
+        except OSError:
+            # Windows does not expose a generally usable directory fsync.
+            if os.name != "nt":
+                raise
+    finally:
+        os.close(descriptor)
+
+
 def _safe_name(name: str) -> str:
     if not isinstance(name, str) or not name or Path(name).name != name:
         raise ValueError("checkpoint name must be a simple non-empty filename")
@@ -65,20 +84,51 @@ class VersionedCheckpointStore:
     complete generation, never an in-flight append.
     """
 
-    def __init__(self, root: str | Path) -> None:
+    def __init__(
+        self,
+        root: str | Path,
+        *,
+        retention_generations: int | None = None,
+        resource_budget: ResourceBudgetService | None = None,
+        retention_name: str | None = None,
+    ) -> None:
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
+        if retention_generations is not None and (
+            isinstance(retention_generations, bool)
+            or not isinstance(retention_generations, int)
+            or retention_generations < 1
+        ):
+            raise ValueError("retention_generations must be a positive integer when provided")
+        self.retention_generations = retention_generations
+        self.resource_budget = resource_budget
+        if retention_name is not None:
+            retention_name = _safe_name(retention_name)
+        self.retention_name = retention_name
+        self._retained_bytes_cache: int | None = None
+        self._retention_index: dict[str, list[str]] = {}
         self._stats: dict[str, float | int] = {
             "bytes_written": 0,
             "array_bytes_written": 0,
             "physical_bytes_written": 0,
+            "metadata_bytes_written": 0,
             "bytes_read": 0,
             "fsync_seconds": 0.0,
             "digest_seconds": 0.0,
             "write_seconds": 0.0,
+            "checkpoint_wall_seconds": 0.0,
+            "cleanup_seconds": 0.0,
             "commits": 0,
+            "cleanup_calls": 0,
+            "stale_generation_count": 0,
+            "stale_generation_bytes": 0,
+            "retired_generation_count": 0,
+            "retired_generation_bytes": 0,
             "peak_retained_bytes": 0,
+            "max_retained_scratch_bytes": 0,
         }
+        if self.retention_generations is not None:
+            self._recover_rolling_generations()
 
     def _add_stat(self, name: str, value: float | int) -> None:
         if isinstance(value, float):
@@ -87,6 +137,8 @@ class VersionedCheckpointStore:
             self._stats[name] = int(self._stats.get(name, 0)) + int(value)
 
     def _retained_bytes(self) -> int:
+        if self.retention_generations is not None and self._retained_bytes_cache is not None:
+            return int(self._retained_bytes_cache)
         total = 0
         try:
             for path in self.root.iterdir():
@@ -96,22 +148,215 @@ class VersionedCheckpointStore:
                         for child in path.rglob("*")
                         if child.is_file()
                     )
-                elif path.is_file() and path.name.endswith(".pointer.json"):
+                elif (
+                    path.is_file()
+                    and path.name.endswith(".pointer.json")
+                    and not path.name.endswith(".incremental.pointer.json")
+                ):
                     total += int(path.stat().st_size)
         except OSError as exc:
             raise CheckpointValidationError(
                 "unable to inspect checkpoint volume"
             ) from exc
+        if self.retention_generations is not None:
+            self._retained_bytes_cache = total
         return total
 
-    def metrics(self) -> dict[str, float | int]:
-        result: dict[str, float | int] = dict(self._stats)
+    def metrics(self) -> dict[str, float | int | None]:
+        result: dict[str, float | int | None] = dict(self._stats)
         result["retained_bytes"] = self._retained_bytes()
         result["peak_retained_bytes"] = max(
             int(result.get("peak_retained_bytes", 0)), int(result["retained_bytes"])
         )
         self._stats["peak_retained_bytes"] = int(result["peak_retained_bytes"])
+        result["max_retained_scratch_bytes"] = max(
+            int(self._stats.get("max_retained_scratch_bytes", 0)),
+            int(result["peak_retained_bytes"]),
+        )
+        self._stats["max_retained_scratch_bytes"] = int(result["max_retained_scratch_bytes"])
+        result["scratch_budget_bytes"] = (
+            None
+            if self.resource_budget is None
+            else self.resource_budget.budget.scratch_budget_bytes
+        )
         return result
+
+    def _retention_path(self, name: str) -> Path:
+        return self.root / f".{_safe_name(name)}.retention.json"
+
+    def _read_retention_index(self, name: str) -> list[str]:
+        if self.retention_generations is None:
+            return []
+        checkpoint_name = _safe_name(name)
+        if self.retention_name is not None and checkpoint_name != self.retention_name:
+            raise ValueError(
+                f"rolling retention is scoped to checkpoint {self.retention_name!r}"
+            )
+        cached = self._retention_index.get(checkpoint_name)
+        if cached is not None:
+            return list(cached)
+        path = self._retention_path(checkpoint_name)
+        if not path.is_file():
+            result: list[str] = []
+        else:
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                values = payload.get("generations")
+                if not isinstance(values, list):
+                    raise ValueError("retention generations are not a list")
+                result = []
+                for value in values:
+                    if (
+                        not isinstance(value, str)
+                        or Path(value).name != value
+                        or not value.startswith(f"{checkpoint_name}.generation-")
+                    ):
+                        raise ValueError("retention generation name is invalid")
+                    if value not in result:
+                        result.append(value)
+            except (OSError, TypeError, ValueError) as exc:
+                raise CheckpointValidationError(
+                    "checkpoint retention metadata is unreadable"
+                ) from exc
+        self._retention_index[checkpoint_name] = result
+        return list(result)
+
+    def _write_retention_index(self, name: str, generations: list[str]) -> None:
+        if self.retention_generations is None:
+            return
+        checkpoint_name = _safe_name(name)
+        if self.retention_name is not None and checkpoint_name != self.retention_name:
+            raise ValueError(
+                f"rolling retention is scoped to checkpoint {self.retention_name!r}"
+            )
+        path = self._retention_path(checkpoint_name)
+        temporary = self.root / f".{checkpoint_name}.retention-{uuid.uuid4().hex}.tmp"
+        payload = {
+            "schema": CHECKPOINT_SCHEMA_VERSION,
+            "name": checkpoint_name,
+            "generations": list(generations[-self.retention_generations :]),
+        }
+        try:
+            with temporary.open("w", encoding="utf-8", newline="\n") as handle:
+                json.dump(payload, handle, sort_keys=True, separators=(",", ":"))
+                handle.write("\n")
+                handle.flush()
+                sync_started = time.perf_counter()
+                os.fsync(handle.fileno())
+                self._add_stat("fsync_seconds", time.perf_counter() - sync_started)
+            self._add_stat("physical_bytes_written", int(temporary.stat().st_size))
+            self._add_stat("metadata_bytes_written", int(temporary.stat().st_size))
+            os.replace(temporary, path)
+            _fsync_directory(self.root)
+        finally:
+            temporary.unlink(missing_ok=True)
+        self._retention_index[checkpoint_name] = list(payload["generations"])
+
+    def _referenced_generations(self) -> set[str]:
+        referenced: set[str] = set()
+        for pointer in self.root.glob("*.pointer.json"):
+            if pointer.name.endswith(".incremental.pointer.json"):
+                continue
+            try:
+                payload = json.loads(pointer.read_text(encoding="utf-8"))
+                generation = payload.get("generation")
+            except (OSError, TypeError, ValueError) as exc:
+                raise CheckpointValidationError(
+                    f"checkpoint pointer is unreadable: {pointer.name}"
+                ) from exc
+            if payload.get("schema") != CHECKPOINT_SCHEMA_VERSION:
+                raise CheckpointValidationError(
+                    f"checkpoint pointer schema is incompatible: {pointer.name}"
+                )
+            if not isinstance(generation, str) or Path(generation).name != generation:
+                raise CheckpointValidationError(
+                    f"checkpoint pointer generation is invalid: {pointer.name}"
+                )
+            if not (self.root / generation).is_dir():
+                raise CheckpointValidationError(
+                    f"checkpoint pointer generation is missing: {generation}"
+                )
+            referenced.add(generation)
+        return referenced
+
+    @staticmethod
+    def _entry_bytes(path: Path) -> int:
+        if path.is_file():
+            return int(path.stat().st_size)
+        if path.is_dir():
+            return sum(
+                int(child.stat().st_size) for child in path.rglob("*") if child.is_file()
+            )
+        return 0
+
+    def _remove_generation_if_unreferenced(
+        self, path: Path, *, referenced: set[str] | None = None
+    ) -> int:
+        if not path.is_dir() or ".generation-" not in path.name:
+            return 0
+        active = referenced if referenced is not None else self._referenced_generations()
+        if path.name in active:
+            return 0
+        byte_count = self._entry_bytes(path)
+        try:
+            shutil.rmtree(path)
+        except OSError as exc:
+            raise CheckpointValidationError(
+                f"unable to retire stale checkpoint generation: {path.name}"
+            ) from exc
+        if path.exists():
+            raise CheckpointValidationError(
+                f"stale checkpoint generation remains after retirement: {path.name}"
+            )
+        self._add_stat("stale_generation_count", 1)
+        self._add_stat("stale_generation_bytes", byte_count)
+        self._add_stat("retired_generation_count", 1)
+        self._add_stat("retired_generation_bytes", byte_count)
+        if self._retained_bytes_cache is not None:
+            self._retained_bytes_cache = max(0, self._retained_bytes_cache - byte_count)
+        return byte_count
+
+    def _recover_rolling_generations(self) -> None:
+        """Recover a bounded rolling set once when a store is opened."""
+
+        referenced = self._referenced_generations()
+        names: set[str] = set()
+        if self.retention_name is not None:
+            names.add(self.retention_name)
+        else:
+            for pointer in self.root.glob("*.pointer.json"):
+                if pointer.name.endswith(".incremental.pointer.json"):
+                    continue
+                names.add(pointer.name[: -len(".pointer.json")])
+            for path in self.root.iterdir():
+                if path.is_dir() and ".generation-" in path.name:
+                    names.add(path.name.split(".generation-", 1)[0])
+        for name in sorted(names):
+            _safe_name(name)
+            indexed = self._read_retention_index(name)
+            active = next(
+                (
+                    generation
+                    for generation in referenced
+                    if generation.startswith(f"{name}.generation-")
+                ),
+                None,
+            )
+            keep = [generation for generation in indexed if (self.root / generation).is_dir()]
+            if active is not None:
+                keep = [generation for generation in keep if generation != active] + [active]
+            keep = keep[-int(self.retention_generations or 1) :]
+            for path in self.root.iterdir():
+                if path.is_dir() and path.name.startswith(f"{name}.generation-"):
+                    if path.name not in keep:
+                        self._remove_generation_if_unreferenced(path, referenced=referenced)
+            if keep:
+                self._retention_index[name] = keep
+                self._write_retention_index(name, keep)
+            else:
+                self._retention_path(name).unlink(missing_ok=True)
+        self._retained_bytes_cache = None
+        self._retained_bytes()
 
     def _pointer(self, name: str) -> Path:
         return self.root / f"{_safe_name(name)}.pointer.json"
@@ -125,10 +370,93 @@ class VersionedCheckpointStore:
         arrays: Mapping[str, np.ndarray] | None = None,
     ) -> str:
         checkpoint_name = _safe_name(name)
+        if self.retention_name is not None and checkpoint_name != self.retention_name:
+            raise ValueError(
+                f"rolling retention is scoped to checkpoint {self.retention_name!r}"
+            )
         generation = f"{checkpoint_name}.generation-{uuid.uuid4().hex}"
         temporary = self.root / f".{generation}.tmp"
         write_started = time.perf_counter()
+        if self.retention_generations is not None:
+            estimated_array_bytes = sum(
+                int(np.asarray(value).nbytes) + 512 for value in (arrays or {}).values()
+            )
+            estimated_metadata_bytes = (
+                8192
+                + 256 * len(arrays or {})
+                + len(json.dumps(dict(identity), sort_keys=True, separators=(",", ":")))
+                + len(json.dumps(dict(state), sort_keys=True, separators=(",", ":")))
+            )
+            requested_scratch = estimated_array_bytes + estimated_metadata_bytes
+            retained = self._retained_bytes()
+            scratch_needed = retained + requested_scratch
+            self._stats["max_retained_scratch_bytes"] = max(
+                int(self._stats.get("max_retained_scratch_bytes", 0)), scratch_needed
+            )
+            if self.resource_budget is not None:
+                limit = self.resource_budget.budget.scratch_budget_bytes
+                if limit is None:
+                    raise ResourceCapacityError(
+                        "LOO checkpoint scratch availability is unknown",
+                        operation="LOO checkpoint write",
+                        requested_bytes=requested_scratch,
+                        scratch_needed_bytes=scratch_needed,
+                        scratch_available_bytes=None,
+                    )
+                if scratch_needed > limit:
+                    raise ResourceCapacityError(
+                        "LOO rolling checkpoint exceeds the managed scratch budget: "
+                        f"retained_bytes={retained}, requested_bytes={requested_scratch}, "
+                        f"scratch_needed_bytes={scratch_needed}, scratch_budget_bytes={limit}",
+                        operation="LOO checkpoint write",
+                        requested_bytes=requested_scratch,
+                        scratch_needed_bytes=scratch_needed,
+                        scratch_available_bytes=limit,
+                    )
+                lease = self.resource_budget.acquire(
+                    "LOO checkpoint write",
+                    max(1, estimated_metadata_bytes),
+                    scratch_bytes=scratch_needed,
+                )
+            else:
+                lease = None
+            try:
+                return self._write_generation(
+                    checkpoint_name,
+                    generation,
+                    temporary,
+                    identity=identity,
+                    state=state,
+                    arrays=arrays,
+                    write_started=write_started,
+                )
+            finally:
+                if lease is not None:
+                    lease.close()
+        return self._write_generation(
+            checkpoint_name,
+            generation,
+            temporary,
+            identity=identity,
+            state=state,
+            arrays=arrays,
+            write_started=write_started,
+        )
+
+    def _write_generation(
+        self,
+        checkpoint_name: str,
+        generation: str,
+        temporary: Path,
+        *,
+        identity: Mapping[str, Any],
+        state: Mapping[str, Any],
+        arrays: Mapping[str, np.ndarray] | None,
+        write_started: float,
+    ) -> str:
         temporary.mkdir()
+        final = self.root / generation
+        pointer_temporary: Path | None = None
         try:
             array_entries: dict[str, dict[str, Any]] = {}
             for array_name, value in (arrays or {}).items():
@@ -175,8 +503,9 @@ class VersionedCheckpointStore:
                 os.fsync(handle.fileno())
                 self._add_stat("fsync_seconds", time.perf_counter() - sync_started)
             self._add_stat("physical_bytes_written", int(manifest_path.stat().st_size))
-            final = self.root / generation
+            self._add_stat("metadata_bytes_written", int(manifest_path.stat().st_size))
             os.replace(temporary, final)
+            _fsync_directory(self.root)
             pointer_temporary = self.root / f".{checkpoint_name}.pointer-{uuid.uuid4().hex}.tmp"
             pointer_payload = {"schema": CHECKPOINT_SCHEMA_VERSION, "generation": generation}
             with pointer_temporary.open("w", encoding="utf-8", newline="\n") as handle:
@@ -187,15 +516,45 @@ class VersionedCheckpointStore:
                 os.fsync(handle.fileno())
                 self._add_stat("fsync_seconds", time.perf_counter() - sync_started)
             self._add_stat("physical_bytes_written", int(pointer_temporary.stat().st_size))
+            self._add_stat("metadata_bytes_written", int(pointer_temporary.stat().st_size))
             os.replace(pointer_temporary, self._pointer(checkpoint_name))
+            _fsync_directory(self.root)
+
+            if self.retention_generations is not None:
+                previous = self._read_retention_index(checkpoint_name)
+                retained_generations = [
+                    value
+                    for value in previous
+                    if value != generation and (self.root / value).is_dir()
+                ]
+                retained_generations.append(generation)
+                retained_generations = retained_generations[-int(self.retention_generations) :]
+                referenced = self._referenced_generations()
+                cleanup_started = time.perf_counter()
+                for value in previous:
+                    if value not in retained_generations:
+                        self._remove_generation_if_unreferenced(
+                            self.root / value, referenced=referenced
+                        )
+                self._add_stat("cleanup_seconds", time.perf_counter() - cleanup_started)
+                self._stats["cleanup_calls"] = int(self._stats.get("cleanup_calls", 0)) + 1
+                self._write_retention_index(checkpoint_name, retained_generations)
+                self._retained_bytes_cache = None
+                self._retained_bytes()
             self._add_stat("commits", 1)
-            self._add_stat("write_seconds", time.perf_counter() - write_started)
+            elapsed = max(0.0, time.perf_counter() - write_started)
+            self._add_stat("write_seconds", elapsed)
+            self._add_stat("checkpoint_wall_seconds", elapsed)
             self._stats["peak_retained_bytes"] = max(
                 int(self._stats.get("peak_retained_bytes", 0)), self._retained_bytes()
             )
             return generation
         except BaseException:
             shutil.rmtree(temporary, ignore_errors=True)
+            if pointer_temporary is not None:
+                pointer_temporary.unlink(missing_ok=True)
+            if final.exists():
+                self._remove_generation_if_unreferenced(final)
             raise
 
     save = write
@@ -289,27 +648,52 @@ class VersionedCheckpointStore:
         except FileNotFoundError:
             pass
         if isinstance(generation, str) and Path(generation).name == generation:
-            shutil.rmtree(self.root / generation, ignore_errors=True)
+            self._remove_generation_if_unreferenced(self.root / generation)
+        if self.retention_generations is not None:
+            self._retention_index.pop(checkpoint_name, None)
+            self._retention_path(checkpoint_name).unlink(missing_ok=True)
+            self._retained_bytes_cache = None
+            self._retained_bytes()
 
-    def clean_stale(self, *, keep_names: set[str] | None = None) -> int:
+    def clean_stale(
+        self,
+        *,
+        keep_names: set[str] | None = None,
+        checkpoint_names: set[str] | None = None,
+    ) -> int:
         """Remove only unreferenced generations and temporary directories."""
 
+        cleanup_started = time.perf_counter()
         keep = set(keep_names or ())
-        referenced = set()
-        for pointer in self.root.glob("*.pointer.json"):
-            try:
-                generation = json.loads(pointer.read_text(encoding="utf-8")).get("generation")
-            except (OSError, ValueError):
-                continue
-            if isinstance(generation, str):
-                referenced.add(generation)
+        scope = set(checkpoint_names or ())
+        if self.retention_name is not None:
+            scope.add(self.retention_name)
+        if scope:
+            scope = {_safe_name(name) for name in scope}
+        referenced = self._referenced_generations()
         removed = 0
         for path in self.root.iterdir():
-            if not path.is_dir() or path.name in referenced or path.name in keep:
+            if path.is_dir() and (path.name in referenced or path.name in keep):
                 continue
-            if path.name.startswith(".") or ".generation-" in path.name:
-                shutil.rmtree(path, ignore_errors=True)
+            if path.is_dir() and (path.name.startswith(".") or ".generation-" in path.name):
+                generation_name = path.name.split(".generation-", 1)[0]
+                if scope and generation_name.lstrip(".") not in scope:
+                    continue
+                if ".generation-" in path.name:
+                    self._remove_generation_if_unreferenced(path, referenced=referenced)
+                else:
+                    shutil.rmtree(path, ignore_errors=True)
                 removed += 1
+            elif path.is_file() and path.name.startswith(".") and path.name.endswith(".tmp"):
+                if scope and not any(path.name.startswith(f".{name}.") for name in scope):
+                    continue
+                path.unlink(missing_ok=True)
+                removed += 1
+        self._stats["cleanup_calls"] = int(self._stats.get("cleanup_calls", 0)) + 1
+        self._add_stat("cleanup_seconds", time.perf_counter() - cleanup_started)
+        if self.retention_generations is not None:
+            self._retained_bytes_cache = None
+            self._retained_bytes()
         return removed
 
 

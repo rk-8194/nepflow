@@ -33,6 +33,7 @@ from .models import (
     BANDWIDTH_SCHEMA_VERSION,
     CALIBRATION_OPTIMIZER_ID,
     CALIBRATION_OPTIMIZER_VERSION,
+    DEFAULT_LOO_CHECKPOINT_EVERY_SOURCES,
     DEFAULT_NEIGHBOUR_BACKEND_ID,
     GPU_NEIGHBOUR_BACKEND_ALIASES,
     KERNEL_FAMILY,
@@ -490,9 +491,22 @@ def _settings_from_arguments(
     gpu_tile_size: int,
     max_gpu_support_bytes: int | None,
     max_gpu_neighbour_bytes: int | None,
+    loo_checkpoint_every_sources: int | None,
+    loo_checkpoint_every_seconds: float | None,
 ) -> EntropyBandwidthSettings:
     if settings is not None:
-        if any(value is not None for value in (mode, k, c, k_candidates, c_candidates)):
+        if any(
+            value is not None
+            for value in (
+                mode,
+                k,
+                c,
+                k_candidates,
+                c_candidates,
+                loo_checkpoint_every_sources,
+                loo_checkpoint_every_seconds,
+            )
+        ):
             raise ValueError("settings cannot be combined with explicit calibration arguments")
         if isinstance(settings, EntropyBandwidthSettings):
             return settings
@@ -518,6 +532,12 @@ def _settings_from_arguments(
             gpu_tile_size=gpu_tile_size,
             max_gpu_support_bytes=max_gpu_support_bytes,
             max_gpu_neighbour_bytes=max_gpu_neighbour_bytes,
+            loo_checkpoint_every_sources=(
+                DEFAULT_LOO_CHECKPOINT_EVERY_SOURCES
+                if loo_checkpoint_every_sources is None
+                else loo_checkpoint_every_sources
+            ),
+            loo_checkpoint_every_seconds=loo_checkpoint_every_seconds,
         )
     return EntropyBandwidthSettings(
         mode=selected_mode,
@@ -538,6 +558,12 @@ def _settings_from_arguments(
         gpu_tile_size=gpu_tile_size,
         max_gpu_support_bytes=max_gpu_support_bytes,
         max_gpu_neighbour_bytes=max_gpu_neighbour_bytes,
+        loo_checkpoint_every_sources=(
+            DEFAULT_LOO_CHECKPOINT_EVERY_SOURCES
+            if loo_checkpoint_every_sources is None
+            else loo_checkpoint_every_sources
+        ),
+        loo_checkpoint_every_seconds=loo_checkpoint_every_seconds,
     )
 
 
@@ -649,6 +675,8 @@ def calibrate_bandwidth(
     gpu_tile_size: int = 128,
     max_gpu_support_bytes: int | None = None,
     max_gpu_neighbour_bytes: int | None = None,
+    loo_checkpoint_every_sources: int | None = None,
+    loo_checkpoint_every_seconds: float | None = None,
     resource_budget: ResourceBudgetService | None = None,
     checkpoint_path: str | Path | None = None,
     resume: bool = True,
@@ -689,6 +717,8 @@ def calibrate_bandwidth(
         gpu_tile_size=gpu_tile_size,
         max_gpu_support_bytes=max_gpu_support_bytes,
         max_gpu_neighbour_bytes=max_gpu_neighbour_bytes,
+        loo_checkpoint_every_sources=loo_checkpoint_every_sources,
+        loo_checkpoint_every_seconds=loo_checkpoint_every_seconds,
     )
     selected_settings, runtime_budget = _resolve_runtime_limits(
         selected_settings,
@@ -910,27 +940,31 @@ def calibrate_bandwidth(
                 return
             elapsed, remaining = _progress_timing(completed, total_sources, pair_started)
             percentage = 100.0 * completed / total_sources
-            metrics: Mapping[str, int | float | None] = (
-                index.memory_metrics() if index is not None else {}
-            )
+            active = operational_metrics.get("loo_active_support_metrics", {})
+            metrics: Mapping[str, Any] = active if isinstance(active, Mapping) else {}
 
-            def metric(name: str, default: int | float = 0) -> int | float:
+            def metric(name: str, default: int | float | str = "unavailable") -> Any:
                 value = metrics.get(name)
                 return default if value is None else value
 
+            stats_status = str(metrics.get("support_provider_stats_status", "not available"))
+            current_support = metric("current_support_count")
+            radius_queries = metric("support_provider_radius_queries")
+
             logger.info(
                 "Bandwidth calibration pair source progress: k=%d, %s, source=%d/%d "
-                "(%.1f%%), phase=radius-support+loo, current_support=%d, "
+                "(%.1f%%), phase=radius-support+loo, support_provider=%s, "
+                "support_metrics=%s, current_support=%s, "
                 "min_support=%s, mean_support=%s, "
-                "max_support=%d, "
-                "radius_queries=%d, unique_distance_evaluations=%d, "
-                "atomic_distance_evaluations=%d, "
+                "max_support=%s, "
+                "radius_queries=%s, unique_distance_evaluations=%s, "
+                "atomic_distance_evaluations=%s, "
                 "support_cache_bytes=0, "
-                "cache_hit=%d, cache_miss=%d, cache_eviction=%d, "
-                "cache_admission_rejected=%d, cache_bytes=%d, cache_peak_bytes=%d, "
-                "cache_time_saved_seconds=%.6f, "
-                "support_cache_peak_bytes=0, grouping_bytes=%d, grouping_build_seconds=%.3f, "
-                "tree_build_seconds=%.3f, index_bytes=%d, query_workspace_peak_bytes=%d, "
+                "cache_hit=%s, cache_miss=%s, cache_eviction=%s, "
+                "cache_admission_rejected=%s, cache_bytes=%s, cache_peak_bytes=%s, "
+                "cache_time_saved_seconds=%s, "
+                "support_cache_peak_bytes=0, grouping_bytes=%s, grouping_build_seconds=%s, "
+                "tree_build_seconds=%s, index_bytes=%s, query_workspace_peak_bytes=%s, "
                 "process_peak_rss_bytes=%s, cgroup_memory_current_bytes=%s, "
                 "elapsed=%.3fs, estimated remaining=%.3fs",
                 candidate_k,
@@ -938,25 +972,27 @@ def calibrate_bandwidth(
                 completed,
                 total_sources,
                 percentage,
-                int(metric("current_support_count")),
+                str(metrics.get("support_provider", "not available")),
+                stats_status,
+                str(current_support),
                 str(metrics.get("min_support_count", "unavailable")),
                 str(metrics.get("mean_support_count", "unavailable")),
-                int(metric("max_support_count")),
-                int(metric("radius_queries")),
-                int(metric("unique_distance_evaluations")),
-                int(metric("atomic_distance_evaluations")),
-                int(metric("cache_hit")),
-                int(metric("cache_miss")),
-                int(metric("cache_eviction")),
-                int(metric("cache_admission_rejected")),
-                int(metric("cache_bytes")),
-                int(metric("cache_peak_bytes")),
-                float(metric("cache_time_saved_seconds")),
-                int(metric("grouping_bytes")),
-                float(metric("grouping_build_seconds")),
-                float(metric("tree_build_seconds")),
-                int(metric("index_bytes")),
-                int(metric("query_workspace_peak_bytes")),
+                str(metrics.get("max_support_count", "unavailable")),
+                str(radius_queries),
+                str(metric("support_provider_unique_distance_evaluations")),
+                str(metric("support_provider_atomic_distance_evaluations")),
+                str(metrics.get("cache_hit", "unavailable")),
+                str(metrics.get("cache_miss", "unavailable")),
+                str(metrics.get("cache_eviction", "unavailable")),
+                str(metrics.get("cache_admission_rejected", "unavailable")),
+                str(metrics.get("cache_bytes", "unavailable")),
+                str(metrics.get("cache_peak_bytes", "unavailable")),
+                str(metrics.get("cache_time_saved_seconds", "unavailable")),
+                str(metrics.get("grouping_bytes", "unavailable")),
+                str(metrics.get("grouping_build_seconds", "unavailable")),
+                str(metrics.get("tree_build_seconds", "unavailable")),
+                str(metrics.get("index_bytes", "unavailable")),
+                str(metrics.get("query_workspace_peak_bytes", "unavailable")),
                 str(metrics.get("process_peak_rss_bytes", "unavailable")),
                 str(metrics.get("cgroup_memory_current_bytes", "unavailable")),
                 elapsed,
@@ -1170,6 +1206,8 @@ def calibrate_bandwidth(
                             capacity_context=f"k={candidate_k}, c={c_batch[0]:g}",
                             checkpoint_path=checkpoint_path,
                             checkpoint_name=f"loo-k{candidate_k}",
+                            checkpoint_every_sources=selected_settings.loo_checkpoint_every_sources,
+                            checkpoint_every_seconds=selected_settings.loo_checkpoint_every_seconds,
                             resume=resume,
                             diagnostics=operational_metrics,
                             kernel_support_execution=selected_settings.kernel_support_execution,
@@ -1198,6 +1236,8 @@ def calibrate_bandwidth(
                         checkpoint_path=checkpoint_path,
                         checkpoint_name=f"loo-k{candidate_k}-c-"
                         + "-".join(f"{value:g}" for value in c_batch),
+                        checkpoint_every_sources=selected_settings.loo_checkpoint_every_sources,
+                        checkpoint_every_seconds=selected_settings.loo_checkpoint_every_seconds,
                         resume=resume,
                         diagnostics=operational_metrics,
                         kernel_support_execution=selected_settings.kernel_support_execution,

@@ -44,6 +44,10 @@ KERNEL_OPERATOR_SCHEMA_VERSION = "kernel-operator-v1"
 SPARSE_NUMERICAL_TOLERANCE = 1.0e-12
 ENTROPY_OBJECTIVE_SCHEMA_VERSION = "entropy-objective-v1"
 DEFAULT_RADIUS_QUERY_BYTES = 256 * 1024 * 1024
+# LOO persistence is deliberately row-batched.  This is an operational
+# setting: it changes only restart granularity and never source order or
+# floating-point accumulation order.
+DEFAULT_LOO_CHECKPOINT_EVERY_SOURCES = 4096
 
 
 def _readonly_float_array(value: Any, *, name: str) -> np.ndarray:
@@ -108,6 +112,8 @@ class EntropyBandwidthSettings:
     gpu_tile_size: int = 128
     max_gpu_support_bytes: int | None = None
     max_gpu_neighbour_bytes: int | None = None
+    loo_checkpoint_every_sources: int = DEFAULT_LOO_CHECKPOINT_EVERY_SOURCES
+    loo_checkpoint_every_seconds: float | None = None
 
     def __post_init__(self) -> None:
         mode = str(self.mode).strip().lower()
@@ -189,6 +195,18 @@ class EntropyBandwidthSettings:
             or int(self.calibration_batch_size) < 1
         ):
             raise ValueError("calibration_batch_size must be a positive integer when provided")
+        if (
+            isinstance(self.loo_checkpoint_every_sources, bool)
+            or not isinstance(self.loo_checkpoint_every_sources, (int, np.integer))
+            or int(self.loo_checkpoint_every_sources) < 1
+        ):
+            raise ValueError("loo_checkpoint_every_sources must be a positive integer")
+        if self.loo_checkpoint_every_seconds is not None:
+            if isinstance(self.loo_checkpoint_every_seconds, bool):
+                raise ValueError("loo_checkpoint_every_seconds must be finite and positive")
+            seconds = float(self.loo_checkpoint_every_seconds)
+            if not math.isfinite(seconds) or seconds <= 0.0:
+                raise ValueError("loo_checkpoint_every_seconds must be finite and positive")
         k_candidates = _validate_ordered_integer_domain(self.k_candidates, "k_candidates")
         c_candidates = _validate_ordered_float_domain(self.c_candidates, "c_candidates")
         if mode == "manual":
@@ -228,6 +246,13 @@ class EntropyBandwidthSettings:
             object.__setattr__(self, "max_gpu_support_bytes", int(self.max_gpu_support_bytes))
         if self.max_gpu_neighbour_bytes is not None:
             object.__setattr__(self, "max_gpu_neighbour_bytes", int(self.max_gpu_neighbour_bytes))
+        object.__setattr__(
+            self, "loo_checkpoint_every_sources", int(self.loo_checkpoint_every_sources)
+        )
+        if self.loo_checkpoint_every_seconds is not None:
+            object.__setattr__(
+                self, "loo_checkpoint_every_seconds", float(self.loo_checkpoint_every_seconds)
+            )
 
     @property
     def operational_work_bytes(self) -> int:

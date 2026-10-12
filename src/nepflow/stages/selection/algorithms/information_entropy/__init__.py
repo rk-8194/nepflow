@@ -80,6 +80,7 @@ from .kernels import (
     wendland_kernel,
 )
 from .models import (
+    DEFAULT_LOO_CHECKPOINT_EVERY_SOURCES,
     DEFAULT_NEIGHBOUR_BACKEND_ID,
     DEFAULT_RADIUS_QUERY_BYTES,
     ENTROPY_OBJECTIVE_SCHEMA_VERSION,
@@ -251,6 +252,7 @@ __all__ = [
     "ScientificDiagnostics",
     "InformationEntropyConfig",
     "DEFAULT_NEIGHBOUR_BACKEND_ID",
+    "DEFAULT_LOO_CHECKPOINT_EVERY_SOURCES",
     "DEFAULT_RADIUS_QUERY_BYTES",
     "KERNEL_SUPPORT_EXECUTION_CPU",
     "KERNEL_SUPPORT_EXECUTION_GPU",

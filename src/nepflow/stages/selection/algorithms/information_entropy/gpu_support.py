@@ -151,6 +151,8 @@ class ExactTiledGPUSupport:
             self.cpu_rescanned_count = 0
             self.h2d_bytes = 0
             self.d2h_bytes = 0
+            self.h2d_seconds = 0.0
+            self.d2h_seconds = 0.0
             self.gpu_seconds = 0.0
             self.cpu_verification_seconds = 0.0
             self.support_query_count = 0
@@ -240,6 +242,8 @@ class ExactTiledGPUSupport:
         self.cpu_rescanned_count = 0
         self.h2d_bytes = 0
         self.d2h_bytes = 0
+        self.h2d_seconds = 0.0
+        self.d2h_seconds = 0.0
         self.device_workspace_peak_bytes = 0
         self.host_workspace_peak_bytes = 0
         self.gpu_seconds = 0.0
@@ -318,8 +322,10 @@ class ExactTiledGPUSupport:
         self.h2d_bytes += int(source_values.nbytes + target_values.nbytes)
         gpu_started = time.perf_counter()
         with cp.cuda.Device(self.device):
+            transfer_started = time.perf_counter()
             gpu_sources = cp.asarray(source_values, dtype=cp.float64)
             gpu_targets = cp.asarray(target_values, dtype=cp.float64)
+            self.h2d_seconds += max(0.0, time.perf_counter() - transfer_started)
             distance_squared = cp.zeros(
                 (source_indices.size, target_indices.size), dtype=cp.float64
             )
@@ -327,7 +333,9 @@ class ExactTiledGPUSupport:
                 delta = gpu_targets[None, :, dimension] - gpu_sources[:, None, dimension]
                 distance_squared += delta * delta
             gpu_distances = cp.sqrt(distance_squared)
+            transfer_started = time.perf_counter()
             host_distances = np.asarray(cp.asnumpy(gpu_distances), dtype=np.float64)
+            self.d2h_seconds += max(0.0, time.perf_counter() - transfer_started)
         self.gpu_seconds += max(0.0, time.perf_counter() - gpu_started)
         self.d2h_bytes += int(host_distances.nbytes)
         self.fp64_evaluations += int(source_indices.size * target_indices.size)
@@ -578,7 +586,10 @@ class ExactTiledGPUSupport:
                 "gpu_cpu_rescanned_count": self.cpu_rescanned_count,
                 "gpu_h2d_bytes": self.h2d_bytes,
                 "gpu_d2h_bytes": self.d2h_bytes,
+                "gpu_h2d_seconds": self.h2d_seconds,
+                "gpu_d2h_seconds": self.d2h_seconds,
                 "gpu_seconds": self.gpu_seconds,
+                "gpu_strict_radius_screening_seconds": self.gpu_seconds,
                 "gpu_active_seconds_sum": float(self.gpu_seconds),
                 "gpu_wall_seconds": float(self.support_wall_seconds),
                 "gpu_parallelism_estimate": (
@@ -624,7 +635,10 @@ class ExactTiledGPUSupport:
             "gpu_cpu_rescanned_count": self.cpu_rescanned_count,
             "gpu_h2d_bytes": self.h2d_bytes,
             "gpu_d2h_bytes": self.d2h_bytes,
+            "gpu_h2d_seconds": self.h2d_seconds,
+            "gpu_d2h_seconds": self.d2h_seconds,
             "gpu_seconds": self.gpu_seconds,
+            "gpu_strict_radius_screening_seconds": self.gpu_seconds,
             "gpu_active_seconds_sum": float(self.gpu_seconds),
             "gpu_wall_seconds": float(self.support_query_seconds),
             "gpu_parallelism_estimate": 1.0 if self.support_query_seconds > 0.0 else 0.0,
@@ -684,6 +698,12 @@ class ExactTiledGPUSupport:
                     for item in metrics
                 ),
             )
+        self.h2d_seconds = sum(
+            float(item.get("gpu_h2d_seconds", 0.0) or 0.0) for item in metrics
+        )
+        self.d2h_seconds = sum(
+            float(item.get("gpu_d2h_seconds", 0.0) or 0.0) for item in metrics
+        )
         self.device_workspace_peak_bytes = max(
             int(item.get("gpu_device_workspace_peak_bytes", 0) or 0) for item in metrics
         )

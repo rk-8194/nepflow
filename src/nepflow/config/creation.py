@@ -346,6 +346,10 @@ entropy_gpu_tile_size=128
 entropy_max_gpu_support_bytes=
 # Optional device-workspace ceiling for the explicit exact_tiled_gpu_knn backend.
 entropy_max_gpu_neighbour_bytes=
+# LOO checkpoints are rolling, crash-consistent snapshots.  This cadence is
+# operational only and does not change source order or numerical accumulation.
+entropy_loo_checkpoint_every_sources=4096
+entropy_loo_checkpoint_every_seconds=
 # Atomic graph limits apply only to the bounded reference/debug graph API;
 # production information_entropy streams exact candidate contributions.
 

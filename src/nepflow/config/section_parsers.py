@@ -713,6 +713,14 @@ def parse_selection(values: Mapping[str, str]) -> SelectionConfig:
             value("entropy_max_gpu_neighbour_bytes", "", "max_gpu_neighbour_bytes"),
             "selection.entropy_max_gpu_neighbour_bytes",
         ),
+        loo_checkpoint_every_sources=_parse_int(
+            value("entropy_loo_checkpoint_every_sources", "4096", "loo_checkpoint_every_sources"),
+            "selection.entropy_loo_checkpoint_every_sources",
+        ),
+        loo_checkpoint_every_seconds=_parse_optional_float(
+            value("entropy_loo_checkpoint_every_seconds", "", "loo_checkpoint_every_seconds"),
+            "selection.entropy_loo_checkpoint_every_seconds",
+        ),
     )
     entropy = EntropySelectionConfig(
         beta=_parse_float(value("entropy_beta", "1.0", "beta"), "selection.entropy_beta"),

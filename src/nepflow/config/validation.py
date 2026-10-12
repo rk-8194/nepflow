@@ -349,6 +349,22 @@ def validate_config(
         raise ConfigurationError(
             "selection.entropy.bandwidth.max_gpu_neighbour_bytes must be positive when provided"
         )
+    if (
+        isinstance(bandwidth.loo_checkpoint_every_sources, bool)
+        or not isinstance(bandwidth.loo_checkpoint_every_sources, int)
+        or bandwidth.loo_checkpoint_every_sources < 1
+    ):
+        raise ConfigurationError(
+            "selection.entropy.bandwidth.loo_checkpoint_every_sources must be positive"
+        )
+    if bandwidth.loo_checkpoint_every_seconds is not None and (
+        isinstance(bandwidth.loo_checkpoint_every_seconds, bool)
+        or not math.isfinite(float(bandwidth.loo_checkpoint_every_seconds))
+        or bandwidth.loo_checkpoint_every_seconds <= 0.0
+    ):
+        raise ConfigurationError(
+            "selection.entropy.bandwidth.loo_checkpoint_every_seconds must be finite and positive"
+        )
     if not isinstance(bandwidth.chunk_size, int) or bandwidth.chunk_size < 1:
         raise ConfigurationError("selection.entropy.bandwidth.chunk_size must be positive")
     if bandwidth.max_index_bytes is not None and (

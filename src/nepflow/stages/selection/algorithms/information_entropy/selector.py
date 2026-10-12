@@ -863,6 +863,12 @@ class InformationEntropySelectionAlgorithm:
                     if getattr(bandwidth, "max_gpu_neighbour_bytes", None) is None
                     else int(bandwidth.max_gpu_neighbour_bytes)
                 ),
+                loo_checkpoint_every_sources=int(
+                    getattr(bandwidth, "loo_checkpoint_every_sources", 4096)
+                ),
+                loo_checkpoint_every_seconds=getattr(
+                    bandwidth, "loo_checkpoint_every_seconds", None
+                ),
             )
         return EntropyBandwidthSettings()
 
