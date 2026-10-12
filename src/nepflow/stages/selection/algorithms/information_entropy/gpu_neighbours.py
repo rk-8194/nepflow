@@ -52,7 +52,7 @@ from .neighbours import (
 logger = logging.getLogger(__name__)
 _GPU_PROGRESS_INTERVAL_SECONDS = 10.0
 _DEFAULT_MAX_CPU_RESCANS = 16_384
-_GPU_KNN_NUMERICAL_CONTRACT = "fp64-direct-canonical-cpu-interval-v1"
+_GPU_KNN_NUMERICAL_CONTRACT = "fp64-direct-canonical-cpu-interval-v2"
 _OUTWARD_ROUNDING_STEPS = 2
 
 
@@ -101,7 +101,7 @@ def _direct_cpu_relative_bound(one_evaluation: float) -> float:
 
     The ideal distance is eliminated between two independent evaluations.  If
     both use the one-evaluation contract, the canonical CPU result is bounded
-    below by ``gpu / ((1+gamma) * (1+gamma))``.  The multiplication is rounded
+    below by ``gpu * (1-gamma) / (1+gamma)``.  The quotient is rounded
     outward before use; unsupported/non-finite values fail closed at the call
     site.
     """
@@ -109,7 +109,12 @@ def _direct_cpu_relative_bound(one_evaluation: float) -> float:
     gamma = float(one_evaluation)
     if not np.isfinite(gamma) or gamma <= 0.0 or gamma >= 1.0:
         raise GPUCertificationError("direct GPU/CPU FP64 interval is unsupported")
-    factor = float((1.0 + gamma) * (1.0 + gamma))
+    numerator = float(_outward_upper(1.0 + gamma))
+    denominator = float(_outward_lower(1.0 - gamma))
+    if denominator <= 0.0:
+        raise GPUCertificationError("direct GPU/CPU FP64 interval is not representable")
+    factor = float(numerator / denominator)
+    factor = float(_outward_upper(factor))
     if not np.isfinite(factor) or factor <= 1.0:
         raise GPUCertificationError("direct GPU/CPU FP64 interval is not representable")
     return float(np.nextafter(factor - 1.0, np.inf))
@@ -329,6 +334,8 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
         self.gpu_h2d_seconds = 0.0
         self.gpu_d2h_seconds = 0.0
         self.gpu_distance_reduction_seconds = 0.0
+        self.first_pass_gpu_seconds = 0.0
+        self.extra_refinement_gpu_seconds = 0.0
         self.gpu_synchronization_seconds = 0.0
         self.gpu_launch_allocation_seconds = 0.0
         self.gpu_tile_wall_seconds = 0.0
@@ -339,6 +346,9 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
         self.certification_seconds = 0.0
         self.cpu_verification_seconds = 0.0
         self.certification_rescans = 0
+        self.first_pass_fp64_evaluations = 0
+        self.extra_refinement_fp64_evaluations = 0
+        self.fast_certified_count = 0
         self.ambiguous_boundary_count = 0
         self.rescan_reasons: dict[str, int] = {}
         # Boundary-proof diagnostics.  The weak retained-distance witness is
@@ -357,6 +367,7 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
         self.boundary_refinement_cpu_seconds = 0.0
         self.boundary_interval_unsafe_count = 0
         self.boundary_interval_overlap_count = 0
+        self.omission_interval_unsafe_count = 0
         self.cpu_refinement_candidate_count = 0
         self.cpu_refinement_budget_exhausted = 0
         self.full_rescan_last_resort_count = 0
@@ -540,8 +551,19 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
         source_offset: int,
         target_offset: int,
         target_count: int,
-    ) -> tuple[Any, Any, Any]:
-        """Return GPU-local candidates and an outward-bound omission witness."""
+    ) -> tuple[Any, Any, Any, Any, Any]:
+        """Return candidates, raw witnesses, and certified omission state.
+
+        ``local_bound`` is the reported GPU distance of the first locally
+        omitted target.  ``local_lower`` is its outward-rounded lower bound
+        for the canonical CPU distance, but is usable only when
+        ``local_unsafe`` is false.  If a tile contains no local omission,
+        ``local_lower`` is infinity while its unsafe bit is still retained:
+        a later global merge may omit one of those retained candidates.  The
+        safety mask is evaluated from the already resident
+        subtraction/square/reduction tile, so no second reference scan is
+        introduced.
+        """
 
         cp = self._cp
         source_count = int(gpu_sources.shape[0])
@@ -558,8 +580,30 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
             with cp.cuda.Device(self.device):
                 compute_started = time.perf_counter()
                 delta = gpu_sources[:, None, :] - gpu_targets[None, :, :]
+                difference_safe = cp.all(
+                    (delta == 0.0)
+                    | (delta >= 2.0 * np.sqrt(np.finfo(np.float64).tiny))
+                    | (delta <= -2.0 * np.sqrt(np.finfo(np.float64).tiny)),
+                    axis=2,
+                )
+                difference_finite = cp.all(cp.isfinite(delta), axis=2)
                 delta *= delta
+                square_safe = cp.all(
+                    (delta == 0.0) | (delta >= 2.0 * np.finfo(np.float64).tiny),
+                    axis=2,
+                )
+                square_finite = cp.all(cp.isfinite(delta), axis=2)
                 distance_squared = cp.sum(delta, axis=2, dtype=cp.float64)
+                sum_safe = cp.isfinite(distance_squared) & (
+                    distance_squared
+                    <= np.finfo(np.float64).max
+                    / float(1.0 + self.certification_relative_bound)
+                )
+                pair_safe = difference_safe & difference_finite & square_safe & square_finite
+                pair_safe &= sum_safe
+                if not self._gpu_fp64_certification_safe:
+                    pair_safe = cp.zeros(pair_safe.shape, dtype=bool)
+                source_safe = cp.all(pair_safe, axis=1)
                 isfinite = getattr(cp, "isfinite", None)
                 all_values_finite = getattr(cp, "all", None)
                 partition_kth = int(keep_count if target_count > keep_count else keep_count - 1)
@@ -592,6 +636,11 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
                     finite_rows = all_values_finite(isfinite(distance_squared), axis=1)
                     local_bound = cp.where(finite_rows, local_bound, cp.nan)
                     invalid_rows_host = np.asarray(cp.asnumpy(~finite_rows), dtype=bool)
+                local_unsafe = ~source_safe
+                if target_count <= keep_count:
+                    local_lower = cp.full((source_count,), np.inf, dtype=cp.float64)
+                else:
+                    local_lower = self._gpu_reported_lower_bound(local_bound)
         except Exception as exc:
             if isinstance(exc, (GPUCapacityError, GPUCertificationError)):
                 raise
@@ -646,6 +695,7 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
                             local_bound[int(row)] = float(canonical[order[keep_count]])
                         else:
                             local_bound[int(row)] = np.inf
+                        local_unsafe[int(row)] = True
             except (FloatingPointError, ValueError, RadiusQueryCapacityError) as exc:
                 raise GPUCertificationError(
                     "exact CPU refinement of a non-finite GPU kNN tile failed"
@@ -655,16 +705,18 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
         operation_elapsed = max(0.0, time.perf_counter() - operation_started)
         self.gpu_operation_seconds += operation_elapsed
         self.gpu_seconds += compute_elapsed
+        self.first_pass_gpu_seconds += compute_elapsed
         self.gpu_launch_allocation_seconds += max(
             0.0,
             operation_elapsed - compute_elapsed,
         )
         self.fp64_evaluations += int(source_count * target_count)
+        self.first_pass_fp64_evaluations += int(source_count * target_count)
         self.device_workspace_peak_bytes = max(
             self.device_workspace_peak_bytes,
             self.global_candidate_state_bytes + self.resident_reference_bytes + reserved,
         )
-        return selected_indices, selected_distances, local_bound
+        return selected_indices, selected_distances, local_bound, local_lower, local_unsafe
 
     def _merge_gpu_candidates(
         self,
@@ -676,6 +728,10 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
         local_indices: Any,
         local_distances: Any,
         local_bound: Any,
+        local_lower: Any,
+        local_unsafe: Any,
+        certified_omission_lower: Any,
+        omission_interval_unsafe: Any,
         existing_count: int,
         keep_count: int,
     ) -> None:
@@ -691,6 +747,10 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
                 local_indices,
                 local_distances,
                 local_bound,
+                local_lower,
+                local_unsafe,
+                certified_omission_lower,
+                omission_interval_unsafe,
                 existing_count,
                 keep_count,
             )
@@ -705,16 +765,34 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
         local_indices: Any,
         local_distances: Any,
         local_bound: Any,
+        local_lower: Any,
+        local_unsafe: Any,
+        certified_omission_lower: Any,
+        omission_interval_unsafe: Any,
         existing_count: int,
         keep_count: int,
     ) -> None:
-        """Merge candidates while the owning CUDA device is current."""
+        """Merge candidates while the owning CUDA device is current.
+
+        ``omission_bounds`` and ``merge_bounds`` retain raw GPU-distance
+        diagnostics: the former is the minimum first-local-omitted witness
+        across reference tiles, while the latter is the minimum witness
+        discarded while merging retained prefixes.  The corresponding
+        ``certified_omission_lower`` stores the same minima after the direct
+        GPU-to-canonical-CPU enclosure.  A source-level unsafe bit is sticky
+        across both kinds of witness, so an unsafe tile can never be promoted
+        to a fast certificate by a later safe tile.
+        """
 
         cp = self._cp
         source_stop = source_start + int(local_indices.shape[0])
         omission_bounds[source_start:source_stop] = cp.minimum(
             omission_bounds[source_start:source_stop], local_bound
         )
+        certified_omission_lower[source_start:source_stop] = cp.minimum(
+            certified_omission_lower[source_start:source_stop], local_lower
+        )
+        omission_interval_unsafe[source_start:source_stop] |= local_unsafe
         local_count = int(local_indices.shape[1])
         if existing_count == 0:
             global_indices[source_start:source_stop, :local_count] = local_indices
@@ -760,6 +838,10 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
             )[:, 0]
             merge_bounds[source_start:source_stop] = cp.minimum(
                 merge_bounds[source_start:source_stop], excluded_distances
+            )
+            certified_omission_lower[source_start:source_stop] = cp.minimum(
+                certified_omission_lower[source_start:source_stop],
+                self._gpu_reported_lower_bound(excluded_distances),
             )
         selected_count = int(selected_indices.shape[1])
         global_indices[source_start:source_stop, :selected_count] = selected_indices
@@ -836,6 +918,26 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
             lower[~safe] = -np.inf
         return safe, lower
 
+    def _gpu_reported_lower_bound(self, reported: Any) -> Any:
+        """Outward-round a GPU distance into a canonical-CPU lower bound."""
+
+        cp = self._cp
+        denominator = float(_outward_upper(1.0 + self.certification_direct_relative_bound))
+        if not np.isfinite(denominator) or denominator <= 1.0:
+            raise GPUCertificationError(
+                "GPU omission lower-bound denominator is not representable"
+            )
+        with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+            lower = reported / denominator
+        nextafter = getattr(cp, "nextafter", None)
+        if nextafter is None:
+            raise GPUCertificationError(
+                "CuPy does not expose outward nextafter needed for exact certification"
+            )
+        lower = nextafter(lower, 0.0)
+        lower = nextafter(lower, 0.0)
+        return lower
+
     def _adaptive_gpu_boundary_refinement(
         self,
         query: np.ndarray,
@@ -897,6 +999,7 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
         best_locations = initial_locations[initial_order][: int(k)].copy()
         best_distances = initial_values[initial_order][: int(k)].copy()
         cpu_elapsed = max(0.0, time.perf_counter() - canonical_started)
+        refinement_candidates_this_source = 0
 
         uploaded_source = None
         if gpu_reference is None:
@@ -962,10 +1065,12 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
                             ) from exc
                         gpu_elapsed = max(0.0, time.perf_counter() - gpu_started)
                         self.boundary_refinement_gpu_seconds += gpu_elapsed
+                        self.extra_refinement_gpu_seconds += gpu_elapsed
                         self.gpu_distance_reduction_seconds += gpu_elapsed
                         self.gpu_operation_seconds += gpu_elapsed
                         self.gpu_seconds += gpu_elapsed
                         self.fp64_evaluations += target_count
+                        self.extra_refinement_fp64_evaluations += target_count
                         self.distance_evaluations += target_count
                         self.unique_distance_evaluations += target_count
 
@@ -1000,15 +1105,19 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
                         )
                         if candidate_count == 0:
                             continue
-                        if (
-                            self.cpu_refinement_candidate_count + candidate_count
-                            > self.max_cpu_refinement_candidates
-                        ):
+                        attempted_candidates = (
+                            refinement_candidates_this_source + candidate_count
+                        )
+                        if attempted_candidates > self.max_cpu_refinement_candidates:
                             self.cpu_refinement_budget_exhausted += 1
                             raise GPUCertificationError(
-                                "exact GPU kNN boundary CPU-canonicalization budget "
-                                "was exhausted; refusing an unbounded approximate fallback"
+                                "exact GPU kNN boundary CPU-canonicalization budget was "
+                                f"exhausted for source_location={source_location}: "
+                                f"attempted_candidates={attempted_candidates}, "
+                                f"cap={self.max_cpu_refinement_candidates}; "
+                                "refusing an unbounded approximate fallback"
                             )
+                        refinement_candidates_this_source = attempted_candidates
                         self.cpu_refinement_candidate_count += candidate_count
                         candidate_locations = candidate_offsets + int(target_start)
                         combined_locations = np.unique(
@@ -1086,6 +1195,8 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
         k: int,
         *,
         gpu_reference: Any | None = None,
+        certified_omission_lower_bound: float = np.inf,
+        omission_interval_unsafe: bool = True,
     ) -> tuple[np.ndarray, np.ndarray]:
         """Certify the globally merged GPU result or refine one boundary."""
 
@@ -1157,31 +1268,18 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
             float(legacy_omission_bound), float(legacy_merge_bound)
         )
         omitted = certified_locations.size < int(self.unique_locations.shape[0] - 1)
-        # The old omitted-bound test compared one GPU scalar with one adjusted
-        # CPU scalar.  It is retained only as a diagnostic witness.  Scientific
-        # acceptance below always goes through the streaming pair-level
-        # GPU-to-canonical-CPU interval filter, because the omitted witness has
-        # no target magnitudes with which to prove its own arithmetic safety.
-        weak_lower = float("-inf")
-        weak_upper = float("inf")
-        if np.isfinite(omitted_bound) and omitted_bound >= 0.0:
-            with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
-                weak_lower = float(
-                    _outward_lower(
-                        omitted_bound
-                        / float(
-                            _outward_upper(
-                                1.0 + self.certification_direct_relative_bound
-                            )
-                        )
-                    )
-                )
-        if np.isfinite(reported_boundary) and reported_boundary >= 0.0:
-            weak_upper = float(_outward_upper(reported_boundary))
-        weak_certifiable = bool(
-            np.isfinite(weak_lower)
-            and np.isfinite(weak_upper)
-            and weak_lower > weak_upper
+        cpu_boundary_upper = (
+            float(_outward_upper(reported_boundary))
+            if np.isfinite(reported_boundary) and reported_boundary >= 0.0
+            else float("inf")
+        )
+        certified_lower = float(certified_omission_lower_bound)
+        fast_certifiable = bool(
+            omitted
+            and not bool(omission_interval_unsafe)
+            and np.isfinite(certified_lower)
+            and np.isfinite(cpu_boundary_upper)
+            and certified_lower > cpu_boundary_upper
         )
         if omitted:
             if np.isfinite(omitted_bound) and np.isfinite(legacy_omitted_bound):
@@ -1192,9 +1290,17 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
             elif np.isinf(omitted_bound) and np.isfinite(legacy_omitted_bound):
                 self.first_excluded_gap_count += 1
                 self.first_excluded_unbounded_count += 1
-        if omitted and weak_certifiable:
+        if omitted and omission_interval_unsafe:
+            self.omission_interval_unsafe_count += 1
+        if omitted and fast_certifiable:
+            self.fast_certified_count += 1
             self.false_ambiguity_avoided += 1
-        if omitted:
+            self.certified_tiles += 1
+            result = (
+                certified_locations[: int(k)],
+                certified_distances[: int(k)],
+            )
+        elif omitted:
             self.ambiguous_boundary_count += 1
             self.genuine_unresolved_boundary_count += 1
             self.boundary_refinements += 1
@@ -1388,7 +1494,9 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
         )
         keep_count = min(location_count, order_k + 2)
         dimension = int(self.descriptors.shape[1])
-        global_state_bytes = int(state_count * keep_count * 16 + state_count * 16)
+        # Two raw GPU witnesses, one certified CPU lower bound, and a compact
+        # per-source unsafe flag accompany the persistent k+2 candidate state.
+        global_state_bytes = int(state_count * keep_count * 16 + state_count * 25)
         full_reference_bytes = int(self.unique_locations.nbytes)
         try:
             source_tile, target_tile, _ = self._tile_shape(
@@ -1468,11 +1576,15 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
         global_distances = None
         omission_bounds = None
         merge_bounds = None
+        certified_omission_lower = None
+        omission_interval_unsafe = None
         gpu_targets = None
         gpu_sources = None
         local_indices = None
         local_distances = None
         local_bound = None
+        local_lower = None
+        local_unsafe = None
         started = time.perf_counter()
         last_worker_progress = started
         last_worker_evaluations = 0
@@ -1535,6 +1647,10 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
                     global_distances = cp.full((state_count, keep_count), np.inf, dtype=cp.float64)
                     omission_bounds = cp.full((state_count,), np.inf, dtype=cp.float64)
                     merge_bounds = cp.full((state_count,), np.inf, dtype=cp.float64)
+                    certified_omission_lower = cp.full(
+                        (state_count,), np.inf, dtype=cp.float64
+                    )
+                    omission_interval_unsafe = cp.zeros((state_count,), dtype=bool)
                     self._synchronize()
             except Exception as exc:
                 if isinstance(exc, MemoryError) or "out of memory" in str(exc).lower():
@@ -1591,7 +1707,13 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
                                 self.unique_locations[source_start_tile:source_stop]
                             )
                         local_keep = min(target_count, keep_count)
-                        local_indices, local_distances, local_bound = self._gpu_top_candidates(
+                        (
+                            local_indices,
+                            local_distances,
+                            local_bound,
+                            local_lower,
+                            local_unsafe,
+                        ) = self._gpu_top_candidates(
                             gpu_sources,
                             gpu_targets,
                             local_keep,
@@ -1604,6 +1726,8 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
                             and global_distances is not None
                             and omission_bounds is not None
                             and merge_bounds is not None
+                            and certified_omission_lower is not None
+                            and omission_interval_unsafe is not None
                         )
                         merge_started = time.perf_counter()
                         self._merge_gpu_candidates(
@@ -1615,6 +1739,10 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
                             local_indices,
                             local_distances,
                             local_bound,
+                            local_lower,
+                            local_unsafe,
+                            certified_omission_lower,
+                            omission_interval_unsafe,
                             min(reference_start, keep_count),
                             keep_count,
                         )
@@ -1631,6 +1759,8 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
                         local_indices = None
                         local_distances = None
                         local_bound = None
+                        local_lower = None
+                        local_unsafe = None
                     self.target_tiles += 1
                     self.distance_evaluations += batch_count * target_count
                     self.unique_distance_evaluations += batch_count * target_count
@@ -1644,7 +1774,7 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
                 state_start = source_start_tile - state_offset
                 state_stop = source_stop - state_offset
                 batch_count = source_stop - source_start_tile
-                host_bytes = int(batch_count * keep_count * 16 + batch_count * 16 + 8192)
+                host_bytes = int(batch_count * keep_count * 16 + batch_count * 25 + 8192)
                 self.host_workspace_peak_bytes = max(self.host_workspace_peak_bytes, host_bytes)
                 lease = self.resource_budget.acquire(
                     "exact tiled GPU kNN final certification", max(1, host_bytes)
@@ -1655,6 +1785,8 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
                         and global_distances is not None
                         and omission_bounds is not None
                         and merge_bounds is not None
+                        and certified_omission_lower is not None
+                        and omission_interval_unsafe is not None
                     )
                     d2h_started = time.perf_counter()
                     with cp.cuda.Device(self.device):
@@ -1674,6 +1806,18 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
                             cp.asnumpy(merge_bounds[state_start:state_stop]),
                             dtype=np.float64,
                         )
+                        host_certified_omission_lower = np.asarray(
+                            cp.asnumpy(
+                                certified_omission_lower[state_start:state_stop]
+                            ),
+                            dtype=np.float64,
+                        )
+                        host_omission_interval_unsafe = np.asarray(
+                            cp.asnumpy(
+                                omission_interval_unsafe[state_start:state_stop]
+                            ),
+                            dtype=bool,
+                        )
                         synchronization = self._synchronize()
                     d2h_elapsed = max(0.0, time.perf_counter() - d2h_started)
                     self.d2h_bytes += int(
@@ -1681,6 +1825,8 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
                         + host_distances.nbytes
                         + host_omission.nbytes
                         + host_merge.nbytes
+                        + host_certified_omission_lower.nbytes
+                        + host_omission_interval_unsafe.nbytes
                     )
                     self.gpu_d2h_seconds += d2h_elapsed
                     self.gpu_launch_allocation_seconds += max(0.0, d2h_elapsed - synchronization)
@@ -1696,6 +1842,12 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
                             float(np.max(host_distances[offset])),
                             order_k,
                             gpu_reference=gpu_reference,
+                            certified_omission_lower_bound=float(
+                                host_certified_omission_lower[offset]
+                            ),
+                            omission_interval_unsafe=bool(
+                                host_omission_interval_unsafe[offset]
+                            ),
                         )
                         if locations.size != order_k:
                             raise GPUCertificationError(
@@ -1716,10 +1868,14 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
             local_indices = None
             local_distances = None
             local_bound = None
+            local_lower = None
+            local_unsafe = None
             global_indices = None
             global_distances = None
             omission_bounds = None
             merge_bounds = None
+            certified_omission_lower = None
+            omission_interval_unsafe = None
             try:
                 with self._cp.cuda.Device(self.device):
                     for name in (
@@ -2247,6 +2403,9 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
             "gpu_h2d_bytes",
             "gpu_d2h_bytes",
             "gpu_cpu_rescanned_count",
+            "gpu_first_pass_fp64_evaluations",
+            "gpu_extra_refinement_fp64_evaluations",
+            "gpu_fast_certified_count",
             "gpu_exact_boundary_recertifications",
             "gpu_first_excluded_gap_count",
             "gpu_first_excluded_unbounded_count",
@@ -2256,6 +2415,7 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
             "gpu_boundary_refinement_candidate_count",
             "gpu_boundary_interval_unsafe_count",
             "gpu_boundary_interval_overlap_count",
+            "gpu_omission_interval_unsafe_count",
             "gpu_cpu_refinement_candidate_count",
             "gpu_cpu_refinement_budget_exhausted",
             "gpu_full_rescan_last_resort_count",
@@ -2308,6 +2468,14 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
         )
         self.gpu_seconds = sum(
             float(item.get("gpu_kernel_seconds", 0.0) or 0.0)
+            for item in self.per_device_metrics.values()
+        )
+        self.first_pass_gpu_seconds = sum(
+            float(item.get("gpu_first_pass_gpu_seconds", 0.0) or 0.0)
+            for item in self.per_device_metrics.values()
+        )
+        self.extra_refinement_gpu_seconds = sum(
+            float(item.get("gpu_extra_refinement_gpu_seconds", 0.0) or 0.0)
             for item in self.per_device_metrics.values()
         )
         self.gpu_operation_seconds = sum(
@@ -2504,6 +2672,13 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
                 "gpu_certification_seconds": float(self.certification_seconds),
                 "gpu_cpu_verification_seconds": float(self.cpu_verification_seconds),
                 "gpu_certification_rescans": int(self.certification_rescans),
+                "gpu_first_pass_fp64_evaluations": int(
+                    self.first_pass_fp64_evaluations
+                ),
+                "gpu_extra_refinement_fp64_evaluations": int(
+                    self.extra_refinement_fp64_evaluations
+                ),
+                "gpu_fast_certified_count": int(self.fast_certified_count),
                 "gpu_rescan_reasons": dict(self.rescan_reasons),
                 "gpu_max_cpu_rescans": int(self.max_cpu_rescans),
                 "gpu_cpu_tile_refinements": int(self.cpu_tile_refinements),
@@ -2528,6 +2703,9 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
                 "gpu_boundary_interval_unsafe_count": int(
                     self.boundary_interval_unsafe_count
                 ),
+                "gpu_omission_interval_unsafe_count": int(
+                    self.omission_interval_unsafe_count
+                ),
                 "gpu_boundary_interval_overlap_count": int(
                     self.boundary_interval_overlap_count
                 ),
@@ -2542,6 +2720,10 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
                 ),
                 "gpu_boundary_refinement_gpu_seconds": float(
                     self.boundary_refinement_gpu_seconds
+                ),
+                "gpu_first_pass_gpu_seconds": float(self.first_pass_gpu_seconds),
+                "gpu_extra_refinement_gpu_seconds": float(
+                    self.extra_refinement_gpu_seconds
                 ),
                 "gpu_boundary_refinement_cpu_seconds": float(
                     self.boundary_refinement_cpu_seconds
@@ -2734,7 +2916,7 @@ def compute_gpu_tiled_neighbours(
     )
     identity = {
         "phase": "exact-knn",
-        "schema": "exact-knn-checkpoint-v2",
+        "schema": "exact-knn-checkpoint-v3",
         "backend": active_index.backend,
         "backend_version": active_index.backend_version,
         "numerical_contract": _GPU_KNN_NUMERICAL_CONTRACT,
@@ -2839,7 +3021,7 @@ def compute_gpu_tiled_neighbours_many(
     )
     identity = {
         "phase": "exact-knn",
-        "schema": "exact-knn-checkpoint-v2",
+        "schema": "exact-knn-checkpoint-v3",
         "backend": active_index.backend,
         "backend_version": active_index.backend_version,
         "numerical_contract": _GPU_KNN_NUMERICAL_CONTRACT,

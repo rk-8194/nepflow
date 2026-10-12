@@ -54,6 +54,7 @@ def _fake_cupy(
         zeros=np.zeros,
         full=np.full,
         sqrt=sqrt_fn,
+        nextafter=np.nextafter,
         sum=np.sum,
         max=np.max,
         minimum=np.minimum,
@@ -184,7 +185,7 @@ def test_fake_gpu_knn_reports_bounded_transfers_and_reuses_k_prefix(
     assert metrics["gpu_reference_uploads"] == 1
     assert metrics["gpu_reference_shards"] == 0
     assert metrics["gpu_resident_reference_bytes"] == descriptors.nbytes
-    assert metrics["gpu_d2h_bytes"] == 12 * (6 * 16 + 16)
+    assert metrics["gpu_d2h_bytes"] == 12 * (6 * 16 + 16 + 8 + 1)
     assert metrics["gpu_operation_seconds_inclusive"] >= metrics["gpu_kernel_seconds"]
     second = ExactTiledGPUNeighbourIndex(
         descriptors,
@@ -232,6 +233,8 @@ def test_fake_gpu_knn_uses_first_excluded_witness_across_reference_tiles(
     assert source_location not in rescanned_sources
     metrics = index.memory_metrics()
     assert metrics["gpu_false_ambiguity_avoided"] >= 1
+    assert metrics["gpu_fast_certified_count"] >= 1
+    assert metrics["gpu_boundary_refinements"] < metrics["gpu_final_certifications"]
     assert metrics["gpu_first_excluded_gap_max"] >= 12.0
     index.close()
 
@@ -426,6 +429,52 @@ def test_fake_gpu_boundary_cpu_refinement_budget_fails_closed(
     index.close()
 
 
+def test_fake_gpu_cpu_refinement_budget_is_source_local(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Independent bounded sources may exceed the cumulative diagnostic total."""
+
+    monkeypatch.setitem(sys.modules, "cupy", _fake_cupy())
+    from nepflow.stages.selection.algorithms.information_entropy.gpu_neighbours import (
+        ExactTiledGPUNeighbourIndex,
+    )
+
+    index = ExactTiledGPUNeighbourIndex(
+        np.asarray([[float(i)] for i in range(6)], dtype=np.float64),
+        gpu_tile_size=2,
+        max_device_bytes=64 * 1024,
+        resource_budget=_budget(),
+    )
+    index.max_cpu_refinement_candidates = 4
+
+    def retain_one_per_tile(
+        _query: np.ndarray,
+        targets: np.ndarray,
+        _gpu_distances: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        lower = np.full(targets.shape[0], np.inf, dtype=np.float64)
+        lower[0] = 0.0
+        return np.ones(targets.shape[0], dtype=bool), lower
+
+    monkeypatch.setattr(index, "_gpu_cpu_lower_interval", retain_one_per_tile)
+    for source_location, reported_location in ((0, 1), (1, 0)):
+        index._certify_final(
+            index.unique_locations[source_location],
+            source_location,
+            np.asarray([source_location, reported_location], dtype=np.int64),
+            np.asarray([0.0, 1.0], dtype=np.float64),
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1,
+        )
+
+    assert index.cpu_refinement_candidate_count > index.max_cpu_refinement_candidates
+    assert index.cpu_refinement_budget_exhausted == 0
+    index.close()
+
+
 def test_gpu_checkpoint_rejects_incompatible_numerical_contract(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -605,7 +654,7 @@ def test_fake_gpu_knn_uses_bounded_reference_shards_when_pool_cannot_reside(
     index = ExactTiledGPUNeighbourIndex(
         descriptors,
         gpu_tile_size=3,
-        max_device_bytes=1300,
+        max_device_bytes=1400,
         resource_budget=budget,
     )
     _, rows, distances = index.query_neighbours(2, chunk_size=3)
