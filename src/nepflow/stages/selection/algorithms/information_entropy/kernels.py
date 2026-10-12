@@ -428,6 +428,13 @@ class _KernelSupportProvider:
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Return source supports as bounded CSR arrays.
 
+        ``radii`` may be a one-dimensional source-radius vector or a
+        ``(candidate_count, source_count)`` matrix.  The GPU provider uses the
+        latter to screen one conservative per-source superset and the caller
+        applies each candidate's strict radius to the canonical distances.
+        CPU providers use the same maximum-radius superset contract, keeping
+        the accumulation order identical across execution modes.
+
         Indexed CPU support queries share their tree preflight and canonical
         distance pass.  Backends without a batched radius primitive retain the
         exact source-by-source implementation and are assembled into the same
@@ -435,14 +442,30 @@ class _KernelSupportProvider:
         """
 
         sources = np.asarray(source_indices, dtype=np.int64)
-        scales = np.asarray(radii, dtype=np.float64)
-        if sources.ndim != 1 or scales.ndim != 1 or sources.shape != scales.shape:
-            raise ValueError("source_indices and radii must be aligned one-dimensional arrays")
+        requested_radii = np.asarray(radii, dtype=np.float64)
+        if sources.ndim != 1 or requested_radii.ndim not in (1, 2):
+            raise ValueError(
+                "source_indices must be one-dimensional and radii must have shape "
+                "(source_count,) or (candidate_count, source_count)"
+            )
+        if requested_radii.shape[-1] != sources.size:
+            raise ValueError("source_indices and radii must have aligned source dimensions")
+        if requested_radii.ndim == 2 and requested_radii.shape[0] == 0:
+            raise ValueError("support_many requires at least one radius candidate")
         if sources.size == 0:
             raise ValueError("support_many requires at least one source")
+        if not np.all(np.isfinite(requested_radii)) or np.any(requested_radii <= 0.0):
+            raise ValueError("support radii must be finite and strictly positive")
+        scales = (
+            requested_radii
+            if requested_radii.ndim == 1
+            else np.max(requested_radii, axis=0)
+        )
         started = time.perf_counter()
         if self.gpu_support is not None:
-            offsets, targets, distances = self.gpu_support.support_many(sources, scales)
+            offsets, targets, distances = self.gpu_support.support_many(
+                sources, requested_radii
+            )
             counts = np.diff(offsets)
             for count in counts:
                 support_count = int(count)
@@ -1084,6 +1107,8 @@ def evaluate_leave_one_out_objectives(
     support_totals = np.zeros(batch_count, dtype=np.int64)
     support_samples = np.zeros(batch_count, dtype=np.int64)
     support_maxima = np.zeros(batch_count, dtype=np.int64)
+    conservative_candidate_totals = np.zeros(batch_count, dtype=np.int64)
+    conservative_candidate_maxima = np.zeros(batch_count, dtype=np.int64)
     peak_workspace_bytes = batch_arrays_bytes
     checkpoint_store = (
         None
@@ -1145,12 +1170,22 @@ def evaluate_leave_one_out_objectives(
             saved_totals = checkpoint_state.get("support_totals", support_totals.tolist())
             saved_samples = checkpoint_state.get("support_samples", support_samples.tolist())
             saved_maxima = checkpoint_state.get("support_maxima", support_maxima.tolist())
+            saved_conservative_totals = checkpoint_state.get(
+                "conservative_candidate_totals", conservative_candidate_totals.tolist()
+            )
+            saved_conservative_maxima = checkpoint_state.get(
+                "conservative_candidate_maxima", conservative_candidate_maxima.tolist()
+            )
             if not (
                 isinstance(saved_invalid, list)
                 and len(saved_invalid) == batch_count
                 and len(saved_totals) == batch_count
                 and len(saved_samples) == batch_count
                 and len(saved_maxima) == batch_count
+                and isinstance(saved_conservative_totals, list)
+                and len(saved_conservative_totals) == batch_count
+                and isinstance(saved_conservative_maxima, list)
+                and len(saved_conservative_maxima) == batch_count
             ):
                 raise CheckpointValidationError("LOO checkpoint cumulative state is incompatible")
             invalid_reasons = [
@@ -1160,6 +1195,12 @@ def evaluate_leave_one_out_objectives(
             support_totals[...] = np.asarray(saved_totals, dtype=np.int64)
             support_samples[...] = np.asarray(saved_samples, dtype=np.int64)
             support_maxima[...] = np.asarray(saved_maxima, dtype=np.int64)
+            conservative_candidate_totals[...] = np.asarray(
+                saved_conservative_totals, dtype=np.int64
+            )
+            conservative_candidate_maxima[...] = np.asarray(
+                saved_conservative_maxima, dtype=np.int64
+            )
             logger.info(
                 "Resuming exact batched leave-one-out from source %d/%d",
                 source_start,
@@ -1191,6 +1232,8 @@ def evaluate_leave_one_out_objectives(
                 "support_totals": support_totals.tolist(),
                 "support_samples": support_samples.tolist(),
                 "support_maxima": support_maxima.tolist(),
+                "conservative_candidate_totals": conservative_candidate_totals.tolist(),
+                "conservative_candidate_maxima": conservative_candidate_maxima.tolist(),
             },
             arrays={"numerator": numerator},
         )
@@ -1208,10 +1251,10 @@ def evaluate_leave_one_out_objectives(
     for batch_start in range(source_start, row_count, query_block):
         batch_stop = min(batch_start + query_block, row_count)
         source_indices = np.arange(batch_start, batch_stop, dtype=np.int64)
-        maximum_scales = np.max(scales[:, batch_start:batch_stop], axis=0)
+        source_scales = scales[:, batch_start:batch_stop]
         support_offsets, support_targets, support_distances = provider.support_many(
             source_indices,
-            maximum_scales,
+            source_scales,
         )
         peak_scratch_bytes = max(peak_scratch_bytes, int(service.reserved_scratch_bytes))
         peak_lease_bytes = max(peak_lease_bytes, int(service.reserved_memory_bytes))
@@ -1223,7 +1266,7 @@ def evaluate_leave_one_out_objectives(
                 f"N={row_count}",
                 f"d'={values.shape[1]}",
                 f"source_row={batch_start}",
-                f"radius={float(np.max(maximum_scales))}",
+                f"radius={float(np.max(source_scales))}",
                 f"requested_bytes={requested_bytes}",
                 f"max_calibration_work_bytes={work_limit}",
             ]
@@ -1239,6 +1282,12 @@ def evaluate_leave_one_out_objectives(
             end = int(support_offsets[local_index + 1])
             target_indices = support_targets[begin:end]
             distances = support_distances[begin:end]
+            conservative_count = int(target_indices.shape[0])
+            conservative_candidate_totals += conservative_count
+            conservative_candidate_maxima = np.maximum(
+                conservative_candidate_maxima,
+                conservative_count,
+            )
             normalization_started = time.perf_counter()
             for batch_index, scale in enumerate(source_scales):
                 if invalid_reasons[batch_index] is not None:
@@ -1385,6 +1434,10 @@ def evaluate_leave_one_out_objectives(
         ),
         "batch_count": batch_count,
         "source_count": row_count,
+        "support_size_per_candidate": support_totals.tolist(),
+        "support_max_per_candidate": support_maxima.tolist(),
+        "conservative_candidate_count_per_candidate": conservative_candidate_totals.tolist(),
+        "conservative_candidate_max_per_candidate": conservative_candidate_maxima.tolist(),
         "checkpoint_writes": checkpoint_writes,
         "checkpoint_bytes": checkpoint_bytes,
         "checkpoint_seconds": checkpoint_seconds,
@@ -1498,6 +1551,8 @@ def evaluate_leave_one_out_objectives(
             "gpu_source_tiles",
             "gpu_target_tiles",
             "gpu_fp64_evaluations",
+            "gpu_launch_count",
+            "gpu_d2h_transfer_count",
             "gpu_ambiguous_boundary_count",
             "gpu_cpu_rescanned_count",
             "gpu_completed_locations",
@@ -1518,6 +1573,9 @@ def evaluate_leave_one_out_objectives(
             "gpu_certification_seconds",
             "gpu_cpu_verification_seconds",
             "gpu_cpu_tile_refinement_seconds",
+            "gpu_conservative_candidate_count",
+            "gpu_grouped_radius_query_count",
+            "gpu_reused_radius_scans",
             "support_query_count",
             "support_entries",
             "support_query_seconds",
@@ -1543,6 +1601,20 @@ def evaluate_leave_one_out_objectives(
                     diagnostics[metric_name] = max(diagnostics.get(metric_name, 0), metric_value)
                 else:
                     diagnostics[metric_name] = metric_value
+        diagnostics["support_size_per_candidate"] = provider_metrics.get(
+            "support_size_per_candidate", operational_metrics["support_size_per_candidate"]
+        )
+        diagnostics["support_max_per_candidate"] = provider_metrics.get(
+            "support_max_per_candidate", operational_metrics["support_max_per_candidate"]
+        )
+        diagnostics["conservative_candidate_count_per_candidate"] = provider_metrics.get(
+            "conservative_candidate_count_per_candidate",
+            operational_metrics["conservative_candidate_count_per_candidate"],
+        )
+        diagnostics["conservative_candidate_max_per_candidate"] = provider_metrics.get(
+            "conservative_candidate_max_per_candidate",
+            operational_metrics["conservative_candidate_max_per_candidate"],
+        )
     return tuple(results)
 
 

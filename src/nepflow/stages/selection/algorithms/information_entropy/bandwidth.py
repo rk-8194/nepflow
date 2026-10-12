@@ -26,6 +26,7 @@ from .gpu_neighbours import (
     ExactTiledGPUNeighbourIndex,
     compute_gpu_tiled_neighbours_many,
 )
+from .gpu_support import ExactTiledGPUSupport
 from .kernels import (
     evaluate_leave_one_out_objective,
     evaluate_leave_one_out_objectives,
@@ -74,8 +75,12 @@ class BandwidthCalibrationError(ValueError):
 
 BandwidthCalibrationCapacityError = RadiusQueryCapacityError
 
-_C_BATCH_PILOT_VERSION = "support-ratio-pilot-v1"
+_C_BATCH_PILOT_VERSION = "support-cost-pilot-v2"
 _C_BATCH_SUPPORT_RATIO_LIMIT = 2.0
+_C_BATCH_PILOT_SOURCE_LIMIT = 16
+_C_BATCH_NORMALIZATION_COST = 1.0e-9
+_C_BATCH_CHECKPOINT_COST_SECONDS = 1.0e-3
+_C_BATCH_MEMORY_BANDWIDTH_BYTES_PER_SECOND = 20.0e9
 
 
 @dataclass(frozen=True, slots=True)
@@ -822,6 +827,24 @@ def _restore_calibration_grid_state(
         or Path(retire_name).name != retire_name
     ):
         raise CheckpointValidationError("calibration grid retirement handoff is invalid")
+    raw_groups = state.get("c_batch_groups", [])
+    if not isinstance(raw_groups, list) or any(not isinstance(item, dict) for item in raw_groups):
+        raise CheckpointValidationError("calibration grid c-batch metadata is invalid")
+    normalized_groups: list[dict[str, Any]] = []
+    for item in raw_groups:
+        values = item.get("c_values")
+        if not isinstance(values, list) or not values:
+            raise CheckpointValidationError("calibration grid c-batch values are invalid")
+        if any(
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+            for value in values
+        ):
+            raise CheckpointValidationError("calibration grid c-batch values are invalid")
+        normalized = dict(item)
+        normalized["c_values"] = [float(value) for value in values]
+        normalized_groups.append(normalized)
     return {
         "attempts": attempts,
         "pair_wall_seconds": pair_wall_seconds,
@@ -829,6 +852,7 @@ def _restore_calibration_grid_state(
         "winner": winner,
         "elapsed_wall_seconds": float(elapsed),
         "retire_checkpoint_name": retire_name,
+        "c_batch_groups": normalized_groups,
     }
 
 
@@ -1052,7 +1076,30 @@ def calibrate_bandwidth(
         "loo_pair_count": 0,
         "resource_lease_peak_bytes": 0,
         "scratch_peak_bytes": 0,
+        "c_batch_group_count": 0,
+        "c_batch_groups": [],
+        "c_batch_reused_scans": 0,
+        "c_batch_projected_savings": 0.0,
+        "c_batch_pilot_seconds": 0.0,
+        "c_batch_pilot_sources": 0,
+        "c_batch_pilot_gpu_fp64_evaluations": 0,
+        "c_batch_pilot_d2h_bytes": 0,
+        "c_batch_actual_gpu_fp64_evaluations": 0,
+        "c_batch_actual_d2h_bytes": 0,
+        "c_batch_measured_scan_savings": 0,
+        "c_batch_measured_d2h_savings_bytes": 0,
+        "support_size_per_c": [],
     }
+    if restored_grid is not None:
+        restored_groups = list(restored_grid.get("c_batch_groups", []))
+        operational_metrics["c_batch_groups"] = restored_groups
+        operational_metrics["c_batch_group_count"] = len(restored_groups)
+        operational_metrics["c_batch_reused_scans"] = sum(
+            max(0, len(item.get("c_values", [])) - 1) for item in restored_groups
+        )
+        operational_metrics["c_batch_projected_savings"] = sum(
+            float(item.get("projected_savings", 0.0) or 0.0) for item in restored_groups
+        )
 
     def sample_resource_leases() -> None:
         operational_metrics["resource_lease_peak_bytes"] = max(
@@ -1292,6 +1339,7 @@ def calibrate_bandwidth(
             "cursor": len(attempts),
             "attempts": [_attempt_payload(attempt) for attempt in attempts],
             "pair_wall_seconds": [float(value) for value in pair_wall_seconds],
+            "c_batch_groups": list(operational_metrics.get("c_batch_groups", [])),
             "active_batch": None if active_batch is None else dict(active_batch),
             "retire_checkpoint_name": retire_checkpoint_name,
             "winner": winner_payload,
@@ -1478,7 +1526,81 @@ def calibrate_bandwidth(
             ),
         )
         predicted_support: dict[float, float | None] = {value: None for value in ordered}
-        if isinstance(index, IndexedCPUNeighbourIndex):
+        pilot_seconds = 0.0
+        pilot_gpu_metrics: Mapping[str, Any] = {}
+        pilot_sample_count = 0
+        if width > 1 and selected_settings.kernel_support_execution == "exact_tiled_gpu":
+            pilot_started = time.perf_counter()
+            pilot_provider = ExactTiledGPUSupport(
+                pool.descriptors,
+                device=selected_settings.gpu_device,
+                gpu_devices=selected_settings.gpu_devices,
+                tile_size=selected_settings.gpu_tile_size,
+                max_device_bytes=selected_settings.max_gpu_support_bytes,
+                max_host_bytes=selected_settings.radius_query_bytes,
+                resource_budget=runtime_budget,
+                capacity_context=f"c-batch GPU pilot k={neighbours.k}",
+            )
+            try:
+                pilot_source_count = min(_C_BATCH_PILOT_SOURCE_LIMIT, row_count)
+                if pilot_source_count < 1:
+                    raise RadiusQueryCapacityError(
+                        "GPU c-batch pilot cannot fit one source in its bounded workspace"
+                    )
+                sample_rows = np.unique(
+                    np.linspace(0, row_count - 1, pilot_source_count, dtype=np.int64)
+                )
+                pilot_sample_count = int(sample_rows.size)
+                pilot_support_totals = np.zeros(len(ordered), dtype=np.float64)
+                pilot_source_tile = max(1, int(pilot_provider.source_tile_size))
+                for pilot_start in range(0, sample_rows.size, pilot_source_tile):
+                    pilot_rows = sample_rows[pilot_start : pilot_start + pilot_source_tile]
+                    pilot_radii = np.stack(
+                        [candidate_c * neighbours.radii[pilot_rows] for candidate_c in ordered]
+                    )
+                    pilot_offsets, _pilot_targets, pilot_distances = (
+                        pilot_provider.support_many(pilot_rows, pilot_radii)
+                    )
+                    for candidate_index in range(len(ordered)):
+                        for source_offset in range(pilot_rows.size):
+                            begin = int(pilot_offsets[source_offset])
+                            end = int(pilot_offsets[source_offset + 1])
+                            pilot_support_totals[candidate_index] += np.count_nonzero(
+                                pilot_distances[begin:end]
+                                < pilot_radii[candidate_index, source_offset]
+                            )
+                for candidate_index, candidate_c in enumerate(ordered):
+                    predicted_support[candidate_c] = (
+                        pilot_support_totals[candidate_index] / sample_rows.size
+                    )
+                pilot_gpu_metrics = pilot_provider.operational_metrics()
+            finally:
+                pilot_seconds = max(0.0, time.perf_counter() - pilot_started)
+                pilot_provider.close()
+            operational_metrics["c_batch_pilot_seconds"] = operational_metrics.get(
+                "c_batch_pilot_seconds", 0.0
+            ) + pilot_seconds
+            operational_metrics["c_batch_pilot_sources"] = operational_metrics.get(
+                "c_batch_pilot_sources", 0
+            ) + int(sample_rows.size)
+            operational_metrics["c_batch_pilot_gpu_fp64_evaluations"] = operational_metrics.get(
+                "c_batch_pilot_gpu_fp64_evaluations", 0
+            ) + int(pilot_gpu_metrics.get("gpu_fp64_evaluations", 0) or 0)
+            operational_metrics["c_batch_pilot_d2h_bytes"] = operational_metrics.get(
+                "c_batch_pilot_d2h_bytes", 0
+            ) + int(pilot_gpu_metrics.get("gpu_d2h_bytes", 0) or 0)
+            logger.info(
+                "Bandwidth GPU c-batch pilot completed: version=%s, k=%d, sources=%d, "
+                "seconds=%.6f, gpu_fp64_evaluations=%d, d2h_bytes=%d, predicted_support=%s",
+                _C_BATCH_PILOT_VERSION,
+                neighbours.k,
+                sample_rows.size,
+                pilot_seconds,
+                int(pilot_gpu_metrics.get("gpu_fp64_evaluations", 0) or 0),
+                int(pilot_gpu_metrics.get("gpu_d2h_bytes", 0) or 0),
+                ", ".join(f"c={value:g}:{predicted_support[value]}" for value in ordered),
+            )
+        elif isinstance(index, IndexedCPUNeighbourIndex):
             row_count = int(pool.descriptors.shape[0])
             sample_count = min(16, row_count)
             pilot_cost = sample_count * len(ordered)
@@ -1543,11 +1665,96 @@ def calibrate_bandwidth(
                     pilot_cost,
                     maximum_saved_queries,
                 )
+        elif selected_settings.kernel_support_execution == "exact_tiled_gpu":
+            logger.info(
+                "Bandwidth GPU c-batch pilot skipped: version=%s, k=%d, "
+                "batch_width=%d does not admit a shared group",
+                _C_BATCH_PILOT_VERSION,
+                neighbours.k,
+                width,
+            )
 
-        # Preserve the configured c order.  Adjacent candidates share one
-        # radius query only while their measured support work is comparable;
-        # this prevents a wide c from forcing every narrow candidate through
-        # the widest support.  The batch size remains an upper bound.
+        is_gpu = selected_settings.kernel_support_execution == "exact_tiled_gpu"
+        scan_pairs = float(row_count * row_count)
+        scan_seconds = 0.0
+        d2h_seconds = 0.0
+        cpu_verification_seconds = 0.0
+        cpu_rescanned_count = 0
+        if is_gpu and pilot_gpu_metrics:
+            pilot_source_count = max(1, pilot_sample_count)
+            scale_to_pool = row_count / pilot_source_count
+            scan_pairs = max(
+                1.0,
+                float(pilot_gpu_metrics.get("gpu_fp64_evaluations", 0) or 0)
+                * scale_to_pool,
+            )
+            scan_seconds = float(pilot_gpu_metrics.get("gpu_seconds", 0.0) or 0.0) * scale_to_pool
+            d2h_seconds = (
+                float(pilot_gpu_metrics.get("gpu_d2h_seconds", 0.0) or 0.0) * scale_to_pool
+            )
+            cpu_verification_seconds = (
+                float(pilot_gpu_metrics.get("gpu_cpu_verification_seconds", 0.0) or 0.0)
+                * scale_to_pool
+            )
+            cpu_rescanned_count = int(pilot_gpu_metrics.get("gpu_cpu_rescanned_count", 0) or 0)
+        scan_time_per_pair = (
+            scan_seconds / scan_pairs if scan_seconds > 0.0 else 1.0e-9
+        )
+        verification_time_per_candidate = (
+            cpu_verification_seconds / max(1, cpu_rescanned_count)
+            if cpu_verification_seconds > 0.0
+            else 1.0e-9
+        )
+
+        def estimated_cost(batch: Sequence[float]) -> float:
+            supports = [predicted_support.get(value) for value in batch]
+            if any(value is None for value in supports):
+                return float("inf")
+            numeric_supports = [float(value) for value in supports if value is not None]
+            candidate_count = max(numeric_supports, default=0.0) * row_count
+            candidate_verification = candidate_count * verification_time_per_candidate
+            normalization = (
+                sum(numeric_supports)
+                * row_count
+                * _C_BATCH_NORMALIZATION_COST
+            )
+            scan = scan_pairs * scan_time_per_pair
+            if d2h_seconds > 0.0:
+                scan += d2h_seconds
+            # The C-by-N numerator and the bounded CSR candidate output are
+            # deliberately part of the model, so grouping is not based only
+            # on a support-size ratio.
+            memory_bytes = (
+                16.0 * len(batch) * row_count
+                + 32.0 * max(numeric_supports, default=0.0) * min(row_count, width)
+            )
+            memory_seconds = memory_bytes / _C_BATCH_MEMORY_BANDWIDTH_BYTES_PER_SECOND
+            checkpoint_seconds = _C_BATCH_CHECKPOINT_COST_SECONDS
+            return (
+                scan
+                + candidate_verification
+                + normalization
+                + memory_seconds
+                + checkpoint_seconds
+            )
+
+        def workspace_admissible(batch: Sequence[float]) -> bool:
+            maximum_support = max(
+                (predicted_support.get(value) or 0.0 for value in batch),
+                default=0.0,
+            )
+            query_sources = min(row_count, int(selected_settings.chunk_size))
+            requested = (
+                8192
+                + int(source_workspace_bound)
+                + 16 * len(batch) * row_count
+                + 32 * int(math.ceil(maximum_support)) * query_sources
+            )
+            return requested <= int(selected_settings.operational_work_bytes)
+
+        # Preserve configured c order. Adjacent candidates share one support
+        # scan only when the measured/estimated cost and bounded workspace
+        # justify the larger canonical verification superset.
         grouped: list[tuple[float, ...]] = []
         current: list[float] = []
         for candidate_c in ordered:
@@ -1561,7 +1768,12 @@ def calibrate_bandwidth(
                 and candidate_estimate is not None
                 and candidate_estimate / max(current_min, 1.0) <= _C_BATCH_SUPPORT_RATIO_LIMIT
             )
-            if len(current) < width and comparable:
+            proposed = (*current, candidate_c)
+            singleton_cost = sum(estimated_cost((value,)) for value in proposed)
+            shared_cost = estimated_cost(proposed)
+            beneficial = shared_cost < singleton_cost
+            admissible = workspace_admissible(proposed)
+            if len(current) < width and comparable and beneficial and admissible:
                 current.append(candidate_c)
             else:
                 grouped.append(tuple(current))
@@ -1569,22 +1781,74 @@ def calibrate_bandwidth(
         if current:
             grouped.append(tuple(current))
         batches = tuple(grouped)
+        decision_records: list[dict[str, Any]] = []
+        for batch in batches:
+            singleton_cost = sum(estimated_cost((value,)) for value in batch)
+            shared_cost = estimated_cost(batch)
+            projected_savings = (
+                max(0.0, singleton_cost - shared_cost)
+                if math.isfinite(singleton_cost) and math.isfinite(shared_cost)
+                else None
+            )
+            decision_records.append(
+                {
+                    "k": int(neighbours.k),
+                    "c_values": list(batch),
+                    "predicted_support": [predicted_support.get(value) for value in batch],
+                    "estimated_cost": shared_cost if math.isfinite(shared_cost) else None,
+                    "singleton_cost": (
+                        singleton_cost if math.isfinite(singleton_cost) else None
+                    ),
+                    "projected_savings": projected_savings,
+                    "choice": "shared" if len(batch) > 1 else "singleton",
+                    "pilot_seconds": pilot_seconds,
+                    "pilot_gpu_fp64_evaluations": int(
+                        pilot_gpu_metrics.get("gpu_fp64_evaluations", 0) or 0
+                    ),
+                    "pilot_gpu_launch_count": int(
+                        pilot_gpu_metrics.get("gpu_launch_count", 0) or 0
+                    ),
+                    "pilot_d2h_bytes": int(pilot_gpu_metrics.get("gpu_d2h_bytes", 0) or 0),
+                    "gpu": is_gpu,
+                }
+            )
+        operational_metrics.setdefault("c_batch_groups", []).extend(decision_records)
+        operational_metrics["c_batch_group_count"] = operational_metrics.get(
+            "c_batch_group_count", 0
+        ) + len(batches)
+        operational_metrics["c_batch_reused_scans"] = operational_metrics.get(
+            "c_batch_reused_scans", 0
+        ) + sum(max(0, len(batch) - 1) for batch in batches)
+        operational_metrics["c_batch_projected_savings"] = operational_metrics.get(
+            "c_batch_projected_savings", 0.0
+        ) + sum(
+            float(record["projected_savings"] or 0.0) for record in decision_records
+        )
         logger.info(
-            "Bandwidth calibration c batching: version=%s, batch_size=%d, c_count=%d, "
-            "c_batches=%d, estimated_batch_workspace_bytes=%d, max_calibration_work_bytes=%d",
+            "Bandwidth calibration c batching: version=%s, k=%d, batch_size=%d, c_count=%d, "
+            "c_batches=%d, estimated_batch_workspace_bytes=%d, max_calibration_work_bytes=%d, "
+            "pilot_seconds=%.6f, gpu=%s",
             _C_BATCH_PILOT_VERSION,
+            neighbours.k,
             width,
             len(ordered),
             len(batches),
             max(8192 + len(batch) * per_c_bytes + source_workspace_bound for batch in batches),
             selected_settings.operational_work_bytes,
+            pilot_seconds,
+            is_gpu,
         )
         for batch in batches:
             logger.info(
-                "Bandwidth calibration c-batch planned: k=%d, c_batch=%s, predicted_support=%s",
+                "Bandwidth calibration c-batch planned: k=%d, c_batch=%s, predicted_support=%s, "
+                "choice=%s, estimated_cost=%.6g, singleton_cost=%.6g, projected_savings=%.6g",
                 neighbours.k,
                 ",".join(f"{value:g}" for value in batch),
                 ",".join(str(predicted_support.get(value)) for value in batch),
+                "shared" if len(batch) > 1 else "singleton",
+                estimated_cost(batch),
+                sum(estimated_cost((value,)) for value in batch),
+                max(0.0, sum(estimated_cost((value,)) for value in batch) - estimated_cost(batch)),
             )
         return batches
 
@@ -1771,6 +2035,63 @@ def calibrate_bandwidth(
                     )
                 operational_metrics["loo_seconds"] += max(0.0, time.perf_counter() - loo_started)
                 operational_metrics["loo_pair_count"] += len(c_batch)
+                active_support_metrics = operational_metrics.get(
+                    "loo_active_support_metrics", {}
+                )
+                if not isinstance(active_support_metrics, Mapping):
+                    active_support_metrics = {}
+                actual_gpu_pairs = int(
+                    active_support_metrics.get("gpu_fp64_evaluations", 0) or 0
+                )
+                actual_d2h_bytes = int(active_support_metrics.get("gpu_d2h_bytes", 0) or 0)
+                independent_gpu_pairs = len(c_batch) * pool.descriptors.shape[0] ** 2
+                independent_d2h_bytes = independent_gpu_pairs * np.dtype(np.float64).itemsize
+                operational_metrics["c_batch_actual_gpu_fp64_evaluations"] += actual_gpu_pairs
+                operational_metrics["c_batch_actual_d2h_bytes"] += actual_d2h_bytes
+                operational_metrics["c_batch_measured_scan_savings"] += max(
+                    0, independent_gpu_pairs - actual_gpu_pairs
+                )
+                operational_metrics["c_batch_measured_d2h_savings_bytes"] += max(
+                    0, independent_d2h_bytes - actual_d2h_bytes
+                )
+                operational_metrics["support_size_per_c"].append(
+                    {
+                        "k": int(candidate_k),
+                        "c_values": list(c_batch),
+                        "support_size": list(
+                            operational_metrics.get("support_size_per_candidate", [])
+                        ),
+                        "support_max": list(
+                            operational_metrics.get("support_max_per_candidate", [])
+                        ),
+                        "conservative_candidate_count": list(
+                            operational_metrics.get(
+                                "conservative_candidate_count_per_candidate", []
+                            )
+                        ),
+                        "conservative_candidate_max": list(
+                            operational_metrics.get(
+                                "conservative_candidate_max_per_candidate", []
+                            )
+                        ),
+                        "gpu_fp64_evaluations": int(
+                            actual_gpu_pairs
+                        ),
+                        "gpu_launch_count": int(
+                            active_support_metrics.get("gpu_launch_count", 0) or 0
+                        ),
+                        "gpu_d2h_transfer_count": int(
+                            active_support_metrics.get("gpu_d2h_transfer_count", 0) or 0
+                        ),
+                        "gpu_d2h_bytes": int(
+                            actual_d2h_bytes
+                        ),
+                        "gpu_cpu_verification_seconds": float(
+                            active_support_metrics.get("gpu_cpu_verification_seconds", 0.0)
+                            or 0.0
+                        ),
+                    }
+                )
                 sample_resource_leases()
                 if isinstance(index, (IndexedCPUNeighbourIndex, TiledCPUNeighbourIndex)):
                     metrics = index.memory_metrics()

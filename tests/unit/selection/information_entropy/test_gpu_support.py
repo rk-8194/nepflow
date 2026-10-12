@@ -204,6 +204,84 @@ def test_fake_gpu_support_preserves_strict_ulp_duplicates_and_original_rows(
     assert provider.operational_metrics()["gpu_cpu_rescanned_count"] >= len(expected_targets)
 
 
+def test_fake_gpu_support_shared_radius_matrix_matches_isolated_queries(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setitem(sys.modules, "cupy", _fake_cupy())
+    descriptors = np.asarray([[0.0], [1.0], [1.0], [2.0]], dtype=np.float64)
+    sources = np.arange(descriptors.shape[0], dtype=np.int64)
+    radii = np.asarray(
+        [
+            [np.nextafter(1.0, 0.0)] * sources.size,
+            [1.0] * sources.size,
+            [np.nextafter(1.0, 2.0)] * sources.size,
+            [2.0] * sources.size,
+        ],
+        dtype=np.float64,
+    )
+    shared = ExactTiledGPUSupport(
+        descriptors,
+        tile_size=2,
+        max_device_bytes=64 * 1024,
+        max_host_bytes=1_000_000,
+    )
+    offsets, targets, distances = shared.support_many(sources, radii)
+    for candidate_index in range(radii.shape[0]):
+        for source_index in range(sources.size):
+            begin = int(offsets[source_index])
+            end = int(offsets[source_index + 1])
+            keep = distances[begin:end] < radii[candidate_index, source_index]
+            exact = np.sqrt(
+                np.sum((descriptors - descriptors[source_index]) ** 2, axis=1)
+            )
+            expected = np.flatnonzero(exact < radii[candidate_index, source_index])
+            np.testing.assert_array_equal(targets[begin:end][keep], expected)
+    metrics = shared.operational_metrics()
+    assert metrics["gpu_grouped_radius_query_count"] == 1
+    assert metrics["gpu_reused_radius_scans"] == radii.shape[0] - 1
+    assert metrics["gpu_launch_count"] == metrics["gpu_d2h_transfer_count"]
+    shared.close()
+
+
+def test_fake_gpu_calibration_planner_reports_shared_and_singleton_choices(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setitem(sys.modules, "cupy", _fake_cupy())
+    descriptors = np.asarray(
+        [[float(index), float(index % 2)] for index in range(8)], dtype=np.float64
+    )
+    pool = build_entropy_pool(
+        descriptors,
+        candidate_ids=("a", "b", "c", "d"),
+        row_candidate_ids=("a", "a", "b", "b", "c", "c", "d", "d"),
+    )
+    common = dict(
+        backend="exact_tiled_cpu",
+        kernel_support_execution="exact_tiled_gpu",
+        k_candidates=(1,),
+        c_candidates=(1.5, 2.0, 4.0),
+        chunk_size=2,
+        max_calibration_work_bytes=1_000_000,
+        max_radius_query_bytes=1_000_000,
+        max_gpu_support_bytes=64 * 1024,
+        gpu_tile_size=2,
+    )
+    shared = calibrate_bandwidth(
+        pool,
+        EntropyBandwidthSettings(**common, calibration_batch_size=3),
+    )
+    singleton = calibrate_bandwidth(
+        pool,
+        EntropyBandwidthSettings(**common, calibration_batch_size=1),
+    )
+    assert any(len(item["c_values"]) > 1 for item in shared.operational_metrics["c_batch_groups"])
+    assert shared.operational_metrics["gpu_reused_radius_scans"] > 0
+    assert all(
+        len(item["c_values"]) == 1 for item in singleton.operational_metrics["c_batch_groups"]
+    )
+    assert singleton.operational_metrics["c_batch_reused_scans"] == 0
+
+
 def test_fake_multi_gpu_support_merges_contiguous_ranges_deterministically(
     monkeypatch: pytest.MonkeyPatch,
 ):

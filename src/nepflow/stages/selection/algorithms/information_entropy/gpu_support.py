@@ -147,6 +147,8 @@ class ExactTiledGPUSupport:
             self.source_tiles = 0
             self.target_tiles = 0
             self.fp64_evaluations = 0
+            self.gpu_launch_count = 0
+            self.d2h_transfer_count = 0
             self.ambiguous_boundary_count = 0
             self.cpu_rescanned_count = 0
             self.h2d_bytes = 0
@@ -157,6 +159,9 @@ class ExactTiledGPUSupport:
             self.cpu_verification_seconds = 0.0
             self.support_query_count = 0
             self.support_entries = 0
+            self.grouped_radius_query_count = 0
+            self.reused_radius_scans = 0
+            self.conservative_candidate_count = 0
             self.support_query_seconds = 0.0
             self.support_wall_seconds = 0.0
             return
@@ -234,10 +239,14 @@ class ExactTiledGPUSupport:
                 requested_bytes=per_source,
                 available_bytes=self.max_host_bytes,
             )
+        device_source_tile_size, _, _ = self._tile_shape(self.source_tile_size)
+        self.source_tile_size = min(self.source_tile_size, device_source_tile_size)
 
         self.source_tiles = 0
         self.target_tiles = 0
         self.fp64_evaluations = 0
+        self.gpu_launch_count = 0
+        self.d2h_transfer_count = 0
         self.ambiguous_boundary_count = 0
         self.cpu_rescanned_count = 0
         self.h2d_bytes = 0
@@ -250,6 +259,9 @@ class ExactTiledGPUSupport:
         self.cpu_verification_seconds = 0.0
         self.support_query_count = 0
         self.support_entries = 0
+        self.grouped_radius_query_count = 0
+        self.reused_radius_scans = 0
+        self.conservative_candidate_count = 0
         self.support_query_seconds = 0.0
         self.support_wall_seconds = 0.0
 
@@ -337,6 +349,8 @@ class ExactTiledGPUSupport:
             host_distances = np.asarray(cp.asnumpy(gpu_distances), dtype=np.float64)
             self.d2h_seconds += max(0.0, time.perf_counter() - transfer_started)
         self.gpu_seconds += max(0.0, time.perf_counter() - gpu_started)
+        self.gpu_launch_count += 1
+        self.d2h_transfer_count += 1
         self.d2h_bytes += int(host_distances.nbytes)
         self.fp64_evaluations += int(source_indices.size * target_indices.size)
         self.device_workspace_peak_bytes = max(self.device_workspace_peak_bytes, reserved_bytes)
@@ -362,6 +376,7 @@ class ExactTiledGPUSupport:
         self.ambiguous_boundary_count += int(
             np.count_nonzero(np.abs(host_distances - radii[:, None]) <= bound)
         )
+        self.conservative_candidate_count += int(np.count_nonzero(potential))
         self.host_workspace_peak_bytes = max(
             self.host_workspace_peak_bytes,
             int(source_values.nbytes + target_values.nbytes + host_distances.nbytes + bound.nbytes),
@@ -372,17 +387,46 @@ class ExactTiledGPUSupport:
         self,
         source_indices: Sequence[int] | np.ndarray,
         radii: Sequence[float] | np.ndarray,
+        *,
+        _record_group: bool = True,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Return an exact source-major CSR support superset.
+
+        ``radii`` may be either ``(source_count,)`` for the historical
+        single-radius query or ``(candidate_count, source_count)``.  For the
+        latter, one GPU distance pass is screened with the largest radius for
+        each source and canonical CPU distances are returned for that finite
+        superset.  Callers reconstruct each candidate's strict support with
+        ``distances < radii[candidate]``; this preserves duplicate rows,
+        source self-inclusion, and the original target order without retaining
+        a C-by-N-by-N workspace.
+        """
+
         sources = np.asarray(source_indices, dtype=np.int64)
-        scales = np.asarray(radii, dtype=np.float64)
-        if sources.ndim != 1 or scales.ndim != 1 or sources.shape != scales.shape:
-            raise ValueError("source_indices and radii must be aligned one-dimensional arrays")
+        requested_radii = np.asarray(radii, dtype=np.float64)
+        if sources.ndim != 1 or requested_radii.ndim not in (1, 2):
+            raise ValueError(
+                "source_indices must be one-dimensional and radii must have shape "
+                "(source_count,) or (candidate_count, source_count)"
+            )
+        if requested_radii.shape[-1] != sources.size:
+            raise ValueError("source_indices and radii must have aligned source dimensions")
+        if requested_radii.ndim == 2 and requested_radii.shape[0] == 0:
+            raise ValueError("support_many requires at least one radius candidate")
+        scales = (
+            requested_radii
+            if requested_radii.ndim == 1
+            else np.max(requested_radii, axis=0)
+        )
         if sources.size == 0:
             raise ValueError("support_many requires at least one source")
         if np.any(sources < 0) or np.any(sources >= self.descriptors.shape[0]):
             raise ValueError("source_indices contains an out-of-range row")
-        if not np.all(np.isfinite(scales)) or np.any(scales <= 0.0):
+        if not np.all(np.isfinite(requested_radii)) or np.any(requested_radii <= 0.0):
             raise ValueError("GPU support radii must be finite and strictly positive")
+        if _record_group and requested_radii.ndim == 2 and requested_radii.shape[0] > 1:
+            self.grouped_radius_query_count += 1
+            self.reused_radius_scans += max(0, int(requested_radii.shape[0]) - 1)
         if self._workers:
             started = time.perf_counter()
             target_parts: list[np.ndarray] = []
@@ -401,7 +445,9 @@ class ExactTiledGPUSupport:
                     futures[worker_index] = executor.submit(
                         self._workers[worker_index]._support_many_on_device,
                         sources[start:stop],
-                        scales[start:stop],
+                        requested_radii[:, start:stop]
+                        if requested_radii.ndim == 2
+                        else scales[start:stop],
                     )
                 for worker_index, (_device, start, stop) in enumerate(ranges):
                     if start == stop:
@@ -454,7 +500,11 @@ class ExactTiledGPUSupport:
             for start in range(0, sources.size, source_tile_limit):
                 stop = min(start + source_tile_limit, sources.size)
                 tile_offsets, tile_targets, tile_distances = self.support_many(
-                    sources[start:stop], scales[start:stop]
+                    sources[start:stop],
+                    requested_radii[:, start:stop]
+                    if requested_radii.ndim == 2
+                    else scales[start:stop],
+                    _record_group=False,
                 )
                 target_parts.append(tile_targets)
                 distance_parts.append(tile_distances)
@@ -559,7 +609,7 @@ class ExactTiledGPUSupport:
         """Run one single-device worker while its CUDA context is current."""
 
         with self._cp.cuda.Device(self.device):
-            return self.support_many(source_indices, radii)
+            return self.support_many(source_indices, radii, _record_group=False)
 
     def operational_metrics(self) -> dict[str, Any]:
         if self._workers:
@@ -581,9 +631,14 @@ class ExactTiledGPUSupport:
                 "gpu_source_tiles": self.source_tiles,
                 "gpu_target_tiles": self.target_tiles,
                 "gpu_fp64_evaluations": self.fp64_evaluations,
+                "gpu_launch_count": self.gpu_launch_count,
+                "gpu_d2h_transfer_count": self.d2h_transfer_count,
                 "gpu_ambiguous_boundary_count": self.ambiguous_boundary_count,
                 "gpu_exact_boundary_recertifications": self.ambiguous_boundary_count,
                 "gpu_cpu_rescanned_count": self.cpu_rescanned_count,
+                "gpu_conservative_candidate_count": self.conservative_candidate_count,
+                "gpu_grouped_radius_query_count": self.grouped_radius_query_count,
+                "gpu_reused_radius_scans": self.reused_radius_scans,
                 "gpu_h2d_bytes": self.h2d_bytes,
                 "gpu_d2h_bytes": self.d2h_bytes,
                 "gpu_h2d_seconds": self.h2d_seconds,
@@ -630,9 +685,14 @@ class ExactTiledGPUSupport:
             "gpu_source_tiles": self.source_tiles,
             "gpu_target_tiles": self.target_tiles,
             "gpu_fp64_evaluations": self.fp64_evaluations,
+            "gpu_launch_count": self.gpu_launch_count,
+            "gpu_d2h_transfer_count": self.d2h_transfer_count,
             "gpu_ambiguous_boundary_count": self.ambiguous_boundary_count,
             "gpu_exact_boundary_recertifications": self.ambiguous_boundary_count,
             "gpu_cpu_rescanned_count": self.cpu_rescanned_count,
+            "gpu_conservative_candidate_count": self.conservative_candidate_count,
+            "gpu_grouped_radius_query_count": self.grouped_radius_query_count,
+            "gpu_reused_radius_scans": self.reused_radius_scans,
             "gpu_h2d_bytes": self.h2d_bytes,
             "gpu_d2h_bytes": self.d2h_bytes,
             "gpu_h2d_seconds": self.h2d_seconds,
@@ -667,8 +727,11 @@ class ExactTiledGPUSupport:
             "source_tiles",
             "target_tiles",
             "fp64_evaluations",
+            "gpu_launch_count",
+            "d2h_transfer_count",
             "ambiguous_boundary_count",
             "cpu_rescanned_count",
+            "conservative_candidate_count",
             "h2d_bytes",
             "d2h_bytes",
             "support_query_count",
@@ -684,8 +747,11 @@ class ExactTiledGPUSupport:
                                 "source_tiles": "gpu_source_tiles",
                                 "target_tiles": "gpu_target_tiles",
                                 "fp64_evaluations": "gpu_fp64_evaluations",
+                                "gpu_launch_count": "gpu_launch_count",
+                                "d2h_transfer_count": "gpu_d2h_transfer_count",
                                 "ambiguous_boundary_count": "gpu_ambiguous_boundary_count",
                                 "cpu_rescanned_count": "gpu_cpu_rescanned_count",
+                                "conservative_candidate_count": "gpu_conservative_candidate_count",
                                 "h2d_bytes": "gpu_h2d_bytes",
                                 "d2h_bytes": "gpu_d2h_bytes",
                                 "support_query_count": "support_query_count",

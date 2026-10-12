@@ -113,6 +113,8 @@ def _metric_delta(after: dict[str, Any], before: dict[str, Any]) -> dict[str, An
         "gpu_reference_uploads",
         "gpu_reference_shards",
         "gpu_fp64_evaluations",
+        "gpu_launch_count",
+        "gpu_d2h_transfer_count",
         "gpu_certification_rescans",
         "gpu_ambiguous_boundary_count",
         "gpu_certified_tiles",
