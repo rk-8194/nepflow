@@ -52,30 +52,146 @@ from .neighbours import (
 logger = logging.getLogger(__name__)
 _GPU_PROGRESS_INTERVAL_SECONDS = 10.0
 _DEFAULT_MAX_CPU_RESCANS = 16_384
+_GPU_KNN_NUMERICAL_CONTRACT = "fp64-direct-canonical-cpu-interval-v1"
+_OUTWARD_ROUNDING_STEPS = 2
 
 
 def _gamma_bound(dimension: int) -> float:
-    """Return an outward-rounded relative FP64 operation bound.
+    """Return the one-evaluation relative FP64 distance error bound.
 
-    The GPU tile computes one subtraction, square, and a floating-point sum per
-    coordinate, followed by a square root.  The allowance is a conservative
-    first-order ``gamma_n`` bound for the reduction and selection path.  It is
-    used only when all intermediates are in the normal finite FP64 range; the
-    underflow/overflow regime fails closed to exhaustive CPU verification.
-    ``argpartition`` only orders the already-rounded non-negative scores and
-    adds no arithmetic error to this distance interval.
+    Numerical contract
+    ------------------
+    ``_distance_values`` and the CuPy screening expression both operate on
+    IEEE-754 binary64 inputs with round-to-nearest subtraction, multiplication,
+    non-negative reduction, and correctly-rounded square root.  For a pair
+    whose subtraction, squares, reduction, and square root are finite *normal*
+    values, let ``D`` be the exact Euclidean distance between the stored
+    binary64 inputs.  Each implementation returns ``d`` satisfying
+
+        D / (1 + gamma) <= d <= D / (1 - gamma).
+
+    Each coordinate's subtraction and square contribute two rounded
+    operations, the positive reduction is bounded by ``gamma_dimension``
+    (the sequential bound covers pairwise GPU reductions), and the final square
+    root contributes one rounded operation.  This is deliberately an upper
+    bound, not an assumption that the two results are equal.  Subnormal,
+    overflow, non-finite, or otherwise unrepresentable intermediates are
+    outside this contract and must be CPU-canonicalized rather than excluded
+    by a bound.
     """
 
     if dimension < 1:
         raise GPUCertificationError("GPU kNN requires a positive descriptor dimension")
     unit_roundoff = np.finfo(np.float64).eps / 2.0
-    operation_product = float((3 * int(dimension) + 8) * unit_roundoff)
+    # ``gamma_n`` is the usual n*u/(1-n*u) bound.  Treating the reduction as
+    # at most ``dimension`` rounded additions and adding the two per-coordinate
+    # operations plus the square root gives a conservative ``gamma_(d+3)``
+    # enclosure without relying on ``1 + u`` being representable above one.
+    operation_product = float((int(dimension) + 3) * unit_roundoff)
     if not np.isfinite(operation_product) or operation_product >= 1.0:
         raise GPUCertificationError("GPU FP64 certification bound is not representable")
     relative = operation_product / (1.0 - operation_product)
     if not np.isfinite(relative) or relative <= 0.0:
         raise GPUCertificationError("GPU FP64 certification bound is not finite")
     return float(np.nextafter(relative, np.inf))
+
+
+def _direct_cpu_relative_bound(one_evaluation: float) -> float:
+    """Bound a GPU result directly against the canonical CPU result.
+
+    The ideal distance is eliminated between two independent evaluations.  If
+    both use the one-evaluation contract, the canonical CPU result is bounded
+    below by ``gpu / ((1+gamma) * (1+gamma))``.  The multiplication is rounded
+    outward before use; unsupported/non-finite values fail closed at the call
+    site.
+    """
+
+    gamma = float(one_evaluation)
+    if not np.isfinite(gamma) or gamma <= 0.0 or gamma >= 1.0:
+        raise GPUCertificationError("direct GPU/CPU FP64 interval is unsupported")
+    factor = float((1.0 + gamma) * (1.0 + gamma))
+    if not np.isfinite(factor) or factor <= 1.0:
+        raise GPUCertificationError("direct GPU/CPU FP64 interval is not representable")
+    return float(np.nextafter(factor - 1.0, np.inf))
+
+
+def _outward_lower(value: np.ndarray | float) -> np.ndarray | float:
+    """Round a finite non-negative scalar/array toward zero."""
+
+    result = np.nextafter(value, 0.0)
+    for _ in range(_OUTWARD_ROUNDING_STEPS - 1):
+        result = np.nextafter(result, 0.0)
+    return result
+
+
+def _outward_upper(value: np.ndarray | float) -> np.ndarray | float:
+    """Round a finite non-negative scalar/array toward positive infinity."""
+
+    result = np.nextafter(value, np.inf)
+    for _ in range(_OUTWARD_ROUNDING_STEPS - 1):
+        result = np.nextafter(result, np.inf)
+    return result
+
+
+def _safe_fp64_distance_pairs(
+    query: np.ndarray,
+    targets: np.ndarray,
+    *,
+    max_safe_component: float,
+    relative_bound: float,
+) -> np.ndarray:
+    """Return pairs covered by the normal finite FP64 interval contract.
+
+    The test is intentionally stricter than merely checking the final GPU
+    distance.  It rejects cancellation/subnormal differences, underflowing
+    squares, and reductions too close to overflow.  A false ``False`` only
+    causes CPU canonicalization; it can never justify exclusion.
+    """
+
+    count = int(targets.shape[0])
+    safe = np.zeros(count, dtype=bool)
+    if count == 0:
+        return safe
+    if not np.all(np.isfinite(query)) or not np.all(np.isfinite(targets)):
+        return safe
+    if not np.all(np.abs(query) <= max_safe_component):
+        return safe
+    safe[:] = np.all(np.abs(targets) <= max_safe_component, axis=1)
+    if not np.any(safe):
+        return safe
+    with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+        delta = targets - query
+        magnitude = np.abs(delta)
+        nonzero = magnitude != 0.0
+        normal_difference = (~nonzero) | (
+            magnitude >= 2.0 * np.sqrt(np.finfo(np.float64).tiny)
+        )
+        squared = delta * delta
+        normal_square = (~nonzero) | (squared >= 2.0 * np.finfo(np.float64).tiny)
+        squared_sum = np.sum(squared, axis=1, dtype=np.float64)
+    finite = np.all(np.isfinite(delta), axis=1) & np.all(np.isfinite(squared), axis=1)
+    finite &= np.isfinite(squared_sum)
+    finite &= np.all(normal_difference, axis=1) & np.all(normal_square, axis=1)
+    # Leave enough headroom for the reduction and the final square root.  The
+    # component bound above already makes this generous for ordinary inputs;
+    # this explicit check covers values close to max float as well.
+    reduction_factor = float(1.0 + relative_bound)
+    finite &= squared_sum <= np.finfo(np.float64).max / reduction_factor
+    safe &= finite
+    return safe
+
+
+def _stamp_gpu_checkpoint_identity(identity: dict[str, Any]) -> None:
+    """Attach the numerical contract to caller-owned checkpoint identities."""
+
+    previous = identity.get("numerical_contract")
+    if previous is not None and previous != _GPU_KNN_NUMERICAL_CONTRACT:
+        raise ValueError(
+            "GPU kNN checkpoint numerical contract is incompatible with the current "
+            f"implementation: checkpoint={previous!r}, current={_GPU_KNN_NUMERICAL_CONTRACT!r}"
+        )
+    identity["numerical_contract"] = _GPU_KNN_NUMERICAL_CONTRACT
+    identity["backend_version"] = GPU_NEIGHBOUR_BACKEND_VERSION
 
 
 def _canonical_distances(query: np.ndarray, targets: np.ndarray) -> np.ndarray:
@@ -153,11 +269,19 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
         self.device_free_bytes = int(free_bytes)
         values = _validate_descriptors(descriptors)
         self.certification_relative_bound = _gamma_bound(int(values.shape[1]))
+        self.certification_direct_relative_bound = _direct_cpu_relative_bound(
+            self.certification_relative_bound
+        )
         float_info = np.finfo(np.float64)
-        max_safe_component = float(np.sqrt(float_info.max / (4.0 * int(values.shape[1]))))
+        # Two input components can differ by twice this value.  The extra
+        # factor leaves room for the rounded square/reduction and keeps the
+        # interval contract in the finite normal regime.
+        max_safe_component = float(np.sqrt(float_info.max / (16.0 * int(values.shape[1]))))
         self._max_safe_component = max_safe_component
         magnitudes = np.abs(values)
-        self._gpu_fp64_certification_safe = bool(np.all(magnitudes <= max_safe_component))
+        self._gpu_fp64_certification_safe = bool(
+            np.all(np.isfinite(values)) and np.all(magnitudes <= max_safe_component)
+        )
         super().__init__(
             values,
             tile_size=(self.requested_tile_size if tile_size is None else tile_size),
@@ -231,6 +355,10 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
         self.boundary_refinement_max_candidate_set = 0
         self.boundary_refinement_gpu_seconds = 0.0
         self.boundary_refinement_cpu_seconds = 0.0
+        self.boundary_interval_unsafe_count = 0
+        self.boundary_interval_overlap_count = 0
+        self.cpu_refinement_candidate_count = 0
+        self.cpu_refinement_budget_exhausted = 0
         self.full_rescan_last_resort_count = 0
         self.cpu_tile_refinements = 0
         self.cpu_tile_refinement_seconds = 0.0
@@ -248,6 +376,14 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
                 _DEFAULT_MAX_CPU_RESCANS,
                 max(256, int(self.unique_locations.shape[0] // 100)),
             ),
+        )
+        # Adaptive refinement is allowed to CPU-canonicalize a bounded set of
+        # potentially competitive targets.  If an unsafe/tie-heavy workload
+        # exceeds this explicit work budget, certification fails closed rather
+        # than silently becoming an unbounded CPU fallback.
+        self.max_cpu_refinement_candidates = max(
+            256,
+            min(_DEFAULT_MAX_CPU_RESCANS, int(self.unique_locations.shape[0])),
         )
         self.gpu_unique_location_grouping_seconds = float(
             getattr(self, "grouping_build_seconds", 0.0)
@@ -654,7 +790,51 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
     def _source_fp64_certification_safe(self, query: np.ndarray) -> bool:
         """Check arithmetic safety for one source, not the complete pool."""
 
-        return bool(np.all(np.abs(query) <= self._max_safe_component))
+        return bool(
+            np.all(np.isfinite(query))
+            and np.all(np.abs(query) <= self._max_safe_component)
+        )
+
+    def _gpu_cpu_lower_interval(
+        self,
+        query: np.ndarray,
+        targets: np.ndarray,
+        gpu_distances: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Return ``(safe, lower)`` for canonical CPU distances.
+
+        ``lower`` is a proven, outward-rounded lower bound on the distance
+        that `_distance_values` would return for each target, derived from the
+        independently rounded GPU result.  The GPU and CPU one-evaluation
+        errors are both included in the denominator.  The caller must retain
+        every pair whose interval is unsafe or touches the CPU boundary.
+        """
+
+        distances = np.asarray(gpu_distances, dtype=np.float64)
+        safe = _safe_fp64_distance_pairs(
+            np.asarray(query, dtype=np.float64),
+            np.asarray(targets, dtype=np.float64),
+            max_safe_component=self._max_safe_component,
+            relative_bound=self.certification_relative_bound,
+        )
+        safe &= np.isfinite(distances) & (distances >= 0.0)
+        lower = np.full(distances.shape, -np.inf, dtype=np.float64)
+        if not np.any(safe):
+            return safe, lower
+        denominator = float(1.0 + self.certification_direct_relative_bound)
+        denominator = float(_outward_upper(denominator))
+        if not np.isfinite(denominator) or denominator <= 1.0:
+            raise GPUCertificationError(
+                "direct GPU/CPU FP64 lower interval is not representable"
+            )
+        with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+            lower[safe] = np.asarray(
+                _outward_lower(distances[safe] / denominator), dtype=np.float64
+            )
+        if not np.all(np.isfinite(lower[safe])):
+            safe &= np.isfinite(lower)
+            lower[~safe] = -np.inf
+        return safe, lower
 
     def _adaptive_gpu_boundary_refinement(
         self,
@@ -670,7 +850,10 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
 
         The GPU distance is used only as a conservative inclusion filter.  A
         target is sent to the canonical CPU primitive whenever its outward
-        lower interval could reach the already-certified CPU kth distance.
+        lower interval could reach the already-certified CPU kth distance;
+        exclusion is allowed only when that lower endpoint is strictly above
+        the outward CPU boundary endpoint.  Unsafe arithmetic and touching
+        intervals are retained.
         The CPU state is reduced to ``k`` rows after every target tile, so a
         pool with a large tie plateau does not require a pool-sized candidate
         workspace.
@@ -685,30 +868,16 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
                 location_count,
             ),
         )
-        relative = float(self.certification_relative_bound)
-        lower_denominator = float(1.0 + relative)
-        upper_denominator = float(1.0 - relative)
-        if (
-            not np.isfinite(lower_denominator)
-            or not np.isfinite(upper_denominator)
-            or lower_denominator <= 0.0
-            or upper_denominator <= 0.0
-        ):
+        if not np.isfinite(reported_boundary) or reported_boundary < 0.0:
             raise GPUCertificationError(
-                "adaptive GPU boundary refinement has an unsupported FP64 interval bound"
+                "adaptive GPU boundary refinement received an unsupported CPU boundary"
             )
-        for _ in range(4):
-            lower_denominator = float(np.nextafter(lower_denominator, np.inf))
-            upper_denominator = float(np.nextafter(upper_denominator, 0.0))
-        # The CPU and GPU distances are independent rounded evaluations.  A
-        # candidate remains in the exact CPU set whenever its GPU lower
-        # endpoint can touch the CPU kth upper endpoint.  The adjacent
-        # representable steps cover the scalar division roundings; rejecting
-        # an interval that becomes non-finite is fail-closed.
-        cpu_kth_upper = float(reported_boundary / upper_denominator)
-        for _ in range(4):
-            cpu_kth_upper = float(np.nextafter(cpu_kth_upper, np.inf))
-        if not np.isfinite(cpu_kth_upper):
+        # The CPU boundary is already the canonical float64 result.  Round it
+        # outward for the scalar comparison; no unproven ``1+gamma`` threshold
+        # is applied to the GPU value.  Candidate lower endpoints are direct
+        # GPU-to-canonical-CPU enclosures computed per pair below.
+        cpu_boundary_upper = float(_outward_upper(float(reported_boundary)))
+        if not np.isfinite(cpu_boundary_upper):
             raise GPUCertificationError(
                 "adaptive GPU boundary refinement produced an unrepresentable CPU interval"
             )
@@ -770,13 +939,6 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
                                 delta = gpu_source[:, None, :] - gpu_targets[None, :, :]
                                 delta *= delta
                                 squared = cp.sum(delta, axis=2, dtype=cp.float64)
-                                finite = cp.all(cp.isfinite(squared), axis=1)
-                                finite_host = np.asarray(cp.asnumpy(finite), dtype=bool)
-                                if not bool(np.all(finite_host)):
-                                    raise GPUCertificationError(
-                                        "adaptive GPU boundary refinement encountered a "
-                                        "non-finite distance interval"
-                                    )
                                 gpu_distances = cp.sqrt(squared)[0]
                                 self._synchronize()
                                 host_distances = np.asarray(
@@ -807,17 +969,27 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
                         self.distance_evaluations += target_count
                         self.unique_distance_evaluations += target_count
 
-                        gpu_lower = np.asarray(
-                            host_distances / lower_denominator, dtype=np.float64
+                        target_values = self.unique_locations[target_start:target_stop]
+                        interval_safe, gpu_lower = self._gpu_cpu_lower_interval(
+                            query,
+                            target_values,
+                            host_distances,
                         )
-                        for _ in range(4):
-                            gpu_lower = np.nextafter(gpu_lower, 0.0)
-                        if not np.all(np.isfinite(gpu_lower)):
-                            raise GPUCertificationError(
-                                "adaptive GPU boundary refinement produced an "
-                                "unrepresentable GPU interval"
+                        unsafe_count = int(np.count_nonzero(~interval_safe))
+                        self.boundary_interval_unsafe_count += unsafe_count
+                        # Non-finite or unsupported arithmetic is never
+                        # excluded.  The candidate is CPU-canonicalized in
+                        # the same bounded tile as any overlapping interval.
+                        candidate_mask = np.ones(target_count, dtype=bool)
+                        if np.any(interval_safe):
+                            self.boundary_interval_overlap_count += int(
+                                np.count_nonzero(
+                                    gpu_lower[interval_safe] <= cpu_boundary_upper
+                                )
                             )
-                        candidate_mask = gpu_lower <= cpu_kth_upper
+                            candidate_mask[interval_safe] = (
+                                gpu_lower[interval_safe] <= cpu_boundary_upper
+                            )
                         candidate_offsets = np.flatnonzero(candidate_mask).astype(
                             np.int64, copy=False
                         )
@@ -828,6 +1000,16 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
                         )
                         if candidate_count == 0:
                             continue
+                        if (
+                            self.cpu_refinement_candidate_count + candidate_count
+                            > self.max_cpu_refinement_candidates
+                        ):
+                            self.cpu_refinement_budget_exhausted += 1
+                            raise GPUCertificationError(
+                                "exact GPU kNN boundary CPU-canonicalization budget "
+                                "was exhausted; refusing an unbounded approximate fallback"
+                            )
+                        self.cpu_refinement_candidate_count += candidate_count
                         candidate_locations = candidate_offsets + int(target_start)
                         combined_locations = np.unique(
                             np.concatenate((best_locations, candidate_locations))
@@ -975,38 +1157,31 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
             float(legacy_omission_bound), float(legacy_merge_bound)
         )
         omitted = certified_locations.size < int(self.unique_locations.shape[0] - 1)
-        relative = self.certification_relative_bound
-        lower_denominator = float(1.0 + relative)
-        upper_denominator = float(1.0 - relative)
-        if (
-            not np.isfinite(lower_denominator)
-            or not np.isfinite(upper_denominator)
-            or lower_denominator <= 0.0
-            or upper_denominator <= 0.0
-        ):
-            raise GPUCertificationError("GPU FP64 certification interval is unsupported")
-        for _ in range(4):
-            lower_denominator = float(np.nextafter(lower_denominator, np.inf))
-            upper_denominator = float(np.nextafter(upper_denominator, 0.0))
-        lower = float(omitted_bound / lower_denominator)
-        upper = float(reported_boundary / upper_denominator)
-        # The gamma bound covers the GPU arithmetic.  The repeated adjacent
-        # representable steps also cover the host-side division/product used
-        # to turn that bound into an interval; this keeps the proof outward
-        # rounded instead of relying on a nominal comparison tolerance.
-        for _ in range(4):
-            lower = float(np.nextafter(lower, 0.0))
-            upper = float(np.nextafter(upper, np.inf))
-        legacy_lower = float(legacy_omitted_bound / lower_denominator)
-        for _ in range(4):
-            legacy_lower = float(np.nextafter(legacy_lower, 0.0))
-        legacy_certifiable = bool(
-            not omitted
-            or (
-                np.isfinite(legacy_lower)
-                and np.isfinite(upper)
-                and legacy_lower > upper
-            )
+        # The old omitted-bound test compared one GPU scalar with one adjusted
+        # CPU scalar.  It is retained only as a diagnostic witness.  Scientific
+        # acceptance below always goes through the streaming pair-level
+        # GPU-to-canonical-CPU interval filter, because the omitted witness has
+        # no target magnitudes with which to prove its own arithmetic safety.
+        weak_lower = float("-inf")
+        weak_upper = float("inf")
+        if np.isfinite(omitted_bound) and omitted_bound >= 0.0:
+            with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+                weak_lower = float(
+                    _outward_lower(
+                        omitted_bound
+                        / float(
+                            _outward_upper(
+                                1.0 + self.certification_direct_relative_bound
+                            )
+                        )
+                    )
+                )
+        if np.isfinite(reported_boundary) and reported_boundary >= 0.0:
+            weak_upper = float(_outward_upper(reported_boundary))
+        weak_certifiable = bool(
+            np.isfinite(weak_lower)
+            and np.isfinite(weak_upper)
+            and weak_lower > weak_upper
         )
         if omitted:
             if np.isfinite(omitted_bound) and np.isfinite(legacy_omitted_bound):
@@ -1017,32 +1192,25 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
             elif np.isinf(omitted_bound) and np.isfinite(legacy_omitted_bound):
                 self.first_excluded_gap_count += 1
                 self.first_excluded_unbounded_count += 1
-        certifiable = bool(
-            not omitted or (np.isfinite(lower) and np.isfinite(upper) and lower > upper)
-        )
-        if omitted and certifiable:
-            if not legacy_certifiable:
-                self.false_ambiguity_avoided += 1
-        if not certifiable:
+        if omitted and weak_certifiable:
+            self.false_ambiguity_avoided += 1
+        if omitted:
             self.ambiguous_boundary_count += 1
-            if np.isfinite(lower) and np.isfinite(upper):
-                self.genuine_unresolved_boundary_count += 1
-                self.boundary_refinements += 1
-                result_locations, result_distances, adaptive_cpu = (
-                    self._adaptive_gpu_boundary_refinement(
-                        query,
-                        source_location,
-                        reported_locations,
-                        k,
-                        reported_boundary,
-                        gpu_reference=gpu_reference,
-                    )
+            self.genuine_unresolved_boundary_count += 1
+            self.boundary_refinements += 1
+            result_locations, result_distances, adaptive_cpu = (
+                self._adaptive_gpu_boundary_refinement(
+                    query,
+                    source_location,
+                    reported_locations,
+                    k,
+                    reported_boundary,
+                    gpu_reference=gpu_reference,
                 )
-                cpu_verification += adaptive_cpu
-                result = (result_locations, result_distances)
-                self.certified_tiles += 1
-            else:
-                result = rescan("nonfinite_or_ambiguous_boundary")
+            )
+            cpu_verification += adaptive_cpu
+            result = (result_locations, result_distances)
+            self.certified_tiles += 1
         else:
             self.certified_tiles += 1
             result = (
@@ -1069,6 +1237,8 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
     ) -> tuple[np.ndarray, np.ndarray]:
         order_k = _validate_k(k)
         block = _validate_chunk_size(chunk_size)
+        if checkpoint_store is not None and checkpoint_identity is not None:
+            _stamp_gpu_checkpoint_identity(checkpoint_identity)
         if len(self.gpu_devices) > 1 and source_range is None:
             return self._compute_multi_location_neighbours(
                 order_k,
@@ -1639,6 +1809,8 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
         location_count = int(self.unique_locations.shape[0])
         if checkpoint_store is not None and checkpoint_identity is None:
             raise ValueError("kNN checkpoint identity is required")
+        if checkpoint_store is not None and checkpoint_identity is not None:
+            _stamp_gpu_checkpoint_identity(checkpoint_identity)
         if (
             isinstance(checkpoint_every_locations, bool)
             or not isinstance(checkpoint_every_locations, (int, np.integer))
@@ -2082,6 +2254,10 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
             "gpu_genuine_unresolved_boundary_count",
             "gpu_boundary_refinements",
             "gpu_boundary_refinement_candidate_count",
+            "gpu_boundary_interval_unsafe_count",
+            "gpu_boundary_interval_overlap_count",
+            "gpu_cpu_refinement_candidate_count",
+            "gpu_cpu_refinement_budget_exhausted",
             "gpu_full_rescan_last_resort_count",
         )
         for name in numeric_sum:
@@ -2349,6 +2525,21 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
                 "gpu_boundary_refinement_max_candidate_set": int(
                     self.boundary_refinement_max_candidate_set
                 ),
+                "gpu_boundary_interval_unsafe_count": int(
+                    self.boundary_interval_unsafe_count
+                ),
+                "gpu_boundary_interval_overlap_count": int(
+                    self.boundary_interval_overlap_count
+                ),
+                "gpu_cpu_refinement_candidate_count": int(
+                    self.cpu_refinement_candidate_count
+                ),
+                "gpu_max_cpu_refinement_candidates": int(
+                    self.max_cpu_refinement_candidates
+                ),
+                "gpu_cpu_refinement_budget_exhausted": int(
+                    self.cpu_refinement_budget_exhausted
+                ),
                 "gpu_boundary_refinement_gpu_seconds": float(
                     self.boundary_refinement_gpu_seconds
                 ),
@@ -2361,7 +2552,10 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
                 "gpu_certified_tiles": int(self.certified_tiles),
                 "gpu_final_certifications": int(self.final_certifications),
                 "gpu_certification_relative_bound": float(self.certification_relative_bound),
-                "gpu_certification_contract": "fp64-gamma-independent-interval-v3",
+                "gpu_certification_direct_relative_bound": float(
+                    self.certification_direct_relative_bound
+                ),
+                "gpu_certification_contract": _GPU_KNN_NUMERICAL_CONTRACT,
                 "gpu_certification_fp64_safe": bool(self._gpu_fp64_certification_safe),
                 "gpu_certification_safety_scope": (
                     "pool-wide diagnostic only; final certification uses source-local "
@@ -2540,9 +2734,10 @@ def compute_gpu_tiled_neighbours(
     )
     identity = {
         "phase": "exact-knn",
-        "schema": "exact-knn-checkpoint-v1",
+        "schema": "exact-knn-checkpoint-v2",
         "backend": active_index.backend,
         "backend_version": active_index.backend_version,
+        "numerical_contract": _GPU_KNN_NUMERICAL_CONTRACT,
         "descriptors": _array_fingerprint(values),
         "row_ids": list(ordered_row_ids),
         "unique_locations": _array_fingerprint(active_index.unique_locations),
@@ -2644,9 +2839,10 @@ def compute_gpu_tiled_neighbours_many(
     )
     identity = {
         "phase": "exact-knn",
-        "schema": "exact-knn-checkpoint-v1",
+        "schema": "exact-knn-checkpoint-v2",
         "backend": active_index.backend,
         "backend_version": active_index.backend_version,
+        "numerical_contract": _GPU_KNN_NUMERICAL_CONTRACT,
         "descriptors": _array_fingerprint(values),
         "row_ids": list(ordered_row_ids),
         "unique_locations": _array_fingerprint(active_index.unique_locations),

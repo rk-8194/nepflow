@@ -352,6 +352,106 @@ def test_fake_gpu_boundary_filter_keeps_opposite_rounding_near_tie(
     index.close()
 
 
+def test_fake_gpu_boundary_nonfinite_interval_is_cpu_rechecked(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unsafe GPU interval is retained and canonicalized, never excluded."""
+
+    def nonfinite_sqrt(values: np.ndarray) -> np.ndarray:
+        distances = np.sqrt(values)
+        return np.where(values > 0.5, np.nan, distances)
+
+    monkeypatch.setitem(sys.modules, "cupy", _fake_cupy(sqrt_fn=nonfinite_sqrt))
+    descriptors = np.asarray([[0.0], [1.0], [2.0], [3.0]], dtype=np.float64)
+    oracle = compute_exact_neighbours(descriptors, 1, chunk_size=2, resource_budget=_budget())
+    from nepflow.stages.selection.algorithms.information_entropy.gpu_neighbours import (
+        ExactTiledGPUNeighbourIndex,
+    )
+
+    index = ExactTiledGPUNeighbourIndex(
+        descriptors,
+        gpu_tile_size=2,
+        max_device_bytes=64 * 1024,
+        resource_budget=_budget(),
+    )
+    source_location = int(index.row_to_location[0])
+    locations, distances = index._certify_final(
+        index.unique_locations[source_location],
+        source_location,
+        np.asarray([source_location, 2, 3], dtype=np.int64),
+        np.asarray([0.0, 2.0, 3.0], dtype=np.float64),
+        2.0,
+        2.0,
+        2.0,
+        2.0,
+        1,
+    )
+    np.testing.assert_array_equal(
+        index.location_representatives[locations], oracle.neighbour_indices[0]
+    )
+    np.testing.assert_array_equal(distances, oracle.neighbour_distances[0])
+    assert index.memory_metrics()["gpu_boundary_interval_unsafe_count"] > 0
+    index.close()
+
+
+def test_fake_gpu_boundary_cpu_refinement_budget_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setitem(sys.modules, "cupy", _fake_cupy())
+    from nepflow.stages.selection.algorithms.information_entropy.gpu_neighbours import (
+        ExactTiledGPUNeighbourIndex,
+        GPUCertificationError,
+    )
+
+    index = ExactTiledGPUNeighbourIndex(
+        np.asarray([[0.0], [1.0], [2.0], [3.0]], dtype=np.float64),
+        gpu_tile_size=2,
+        max_device_bytes=64 * 1024,
+        resource_budget=_budget(),
+    )
+    index.max_cpu_refinement_candidates = 1
+    with pytest.raises(GPUCertificationError, match="CPU-canonicalization budget"):
+        index._certify_final(
+            index.unique_locations[0],
+            0,
+            np.asarray([0, 2, 3], dtype=np.int64),
+            np.asarray([0.0, 2.0, 3.0], dtype=np.float64),
+            2.0,
+            2.0,
+            2.0,
+            2.0,
+            1,
+        )
+    assert index.memory_metrics()["gpu_cpu_refinement_budget_exhausted"] == 1
+    index.close()
+
+
+def test_gpu_checkpoint_rejects_incompatible_numerical_contract(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setitem(sys.modules, "cupy", _fake_cupy())
+    from nepflow.stages.selection.algorithms.information_entropy.gpu_neighbours import (
+        ExactTiledGPUNeighbourIndex,
+    )
+
+    index = ExactTiledGPUNeighbourIndex(
+        np.asarray([[0.0], [1.0], [2.0]], dtype=np.float64),
+        gpu_tile_size=2,
+        max_device_bytes=64 * 1024,
+        resource_budget=_budget(),
+    )
+    store = IncrementalCheckpointStore(str(tmp_path / "checkpoint"))
+    with pytest.raises(ValueError, match="numerical contract is incompatible"):
+        index.query_neighbours(
+            1,
+            chunk_size=2,
+            checkpoint_store=store,
+            checkpoint_identity={"schema": "old", "numerical_contract": "old-v3"},
+        )
+    index.close()
+
+
 @pytest.mark.parametrize("device_count", (2, 4))
 def test_fake_multi_gpu_knn_scheduler_preserves_order_and_device_metrics(
     monkeypatch: pytest.MonkeyPatch, device_count: int
