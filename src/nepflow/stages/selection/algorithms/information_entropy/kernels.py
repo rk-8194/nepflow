@@ -876,6 +876,7 @@ def evaluate_leave_one_out_objective(
                 "gpu_device_count",
                 "gpu_per_device",
                 "knn_gpu_per_device",
+                "gpu_rescan_reasons",
             }:
                 diagnostics[metric_name] = metric_value
             elif isinstance(metric_value, bool):
@@ -1363,10 +1364,24 @@ def evaluate_leave_one_out_objectives(
             "gpu_fp64_evaluations",
             "gpu_ambiguous_boundary_count",
             "gpu_cpu_rescanned_count",
+            "gpu_completed_locations",
+            "gpu_distance_evaluations",
+            "gpu_unique_distance_evaluations",
+            "gpu_atomic_distance_evaluations",
+            "gpu_cpu_tile_refinements",
             "gpu_h2d_bytes",
             "gpu_d2h_bytes",
             "gpu_seconds",
+            "gpu_active_kernel_seconds_sum",
+            "gpu_active_operation_seconds_sum",
+            "gpu_operation_seconds_inclusive",
+            "gpu_h2d_seconds",
+            "gpu_d2h_seconds",
+            "gpu_synchronization_seconds",
+            "gpu_launch_allocation_seconds",
+            "gpu_certification_seconds",
             "gpu_cpu_verification_seconds",
+            "gpu_cpu_tile_refinement_seconds",
             "support_query_count",
             "support_entries",
             "support_query_seconds",
@@ -1380,6 +1395,7 @@ def evaluate_leave_one_out_objectives(
                 "gpu_device_count",
                 "gpu_per_device",
                 "knn_gpu_per_device",
+                "gpu_rescan_reasons",
             }:
                 diagnostics[metric_name] = metric_value
             elif isinstance(metric_value, bool):

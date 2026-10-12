@@ -2634,6 +2634,7 @@ class TiledCPUNeighbourIndex:
                 available_bytes=remaining,
                 reserved_headroom_bytes=service.budget.reserved_headroom_bytes,
             )
+        grouping_started = time.perf_counter()
         locations, first_indices, row_to_location = np.unique(
             values,
             axis=0,
@@ -2657,6 +2658,7 @@ class TiledCPUNeighbourIndex:
         np.cumsum(location_counts, dtype=np.int64, out=self.location_indptr[1:])
         self.rows_by_location.setflags(write=False)
         self.location_indptr.setflags(write=False)
+        self.grouping_build_seconds = max(0.0, time.perf_counter() - grouping_started)
         self.tile_size = tile
         self.grouping_bytes = int(self.rows_by_location.nbytes + self.location_indptr.nbytes)
         self.index_bytes = int(

@@ -368,6 +368,113 @@ def test_fake_gpu_knn_checkpoint_resume_publishes_only_new_ranges(
     assert state["chunk_count"] == 4
 
 
+@pytest.mark.parametrize("device_count", (2, 4))
+def test_fake_multi_gpu_checkpoint_resume_commits_contiguous_prefix(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    device_count: int,
+) -> None:
+    monkeypatch.setitem(sys.modules, "cupy", _fake_cupy(device_count=device_count))
+
+    class InterruptingStore(IncrementalCheckpointStore):
+        def __init__(self, root: str) -> None:
+            super().__init__(root)
+            self.interrupted = False
+
+        def write_chunk(self, *args: Any, **kwargs: Any) -> dict[str, float | int]:
+            result = super().write_chunk(*args, **kwargs)
+            if not self.interrupted:
+                self.interrupted = True
+                raise RuntimeError("intentional multi-GPU interruption")
+            return result
+
+    descriptors = np.asarray(
+        [[float(i), float(i % 5), float((i * 11) % 7)] for i in range(24)],
+        dtype=np.float64,
+    )
+    identity = {"schema": "gpu-multi-checkpoint-test", "ordered": list(range(len(descriptors)))}
+    store = InterruptingStore(str(tmp_path))
+    from nepflow.stages.selection.algorithms.information_entropy.gpu_neighbours import (
+        ExactTiledGPUNeighbourIndex,
+    )
+
+    interrupted = ExactTiledGPUNeighbourIndex(
+        descriptors,
+        gpu_devices=tuple(range(device_count)),
+        gpu_tile_size=4,
+        max_device_bytes=32 * 1024,
+        resource_budget=_budget(),
+    )
+    with pytest.raises(RuntimeError, match="intentional multi-GPU interruption"):
+        interrupted.query_neighbours(
+            3,
+            chunk_size=3,
+            checkpoint_store=store,
+            checkpoint_identity=identity,
+            checkpoint_every_locations=3,
+        )
+    checkpoint_state = store.load(
+        "knn",
+        expected_identity=identity,
+        k_max=3,
+        location_count=len(np.unique(descriptors, axis=0)),
+    )[1]
+    assert 0 < checkpoint_state["cursor"] < len(descriptors)
+
+    resumed = ExactTiledGPUNeighbourIndex(
+        descriptors,
+        gpu_devices=tuple(range(device_count)),
+        gpu_tile_size=4,
+        max_device_bytes=32 * 1024,
+        resource_budget=_budget(),
+    )
+    _, resumed_indices, resumed_distances = resumed.query_neighbours(
+        3,
+        chunk_size=3,
+        checkpoint_store=store,
+        checkpoint_identity=identity,
+        checkpoint_every_locations=3,
+        preserve_checkpoint=True,
+    )
+    reference = compute_exact_neighbours(descriptors, 3, chunk_size=3, resource_budget=_budget())
+    np.testing.assert_array_equal(resumed_indices, reference.neighbour_indices)
+    np.testing.assert_array_equal(resumed_distances, reference.neighbour_distances)
+    final_state = store.load(
+        "knn",
+        expected_identity=identity,
+        k_max=3,
+        location_count=len(resumed.unique_locations),
+    )[1]
+    assert final_state["cursor"] == len(resumed.unique_locations)
+
+
+def test_fake_multi_gpu_worker_failure_is_propagated_without_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setitem(sys.modules, "cupy", _fake_cupy(device_count=2))
+    from nepflow.stages.selection.algorithms.information_entropy.gpu_neighbours import (
+        ExactTiledGPUNeighbourIndex,
+    )
+
+    original_query = ExactTiledGPUNeighbourIndex.query_neighbours_range
+
+    def failing_query(self: Any, *args: Any, **kwargs: Any):
+        if self.device == 1:
+            raise RuntimeError("injected device worker failure")
+        return original_query(self, *args, **kwargs)
+
+    monkeypatch.setattr(ExactTiledGPUNeighbourIndex, "query_neighbours_range", failing_query)
+    index = ExactTiledGPUNeighbourIndex(
+        np.asarray([[float(i), float(i % 3)] for i in range(16)], dtype=np.float64),
+        gpu_devices=(0, 1),
+        gpu_tile_size=4,
+        max_device_bytes=32 * 1024,
+        resource_budget=_budget(),
+    )
+    with pytest.raises(RuntimeError, match="injected device worker failure"):
+        index.query_neighbours(2, chunk_size=3)
+
+
 def test_fake_gpu_knn_fails_before_unbounded_result_admission(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

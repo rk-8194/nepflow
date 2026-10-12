@@ -9,10 +9,12 @@ CPU; it is never accepted as an approximate top-k result.
 
 from __future__ import annotations
 
+import logging
 import os
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
+from queue import Empty, Full, Queue
 from typing import Any
 
 import numpy as np
@@ -44,6 +46,10 @@ from .neighbours import (
     _validate_k,
     _validate_row_ids,
 )
+
+logger = logging.getLogger(__name__)
+_GPU_PROGRESS_INTERVAL_SECONDS = 10.0
+_DEFAULT_MAX_CPU_RESCANS = 16_384
 
 
 def _gamma_bound(dimension: int) -> float:
@@ -112,6 +118,7 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
         max_neighbour_cache_bytes: int | None = DEFAULT_NEIGHBOUR_CACHE_BYTES,
         resource_budget: ResourceBudgetService | None = None,
     ) -> None:
+        worker_setup_started = time.perf_counter()
         if isinstance(device, bool) or not isinstance(device, (int, np.integer)):
             raise ValueError("gpu_device must be a non-negative integer")
         if int(device) < 0:
@@ -146,12 +153,9 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
         self.certification_relative_bound = _gamma_bound(int(values.shape[1]))
         float_info = np.finfo(np.float64)
         max_safe_component = float(np.sqrt(float_info.max / (4.0 * int(values.shape[1]))))
-        min_safe_component = float(np.sqrt(float_info.tiny) / (float_info.eps / 2.0))
+        self._max_safe_component = max_safe_component
         magnitudes = np.abs(values)
-        self._gpu_fp64_certification_safe = bool(
-            np.all(magnitudes <= max_safe_component)
-            and not np.any((magnitudes > 0.0) & (magnitudes < min_safe_component))
-        )
+        self._gpu_fp64_certification_safe = bool(np.all(magnitudes <= max_safe_component))
         super().__init__(
             values,
             tile_size=(self.requested_tile_size if tile_size is None else tile_size),
@@ -210,8 +214,33 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
         self.cpu_verification_seconds = 0.0
         self.certification_rescans = 0
         self.ambiguous_boundary_count = 0
+        self.rescan_reasons: dict[str, int] = {}
+        self.cpu_tile_refinements = 0
+        self.cpu_tile_refinement_seconds = 0.0
         self.certified_tiles = 0
         self.final_certifications = 0
+        self.completed_locations = 0
+        self.problematic_source_count = int(
+            np.count_nonzero(
+                np.any(np.abs(self.unique_locations) > self._max_safe_component, axis=1)
+            )
+        )
+        self.max_cpu_rescans = max(
+            256,
+            min(
+                _DEFAULT_MAX_CPU_RESCANS,
+                max(256, int(self.unique_locations.shape[0] // 100)),
+            ),
+        )
+        self.gpu_unique_location_grouping_seconds = float(
+            getattr(self, "grouping_build_seconds", 0.0)
+        )
+        self.gpu_worker_setup_seconds = max(
+            0.0,
+            time.perf_counter() - worker_setup_started - self.gpu_unique_location_grouping_seconds,
+        )
+        self.gpu_effective_source_tile_size = 0
+        self.gpu_effective_target_tile_size = 0
         self.per_device_metrics: dict[int, dict[str, Any]] = {}
         self._last_neighbour_location_count = 0
 
@@ -351,6 +380,7 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
         gpu_targets: Any,
         keep_count: int,
         *,
+        source_offset: int,
         target_offset: int,
         target_count: int,
     ) -> tuple[Any, Any, Any]:
@@ -366,6 +396,7 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
         )
         operation_started = time.perf_counter()
         compute_elapsed = 0.0
+        invalid_rows_host = np.zeros(source_count, dtype=bool)
         try:
             with cp.cuda.Device(self.device):
                 compute_started = time.perf_counter()
@@ -394,6 +425,7 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
                     # D2H synchronization for every reference tile.
                     finite_rows = all_values_finite(isfinite(distance_squared), axis=1)
                     local_bound = cp.where(finite_rows, local_bound, cp.nan)
+                    invalid_rows_host = np.asarray(cp.asnumpy(~finite_rows), dtype=bool)
         except Exception as exc:
             if isinstance(exc, (GPUCapacityError, GPUCertificationError)):
                 raise
@@ -408,6 +440,51 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
             raise GPUCertificationError(
                 f"GPU kNN tile evaluation failed on gpu_device={self.device}: {exc}"
             ) from exc
+        if np.any(invalid_rows_host):
+            # A non-finite GPU tile is refined only for the affected source
+            # rows. This preserves the exact canonical CPU distance and
+            # supplies a finite omission witness to the global reduction;
+            # it does not turn a single problematic target into a pool-wide
+            # full-pool rescan.
+            refinement_count = int(np.count_nonzero(invalid_rows_host))
+            if self.cpu_tile_refinements + refinement_count > self.max_cpu_rescans:
+                raise GPUCertificationError(
+                    "exact GPU kNN reached its bounded CPU tile-refinement limit; "
+                    f"refinements={self.cpu_tile_refinements}, requested={refinement_count}, "
+                    f"limit={self.max_cpu_rescans}. Inspect the descriptor range diagnostics."
+                )
+            refinement_started = time.perf_counter()
+            target_values = self.unique_locations[target_offset : target_offset + target_count]
+            try:
+                with cp.cuda.Device(self.device):
+                    for row in np.flatnonzero(invalid_rows_host):
+                        source_values = self.unique_locations[source_offset + int(row)]
+                        canonical = self._distance_values(source_values, target_values)
+                        order = np.lexsort(
+                            (
+                                self.location_representatives[
+                                    target_offset : target_offset + target_count
+                                ],
+                                canonical,
+                            )
+                        )[:keep_count]
+                        selected_indices[int(row)] = cp.asarray(
+                            order.astype(np.int64, copy=False) + int(target_offset),
+                            dtype=cp.int64,
+                        )
+                        selected_distances[int(row)] = cp.asarray(
+                            canonical[order], dtype=cp.float64
+                        )
+                        if target_count > keep_count:
+                            local_bound[int(row)] = float(canonical[order[-1]])
+                        else:
+                            local_bound[int(row)] = np.inf
+            except (FloatingPointError, ValueError, RadiusQueryCapacityError) as exc:
+                raise GPUCertificationError(
+                    "exact CPU refinement of a non-finite GPU kNN tile failed"
+                ) from exc
+            self.cpu_tile_refinements += refinement_count
+            self.cpu_tile_refinement_seconds += max(0.0, time.perf_counter() - refinement_started)
         operation_elapsed = max(0.0, time.perf_counter() - operation_started)
         self.gpu_operation_seconds += operation_elapsed
         self.gpu_seconds += compute_elapsed
@@ -533,6 +610,38 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
         elapsed = max(0.0, time.perf_counter() - started)
         return order.astype(np.int64, copy=False), distances[order], elapsed
 
+    def _source_fp64_certification_safe(self, query: np.ndarray) -> bool:
+        """Check arithmetic safety for one source, not the complete pool."""
+
+        return bool(np.all(np.abs(query) <= self._max_safe_component))
+
+    def _record_rescan_request(self, reason: str) -> None:
+        count = int(self.rescan_reasons.get(reason, 0)) + 1
+        self.rescan_reasons[reason] = count
+        if self.certification_rescans >= self.max_cpu_rescans:
+            reasons = ", ".join(
+                f"{name}={value}" for name, value in sorted(self.rescan_reasons.items())
+            )
+            raise GPUCertificationError(
+                "exact GPU kNN reached its bounded CPU-rescan limit; "
+                f"rescans={self.certification_rescans}, limit={self.max_cpu_rescans}, "
+                f"source={reason}, reasons={reasons}. "
+                "Inspect the rescan diagnostics and use a numerically safe exact "
+                "descriptor representation or an explicitly bounded CPU verification plan."
+            )
+        if self.certification_rescans + 1 in {
+            self.max_cpu_rescans // 2,
+            self.max_cpu_rescans,
+        }:
+            logger.warning(
+                "Exact GPU kNN CPU rescans are approaching their bounded limit: "
+                "device=%d rescans=%d limit=%d reasons=%s",
+                self.device,
+                self.certification_rescans + 1,
+                self.max_cpu_rescans,
+                self.rescan_reasons,
+            )
+
     def _certify_final(
         self,
         query: np.ndarray,
@@ -549,16 +658,17 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
         started = time.perf_counter()
         cpu_verification = 0.0
 
-        def rescan() -> tuple[np.ndarray, np.ndarray]:
+        def rescan(reason: str) -> tuple[np.ndarray, np.ndarray]:
             nonlocal cpu_verification
+            self._record_rescan_request(reason)
             self.certification_rescans += 1
             locations, distances, elapsed = self._exact_rescan(query, source_location, k)
             cpu_verification += elapsed
             return locations, distances
 
-        if not self._gpu_fp64_certification_safe:
+        if not self._source_fp64_certification_safe(query):
             self.ambiguous_boundary_count += 1
-            result = rescan()
+            result = rescan("source_fp64_range_unsafe")
             self.certification_seconds += max(0.0, time.perf_counter() - started - cpu_verification)
             self.cpu_verification_seconds += cpu_verification
             return result
@@ -576,7 +686,7 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
             and np.all(np.isfinite(reported_distances))
         )
         if not valid:
-            result = rescan()
+            result = rescan("invalid_gpu_candidate")
             self.certification_seconds += max(0.0, time.perf_counter() - started - cpu_verification)
             self.cpu_verification_seconds += cpu_verification
             return result
@@ -623,7 +733,11 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
         )
         if not certifiable:
             self.ambiguous_boundary_count += 1
-            result = rescan()
+            result = rescan(
+                "nonfinite_or_ambiguous_boundary"
+                if not np.isfinite(lower) or not np.isfinite(upper)
+                else "ambiguous_boundary"
+            )
         else:
             self.certified_tiles += 1
             result = (
@@ -646,6 +760,7 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
         checkpoint_every_locations: int = 1,
         resume: bool = True,
         preserve_checkpoint: bool = False,
+        on_complete_chunk: Callable[[int, np.ndarray, np.ndarray], None] | None = None,
     ) -> tuple[np.ndarray, np.ndarray]:
         order_k = _validate_k(k)
         block = _validate_chunk_size(chunk_size)
@@ -697,8 +812,14 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
         if checkpoint_store is not None and not resume:
             checkpoint_store.clear(checkpoint_name)
 
-        neighbours = np.empty((location_count, order_k), dtype=np.int64)
-        distances_out = np.empty((location_count, order_k), dtype=np.float64)
+        publication_block = (
+            min(block, int(checkpoint_every_locations)) if on_complete_chunk is not None else block
+        )
+        state_offset = range_start if range_mode else 0
+        state_count = (range_stop - range_start) if range_mode else location_count
+        result_rows = state_count if range_mode else location_count
+        neighbours = np.empty((result_rows, order_k), dtype=np.int64)
+        distances_out = np.empty((result_rows, order_k), dtype=np.float64)
         source_start = range_start
         incremental_store: IncrementalCheckpointStore | None = None
         legacy_store: VersionedCheckpointStore | None = None
@@ -780,11 +901,13 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
             self._store_neighbour_cache(order_k, neighbours, distances_out)
             return neighbours, distances_out
 
-        requested_sources = min(self.requested_tile_size, block, location_count)
+        requested_sources = min(
+            self.requested_tile_size,
+            publication_block,
+            location_count,
+        )
         keep_count = min(location_count, order_k + 2)
         dimension = int(self.descriptors.shape[1])
-        state_offset = range_start if range_mode else 0
-        state_count = (range_stop - range_start) if range_mode else location_count
         global_state_bytes = int(state_count * keep_count * 16 + state_count * 16)
         full_reference_bytes = int(self.unique_locations.nbytes)
         try:
@@ -802,31 +925,68 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
             resident_full_reference = False
         source_tile = max(1, min(source_tile, requested_sources))
         target_tile = max(1, min(target_tile, self.requested_tile_size, location_count))
+        self.gpu_effective_source_tile_size = int(source_tile)
+        self.gpu_effective_target_tile_size = int(target_tile)
+        logger.info(
+            "Exact GPU kNN worker configured: gpu_device=%d source_range=[%d,%d) "
+            "source_tile_size=%d target_tile_size=%d estimated_source_tiles=%d "
+            "estimated_target_tiles=%d",
+            self.device,
+            source_start,
+            range_stop,
+            source_tile,
+            target_tile,
+            (range_stop - source_start + source_tile - 1) // source_tile,
+            (location_count + target_tile - 1) // target_tile,
+        )
         self.global_candidate_state_bytes = global_state_bytes
         self.resident_reference_bytes = full_reference_bytes if resident_full_reference else 0
         checkpoint_cursor = source_start
+        self.gpu_effective_source_tile_size = min(
+            self.requested_tile_size,
+            publication_block if (incremental_store is not None or on_complete_chunk) else block,
+            location_count,
+        )
+        self.gpu_effective_target_tile_size = min(self.requested_tile_size, location_count)
 
-        def finish_checkpoint(completed_stop: int) -> None:
+        def publish_completed(start: int, completed_stop: int) -> None:
             nonlocal checkpoint_cursor
-            if (
-                incremental_store is None
-                or checkpoint_identity is None
-                or (
-                    completed_stop - checkpoint_cursor < int(checkpoint_every_locations)
-                    and completed_stop != location_count
-                )
-            ):
-                return
-            incremental_store.write_chunk(
-                checkpoint_name,
-                identity=checkpoint_identity,
-                start=checkpoint_cursor,
-                neighbour_locations=neighbours[checkpoint_cursor:completed_stop],
-                neighbour_distances=distances_out[checkpoint_cursor:completed_stop],
-                k_max=order_k,
-                location_count=location_count,
-            )
-            checkpoint_cursor = completed_stop
+            chunk_start = int(start)
+            while chunk_start < int(completed_stop):
+                chunk_stop = min(chunk_start + publication_block, int(completed_stop))
+                local_start = chunk_start - state_offset
+                local_stop = chunk_stop - state_offset
+                if on_complete_chunk is not None:
+                    on_complete_chunk(
+                        chunk_start,
+                        np.array(neighbours[local_start:local_stop], copy=True),
+                        np.array(distances_out[local_start:local_stop], copy=True),
+                    )
+                self.completed_locations += chunk_stop - chunk_start
+                if (
+                    incremental_store is not None
+                    and checkpoint_identity is not None
+                    and chunk_stop > checkpoint_cursor
+                    and (
+                        chunk_stop - checkpoint_cursor >= int(checkpoint_every_locations)
+                        or chunk_stop == location_count
+                    )
+                ):
+                    incremental_store.write_chunk(
+                        checkpoint_name,
+                        identity=checkpoint_identity,
+                        start=checkpoint_cursor,
+                        neighbour_locations=neighbours[
+                            checkpoint_cursor - state_offset : chunk_stop - state_offset
+                        ],
+                        neighbour_distances=distances_out[
+                            checkpoint_cursor - state_offset : chunk_stop - state_offset
+                        ],
+                        k_max=order_k,
+                        location_count=location_count,
+                    )
+                    checkpoint_cursor = chunk_stop
+                chunk_start = chunk_stop
 
         gpu_reference = None
         global_indices = None
@@ -839,6 +999,56 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
         local_distances = None
         local_bound = None
         started = time.perf_counter()
+        last_worker_progress = started
+        last_worker_evaluations = 0
+        last_worker_rescans = 0
+        last_worker_completed = 0
+
+        def log_worker_progress(*, force: bool = False) -> None:
+            nonlocal last_worker_progress, last_worker_evaluations
+            nonlocal last_worker_rescans, last_worker_completed
+            now = time.perf_counter()
+            if not force and now - last_worker_progress < _GPU_PROGRESS_INTERVAL_SECONDS:
+                return
+            elapsed = max(0.0, now - started)
+            if elapsed <= 0.0:
+                return
+            if (
+                self.fp64_evaluations > last_worker_evaluations
+                and self.completed_locations == last_worker_completed
+                and self.certification_rescans > last_worker_rescans
+            ):
+                logger.warning(
+                    "Exact GPU kNN worker GPU activity has no completed-location progress "
+                    "while CPU rescans accumulate: gpu_device=%d evaluations=%d "
+                    "completed=%d rescans=%d reasons=%s",
+                    self.device,
+                    self.fp64_evaluations,
+                    self.completed_locations,
+                    self.certification_rescans,
+                    self.rescan_reasons,
+                )
+            logger.info(
+                "Exact GPU kNN worker progress: gpu_device=%d completed=%d/%d "
+                "gpu_evaluations=%d elapsed=%.1fs throughput=%.1f locations/s "
+                "cpu_certifications=%d cpu_tile_refinements=%d full_rescans=%d "
+                "rescan_reasons=%s",
+                self.device,
+                self.completed_locations,
+                range_stop - source_start,
+                self.fp64_evaluations,
+                elapsed,
+                self.completed_locations / elapsed,
+                self.final_certifications,
+                self.cpu_tile_refinements,
+                self.certification_rescans,
+                self.rescan_reasons,
+            )
+            last_worker_progress = now
+            last_worker_evaluations = self.fp64_evaluations
+            last_worker_rescans = self.certification_rescans
+            last_worker_completed = self.completed_locations
+
         try:
             cp = self._cp
             try:
@@ -907,6 +1117,7 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
                             gpu_sources,
                             gpu_targets,
                             local_keep,
+                            source_offset=source_start_tile,
                             target_offset=reference_start,
                             target_count=target_count,
                         )
@@ -945,6 +1156,7 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
                     self.target_tiles += 1
                     self.distance_evaluations += batch_count * target_count
                     self.unique_distance_evaluations += batch_count * target_count
+                    log_worker_progress()
                 if not resident_full_reference:
                     del gpu_targets
             self.source_tiles += int((range_stop - source_start + source_tile - 1) // source_tile)
@@ -1008,12 +1220,14 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
                             raise GPUCertificationError(
                                 "GPU kNN exact reduction returned an incomplete neighbour row"
                             )
-                        neighbours[source_location] = locations
-                        distances_out[source_location] = values
+                        local_source = source_location - state_offset
+                        neighbours[local_source] = locations
+                        distances_out[local_source] = values
                 finally:
                     lease.close()
                 self.index_queries += batch_count
-                finish_checkpoint(source_stop)
+                publish_completed(source_start_tile, source_stop)
+                log_worker_progress()
         finally:
             gpu_reference = None
             gpu_targets = None
@@ -1036,6 +1250,7 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
                             pool_factory().free_all_blocks()
             except Exception:
                 pass
+            log_worker_progress(force=True)
         if incremental_store is not None and not preserve_checkpoint:
             incremental_store.clear(checkpoint_name)
             incremental_store.clean_stale()
@@ -1046,8 +1261,8 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
         self._last_neighbour_compute_seconds = max(0.0, time.perf_counter() - started)
         if range_mode:
             return (
-                np.asarray(neighbours[range_start:range_stop], dtype=np.int64),
-                np.asarray(distances_out[range_start:range_stop], dtype=np.float64),
+                np.asarray(neighbours, dtype=np.int64),
+                np.asarray(distances_out, dtype=np.float64),
             )
         self._store_neighbour_cache(order_k, neighbours, distances_out)
         return neighbours, distances_out
@@ -1059,6 +1274,7 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
         stop: int,
         *,
         chunk_size: int = 1024,
+        on_complete_chunk: Callable[[int, np.ndarray, np.ndarray], None] | None = None,
     ) -> tuple[np.ndarray, np.ndarray]:
         """Compute one globally indexed contiguous unique-location range.
 
@@ -1078,6 +1294,8 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
                 k,
                 chunk_size=chunk_size,
                 source_range=(start, stop),
+                checkpoint_every_locations=chunk_size,
+                on_complete_chunk=on_complete_chunk,
             )
 
     def _compute_multi_location_neighbours(
@@ -1146,9 +1364,16 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
                 raise ValueError("multi-GPU kNN checkpoint cursor or arrays are incompatible")
             neighbours[:cursor] = saved_locations
             distances[:cursor] = saved_distances
+        initial_cursor = cursor
+
+        if checkpoint_store is not None and not isinstance(
+            checkpoint_store, (IncrementalCheckpointStore, VersionedCheckpointStore)
+        ):
+            raise TypeError("checkpoint_store must be a supported checkpoint store")
 
         # Construction is deliberately eager: device loss/capacity failure on
         # any requested worker occurs before the first durable publication.
+        worker_setup_started = time.perf_counter()
         worker_list: list[ExactTiledGPUNeighbourIndex] = []
         try:
             for device in self.gpu_devices:
@@ -1170,9 +1395,62 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
                 worker.close()
             raise
         workers = tuple(worker_list)
+        self.gpu_worker_setup_seconds += max(0.0, time.perf_counter() - worker_setup_started)
         ranges = contiguous_gpu_ranges(location_count, self.gpu_devices)
         self._last_neighbour_location_count = max(0, location_count - cursor)
-        block = min(int(chunk_size), int(checkpoint_every_locations))
+        source_chunk = (
+            min(int(chunk_size), int(checkpoint_every_locations))
+            if checkpoint_store is not None
+            else int(chunk_size)
+        )
+        effective_source_tile = min(self.requested_tile_size, source_chunk, location_count)
+        effective_target_tile = min(self.requested_tile_size, location_count)
+        estimated_tiles = {
+            str(int(device)): {
+                "source_range": [int(range_start), int(range_stop)],
+                "source_tiles": (
+                    max(
+                        0,
+                        (
+                            int(range_stop)
+                            - max(int(range_start), cursor)
+                            + effective_source_tile
+                            - 1
+                        )
+                        // effective_source_tile,
+                    )
+                    if range_stop > cursor
+                    else 0
+                ),
+                "target_tiles": (
+                    (location_count + effective_target_tile - 1) // effective_target_tile
+                ),
+            }
+            for device, range_start, range_stop in ranges
+        }
+        logger.info(
+            "Exact GPU kNN start: backend=%s gpu_devices=%s N=%d Q=%d d'=%d "
+            "source_tile_size=%d target_tile_size=%d requested_gpu_tile_size=%d "
+            "chunk_size=%d checkpoint_every=%d checkpoint_mode=%s cursor=%d "
+            "ranges=%s estimated_tile_counts=%s max_device_bytes=%d "
+            "max_neighbour_cache_bytes=%s",
+            self.backend,
+            list(self.gpu_devices),
+            int(self.descriptors.shape[0]),
+            location_count,
+            int(self.descriptors.shape[1]),
+            effective_source_tile,
+            effective_target_tile,
+            self.requested_tile_size,
+            int(chunk_size),
+            int(checkpoint_every_locations),
+            "disabled" if checkpoint_store is None else type(checkpoint_store).__name__,
+            cursor,
+            [(int(device), int(start), int(stop)) for device, start, stop in ranges],
+            estimated_tiles,
+            int(self.max_device_bytes),
+            self.max_neighbour_cache_bytes,
+        )
 
         def publish(start: int, stop: int) -> None:
             if checkpoint_store is None or checkpoint_identity is None:
@@ -1203,6 +1481,116 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
         started = time.perf_counter()
         executor: ThreadPoolExecutor | None = None
         futures: dict[int, Any] = {}
+        completed_queue: Queue[tuple[int, int, np.ndarray, np.ndarray]] = Queue(
+            maxsize=max(2, 4 * len(workers))
+        )
+        abort_requested = False
+        pending_chunks: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+        worker_completed = {int(index): 0 for index in range(len(workers))}
+        last_progress = started
+        last_committed = cursor
+        last_rescans = 0
+        last_gpu_evaluations = 0
+
+        def enqueue_chunk(
+            worker_index: int,
+            start: int,
+            chunk_locations: np.ndarray,
+            chunk_distances: np.ndarray,
+        ) -> None:
+            worker_completed[worker_index] += int(chunk_locations.shape[0])
+            while not abort_requested:
+                try:
+                    completed_queue.put(
+                        (
+                            worker_index,
+                            int(start),
+                            chunk_locations,
+                            chunk_distances,
+                        ),
+                        timeout=0.5,
+                    )
+                    return
+                except Full:
+                    continue
+
+        def log_progress(*, force: bool = False) -> None:
+            nonlocal last_progress, last_committed, last_rescans, last_gpu_evaluations
+            now = time.perf_counter()
+            if not force and now - last_progress < _GPU_PROGRESS_INTERVAL_SECONDS:
+                return
+            elapsed = max(0.0, now - started)
+            metrics = [worker.memory_metrics() for worker in workers]
+            completed = sum(worker_completed.values())
+            evaluations = sum(int(item.get("gpu_fp64_evaluations", 0) or 0) for item in metrics)
+            rescans = sum(int(item.get("gpu_certification_rescans", 0) or 0) for item in metrics)
+            rescan_reasons: dict[str, int] = {}
+            for item in metrics:
+                for reason, count in item.get("gpu_rescan_reasons", {}).items():
+                    rescan_reasons[str(reason)] = rescan_reasons.get(str(reason), 0) + int(count)
+            throughput = (completed / elapsed) if elapsed > 0.0 else 0.0
+            eta = (
+                (location_count - cursor) / throughput
+                if throughput > 0.0 and cursor < location_count
+                else None
+            )
+            logger.info(
+                "Exact GPU kNN progress: completed=%d/%d committed_prefix=%d/%d "
+                "per_device_completed=%s gpu_evaluations=%d elapsed=%.1fs "
+                "throughput=%.1f locations/s eta=%s cpu_certifications=%d "
+                "cpu_tile_refinements=%d full_rescans=%d rescan_reasons=%s",
+                completed,
+                max(0, location_count - initial_cursor),
+                cursor,
+                location_count,
+                {int(workers[index].device): count for index, count in worker_completed.items()},
+                evaluations,
+                elapsed,
+                throughput,
+                "qualified" if eta is None else f"{eta:.1f}s (qualified)",
+                sum(int(item.get("gpu_final_certifications", 0) or 0) for item in metrics),
+                sum(int(item.get("gpu_cpu_tile_refinements", 0) or 0) for item in metrics),
+                rescans,
+                rescan_reasons,
+            )
+            if (
+                evaluations > last_gpu_evaluations
+                and cursor == last_committed
+                and rescans > last_rescans
+            ):
+                logger.warning(
+                    "Exact GPU kNN GPU evaluations are advancing without a committed "
+                    "location while CPU rescans accumulate: committed_prefix=%d "
+                    "gpu_evaluations=%d full_rescans=%d",
+                    cursor,
+                    evaluations,
+                    rescans,
+                )
+            last_progress = now
+            last_committed = cursor
+            last_rescans = rescans
+            last_gpu_evaluations = evaluations
+
+        def commit_ready() -> None:
+            nonlocal cursor
+            while cursor in pending_chunks:
+                chunk_locations, chunk_distances = pending_chunks.pop(cursor)
+                length = int(chunk_locations.shape[0])
+                if length < 1 or cursor + length > location_count:
+                    raise GPUCertificationError(
+                        "GPU kNN worker returned an invalid completed chunk"
+                    )
+                stop = cursor + length
+                neighbours[cursor:stop] = chunk_locations
+                distances[cursor:stop] = chunk_distances
+                publish(cursor, stop)
+                cursor = stop
+
+        def raise_finished_worker_errors() -> None:
+            for future in futures.values():
+                if future.done():
+                    future.result()
+
         try:
             # Each worker owns one device and runs in its own thread.  CuPy's
             # current device and stream are thread-local, and every worker
@@ -1216,27 +1604,48 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
                     k,
                     max(range_start, cursor),
                     range_stop,
-                    chunk_size=chunk_size,
+                    chunk_size=source_chunk,
+                    on_complete_chunk=lambda start, locations, distances, index=worker_index: (
+                        enqueue_chunk(index, start, locations, distances)
+                    ),
                 )
                 for worker_index, (_device, range_start, range_stop) in enumerate(ranges)
                 if range_stop > cursor
             }
-            for worker_index, (_device, range_start, range_stop) in enumerate(ranges):
-                if range_stop <= cursor:
+            remaining_futures = set(futures.values())
+            while remaining_futures or not completed_queue.empty():
+                try:
+                    _worker_index, start, chunk_locations, chunk_distances = completed_queue.get(
+                        timeout=1.0
+                    )
+                except Empty:
+                    raise_finished_worker_errors()
+                    remaining_futures = {
+                        future for future in remaining_futures if not future.done()
+                    }
+                    log_progress()
                     continue
-                worker_locations, worker_distances = futures[worker_index].result()
-                start = max(range_start, cursor)
-                offset = 0
-                while start < range_stop:
-                    stop = min(start + block, range_stop)
-                    length = stop - start
-                    neighbours[start:stop] = worker_locations[offset : offset + length]
-                    distances[start:stop] = worker_distances[offset : offset + length]
-                    publish(start, stop)
-                    cursor = stop
-                    start = stop
-                    offset += length
+                raise_finished_worker_errors()
+                if start in pending_chunks:
+                    raise GPUCertificationError(
+                        f"GPU kNN workers returned duplicate completed chunk at start={start}"
+                    )
+                pending_chunks[start] = (chunk_locations, chunk_distances)
+                commit_ready()
+                for future in tuple(remaining_futures):
+                    if future.done():
+                        future.result()
+                        remaining_futures.remove(future)
+                log_progress()
+            raise_finished_worker_errors()
+            commit_ready()
+            if cursor != location_count:
+                raise GPUCertificationError(
+                    "GPU kNN workers completed without producing a contiguous result prefix: "
+                    f"cursor={cursor}, location_count={location_count}"
+                )
         except BaseException:
+            abort_requested = True
             if executor is not None:
                 for future in futures.values():
                     future.cancel()
@@ -1247,6 +1656,9 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
             self.per_device_metrics = {
                 int(worker.device): worker.memory_metrics() for worker in workers
             }
+            self._last_neighbour_compute_seconds = max(0.0, time.perf_counter() - started)
+            log_progress(force=True)
+            self._merge_multi_metrics()
             for worker in workers:
                 worker.close()
         if checkpoint_store is not None and not preserve_checkpoint:
@@ -1365,6 +1777,37 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
             int(item.get("gpu_final_certifications", 0) or 0)
             for item in self.per_device_metrics.values()
         )
+        self.completed_locations = sum(
+            int(item.get("gpu_completed_locations", 0) or 0)
+            for item in self.per_device_metrics.values()
+        )
+        self.index_queries = self.completed_locations
+        self.distance_evaluations = sum(
+            int(item.get("distance_evaluations", 0) or 0)
+            for item in self.per_device_metrics.values()
+        )
+        self.unique_distance_evaluations = sum(
+            int(item.get("unique_distance_evaluations", 0) or 0)
+            for item in self.per_device_metrics.values()
+        )
+        self.atomic_distance_evaluations = sum(
+            int(item.get("atomic_distance_evaluations", 0) or 0)
+            for item in self.per_device_metrics.values()
+        )
+        self.rescan_reasons = {}
+        for item in self.per_device_metrics.values():
+            for reason, count in item.get("gpu_rescan_reasons", {}).items():
+                self.rescan_reasons[str(reason)] = self.rescan_reasons.get(str(reason), 0) + int(
+                    count
+                )
+        self.cpu_tile_refinements = sum(
+            int(item.get("gpu_cpu_tile_refinements", 0) or 0)
+            for item in self.per_device_metrics.values()
+        )
+        self.cpu_tile_refinement_seconds = sum(
+            float(item.get("gpu_cpu_tile_refinement_seconds", 0.0) or 0.0)
+            for item in self.per_device_metrics.values()
+        )
 
     def memory_metrics(self) -> dict[str, Any]:
         metrics: dict[str, Any] = dict(super().memory_metrics())
@@ -1390,6 +1833,12 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
                 "gpu_d2h_bytes": int(self.d2h_bytes),
                 "gpu_device_workspace_peak_bytes": int(self.device_workspace_peak_bytes),
                 "gpu_host_workspace_peak_bytes": int(self.host_workspace_peak_bytes),
+                "gpu_worker_setup_seconds": float(self.gpu_worker_setup_seconds),
+                "gpu_unique_location_grouping_seconds": float(
+                    self.gpu_unique_location_grouping_seconds
+                ),
+                "gpu_effective_source_tile_size": int(self.gpu_effective_source_tile_size),
+                "gpu_effective_target_tile_size": int(self.gpu_effective_target_tile_size),
                 "gpu_kernel_seconds": float(self.gpu_seconds),
                 "gpu_active_kernel_seconds_sum": float(self.gpu_seconds),
                 "gpu_distance_reduction_seconds": float(self.gpu_distance_reduction_seconds),
@@ -1432,6 +1881,10 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
                 "gpu_certification_seconds": float(self.certification_seconds),
                 "gpu_cpu_verification_seconds": float(self.cpu_verification_seconds),
                 "gpu_certification_rescans": int(self.certification_rescans),
+                "gpu_rescan_reasons": dict(self.rescan_reasons),
+                "gpu_max_cpu_rescans": int(self.max_cpu_rescans),
+                "gpu_cpu_tile_refinements": int(self.cpu_tile_refinements),
+                "gpu_cpu_tile_refinement_seconds": float(self.cpu_tile_refinement_seconds),
                 "gpu_ambiguous_boundary_count": int(self.ambiguous_boundary_count),
                 "gpu_exact_boundary_recertifications": int(self.ambiguous_boundary_count),
                 "gpu_certified_tiles": int(self.certified_tiles),
@@ -1439,6 +1892,15 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
                 "gpu_certification_relative_bound": float(self.certification_relative_bound),
                 "gpu_certification_contract": "fp64-gamma-bound-v2",
                 "gpu_certification_fp64_safe": bool(self._gpu_fp64_certification_safe),
+                "gpu_certification_safety_scope": (
+                    "pool-wide diagnostic only; final certification uses source-local "
+                    "range checks and tile-local exact refinement"
+                ),
+                "gpu_completed_locations": int(self.completed_locations),
+                "gpu_problematic_source_count": int(self.problematic_source_count),
+                "gpu_distance_evaluations": int(self.distance_evaluations),
+                "gpu_unique_distance_evaluations": int(self.unique_distance_evaluations),
+                "gpu_atomic_distance_evaluations": int(self.atomic_distance_evaluations),
                 "gpu_per_device": [metrics for _device, metrics in self.per_device_metrics.items()],
                 "knn_throughput_locations_per_second": (
                     self._last_neighbour_location_count / self._last_neighbour_compute_seconds

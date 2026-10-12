@@ -117,6 +117,11 @@ def _metric_delta(after: dict[str, Any], before: dict[str, Any]) -> dict[str, An
         "gpu_ambiguous_boundary_count",
         "gpu_certified_tiles",
         "gpu_final_certifications",
+        "gpu_completed_locations",
+        "gpu_distance_evaluations",
+        "gpu_unique_distance_evaluations",
+        "gpu_atomic_distance_evaluations",
+        "gpu_cpu_tile_refinements",
     }
     result: dict[str, Any] = {}
     for key, value in after.items():
@@ -157,6 +162,9 @@ def _exclusive_knn_phase_seconds(metrics: dict[str, Any]) -> dict[str, float]:
         "gpu_launch_allocation",
         "gpu_certification",
         "gpu_cpu_verification",
+        "gpu_cpu_tile_refinement",
+        "gpu_worker_setup",
+        "gpu_unique_location_grouping",
         "checkpoint_serialization",
         "checkpoint_fsync",
         "checkpoint_digest",
@@ -459,6 +467,8 @@ def _prepare(
             else 0.0,
         },
         "knn_per_run_metrics": knn_phase_metrics,
+        "knn_gpu_per_device": after_knn.get("gpu_per_device", []),
+        "knn_rescan_reasons": after_knn.get("gpu_rescan_reasons", {}),
         "cumulative_index_metrics": lifetime_index_metrics,
         "knn_checkpoint": checkpoint_metrics,
         "selection_prepare_semantics": (
@@ -491,6 +501,11 @@ def _summarize_gpu_observations(
                 device = int(record["gpu_device"])
                 aggregate = by_device.setdefault(device, {})
                 for key, value in record.items():
+                    if key == "gpu_rescan_reasons" and isinstance(value, dict):
+                        reasons = aggregate.setdefault("gpu_rescan_reasons", {})
+                        for reason, count in value.items():
+                            reasons[str(reason)] = int(reasons.get(str(reason), 0)) + int(count)
+                        continue
                     if key == "gpu_device" or isinstance(value, (list, dict, bool, str)):
                         if key != "gpu_device":
                             aggregate[key] = value
@@ -524,6 +539,16 @@ def _summarize_gpu_observations(
                 if "gpu_active_seconds_sum" in aggregate and "gpu_wall_seconds" in aggregate:
                     aggregate["gpu_parallelism_estimate"] = (
                         float(aggregate["gpu_active_seconds_sum"])
+                        / float(aggregate["gpu_wall_seconds"])
+                        if float(aggregate["gpu_wall_seconds"]) > 0.0
+                        else 0.0
+                    )
+                if (
+                    "gpu_active_operation_seconds_sum" in aggregate
+                    and "gpu_wall_seconds" in aggregate
+                ):
+                    aggregate["gpu_parallelism_estimate"] = (
+                        float(aggregate["gpu_active_operation_seconds_sum"])
                         / float(aggregate["gpu_wall_seconds"])
                         if float(aggregate["gpu_wall_seconds"]) > 0.0
                         else 0.0
@@ -616,6 +641,7 @@ def _production_calibration_timing(
     gpu_tile_size: int,
     max_gpu_support_bytes: int | None,
     gpu_devices: str | None = None,
+    diagnostics: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Measure the production 16-pair LOO grid without an oracle allocation.
 
@@ -676,6 +702,7 @@ def _production_calibration_timing(
         gpu_devices=gpu_devices,
         gpu_tile_size=gpu_tile_size,
         max_gpu_support_bytes=max_gpu_support_bytes,
+        diagnostics=diagnostics,
     )
     elapsed = max(0.0, time.perf_counter() - started)
     return {
@@ -712,6 +739,7 @@ def _correctness_checks(
     n_rows = int(pool.descriptors.shape[0])
     calibration_started = time.perf_counter()
     if n_rows > oracle_limit:
+        production_timing_diagnostics: dict[str, Any] = {}
         production_timing = _production_calibration_timing(
             pool,
             neighbours,
@@ -725,6 +753,19 @@ def _correctness_checks(
             gpu_devices=gpu_devices,
             gpu_tile_size=gpu_tile_size,
             max_gpu_support_bytes=max_gpu_support_bytes,
+            diagnostics=production_timing_diagnostics,
+        )
+        requested_gpu_devices = normalize_gpu_devices(gpu_devices, gpu_device=gpu_device)
+        observed_devices = tuple(
+            int(device) for device in production_timing_diagnostics.get("gpu_devices", ())
+        )
+        gpu_execution_verified = bool(
+            kernel_support_execution != "exact_tiled_gpu"
+            or (
+                observed_devices == requested_gpu_devices
+                and len(production_timing_diagnostics.get("gpu_per_device", ()))
+                == len(requested_gpu_devices)
+            )
         )
         return {
             "status": "skipped",
@@ -735,6 +776,10 @@ def _correctness_checks(
                 "production_timing": production_timing,
                 "all_16_pairs_tested": production_timing["pair_count"]
                 == len(PRODUCTION_K_VALUES) * len(PRODUCTION_C_VALUES),
+                "production_gpu_execution_verified": gpu_execution_verified,
+                "production_gpu_devices_requested": list(requested_gpu_devices),
+                "production_gpu_devices_observed": list(observed_devices),
+                "production_gpu_diagnostics": production_timing_diagnostics,
             },
         }
     reference_by_k: dict[int, ExactNeighbourResult] = {}
@@ -750,6 +795,13 @@ def _correctness_checks(
             representation_fingerprint=pool.representation_fingerprint,
             row_ids=_pool_row_ids(pool),
         )
+        production_knn_options: dict[str, Any] = {}
+        if backend in GPU_NEIGHBOUR_BACKEND_ALIASES:
+            production_knn_options = {
+                "gpu_device": gpu_device,
+                "gpu_devices": gpu_devices,
+                "gpu_tile_size": gpu_tile_size,
+            }
         production_by_k[candidate_k] = compute_neighbours(
             pool.descriptors,
             candidate_k,
@@ -759,6 +811,7 @@ def _correctness_checks(
             representation_fingerprint=pool.representation_fingerprint,
             row_ids=_pool_row_ids(pool),
             resource_budget=resource_budget,
+            **production_knn_options,
         )
     reference = reference_by_k.get(max(supported_k, default=1), neighbours)
     indices_equal = bool(np.array_equal(neighbours.indices, reference.indices))
@@ -1376,7 +1429,12 @@ def main() -> None:
     parser.add_argument("--backend", choices=("all", *AVAILABLE_BACKENDS), default="all")
     parser.add_argument("--workers", nargs="+", type=int, default=[1, 8, 64])
     parser.add_argument("--k-max", type=int, default=8)
-    parser.add_argument("--chunk-size", type=int, default=256)
+    parser.add_argument(
+        "--chunk-size",
+        type=int,
+        default=1024,
+        help="resolved source/checkpoint chunk size; run separately with 2048 for comparison",
+    )
     parser.add_argument("--max-entries", type=int, default=10_000_000)
     parser.add_argument("--max-radius-query-bytes", type=int, default=None)
     parser.add_argument("--max-index-bytes", type=int, default=None)
@@ -1392,7 +1450,7 @@ def main() -> None:
         default=None,
         help="explicit comma-separated process-visible CUDA ordinals, e.g. 0,1,2,3",
     )
-    parser.add_argument("--gpu-tile-size", type=int, default=128)
+    parser.add_argument("--gpu-tile-size", type=int, default=2048)
     parser.add_argument("--max-gpu-support-bytes", type=int, default=None)
     parser.add_argument("--max-gpu-neighbour-bytes", type=int, default=None)
     parser.add_argument("--memory-budget-bytes", type=int, default=None)
@@ -1623,6 +1681,7 @@ def main() -> None:
                 if index is not None:
                     index.close()
 
+    resolved_gpu_devices = normalize_gpu_devices(args.gpu_devices, gpu_device=args.gpu_device)
     output = {
         "schema": "nepflow-information-entropy-scaling-benchmark-v6",
         "fixture": {
@@ -1639,7 +1698,18 @@ def main() -> None:
             "kernel_support_execution": args.kernel_support_execution,
             "gpu_device": args.gpu_device,
             "gpu_devices": args.gpu_devices,
+            "resolved_gpu_devices": list(resolved_gpu_devices),
             "gpu_tile_size": args.gpu_tile_size,
+            "resolved_production_settings": {
+                "gpu_tile_size": int(args.gpu_tile_size),
+                "chunk_size": int(args.chunk_size),
+                "effective_source_tile_size": int(min(args.gpu_tile_size, args.chunk_size)),
+                "comparison_chunk_sizes": [1024, 2048],
+                "comparison_instruction": (
+                    "run once with --chunk-size 1024 and once with --chunk-size 2048; "
+                    "keep --gpu-tile-size 2048 and the same resolved GPU ordinals"
+                ),
+            },
             "max_gpu_support_bytes": args.max_gpu_support_bytes,
             "max_gpu_neighbour_bytes": args.max_gpu_neighbour_bytes,
             "knn_only": bool(args.knn_only),
