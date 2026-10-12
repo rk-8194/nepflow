@@ -233,6 +233,67 @@ def test_fake_multi_gpu_knn_scheduler_preserves_order_and_device_metrics(
     index.close()
 
 
+@pytest.mark.parametrize("checkpoint_every", (1, 8, 1024, None))
+def test_checkpoint_interval_does_not_shrink_multi_gpu_compute_tiles(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    checkpoint_every: int | None,
+) -> None:
+    """Checkpoint cadence must not turn a configured source tile into rows."""
+
+    monkeypatch.setitem(sys.modules, "cupy", _fake_cupy(device_count=2))
+    descriptors = np.asarray(
+        [[float(i), float(i % 5), float((i * 11) % 7)] for i in range(40)],
+        dtype=np.float64,
+    )
+    identity = {"schema": "gpu-tile-checkpoint-regression", "rows": list(range(40))}
+    store = (
+        None
+        if checkpoint_every is None
+        else IncrementalCheckpointStore(str(tmp_path / f"interval-{checkpoint_every}"))
+    )
+    from nepflow.stages.selection.algorithms.information_entropy.gpu_neighbours import (
+        ExactTiledGPUNeighbourIndex,
+    )
+
+    index = ExactTiledGPUNeighbourIndex(
+        descriptors,
+        gpu_devices=(0, 1),
+        gpu_tile_size=8,
+        max_device_bytes=32 * 1024,
+        resource_budget=_budget(),
+    )
+    index.query_neighbours(
+        2,
+        chunk_size=4,
+        checkpoint_store=store,
+        checkpoint_identity=identity if store is not None else None,
+        checkpoint_every_locations=1 if checkpoint_every is None else checkpoint_every,
+        preserve_checkpoint=store is not None,
+    )
+
+    metrics = index.memory_metrics()
+    assert metrics["gpu_effective_source_tile_size"] == 4
+    assert metrics["gpu_effective_source_tile_sizes"] == {0: 4, 1: 4}
+    assert metrics["gpu_checkpoint_batch_size"] == 4
+    assert metrics["gpu_source_tiles"] == 10
+    assert metrics["gpu_checkpoint_every_locations"] == (
+        0 if checkpoint_every is None else checkpoint_every
+    )
+    if store is None:
+        assert metrics["gpu_checkpoint_commits"] == 0
+    else:
+        assert 1 <= metrics["gpu_checkpoint_commits"] <= 10
+        state = store.load(
+            "knn",
+            expected_identity=identity,
+            k_max=2,
+            location_count=len(index.unique_locations),
+        )[1]
+        assert state["cursor"] == len(index.unique_locations)
+    index.close()
+
+
 def test_fake_gpu_knn_rescans_ambiguous_ties_and_wide_values(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

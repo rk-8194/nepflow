@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 import time
 from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
@@ -241,6 +242,10 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
         )
         self.gpu_effective_source_tile_size = 0
         self.gpu_effective_target_tile_size = 0
+        self.gpu_checkpoint_every_locations = 0
+        self.gpu_checkpoint_batch_size = 0
+        self.gpu_checkpoint_commits = 0
+        self.gpu_checkpoint_inflight_limit = 0
         self.per_device_metrics: dict[int, dict[str, Any]] = {}
         self._last_neighbour_location_count = 0
 
@@ -812,9 +817,14 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
         if checkpoint_store is not None and not resume:
             checkpoint_store.clear(checkpoint_name)
 
-        publication_block = (
-            min(block, int(checkpoint_every_locations)) if on_complete_chunk is not None else block
+        self.gpu_checkpoint_every_locations = (
+            int(checkpoint_every_locations) if checkpoint_store is not None else 0
         )
+        self.gpu_checkpoint_batch_size = max(1, min(block, location_count))
+        # ``block`` is the compute tile requested by the caller.  A checkpoint
+        # interval may be smaller, but it must only affect publication after a
+        # tile has been computed; it must never reduce the GPU source tile.
+        publication_block = block
         state_offset = range_start if range_mode else 0
         state_count = (range_stop - range_start) if range_mode else location_count
         result_rows = state_count if range_mode else location_count
@@ -903,7 +913,7 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
 
         requested_sources = min(
             self.requested_tile_size,
-            publication_block,
+            block,
             location_count,
         )
         keep_count = min(location_count, order_k + 2)
@@ -942,12 +952,6 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
         self.global_candidate_state_bytes = global_state_bytes
         self.resident_reference_bytes = full_reference_bytes if resident_full_reference else 0
         checkpoint_cursor = source_start
-        self.gpu_effective_source_tile_size = min(
-            self.requested_tile_size,
-            publication_block if (incremental_store is not None or on_complete_chunk) else block,
-            location_count,
-        )
-        self.gpu_effective_target_tile_size = min(self.requested_tile_size, location_count)
 
         def publish_completed(start: int, completed_stop: int) -> None:
             nonlocal checkpoint_cursor
@@ -985,6 +989,7 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
                         k_max=order_k,
                         location_count=location_count,
                     )
+                    self.gpu_checkpoint_commits += 1
                     checkpoint_cursor = chunk_stop
                 chunk_start = chunk_stop
 
@@ -1317,6 +1322,12 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
         contexts rather than a process-wide automatic device selector; the
         same exact screening, FP64 boundary proof and CPU canonical
         certification is therefore applied independently on every range.
+
+        ``chunk_size`` is the GPU source-compute batch.  Checkpoint cadence is
+        a durable-prefix flush threshold: a completed compute batch is the
+        smallest publication unit, contiguous batches are coalesced for larger
+        intervals, and a bounded per-worker buffer prevents out-of-order
+        results from consuming unbounded host memory.
         """
 
         location_count = int(self.unique_locations.shape[0])
@@ -1398,13 +1409,19 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
         self.gpu_worker_setup_seconds += max(0.0, time.perf_counter() - worker_setup_started)
         ranges = contiguous_gpu_ranges(location_count, self.gpu_devices)
         self._last_neighbour_location_count = max(0, location_count - cursor)
-        source_chunk = (
-            min(int(chunk_size), int(checkpoint_every_locations))
-            if checkpoint_store is not None
-            else int(chunk_size)
+        # Checkpoint publication is deliberately independent from GPU compute
+        # tiling.  Workers publish completed compute batches and the central
+        # coordinator coalesces contiguous batches before a durable flush.
+        source_chunk = int(chunk_size)
+        checkpoint_batch_size = max(1, min(source_chunk, location_count))
+        checkpoint_inflight_limit = 2
+        requested_source_tile = min(self.requested_tile_size, source_chunk, location_count)
+        requested_target_tile = min(self.requested_tile_size, location_count)
+        self.gpu_checkpoint_every_locations = (
+            int(checkpoint_every_locations) if checkpoint_store is not None else 0
         )
-        effective_source_tile = min(self.requested_tile_size, source_chunk, location_count)
-        effective_target_tile = min(self.requested_tile_size, location_count)
+        self.gpu_checkpoint_batch_size = checkpoint_batch_size
+        self.gpu_checkpoint_inflight_limit = checkpoint_inflight_limit
         estimated_tiles = {
             str(int(device)): {
                 "source_range": [int(range_start), int(range_stop)],
@@ -1414,24 +1431,25 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
                         (
                             int(range_stop)
                             - max(int(range_start), cursor)
-                            + effective_source_tile
+                            + requested_source_tile
                             - 1
                         )
-                        // effective_source_tile,
+                        // requested_source_tile,
                     )
                     if range_stop > cursor
                     else 0
                 ),
                 "target_tiles": (
-                    (location_count + effective_target_tile - 1) // effective_target_tile
+                    (location_count + requested_target_tile - 1) // requested_target_tile
                 ),
             }
             for device, range_start, range_stop in ranges
         }
         logger.info(
             "Exact GPU kNN start: backend=%s gpu_devices=%s N=%d Q=%d d'=%d "
-            "source_tile_size=%d target_tile_size=%d requested_gpu_tile_size=%d "
-            "chunk_size=%d checkpoint_every=%d checkpoint_mode=%s cursor=%d "
+            "requested_source_tile_size=%d requested_target_tile_size=%d "
+            "requested_gpu_tile_size=%d chunk_size=%d checkpoint_every=%d "
+            "checkpoint_batch_size=%d checkpoint_inflight_limit=%d checkpoint_mode=%s cursor=%d "
             "ranges=%s estimated_tile_counts=%s max_device_bytes=%d "
             "max_neighbour_cache_bytes=%s",
             self.backend,
@@ -1439,11 +1457,13 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
             int(self.descriptors.shape[0]),
             location_count,
             int(self.descriptors.shape[1]),
-            effective_source_tile,
-            effective_target_tile,
+            requested_source_tile,
+            requested_target_tile,
             self.requested_tile_size,
             int(chunk_size),
             int(checkpoint_every_locations),
+            checkpoint_batch_size,
+            checkpoint_inflight_limit,
             "disabled" if checkpoint_store is None else type(checkpoint_store).__name__,
             cursor,
             [(int(device), int(start), int(stop)) for device, start, stop in ranges],
@@ -1477,6 +1497,7 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
                 )
             else:
                 raise TypeError("checkpoint_store must be a supported checkpoint store")
+            self.gpu_checkpoint_commits += 1
 
         started = time.perf_counter()
         executor: ThreadPoolExecutor | None = None
@@ -1485,7 +1506,14 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
             maxsize=max(2, 4 * len(workers))
         )
         abort_requested = False
-        pending_chunks: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+        # A worker may have at most two certified batches in the queue or
+        # coordinator buffer.  This bounds out-of-order retention while still
+        # allowing each device to continue computing independently.
+        worker_inflight_slots = [
+            threading.BoundedSemaphore(checkpoint_inflight_limit) for _ in workers
+        ]
+        pending_chunks: dict[int, tuple[int, np.ndarray, np.ndarray]] = {}
+        ready_cursor = cursor
         worker_completed = {int(index): 0 for index in range(len(workers))}
         last_progress = started
         last_committed = cursor
@@ -1499,7 +1527,15 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
             chunk_distances: np.ndarray,
         ) -> None:
             worker_completed[worker_index] += int(chunk_locations.shape[0])
+            acquired = False
             while not abort_requested:
+                try:
+                    acquired = worker_inflight_slots[worker_index].acquire(timeout=0.5)
+                except KeyboardInterrupt:
+                    raise
+                if acquired:
+                    break
+            while acquired and not abort_requested:
                 try:
                     completed_queue.put(
                         (
@@ -1513,6 +1549,8 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
                     return
                 except Full:
                     continue
+            if acquired:
+                worker_inflight_slots[worker_index].release()
 
         def log_progress(*, force: bool = False) -> None:
             nonlocal last_progress, last_committed, last_rescans, last_gpu_evaluations
@@ -1572,19 +1610,40 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
             last_gpu_evaluations = evaluations
 
         def commit_ready() -> None:
-            nonlocal cursor
-            while cursor in pending_chunks:
-                chunk_locations, chunk_distances = pending_chunks.pop(cursor)
+            nonlocal cursor, ready_cursor
+            while ready_cursor in pending_chunks:
+                chunk_start = ready_cursor
+                worker_index, chunk_locations, chunk_distances = pending_chunks.pop(chunk_start)
                 length = int(chunk_locations.shape[0])
-                if length < 1 or cursor + length > location_count:
+                if (
+                    length < 1
+                    or chunk_locations.shape != (length, k)
+                    or chunk_distances.shape != (length, k)
+                    or chunk_locations.dtype != np.dtype(np.int64)
+                    or chunk_distances.dtype != np.dtype(np.float64)
+                    or chunk_start + length > location_count
+                ):
                     raise GPUCertificationError(
                         "GPU kNN worker returned an invalid completed chunk"
                     )
-                stop = cursor + length
-                neighbours[cursor:stop] = chunk_locations
-                distances[cursor:stop] = chunk_distances
-                publish(cursor, stop)
-                cursor = stop
+                stop = chunk_start + length
+                neighbours[chunk_start:stop] = chunk_locations
+                distances[chunk_start:stop] = chunk_distances
+                worker_inflight_slots[worker_index].release()
+                ready_cursor = stop
+                # The publication unit is a completed compute batch.  Small
+                # checkpoint intervals trigger the next completed batch, not
+                # one queue item and filesystem commit per source row.  Larger
+                # intervals coalesce contiguous completed batches into one
+                # durable prefix.  Thus the requested interval remains a
+                # flush threshold while all durable rows are certified.
+                if (
+                    checkpoint_store is None
+                    or ready_cursor - cursor >= int(checkpoint_every_locations)
+                    or ready_cursor == location_count
+                ):
+                    publish(cursor, ready_cursor)
+                    cursor = ready_cursor
 
         def raise_finished_worker_errors() -> None:
             for future in futures.values():
@@ -1626,11 +1685,11 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
                     log_progress()
                     continue
                 raise_finished_worker_errors()
-                if start in pending_chunks:
+                if start < ready_cursor or start in pending_chunks:
                     raise GPUCertificationError(
-                        f"GPU kNN workers returned duplicate completed chunk at start={start}"
+                        f"GPU kNN workers returned an overlapping completed chunk at start={start}"
                     )
-                pending_chunks[start] = (chunk_locations, chunk_distances)
+                pending_chunks[start] = (_worker_index, chunk_locations, chunk_distances)
                 commit_ready()
                 for future in tuple(remaining_futures):
                     if future.done():
@@ -1659,6 +1718,29 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
             self._last_neighbour_compute_seconds = max(0.0, time.perf_counter() - started)
             log_progress(force=True)
             self._merge_multi_metrics()
+            logger.info(
+                "Exact GPU kNN resolved tiles: source_tile_sizes=%s target_tile_sizes=%s "
+                "checkpoint_every=%d checkpoint_batch_size=%d checkpoint_commits=%d "
+                "estimated_tile_counts=%s",
+                {
+                    int(device): int(metrics.get("gpu_effective_source_tile_size", 0) or 0)
+                    for device, metrics in self.per_device_metrics.items()
+                },
+                {
+                    int(device): int(metrics.get("gpu_effective_target_tile_size", 0) or 0)
+                    for device, metrics in self.per_device_metrics.items()
+                },
+                int(checkpoint_every_locations),
+                checkpoint_batch_size,
+                int(self.gpu_checkpoint_commits),
+                {
+                    int(device): {
+                        "source_tiles": int(metrics.get("gpu_source_tiles", 0) or 0),
+                        "target_tiles": int(metrics.get("gpu_target_tiles", 0) or 0),
+                    }
+                    for device, metrics in self.per_device_metrics.items()
+                },
+            )
             for worker in workers:
                 worker.close()
         if checkpoint_store is not None and not preserve_checkpoint:
@@ -1808,6 +1890,20 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
             float(item.get("gpu_cpu_tile_refinement_seconds", 0.0) or 0.0)
             for item in self.per_device_metrics.values()
         )
+        effective_source_tiles = [
+            int(item.get("gpu_effective_source_tile_size", 0) or 0)
+            for item in self.per_device_metrics.values()
+            if int(item.get("gpu_effective_source_tile_size", 0) or 0) > 0
+        ]
+        effective_target_tiles = [
+            int(item.get("gpu_effective_target_tile_size", 0) or 0)
+            for item in self.per_device_metrics.values()
+            if int(item.get("gpu_effective_target_tile_size", 0) or 0) > 0
+        ]
+        if effective_source_tiles:
+            self.gpu_effective_source_tile_size = min(effective_source_tiles)
+        if effective_target_tiles:
+            self.gpu_effective_target_tile_size = min(effective_target_tiles)
 
     def memory_metrics(self) -> dict[str, Any]:
         metrics: dict[str, Any] = dict(super().memory_metrics())
@@ -1839,6 +1935,22 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
                 ),
                 "gpu_effective_source_tile_size": int(self.gpu_effective_source_tile_size),
                 "gpu_effective_target_tile_size": int(self.gpu_effective_target_tile_size),
+                "gpu_effective_source_tile_sizes": {
+                    int(device): int(metrics.get("gpu_effective_source_tile_size", 0) or 0)
+                    for device, metrics in self.per_device_metrics.items()
+                },
+                "gpu_effective_target_tile_sizes": {
+                    int(device): int(metrics.get("gpu_effective_target_tile_size", 0) or 0)
+                    for device, metrics in self.per_device_metrics.items()
+                },
+                "gpu_checkpoint_every_locations": int(self.gpu_checkpoint_every_locations),
+                "gpu_checkpoint_batch_size": int(self.gpu_checkpoint_batch_size),
+                "gpu_checkpoint_commits": int(self.gpu_checkpoint_commits),
+                "gpu_checkpoint_inflight_limit": int(self.gpu_checkpoint_inflight_limit),
+                "gpu_checkpoint_flush_policy": (
+                    "completed compute batches; coalesce contiguous batches until the requested "
+                    "interval or final prefix, with no row-level queue or filesystem flush"
+                ),
                 "gpu_kernel_seconds": float(self.gpu_seconds),
                 "gpu_active_kernel_seconds_sum": float(self.gpu_seconds),
                 "gpu_distance_reduction_seconds": float(self.gpu_distance_reduction_seconds),
