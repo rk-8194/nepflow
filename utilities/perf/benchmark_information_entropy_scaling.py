@@ -114,6 +114,8 @@ def _metric_delta(after: dict[str, Any], before: dict[str, Any]) -> dict[str, An
         "gpu_reference_shards",
         "gpu_fp64_evaluations",
         "gpu_launch_count",
+        "gpu_distance_block_count",
+        "gpu_kernel_launch_equivalent_count",
         "gpu_d2h_transfer_count",
         "gpu_certification_rescans",
         "gpu_ambiguous_boundary_count",
@@ -124,6 +126,7 @@ def _metric_delta(after: dict[str, Any], before: dict[str, Any]) -> dict[str, An
         "gpu_unique_distance_evaluations",
         "gpu_atomic_distance_evaluations",
         "gpu_cpu_tile_refinements",
+        "gpu_allocation_count",
     }
     result: dict[str, Any] = {}
     for key, value in after.items():
@@ -150,6 +153,9 @@ def _metric_delta(after: dict[str, Any], before: dict[str, Any]) -> dict[str, An
         "gpu_conservative_candidate_density",
         "gpu_device_workspace_peak_bytes",
         "gpu_host_workspace_peak_bytes",
+        "gpu_memory_pool_peak_bytes",
+        "gpu_memory_pool_used_peak_bytes",
+        "gpu_distance_block_width",
     ):
         if key in after:
             result[key] = after[key]
@@ -202,6 +208,56 @@ def _exclusive_knn_phase_seconds(metrics: dict[str, Any]) -> dict[str, float]:
     phases["radius_preflight"] = raw_phases["radius_preflight_count"]
     phases["checkpoint_serialization"] = max(0.0, publication - fsync - digest)
     return phases
+
+
+def _gpu_timing_observation(metrics: dict[str, Any]) -> dict[str, Any]:
+    """Expose disjoint GPU timing/throughput gauges in benchmark output."""
+
+    return {
+        "h2d_seconds": float(metrics.get("gpu_h2d_seconds", 0.0) or 0.0),
+        "distance_reduction_seconds": float(
+            metrics.get("gpu_distance_reduction_seconds", 0.0) or 0.0
+        ),
+        "active_kernel_seconds": float(
+            metrics.get("gpu_active_kernel_seconds_sum", 0.0) or 0.0
+        ),
+        "launch_allocation_seconds": float(
+            metrics.get("gpu_launch_allocation_seconds", 0.0) or 0.0
+        ),
+        "allocation_seconds": float(metrics.get("gpu_allocation_seconds", 0.0) or 0.0),
+        "synchronization_seconds": float(
+            metrics.get("gpu_synchronization_seconds", 0.0) or 0.0
+        ),
+        "candidate_compaction_seconds": float(
+            metrics.get("gpu_candidate_compaction_seconds", 0.0) or 0.0
+        ),
+        "compact_d2h_seconds": float(
+            metrics.get("gpu_compact_candidate_d2h_seconds", 0.0) or 0.0
+        ),
+        "cpu_verification_seconds": float(
+            metrics.get("gpu_cpu_verification_seconds", 0.0) or 0.0
+        ),
+        "support_wall_seconds": float(metrics.get("support_query_wall_seconds", 0.0) or 0.0),
+        "distance_comparisons": int(metrics.get("gpu_fp64_evaluations", 0) or 0),
+        "distance_comparisons_per_second": float(
+            metrics.get("gpu_distance_comparisons_per_second", 0.0) or 0.0
+        ),
+        "launch_equivalent_count": int(
+            metrics.get("gpu_kernel_launch_equivalent_count", 0) or 0
+        ),
+        "launch_equivalent_per_tile": float(
+            metrics.get("gpu_launch_equivalent_per_tile", 0.0) or 0.0
+        ),
+        "allocation_count": int(metrics.get("gpu_allocation_count", 0) or 0),
+        "allocation_bytes": int(metrics.get("gpu_allocation_bytes", 0) or 0),
+        "device_workspace_peak_bytes": int(
+            metrics.get("gpu_device_workspace_peak_bytes", 0) or 0
+        ),
+        "memory_pool_peak_bytes": int(metrics.get("gpu_memory_pool_peak_bytes", 0) or 0),
+        "candidate_density": float(
+            metrics.get("gpu_conservative_candidate_density", 0.0) or 0.0
+        ),
+    }
 
 
 def _fixture(
@@ -528,6 +584,7 @@ def _summarize_gpu_observations(
                         "gpu_device_count",
                         "gpu_tile_size",
                         "gpu_source_tile_size",
+                        "gpu_distance_block_width",
                         "gpu_device_occupancy_fraction",
                     }:
                         aggregate[key] = max(float(aggregate.get(key, 0.0)), float(value))
@@ -538,6 +595,26 @@ def _summarize_gpu_observations(
                     else:
                         aggregate[key] = float(aggregate.get(key, 0.0)) + float(value)
                 aggregate["gpu_device"] = device
+                if (
+                    "gpu_fp64_evaluations" in aggregate
+                    and "gpu_distance_reduction_seconds" in aggregate
+                ):
+                    aggregate["gpu_distance_comparisons_per_second"] = (
+                        float(aggregate["gpu_fp64_evaluations"])
+                        / float(aggregate["gpu_distance_reduction_seconds"])
+                        if float(aggregate["gpu_distance_reduction_seconds"]) > 0.0
+                        else 0.0
+                    )
+                if (
+                    "gpu_launch_count" in aggregate
+                    and "gpu_kernel_launch_equivalent_count" in aggregate
+                ):
+                    aggregate["gpu_launch_equivalent_per_tile"] = (
+                        float(aggregate["gpu_kernel_launch_equivalent_count"])
+                        / float(aggregate["gpu_launch_count"])
+                        if float(aggregate["gpu_launch_count"]) > 0.0
+                        else 0.0
+                    )
                 if "support_query_count" in aggregate and "support_query_seconds" in aggregate:
                     aggregate["support_query_throughput_per_second"] = (
                         float(aggregate["support_query_count"])
@@ -630,6 +707,7 @@ def _run_stream(
     operations["cumulative_index_metrics"] = cumulative_index_metrics
     operations["per_run_index_metrics"] = _metric_delta(index_after, index_before)
     operations["completion_seconds"] = elapsed
+    operations["gpu_timing"] = _gpu_timing_observation(operations)
     operations["candidate_throughput_per_second"] = (
         len(pool.candidate_ids) / elapsed if elapsed > 0.0 else 0.0
     )

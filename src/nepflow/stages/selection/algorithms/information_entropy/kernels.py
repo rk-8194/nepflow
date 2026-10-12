@@ -597,6 +597,12 @@ class _KernelSupportProvider:
             metrics.setdefault(key, value)
         return metrics
 
+    def close(self) -> None:
+        """Release optional GPU support pools without owning the neighbour index."""
+
+        if self.gpu_support is not None:
+            self.gpu_support.close()
+
     def normaliser(
         self,
         source_index: int,
@@ -1430,6 +1436,7 @@ def evaluate_leave_one_out_objectives(
         checkpoint_store.clear(checkpoint_name)
         checkpoint_store.clean_stale(checkpoint_names={checkpoint_name})
     provider_metrics = provider.operational_metrics()
+    provider.close()
     total_seconds = max(0.0, time.perf_counter() - loo_started)
     operational_metrics = {
         "wall_seconds": total_seconds,
@@ -1559,6 +1566,8 @@ def evaluate_leave_one_out_objectives(
             "gpu_target_tiles",
             "gpu_fp64_evaluations",
             "gpu_launch_count",
+            "gpu_distance_block_count",
+            "gpu_kernel_launch_equivalent_count",
             "gpu_d2h_transfer_count",
             "gpu_ambiguous_boundary_count",
             "gpu_cpu_rescanned_count",
@@ -1576,6 +1585,8 @@ def evaluate_leave_one_out_objectives(
             "gpu_seconds",
             "gpu_screening_seconds",
             "gpu_kernel_wall_seconds",
+            "gpu_distance_reduction_seconds",
+            "gpu_tile_wall_seconds",
             "gpu_candidate_compaction_seconds",
             "gpu_synchronization_seconds",
             "gpu_active_kernel_seconds_sum",
@@ -1586,6 +1597,11 @@ def evaluate_leave_one_out_objectives(
             "gpu_full_tile_d2h_seconds",
             "gpu_compact_candidate_d2h_seconds",
             "gpu_launch_allocation_seconds",
+            "gpu_memory_pool_peak_bytes",
+            "gpu_memory_pool_used_peak_bytes",
+            "gpu_allocation_bytes",
+            "gpu_allocation_count",
+            "gpu_allocation_seconds",
             "gpu_certification_seconds",
             "gpu_cpu_verification_seconds",
             "gpu_cpu_tile_refinement_seconds",
@@ -2057,8 +2073,10 @@ def build_sparse_atomic_kernel_graph(
         )
     except Exception as exc:
         logger.error("Sparse atomic kernel graph failed: %s", exc)
+        support_provider.close()
         raise
 
+    support_provider.close()
     elapsed, _, _ = _progress_timing(n_rows, n_rows, started)
     support_sizes = graph.support_sizes
     logger.info(
@@ -3199,6 +3217,7 @@ def build_streamed_candidate_contributions(
         source_loop_seconds = max(0.0, time.perf_counter() - source_phase_started)
     except BaseException as exc:
         logger.error("Streamed candidate contributions failed: %s", exc)
+        support_provider.close()
         lease.close()
         if isinstance(exc, OSError):
             raise ResourceCapacityError(
@@ -3217,6 +3236,7 @@ def build_streamed_candidate_contributions(
 
     sample_lease()
     provider_metrics = support_provider.operational_metrics()
+    support_provider.close()
     operational_metrics = {
         "wall_seconds": max(0.0, time.perf_counter() - started),
         "source_loop_seconds": source_loop_seconds,

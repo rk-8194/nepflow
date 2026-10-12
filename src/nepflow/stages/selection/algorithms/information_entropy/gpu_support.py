@@ -28,6 +28,10 @@ from .models import KERNEL_SUPPORT_EXECUTION_GPU_VERSION
 
 _FLOAT64_UNIT_ROUNDOFF = np.finfo(np.float64).eps / 2.0
 _FLOAT64_MIN_SUBNORMAL = float(np.nextafter(np.float64(0.0), np.float64(1.0)))
+# A subdimension block is deliberately small.  It bounds the only temporary
+# with three spatial axes while reducing the Python/CuPy dispatch count for the
+# production d'=42 descriptors from 42 launches/groups to six.
+_DISTANCE_BLOCK_WIDTH = 8
 
 
 class GPUSupportError(RuntimeError):
@@ -152,6 +156,8 @@ class ExactTiledGPUSupport:
             self.target_tiles = 0
             self.fp64_evaluations = 0
             self.gpu_launch_count = 0
+            self.gpu_distance_block_count = 0
+            self.gpu_kernel_launch_equivalent_count = 0
             self.d2h_transfer_count = 0
             self.ambiguous_boundary_count = 0
             self.cpu_rescanned_count = 0
@@ -167,8 +173,19 @@ class ExactTiledGPUSupport:
             self.compact_candidate_d2h_seconds = 0.0
             self.gpu_seconds = 0.0
             self.gpu_screening_seconds = 0.0
+            self.gpu_active_kernel_seconds = 0.0
+            self.gpu_distance_reduction_seconds = 0.0
+            self.gpu_launch_allocation_seconds = 0.0
+            self.gpu_tile_wall_seconds = 0.0
             self.gpu_candidate_compaction_seconds = 0.0
             self.gpu_synchronization_seconds = 0.0
+            self.gpu_memory_pool_peak_bytes = 0
+            self.gpu_memory_pool_used_peak_bytes = 0
+            self.gpu_allocation_bytes = 0
+            self.gpu_allocation_count = 0
+            self.gpu_allocation_seconds = 0.0
+            self._gpu_target_workspace = None
+            self._gpu_radii_workspace = None
             self.cpu_verification_seconds = 0.0
             self.support_query_count = 0
             self.support_entries = 0
@@ -259,6 +276,8 @@ class ExactTiledGPUSupport:
         self.target_tiles = 0
         self.fp64_evaluations = 0
         self.gpu_launch_count = 0
+        self.gpu_distance_block_count = 0
+        self.gpu_kernel_launch_equivalent_count = 0
         self.d2h_transfer_count = 0
         self.ambiguous_boundary_count = 0
         self.cpu_rescanned_count = 0
@@ -276,8 +295,19 @@ class ExactTiledGPUSupport:
         self.host_workspace_peak_bytes = 0
         self.gpu_seconds = 0.0
         self.gpu_screening_seconds = 0.0
+        self.gpu_active_kernel_seconds = 0.0
+        self.gpu_distance_reduction_seconds = 0.0
+        self.gpu_launch_allocation_seconds = 0.0
+        self.gpu_tile_wall_seconds = 0.0
         self.gpu_candidate_compaction_seconds = 0.0
         self.gpu_synchronization_seconds = 0.0
+        self.gpu_memory_pool_peak_bytes = 0
+        self.gpu_memory_pool_used_peak_bytes = 0
+        self.gpu_allocation_bytes = 0
+        self.gpu_allocation_count = 0
+        self.gpu_allocation_seconds = 0.0
+        self._gpu_target_workspace = None
+        self._gpu_radii_workspace = None
         self.cpu_verification_seconds = 0.0
         self.support_query_count = 0
         self.support_entries = 0
@@ -319,17 +349,21 @@ class ExactTiledGPUSupport:
         dimension = int(self.descriptors.shape[1])
         source_count = max(1, min(int(source_count), self.requested_tile_size))
         target_count = min(self.requested_tile_size, int(self.descriptors.shape[0]))
+        block_width = min(dimension, _DISTANCE_BLOCK_WIDTH)
 
         def required(sources: int, targets: int) -> int:
-            # Reserve distance-square, certified-error, lower-bound, mask and
-            # compact-index workspaces.  The dimension loop never creates an
-            # N x N x d array, and the compact index output is bounded by the
-            # tile itself even for dense supports.
-            # The coefficient includes overlapping CuPy temporaries created
-            # by the interval arithmetic and compact payload construction;
-            # conservative over-reservation is preferable to an allocator
-            # failure after a tile has already been launched.
-            return int(160 * sources * targets + 8 * (sources + targets) * dimension)
+            # Reserve the two-dimensional interval/reduction state, a bounded
+            # S x T x block_width descriptor temporary, descriptor uploads and
+            # compact-index workspaces.  The block width is fixed, so this can
+            # never become an S x T x d or N x N x d materialisation.  The
+            # coefficient includes overlapping CuPy temporaries created by
+            # broadcasting and reduction; conservative over-reservation is
+            # preferable to an allocator failure after a tile is launched.
+            return int(
+                320 * sources * targets
+                + 24 * block_width * sources * targets
+                + 8 * (sources + targets) * dimension
+            )
 
         while required(source_count, target_count) > self.max_device_bytes:
             if target_count > 1:
@@ -346,6 +380,99 @@ class ExactTiledGPUSupport:
                     available_bytes=self.max_device_bytes,
                 )
         return source_count, target_count, required(source_count, target_count)
+
+    def _distance_block_width(self) -> int:
+        """Return the bounded descriptor width used by the vectorized reducer."""
+
+        return min(int(self.descriptors.shape[1]), _DISTANCE_BLOCK_WIDTH)
+
+    def _memory_pool_snapshot(self) -> tuple[int, int]:
+        """Return (cached-pool-bytes, in-use-pool-bytes) when CuPy exposes it."""
+
+        pool_factory = getattr(self._cp, "get_default_memory_pool", None)
+        if pool_factory is None:
+            return 0, 0
+        try:
+            pool = pool_factory()
+            total = getattr(pool, "total_bytes", None)
+            used = getattr(pool, "used_bytes", None)
+            total_bytes = int(total()) if callable(total) else 0
+            used_bytes = int(used()) if callable(used) else 0
+            return max(0, total_bytes), max(0, used_bytes)
+        except Exception:
+            # Pool diagnostics must never become a backend fallback or affect
+            # the certified screening path.
+            return 0, 0
+
+    def _upload_reusable_tile(self, attribute: str, values: np.ndarray) -> Any:
+        """Copy one bounded host tile into a per-worker reusable device buffer."""
+
+        empty = getattr(self._cp, "empty", None)
+        if empty is None:
+            allocation_started = time.perf_counter()
+            result = self._cp.asarray(values, dtype=self._cp.float64)
+            self.gpu_allocation_seconds += max(0.0, time.perf_counter() - allocation_started)
+            return result
+        existing = getattr(self, attribute)
+        rows = int(values.shape[0])
+        trailing_shape = tuple(int(size) for size in values.shape[1:])
+        if (
+            existing is None
+            or existing.shape[0] < rows
+            or tuple(int(size) for size in existing.shape[1:]) != trailing_shape
+        ):
+            capacity = rows if existing is None else max(rows, int(existing.shape[0]) * 2)
+            allocation_started = time.perf_counter()
+            existing = empty((capacity, *trailing_shape), dtype=self._cp.float64)
+            self.gpu_allocation_seconds += max(0.0, time.perf_counter() - allocation_started)
+            setattr(self, attribute, existing)
+        view = existing[:rows]
+        view[...] = values
+        return view
+
+    def _record_memory_pool_growth(
+        self, before: tuple[int, int], after: tuple[int, int]
+    ) -> None:
+        before_total, _ = before
+        after_total, after_used = after
+        self.gpu_memory_pool_peak_bytes = max(self.gpu_memory_pool_peak_bytes, after_total)
+        self.gpu_memory_pool_used_peak_bytes = max(
+            self.gpu_memory_pool_used_peak_bytes, after_used
+        )
+        growth = max(0, after_total - before_total)
+        if growth:
+            self.gpu_allocation_bytes += growth
+            self.gpu_allocation_count += 1
+
+    def _cuda_event_start(self) -> Any | None:
+        """Start optional device timing without requiring CUDA in test doubles."""
+
+        event_factory = getattr(self._cp.cuda, "Event", None)
+        if event_factory is None:
+            return None
+        try:
+            event = event_factory()
+            event.record()
+            return event
+        except Exception:
+            return None
+
+    def _cuda_event_elapsed(self, started: Any | None) -> float | None:
+        """Return elapsed CUDA seconds for an event pair, if supported."""
+
+        if started is None:
+            return None
+        event_factory = getattr(self._cp.cuda, "Event", None)
+        if event_factory is None:
+            return None
+        try:
+            stopped = event_factory()
+            stopped.record()
+            self._synchronize_current_stream()
+            elapsed_ms = started.elapsed_time(stopped)
+            return max(0.0, float(elapsed_ms) / 1000.0)
+        except Exception:
+            return None
 
     def _synchronize_current_stream(self) -> None:
         """Synchronize when the runtime exposes a stream primitive.
@@ -396,15 +523,17 @@ class ExactTiledGPUSupport:
             raise ValueError("screening radii must align with the source tile")
         gpu_started = time.perf_counter()
         with cp.cuda.Device(self.device):
+            pool_before = self._memory_pool_snapshot()
             transfer_started = time.perf_counter()
             if gpu_sources is None:
                 gpu_sources = cp.asarray(source_values, dtype=cp.float64)
                 self.h2d_bytes += int(source_values.nbytes)
-            gpu_targets = cp.asarray(target_values, dtype=cp.float64)
-            gpu_radii = cp.asarray(radii_values, dtype=cp.float64)
+            gpu_targets = self._upload_reusable_tile("_gpu_target_workspace", target_values)
+            gpu_radii = self._upload_reusable_tile("_gpu_radii_workspace", radii_values)
             self.h2d_seconds += max(0.0, time.perf_counter() - transfer_started)
             self.h2d_bytes += int(target_values.nbytes + radii_values.nbytes)
             screening_started = time.perf_counter()
+            cuda_screening_event = self._cuda_event_start()
             distance_squared = cp.zeros(
                 (source_indices.size, target_indices.size), dtype=cp.float64
             )
@@ -414,26 +543,103 @@ class ExactTiledGPUSupport:
             dimension_count = int(self.descriptors.shape[1])
             unit_roundoff = _FLOAT64_UNIT_ROUNDOFF
             min_subnormal = _FLOAT64_MIN_SUBNORMAL
-            for dimension in range(self.descriptors.shape[1]):
-                delta = gpu_targets[None, :, dimension] - gpu_sources[:, None, dimension]
-                coordinate_scale = cp.abs(
-                    gpu_targets[None, :, dimension]
-                ) + cp.abs(gpu_sources[:, None, dimension])
-                # Inflate the rounded absolute-coordinate sum before using it
-                # as the subtraction scale; this also covers subnormal
-                # addition and cancellation cases.
+            sum_operation = getattr(cp, "sum", None)
+            if sum_operation is None:
+                raise GPUSupportError(
+                    "exact tiled GPU support requires CuPy's float64 reduction primitive"
+                )
+            distance_block_width = self._distance_block_width()
+            distance_block_count = 0
+            # Each block creates only S x T x block_width temporaries.  The
+            # block reduction is enclosed explicitly: the radius certificate
+            # remains valid for CuPy's reduction order rather than assuming a
+            # particular tree or FMA implementation.
+            for block_start in range(0, dimension_count, distance_block_width):
+                block_stop = min(block_start + distance_block_width, dimension_count)
+                block_width = block_stop - block_start
+                target_block = gpu_targets[None, :, block_start:block_stop]
+                source_block = gpu_sources[:, None, block_start:block_stop]
+                delta = target_block - source_block
+                coordinate_scale = cp.abs(target_block) + cp.abs(source_block)
                 coordinate_scale = (
                     coordinate_scale
                     + 2.0 * unit_roundoff * coordinate_scale
                     + 2.0 * min_subnormal
                 )
-                subtraction_error = unit_roundoff * coordinate_scale + min_subnormal
-                computed_scale = coordinate_scale + subtraction_error
-                distance_squared += delta * delta
-                square_error += (
-                    (2.0 * coordinate_scale + subtraction_error) * subtraction_error
-                    + unit_roundoff * computed_scale * computed_scale
-                    + min_subnormal
+
+                block_distance_squared = sum_operation(
+                    delta * delta, axis=2, dtype=cp.float64
+                )
+                scale_sum = sum_operation(coordinate_scale, axis=2, dtype=cp.float64)
+                scale_squared_sum = sum_operation(
+                    coordinate_scale * coordinate_scale,
+                    axis=2,
+                    dtype=cp.float64,
+                )
+                block_unit_roundoff = block_width * unit_roundoff
+                block_gamma = (
+                    block_unit_roundoff / (1.0 - block_unit_roundoff)
+                    if block_unit_roundoff < 1.0
+                    else np.inf
+                )
+
+                # Bound the rounded reductions of scale and scale**2 from
+                # above before using them to enclose subtraction/square
+                # error.  All reductions are non-negative, so a relative
+                # gamma bound plus a subnormal term is sufficient.
+                scale_sum_upper = (
+                    scale_sum * (1.0 + 2.0 * block_gamma)
+                    + block_width * min_subnormal
+                )
+                scale_squared_upper = (
+                    scale_squared_sum
+                    * (1.0 + 4.0 * unit_roundoff)
+                    * (1.0 + 2.0 * block_gamma)
+                    + block_width * min_subnormal
+                )
+                quadratic_coefficient = (
+                    2.0 * unit_roundoff
+                    + unit_roundoff * unit_roundoff
+                    + unit_roundoff * (1.0 + unit_roundoff) ** 2
+                )
+                linear_coefficient = min_subnormal * (
+                    2.0
+                    + 2.0 * unit_roundoff
+                    + 2.0 * unit_roundoff * (1.0 + unit_roundoff)
+                )
+                constant_error = block_width * (
+                    min_subnormal + min_subnormal * min_subnormal * (1.0 + unit_roundoff)
+                )
+                block_square_error = (
+                    quadratic_coefficient * scale_squared_upper
+                    + linear_coefficient * scale_sum_upper
+                    + constant_error
+                )
+                # Enclose the non-negative block sum and the scalar
+                # accumulation of its error estimate.  This is deliberately
+                # wider than a hardware-specific reduction bound.
+                block_square_error = (
+                    2.0 * block_square_error
+                    + 4.0
+                    * block_gamma
+                    * (cp.abs(block_distance_squared) + cp.abs(block_square_error))
+                    + (4.0 * block_width + 4.0) * min_subnormal
+                )
+                distance_squared += block_distance_squared
+                square_error += block_square_error
+                distance_block_count += 1
+
+                del (
+                    target_block,
+                    source_block,
+                    delta,
+                    coordinate_scale,
+                    block_distance_squared,
+                    scale_sum,
+                    scale_squared_sum,
+                    scale_sum_upper,
+                    scale_squared_upper,
+                    block_square_error,
                 )
             if dimension_count * unit_roundoff < 1.0:
                 summation_gamma = (dimension_count * unit_roundoff) / (
@@ -490,9 +696,39 @@ class ExactTiledGPUSupport:
             # certification instead of being excluded by a NaN comparison.
             potential = potential | ~finite
             boundary = boundary | ~finite
-            self._synchronize_current_stream()
+            synchronization_before = self.gpu_synchronization_seconds
+            cuda_active_seconds = self._cuda_event_elapsed(cuda_screening_event)
+            screening_synchronization_seconds = max(
+                0.0, self.gpu_synchronization_seconds - synchronization_before
+            )
+            if cuda_active_seconds is None:
+                fallback_synchronization_before = self.gpu_synchronization_seconds
+                self._synchronize_current_stream()
+                screening_synchronization_seconds += max(
+                    0.0,
+                    self.gpu_synchronization_seconds - fallback_synchronization_before,
+                )
+                cuda_active_seconds = max(
+                    0.0,
+                    time.perf_counter() - screening_started
+                    - screening_synchronization_seconds,
+                )
         screening_seconds = max(0.0, time.perf_counter() - screening_started)
         self.gpu_screening_seconds += screening_seconds
+        self.gpu_active_kernel_seconds += float(cuda_active_seconds)
+        self.gpu_distance_reduction_seconds += screening_seconds
+        self.gpu_launch_allocation_seconds += max(
+            0.0,
+            screening_seconds
+            - float(cuda_active_seconds)
+            - screening_synchronization_seconds,
+        )
+        self.gpu_distance_block_count += distance_block_count
+        # This is a stable, backend-independent launch-equivalent diagnostic:
+        # six high-level vectorized groups per descriptor block plus the fixed
+        # interval/mask groups.  It is intentionally not presented as a CUDA
+        # hardware kernel count.
+        self.gpu_kernel_launch_equivalent_count += 6 * distance_block_count + 10
 
         compaction_started = time.perf_counter()
         with cp.cuda.Device(self.device):
@@ -511,6 +747,7 @@ class ExactTiledGPUSupport:
         transfer_started = time.perf_counter()
         with cp.cuda.Device(self.device):
             candidate_host = np.asarray(cp.asnumpy(candidate_payload), dtype=np.int64)
+            pool_after = self._memory_pool_snapshot()
         transfer_seconds = max(0.0, time.perf_counter() - transfer_started)
         if candidate_host.ndim == 1:
             candidate_flat = candidate_host
@@ -522,7 +759,10 @@ class ExactTiledGPUSupport:
         self.compact_candidate_d2h_bytes += int(candidate_host.nbytes)
         self.d2h_bytes += int(candidate_host.nbytes)
         self.compact_candidate_d2h_transfer_count += 1
-        self.gpu_seconds += max(0.0, time.perf_counter() - gpu_started)
+        self._record_memory_pool_growth(pool_before, pool_after)
+        tile_wall_seconds = max(0.0, time.perf_counter() - gpu_started)
+        self.gpu_seconds += tile_wall_seconds
+        self.gpu_tile_wall_seconds += tile_wall_seconds
         self.gpu_launch_count += 1
         self.d2h_transfer_count += 1
         self.fp64_evaluations += int(source_indices.size * target_indices.size)
@@ -806,6 +1046,21 @@ class ExactTiledGPUSupport:
                 "gpu_target_tiles": self.target_tiles,
                 "gpu_fp64_evaluations": self.fp64_evaluations,
                 "gpu_launch_count": self.gpu_launch_count,
+                "gpu_distance_block_count": self.gpu_distance_block_count,
+                "gpu_kernel_launch_equivalent_count": (
+                    self.gpu_kernel_launch_equivalent_count
+                ),
+                "gpu_distance_block_width": self._distance_block_width(),
+                "gpu_distance_comparisons_per_second": (
+                    self.fp64_evaluations / self.gpu_distance_reduction_seconds
+                    if self.gpu_distance_reduction_seconds > 0.0
+                    else 0.0
+                ),
+                "gpu_launch_equivalent_per_tile": (
+                    self.gpu_kernel_launch_equivalent_count / self.gpu_launch_count
+                    if self.gpu_launch_count
+                    else 0.0
+                ),
                 "gpu_d2h_transfer_count": self.d2h_transfer_count,
                 "gpu_ambiguous_boundary_count": self.ambiguous_boundary_count,
                 "gpu_exact_boundary_recertifications": self.ambiguous_boundary_count,
@@ -833,10 +1088,21 @@ class ExactTiledGPUSupport:
                 "gpu_seconds": self.gpu_seconds,
                 "gpu_screening_seconds": self.gpu_screening_seconds,
                 "gpu_kernel_wall_seconds": self.gpu_screening_seconds,
+                "gpu_active_kernel_seconds_sum": self.gpu_active_kernel_seconds,
+                "gpu_active_operation_seconds_sum": self.gpu_active_kernel_seconds,
+                "gpu_operation_seconds_inclusive": self.gpu_seconds,
+                "gpu_distance_reduction_seconds": self.gpu_distance_reduction_seconds,
+                "gpu_launch_allocation_seconds": self.gpu_launch_allocation_seconds,
+                "gpu_tile_wall_seconds": self.gpu_tile_wall_seconds,
                 "gpu_candidate_compaction_seconds": self.gpu_candidate_compaction_seconds,
                 "gpu_synchronization_seconds": self.gpu_synchronization_seconds,
+                "gpu_memory_pool_peak_bytes": self.gpu_memory_pool_peak_bytes,
+                "gpu_memory_pool_used_peak_bytes": self.gpu_memory_pool_used_peak_bytes,
+                "gpu_allocation_bytes": self.gpu_allocation_bytes,
+                "gpu_allocation_count": self.gpu_allocation_count,
+                "gpu_allocation_seconds": self.gpu_allocation_seconds,
                 "gpu_strict_radius_screening_seconds": self.gpu_screening_seconds,
-                "gpu_active_seconds_sum": float(self.gpu_seconds),
+                "gpu_active_seconds_sum": float(self.gpu_active_kernel_seconds),
                 "gpu_wall_seconds": float(self.support_wall_seconds),
                 "gpu_parallelism_estimate": (
                     self.gpu_seconds / self.support_wall_seconds
@@ -854,6 +1120,19 @@ class ExactTiledGPUSupport:
                     else 0.0
                 ),
                 "gpu_per_device": per_device,
+                "gpu_distance_comparisons_per_second_definition": (
+                    "fp64 source-target comparisons divided by the inclusive device "
+                    "distance/reduction section wall time"
+                ),
+                "gpu_kernel_launch_equivalent_definition": (
+                    "stable count of high-level vectorized CuPy operation groups; not a "
+                    "hardware CUDA kernel count"
+                ),
+                "gpu_active_time_definition": (
+                    "CUDA event elapsed time for the on-device screening section when "
+                    "events are available; otherwise the synchronized screening wall "
+                    "time is reported as a conservative fallback"
+                ),
             }
             return aggregate
         free_bytes, total_bytes = self._device_memory_info()
@@ -877,6 +1156,19 @@ class ExactTiledGPUSupport:
             "gpu_target_tiles": self.target_tiles,
             "gpu_fp64_evaluations": self.fp64_evaluations,
             "gpu_launch_count": self.gpu_launch_count,
+            "gpu_distance_block_count": self.gpu_distance_block_count,
+            "gpu_kernel_launch_equivalent_count": self.gpu_kernel_launch_equivalent_count,
+            "gpu_distance_block_width": self._distance_block_width(),
+            "gpu_distance_comparisons_per_second": (
+                self.fp64_evaluations / self.gpu_distance_reduction_seconds
+                if self.gpu_distance_reduction_seconds > 0.0
+                else 0.0
+            ),
+            "gpu_launch_equivalent_per_tile": (
+                self.gpu_kernel_launch_equivalent_count / self.gpu_launch_count
+                if self.gpu_launch_count
+                else 0.0
+            ),
             "gpu_d2h_transfer_count": self.d2h_transfer_count,
             "gpu_ambiguous_boundary_count": self.ambiguous_boundary_count,
             "gpu_exact_boundary_recertifications": self.ambiguous_boundary_count,
@@ -904,10 +1196,21 @@ class ExactTiledGPUSupport:
             "gpu_seconds": self.gpu_seconds,
             "gpu_screening_seconds": self.gpu_screening_seconds,
             "gpu_kernel_wall_seconds": self.gpu_screening_seconds,
+            "gpu_active_kernel_seconds_sum": self.gpu_active_kernel_seconds,
+            "gpu_active_operation_seconds_sum": self.gpu_active_kernel_seconds,
+            "gpu_operation_seconds_inclusive": self.gpu_seconds,
+            "gpu_distance_reduction_seconds": self.gpu_distance_reduction_seconds,
+            "gpu_launch_allocation_seconds": self.gpu_launch_allocation_seconds,
+            "gpu_tile_wall_seconds": self.gpu_tile_wall_seconds,
             "gpu_candidate_compaction_seconds": self.gpu_candidate_compaction_seconds,
             "gpu_synchronization_seconds": self.gpu_synchronization_seconds,
+            "gpu_memory_pool_peak_bytes": self.gpu_memory_pool_peak_bytes,
+            "gpu_memory_pool_used_peak_bytes": self.gpu_memory_pool_used_peak_bytes,
+            "gpu_allocation_bytes": self.gpu_allocation_bytes,
+            "gpu_allocation_count": self.gpu_allocation_count,
+            "gpu_allocation_seconds": self.gpu_allocation_seconds,
             "gpu_strict_radius_screening_seconds": self.gpu_screening_seconds,
-            "gpu_active_seconds_sum": float(self.gpu_seconds),
+            "gpu_active_seconds_sum": float(self.gpu_active_kernel_seconds),
             "gpu_wall_seconds": float(self.support_query_seconds),
             "gpu_parallelism_estimate": 1.0 if self.support_query_seconds > 0.0 else 0.0,
             "gpu_cpu_verification_seconds": self.cpu_verification_seconds,
@@ -922,6 +1225,19 @@ class ExactTiledGPUSupport:
                 else 0.0
             ),
         }
+        metrics["gpu_distance_comparisons_per_second_definition"] = (
+            "fp64 source-target comparisons divided by the inclusive device "
+            "distance/reduction section wall time"
+        )
+        metrics["gpu_kernel_launch_equivalent_definition"] = (
+            "stable count of high-level vectorized CuPy operation groups; not a "
+            "hardware CUDA kernel count"
+        )
+        metrics["gpu_active_time_definition"] = (
+            "CUDA event elapsed time for the on-device screening section when events "
+            "are available; otherwise the synchronized screening wall time is reported "
+            "as a conservative fallback"
+        )
         metrics["gpu_per_device"] = [dict(metrics)]
         return metrics
 
@@ -936,6 +1252,8 @@ class ExactTiledGPUSupport:
             "target_tiles",
             "fp64_evaluations",
             "gpu_launch_count",
+            "gpu_distance_block_count",
+            "gpu_kernel_launch_equivalent_count",
             "d2h_transfer_count",
             "ambiguous_boundary_count",
             "cpu_rescanned_count",
@@ -960,6 +1278,10 @@ class ExactTiledGPUSupport:
                                 "target_tiles": "gpu_target_tiles",
                                 "fp64_evaluations": "gpu_fp64_evaluations",
                                 "gpu_launch_count": "gpu_launch_count",
+                                "gpu_distance_block_count": "gpu_distance_block_count",
+                                "gpu_kernel_launch_equivalent_count": (
+                                    "gpu_kernel_launch_equivalent_count"
+                                ),
                                 "d2h_transfer_count": "gpu_d2h_transfer_count",
                                 "ambiguous_boundary_count": "gpu_ambiguous_boundary_count",
                                 "cpu_rescanned_count": "gpu_cpu_rescanned_count",
@@ -1007,6 +1329,21 @@ class ExactTiledGPUSupport:
         self.gpu_screening_seconds = sum(
             float(item.get("gpu_screening_seconds", 0.0) or 0.0) for item in metrics
         )
+        self.gpu_active_kernel_seconds = sum(
+            float(item.get("gpu_active_kernel_seconds_sum", 0.0) or 0.0)
+            for item in metrics
+        )
+        self.gpu_distance_reduction_seconds = sum(
+            float(item.get("gpu_distance_reduction_seconds", 0.0) or 0.0)
+            for item in metrics
+        )
+        self.gpu_launch_allocation_seconds = sum(
+            float(item.get("gpu_launch_allocation_seconds", 0.0) or 0.0)
+            for item in metrics
+        )
+        self.gpu_tile_wall_seconds = sum(
+            float(item.get("gpu_tile_wall_seconds", 0.0) or 0.0) for item in metrics
+        )
         self.gpu_candidate_compaction_seconds = sum(
             float(item.get("gpu_candidate_compaction_seconds", 0.0) or 0.0)
             for item in metrics
@@ -1014,6 +1351,21 @@ class ExactTiledGPUSupport:
         self.gpu_synchronization_seconds = sum(
             float(item.get("gpu_synchronization_seconds", 0.0) or 0.0)
             for item in metrics
+        )
+        self.gpu_memory_pool_peak_bytes = max(
+            int(item.get("gpu_memory_pool_peak_bytes", 0) or 0) for item in metrics
+        )
+        self.gpu_memory_pool_used_peak_bytes = max(
+            int(item.get("gpu_memory_pool_used_peak_bytes", 0) or 0) for item in metrics
+        )
+        self.gpu_allocation_bytes = sum(
+            int(item.get("gpu_allocation_bytes", 0) or 0) for item in metrics
+        )
+        self.gpu_allocation_count = sum(
+            int(item.get("gpu_allocation_count", 0) or 0) for item in metrics
+        )
+        self.gpu_allocation_seconds = sum(
+            float(item.get("gpu_allocation_seconds", 0.0) or 0.0) for item in metrics
         )
         self.cpu_verification_seconds = sum(
             float(item.get("gpu_cpu_verification_seconds", 0.0) or 0.0) for item in metrics
@@ -1029,6 +1381,8 @@ class ExactTiledGPUSupport:
             worker.close()
         try:
             with self._cp.cuda.Device(self.device):
+                self._gpu_target_workspace = None
+                self._gpu_radii_workspace = None
                 for name in ("get_default_memory_pool", "get_default_pinned_memory_pool"):
                     pool_factory = getattr(self._cp, name, None)
                     if pool_factory is not None:
