@@ -686,12 +686,31 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
             ),
         )
         relative = float(self.certification_relative_bound)
-        threshold = float(reported_boundary * (1.0 + relative))
-        for _ in range(4):
-            threshold = float(np.nextafter(threshold, np.inf))
-        if np.isnan(threshold):
+        lower_denominator = float(1.0 + relative)
+        upper_denominator = float(1.0 - relative)
+        if (
+            not np.isfinite(lower_denominator)
+            or not np.isfinite(upper_denominator)
+            or lower_denominator <= 0.0
+            or upper_denominator <= 0.0
+        ):
             raise GPUCertificationError(
-                "adaptive GPU boundary refinement produced a non-finite inclusion threshold"
+                "adaptive GPU boundary refinement has an unsupported FP64 interval bound"
+            )
+        for _ in range(4):
+            lower_denominator = float(np.nextafter(lower_denominator, np.inf))
+            upper_denominator = float(np.nextafter(upper_denominator, 0.0))
+        # The CPU and GPU distances are independent rounded evaluations.  A
+        # candidate remains in the exact CPU set whenever its GPU lower
+        # endpoint can touch the CPU kth upper endpoint.  The adjacent
+        # representable steps cover the scalar division roundings; rejecting
+        # an interval that becomes non-finite is fail-closed.
+        cpu_kth_upper = float(reported_boundary / upper_denominator)
+        for _ in range(4):
+            cpu_kth_upper = float(np.nextafter(cpu_kth_upper, np.inf))
+        if not np.isfinite(cpu_kth_upper):
+            raise GPUCertificationError(
+                "adaptive GPU boundary refinement produced an unrepresentable CPU interval"
             )
 
         canonical_started = time.perf_counter()
@@ -788,7 +807,17 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
                         self.distance_evaluations += target_count
                         self.unique_distance_evaluations += target_count
 
-                        candidate_mask = host_distances <= threshold
+                        gpu_lower = np.asarray(
+                            host_distances / lower_denominator, dtype=np.float64
+                        )
+                        for _ in range(4):
+                            gpu_lower = np.nextafter(gpu_lower, 0.0)
+                        if not np.all(np.isfinite(gpu_lower)):
+                            raise GPUCertificationError(
+                                "adaptive GPU boundary refinement produced an "
+                                "unrepresentable GPU interval"
+                            )
+                        candidate_mask = gpu_lower <= cpu_kth_upper
                         candidate_offsets = np.flatnonzero(candidate_mask).astype(
                             np.int64, copy=False
                         )
@@ -947,8 +976,20 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
         )
         omitted = certified_locations.size < int(self.unique_locations.shape[0] - 1)
         relative = self.certification_relative_bound
-        lower = float(omitted_bound / (1.0 + relative))
-        upper = float(reported_boundary * (1.0 + relative))
+        lower_denominator = float(1.0 + relative)
+        upper_denominator = float(1.0 - relative)
+        if (
+            not np.isfinite(lower_denominator)
+            or not np.isfinite(upper_denominator)
+            or lower_denominator <= 0.0
+            or upper_denominator <= 0.0
+        ):
+            raise GPUCertificationError("GPU FP64 certification interval is unsupported")
+        for _ in range(4):
+            lower_denominator = float(np.nextafter(lower_denominator, np.inf))
+            upper_denominator = float(np.nextafter(upper_denominator, 0.0))
+        lower = float(omitted_bound / lower_denominator)
+        upper = float(reported_boundary / upper_denominator)
         # The gamma bound covers the GPU arithmetic.  The repeated adjacent
         # representable steps also cover the host-side division/product used
         # to turn that bound into an interval; this keeps the proof outward
@@ -956,7 +997,7 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
         for _ in range(4):
             lower = float(np.nextafter(lower, 0.0))
             upper = float(np.nextafter(upper, np.inf))
-        legacy_lower = float(legacy_omitted_bound / (1.0 + relative))
+        legacy_lower = float(legacy_omitted_bound / lower_denominator)
         for _ in range(4):
             legacy_lower = float(np.nextafter(legacy_lower, 0.0))
         legacy_certifiable = bool(
@@ -2320,7 +2361,7 @@ class ExactTiledGPUNeighbourIndex(TiledCPUNeighbourIndex):
                 "gpu_certified_tiles": int(self.certified_tiles),
                 "gpu_final_certifications": int(self.final_certifications),
                 "gpu_certification_relative_bound": float(self.certification_relative_bound),
-                "gpu_certification_contract": "fp64-gamma-bound-v2",
+                "gpu_certification_contract": "fp64-gamma-independent-interval-v3",
                 "gpu_certification_fp64_safe": bool(self._gpu_fp64_certification_safe),
                 "gpu_certification_safety_scope": (
                     "pool-wide diagnostic only; final certification uses source-local "

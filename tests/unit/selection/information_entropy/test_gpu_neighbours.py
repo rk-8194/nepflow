@@ -26,7 +26,12 @@ from nepflow.stages.selection.algorithms.information_entropy.neighbours import (
 )
 
 
-def _fake_cupy(*, device_count: int = 1, free_bytes: int = 64 * 1024 * 1024):
+def _fake_cupy(
+    *,
+    device_count: int = 1,
+    free_bytes: int = 64 * 1024 * 1024,
+    sqrt_fn: Any = np.sqrt,
+):
     class Device:
         def __init__(self, ordinal: int):
             self.ordinal = ordinal
@@ -48,7 +53,7 @@ def _fake_cupy(*, device_count: int = 1, free_bytes: int = 64 * 1024 * 1024):
         asnumpy=np.asarray,
         zeros=np.zeros,
         full=np.full,
-        sqrt=np.sqrt,
+        sqrt=sqrt_fn,
         sum=np.sum,
         max=np.max,
         minimum=np.minimum,
@@ -263,6 +268,87 @@ def test_fake_gpu_knn_adaptively_resolves_kth_boundary_ties(
     assert metrics["gpu_boundary_refinements"] > 0
     assert metrics["gpu_boundary_refinement_candidate_count"] >= 4
     assert metrics["gpu_certification_rescans"] == 0
+    index.close()
+
+
+def test_fake_gpu_boundary_filter_keeps_opposite_rounding_near_tie(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Independent CPU/GPU error directions must not drop a true competitor."""
+
+    from nepflow.stages.selection.algorithms.information_entropy.gpu_neighbours import (
+        ExactTiledGPUNeighbourIndex,
+        _gamma_bound,
+    )
+
+    gamma = _gamma_bound(42)
+    candidate_value = 1.0 - 0.25 * gamma
+
+    def adversarial_sqrt(values: np.ndarray) -> np.ndarray:
+        distances = np.sqrt(values)
+        candidate = (values > 1.0 - 2.0 * gamma) & (values < 1.0)
+        return np.where(candidate, distances + 1.5 * gamma, distances)
+
+    monkeypatch.setitem(sys.modules, "cupy", _fake_cupy(sqrt_fn=adversarial_sqrt))
+    descriptors = np.zeros((4, 42), dtype=np.float64)
+    descriptors[1, 0] = candidate_value
+    descriptors[2, 0] = 1.0
+    descriptors[3, 0] = -1.0
+    oracle = compute_exact_neighbours(descriptors, 1, chunk_size=2, resource_budget=_budget())
+
+    from nepflow.stages.selection.algorithms.information_entropy.gpu_neighbours import (
+        ExactTiledGPUNeighbourIndex,
+    )
+
+    index = ExactTiledGPUNeighbourIndex(
+        descriptors,
+        gpu_tile_size=2,
+        max_device_bytes=64 * 1024,
+        resource_budget=_budget(),
+    )
+    source_location = int(index.row_to_location[0])
+    candidate_location = int(index.row_to_location[1])
+    selected_locations = np.asarray(
+        [source_location, int(index.row_to_location[2]), int(index.row_to_location[3])],
+        dtype=np.int64,
+    )
+    selected_distances = np.asarray([0.0, 1.0, 1.0], dtype=np.float64)
+    gpu_candidate_distance = float(
+        adversarial_sqrt(np.asarray([candidate_value * candidate_value], dtype=np.float64))[0]
+    )
+    old_threshold = float(1.0 * (1.0 + gamma))
+    for _ in range(4):
+        old_threshold = float(np.nextafter(old_threshold, np.inf))
+    assert gpu_candidate_distance > old_threshold
+    gpu_lower = float(gpu_candidate_distance / (1.0 + gamma))
+    cpu_upper = float(1.0 / (1.0 - gamma))
+    for _ in range(4):
+        gpu_lower = float(np.nextafter(gpu_lower, 0.0))
+        cpu_upper = float(np.nextafter(cpu_upper, np.inf))
+    assert gpu_lower <= cpu_upper
+
+    for resident in (False, True):
+        gpu_reference = (
+            index._cp.asarray(index.unique_locations, dtype=index._cp.float64)
+            if resident
+            else None
+        )
+        locations, distances = index._certify_final(
+            index.unique_locations[source_location],
+            source_location,
+            selected_locations,
+            selected_distances,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1,
+            gpu_reference=gpu_reference,
+        )
+        assert int(index.location_representatives[locations[0]]) == int(
+            oracle.neighbour_indices[0, 0]
+        )
+        np.testing.assert_allclose(distances, oracle.neighbour_distances[0])
     index.close()
 
 
