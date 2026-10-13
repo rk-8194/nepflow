@@ -1397,7 +1397,27 @@ tie verification. `knn_fast_path_certified_count`,
 `knn_fast_path_ambiguous_count`, `radius_preflight_count`, and
 `radius_retrieval_count` are operational diagnostics; the additional
 `knn_fast_path_fallback_count` records whole chunks that retained the complete
-verification path. None of these counters enter scientific fingerprints.
+ verification path. None of these counters enter scientific fingerprints.
+
+### Exact reference-measure occupancy preprocessing
+
+The preliminary-whitened descriptor rows use the dependency-neutral indexed
+radius service in `selection/indexed_radius.py`. It builds deterministic
+exact-coordinate grouping for diagnostics and uses bounded `cKDTree`
+count-only queries over the original rows, so duplicate locations retain their
+atomic multiplicity without materialising an `N x N` distance array. Queries
+use `eps=0`; an outward, dimension-aware float64 guard supplies a conservative
+candidate annulus, and only rows whose inner/outer counts differ are retrieved
+and verified with the canonical inclusive NumPy squared-distance oracle.
+
+The scientific definition remains `descriptor-local-occupancy-v1` with
+`o_i` including row `i` and `p_i` proportional to `1/o_i`. Query width and
+worker count are operational, bounded by the runtime budget and SLURM CPU
+allocation, and are excluded from scientific fingerprints. Diagnostics record
+unique locations, duplicate fraction, occupancy quantiles, singleton/multi-row
+fractions, effective support, index/query timing, and boundary-certification
+counts. A warning is emitted when the configured radius makes almost every row
+a singleton; the radius and weights are never changed automatically.
 
 ---
 

@@ -1150,7 +1150,27 @@ The selection stage shall not:
 
 ---
 
-## 36. Future Implementation Guidance
+## 36. Exact Reference-Measure Preprocessing
+
+Preliminary-whitened local descriptors use an indexed exact radius-count
+service. The service groups exact duplicate locations for deterministic
+diagnostics, bounds `cKDTree` queries by the configured batch width, and counts
+original rows so duplicate atomic environments retain their multiplicity. It
+uses `eps=0` and a conservative outward float64 boundary guard; only
+inner/outer count disagreements materialise candidate indices for canonical
+NumPy `sum((x-y)**2) <= tolerance**2` verification. The scientific
+`descriptor-local-occupancy-v1` definition and `1/o_i` weighting are unchanged.
+
+Operational diagnostics persist unique-location and duplicate counts,
+occupancy quantiles, singleton/multi-neighbour fractions, effective support,
+index/query timings, worker count, and boundary-certification work. A nearly
+all-singleton pool emits a warning without changing the configured radius or
+weights. Runtime worker and workspace limits remain operational and do not
+enter scientific fingerprints.
+
+---
+
+## 37. Future Implementation Guidance
 
 Any implementation should keep five concerns conceptually separate:
 
@@ -1169,7 +1189,7 @@ A new plotting method should not alter selected identities.
 
 ---
 
-## 37. Master Design Principle
+## 38. Master Design Principle
 
 The selection stage should answer one question:
 

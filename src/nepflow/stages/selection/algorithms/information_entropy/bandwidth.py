@@ -247,8 +247,9 @@ def build_entropy_pool(
     The reference measure is a fixed-radius occupancy estimate.  For row ``i``,
     ``o_i`` is the number of rows whose whitened descriptor is within the
     inclusive Euclidean tolerance (including ``i``); the unnormalised mass is
-    ``1 / o_i``.  This is evaluated in descriptor blocks, so memory is bounded
-    by the configured chunk size rather than an ``N x N`` distance matrix.
+    ``1 / o_i``.  This is evaluated by an indexed exact radius service over
+    unique descriptor locations, so memory is bounded by the configured query
+    batch rather than an ``N x N`` distance matrix.
     Exact and near duplicates therefore share one region's mass, while an
     isolated valid environment retains strictly positive mass.
     """
@@ -279,13 +280,16 @@ def build_entropy_pool(
     if not transform_id or not representation_id:
         raise ValueError("transform and representation fingerprints must not be blank")
 
+    candidate_index_by_id = {
+        candidate_id: index for index, candidate_id in enumerate(ordered_candidates)
+    }
     candidate_indices: list[int] = []
     for row in ordered_rows:
         owner = _row_owner(row)
-        try:
-            candidate_indices.append(ordered_candidates.index(owner))
-        except ValueError as exc:
-            raise ValueError(f"unknown candidate owner {owner!r} in entropy row mapping") from exc
+        candidate_index = candidate_index_by_id.get(owner)
+        if candidate_index is None:
+            raise ValueError(f"unknown candidate owner {owner!r} in entropy row mapping")
+        candidate_indices.append(candidate_index)
     counts = np.bincount(candidate_indices, minlength=len(ordered_candidates))
     if np.any(counts == 0):
         missing = ordered_candidates[int(np.flatnonzero(counts == 0)[0])]
@@ -375,11 +379,28 @@ def build_entropy_pool(
     }
     # Chunk width is an operational memory bound, not a scientific choice;
     # exclude it from the pool identity while retaining it in the manifest.
+    # Timing, worker, grouping and boundary counters are likewise operational
+    # evidence and must not change a scientific pool fingerprint.
     identity_payload = dict(pool_payload)
     identity_payload["reference_measure_config"] = {
         key: value
         for key, value in pool_payload["reference_measure_config"].items()
         if key != "chunk_size"
+    }
+    stable_diagnostic_keys = {
+        "occupancy_fingerprint",
+        "occupancy_count",
+        "effective_support",
+        "effective_weighted_sample_mass",
+        "maximum_row_mass",
+        "mass_concentration_hhi",
+        "positive_row_count",
+        "weight_squared_sum",
+    }
+    identity_payload["reference_measure_diagnostics"] = {
+        key: value
+        for key, value in measure_diagnostics.items()
+        if key in stable_diagnostic_keys
     }
     pool_fingerprint = sha256_canonical_json(identity_payload)
     return EntropyPool(

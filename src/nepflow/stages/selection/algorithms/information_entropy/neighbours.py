@@ -21,6 +21,7 @@ from nepflow.resources.budget import (
     build_resource_budget,
 )
 
+from ...indexed_radius import group_descriptor_locations
 from .checkpointing import (
     CheckpointValidationError,
     IncrementalCheckpointStore,
@@ -1278,16 +1279,13 @@ class IndexedCPUNeighbourIndex:
             values.shape[0],
             values.shape[1],
         )
-        locations, first_indices, row_to_location = np.unique(
-            values,
-            axis=0,
-            return_index=True,
-            return_inverse=True,
+        locations, first_indices, row_to_location, _location_multiplicity = (
+            group_descriptor_locations(values)
         )
         self.descriptors = values
-        self.unique_locations = np.ascontiguousarray(locations, dtype=np.float64)
-        self.location_representatives = np.asarray(first_indices, dtype=np.int64)
-        self.row_to_location = np.asarray(row_to_location, dtype=np.int64)
+        self.unique_locations = locations
+        self.location_representatives = first_indices
+        self.row_to_location = row_to_location
         location_count = int(self.unique_locations.shape[0])
         grouping_started = time.perf_counter()
         self.rows_by_location = np.asarray(

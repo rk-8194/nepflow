@@ -9,6 +9,7 @@ cycle.
 from __future__ import annotations
 
 import hashlib
+import logging
 import math
 from dataclasses import dataclass
 from typing import Any
@@ -16,6 +17,11 @@ from typing import Any
 import numpy as np
 
 from nepflow.io.hashing import sha256_canonical_json
+from nepflow.resources.budget import ResourceBudgetService
+
+from .indexed_radius import IndexedRadiusCountService
+
+logger = logging.getLogger(__name__)
 
 REFERENCE_MEASURE_VERSION = "descriptor-local-occupancy-v1"
 REFERENCE_MEASURE_ESTIMATOR = "fixed-radius-euclidean-occupancy"
@@ -77,29 +83,35 @@ def _fixed_radius_occupancy(
     *,
     tolerance: float,
     chunk_size: int,
+    resource_budget: ResourceBudgetService | None = None,
 ) -> np.ndarray:
-    """Count inclusive descriptor balls without materialising an N x N array."""
+    """Count inclusive descriptor balls with an indexed exact radius service."""
+
+    counts, _diagnostics = _fixed_radius_occupancy_with_diagnostics(
+        descriptors,
+        tolerance=tolerance,
+        chunk_size=chunk_size,
+        resource_budget=resource_budget,
+    )
+    return counts
+
+
+def _fixed_radius_occupancy_with_diagnostics(
+    descriptors: np.ndarray,
+    *,
+    tolerance: float,
+    chunk_size: int,
+    resource_budget: ResourceBudgetService | None = None,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Return exact occupancies and the operational indexed-query evidence."""
 
     values, radius, configured_block = _validate_inputs(descriptors, tolerance, chunk_size)
-    n_rows = int(values.shape[0])
-    counts = np.zeros(n_rows, dtype=np.int64)
-    radius_squared = radius * radius
-    block = min(configured_block, max(1, math.isqrt(n_rows)))
-    for source_start in range(0, n_rows, block):
-        source_stop = min(source_start + block, n_rows)
-        source = values[source_start:source_stop]
-        for target_start in range(0, n_rows, block):
-            target_stop = min(target_start + block, n_rows)
-            target = values[target_start:target_stop]
-            with np.errstate(over="ignore", invalid="ignore"):
-                difference = source[:, None, :] - target[None, :, :]
-                squared = np.sum(difference * difference, axis=2, dtype=np.float64)
-            counts[source_start:source_stop] += np.count_nonzero(
-                squared <= radius_squared, axis=1
-            )
-    if np.any(counts < 1):
-        raise ValueError("reference-measure occupancy must include every row itself")
-    return counts
+    service = IndexedRadiusCountService(
+        values,
+        chunk_size=configured_block,
+        resource_budget=resource_budget,
+    )
+    return service.count(radius)
 
 
 def estimate_reference_measure(
@@ -108,6 +120,7 @@ def estimate_reference_measure(
     tolerance: float = DEFAULT_REFERENCE_MEASURE_TOLERANCE,
     chunk_size: int = DEFAULT_REFERENCE_MEASURE_CHUNK_SIZE,
     preprocessing_transform_fingerprint: str = "",
+    resource_budget: ResourceBudgetService | None = None,
 ) -> ReferenceMeasure:
     """Estimate the canonical density-aware target probabilities.
 
@@ -118,10 +131,11 @@ def estimate_reference_measure(
     """
 
     values, radius, configured_block = _validate_inputs(descriptors, tolerance, chunk_size)
-    occupancy = _fixed_radius_occupancy(
+    occupancy, occupancy_diagnostics = _fixed_radius_occupancy_with_diagnostics(
         values,
         tolerance=radius,
         chunk_size=configured_block,
+        resource_budget=resource_budget,
     )
     raw_weights = 1.0 / occupancy.astype(np.float64)
     total = float(math.fsum(float(value) for value in raw_weights))
@@ -149,6 +163,7 @@ def estimate_reference_measure(
         "chunk_size": configured_block,
     }
     diagnostics = {
+        **occupancy_diagnostics,
         "occupancy_fingerprint": _array_fingerprint(np.asarray(occupancy, dtype=np.int64)),
         "occupancy_count": {
             "minimum": int(np.min(occupancy)),
@@ -163,6 +178,15 @@ def estimate_reference_measure(
         "positive_row_count": int(probabilities.size),
         "weight_squared_sum": hhi,
     }
+    singleton_fraction = float(occupancy_diagnostics["singleton_row_fraction"])
+    if singleton_fraction >= 0.99:
+        logger.warning(
+            "Reference-measure occupancy is almost entirely singleton at tolerance=%g: "
+            "singleton_fraction=%.6f; density correction therefore approximates uniform "
+            "row weighting; the configured tolerance was not changed",
+            radius,
+            singleton_fraction,
+        )
     return ReferenceMeasure(
         probabilities=probabilities,
         version=REFERENCE_MEASURE_VERSION,

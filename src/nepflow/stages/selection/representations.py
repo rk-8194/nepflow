@@ -1527,6 +1527,16 @@ def _local_identity(
     transform: WhiteningTransform,
     reference_measure: ReferenceMeasure,
 ) -> dict[str, Any]:
+    stable_diagnostic_keys = {
+        "occupancy_fingerprint",
+        "occupancy_count",
+        "effective_support",
+        "effective_weighted_sample_mass",
+        "maximum_row_mass",
+        "mass_concentration_hhi",
+        "positive_row_count",
+        "weight_squared_sum",
+    }
     return {
         "schema_version": LOCAL_REPRESENTATION_SCHEMA_VERSION,
         "candidate_ids": list(candidate_ids),
@@ -1550,7 +1560,13 @@ def _local_identity(
                 if key != "chunk_size"
             },
             "weights_fingerprint": reference_measure.weights_fingerprint,
-            "diagnostics": reference_measure.diagnostics,
+            # Keep scientifically determined occupancy evidence in the stable
+            # identity while excluding implementation/timing diagnostics.
+            "diagnostics": {
+                key: value
+                for key, value in reference_measure.diagnostics.items()
+                if key in stable_diagnostic_keys
+            },
         },
         "reference_measure_settings": {
             "version": reference_measure.version,
@@ -1632,18 +1648,28 @@ def build_local_environment_representation(
     )
     if not np.all(np.isfinite(raw)):
         raise ValueError("local representation contains non-finite values")
-    logger.info("Local descriptor whitening started")
+    logger.info("Preliminary descriptor whitening started")
     preliminary_transform = fit_deterministic_whitening(
         raw,
         tolerance=settings.whitening_tolerance,
         regularization=settings.whitening_regularization,
         singular_policy=settings.whitening_singular_policy,
     )
+    logger.info(
+        "Preliminary descriptor whitening completed: rows=%d, dimensions=%d",
+        raw.shape[0],
+        preliminary_transform.retained_dimensions,
+    )
     reference_measure = estimate_reference_measure(
         preliminary_transform.apply(raw),
         tolerance=reference_measure_tolerance,
         chunk_size=reference_measure_chunk_size,
         preprocessing_transform_fingerprint=preliminary_transform.fingerprint,
+        resource_budget=resource_budget,
+    )
+    logger.info(
+        "Final weighted descriptor whitening started: effective_support=%.3f",
+        float(reference_measure.diagnostics["effective_support"]),
     )
     transform = fit_deterministic_whitening(
         raw,
@@ -1654,7 +1680,11 @@ def build_local_environment_representation(
         target_weighting_version=reference_measure.config["weighting_version"],
     )
     whitened = transform.apply(raw)
-    logger.info("Local descriptor whitening completed")
+    logger.info(
+        "Final weighted descriptor whitening completed: rows=%d, dimensions=%d",
+        whitened.shape[0],
+        transform.retained_dimensions,
+    )
     identity = _local_identity(
         ordered_candidate_ids,
         ordered_structure_ids,
@@ -1748,6 +1778,9 @@ def _write_local_representation_cache(
             "rows_sha256": sha256_canonical_json(rows_payload),
         },
         "representation_fingerprint": representation.fingerprint,
+        # Operational occupancy evidence is persisted for reports but is not
+        # part of the scientific identity or representation fingerprint.
+        "reference_measure_diagnostics": dict(representation.reference_measure_diagnostics),
     }
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     staging_fd, staging_name = tempfile.mkstemp(
@@ -1876,7 +1909,11 @@ def _load_local_representation_cache(
         if actual_reference_measure.get("version") != REFERENCE_MEASURE_VERSION:
             return None
         reference_config = actual_reference_measure.get("config")
-        reference_diagnostics = actual_reference_measure.get("diagnostics")
+        reference_diagnostics = manifest.get("reference_measure_diagnostics")
+        if reference_diagnostics is None:
+            # Read caches written before diagnostics were separated from the
+            # scientific identity.
+            reference_diagnostics = actual_reference_measure.get("diagnostics")
         if not isinstance(reference_config, dict) or not isinstance(reference_diagnostics, dict):
             return None
         if reference_config.get("weighting_version") != TARGET_WEIGHTING_VERSION:
