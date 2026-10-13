@@ -41,9 +41,9 @@ from .models import (
     CALIBRATION_OPTIMIZER_VERSION,
     DEFAULT_LOO_CHECKPOINT_EVERY_SOURCES,
     DEFAULT_NEIGHBOUR_BACKEND_ID,
+    KERNEL_BANDWIDTH_RULE_ASYMMETRIC_SOURCE,
     ENTROPY_OBJECTIVE_SCHEMA_VERSION,
     GPU_NEIGHBOUR_BACKEND_ALIASES,
-    KERNEL_BANDWIDTH_RULE_ASYMMETRIC_SOURCE,
     KERNEL_BANDWIDTH_RULE_SYMMETRIC_MAX,
     KERNEL_FAMILY,
     KERNEL_OPERATOR_SCHEMA_VERSION,
@@ -357,7 +357,7 @@ def _freeze_from_neighbours(
     pool: EntropyPool,
     neighbours: ExactNeighbourResult,
     c: float,
-    kernel_bandwidth_rule: str = KERNEL_BANDWIDTH_RULE_ASYMMETRIC_SOURCE,
+    kernel_bandwidth_rule: str = KERNEL_BANDWIDTH_RULE_SYMMETRIC_MAX,
 ) -> FrozenBandwidths:
     scale = _positive_float(c, "c")
     bandwidth_rule = normalize_kernel_bandwidth_rule(kernel_bandwidth_rule)
@@ -380,9 +380,8 @@ def _freeze_from_neighbours(
         "k": neighbours.k,
         "c": scale,
     }
-    # Keep the legacy asymmetric fingerprint byte-for-byte stable.  A new
-    # scientific rule receives an explicit, versioned identity so it cannot
-    # reuse an asymmetric artifact or be silently relabelled.
+    # Keep the legacy asymmetric fingerprint byte-for-byte stable.  Symmetric
+    # artifacts carry a versioned rule identity and cannot collide with it.
     if bandwidth_rule != KERNEL_BANDWIDTH_RULE_ASYMMETRIC_SOURCE:
         identity["kernel_bandwidth_rule"] = bandwidth_rule
         identity["kernel_bandwidth_rule_version"] = kernel_bandwidth_rule_version(
@@ -426,7 +425,7 @@ def calculate_frozen_bandwidths(
     gpu_devices: Sequence[int] | str | int | None = None,
     gpu_tile_size: int = 128,
     max_gpu_neighbour_bytes: int | None = None,
-    kernel_bandwidth_rule: str = KERNEL_BANDWIDTH_RULE_ASYMMETRIC_SOURCE,
+    kernel_bandwidth_rule: str = KERNEL_BANDWIDTH_RULE_SYMMETRIC_MAX,
     resource_budget: ResourceBudgetService | None = None,
 ) -> FrozenBandwidths:
     """Calculate and freeze exact full-pool ``r_k`` and ``h=c*r_k``."""
@@ -545,25 +544,14 @@ def _settings_from_arguments(
             raise ValueError("settings cannot be combined with explicit calibration arguments")
         requested_rule = normalize_kernel_bandwidth_rule(kernel_bandwidth_rule)
         if isinstance(settings, EntropyBandwidthSettings):
-            if (
-                requested_rule != KERNEL_BANDWIDTH_RULE_ASYMMETRIC_SOURCE
-                and requested_rule != settings.kernel_bandwidth_rule
-            ):
-                raise ValueError(
-                    "settings kernel_bandwidth_rule conflicts with the explicit calibration rule"
-                )
+            # A validated settings object is already authoritative.  This is
+            # important for the explicit legacy mode: the public API default
+            # is symmetric, but passing a legacy settings object must remain a
+            # deliberate, resumable asymmetric run.
             return settings
         settings_mapping = dict(settings)
         if "kernel_bandwidth_rule" not in settings_mapping:
             settings_mapping["kernel_bandwidth_rule"] = requested_rule
-        elif (
-            requested_rule != KERNEL_BANDWIDTH_RULE_ASYMMETRIC_SOURCE
-            and normalize_kernel_bandwidth_rule(settings_mapping["kernel_bandwidth_rule"])
-            != requested_rule
-        ):
-            raise ValueError(
-                "settings kernel_bandwidth_rule conflicts with the explicit calibration rule"
-            )
         return EntropyBandwidthSettings(**settings_mapping)
     selected_mode = "automatic" if mode is None else mode
     if selected_mode == "manual":
@@ -1006,7 +994,7 @@ def calibrate_bandwidth(
     max_calibration_work_bytes: int | None = None,
     calibration_batch_size: int | None = None,
     kernel_support_execution: str = "cpu",
-    kernel_bandwidth_rule: str = KERNEL_BANDWIDTH_RULE_ASYMMETRIC_SOURCE,
+    kernel_bandwidth_rule: str = KERNEL_BANDWIDTH_RULE_SYMMETRIC_MAX,
     gpu_device: int = 0,
     gpu_devices: Sequence[int] | str | int | None = None,
     gpu_tile_size: int = 128,
@@ -1068,11 +1056,6 @@ def calibrate_bandwidth(
         loo_checkpoint_every_sources=loo_checkpoint_every_sources,
         loo_checkpoint_every_seconds=loo_checkpoint_every_seconds,
     )
-    if selected_settings.kernel_bandwidth_rule == KERNEL_BANDWIDTH_RULE_SYMMETRIC_MAX:
-        raise ValueError(
-            "kernel_bandwidth_rule='symmetric_max' is currently available only through "
-            "the bounded CPU reference oracle; production LOO calibration is not yet integrated"
-        )
     selected_settings, runtime_budget = _resolve_runtime_limits(
         selected_settings,
         pool,
@@ -1609,7 +1592,10 @@ def calibrate_bandwidth(
         if selected_settings.mode == "manual":
             return (ordered,)
         row_count = int(pool.descriptors.shape[0])
-        per_c_bytes = 16 * row_count
+        # Batched LOO retains the numerator plus geometric/raw incoming
+        # support counters for diagnostics, in addition to the candidate
+        # bandwidth vector.
+        per_c_bytes = 32 * row_count
         source_workspace_bound = _estimate_radius_workspace_bytes(
             row_count,
             row_count,
@@ -1668,16 +1654,39 @@ def calibrate_bandwidth(
                     pilot_radii = np.stack(
                         [candidate_c * neighbours.radii[pilot_rows] for candidate_c in ordered]
                     )
-                    pilot_offsets, _pilot_targets, pilot_distances = (
-                        pilot_provider.support_many(pilot_rows, pilot_radii)
+                    pilot_target_bandwidths = (
+                        np.stack(
+                            [candidate_c * neighbours.radii for candidate_c in ordered]
+                        )
+                        if selected_settings.kernel_bandwidth_rule
+                        == KERNEL_BANDWIDTH_RULE_SYMMETRIC_MAX
+                        else None
+                    )
+                    pilot_offsets, pilot_targets, pilot_distances = pilot_provider.support_many(
+                        pilot_rows,
+                        pilot_radii,
+                        target_bandwidths=pilot_target_bandwidths,
+                        kernel_bandwidth_rule=selected_settings.kernel_bandwidth_rule,
                     )
                     for candidate_index in range(len(ordered)):
                         for source_offset in range(pilot_rows.size):
                             begin = int(pilot_offsets[source_offset])
                             end = int(pilot_offsets[source_offset + 1])
+                            if (
+                                selected_settings.kernel_bandwidth_rule
+                                == KERNEL_BANDWIDTH_RULE_SYMMETRIC_MAX
+                            ):
+                                assert pilot_target_bandwidths is not None
+                                effective = np.maximum(
+                                    pilot_radii[candidate_index, source_offset],
+                                    pilot_target_bandwidths[
+                                        candidate_index, pilot_targets[begin:end]
+                                    ],
+                                )
+                            else:
+                                effective = pilot_radii[candidate_index, source_offset]
                             pilot_support_totals[candidate_index] += np.count_nonzero(
-                                pilot_distances[begin:end]
-                                < pilot_radii[candidate_index, source_offset]
+                                pilot_distances[begin:end] < effective
                             )
                 for candidate_index, candidate_c in enumerate(ordered):
                     predicted_support[candidate_c] = (
@@ -1870,6 +1879,12 @@ def calibrate_bandwidth(
         for candidate_c in ordered:
             if not current:
                 current.append(candidate_c)
+                continue
+            if selected_settings.kernel_bandwidth_rule == KERNEL_BANDWIDTH_RULE_SYMMETRIC_MAX and (
+                float(candidate_c) == 1.0 or float(current[0]) == 1.0
+            ):
+                grouped.append(tuple(current))
+                current = [candidate_c]
                 continue
             current_min = predicted_support.get(current[0])
             candidate_estimate = predicted_support.get(candidate_c)
@@ -2132,6 +2147,7 @@ def calibrate_bandwidth(
                             gpu_devices=selected_settings.gpu_devices,
                             gpu_tile_size=selected_settings.gpu_tile_size,
                             max_gpu_support_bytes=selected_settings.max_gpu_support_bytes,
+                            kernel_bandwidth_rule=selected_settings.kernel_bandwidth_rule,
                             knn_support=(neighbours if frozen.c == 1.0 else None),
                             knn_support_row_ids=(
                                 _pool_row_ids(pool) if frozen.c == 1.0 else None
@@ -2167,6 +2183,7 @@ def calibrate_bandwidth(
                         gpu_devices=selected_settings.gpu_devices,
                         gpu_tile_size=selected_settings.gpu_tile_size,
                         max_gpu_support_bytes=selected_settings.max_gpu_support_bytes,
+                        kernel_bandwidth_rule=selected_settings.kernel_bandwidth_rule,
                         knn_support=(neighbours if use_knn_prefix_support else None),
                         knn_support_row_ids=(
                             _pool_row_ids(pool) if use_knn_prefix_support else None
@@ -2500,6 +2517,9 @@ def calibrate_bandwidth(
         calibration_payload["kernel_bandwidth_rule_version"] = (
             selected_bandwidths.kernel_bandwidth_rule_version
         )
+    selected_neighbours = radii_by_k.get(selected_bandwidths.k)
+    if isinstance(selected_neighbours, str):
+        selected_neighbours = None
     return BandwidthCalibrationResult(
         mode=selected_settings.mode,
         selected=selected_bandwidths,
@@ -2516,6 +2536,7 @@ def calibrate_bandwidth(
         pool_fingerprint=pool.fingerprint,
         calibration_fingerprint=sha256_canonical_json(calibration_payload),
         loo_probabilities=loo_probabilities,
+        selected_neighbours=selected_neighbours,
         backend=selected_bandwidths.backend,
         backend_version=selected_bandwidths.backend_version,
         backend_fingerprint=selected_bandwidths.backend_fingerprint,

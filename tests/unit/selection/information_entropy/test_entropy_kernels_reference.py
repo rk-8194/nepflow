@@ -91,7 +91,11 @@ def test_symmetric_max_reference_has_symmetric_raw_weights_and_normalized_column
     np.testing.assert_array_equal(raw_matrix, raw_matrix.T)
     np.testing.assert_allclose(np.sum(matrix, axis=0), 1.0)
 
-    asymmetric = normalized_kernel_matrix(descriptors, bandwidths)
+    asymmetric = normalized_kernel_matrix(
+        descriptors,
+        bandwidths,
+        kernel_bandwidth_rule="asymmetric_source",
+    )
     assert not np.array_equal(asymmetric, matrix)
 
 

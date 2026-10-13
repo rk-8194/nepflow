@@ -2,9 +2,10 @@
 
 This module deliberately sits after the scientific selector.  It consumes the
 validated pool, calibration, graph, contribution and selection records; it
-does not refit, retune, reorder, or acquire anything.  The JSON form contains
-only scientific values and identities, so presentation and operational timing
-cannot change a run fingerprint.
+does not refit, retune, reorder, or acquire anything.  Scientific values and
+identities are fingerprinted separately from the retained operational evidence
+(timings, memory, and provider counters), so runtime variation cannot change a
+run fingerprint.
 """
 
 from __future__ import annotations
@@ -24,6 +25,7 @@ from nepflow.io.hashing import sha256_bytes, sha256_canonical_json, sha256_file
 
 from .models import (
     KERNEL_BANDWIDTH_RULE_ASYMMETRIC_SOURCE,
+    KERNEL_BANDWIDTH_RULE_SYMMETRIC_MAX,
     SPARSE_NUMERICAL_TOLERANCE,
     BandwidthCalibrationResult,
     CalibrationAttempt,
@@ -445,6 +447,8 @@ class GraphDiagnostics:
     backend: str
     metric: str
     backend_version: str
+    kernel_bandwidth_rule: str = KERNEL_BANDWIDTH_RULE_SYMMETRIC_MAX
+    kernel_bandwidth_rule_version: str = ""
     numerical_tolerance: float = DIAGNOSTICS_NUMERICAL_TOLERANCE
     atomic_graph_materialized: bool = True
     atomic_graph_csr_bytes: int = -1
@@ -453,6 +457,7 @@ class GraphDiagnostics:
     candidate_storage: str = "memory"
     candidate_storage_path: str | None = None
     candidate_resident_bytes: int = 0
+    operational_metrics: dict[str, Any] = field(default_factory=dict, compare=False, repr=False)
 
     def __post_init__(self) -> None:
         for name in (
@@ -489,6 +494,12 @@ class GraphDiagnostics:
                 raise ValueError(f"graph {name} must be non-negative when supplied")
         if not self.backend.strip() or not self.metric.strip() or not self.backend_version.strip():
             raise ValueError("graph backend identity is required")
+        rule = normalize_kernel_bandwidth_rule(self.kernel_bandwidth_rule)
+        expected_rule_version = kernel_bandwidth_rule_version(rule)
+        if self.kernel_bandwidth_rule_version not in {"", expected_rule_version}:
+            raise ValueError("graph kernel bandwidth rule version is incompatible")
+        object.__setattr__(self, "kernel_bandwidth_rule", rule)
+        object.__setattr__(self, "kernel_bandwidth_rule_version", expected_rule_version)
         if not isinstance(self.atomic_graph_materialized, bool):
             raise ValueError("atomic_graph_materialized must be boolean")
         atomic_bytes = int(self.atomic_graph_csr_bytes)
@@ -512,9 +523,12 @@ class GraphDiagnostics:
             self.candidate_storage_path, str
         ):
             raise ValueError("candidate_storage_path must be a string when supplied")
+        if not isinstance(self.operational_metrics, dict):
+            raise ValueError("graph operational_metrics must be a dictionary")
+        object.__setattr__(self, "operational_metrics", dict(self.operational_metrics))
 
     def to_manifest(self) -> dict[str, Any]:
-        return {
+        manifest = {
             "atomic_row_count": self.atomic_row_count,
             "edge_count": self.edge_count,
             "edge_per_row": self.edge_per_row,
@@ -543,7 +557,11 @@ class GraphDiagnostics:
             "atomic_graph_csr_bytes": self.atomic_graph_csr_bytes,
             "kernel_operator_fingerprint": self.kernel_operator_fingerprint,
             "numerical_tolerance": self.numerical_tolerance,
+            "operations": dict(self.operational_metrics),
+            "kernel_bandwidth_rule": self.kernel_bandwidth_rule,
+            "kernel_bandwidth_rule_version": self.kernel_bandwidth_rule_version,
         }
+        return manifest
 
     @property
     def E(self) -> int:
@@ -740,6 +758,13 @@ class EntropyScientificDiagnostics:
 
     def _fingerprint_payload(self) -> dict[str, Any]:
         calibration_record = self._calibration_manifest()
+        if calibration_record is not None:
+            calibration_record = dict(calibration_record)
+            if self.kernel_bandwidth_rule == KERNEL_BANDWIDTH_RULE_ASYMMETRIC_SOURCE:
+                # Preserve the pre-rule scientific fingerprint while still
+                # exposing explicit legacy provenance in the user manifest.
+                calibration_record.pop("kernel_bandwidth_rule", None)
+                calibration_record.pop("kernel_bandwidth_rule_version", None)
         graph_record = self.graph.to_manifest()
         graph_memory = graph_record.get("memory")
         if isinstance(graph_memory, dict):
@@ -751,6 +776,12 @@ class EntropyScientificDiagnostics:
             graph_memory.pop("candidate_storage_path", None)
             graph_memory.pop("candidate_resident_bytes", None)
             graph_record["memory"] = graph_memory
+        # Runtime timings, memory observations, and provider counters are
+        # evidence, not scientific identity.
+        graph_record.pop("operations", None)
+        if self.kernel_bandwidth_rule == KERNEL_BANDWIDTH_RULE_ASYMMETRIC_SOURCE:
+            graph_record.pop("kernel_bandwidth_rule", None)
+            graph_record.pop("kernel_bandwidth_rule_version", None)
         return {
             "schema_version": self.schema_version,
             "candidate_ids": list(self.candidate_ids),
@@ -1024,6 +1055,15 @@ class EntropyScientificDiagnostics:
                 "radii": self.radius_summary.to_manifest(),
                 "source_bandwidths": self.bandwidth_summary.to_manifest(),
                 "relation": "h_a=c*r_{k,a}",
+                "kernel_bandwidth_rule": self.kernel_bandwidth_rule,
+                "kernel_bandwidth_rule_version": (
+                    calibration_record.get("kernel_bandwidth_rule_version", "")
+                ),
+                "effective_pair_bandwidth": (
+                    "H_ab=max(h_a,h_b)"
+                    if self.kernel_bandwidth_rule == KERNEL_BANDWIDTH_RULE_SYMMETRIC_MAX
+                    else "H_ab=h_a"
+                ),
                 "selected_k": calibration_record["selected"]["k"],
                 "selected_c": calibration_record["selected"]["c"],
                 "calibration": calibration_record,
@@ -1279,12 +1319,11 @@ def calibration_manifest(calibration: BandwidthCalibrationResult) -> dict[str, A
         "backend_version": calibration.backend_version,
         "backend_fingerprint": calibration.backend_fingerprint,
         "metric": calibration.selected.metric,
-    }
-    if calibration.kernel_bandwidth_rule != KERNEL_BANDWIDTH_RULE_ASYMMETRIC_SOURCE:
-        manifest["kernel_bandwidth_rule"] = calibration.kernel_bandwidth_rule
-        manifest["kernel_bandwidth_rule_version"] = (
+        "kernel_bandwidth_rule": calibration.kernel_bandwidth_rule,
+        "kernel_bandwidth_rule_version": (
             calibration.selected.kernel_bandwidth_rule_version
-        )
+        ),
+    }
     return manifest
 
 
@@ -1414,6 +1453,10 @@ def _graph_from_manifest(value: Mapping[str, Any]) -> GraphDiagnostics:
         backend=str(value["backend"]),
         metric=str(value["metric"]),
         backend_version=str(value["backend_version"]),
+        kernel_bandwidth_rule=str(
+            value.get("kernel_bandwidth_rule", KERNEL_BANDWIDTH_RULE_ASYMMETRIC_SOURCE)
+        ),
+        kernel_bandwidth_rule_version=str(value.get("kernel_bandwidth_rule_version", "")),
         atomic_graph_materialized=bool(value.get("atomic_graph_materialized", True)),
         atomic_graph_csr_bytes=int(
             value.get("atomic_graph_csr_bytes", memory.get("csr_array_bytes", 0))
@@ -1435,6 +1478,7 @@ def _graph_from_manifest(value: Mapping[str, Any]) -> GraphDiagnostics:
             else str(memory["candidate_storage_path"])
         ),
         candidate_resident_bytes=int(memory.get("candidate_resident_bytes", 0)),
+        operational_metrics=dict(value.get("operations", {})),
         numerical_tolerance=float(
             value.get("numerical_tolerance", DIAGNOSTICS_NUMERICAL_TOLERANCE)
         ),
@@ -1651,6 +1695,19 @@ def build_entropy_diagnostics(
     )
     if graph_bandwidth_fingerprint != calibration.selected.fingerprint:
         raise ValueError("diagnostics graph bandwidth identity does not match calibration")
+    expected_rule = calibration.kernel_bandwidth_rule
+    graph_rule = normalize_kernel_bandwidth_rule(
+        getattr(graph, "kernel_bandwidth_rule", expected_rule)
+    )
+    if graph_rule != expected_rule:
+        raise ValueError("diagnostics graph kernel bandwidth rule does not match calibration")
+    contribution_rule = normalize_kernel_bandwidth_rule(
+        getattr(contributions, "kernel_bandwidth_rule", graph_rule)
+    )
+    if contribution_rule != expected_rule:
+        raise ValueError(
+            "diagnostics contribution kernel bandwidth rule does not match calibration"
+        )
     if isinstance(graph, SparseAtomicKernelGraph):
         if contributions.graph_fingerprint != graph.fingerprint:
             raise ValueError("diagnostics contribution graph identity does not match graph")
@@ -1761,6 +1818,8 @@ def build_entropy_diagnostics(
         backend=calibration.backend,
         metric=calibration.selected.metric,
         backend_version=calibration.backend_version,
+        kernel_bandwidth_rule=calibration.kernel_bandwidth_rule,
+        kernel_bandwidth_rule_version=calibration.selected.kernel_bandwidth_rule_version,
         atomic_graph_materialized=isinstance(graph, SparseAtomicKernelGraph),
         atomic_graph_csr_bytes=(
             graph.array_bytes if isinstance(graph, SparseAtomicKernelGraph) else 0
@@ -1780,6 +1839,10 @@ def build_entropy_diagnostics(
             if isinstance(graph, SparseAtomicKernelGraph)
             else graph.candidate_resident_bytes
         ),
+        operational_metrics={
+            "calibration": dict(calibration.operational_metrics),
+            "contributions": dict(getattr(graph, "operational_metrics", {})),
+        },
     )
     raw = np.asarray(local_representation.raw_descriptors, dtype=np.float64)
     whitened = np.asarray(local_representation.descriptors, dtype=np.float64)

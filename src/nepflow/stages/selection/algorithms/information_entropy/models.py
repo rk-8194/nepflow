@@ -37,8 +37,8 @@ CALIBRATION_OPTIMIZER_VERSION = "bounded-grid-v1"
 KERNEL_FAMILY = "wendland_c2"
 KERNEL_VERSION = "wendland-c2-v1"
 # Scientific bandwidth rules are deliberately versioned independently from the
-# Wendland family.  ``asymmetric_source`` is the pre-existing production
-# convention; ``symmetric_max`` is currently a CPU reference/oracle rule.
+# Wendland family.  ``asymmetric_source`` is retained as the historical
+# compatibility mode; ``symmetric_max`` is the production default.
 KERNEL_BANDWIDTH_RULE_ASYMMETRIC_SOURCE = "asymmetric_source"
 KERNEL_BANDWIDTH_RULE_SYMMETRIC_MAX = "symmetric_max"
 KERNEL_BANDWIDTH_RULES = frozenset(
@@ -77,6 +77,13 @@ def kernel_bandwidth_rule_version(rule: str) -> str:
         return KERNEL_BANDWIDTH_RULE_SYMMETRIC_MAX_VERSION
     # The empty value intentionally preserves legacy asymmetric identities.
     return ""
+
+
+def kernel_bandwidth_orientation(rule: str) -> str:
+    """Return the truthful metadata orientation for a kernel bandwidth rule."""
+
+    normalized = normalize_kernel_bandwidth_rule(rule)
+    return "h_a" if normalized == KERNEL_BANDWIDTH_RULE_ASYMMETRIC_SOURCE else "pair_H_ab"
 
 
 def _readonly_float_array(value: Any, *, name: str) -> np.ndarray:
@@ -136,7 +143,7 @@ class EntropyBandwidthSettings:
     max_calibration_work_bytes: int | None = None
     calibration_batch_size: int | None = None
     kernel_support_execution: str = KERNEL_SUPPORT_EXECUTION_CPU
-    kernel_bandwidth_rule: str = KERNEL_BANDWIDTH_RULE_ASYMMETRIC_SOURCE
+    kernel_bandwidth_rule: str = KERNEL_BANDWIDTH_RULE_SYMMETRIC_MAX
     gpu_device: int = 0
     gpu_devices: Sequence[int] | str | int | None = None
     gpu_tile_size: int = 128
@@ -412,7 +419,7 @@ class FrozenBandwidths:
     schema_version: str = BANDWIDTH_SCHEMA_VERSION
     backend_version: str = NEIGHBOUR_BACKEND_VERSION
     backend_fingerprint: str = ""
-    kernel_bandwidth_rule: str = KERNEL_BANDWIDTH_RULE_ASYMMETRIC_SOURCE
+    kernel_bandwidth_rule: str = KERNEL_BANDWIDTH_RULE_SYMMETRIC_MAX
     kernel_bandwidth_rule_version: str = ""
 
     @property
@@ -511,6 +518,11 @@ class BandwidthCalibrationResult:
     # Operational evidence is intentionally excluded from calibration
     # fingerprints and scientific equality decisions.
     operational_metrics: dict[str, Any] = field(default_factory=dict, compare=False, repr=False)
+    # The exact neighbour result used during calibration is retained in-memory
+    # so c=1 downstream contribution construction can reuse its certified
+    # prefix without a second support scan.  It is operational provenance, not
+    # part of the scientific result identity.
+    selected_neighbours: Any | None = field(default=None, compare=False, repr=False)
 
     @property
     def k(self) -> int:
@@ -583,9 +595,9 @@ class KernelMetadata:
     family: str = KERNEL_FAMILY
     version: str = KERNEL_VERSION
     normalization: str = "finite-pool-source-column-v1"
-    source_bandwidth_orientation: str = "h_b"
+    source_bandwidth_orientation: str | None = None
     self_membership: bool = True
-    kernel_bandwidth_rule: str = KERNEL_BANDWIDTH_RULE_ASYMMETRIC_SOURCE
+    kernel_bandwidth_rule: str = KERNEL_BANDWIDTH_RULE_SYMMETRIC_MAX
     kernel_bandwidth_rule_version: str = ""
 
     def __post_init__(self) -> None:
@@ -598,6 +610,16 @@ class KernelMetadata:
             )
         object.__setattr__(self, "kernel_bandwidth_rule", rule)
         object.__setattr__(self, "kernel_bandwidth_rule_version", version)
+        expected_orientation = kernel_bandwidth_orientation(rule)
+        supplied_orientation = self.source_bandwidth_orientation
+        if supplied_orientation is None:
+            supplied_orientation = expected_orientation
+        if supplied_orientation != expected_orientation:
+            raise ValueError(
+                "kernel metadata source bandwidth orientation does not match its kernel rule: "
+                f"{rule!r} requires {expected_orientation!r}"
+            )
+        object.__setattr__(self, "source_bandwidth_orientation", supplied_orientation)
 
 
 @dataclass(frozen=True, slots=True)
@@ -660,10 +682,12 @@ class SparseAtomicKernelGraph:
     kernel_family: str = KERNEL_FAMILY
     kernel_version: str = KERNEL_VERSION
     normalization: str = "finite-pool-source-column-v1"
-    source_bandwidth_orientation: str = "h_a"
+    source_bandwidth_orientation: str = "pair_H_ab"
     self_membership: bool = True
     sparse_schema_version: str = SPARSE_KERNEL_GRAPH_SCHEMA_VERSION
     numerical_tolerance: float = SPARSE_NUMERICAL_TOLERANCE
+    kernel_bandwidth_rule: str = KERNEL_BANDWIDTH_RULE_SYMMETRIC_MAX
+    kernel_bandwidth_rule_version: str = ""
 
     def __post_init__(self) -> None:
         source_indptr = _readonly_exact_array(
@@ -744,8 +768,16 @@ class SparseAtomicKernelGraph:
             raise ValueError("unsupported sparse graph kernel identity")
         if self.normalization != "finite-pool-source-column-v1":
             raise ValueError("unsupported sparse graph normalization convention")
-        if self.source_bandwidth_orientation != "h_a":
-            raise ValueError("sparse graph source bandwidth orientation must be h_a")
+        rule = normalize_kernel_bandwidth_rule(self.kernel_bandwidth_rule)
+        expected_orientation = kernel_bandwidth_orientation(rule)
+        if self.source_bandwidth_orientation != expected_orientation:
+            raise ValueError(
+                "sparse graph source bandwidth orientation does not match its kernel rule: "
+                f"{rule!r} requires {expected_orientation!r}"
+            )
+        expected_rule_version = kernel_bandwidth_rule_version(rule)
+        if self.kernel_bandwidth_rule_version not in {"", expected_rule_version}:
+            raise ValueError("sparse graph kernel bandwidth rule version is incompatible")
         if self.sparse_schema_version != SPARSE_KERNEL_GRAPH_SCHEMA_VERSION:
             raise ValueError("unsupported sparse graph schema version")
         if not math.isclose(
@@ -763,6 +795,8 @@ class SparseAtomicKernelGraph:
         object.__setattr__(self, "row_candidate_indices", row_candidates)
         object.__setattr__(self, "candidate_ids", candidate_ids)
         object.__setattr__(self, "numerical_tolerance", tolerance)
+        object.__setattr__(self, "kernel_bandwidth_rule", rule)
+        object.__setattr__(self, "kernel_bandwidth_rule_version", expected_rule_version)
 
     @property
     def n_sources(self) -> int:
@@ -885,6 +919,8 @@ class StreamedKernelExecutionSummary:
     support_execution_version: str = "cpu-canonical-v1"
     gpu_device: int | None = None
     gpu_devices: tuple[int, ...] | None = None
+    kernel_bandwidth_rule: str = KERNEL_BANDWIDTH_RULE_SYMMETRIC_MAX
+    kernel_bandwidth_rule_version: str = ""
 
     def __post_init__(self) -> None:
         for name in (
@@ -960,6 +996,12 @@ class StreamedKernelExecutionSummary:
                 or len(set(self.gpu_devices)) != len(self.gpu_devices)
             ):
                 raise ValueError("gpu_devices must be distinct non-negative integer ordinals")
+        rule = normalize_kernel_bandwidth_rule(self.kernel_bandwidth_rule)
+        expected_rule_version = kernel_bandwidth_rule_version(rule)
+        if self.kernel_bandwidth_rule_version not in {"", expected_rule_version}:
+            raise ValueError("streamed summary kernel bandwidth rule version is incompatible")
+        object.__setattr__(self, "kernel_bandwidth_rule", rule)
+        object.__setattr__(self, "kernel_bandwidth_rule_version", expected_rule_version)
         for name, value in (
             ("backend", self.backend),
             ("metric", self.metric),
@@ -1064,6 +1106,8 @@ class StreamedKernelExecutionSummary:
             "support_execution_version": self.support_execution_version,
             "gpu_device": self.gpu_device,
             "gpu_devices": self.gpu_devices,
+            "kernel_bandwidth_rule": self.kernel_bandwidth_rule,
+            "kernel_bandwidth_rule_version": self.kernel_bandwidth_rule_version,
             "source_query_count": self.source_query_count,
             "numerical_tolerance": self.numerical_tolerance,
             "operations": dict(self.operational_metrics),
@@ -1423,6 +1467,16 @@ class OutOfCoreSparseCandidateContributions:
         self.sparse_schema_version = str(manifest.get("sparse_schema_version", ""))
         self.numerical_tolerance = float(manifest.get("numerical_tolerance", 0.0))
         self.kernel_operator_fingerprint = str(manifest["kernel_operator_fingerprint"])
+        self.kernel_bandwidth_rule = normalize_kernel_bandwidth_rule(
+            manifest.get("kernel_bandwidth_rule", KERNEL_BANDWIDTH_RULE_ASYMMETRIC_SOURCE)
+        )
+        expected_rule_version = kernel_bandwidth_rule_version(self.kernel_bandwidth_rule)
+        supplied_rule_version = str(manifest.get("kernel_bandwidth_rule_version", ""))
+        if supplied_rule_version not in {"", expected_rule_version}:
+            raise ValueError(
+                "candidate contribution store has an incompatible kernel bandwidth rule version"
+            )
+        self.kernel_bandwidth_rule_version = expected_rule_version
         if self.sparse_schema_version != SPARSE_STREAMED_CANDIDATE_CONTRIBUTION_SCHEMA_VERSION:
             raise ValueError("unsupported out-of-core sparse contribution schema")
         if not math.isfinite(self.numerical_tolerance) or not math.isclose(
@@ -2138,5 +2192,6 @@ __all__ = [
     "GreedySelectionResult",
     "GreedySelectionStep",
     "kernel_bandwidth_rule_version",
+    "kernel_bandwidth_orientation",
     "normalize_kernel_bandwidth_rule",
 ]

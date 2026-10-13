@@ -337,7 +337,9 @@ entropy_bandwidth_max_neighbour_cache_bytes=
 # exact_tiled_gpu_knn uses the same explicit device list only for exact kNN; the
 # kernel support provider remains selected separately below.
 entropy_kernel_support_execution=cpu
-entropy_kernel_bandwidth_rule=asymmetric_source
+# Scientific default: H(a,b)=max(h_a,h_b).  Use asymmetric_source only to
+# reproduce historical source-oriented entropy calculations.
+entropy_kernel_bandwidth_rule=symmetric_max
 entropy_gpu_device=0
 # Explicit process-visible CUDA ordinals for both GPU workstreams, e.g. 0,1,2,3.
 # Blank uses gpu_device. Requested ordinals are validated against visibility and

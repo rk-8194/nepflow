@@ -1238,6 +1238,20 @@ def render_diagnostics_markdown(
     graph_identity = "materialized atomic graph" if materialized else "streamed kernel operator"
     graph_edges = "atomic graph edges" if materialized else "implicit kernel interactions"
     memory = graph["memory"]
+    operations = graph.get("operations", {})
+    if not isinstance(operations, Mapping):
+        operations = {}
+    calibration_operations = operations.get("calibration", {})
+    if not isinstance(calibration_operations, Mapping):
+        calibration_operations = {}
+    contribution_operations = operations.get("contributions", {})
+    if not isinstance(contribution_operations, Mapping):
+        contribution_operations = {}
+
+    def metric(source: Mapping[str, Any], name: str, default: Any = "unavailable") -> Any:
+        value = source.get(name, default)
+        return default if value is None else value
+
     lines = [
         "# Information-entropy selection diagnostics",
         "",
@@ -1261,6 +1275,10 @@ def render_diagnostics_markdown(
         f"- Calibration mode: `{calibration['mode']}`; selected bandwidth "
         f"k={bandwidth['selected_k']}, c={bandwidth['selected_c']}; "
         f"selected leave-one-out objective={selected['objective']:.17g}.",
+        f"- Kernel bandwidth rule: "
+        f"`{bandwidth.get('kernel_bandwidth_rule', 'asymmetric_source')}`; "
+        f"source rows retain local h_a and pair support uses "
+        f"`{bandwidth.get('effective_pair_bandwidth', 'H_ab=h_a')}`.",
         f"- Graph identity: {graph_identity}; {graph_edges} E={graph['edge_count']} "
         f"(E/N={graph['edge_per_row']:.6g}).",
         f"- Kernel operator fingerprint: `{graph['kernel_operator_fingerprint']}`.",
@@ -1271,6 +1289,28 @@ def render_diagnostics_markdown(
         f"{memory['measured_peak_memory_bytes']}; estimated peak bytes="
         f"{memory['estimated_peak_memory_bytes']}; contribution spool bytes="
         f"{memory['contribution_spool_bytes']}.",
+        f"- Operational evidence: calibration wall="
+        f"{metric(calibration_operations, 'wall_seconds')} s; "
+        f"contribution wall={metric(contribution_operations, 'wall_seconds')} s; "
+        f"support density={metric(contribution_operations, 'source_support_density_mean')}; "
+        f"fresh GPU FP64 evaluations="
+        f"{metric(contribution_operations, 'gpu_fp64_evaluations', 0)}; "
+        f"zero incoming LOO targets="
+        f"{metric(calibration_operations, 'zero_incoming_off_diagonal_count', 0)}; "
+        f"first offending row="
+        f"{metric(calibration_operations, 'first_zero_incoming_off_diagonal_row', 0)}; "
+        f"geometrically absent/nonrepresentable="
+        f"{metric(calibration_operations, 'geometric_support_absent_count', 0)}/"
+        f"{metric(calibration_operations, 'positive_raw_nonrepresentable_count', 0)}; "
+        f"boundary ties={metric(calibration_operations, 'boundary_tie_count', 0)}.",
+        f"- Exact support reuse: kNN-derived sources="
+        f"{metric(contribution_operations, 'knn_support_derived_sources', 0)}; "
+        f"reused kNN locations={metric(contribution_operations, 'reused_knn_locations', 0)}; "
+        f"new support distance evaluations="
+        f"{metric(contribution_operations, 'support_provider_new_distance_evaluations', 0)}.",
+        f"- Runtime peaks: RSS={metric(contribution_operations, 'process_peak_rss_bytes')}; "
+        f"scratch={metric(contribution_operations, 'peak_scratch_bytes')}; "
+        f"resource lease={metric(contribution_operations, 'resource_lease_peak_bytes')} bytes.",
         f"- Source support: {graph['source_support']['count']} rows, "
         f"q50={graph['source_support']['q50']}, q95={graph['source_support']['q95']}, "
         f"q99={graph['source_support']['q99']} {graph['source_support']['unit']}; "

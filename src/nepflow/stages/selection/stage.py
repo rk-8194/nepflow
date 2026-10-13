@@ -385,7 +385,7 @@ class SelectionStage:
                     "selection.entropy.optimizer_method must be lazy_greedy or full_greedy"
                 )
             kernel_bandwidth_rule = getattr(
-                entropy.bandwidth, "kernel_bandwidth_rule", "asymmetric_source"
+                entropy.bandwidth, "kernel_bandwidth_rule", "symmetric_max"
             )
             if kernel_bandwidth_rule not in {
                 "asymmetric_source",
@@ -643,6 +643,12 @@ class SelectionStage:
                 "calibration_fingerprint": getattr(calibration, "calibration_fingerprint", None),
                 "selected_k": getattr(calibration, "k", None),
                 "selected_c": getattr(calibration, "c", None),
+                "kernel_bandwidth_rule": getattr(calibration, "kernel_bandwidth_rule", None),
+                "kernel_bandwidth_rule_version": getattr(
+                    getattr(calibration, "selected", None),
+                    "kernel_bandwidth_rule_version",
+                    None,
+                ),
                 "graph_fingerprint": (
                     entropy_result.graph_fingerprint or entropy_result.kernel_operator_fingerprint
                 ),

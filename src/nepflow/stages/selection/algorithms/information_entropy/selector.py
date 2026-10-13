@@ -41,6 +41,21 @@ GREEDY_SELECTION_VERSION = "information-entropy-greedy-v1"
 CandidateContributionStore = SparseCandidateContributions | OutOfCoreSparseCandidateContributions
 
 
+def _pool_row_ids(pool: EntropyPool) -> tuple[str, ...]:
+    """Recreate the canonical row identities used by neighbour certification."""
+
+    def value(row: Any, name: str, default: Any) -> Any:
+        if name == "candidate_id" and isinstance(row, str):
+            return row
+        return row.get(name, default) if isinstance(row, Mapping) else getattr(row, name, default)
+
+    return tuple(
+        f"{value(row, 'candidate_id', '')}:{value(row, 'structure_id', '')}:"
+        f"{int(value(row, 'atom_index', index))}:{index}"
+        for index, row in enumerate(pool.rows)
+    )
+
+
 class EntropySelectionError(ValueError):
     """Base error for invalid or uncertifiable direct entropy selections."""
 
@@ -851,7 +866,7 @@ class InformationEntropySelectionAlgorithm:
                 ),
                 kernel_support_execution=str(getattr(bandwidth, "kernel_support_execution", "cpu")),
                 kernel_bandwidth_rule=str(
-                    getattr(bandwidth, "kernel_bandwidth_rule", "asymmetric_source")
+                    getattr(bandwidth, "kernel_bandwidth_rule", "symmetric_max")
                 ),
                 gpu_device=int(getattr(bandwidth, "gpu_device", 0)),
                 gpu_devices=getattr(bandwidth, "gpu_devices", None),
@@ -973,6 +988,14 @@ class InformationEntropySelectionAlgorithm:
             gpu_devices=bandwidth_settings.gpu_devices,
             gpu_tile_size=bandwidth_settings.gpu_tile_size,
             max_gpu_support_bytes=bandwidth_settings.max_gpu_support_bytes,
+            knn_support=calibration.selected_neighbours
+            if calibration.selected.c == 1.0
+            else None,
+            knn_support_row_ids=(
+                _pool_row_ids(pool)
+                if calibration.selected.c == 1.0 and calibration.selected_neighbours is not None
+                else None
+            ),
             storage=str(self._entropy_value(request.options, "contribution_storage", "auto")),
             storage_path=self._entropy_value(request.options, "contribution_storage_path", None),
             checkpoint_path=self._entropy_value(

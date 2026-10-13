@@ -220,6 +220,7 @@ def test_knn_prefix_loo_matches_generic_loo_and_preserves_c_greater_than_one() -
             backend="exact_indexed_cpu",
             index=knn_index,
             diagnostics=generic_diagnostics,
+            kernel_bandwidth_rule="asymmetric_source",
             **limits,
         )[0]
         fast_index = IndexedCPUNeighbourIndex(
@@ -234,6 +235,7 @@ def test_knn_prefix_loo_matches_generic_loo_and_preserves_c_greater_than_one() -
             backend="exact_indexed_cpu",
             index=fast_index,
             diagnostics=fast_diagnostics,
+            kernel_bandwidth_rule="asymmetric_source",
             knn_support=neighbours,
             knn_support_row_ids=row_ids,
             **limits,
@@ -261,6 +263,7 @@ def test_knn_prefix_loo_matches_generic_loo_and_preserves_c_greater_than_one() -
             backend="exact_indexed_cpu",
             index=fast_index,
             diagnostics=scaled_diagnostics,
+            kernel_bandwidth_rule="asymmetric_source",
             knn_support=neighbours,
             knn_support_row_ids=row_ids,
             **limits,
@@ -271,6 +274,7 @@ def test_knn_prefix_loo_matches_generic_loo_and_preserves_c_greater_than_one() -
             (2.0 * neighbours.radii)[None, :],
             backend="exact_indexed_cpu",
             index=knn_index,
+            kernel_bandwidth_rule="asymmetric_source",
             **limits,
         )[0]
         assert scaled.valid == generic_scaled.valid
@@ -311,7 +315,7 @@ def test_bandwidth_calibration_reports_knn_prefix_for_c_one(mode: str) -> None:
         max_calibration_work_bytes=10_000_000,
     )
     result = calibrate_bandwidth(pool, settings)
-    assert result.operational_metrics["support_provider"] == "exact_knn_prefix"
+    assert result.operational_metrics["support_provider"] == "symmetric_knn_union"
     assert result.operational_metrics["knn_support_derived_sources"] == len(descriptors)
     assert result.operational_metrics["support_size_per_c"][0]["support_size"][0] > 0
 

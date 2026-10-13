@@ -134,6 +134,7 @@ from .models import (
     OutOfCoreSparseCandidateContributions,
     SparseAtomicKernelRow,
     SparseCandidateContributionRow,
+    kernel_bandwidth_orientation,
     kernel_bandwidth_rule_version,
     normalize_kernel_bandwidth_rule,
 )
@@ -295,6 +296,7 @@ __all__ = [
     "NEIGHBOUR_DISTINCT_POLICY",
     "NEIGHBOUR_METRIC",
     "normalize_kernel_bandwidth_rule",
+    "kernel_bandwidth_orientation",
     "kernel_bandwidth_rule_version",
     "OUT_OF_CORE_CANDIDATE_CONTRIBUTION_SCHEMA_VERSION",
     "LeaveOneOutObjective",

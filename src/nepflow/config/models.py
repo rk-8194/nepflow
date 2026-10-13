@@ -348,9 +348,9 @@ class EntropyBandwidthConfig:
     max_calibration_work_bytes: int | None = None
     calibration_batch_size: int | None = None
     kernel_support_execution: str = "cpu"
-    # Staged scientific default: production remains on the legacy source rule
-    # until the later end-to-end symmetric integration issue lands.
-    kernel_bandwidth_rule: str = "asymmetric_source"
+    # The symmetric pair-bandwidth rule is the production default.  The
+    # historical source-oriented operator remains an explicit opt-in.
+    kernel_bandwidth_rule: str = "symmetric_max"
     gpu_device: int = 0
     gpu_devices: tuple[int, ...] | str | None = None
     gpu_tile_size: int = 128

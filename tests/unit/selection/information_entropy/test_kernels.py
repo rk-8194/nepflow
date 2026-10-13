@@ -56,7 +56,7 @@ def test_sparse_graph_matches_dense_reference_and_preserves_source_orientation()
     dense = normalized_kernel_matrix(pool.descriptors, frozen.bandwidths, chunk_size=3)
 
     np.testing.assert_array_equal(_dense_from_graph(graph), dense)
-    assert graph.source_bandwidth_orientation == "h_a"
+    assert graph.source_bandwidth_orientation == "pair_H_ab"
     assert all(
         source_index in row.target_indices
         for source_index, row in enumerate(graph.iter_source_rows())

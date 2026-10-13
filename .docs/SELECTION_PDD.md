@@ -907,7 +907,9 @@ projection is not used by the entropy objective.
 Additional entropy figures may summarize the source-specific high-dimensional
 bandwidths and aggregate the original atomic-row `p` and final-mixture `q` masses
 onto a common projected grid. They shall not draw atomic scatter clouds or
-interpret an `h_a` value as a two-dimensional kernel radius. A versioned,
+interpret a local source bandwidth `h_a` as a two-dimensional kernel radius;
+the production pair rule uses `H_ab=max(h_a,h_b)`, while the explicit legacy
+`asymmetric_source` option uses `H_ab=h_a`. A versioned,
 identity-checked presentation artifact under `reports/` shall contain the compact
 candidate summaries and probability grids needed to rerender these figures after
 restore, without recalibrating bandwidths, rebuilding neighbours, or rerunning

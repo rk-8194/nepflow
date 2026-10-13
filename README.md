@@ -140,7 +140,7 @@ explicitly in the selection config. For example:
 ```ini
 entropy_bandwidth_backend=exact_tiled_gpu_knn
 entropy_kernel_support_execution=exact_tiled_gpu
-entropy_kernel_bandwidth_rule=asymmetric_source
+entropy_kernel_bandwidth_rule=symmetric_max
 entropy_gpu_devices=0,1,2,3
 ```
 
@@ -151,11 +151,13 @@ reduce the requested GPU count. kNN and strict-support work are partitioned in
 deterministic source order, and their per-device throughput and transfer/
 certification metrics are included in the execution diagnostics.
 
-The scientific kernel rule is separate from support execution. The staged
-production default is `asymmetric_source`: for source row `a` and target row
-`b`, `H(a,b)=h_a` and `W_ab=wendland_c2(d_ab/H(a,b))`. The bounded exact
-support providers also accept `symmetric_max`, where
-`H(a,b)=max(h_a,h_b)`: c=1 can reuse a persisted canonical kNN prefix through
+The scientific kernel rule is separate from support execution. The production
+default is `symmetric_max`, where for source row `a` and target row `b`,
+`H(a,b)=max(h_a,h_b)` and `W_ab=wendland_c2(d_ab/H(a,b))`. Set
+`entropy_kernel_bandwidth_rule=asymmetric_source` to reproduce the historical
+source-oriented operator, where `H(a,b)=h_a`. The bounded exact
+support providers accept both rules. For `symmetric_max`, c=1 can reuse a
+persisted canonical kNN prefix through
 the deterministic `symmetric_knn_union` reverse index, while general radii use
 `symmetric_tiled_cpu` or `symmetric_tiled_gpu` with CPU-canonical strict
 verification.
@@ -164,8 +166,8 @@ symmetric, but source-column normalization still produces conditional
 probabilities `P(b|a)` whose columns sum to one and need not be symmetric.
 Duplicate descriptor rows retain multiplicity, equality at the support
 boundary contributes zero, and finite-support or FP64-underflow cases do not
-receive artificial floors. Symmetric production LOO/PMF/checkpoint workflow
-integration is intentionally deferred to subsequent integration issues.
+receive artificial floors. The same rule and exact support strategy are used
+for calibration, LOO, candidate PMFs, checkpoints, and final selection.
 
 ## Project Layout
 

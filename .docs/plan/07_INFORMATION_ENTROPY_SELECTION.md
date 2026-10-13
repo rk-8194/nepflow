@@ -292,6 +292,13 @@ The selector must never recompute (r_{k,a}) or (h_a) as structures are selected.
 
 Dense regions naturally have smaller (r_{k,a}) and therefore finer resolution. Sparse regions naturally have larger (r_{k,a}) and therefore coarser resolution.
 
+The production bandwidth rule is `symmetric_max`. For a source row `a` and
+target row `b`, the effective pair bandwidth is `H_ab = max(h_a, h_b)`.
+The historical source-oriented rule `H_ab = h_a` remains available only as
+the explicit `asymmetric_source` compatibility option. The selected rule and
+its version are part of calibration, kernel-operator, checkpoint, and
+selection fingerprints.
+
 ---
 
 ## 8. Local similarity kernel
@@ -336,6 +343,11 @@ end{cases}
 ]
 
 The exact kernel may be changed only through a versioned representation/selection specification.
+
+With the production `symmetric_max` rule, the raw kernel is
+`W_ab = K(d_ab / H_ab)` with `H_ab = max(h_a, h_b)` and strict support
+`d_ab < H_ab`. The `asymmetric_source` compatibility rule uses `H_ab = h_a`
+and preserves the historical operator exactly.
 
 A Gaussian reference implementation may be retained for dense correctness tests:
 

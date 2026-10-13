@@ -308,11 +308,11 @@ max_gpu_support_bytes = 1048576
 
 
 @pytest.mark.parametrize("rule", ["asymmetric_source", "symmetric_max"])
-def test_loader_accepts_kernel_bandwidth_rule_and_keeps_staged_default(
+def test_loader_accepts_kernel_bandwidth_rule_and_uses_symmetric_default(
     tmp_path: Path, rule: str
 ) -> None:
     default = load_config(write_config(tmp_path, BASE_CONFIG))
-    assert default.selection.entropy.bandwidth.kernel_bandwidth_rule == "asymmetric_source"
+    assert default.selection.entropy.bandwidth.kernel_bandwidth_rule == "symmetric_max"
 
     text = BASE_CONFIG + f"\n[selection]\nentropy_kernel_bandwidth_rule = {rule}\n"
     configured = load_config(write_config(tmp_path, text))

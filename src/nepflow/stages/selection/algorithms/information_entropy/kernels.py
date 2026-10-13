@@ -63,6 +63,8 @@ from .models import (
     SparseAtomicKernelGraph,
     SparseCandidateContributions,
     StreamedKernelExecutionSummary,
+    kernel_bandwidth_orientation,
+    kernel_bandwidth_rule_version,
     normalize_kernel_bandwidth_rule,
 )
 from .neighbours import (
@@ -164,14 +166,13 @@ def effective_pair_bandwidths(
     source_bandwidth: float,
     target_bandwidths: np.ndarray,
     *,
-    kernel_bandwidth_rule: str = KERNEL_BANDWIDTH_RULE_ASYMMETRIC_SOURCE,
+    kernel_bandwidth_rule: str = KERNEL_BANDWIDTH_RULE_SYMMETRIC_MAX,
 ) -> np.ndarray:
     """Evaluate the canonical effective bandwidth ``H(a, b)`` for one source.
 
     ``target_bandwidths`` is ordered by target row ``b`` and ``source_bandwidth``
-    is the scalar ``h_a``.  This helper is intentionally CPU/reference-facing;
-    production support queries still use the legacy source-radius path until
-    the symmetric integration issue is complete.
+    is the scalar ``h_a``.  The returned effective vector is the exact pairwise
+    rule selected by ``kernel_bandwidth_rule``.
     """
 
     rule = normalize_kernel_bandwidth_rule(kernel_bandwidth_rule)
@@ -193,7 +194,7 @@ def evaluate_raw_kernel_pairs(
     source_bandwidth: float,
     target_bandwidths: np.ndarray,
     *,
-    kernel_bandwidth_rule: str = KERNEL_BANDWIDTH_RULE_ASYMMETRIC_SOURCE,
+    kernel_bandwidth_rule: str = KERNEL_BANDWIDTH_RULE_SYMMETRIC_MAX,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Return ``(H, strict_support, W)`` for one source column.
 
@@ -244,6 +245,8 @@ class NormalizedKernelColumn:
     source_index: int
     target_indices: np.ndarray
     values: np.ndarray
+    geometric_target_indices: np.ndarray | None = None
+    boundary_tie_count: int = 0
 
     def __post_init__(self) -> None:
         indices = np.array(self.target_indices, dtype=np.int64, copy=True)
@@ -252,10 +255,26 @@ class NormalizedKernelColumn:
             raise ValueError("normalized kernel column arrays must be aligned vectors")
         if not np.all(np.isfinite(values)) or np.any(values <= 0.0):
             raise ValueError("normalized kernel column values must be finite and positive")
+        geometric = (
+            indices.copy()
+            if self.geometric_target_indices is None
+            else np.array(self.geometric_target_indices, dtype=np.int64, copy=True)
+        )
+        if geometric.ndim != 1 or np.any(geometric < 0):
+            raise ValueError("geometric kernel column targets must be a valid vector")
+        if (
+            isinstance(self.boundary_tie_count, bool)
+            or not isinstance(self.boundary_tie_count, (int, np.integer))
+            or int(self.boundary_tie_count) < 0
+        ):
+            raise ValueError("boundary_tie_count must be a non-negative integer")
         indices.setflags(write=False)
         values.setflags(write=False)
+        geometric.setflags(write=False)
         object.__setattr__(self, "target_indices", indices)
         object.__setattr__(self, "values", values)
+        object.__setattr__(self, "geometric_target_indices", geometric)
+        object.__setattr__(self, "boundary_tie_count", int(self.boundary_tie_count))
 
 
 @dataclass(frozen=True, slots=True)
@@ -313,7 +332,7 @@ class _KernelSupportProvider:
         knn_support: ExactNeighbourResult | None = None,
         knn_support_row_ids: Sequence[str] | None = None,
         max_calibration_work_bytes: int | None = None,
-        kernel_bandwidth_rule: str = KERNEL_BANDWIDTH_RULE_ASYMMETRIC_SOURCE,
+        kernel_bandwidth_rule: str = KERNEL_BANDWIDTH_RULE_SYMMETRIC_MAX,
     ) -> None:
         self.descriptors = _validate_descriptors(descriptors)
         self.backend = backend
@@ -517,6 +536,7 @@ class _KernelSupportProvider:
             offsets, targets, distances = self.gpu_support.support_many(
                 np.asarray([source_index], dtype=np.int64),
                 np.asarray([scale], dtype=np.float64),
+                kernel_bandwidth_rule=self.kernel_bandwidth_rule,
             )
             result_targets = targets[: int(offsets[1])]
             result_distances = distances[: int(offsets[1])]
@@ -713,7 +733,9 @@ class _KernelSupportProvider:
             return offsets, targets, distances
         if self.gpu_support is not None:
             offsets, targets, distances = self.gpu_support.support_many(
-                sources, requested_radii
+                sources,
+                requested_radii,
+                kernel_bandwidth_rule=self.kernel_bandwidth_rule,
             )
             counts = np.diff(offsets)
             for count in counts:
@@ -814,6 +836,9 @@ class _KernelSupportProvider:
             "support_execution": self.support_execution,
             "support_execution_version": self.support_execution_version,
             "kernel_bandwidth_rule": self.kernel_bandwidth_rule,
+            "kernel_bandwidth_rule_version": kernel_bandwidth_rule_version(
+                self.kernel_bandwidth_rule
+            ),
             "support_provider_rule": self.kernel_bandwidth_rule,
         }
         if self.gpu_support is not None:
@@ -984,7 +1009,7 @@ def source_normalisers(
     gpu_devices: Sequence[int] | str | int | None = None,
     gpu_tile_size: int = 128,
     max_gpu_support_bytes: int | None = None,
-    kernel_bandwidth_rule: str = KERNEL_BANDWIDTH_RULE_ASYMMETRIC_SOURCE,
+    kernel_bandwidth_rule: str = KERNEL_BANDWIDTH_RULE_SYMMETRIC_MAX,
 ) -> np.ndarray:
     """Return ``Z_b`` over the complete exact compact-kernel support."""
 
@@ -1007,6 +1032,8 @@ def source_normalisers(
         max_gpu_support_bytes=max_gpu_support_bytes,
         kernel_bandwidth_rule=bandwidth_rule,
     )
+    if provider.kernel_bandwidth_rule != bandwidth_rule:
+        raise ValueError("support provider bandwidth rule conflicts with the requested rule")
     normalisers = np.empty(values.shape[0], dtype=np.float64)
     query_block = min(block, provider.support_batch_size)
     for start in range(0, values.shape[0], query_block):
@@ -1064,7 +1091,7 @@ def iter_normalized_kernel_columns(
     gpu_devices: Sequence[int] | str | int | None = None,
     gpu_tile_size: int = 128,
     max_gpu_support_bytes: int | None = None,
-    kernel_bandwidth_rule: str = KERNEL_BANDWIDTH_RULE_ASYMMETRIC_SOURCE,
+    kernel_bandwidth_rule: str = KERNEL_BANDWIDTH_RULE_SYMMETRIC_MAX,
 ) -> Iterator[NormalizedKernelColumn]:
     """Yield positive normalized source columns using bounded workspaces.
 
@@ -1093,6 +1120,8 @@ def iter_normalized_kernel_columns(
         max_gpu_support_bytes=max_gpu_support_bytes,
         kernel_bandwidth_rule=bandwidth_rule,
     )
+    if provider.kernel_bandwidth_rule != bandwidth_rule:
+        raise ValueError("support provider bandwidth rule conflicts with the requested rule")
     if source_indices is None:
         ordered_sources = range(values.shape[0])
     else:
@@ -1120,7 +1149,7 @@ def iter_normalized_kernel_columns(
             target_indices = targets[begin:end]
             source_distances = distances[begin:end]
             if bandwidth_rule == KERNEL_BANDWIDTH_RULE_SYMMETRIC_MAX:
-                _effective, _supported, raw = evaluate_raw_kernel_pairs(
+                _effective, supported, raw = evaluate_raw_kernel_pairs(
                     source_distances,
                     float(scale),
                     scales[target_indices],
@@ -1131,6 +1160,7 @@ def iter_normalized_kernel_columns(
                     raise ValueError(
                         f"source kernel normaliser is invalid for source {source_index}"
                     )
+                geometric_target_indices = target_indices[supported].copy()
             else:
                 normaliser = provider.normaliser(
                     source_index,
@@ -1139,6 +1169,13 @@ def iter_normalized_kernel_columns(
                     source_distances,
                 )
                 raw = np.asarray(wendland_kernel(source_distances / scale), dtype=np.float64)
+                geometric_target_indices = np.asarray(target_indices, dtype=np.int64).copy()
+                _effective = np.full(source_distances.shape, float(scale), dtype=np.float64)
+            boundary_tie_count = int(
+                np.count_nonzero(
+                    (target_indices != source_index) & (source_distances == _effective)
+                )
+            )
             positive = raw > 0.0
             if not np.all(positive):
                 target_indices = target_indices[positive]
@@ -1146,7 +1183,13 @@ def iter_normalized_kernel_columns(
             normalized = raw / normaliser
             column_total = float(np.sum(normalized, dtype=np.float64))
             if target_indices.size:
-                yield NormalizedKernelColumn(source_index, target_indices, normalized)
+                yield NormalizedKernelColumn(
+                    source_index,
+                    target_indices,
+                    normalized,
+                    geometric_target_indices=geometric_target_indices,
+                    boundary_tie_count=boundary_tie_count,
+                )
             if not math.isclose(column_total, 1.0, rel_tol=0.0, abs_tol=1.0e-12):
                 raise ValueError(
                     f"normalized source kernel column {source_index} does not sum to one"
@@ -1162,7 +1205,7 @@ def normalized_kernel_matrix(
     chunk_size: int = 1024,
     max_dense_entries: int = 1_000_000,
     max_radius_query_bytes: int | None = None,
-    kernel_bandwidth_rule: str = KERNEL_BANDWIDTH_RULE_ASYMMETRIC_SOURCE,
+    kernel_bandwidth_rule: str = KERNEL_BANDWIDTH_RULE_SYMMETRIC_MAX,
 ) -> np.ndarray:
     """Build a deliberately bounded dense oracle for small correctness tests.
 
@@ -1210,6 +1253,7 @@ def normalized_kernel_matrix(
         scales,
         chunk_size=chunk_size,
         max_radius_query_bytes=max_radius_query_bytes,
+        kernel_bandwidth_rule=rule,
     ):
         matrix[column.target_indices, column.source_index] = column.values
     return matrix
@@ -1243,18 +1287,13 @@ def evaluate_leave_one_out_objective(
     gpu_devices: Sequence[int] | str | int | None = None,
     gpu_tile_size: int = 128,
     max_gpu_support_bytes: int | None = None,
-    kernel_bandwidth_rule: str = KERNEL_BANDWIDTH_RULE_ASYMMETRIC_SOURCE,
+    kernel_bandwidth_rule: str = KERNEL_BANDWIDTH_RULE_SYMMETRIC_MAX,
     knn_support: ExactNeighbourResult | None = None,
     knn_support_row_ids: Sequence[str] | None = None,
 ) -> LeaveOneOutObjective:
     """Evaluate the exact source-normalized finite-pool LOO objective."""
 
     bandwidth_rule = normalize_kernel_bandwidth_rule(kernel_bandwidth_rule)
-    if bandwidth_rule != KERNEL_BANDWIDTH_RULE_ASYMMETRIC_SOURCE:
-        raise ValueError(
-            "symmetric_max leave-one-out evaluation is not integrated in this release; "
-            "use normalized_kernel_matrix as the bounded CPU reference oracle"
-        )
 
     if checkpoint_path is not None:
         batched = evaluate_leave_one_out_objectives(
@@ -1281,6 +1320,7 @@ def evaluate_leave_one_out_objective(
             gpu_devices=gpu_devices,
             gpu_tile_size=gpu_tile_size,
             max_gpu_support_bytes=max_gpu_support_bytes,
+            kernel_bandwidth_rule=bandwidth_rule,
             knn_support=knn_support,
             knn_support_row_ids=knn_support_row_ids,
         )
@@ -1315,11 +1355,15 @@ def evaluate_leave_one_out_objective(
         gpu_devices=gpu_devices,
         gpu_tile_size=gpu_tile_size,
         max_gpu_support_bytes=max_gpu_support_bytes,
+        kernel_bandwidth_rule=bandwidth_rule,
         knn_support=knn_support,
         knn_support_row_ids=knn_support_row_ids,
         max_calibration_work_bytes=max_calibration_work_bytes,
     )
     numerator = np.zeros(values.shape[0], dtype=np.float64)
+    incoming_geometric = np.zeros(values.shape[0], dtype=np.int64)
+    incoming_positive = np.zeros(values.shape[0], dtype=np.int64)
+    boundary_ties = 0
     loo_started = time.perf_counter()
     for column in iter_normalized_kernel_columns(
         values,
@@ -1337,13 +1381,30 @@ def evaluate_leave_one_out_objective(
         gpu_devices=gpu_devices,
         gpu_tile_size=gpu_tile_size,
         max_gpu_support_bytes=max_gpu_support_bytes,
+        kernel_bandwidth_rule=bandwidth_rule,
     ):
+        geometric_targets = column.geometric_target_indices
+        assert geometric_targets is not None
+        boundary_ties += column.boundary_tie_count
         non_source = column.target_indices != column.source_index
+        geometric_non_source = geometric_targets != column.source_index
+        if np.any(geometric_non_source):
+            np.add.at(
+                incoming_geometric,
+                geometric_targets[geometric_non_source],
+                1,
+            )
         if np.any(non_source):
+            np.add.at(
+                incoming_positive,
+                column.target_indices[non_source],
+                1,
+            )
             numerator[column.target_indices[non_source]] += (
                 masses[column.source_index] * column.values[non_source]
             )
     provider_metrics = provider.operational_metrics()
+    provider.close()
     if diagnostics is not None:
         diagnostics["loo_wall_seconds"] = max(0.0, time.perf_counter() - loo_started)
         diagnostics["loo_support_query_seconds"] = float(
@@ -1364,6 +1425,10 @@ def evaluate_leave_one_out_objective(
                 "gpu_per_device",
                 "knn_gpu_per_device",
                 "gpu_rescan_reasons",
+                "kernel_bandwidth_rule",
+                "support_provider_rule",
+                "support_provider_version",
+                "kernel_bandwidth_rule_version",
             }:
                 diagnostics[metric_name] = metric_value
             elif isinstance(metric_value, bool):
@@ -1376,6 +1441,20 @@ def evaluate_leave_one_out_objective(
         diagnostics["support_max_per_candidate"] = [
             provider_metrics.get("support_count_max")
         ]
+        zero_rows = incoming_positive == 0
+        diagnostics["zero_incoming_off_diagonal_count"] = int(np.count_nonzero(zero_rows))
+        diagnostics["first_zero_incoming_off_diagonal_row"] = (
+            int(np.flatnonzero(zero_rows)[0]) if np.any(zero_rows) else None
+        )
+        zero_rows = incoming_positive == 0
+        geometric_zero_rows = incoming_geometric == 0
+        diagnostics["geometric_support_absent_count"] = int(
+            np.count_nonzero(zero_rows & geometric_zero_rows)
+        )
+        diagnostics["positive_raw_nonrepresentable_count"] = int(
+            np.count_nonzero(zero_rows & ~geometric_zero_rows)
+        )
+        diagnostics["boundary_tie_count"] = boundary_ties
         diagnostics["conservative_candidate_count_per_candidate"] = [
             provider_metrics.get("support_count_mean")
         ]
@@ -1433,7 +1512,7 @@ def evaluate_leave_one_out_objectives(
     gpu_devices: Sequence[int] | str | int | None = None,
     gpu_tile_size: int = 128,
     max_gpu_support_bytes: int | None = None,
-    kernel_bandwidth_rule: str = KERNEL_BANDWIDTH_RULE_ASYMMETRIC_SOURCE,
+    kernel_bandwidth_rule: str = KERNEL_BANDWIDTH_RULE_SYMMETRIC_MAX,
     knn_support: ExactNeighbourResult | None = None,
     knn_support_row_ids: Sequence[str] | None = None,
 ) -> tuple[LeaveOneOutObjective, ...]:
@@ -1449,11 +1528,6 @@ def evaluate_leave_one_out_objectives(
     """
 
     bandwidth_rule = normalize_kernel_bandwidth_rule(kernel_bandwidth_rule)
-    if bandwidth_rule != KERNEL_BANDWIDTH_RULE_ASYMMETRIC_SOURCE:
-        raise ValueError(
-            "symmetric_max leave-one-out evaluation is not integrated in this release; "
-            "use normalized_kernel_matrix as the bounded CPU reference oracle"
-        )
 
     values = _validate_descriptors(descriptors)
     masses = np.asarray(probabilities)
@@ -1515,9 +1589,10 @@ def evaluate_leave_one_out_objectives(
     block = _validate_chunk_size(chunk_size)
     batch_count = int(scales.shape[0])
     row_count = int(values.shape[0])
-    # Keep a conservative allowance for the CxN numerator and bandwidth
-    # batch, while the radius-query guard accounts for source-local geometry.
-    batch_arrays_bytes = 16 * batch_count * row_count + 8192
+    # Keep a conservative allowance for the CxN numerator, bandwidth batch,
+    # and the two incoming-support diagnostic counters, while the
+    # radius-query guard accounts for source-local geometry.
+    batch_arrays_bytes = 32 * batch_count * row_count + 8192
     if batch_arrays_bytes > work_limit:
         details = [
             f"N={row_count}",
@@ -1553,6 +1628,7 @@ def evaluate_leave_one_out_objectives(
         gpu_devices=gpu_devices,
         gpu_tile_size=gpu_tile_size,
         max_gpu_support_bytes=max_gpu_support_bytes,
+        kernel_bandwidth_rule=bandwidth_rule,
         knn_support=knn_support,
         knn_support_row_ids=knn_support_row_ids,
         max_calibration_work_bytes=work_limit,
@@ -1571,6 +1647,10 @@ def evaluate_leave_one_out_objectives(
     support_maxima = np.zeros(batch_count, dtype=np.int64)
     conservative_candidate_totals = np.zeros(batch_count, dtype=np.int64)
     conservative_candidate_maxima = np.zeros(batch_count, dtype=np.int64)
+    incoming_geometric = np.zeros((batch_count, row_count), dtype=np.int64)
+    incoming_positive_raw = np.zeros((batch_count, row_count), dtype=np.int64)
+    boundary_ties = np.zeros(batch_count, dtype=np.int64)
+    diagnostic_counters_complete = True
     peak_workspace_bytes = batch_arrays_bytes
     checkpoint_store = (
         None
@@ -1617,6 +1697,11 @@ def evaluate_leave_one_out_objectives(
             "k_c_batch_shape": [batch_count, row_count],
             "numerical_tolerance": SPARSE_NUMERICAL_TOLERANCE,
         }
+        if bandwidth_rule != KERNEL_BANDWIDTH_RULE_ASYMMETRIC_SOURCE:
+            checkpoint_identity["kernel_bandwidth_rule"] = bandwidth_rule
+            checkpoint_identity["kernel_bandwidth_rule_version"] = kernel_bandwidth_rule_version(
+                bandwidth_rule
+            )
         if normalized_support_execution == KERNEL_SUPPORT_EXECUTION_GPU:
             checkpoint_identity["kernel_support_execution_version"] = (
                 KERNEL_SUPPORT_EXECUTION_GPU_VERSION
@@ -1670,6 +1755,35 @@ def evaluate_leave_one_out_objectives(
             conservative_candidate_maxima[...] = np.asarray(
                 saved_conservative_maxima, dtype=np.int64
             )
+            saved_incoming_geometric = checkpoint_arrays.get("incoming_geometric")
+            saved_incoming_positive_raw = checkpoint_arrays.get("incoming_positive_raw")
+            saved_boundary_ties = checkpoint_state.get("boundary_ties", boundary_ties.tolist())
+            if "boundary_ties" not in checkpoint_state:
+                diagnostic_counters_complete = False
+            if saved_incoming_geometric is not None:
+                if saved_incoming_geometric.shape != incoming_geometric.shape:
+                    raise CheckpointValidationError(
+                        "LOO checkpoint geometric support diagnostics are incompatible"
+                    )
+                incoming_geometric[...] = saved_incoming_geometric
+            else:
+                diagnostic_counters_complete = False
+            if saved_incoming_positive_raw is not None:
+                if saved_incoming_positive_raw.shape != incoming_positive_raw.shape:
+                    raise CheckpointValidationError(
+                        "LOO checkpoint raw support diagnostics are incompatible"
+                    )
+                incoming_positive_raw[...] = saved_incoming_positive_raw
+            else:
+                diagnostic_counters_complete = False
+            if (
+                not isinstance(saved_boundary_ties, list)
+                or len(saved_boundary_ties) != batch_count
+            ):
+                raise CheckpointValidationError(
+                    "LOO checkpoint boundary diagnostics are incompatible"
+                )
+            boundary_ties[...] = np.asarray(saved_boundary_ties, dtype=np.int64)
             logger.info(
                 "Resuming exact batched leave-one-out from source %d/%d",
                 source_start,
@@ -1703,8 +1817,13 @@ def evaluate_leave_one_out_objectives(
                 "support_maxima": support_maxima.tolist(),
                 "conservative_candidate_totals": conservative_candidate_totals.tolist(),
                 "conservative_candidate_maxima": conservative_candidate_maxima.tolist(),
+                "boundary_ties": boundary_ties.tolist(),
             },
-            arrays={"numerator": numerator},
+            arrays={
+                "numerator": numerator,
+                "incoming_geometric": incoming_geometric,
+                "incoming_positive_raw": incoming_positive_raw,
+            },
         )
         after = checkpoint_store.metrics()
         checkpoint_seconds += max(0.0, time.perf_counter() - checkpoint_started)
@@ -1724,6 +1843,10 @@ def evaluate_leave_one_out_objectives(
         support_offsets, support_targets, support_distances = provider.support_many(
             source_indices,
             source_scales,
+            target_bandwidths=(
+                scales if bandwidth_rule == KERNEL_BANDWIDTH_RULE_SYMMETRIC_MAX else None
+            ),
+            kernel_bandwidth_rule=bandwidth_rule,
         )
         peak_scratch_bytes = max(peak_scratch_bytes, int(service.reserved_scratch_bytes))
         peak_lease_bytes = max(peak_lease_bytes, int(service.reserved_memory_bytes))
@@ -1762,9 +1885,21 @@ def evaluate_leave_one_out_objectives(
                 if invalid_reasons[batch_index] is not None:
                     continue
                 try:
-                    included = distances < float(scale)
+                    if bandwidth_rule == KERNEL_BANDWIDTH_RULE_SYMMETRIC_MAX:
+                        effective = np.maximum(float(scale), scales[batch_index, target_indices])
+                    else:
+                        effective = np.full(distances.shape, float(scale), dtype=np.float64)
+                    off_target = target_indices != source_index
+                    boundary_ties[batch_index] += int(
+                        np.count_nonzero(off_target & (distances == effective))
+                    )
+                    included = distances < effective
+                    geometric_targets = target_indices[included & off_target]
+                    if geometric_targets.size:
+                        np.add.at(incoming_geometric[batch_index], geometric_targets, 1)
                     selected_targets = target_indices[included]
                     selected_distances = distances[included]
+                    selected_effective = effective[included]
                     support_size = int(selected_targets.shape[0])
                     support_totals[batch_index] += support_size
                     support_samples[batch_index] += 1
@@ -1773,10 +1908,14 @@ def evaluate_leave_one_out_objectives(
                         support_size,
                     )
                     raw = np.asarray(
-                        wendland_kernel(selected_distances / float(scale)),
+                        wendland_kernel(selected_distances / selected_effective),
                         dtype=np.float64,
                     )
                     positive = raw > 0.0
+                    positive_targets = selected_targets[positive]
+                    positive_targets = positive_targets[positive_targets != source_index]
+                    if positive_targets.size:
+                        np.add.at(incoming_positive_raw[batch_index], positive_targets, 1)
                     if not np.all(positive):
                         selected_targets = selected_targets[positive]
                         raw = raw[positive]
@@ -2080,6 +2219,10 @@ def evaluate_leave_one_out_objectives(
                 "gpu_per_device",
                 "knn_gpu_per_device",
                 "gpu_rescan_reasons",
+                "kernel_bandwidth_rule",
+                "support_provider_rule",
+                "support_provider_version",
+                "kernel_bandwidth_rule_version",
             }:
                 diagnostics[metric_name] = metric_value
             elif isinstance(metric_value, bool):
@@ -2111,6 +2254,31 @@ def evaluate_leave_one_out_objectives(
             "conservative_candidate_max_per_candidate",
             operational_metrics["conservative_candidate_max_per_candidate"],
         )
+        if diagnostic_counters_complete:
+            zero_counts: list[int] = []
+            first_zero_rows: list[int | None] = []
+            geometric_absent_counts: list[int] = []
+            nonrepresentable_counts: list[int] = []
+            for batch_index in range(batch_count):
+                zero = incoming_positive_raw[batch_index] == 0
+                zero_counts.append(int(np.count_nonzero(zero)))
+                first_zero_rows.append(
+                    int(np.flatnonzero(zero)[0]) if np.any(zero) else None
+                )
+                geometric_zero = incoming_geometric[batch_index] == 0
+                geometric_absent_counts.append(int(np.count_nonzero(zero & geometric_zero)))
+                nonrepresentable_counts.append(int(np.count_nonzero(zero & ~geometric_zero)))
+            diagnostics["zero_incoming_off_diagonal_count"] = zero_counts
+            diagnostics["first_zero_incoming_off_diagonal_row"] = first_zero_rows
+            diagnostics["geometric_support_absent_count"] = geometric_absent_counts
+            diagnostics["positive_raw_nonrepresentable_count"] = nonrepresentable_counts
+            diagnostics["boundary_tie_count"] = boundary_ties.tolist()
+        else:
+            diagnostics["zero_incoming_off_diagonal_count"] = None
+            diagnostics["first_zero_incoming_off_diagonal_row"] = None
+            diagnostics["geometric_support_absent_count"] = None
+            diagnostics["positive_raw_nonrepresentable_count"] = None
+            diagnostics["boundary_tie_count"] = None
     return tuple(results)
 
 
@@ -2196,11 +2364,6 @@ def _validate_sparse_graph_inputs(
         )
     if frozen.metric != NEIGHBOUR_METRIC:
         raise ValueError("sparse kernel construction requires the exact Euclidean metric")
-    if frozen.kernel_bandwidth_rule != KERNEL_BANDWIDTH_RULE_ASYMMETRIC_SOURCE:
-        raise ValueError(
-            "symmetric_max bandwidths are reference-only in this release; "
-            "production sparse kernel construction is not yet integrated"
-        )
     candidate_ids = tuple(pool.candidate_ids)
     if not candidate_ids or len(set(candidate_ids)) != len(candidate_ids):
         raise ValueError("entropy pool candidate IDs must be non-empty and unique")
@@ -2238,7 +2401,9 @@ def _graph_fingerprint(
         "kernel_family": KERNEL_FAMILY,
         "kernel_version": KERNEL_VERSION,
         "normalization": "finite-pool-source-column-v1",
-        "source_bandwidth_orientation": "h_a",
+        "source_bandwidth_orientation": kernel_bandwidth_orientation(
+            bandwidths.kernel_bandwidth_rule
+        ),
         "self_membership": True,
         "source_order": "ordered-pool-rows",
         "target_order": "ascending-pool-row-index",
@@ -2281,7 +2446,9 @@ def _kernel_operator_fingerprint(
         "kernel_family": KERNEL_FAMILY,
         "kernel_version": KERNEL_VERSION,
         "normalization": "finite-pool-source-column-v1",
-        "source_bandwidth_orientation": "h_a",
+        "source_bandwidth_orientation": kernel_bandwidth_orientation(
+            bandwidths.kernel_bandwidth_rule
+        ),
         "duplicate_target_policy": "retain-all-original-pool-rows-v1",
         "source_reduction_order": "candidate-id-then-original-source-index-v1",
         "target_order": "ascending-original-pool-row-index",
@@ -2335,6 +2502,8 @@ def build_sparse_atomic_kernel_graph(
     max_spool_bytes: int | None = None,
     progress_callback: SourceProgressCallback | None = None,
     max_radius_query_bytes: int = DEFAULT_RADIUS_QUERY_BYTES,
+    knn_support: ExactNeighbourResult | None = None,
+    knn_support_row_ids: Sequence[str] | None = None,
 ) -> SparseAtomicKernelGraph:
     """Build the exact source-major sparse finite-pool atomic kernel graph."""
 
@@ -2378,6 +2547,9 @@ def build_sparse_atomic_kernel_graph(
         backend=frozen.backend,
         chunk_size=block,
         max_radius_query_bytes=max_radius_query_bytes,
+        kernel_bandwidth_rule=frozen.kernel_bandwidth_rule,
+        knn_support=knn_support,
+        knn_support_row_ids=knn_support_row_ids,
     )
     if (
         frozen.backend
@@ -2423,6 +2595,7 @@ def build_sparse_atomic_kernel_graph(
                 backend=frozen.backend,
                 support_provider=support_provider,
                 max_radius_query_bytes=max_radius_query_bytes,
+                kernel_bandwidth_rule=frozen.kernel_bandwidth_rule,
             ):
                 support = int(column.target_indices.shape[0])
                 source_index = int(column.source_index)
@@ -2538,6 +2711,11 @@ def build_sparse_atomic_kernel_graph(
             bandwidth_fingerprint=frozen.fingerprint,
             transform_fingerprint=pool.transform_fingerprint,
             fingerprint=graph_fingerprint,
+            source_bandwidth_orientation=kernel_bandwidth_orientation(
+                frozen.kernel_bandwidth_rule
+            ),
+            kernel_bandwidth_rule=frozen.kernel_bandwidth_rule,
+            kernel_bandwidth_rule_version=frozen.kernel_bandwidth_rule_version,
         )
     except Exception as exc:
         logger.error("Sparse atomic kernel graph failed: %s", exc)
@@ -2596,6 +2774,8 @@ def _publish_out_of_core_candidate_store(
     source_counts: np.ndarray,
     pool: EntropyPool,
     operator_fingerprint: str,
+    kernel_bandwidth_rule: str,
+    kernel_bandwidth_rule_version: str,
     spool_header: bytes,
     implicit_edge_count: int,
     source_support_min: int,
@@ -2703,6 +2883,8 @@ def _publish_out_of_core_candidate_store(
             "sparse_schema_version": SPARSE_STREAMED_CANDIDATE_CONTRIBUTION_SCHEMA_VERSION,
             "numerical_tolerance": SPARSE_NUMERICAL_TOLERANCE,
             "kernel_operator_fingerprint": operator_fingerprint,
+            "kernel_bandwidth_rule": kernel_bandwidth_rule,
+            "kernel_bandwidth_rule_version": kernel_bandwidth_rule_version,
             "implicit_edge_count": int(implicit_edge_count),
             "source_support_min": int(source_support_min),
             "source_support_mean": float(source_support_mean),
@@ -2754,6 +2936,8 @@ def build_streamed_candidate_contributions(
     gpu_devices: Sequence[int] | str | int | None = None,
     gpu_tile_size: int = 128,
     max_gpu_support_bytes: int | None = None,
+    knn_support: ExactNeighbourResult | None = None,
+    knn_support_row_ids: Sequence[str] | None = None,
 ) -> tuple[
     SparseCandidateContributions | OutOfCoreSparseCandidateContributions,
     StreamedKernelExecutionSummary,
@@ -2917,6 +3101,9 @@ def build_streamed_candidate_contributions(
             if (
                 existing.pool_fingerprint != pool.fingerprint
                 or existing.kernel_operator_fingerprint != operator_fingerprint
+                or existing.kernel_bandwidth_rule != frozen.kernel_bandwidth_rule
+                or existing.kernel_bandwidth_rule_version
+                != frozen.kernel_bandwidth_rule_version
                 or tuple(existing.candidate_ids) != candidate_ids
                 or existing.row_count != n_rows
             ):
@@ -2979,6 +3166,8 @@ def build_streamed_candidate_contributions(
                 candidate_storage="disk",
                 candidate_storage_path=str(existing.directory),
                 candidate_resident_bytes=existing.resident_array_bytes,
+                kernel_bandwidth_rule=frozen.kernel_bandwidth_rule,
+                kernel_bandwidth_rule_version=frozen.kernel_bandwidth_rule_version,
             )
             logger.info(
                 "Reusing verified out-of-core candidate contributions: path=%s, Q=%d",
@@ -3021,6 +3210,9 @@ def build_streamed_candidate_contributions(
             gpu_devices=gpu_devices,
             gpu_tile_size=gpu_tile_size,
             max_gpu_support_bytes=max_gpu_support_bytes,
+            kernel_bandwidth_rule=frozen.kernel_bandwidth_rule,
+            knn_support=knn_support,
+            knn_support_row_ids=knn_support_row_ids,
         )
         if (
             frozen.backend
@@ -3354,6 +3546,7 @@ def build_streamed_candidate_contributions(
                     gpu_devices=gpu_devices,
                     gpu_tile_size=gpu_tile_size,
                     max_gpu_support_bytes=max_gpu_support_bytes,
+                    kernel_bandwidth_rule=frozen.kernel_bandwidth_rule,
                 ):
                     normalization_started = time.perf_counter()
                     source_index = int(column.source_index)
@@ -3661,6 +3854,8 @@ def build_streamed_candidate_contributions(
                     source_counts=source_counts,
                     pool=pool,
                     operator_fingerprint=operator_fingerprint,
+                    kernel_bandwidth_rule=frozen.kernel_bandwidth_rule,
+                    kernel_bandwidth_rule_version=frozen.kernel_bandwidth_rule_version,
                     spool_header=_EDGE_SPOOL_HEADER,
                     implicit_edge_count=implicit_edges,
                     source_support_min=int(np.min(support_sizes)),
@@ -3783,6 +3978,8 @@ def build_streamed_candidate_contributions(
             if support_provider.support_execution == KERNEL_SUPPORT_EXECUTION_GPU
             else None
         ),
+        kernel_bandwidth_rule=frozen.kernel_bandwidth_rule,
+        kernel_bandwidth_rule_version=frozen.kernel_bandwidth_rule_version,
         operational_metrics=operational_metrics,
     )
     logger.info(

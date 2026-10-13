@@ -24,7 +24,6 @@ from .gpu_devices import (
     validate_visible_gpu_devices,
 )
 from .models import (
-    KERNEL_BANDWIDTH_RULE_ASYMMETRIC_SOURCE,
     KERNEL_BANDWIDTH_RULE_SYMMETRIC_MAX,
     KERNEL_SUPPORT_EXECUTION_GPU_VERSION,
     normalize_kernel_bandwidth_rule,
@@ -199,7 +198,7 @@ class ExactTiledGPUSupport:
             self.reused_radius_scans = 0
             self.conservative_candidate_count = 0
             self.support_query_seconds = 0.0
-            self.kernel_bandwidth_rule = KERNEL_BANDWIDTH_RULE_ASYMMETRIC_SOURCE
+            self.kernel_bandwidth_rule = KERNEL_BANDWIDTH_RULE_SYMMETRIC_MAX
             self.support_wall_seconds = 0.0
             return
 
@@ -323,7 +322,7 @@ class ExactTiledGPUSupport:
         self.reused_radius_scans = 0
         self.conservative_candidate_count = 0
         self.support_query_seconds = 0.0
-        self.kernel_bandwidth_rule = KERNEL_BANDWIDTH_RULE_ASYMMETRIC_SOURCE
+        self.kernel_bandwidth_rule = KERNEL_BANDWIDTH_RULE_SYMMETRIC_MAX
         self.support_wall_seconds = 0.0
 
     def _load_cupy(self) -> Any:
@@ -840,7 +839,7 @@ class ExactTiledGPUSupport:
         radii: Sequence[float] | np.ndarray,
         *,
         target_bandwidths: Sequence[float] | np.ndarray | None = None,
-        kernel_bandwidth_rule: str = KERNEL_BANDWIDTH_RULE_ASYMMETRIC_SOURCE,
+        kernel_bandwidth_rule: str = KERNEL_BANDWIDTH_RULE_SYMMETRIC_MAX,
         _record_group: bool = True,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Return an exact source-major CSR support superset.
@@ -1130,7 +1129,7 @@ class ExactTiledGPUSupport:
         source_indices: np.ndarray,
         radii: np.ndarray,
         target_bandwidths: np.ndarray | None = None,
-        kernel_bandwidth_rule: str = KERNEL_BANDWIDTH_RULE_ASYMMETRIC_SOURCE,
+        kernel_bandwidth_rule: str = KERNEL_BANDWIDTH_RULE_SYMMETRIC_MAX,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Run one single-device worker while its CUDA context is current."""
 
