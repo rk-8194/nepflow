@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from io import StringIO
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 from ase.io import write as ase_write
 
@@ -40,6 +40,8 @@ def write_selected_structures(
     test_selection_policy: str = "candidate_mean_fps_legacy",
     test_selection_version: str = "candidate-mean-fps-v1",
     test_selection_provenance: Mapping[str, Any] | None = None,
+    seed_anchor_policy: str = "disabled_for_fps",
+    seed_anchor_resolution: Sequence[Mapping[str, Any]] | None = None,
 ) -> tuple[Path, Path]:
     """Write selected train/test structures using the established paths."""
 
@@ -197,6 +199,11 @@ def write_selected_structures(
                 "test_selection_version": test_selection_version,
                 "test_selection_provenance": dict(test_selection_provenance or {}),
                 "train_anchor_count": len(set(train_anchor_indices or [])),
+                "seed_anchor_policy": seed_anchor_policy,
+                "seed_anchor_count": len(seed_anchor_resolution or []),
+                "seed_anchor_resolution": [
+                    dict(item) for item in (seed_anchor_resolution or [])
+                ],
                 "train_anchor_candidate_ids": [
                     all_candidate_ids[index] for index in sorted(set(train_anchor_indices or []))
                 ],
@@ -383,6 +390,43 @@ def verify_selection_artifacts(
                     "Selection entropy coverage diagnostics plot is missing or empty: "
                     f"{coverage_report}"
                 )
+            calibration_report = reports_dir / "descriptor_bandwidth_calibration.png"
+            calibration_manifest = reports_dir / "descriptor_bandwidth_calibration.manifest.json"
+            if (
+                not calibration_report.is_file()
+                or calibration_report.stat().st_size == 0
+                or not calibration_manifest.is_file()
+                or calibration_manifest.stat().st_size == 0
+            ):
+                raise ArtifactError(
+                    "Selection entropy calibration bandwidth report is missing or empty: "
+                    f"{calibration_report}"
+                )
+            try:
+                calibration_payload = read_json_object(
+                    calibration_manifest,
+                    error_type=ArtifactError,
+                )
+                calibration_artifact = calibration_payload.get("artifact")
+                if (
+                    calibration_payload.get("schema_version")
+                    != "entropy-bandwidth-calibration-report-v1"
+                    or not isinstance(calibration_artifact, Mapping)
+                    or calibration_artifact.get("path") != calibration_report.name
+                    or calibration_artifact.get("sha256")
+                    != sha256_file(calibration_report, required=True)
+                ):
+                    raise ArtifactError(
+                        "Selection entropy calibration bandwidth report identity is invalid: "
+                        f"{calibration_report}"
+                    )
+            except (OSError, TypeError, ValueError) as exc:
+                if isinstance(exc, ArtifactError):
+                    raise
+                raise ArtifactError(
+                    "Selection entropy calibration bandwidth report metadata is malformed: "
+                    f"{calibration_manifest}"
+                ) from exc
     for filename in ("train.xyz", "test.xyz", SELECTION_MANIFEST_FILENAME):
         path = selected_dir / filename
         if not path.is_file() or path.stat().st_size == 0:

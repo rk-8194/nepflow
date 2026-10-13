@@ -49,6 +49,7 @@ from .reports import (
     plot_descriptor_space,
     plot_entropy_coverage_diagnostics,
     plot_entropy_convergence,
+    write_entropy_bandwidth_calibration_report,
     write_diagnostics_report,
     write_entropy_presentation_reports,
 )
@@ -64,7 +65,8 @@ from .strategy import (
     TrainingSelection,
     find_elastic_stress_indices,
     find_single_element_elastic_stress_indices,
-    resolve_seed_indices,
+    resolve_seed_anchors,
+    seed_anchor_policy,
     select_test_set,
     select_training_set,
 )
@@ -363,8 +365,18 @@ class SelectionStage:
             )
 
         seed_indices: list[int] = []
-        if settings.include_seed_structures:
-            seed_indices = resolve_seed_indices(project_dir, prepared["ase_structures"])
+        seed_anchor_resolution: list[dict[str, Any]] = []
+        effective_seed_policy = seed_anchor_policy(settings)
+        if effective_seed_policy == "enabled":
+            resolutions = resolve_seed_anchors(project_dir, prepared["ase_structures"])
+            seed_indices = [item.candidate_index for item in resolutions]
+            seed_anchor_resolution = [
+                {
+                    **item.as_mapping(),
+                    "candidate_id": candidate_identity_ids[item.candidate_index],
+                }
+                for item in resolutions
+            ]
             logger.info("  Seed anchors enabled: %d structures", len(seed_indices))
         single_element_elastic_indices: list[int] = []
         if settings.include_single_element_elastic_stress_structures:
@@ -455,6 +467,8 @@ class SelectionStage:
                 resource_budget=runtime_budget,
                 candidate_ids=candidate_identity_ids,
                 structure_ids=physical_structure_ids,
+                reference_measure_tolerance=entropy.reference_measure_tolerance,
+                reference_measure_chunk_size=entropy.reference_measure_chunk_size,
             )
             representations = _aggregate_local_representations(
                 local_representation,
@@ -540,7 +554,11 @@ class SelectionStage:
                                 )
                             if local_representation is None:
                                 raise StateError("Entropy representation is unavailable for restore")
-                            current_pool = build_entropy_pool(local_representation)
+                            current_pool = build_entropy_pool(
+                                local_representation,
+                                reference_measure_tolerance=entropy.reference_measure_tolerance,
+                                reference_measure_chunk_size=entropy.reference_measure_chunk_size,
+                            )
                             if entropy_record.get("pool_fingerprint") != current_pool.fingerprint:
                                 raise StateError(
                                     "Persisted entropy selection fingerprint does not match current representation"
@@ -554,6 +572,8 @@ class SelectionStage:
                         representations,
                         candidate_identity_ids,
                         candidate_structure_ids=physical_structure_ids,
+                        expected_seed_anchor_policy=effective_seed_policy,
+                        expected_seed_anchor_resolution=seed_anchor_resolution,
                     )
 
         training: Any = select_training_set(
@@ -571,6 +591,11 @@ class SelectionStage:
             resource_budget=runtime_budget,
             checkpoint_root=(
                 project_dir / "selection" / "entropy-checkpoints"
+                if settings.algorithm == "information_entropy"
+                else None
+            ),
+            reports_dir=(
+                project_dir / "reports"
                 if settings.algorithm == "information_entropy"
                 else None
             ),
@@ -666,6 +691,18 @@ class SelectionStage:
                 "pool_fingerprint": entropy_result.pool_fingerprint,
                 "transform_fingerprint": getattr(pool, "transform_fingerprint", None),
                 "representation_fingerprint": getattr(pool, "representation_fingerprint", None),
+                "reference_measure_version": getattr(
+                    pool, "reference_measure_version", None
+                ),
+                "reference_measure_config": dict(
+                    getattr(pool, "reference_measure_config", {})
+                ),
+                "reference_weights_fingerprint": getattr(
+                    pool, "reference_weights_fingerprint", None
+                ),
+                "reference_measure_diagnostics": dict(
+                    getattr(pool, "reference_measure_diagnostics", {})
+                ),
                 "calibration_fingerprint": getattr(calibration, "calibration_fingerprint", None),
                 "selected_k": getattr(calibration, "k", None),
                 "selected_c": getattr(calibration, "c", None),
@@ -715,6 +752,9 @@ class SelectionStage:
                 candidates=prepared["ase_structures"],
                 selected_indices=train_indices,
             )
+        if settings.algorithm == "information_entropy":
+            entropy_provenance["seed_anchor_policy"] = effective_seed_policy
+            entropy_provenance["seed_anchor_resolution"] = seed_anchor_resolution
         return SelectionResult(
             descriptors=representations,
             train_indices=train_indices,
@@ -750,6 +790,8 @@ class SelectionStage:
             test_selection_policy=test_selection["test_selection_policy"],
             test_selection_version=test_selection["test_selection_version"],
             test_selection_provenance=test_selection["test_selection_provenance"],
+            seed_anchor_policy=effective_seed_policy,
+            seed_anchor_resolution=seed_anchor_resolution,
             **train_entropy_values,
         )
 
@@ -780,6 +822,23 @@ class SelectionStage:
                     else "NEP descriptor space"
                 ),
             )
+
+        # The calibration report is intentionally outside the publication
+        # rollback set: a later contribution/selection failure must not erase
+        # the useful calibrated-bandwidth evidence.  Revalidate it here on
+        # repair and on normal finalization as a defensive identity check.
+        if result.entropy_diagnostics is not None:
+            diagnostics = result.entropy_diagnostics
+            if isinstance(diagnostics.pool, EntropyPool) and isinstance(
+                diagnostics.bandwidths, FrozenBandwidths
+            ):
+                write_entropy_bandwidth_calibration_report(
+                    diagnostics.pool,
+                    diagnostics.bandwidths,
+                    result.descriptors,
+                    active.project_dir / "reports",
+                    calibration_fingerprint=diagnostics.calibration.calibration_fingerprint,
+                )
 
         if repair_only:
             if result.entropy_diagnostics is not None:
@@ -834,6 +893,8 @@ class SelectionStage:
             test_selection_policy=result.test_selection_policy,
             test_selection_version=result.test_selection_version,
             test_selection_provenance=result.test_selection_provenance,
+            seed_anchor_policy=result.seed_anchor_policy,
+            seed_anchor_resolution=result.seed_anchor_resolution,
         )
         if result.entropy_diagnostics is not None:
             write_diagnostics_report(

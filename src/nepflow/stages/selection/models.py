@@ -48,6 +48,8 @@ class SelectionResult:
     test_selection_policy: str = "candidate_mean_fps_legacy"
     test_selection_version: str = "candidate-mean-fps-v1"
     test_selection_provenance: Mapping[str, Any] = field(default_factory=dict)
+    seed_anchor_policy: str = "disabled_for_fps"
+    seed_anchor_resolution: list[Mapping[str, Any]] = field(default_factory=list)
 
     def as_mapping(self) -> dict[str, Any]:
         """Return the legacy result shape at the artifact boundary."""
@@ -91,6 +93,8 @@ class SelectionResult:
             "test_selection_policy": self.test_selection_policy,
             "test_selection_version": self.test_selection_version,
             "test_selection_provenance": self.test_selection_provenance,
+            "seed_anchor_policy": self.seed_anchor_policy,
+            "seed_anchor_resolution": self.seed_anchor_resolution,
         }
 
     def __getitem__(self, key: str) -> Any:

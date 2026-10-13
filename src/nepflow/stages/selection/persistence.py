@@ -95,13 +95,17 @@ def selection_policy(settings: SelectionConfig) -> dict[str, Any]:
     """Serialize the complete typed selection policy used for a run."""
 
     values = asdict(settings)
+    # Seed anchors are an entropy-only policy. Keep the FPS run identity
+    # stable even though the shared config model defaults entropy anchors on.
+    if str(settings.algorithm).strip().lower() != "information_entropy":
+        values["include_seed_structures"] = False
     for name in (
         "batch_size",
         "local_descriptor_workers",
         "max_local_descriptor_inflight_bytes",
     ):
         values.pop(name, None)
-    if settings.algorithm == "information_entropy":
+    if str(settings.algorithm).strip().lower() == "information_entropy":
         # These settings belong to the independent NEP/FPS peer or are purely
         # operational for entropy.  They must not invalidate a scientific
         # entropy run when changed without changing its values.
@@ -124,9 +128,13 @@ def selection_policy(settings: SelectionConfig) -> dict[str, Any]:
                 "max_entries",
                 "max_contribution_bytes",
                 "max_contribution_spool_bytes",
+                "reference_measure_chunk_size",
             ):
                 entropy_values.pop(name, None)
             bandwidth_values = entropy_values.get("bandwidth")
+            entropy_values["representation_preprocessing_contract"] = (
+                "full-pool-whitening-v2-reference-measure-v1"
+            )
             if isinstance(bandwidth_values, dict):
                 for name in (
                     "chunk_size",
@@ -224,6 +232,16 @@ def selection_parameters(
     if len(ordered_candidate_ids) != len(ordered_structure_ids):
         raise StateError("Selection candidate and structure ID counts do not match")
 
+    if str(settings.algorithm).strip().lower() == "information_entropy":
+        effective_seed_anchor_policy = (
+            "enabled" if settings.include_seed_structures else "opt_out"
+        )
+    else:
+        effective_seed_anchor_policy = "disabled_for_fps"
+    effective_seed_anchor_resolution = (
+        result.seed_anchor_resolution if effective_seed_anchor_policy == "enabled" else []
+    )
+
     def ids(indices: Sequence[int], values: Sequence[str]) -> list[str]:
         return [values[index] for index in indices]
 
@@ -304,13 +322,16 @@ def selection_parameters(
             "provenance": to_jsonable(result.train_entropy_provenance),
             "diagnostics": diagnostics_manifest,
         }
+    full_configuration = asdict(settings)
+    if str(settings.algorithm).strip().lower() != "information_entropy":
+        full_configuration["include_seed_structures"] = False
     return {
         "schema_version": SELECTION_RUN_SCHEMA,
         "candidate_set_fingerprint": candidate_set_fingerprint(ordered_candidate_ids),
         "candidate_ids": ordered_candidate_ids,
         "candidate_structure_ids": ordered_structure_ids,
         "policy": selection_policy(settings),
-        "full_configuration": to_jsonable(asdict(settings)),
+        "full_configuration": to_jsonable(full_configuration),
         "algorithm_id": result.algorithm_id,
         "algorithm_version": result.algorithm_version,
         "test_selection_policy": result.test_selection_policy,
@@ -338,6 +359,9 @@ def selection_parameters(
             ),
             "elastic": ids(result.elastic_indices, ordered_structure_ids),
         },
+        "seed_anchor_policy": effective_seed_anchor_policy,
+        "seed_anchor_count": len(effective_seed_anchor_resolution),
+        "seed_anchor_resolution": to_jsonable(effective_seed_anchor_resolution),
         "metrics": metrics,
         "test_selection": {
             "policy": result.test_selection_policy,
@@ -469,12 +493,44 @@ def _indices_for_ids(
     return [index_by_id[identity] for identity in values]
 
 
+def _normalize_seed_anchor_resolution(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        raise StateError("Persisted seed-anchor resolution is malformed")
+    normalized: list[dict[str, Any]] = []
+    for index, item in enumerate(value):
+        if not isinstance(item, Mapping):
+            raise StateError(f"Persisted seed-anchor resolution entry {index} is malformed")
+        required = (
+            "seed_id",
+            "parent_structure_id",
+            "candidate_id",
+            "candidate_index",
+            "physical_structure_id",
+            "resolution",
+        )
+        if any(key not in item for key in required):
+            raise StateError(f"Persisted seed-anchor resolution entry {index} is incomplete")
+        normalized.append(
+            {
+                "seed_id": str(item["seed_id"]),
+                "parent_structure_id": str(item["parent_structure_id"]),
+                "candidate_id": str(item["candidate_id"]),
+                "candidate_index": int(item["candidate_index"]),
+                "physical_structure_id": str(item["physical_structure_id"]),
+                "resolution": str(item["resolution"]),
+            }
+        )
+    return normalized
+
+
 def restore_selection_result(
     record: Mapping[str, Any],
     descriptors: Any,
     candidate_ids: Sequence[str],
     *,
     candidate_structure_ids: Sequence[str] | None = None,
+    expected_seed_anchor_policy: str | None = None,
+    expected_seed_anchor_resolution: Sequence[Mapping[str, Any]] | None = None,
 ) -> SelectionResult:
     """Reconcile a completed record by candidate identity, never by file index."""
 
@@ -487,6 +543,57 @@ def restore_selection_result(
     current_candidate_ids = _validate_id_sequence(candidate_ids, label="candidate", unique=True)
     entropy_record: Mapping[str, Any] | None = None
     persisted_algorithm = str(parameters.get("algorithm_id", "fps" if record.get("method") else ""))
+    expected_resolution = (
+        None
+        if expected_seed_anchor_resolution is None
+        else _normalize_seed_anchor_resolution(list(expected_seed_anchor_resolution))
+    )
+    if "seed_anchor_resolution" in parameters:
+        persisted_seed_resolution = _normalize_seed_anchor_resolution(
+            parameters["seed_anchor_resolution"]
+        )
+    else:
+        persisted_seed_resolution = []
+    if "seed_anchor_count" in parameters:
+        try:
+            persisted_seed_count = int(parameters["seed_anchor_count"])
+        except (TypeError, ValueError) as exc:
+            raise StateError("Persisted seed-anchor count is malformed") from exc
+        if persisted_seed_count != len(persisted_seed_resolution):
+            raise StateError("Persisted seed-anchor count disagrees with its resolution")
+    if "seed_anchor_policy" in parameters:
+        persisted_seed_policy = str(parameters["seed_anchor_policy"])
+    else:
+        persisted_seed_policy = (
+            "opt_out" if persisted_algorithm == "information_entropy" else "disabled_for_fps"
+        )
+    if expected_seed_anchor_policy is not None:
+        if persisted_seed_policy != expected_seed_anchor_policy:
+            raise StateError(
+                "Persisted seed-anchor inclusion policy does not match current input"
+            )
+        if expected_resolution is not None:
+            identity_fields = (
+                "seed_id",
+                "parent_structure_id",
+                "candidate_id",
+                "physical_structure_id",
+                "resolution",
+            )
+            persisted_identity = [
+                {key: item[key] for key in identity_fields}
+                for item in persisted_seed_resolution
+            ]
+            expected_identity = [
+                {key: item[key] for key in identity_fields} for item in expected_resolution
+            ]
+            if persisted_identity != expected_identity:
+                raise StateError(
+                    "Persisted seed-anchor lineage does not match current generated candidates"
+                )
+            # Candidate indices are intentionally refreshed for reordered
+            # generated files while the stable IDs above remain authoritative.
+            persisted_seed_resolution = expected_resolution
     if persisted_algorithm == "information_entropy":
         entropy_record = parameters.get("entropy")
         if not isinstance(entropy_record, Mapping):
@@ -765,6 +872,8 @@ def restore_selection_result(
         test_selection_policy=persisted_test_policy,
         test_selection_version=persisted_test_version,
         test_selection_provenance=persisted_test_provenance,
+        seed_anchor_policy=persisted_seed_policy,
+        seed_anchor_resolution=persisted_seed_resolution,
     )
 
 

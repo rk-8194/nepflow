@@ -14,6 +14,8 @@ from ase import Atoms
 from nepflow.stages.selection.algorithms.information_entropy.diagnostics import (
     EntropyScientificDiagnostics,
 )
+from nepflow.stages.selection.algorithms.information_entropy.bandwidth import build_entropy_pool
+from nepflow.stages.selection.algorithms.information_entropy.models import FrozenBandwidths
 from nepflow.stages.selection.artifacts import write_selected_structures
 from nepflow.stages.selection.reports import (
     EntropyPresentationData,
@@ -25,6 +27,7 @@ from nepflow.stages.selection.reports import (
     plot_entropy_convergence,
     plot_projected_entropy_densities,
     write_entropy_presentation_artifact,
+    write_entropy_bandwidth_calibration_report,
 )
 
 
@@ -172,6 +175,45 @@ def test_descriptor_report_writes_png(tmp_path) -> None:
 
     assert output_path.exists()
     assert output_path.stat().st_size > 0
+
+
+def test_early_bandwidth_report_uses_per_candidate_medians_and_reuses_identity(tmp_path) -> None:
+    pool = build_entropy_pool(
+        np.asarray([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]], dtype=np.float64),
+        candidate_ids=["c0", "c1"],
+        row_candidate_ids=["c0", "c0", "c1"],
+        transform_fingerprint="transform",
+        representation_fingerprint="representation",
+    )
+    bandwidths = FrozenBandwidths(
+        radii=np.asarray([1.0, 2.0, 3.0]),
+        bandwidths=np.asarray([5.0, 1.0, 7.0]),
+        k=1,
+        c=2.0,
+        neighbour_fingerprint="neighbours",
+        pool_fingerprint=pool.fingerprint,
+        transform_fingerprint=pool.transform_fingerprint,
+        fingerprint="frozen-bandwidths",
+    )
+    descriptors = np.asarray([[0.0, 0.0], [1.0, 1.0]], dtype=np.float64)
+    first = write_entropy_bandwidth_calibration_report(
+        pool,
+        bandwidths,
+        descriptors,
+        tmp_path,
+        calibration_fingerprint="calibration",
+    )
+    second = write_entropy_bandwidth_calibration_report(
+        pool,
+        bandwidths,
+        descriptors,
+        tmp_path,
+        calibration_fingerprint="calibration",
+    )
+    assert first == second
+    assert first["plot"]["candidate_median_bandwidths"] == [3.0, 7.0]
+    assert (tmp_path / "descriptor_bandwidth_calibration.png").is_file()
+    assert (tmp_path / "descriptor_bandwidth_calibration.manifest.json").is_file()
 
 
 def test_entropy_presentation_artifact_roundtrip_and_report_variants(tmp_path) -> None:

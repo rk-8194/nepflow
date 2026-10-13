@@ -162,7 +162,11 @@ def test_selection_run_persists_exact_ids_as_pending_before_publication(tmp_path
 
 
 def test_reopen_reconciles_by_identity_after_candidate_reordering(tmp_path):
-    settings = SelectionConfig(target_train_count=1, target_test_count=1)
+    settings = SelectionConfig(
+        target_train_count=1,
+        target_test_count=1,
+        include_seed_structures=False,
+    )
     original = [_atoms("Si", 0.0), _atoms("Ge", 1.0)]
     original_ids = structure_ids(original)
     result = _result(np.ones((2, 2)))

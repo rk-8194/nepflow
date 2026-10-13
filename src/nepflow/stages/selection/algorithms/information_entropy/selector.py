@@ -915,7 +915,15 @@ class InformationEntropySelectionAlgorithm:
             raise ValueError(
                 "information-entropy selection requires a local environment representation"
             )
-        pool = build_entropy_pool(local)
+        pool = build_entropy_pool(
+            local,
+            reference_measure_tolerance=float(
+                self._entropy_value(request.options, "reference_measure_tolerance", 1.0e-6)
+            ),
+            reference_measure_chunk_size=int(
+                self._entropy_value(request.options, "reference_measure_chunk_size", 1024)
+            ),
+        )
         if tuple(pool.candidate_ids) != request.candidate_ids:
             raise ValueError("local representation candidate order does not match selection input")
         bandwidth_settings = self._bandwidth_settings(request.options)
@@ -952,6 +960,21 @@ class InformationEntropySelectionAlgorithm:
             max_gpu_support_bytes=bandwidth_settings.max_gpu_support_bytes,
             max_gpu_neighbour_bytes=bandwidth_settings.max_gpu_neighbour_bytes,
         )
+        reports_dir = request.options.get("reports_dir")
+        if reports_dir is not None:
+            # Import lazily: the report module consumes entropy diagnostics,
+            # while this selector is itself exported by the entropy package.
+            from ...reports import write_entropy_bandwidth_calibration_report
+
+            write_entropy_bandwidth_calibration_report(
+                pool,
+                calibration.selected,
+                request.representations,
+                reports_dir,
+                calibration_fingerprint=str(
+                    getattr(calibration, "calibration_fingerprint", "")
+                ),
+            )
         remaining_budget = runtime_budget.remaining_managed_budget
         if remaining_budget is None:
             raise ValueError(runtime_budget.unknown_memory_message("information-entropy selection"))

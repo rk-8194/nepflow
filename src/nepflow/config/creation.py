@@ -268,9 +268,9 @@ algorithm=information_entropy
 # Place this in the config/nep folder.
 nep_model_file=nep89.txt
 
-# Include seed structures from structures/seeds/base_structures.xyz as
-# fixed training anchors before FPS fills the remaining target_train_count.
-include_seed_structures=false
+# Include the canonical unperturbed generated representative for each seed as
+# a fixed information-entropy training anchor. Set false for an explicit opt-out.
+include_seed_structures=true
 
 # Include generated elastic stress structures for unary/single-element seeds
 # as fixed training anchors before FPS. Useful for elemental elastic benchmarks.
@@ -321,6 +321,8 @@ entropy_local_species=
 entropy_whitening_tolerance=1e-12
 entropy_whitening_regularization=1e-12
 entropy_whitening_singular_policy=regularize
+entropy_reference_measure_tolerance=1e-6
+entropy_reference_measure_chunk_size=1024
 entropy_bandwidth_mode=automatic
 entropy_bandwidth_k=
 entropy_bandwidth_c=

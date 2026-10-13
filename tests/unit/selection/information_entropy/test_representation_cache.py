@@ -122,3 +122,31 @@ def test_cache_identity_includes_order_magnetic_mode_tolerance_and_backend_versi
     assert updated["identity"]["preprocessing"]["tolerance"] == 1.0e-8
     assert updated["identity"]["representation"]["backend_version"] == "backend-b"
     assert updated["identity"] != original["identity"]
+
+
+def test_cache_identity_includes_reference_measure_controls(tmp_path) -> None:
+    candidates = [_candidate("Si", 1.0), _candidate("Ge", 2.0)]
+    config = LocalRepresentationConfig(cutoff=4.0, radial_bins=3, angular_bins=3)
+    load_or_calculate_local_representations(
+        tmp_path,
+        candidates,
+        config=config,
+        candidate_ids=["candidate-si", "candidate-ge"],
+        structure_ids=["structure-si", "structure-ge"],
+        reference_measure_tolerance=1.0e-6,
+        reference_measure_chunk_size=2,
+    )
+    manifest_path = local_representation_manifest_path(tmp_path)
+    first = json.loads(manifest_path.read_text(encoding="utf-8"))
+    load_or_calculate_local_representations(
+        tmp_path,
+        candidates,
+        config=config,
+        candidate_ids=["candidate-si", "candidate-ge"],
+        structure_ids=["structure-si", "structure-ge"],
+        reference_measure_tolerance=2.0e-6,
+        reference_measure_chunk_size=2,
+    )
+    second = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert second["identity"]["reference_measure_settings"]["tolerance"] == 2.0e-6
+    assert second["representation_fingerprint"] != first["representation_fingerprint"]

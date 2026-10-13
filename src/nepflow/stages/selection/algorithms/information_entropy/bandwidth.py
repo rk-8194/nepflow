@@ -20,6 +20,10 @@ from nepflow.resources.budget import (
     build_resource_budget,
 )
 from nepflow.stages.selection.representations import LocalEnvironmentRepresentation
+from nepflow.stages.selection.reference_measure import (
+    estimate_reference_measure,
+    reference_weights_fingerprint,
+)
 
 from .checkpointing import (
     CheckpointValidationError,
@@ -39,6 +43,8 @@ from .models import (
     BANDWIDTH_SCHEMA_VERSION,
     CALIBRATION_OPTIMIZER_ID,
     CALIBRATION_OPTIMIZER_VERSION,
+    DEFAULT_REFERENCE_MEASURE_CHUNK_SIZE,
+    DEFAULT_REFERENCE_MEASURE_TOLERANCE,
     DEFAULT_LOO_CHECKPOINT_EVERY_SOURCES,
     DEFAULT_NEIGHBOUR_BACKEND_ID,
     KERNEL_BANDWIDTH_RULE_ASYMMETRIC_SOURCE,
@@ -53,6 +59,7 @@ from .models import (
     KERNEL_VERSION,
     NEIGHBOUR_DISTINCT_POLICY,
     NEIGHBOUR_METRIC,
+    REFERENCE_MEASURE_VERSION,
     BandwidthCalibrationResult,
     CalibrationAttempt,
     EntropyBandwidthSettings,
@@ -232,8 +239,19 @@ def build_entropy_pool(
     row_candidate_ids: Sequence[str] | None = None,
     transform_fingerprint: str | None = None,
     representation_fingerprint: str | None = None,
+    reference_measure_tolerance: float | None = None,
+    reference_measure_chunk_size: int | None = None,
 ) -> EntropyPool:
-    """Validate a local representation and derive equal-candidate row masses."""
+    """Build a finite pool with a density-aware local-environment target measure.
+
+    The reference measure is a fixed-radius occupancy estimate.  For row ``i``,
+    ``o_i`` is the number of rows whose whitened descriptor is within the
+    inclusive Euclidean tolerance (including ``i``); the unnormalised mass is
+    ``1 / o_i``.  This is evaluated in descriptor blocks, so memory is bounded
+    by the configured chunk size rather than an ``N x N`` distance matrix.
+    Exact and near duplicates therefore share one region's mass, while an
+    isolated valid environment retains strictly positive mass.
+    """
 
     descriptors, ordered_rows, ordered_candidates, transform_id, representation_id = (
         _coerce_representation_inputs(
@@ -272,18 +290,77 @@ def build_entropy_pool(
     if np.any(counts == 0):
         missing = ordered_candidates[int(np.flatnonzero(counts == 0)[0])]
         raise ValueError(f"candidate {missing!r} owns no local descriptor rows")
-    masses = np.asarray(
-        [1.0 / (len(ordered_candidates) * int(counts[index])) for index in candidate_indices],
-        dtype=np.float64,
+    local_measure = (
+        representation_or_descriptors
+        if isinstance(representation_or_descriptors, LocalEnvironmentRepresentation)
+        else None
     )
-    if not np.all(np.isfinite(masses)) or np.any(masses <= 0.0):
-        raise ValueError("derived candidate probabilities must be finite and positive")
-    if not math.isclose(float(np.sum(masses, dtype=np.float64)), 1.0, rel_tol=0.0, abs_tol=1.0e-12):
-        raise ValueError("derived candidate probabilities must sum to one")
+    if local_measure is not None and local_measure.target_weights is not None:
+        if local_measure.reference_measure_version != REFERENCE_MEASURE_VERSION:
+            raise ValueError("local representation uses an unsupported reference measure")
+        measure_config = dict(local_measure.reference_measure_config)
+        tolerance = _positive_float(
+            measure_config.get("tolerance")
+            if reference_measure_tolerance is None
+            else reference_measure_tolerance,
+            "reference_measure_tolerance",
+        )
+        effective_chunk_size = (
+            int(measure_config.get("chunk_size", DEFAULT_REFERENCE_MEASURE_CHUNK_SIZE))
+            if reference_measure_chunk_size is None
+            else reference_measure_chunk_size
+        )
+        if isinstance(effective_chunk_size, bool) or not isinstance(
+            effective_chunk_size, (int, np.integer)
+        ) or int(effective_chunk_size) < 1:
+            raise ValueError("reference_measure_chunk_size must be a positive integer")
+        if not math.isclose(
+            float(measure_config.get("tolerance", 0.0)),
+            tolerance,
+            rel_tol=0.0,
+            abs_tol=0.0,
+        ):
+            raise ValueError(
+                "reference_measure_tolerance differs from the local representation; "
+                "rebuild the representation before constructing the entropy pool"
+            )
+        masses = np.asarray(local_measure.target_weights, dtype=np.float64).copy()
+        if reference_weights_fingerprint(masses) != local_measure.reference_weights_fingerprint:
+            raise ValueError("local representation reference weights failed identity validation")
+        measure_diagnostics = dict(local_measure.reference_measure_diagnostics)
+        measure_config["chunk_size"] = int(effective_chunk_size)
+        measure_version = local_measure.reference_measure_version
+        measure_weights_fingerprint = local_measure.reference_weights_fingerprint
+    else:
+        tolerance = _positive_float(
+            DEFAULT_REFERENCE_MEASURE_TOLERANCE
+            if reference_measure_tolerance is None
+            else reference_measure_tolerance,
+            "reference_measure_tolerance",
+        )
+        effective_chunk_size = (
+            DEFAULT_REFERENCE_MEASURE_CHUNK_SIZE
+            if reference_measure_chunk_size is None
+            else reference_measure_chunk_size
+        )
+        if isinstance(effective_chunk_size, bool) or not isinstance(
+            effective_chunk_size, (int, np.integer)
+        ) or int(effective_chunk_size) < 1:
+            raise ValueError("reference_measure_chunk_size must be a positive integer")
+        measure = estimate_reference_measure(
+            values,
+            tolerance=tolerance,
+            chunk_size=int(effective_chunk_size),
+        )
+        masses = np.asarray(measure.probabilities, dtype=np.float64).copy()
+        measure_config = dict(measure.config)
+        measure_diagnostics = dict(measure.diagnostics)
+        measure_version = measure.version
+        measure_weights_fingerprint = measure.weights_fingerprint
 
     row_payload = [_row_identity(row, index) for index, row in enumerate(ordered_rows)]
     pool_payload = {
-        "schema": "entropy-pool-v1",
+        "schema": "entropy-pool-v2",
         "descriptors": _array_fingerprint(np.ascontiguousarray(values)),
         "rows": row_payload,
         "candidate_ids": list(ordered_candidates),
@@ -291,8 +368,20 @@ def build_entropy_pool(
         "probabilities": masses.tolist(),
         "transform_fingerprint": transform_id,
         "representation_fingerprint": representation_id,
+        "reference_measure_version": measure_version,
+        "reference_measure_config": measure_config,
+        "reference_weights_fingerprint": measure_weights_fingerprint,
+        "reference_measure_diagnostics": measure_diagnostics,
     }
-    pool_fingerprint = sha256_canonical_json(pool_payload)
+    # Chunk width is an operational memory bound, not a scientific choice;
+    # exclude it from the pool identity while retaining it in the manifest.
+    identity_payload = dict(pool_payload)
+    identity_payload["reference_measure_config"] = {
+        key: value
+        for key, value in pool_payload["reference_measure_config"].items()
+        if key != "chunk_size"
+    }
+    pool_fingerprint = sha256_canonical_json(identity_payload)
     return EntropyPool(
         descriptors=values,
         rows=tuple(ordered_rows),
@@ -302,6 +391,10 @@ def build_entropy_pool(
         transform_fingerprint=transform_id,
         representation_fingerprint=representation_id,
         fingerprint=pool_fingerprint,
+        reference_measure_version=measure_version,
+        reference_measure_config=pool_payload["reference_measure_config"],
+        reference_weights_fingerprint=pool_payload["reference_weights_fingerprint"],
+        reference_measure_diagnostics=pool_payload["reference_measure_diagnostics"],
     )
 
 
@@ -312,13 +405,18 @@ def derive_candidate_probabilities(
     descriptors: np.ndarray,
     row_candidate_ids: Sequence[str],
     candidate_ids: Sequence[str],
+    *,
+    reference_measure_tolerance: float = DEFAULT_REFERENCE_MEASURE_TOLERANCE,
+    reference_measure_chunk_size: int = DEFAULT_REFERENCE_MEASURE_CHUNK_SIZE,
 ) -> np.ndarray:
-    """Return canonical equal-candidate/equal-within-candidate row masses."""
+    """Return normalized density-aware target probabilities for descriptor rows."""
 
     pool = build_entropy_pool(
         descriptors,
         candidate_ids=candidate_ids,
         row_candidate_ids=row_candidate_ids,
+        reference_measure_tolerance=reference_measure_tolerance,
+        reference_measure_chunk_size=reference_measure_chunk_size,
     )
     return pool.probabilities
 
@@ -333,6 +431,32 @@ def _positive_float(value: Any, name: str) -> float:
     if not math.isfinite(result) or result <= 0.0:
         raise ValueError(f"{name} must be finite and strictly positive")
     return result
+
+
+def _reference_measure_radius_floor(pool: EntropyPool) -> float:
+    """Return the declared occupancy tolerance used to protect kNN scales."""
+
+    value = pool.reference_measure_config.get("tolerance")
+    return _positive_float(
+        DEFAULT_REFERENCE_MEASURE_TOLERANCE if value is None else value,
+        "reference_measure_tolerance",
+    )
+
+
+def _effective_bandwidth_radii(pool: EntropyPool, radii: np.ndarray) -> np.ndarray:
+    """Prevent redundant sub-tolerance rows from shrinking adaptive supports."""
+
+    values = np.asarray(radii, dtype=np.float64)
+    effective = np.maximum(values, _reference_measure_radius_floor(pool))
+    if not np.all(np.isfinite(effective)) or np.any(effective <= 0.0):
+        raise ValueError("effective entropy bandwidth radii must be finite and positive")
+    return effective
+
+
+def _can_reuse_raw_knn_support(pool: EntropyPool, radii: np.ndarray) -> bool:
+    """Reuse the exact kNN prefix only when the reference floor is inactive."""
+
+    return bool(np.array_equal(np.asarray(radii), _effective_bandwidth_radii(pool, radii)))
 
 
 def _progress_timing(completed: int, total: int, started: float) -> tuple[float, float]:
@@ -361,9 +485,10 @@ def _freeze_from_neighbours(
 ) -> FrozenBandwidths:
     scale = _positive_float(c, "c")
     bandwidth_rule = normalize_kernel_bandwidth_rule(kernel_bandwidth_rule)
+    effective_radii = _effective_bandwidth_radii(pool, neighbours.radii)
     with np.errstate(over="raise", under="raise", invalid="raise"):
         try:
-            bandwidths = np.asarray(scale * neighbours.radii, dtype=np.float64)
+            bandwidths = np.asarray(scale * effective_radii, dtype=np.float64)
         except FloatingPointError as exc:
             raise ValueError("c multiplied by neighbour radii overflowed or underflowed") from exc
     if not np.all(np.isfinite(bandwidths)) or np.any(bandwidths <= 0.0):
@@ -388,7 +513,7 @@ def _freeze_from_neighbours(
             bandwidth_rule
         )
     return FrozenBandwidths(
-        radii=neighbours.radii,
+        radii=effective_radii,
         bandwidths=bandwidths,
         k=neighbours.k,
         c=scale,
@@ -413,6 +538,8 @@ def calculate_frozen_bandwidths(
     rows: Sequence[Any] | None = None,
     candidate_ids: Sequence[str] | None = None,
     row_candidate_ids: Sequence[str] | None = None,
+    reference_measure_tolerance: float = DEFAULT_REFERENCE_MEASURE_TOLERANCE,
+    reference_measure_chunk_size: int = DEFAULT_REFERENCE_MEASURE_CHUNK_SIZE,
     transform_fingerprint: str | None = None,
     representation_fingerprint: str | None = None,
     chunk_size: int = 1024,
@@ -441,6 +568,8 @@ def calculate_frozen_bandwidths(
             row_candidate_ids=row_candidate_ids,
             transform_fingerprint=transform_fingerprint,
             representation_fingerprint=representation_fingerprint,
+            reference_measure_tolerance=reference_measure_tolerance,
+            reference_measure_chunk_size=reference_measure_chunk_size,
         )
     )
     service = resource_budget or build_resource_budget()
@@ -623,7 +752,7 @@ def _attempt_payload(attempt: CalibrationAttempt) -> dict[str, Any]:
 
 
 _CALIBRATION_GRID_CHECKPOINT_NAME = "calibration-grid"
-_CALIBRATION_GRID_SCHEMA = "entropy-calibration-grid-v1"
+_CALIBRATION_GRID_SCHEMA = "entropy-calibration-grid-v2"
 
 
 def _loo_checkpoint_name(mode: str, candidate_k: int, candidate_cs: Sequence[float]) -> str:
@@ -658,6 +787,9 @@ def _calibration_grid_identity(
         "candidate_ids_fingerprint": sha256_canonical_json(list(pool.candidate_ids)),
         "row_candidate_indices_fingerprint": _array_fingerprint(pool.row_candidate_indices),
         "probability_fingerprint": _array_fingerprint(pool.probabilities),
+        "reference_measure_version": pool.reference_measure_version,
+        "reference_weights_fingerprint": pool.reference_weights_fingerprint,
+        "reference_measure_config": dict(pool.reference_measure_config),
         "transform_fingerprint": pool.transform_fingerprint,
         "representation_fingerprint": pool.representation_fingerprint,
         "source_order": "ascending-original-pool-row-index",
@@ -977,6 +1109,8 @@ def calibrate_bandwidth(
     rows: Sequence[Any] | None = None,
     candidate_ids: Sequence[str] | None = None,
     row_candidate_ids: Sequence[str] | None = None,
+    reference_measure_tolerance: float = DEFAULT_REFERENCE_MEASURE_TOLERANCE,
+    reference_measure_chunk_size: int = DEFAULT_REFERENCE_MEASURE_CHUNK_SIZE,
     transform_fingerprint: str | None = None,
     representation_fingerprint: str | None = None,
     mode: str | None = None,
@@ -1028,6 +1162,8 @@ def calibrate_bandwidth(
             row_candidate_ids=row_candidate_ids,
             transform_fingerprint=transform_fingerprint,
             representation_fingerprint=representation_fingerprint,
+            reference_measure_tolerance=reference_measure_tolerance,
+            reference_measure_chunk_size=reference_measure_chunk_size,
         )
     )
     selected_settings = _settings_from_arguments(
@@ -2148,7 +2284,12 @@ def calibrate_bandwidth(
                             gpu_tile_size=selected_settings.gpu_tile_size,
                             max_gpu_support_bytes=selected_settings.max_gpu_support_bytes,
                             kernel_bandwidth_rule=selected_settings.kernel_bandwidth_rule,
-                            knn_support=(neighbours if frozen.c == 1.0 else None),
+                            knn_support=(
+                                neighbours
+                                if frozen.c == 1.0
+                                and _can_reuse_raw_knn_support(pool, neighbours.radii)
+                                else None
+                            ),
                             knn_support_row_ids=(
                                 _pool_row_ids(pool) if frozen.c == 1.0 else None
                             ),
@@ -2184,7 +2325,12 @@ def calibrate_bandwidth(
                         gpu_tile_size=selected_settings.gpu_tile_size,
                         max_gpu_support_bytes=selected_settings.max_gpu_support_bytes,
                         kernel_bandwidth_rule=selected_settings.kernel_bandwidth_rule,
-                        knn_support=(neighbours if use_knn_prefix_support else None),
+                        knn_support=(
+                            neighbours
+                            if use_knn_prefix_support
+                            and _can_reuse_raw_knn_support(pool, neighbours.radii)
+                            else None
+                        ),
                         knn_support_row_ids=(
                             _pool_row_ids(pool) if use_knn_prefix_support else None
                         ),
@@ -2485,6 +2631,9 @@ def calibrate_bandwidth(
         "candidate_ids": list(pool.candidate_ids),
         "row_candidate_indices": pool.row_candidate_indices.tolist(),
         "probabilities": pool.probabilities.tolist(),
+        "reference_measure_version": pool.reference_measure_version,
+        "reference_measure_config": dict(pool.reference_measure_config),
+        "reference_weights_fingerprint": pool.reference_weights_fingerprint,
         "transform": pool.transform_fingerprint,
         "neighbour_backend": selected_settings.backend,
         "neighbour_backend_version": selected_bandwidths.backend_version,
@@ -2518,7 +2667,10 @@ def calibrate_bandwidth(
             selected_bandwidths.kernel_bandwidth_rule_version
         )
     selected_neighbours = radii_by_k.get(selected_bandwidths.k)
-    if isinstance(selected_neighbours, str):
+    if isinstance(selected_neighbours, str) or (
+        isinstance(selected_neighbours, ExactNeighbourResult)
+        and not _can_reuse_raw_knn_support(pool, selected_neighbours.radii)
+    ):
         selected_neighbours = None
     return BandwidthCalibrationResult(
         mode=selected_settings.mode,

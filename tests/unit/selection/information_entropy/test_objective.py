@@ -59,12 +59,12 @@ def _dense_contributions(contributions: SparseCandidateContributions) -> np.ndar
 
 def test_pool_target_measure_and_real_sparse_q_are_consumed_as_is() -> None:
     pool, contributions = _fixture()
-    expected = np.asarray([1.0 / 6.0, 1.0 / 6.0, 1.0 / 3.0, 1.0 / 9.0, 1.0 / 9.0, 1.0 / 9.0])
+    expected = np.asarray([1.0 / 8.0, 1.0 / 8.0, 1.0 / 4.0, 1.0 / 8.0, 1.0 / 8.0, 1.0 / 4.0])
 
     np.testing.assert_array_equal(pool.probabilities, expected)
     np.testing.assert_allclose(
         [np.sum(pool.probabilities[pool.row_candidate_indices == index]) for index in range(3)],
-        [1.0 / 3.0] * 3,
+        [1.0 / 4.0, 1.0 / 4.0, 1.0 / 2.0],
     )
     dense = _dense_contributions(contributions)
     np.testing.assert_allclose(np.sum(dense, axis=0), 1.0)

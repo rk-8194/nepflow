@@ -767,6 +767,14 @@ def parse_selection(values: Mapping[str, str]) -> SelectionConfig:
         )
         .strip()
         .lower(),
+        reference_measure_tolerance=_parse_float(
+            value("entropy_reference_measure_tolerance", "1e-6", "reference_measure_tolerance"),
+            "selection.entropy_reference_measure_tolerance",
+        ),
+        reference_measure_chunk_size=_parse_int(
+            value("entropy_reference_measure_chunk_size", "1024", "reference_measure_chunk_size"),
+            "selection.entropy_reference_measure_chunk_size",
+        ),
         bandwidth=bandwidth,
         max_edges=None,
         max_graph_bytes=None,
@@ -780,7 +788,7 @@ def parse_selection(values: Mapping[str, str]) -> SelectionConfig:
         algorithm=values.get("algorithm", "information_entropy").strip().lower(),
         nep_model_file=values.get("nep_model_file", "nep89.txt").strip(),
         include_seed_structures=_parse_bool(
-            values.get("include_seed_structures", "false"),
+            values.get("include_seed_structures", "true"),
             "selection.include_seed_structures",
         ),
         include_single_element_elastic_stress_structures=_parse_bool(

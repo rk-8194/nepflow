@@ -2,6 +2,7 @@
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field, fields, is_dataclass
+import math
 from pathlib import Path
 from typing import Any
 
@@ -376,6 +377,10 @@ class EntropySelectionConfig:
     whitening_tolerance: float = 1.0e-12
     whitening_regularization: float = 1.0e-12
     whitening_singular_policy: str = "regularize"
+    # Fixed-radius descriptor occupancy controls the redundancy-aware target
+    # measure.  They are scientific identity, not operational optimizer knobs.
+    reference_measure_tolerance: float = 1.0e-6
+    reference_measure_chunk_size: int = 1024
     bandwidth: EntropyBandwidthConfig = field(default_factory=EntropyBandwidthConfig)
     max_edges: int | None = None
     max_graph_bytes: int | None = None
@@ -383,6 +388,18 @@ class EntropySelectionConfig:
     max_entries: int | None = None
     max_contribution_bytes: int | None = None
     max_contribution_spool_bytes: int | None = None
+
+    def __post_init__(self) -> None:
+        tolerance = float(self.reference_measure_tolerance)
+        if not math.isfinite(tolerance) or tolerance <= 0.0:
+            raise ValueError("reference_measure_tolerance must be finite and positive")
+        if (
+            isinstance(self.reference_measure_chunk_size, bool)
+            or not isinstance(self.reference_measure_chunk_size, int)
+            or self.reference_measure_chunk_size < 1
+        ):
+            raise ValueError("reference_measure_chunk_size must be a positive integer")
+        object.__setattr__(self, "reference_measure_tolerance", tolerance)
 
 
 @dataclass(frozen=True, slots=True)
@@ -404,7 +421,10 @@ class SelectionConfig:
 
     algorithm: str = "information_entropy"
     nep_model_file: str = "nep89.txt"
-    include_seed_structures: bool = False
+    # Information-entropy selection includes the canonical generated seed
+    # representatives by default.  FPS ignores this policy so its algorithm
+    # remains unchanged; an explicit false is the entropy opt-out.
+    include_seed_structures: bool = True
     include_single_element_elastic_stress_structures: bool = False
     include_elastic_stress_structures: bool = False
     composition_aware_fps: bool = False

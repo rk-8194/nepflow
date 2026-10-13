@@ -323,6 +323,12 @@ def _selection_values(config: NepflowConfig) -> dict[str, str]:
         "entropy_whitening_tolerance": str(selection.entropy.whitening_tolerance),
         "entropy_whitening_regularization": str(selection.entropy.whitening_regularization),
         "entropy_whitening_singular_policy": selection.entropy.whitening_singular_policy,
+        "entropy_reference_measure_tolerance": str(
+            selection.entropy.reference_measure_tolerance
+        ),
+        "entropy_reference_measure_chunk_size": str(
+            selection.entropy.reference_measure_chunk_size
+        ),
         "entropy_bandwidth_mode": selection.entropy.bandwidth.mode,
         "entropy_bandwidth_k": ""
         if selection.entropy.bandwidth.k is None

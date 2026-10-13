@@ -46,6 +46,11 @@ def annotate_generation_provenance(
         candidate_info.update(dict(parameters))
 
     parent_structure_id = calculate_structure_id(base)
+    # Keep the stable lineage fields at the extxyz top level as well as in
+    # the structured provenance payload.  This makes selection resolution
+    # portable across ASE readers that serialize nested mappings as strings.
+    candidate_info["parent_structure_id"] = parent_structure_id
+    candidate_info["perturbation_family"] = perturbation_family
     realized = _realized_composition(candidate)
     # ``actual_composition`` is an accepted legacy metadata field describing
     # the source structure.  Keep it unchanged when present; the canonical

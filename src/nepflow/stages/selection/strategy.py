@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import dataclass
 from pathlib import Path
@@ -44,6 +45,26 @@ class TrainingSelection:
         yield self.minimum_distance
 
 
+@dataclass(frozen=True, slots=True)
+class SeedAnchorResolution:
+    """One deterministic seed-to-generated-anchor resolution."""
+
+    seed_id: str
+    parent_structure_id: str
+    candidate_index: int
+    physical_structure_id: str
+    resolution: str
+
+    def as_mapping(self) -> dict[str, Any]:
+        return {
+            "seed_id": self.seed_id,
+            "parent_structure_id": self.parent_structure_id,
+            "candidate_index": self.candidate_index,
+            "physical_structure_id": self.physical_structure_id,
+            "resolution": self.resolution,
+        }
+
+
 def setting(settings: SelectionConfig | Mapping[str, Any], name: str) -> Any:
     """Read one setting from the typed config or a test mapping."""
 
@@ -60,6 +81,16 @@ def setting(settings: SelectionConfig | Mapping[str, Any], name: str) -> Any:
             return "structure" if settings["mean_descriptor"] else "atomic"
         return settings[legacy_names.get(name, name)]
     return getattr(settings, name)
+
+
+def seed_anchor_policy(settings: SelectionConfig | Mapping[str, Any]) -> str:
+    """Return the effective seed-anchor policy without changing FPS."""
+
+    algorithm = str(setting(settings, "algorithm")).strip().lower()
+    enabled = bool(_setting_or_default(settings, "include_seed_structures", False))
+    if algorithm != "information_entropy":
+        return "disabled_for_fps"
+    return "enabled" if enabled else "opt_out"
 
 
 def _setting_or_default(
@@ -81,6 +112,7 @@ def _algorithm_options(
     local_representation: Any | None = None,
     resource_budget: ResourceBudgetService | None = None,
     checkpoint_root: Path | None = None,
+    reports_dir: Path | None = None,
 ) -> dict[str, Any]:
     """Build algorithm options while retaining legacy mapping defaults."""
 
@@ -110,7 +142,18 @@ def _algorithm_options(
         "local_representation": local_representation,
         "background_mass": _setting_or_default(settings, "background_mass", 1.0e-12),
         "entropy_config": getattr(settings, "entropy", None),
+        "reference_measure_tolerance": _setting_or_default(
+            getattr(settings, "entropy", None) or settings,
+            "reference_measure_tolerance",
+            1.0e-6,
+        ),
+        "reference_measure_chunk_size": _setting_or_default(
+            getattr(settings, "entropy", None) or settings,
+            "reference_measure_chunk_size",
+            1024,
+        ),
         "resource_budget": resource_budget,
+        "reports_dir": None if reports_dir is None else Path(reports_dir),
     }
     if checkpoint_root is not None:
         entropy_root = Path(checkpoint_root)
@@ -140,6 +183,7 @@ def select_training_set(
     candidate_structure_ids: Sequence[str] | None = None,
     resource_budget: ResourceBudgetService | None = None,
     checkpoint_root: Path | None = None,
+    reports_dir: Path | None = None,
 ) -> TrainingSelection:
     """Dispatch one training-selection algorithm with mandatory anchors."""
 
@@ -193,6 +237,7 @@ def select_training_set(
         local_representation=local_representation,
         resource_budget=resource_budget,
         checkpoint_root=checkpoint_root,
+        reports_dir=reports_dir,
     )
     if candidate_structure_ids is not None:
         if len(candidate_structure_ids) != len(ordered_candidate_ids):
@@ -436,8 +481,74 @@ def is_single_element_structure(atoms: Any) -> bool:
     return len(set(symbols)) == 1
 
 
-def resolve_seed_indices(project_dir: Path, reference_ase: list) -> list[int]:
-    """Resolve seed anchors by exact physical structure identity."""
+def _mapping_value(value: Any) -> Mapping[str, Any]:
+    """Normalize nested extxyz provenance back into a mapping."""
+
+    if isinstance(value, Mapping):
+        return value
+    if isinstance(value, str) and value.strip():
+        try:
+            decoded = json.loads(value)
+        except json.JSONDecodeError:
+            return {}
+        return decoded if isinstance(decoded, Mapping) else {}
+    return {}
+
+
+def _lineage_info(atoms: Any) -> tuple[str | None, str | None, str | None]:
+    info = getattr(atoms, "info", {})
+    if not isinstance(info, Mapping):
+        info = {}
+    provenance = _mapping_value(info.get("generation_provenance"))
+    direct_provenance = _mapping_value(info.get("provenance"))
+    parent = info.get("parent_structure_id")
+    nested_parent = provenance.get(
+        "parent_structure_id", direct_provenance.get("parent_structure_id")
+    )
+    if parent is not None and nested_parent is not None and str(parent) != str(nested_parent):
+        return None, None, "__conflicting_lineage__"
+    if parent is None:
+        parent = nested_parent
+    seed_id = info.get("seed_id")
+    nested_seed_id = provenance.get("seed_id", direct_provenance.get("seed_id"))
+    if seed_id is not None and nested_seed_id is not None and str(seed_id) != str(nested_seed_id):
+        return None, None, "__conflicting_lineage__"
+    if seed_id is None:
+        seed_id = nested_seed_id
+    family = info.get("perturbation_type")
+    nested_family = provenance.get(
+        "perturbation_family", direct_provenance.get("perturbation_family")
+    )
+    if (
+        family is not None
+        and nested_family is not None
+        and str(family).lower() != str(nested_family).lower()
+    ):
+        return (
+            None if seed_id is None else str(seed_id),
+            None if parent is None else str(parent),
+            "__conflicting_family__",
+        )
+    if family is None:
+        family = nested_family
+    return (
+        None if seed_id is None else str(seed_id),
+        None if parent is None else str(parent),
+        None if family is None else str(family).strip().lower(),
+    )
+
+
+def resolve_seed_anchors(
+    project_dir: Path,
+    reference_ase: list,
+) -> list[SeedAnchorResolution]:
+    """Resolve each persisted seed to exactly one unperturbed candidate.
+
+    Generated representatives carry both the persisted seed ID and the
+    physical parent ID in ``generation_provenance``.  A direct physical match
+    remains valid for legacy artifacts, but only when it is explicitly marked
+    unperturbed; perturbation descendants are never accepted as fallbacks.
+    """
 
     seeds_path = project_dir / "structures" / "seeds" / "base_structures.xyz"
     if not seeds_path.exists():
@@ -451,33 +562,87 @@ def resolve_seed_indices(project_dir: Path, reference_ase: list) -> list[int]:
     if len(seed_ase) == 0:
         raise ValueError(f"Seed inclusion enabled, but no structures were found in {seeds_path}")
 
-    reference_index: dict[str, int] = {}
-    for index, atoms in enumerate(reference_ase):
-        reference_index.setdefault(calculate_structure_id(atoms), index)
-
-    seed_indices: list[int] = []
-    missing_seeds: list[str] = []
+    candidate_ids = [calculate_structure_id(atoms) for atoms in reference_ase]
+    candidates: list[tuple[str | None, str | None, str | None, str]] = [
+        (*_lineage_info(atoms), candidate_id)
+        for atoms, candidate_id in zip(reference_ase, candidate_ids)
+    ]
+    resolutions: list[SeedAnchorResolution] = []
+    used_candidates: dict[int, str] = {}
     for seed in seed_ase:
-        physical_hash = calculate_structure_id(seed)
-        reference_index_for_seed = reference_index.get(physical_hash)
-        if reference_index_for_seed is None:
-            missing_seeds.append(physical_hash)
-            continue
-        seed_indices.append(reference_index_for_seed)
+        info = getattr(seed, "info", {})
+        persisted_seed_id = info.get("seed_id")
+        seed_id = str(persisted_seed_id or info.get("structure_id") or calculate_structure_id(seed))
+        parent_structure_id = calculate_structure_id(seed)
+        matches: list[tuple[int, str]] = []
+        for index, (
+            candidate_seed_id,
+            candidate_parent_id,
+            family,
+            candidate_id,
+        ) in enumerate(candidates):
+            physical_match = candidate_id == parent_structure_id
+            if family in {"__conflicting_family__", "__conflicting_lineage__"} or (
+                family is not None and family != "unperturbed"
+            ):
+                continue
+            lineage_present = candidate_seed_id is not None or candidate_parent_id is not None
+            seed_match = (
+                candidate_seed_id is None
+                or persisted_seed_id is None
+                or candidate_seed_id == str(persisted_seed_id)
+            )
+            parent_match = candidate_parent_id is None or candidate_parent_id == parent_structure_id
+            lineage_match = lineage_present and seed_match and parent_match
+            direct_match = physical_match and family in {None, "unperturbed"}
+            if lineage_match and family == "unperturbed":
+                matches.append((index, "lineage"))
+            elif direct_match and not lineage_present:
+                matches.append((index, "physical_identity"))
 
-    if missing_seeds:
-        raise ValueError(
-            f"Seed inclusion enabled, but {len(missing_seeds)}/{len(seed_ase)} "
-            "seed structures had no physically identical generated candidate"
+        if len(matches) == 0:
+            raise ValueError(
+                "Seed inclusion enabled, but no canonical unperturbed generated "
+                f"candidate resolved for seed {seed_id!r}; no physically identical "
+                f"generated candidate or matching lineage was found (parent_structure_id="
+                f"{parent_structure_id})"
+            )
+        if len(matches) > 1:
+            descriptions = ", ".join(str(index) for index, _ in matches)
+            raise ValueError(
+                f"Seed inclusion enabled, but seed {seed_id!r} has ambiguous "
+                f"unperturbed generated candidates at indices [{descriptions}]"
+            )
+        index, resolution = matches[0]
+        previous_seed = used_candidates.get(index)
+        if previous_seed is not None and previous_seed != seed_id:
+            raise ValueError(
+                "Seed inclusion enabled, but generated candidate index "
+                f"{index} resolves to multiple seeds: {previous_seed!r} and {seed_id!r}"
+            )
+        used_candidates[index] = seed_id
+        resolutions.append(
+            SeedAnchorResolution(
+                seed_id=seed_id,
+                parent_structure_id=parent_structure_id,
+                candidate_index=index,
+                physical_structure_id=candidate_ids[index],
+                resolution=resolution,
+            )
         )
 
-    seed_indices = sorted(set(seed_indices))
     logger.info(
-        "  Matched %d/%d seed structures by physical hash",
-        len(seed_indices),
+        "  Matched %d/%d seed structures to canonical unperturbed representatives",
+        len(resolutions),
         len(seed_ase),
     )
-    return seed_indices
+    return resolutions
+
+
+def resolve_seed_indices(project_dir: Path, reference_ase: list) -> list[int]:
+    """Backward-compatible index-only view of canonical seed resolution."""
+
+    return sorted(item.candidate_index for item in resolve_seed_anchors(project_dir, reference_ase))
 
 
 def find_elastic_stress_indices(reference_ase: list) -> list[int]:
@@ -524,15 +689,18 @@ def find_single_element_elastic_stress_indices(reference_ase: list) -> list[int]
 
 
 __all__ = [
+    "SeedAnchorResolution",
     "TrainingSelection",
     "find_elastic_stress_indices",
     "find_single_element_elastic_stress_indices",
     "is_elastic_stress",
     "is_single_element_structure",
     "resolve_seed_indices",
+    "resolve_seed_anchors",
     "select_composition_aware_training_set",
     "select_plain_fps_training_set",
     "select_test_set",
     "select_training_set",
+    "seed_anchor_policy",
     "setting",
 ]

@@ -53,6 +53,7 @@ def _context(tmp_path: Path, store: StateStore, settings: SelectionConfig) -> St
 
 def _settings(target_train_count: int) -> SelectionConfig:
     return SelectionConfig(
+        include_seed_structures=False,
         target_train_count=target_train_count,
         target_test_count=1,
         entropy=EntropySelectionConfig(

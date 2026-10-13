@@ -12,6 +12,8 @@ from typing import Any
 
 import numpy as np
 
+from nepflow.stages.selection.reference_measure import reference_weights_fingerprint
+
 NEIGHBOUR_BACKEND_ID = "exact_cpu"
 NEIGHBOUR_BACKEND_VERSION = "exact-cpu-v1"
 INDEXED_NEIGHBOUR_BACKEND_ID = "exact_indexed_cpu"
@@ -57,6 +59,13 @@ DEFAULT_RADIUS_QUERY_BYTES = 256 * 1024 * 1024
 # setting: it changes only restart granularity and never source order or
 # floating-point accumulation order.
 DEFAULT_LOO_CHECKPOINT_EVERY_SOURCES = 4096
+# The target measure is deliberately independent of generator labels.  A
+# fixed-radius occupancy estimate is reproducible, has a clear boundary rule,
+# and can be evaluated in descriptor blocks without materialising N x N.
+REFERENCE_MEASURE_VERSION = "descriptor-local-occupancy-v1"
+REFERENCE_MEASURE_ESTIMATOR = "fixed-radius-euclidean-occupancy"
+DEFAULT_REFERENCE_MEASURE_TOLERANCE = 1.0e-6
+DEFAULT_REFERENCE_MEASURE_CHUNK_SIZE = 1024
 
 
 def normalize_kernel_bandwidth_rule(value: Any) -> str:
@@ -366,6 +375,10 @@ class EntropyPool:
     transform_fingerprint: str
     representation_fingerprint: str
     fingerprint: str
+    reference_measure_version: str = REFERENCE_MEASURE_VERSION
+    reference_measure_config: dict[str, Any] = field(default_factory=dict)
+    reference_weights_fingerprint: str = ""
+    reference_measure_diagnostics: dict[str, Any] = field(default_factory=dict)
 
     @property
     def target_weights(self) -> np.ndarray:
@@ -391,15 +404,40 @@ class EntropyPool:
             raise ValueError("entropy rows, owner mapping, and descriptors must align")
         if len(probabilities) != descriptors.shape[0]:
             raise ValueError("probabilities must align with entropy descriptor rows")
+        if not math.isclose(
+            float(np.sum(probabilities, dtype=np.float64)),
+            1.0,
+            rel_tol=0.0,
+            abs_tol=SPARSE_NUMERICAL_TOLERANCE,
+        ):
+            raise ValueError("entropy reference probabilities must sum to one")
         if np.any(row_candidates < 0) or np.any(row_candidates >= len(self.candidate_ids)):
             raise ValueError("entropy row owner mapping contains an unknown candidate")
         if not self.transform_fingerprint or not self.representation_fingerprint:
             raise ValueError("entropy pool transform and representation identities are required")
+        version = str(self.reference_measure_version).strip()
+        if version != REFERENCE_MEASURE_VERSION:
+            raise ValueError("unsupported entropy reference-measure version")
+        if not isinstance(self.reference_measure_config, dict) or not isinstance(
+            self.reference_measure_diagnostics, dict
+        ):
+            raise ValueError("entropy reference-measure metadata must be dictionaries")
+        config = dict(self.reference_measure_config)
+        diagnostics = dict(self.reference_measure_diagnostics)
+        weights_fingerprint = str(self.reference_weights_fingerprint).strip()
+        if not weights_fingerprint:
+            raise ValueError("entropy reference weights fingerprint is required")
+        if reference_weights_fingerprint(probabilities) != weights_fingerprint:
+            raise ValueError("entropy reference weights fingerprint does not match probabilities")
         descriptors.setflags(write=False)
         row_candidates.setflags(write=False)
         object.__setattr__(self, "descriptors", descriptors)
         object.__setattr__(self, "row_candidate_indices", row_candidates)
         object.__setattr__(self, "probabilities", probabilities)
+        object.__setattr__(self, "reference_measure_version", version)
+        object.__setattr__(self, "reference_measure_config", config)
+        object.__setattr__(self, "reference_measure_diagnostics", diagnostics)
+        object.__setattr__(self, "reference_weights_fingerprint", weights_fingerprint)
 
 
 @dataclass(frozen=True, slots=True)
@@ -2168,12 +2206,16 @@ __all__ = [
     "GPU_NEIGHBOUR_BACKEND_ALIASES",
     "DEFAULT_NEIGHBOUR_BACKEND_ID",
     "DEFAULT_RADIUS_QUERY_BYTES",
+    "DEFAULT_REFERENCE_MEASURE_CHUNK_SIZE",
+    "DEFAULT_REFERENCE_MEASURE_TOLERANCE",
     "KERNEL_SUPPORT_EXECUTION_CPU",
     "KERNEL_SUPPORT_EXECUTION_GPU",
     "KERNEL_SUPPORT_EXECUTION_GPU_VERSION",
     "KERNEL_SUPPORT_EXECUTIONS",
     "NEIGHBOUR_DISTINCT_POLICY",
     "NEIGHBOUR_METRIC",
+    "REFERENCE_MEASURE_ESTIMATOR",
+    "REFERENCE_MEASURE_VERSION",
     "SPARSE_CANDIDATE_CONTRIBUTION_SCHEMA_VERSION",
     "SPARSE_STREAMED_CANDIDATE_CONTRIBUTION_SCHEMA_VERSION",
     "OUT_OF_CORE_CANDIDATE_CONTRIBUTION_SCHEMA_VERSION",

@@ -41,7 +41,7 @@ from .models import (
     normalize_kernel_bandwidth_rule,
 )
 
-DIAGNOSTICS_SCHEMA_VERSION = "entropy-scientific-diagnostics-v3"
+DIAGNOSTICS_SCHEMA_VERSION = "entropy-scientific-diagnostics-v4"
 DIAGNOSTICS_ARRAY_ARTIFACT_SCHEMA = "entropy-diagnostic-arrays-v1"
 PREFIX_COVERAGE_SCHEMA_VERSION = "entropy-prefix-coverage-v1"
 DIAGNOSTICS_NUMERICAL_TOLERANCE = SPARSE_NUMERICAL_TOLERANCE
@@ -634,6 +634,10 @@ class EntropyScientificDiagnostics:
     mass_discrepancy: float
     coverage: tuple[AtomicCoverageDiagnostics, ...]
     provenance_json: str
+    reference_measure_version: str
+    reference_measure_config_json: str
+    reference_weights_fingerprint: str
+    reference_measure_diagnostics_json: str
     scientific_fingerprint: str = ""
     kernel_operator_fingerprint: str | None = None
     tolerance: float = DIAGNOSTICS_NUMERICAL_TOLERANCE
@@ -686,6 +690,20 @@ class EntropyScientificDiagnostics:
         ):
             if not str(value).strip():
                 raise ValueError(f"diagnostics {name} is required")
+        if not str(self.reference_measure_version).strip():
+            raise ValueError("diagnostics reference-measure version is required")
+        for name, raw_value in (
+            ("reference_measure_config_json", self.reference_measure_config_json),
+            ("reference_measure_diagnostics_json", self.reference_measure_diagnostics_json),
+        ):
+            try:
+                parsed = json.loads(raw_value)
+            except (TypeError, json.JSONDecodeError) as exc:
+                raise ValueError(f"diagnostics {name} must contain JSON") from exc
+            if not isinstance(parsed, dict):
+                raise ValueError(f"diagnostics {name} must contain an object")
+        if not str(self.reference_weights_fingerprint).strip():
+            raise ValueError("diagnostics reference weights fingerprint is required")
         target = _tuple_floats(self.target_probabilities, name="target probability")
         final_q = _tuple_floats(self.final_q, name="final q")
         if len(target) != len(rows) or len(final_q) != len(rows):
@@ -827,6 +845,7 @@ class EntropyScientificDiagnostics:
             "pool_fingerprint": self.pool_fingerprint,
             "transform_fingerprint": self.transform_fingerprint,
             "source_fingerprints": {
+                "reference_weights": self.reference_weights_fingerprint,
                 "calibration": (
                     None
                     if calibration_record is None
@@ -857,6 +876,12 @@ class EntropyScientificDiagnostics:
             "final_forward_kl": self.final_forward_kl,
             "coverage": [item.to_manifest() for item in self.coverage],
             "provenance": json.loads(self.provenance_json),
+            "reference_measure": {
+                "version": self.reference_measure_version,
+                "config": json.loads(self.reference_measure_config_json),
+                "weights_fingerprint": self.reference_weights_fingerprint,
+                "diagnostics": json.loads(self.reference_measure_diagnostics_json),
+            },
             "tolerance": self.tolerance,
         }
 
@@ -1059,6 +1084,7 @@ class EntropyScientificDiagnostics:
                 "representation": self.representation_fingerprint,
                 "pool": self.pool_fingerprint,
                 "transform": self.transform_fingerprint,
+                "reference_weights": self.reference_weights_fingerprint,
                 "calibration": (
                     None
                     if calibration_record is None
@@ -1091,6 +1117,12 @@ class EntropyScientificDiagnostics:
                 "magnetic_mode": self.magnetic_mode,
                 "fingerprint": self.representation_fingerprint,
                 "whitening": self.whitening_manifest,
+            },
+            "reference_measure": {
+                "version": self.reference_measure_version,
+                "config": json.loads(self.reference_measure_config_json),
+                "weights_fingerprint": self.reference_weights_fingerprint,
+                "diagnostics": json.loads(self.reference_measure_diagnostics_json),
             },
             "bandwidth": {
                 "radii": self.radius_summary.to_manifest(),
@@ -1161,6 +1193,14 @@ class EntropyScientificDiagnostics:
             raise ValueError("entropy diagnostics science payload is malformed")
         if not isinstance(graph_manifest, Mapping) or not isinstance(bandwidth, Mapping):
             raise ValueError("entropy diagnostics graph/bandwidth payload is malformed")
+        reference_measure = value.get("reference_measure")
+        if not isinstance(reference_measure, Mapping):
+            raise ValueError("entropy diagnostics reference-measure payload is missing")
+        for name in ("version", "config", "weights_fingerprint", "diagnostics"):
+            if name not in reference_measure:
+                raise ValueError("entropy diagnostics reference-measure payload is incomplete")
+        if source.get("reference_weights") != reference_measure["weights_fingerprint"]:
+            raise ValueError("entropy diagnostics reference-weight identity does not match")
         operator_source = source.get("kernel_operator", source.get("graph"))
         if (
             any(
@@ -1259,6 +1299,14 @@ class EntropyScientificDiagnostics:
             coverage=coverage,
             provenance_json=json.dumps(
                 value.get("provenance", {}), sort_keys=True, separators=(",", ":")
+            ),
+            reference_measure_version=str(reference_measure["version"]),
+            reference_measure_config_json=json.dumps(
+                reference_measure["config"], sort_keys=True, separators=(",", ":")
+            ),
+            reference_weights_fingerprint=str(reference_measure["weights_fingerprint"]),
+            reference_measure_diagnostics_json=json.dumps(
+                reference_measure["diagnostics"], sort_keys=True, separators=(",", ":")
             ),
             scientific_fingerprint=str(value.get("scientific_fingerprint", "")),
             kernel_operator_fingerprint=str(operator_source),
@@ -2048,7 +2096,7 @@ def _coverage_summary(
         summary = _distribution(
             distances,
             population=population,
-            weighting="equal-candidate-weighted p_i, renormalized within this conditional population",
+            weighting="redundancy-aware reference p_i, renormalized within this conditional population",
             denominator="sum of authoritative p_i over target rows in this population",
             unit="whitened Euclidean distance",
             weights=weights,
@@ -2058,7 +2106,7 @@ def _coverage_summary(
         summary = _distribution(
             distances,
             population=population,
-            weighting="equal-candidate-weighted p_i, conditional population empty",
+            weighting="redundancy-aware reference p_i, conditional population empty",
             denominator="sum of authoritative p_i over target rows in this population",
             unit="whitened Euclidean distance",
         )
@@ -2432,6 +2480,20 @@ def build_entropy_diagnostics(
         tolerance=DIAGNOSTICS_NUMERICAL_TOLERANCE,
         pool_fingerprint=pool.fingerprint,
     )
+    whitening_manifest = _whitening_manifest_with_diagnostics(
+        local_representation.transform.to_manifest()
+    )
+    whitening_manifest.update(
+        {
+            "reference_measure_version": pool.reference_measure_version,
+            "reference_weights_fingerprint": pool.reference_weights_fingerprint,
+            "effective_weighted_sample_mass": float(
+                1.0 / np.sum(pool.probabilities * pool.probabilities, dtype=np.float64)
+            ),
+            "weighted_mean_fingerprint": whitening_manifest.get("mean_fingerprint"),
+            "weighted_mean_covariance_fingerprint": local_representation.transform.covariance_fingerprint,
+        }
+    )
     return EntropyScientificDiagnostics(
         schema_version=DIAGNOSTICS_SCHEMA_VERSION,
         candidate_ids=tuple(pool.candidate_ids),
@@ -2448,7 +2510,7 @@ def build_entropy_diagnostics(
         pool_fingerprint=pool.fingerprint,
         transform_fingerprint=pool.transform_fingerprint,
         whitening_manifest_json=json.dumps(
-            _whitening_manifest_with_diagnostics(local_representation.transform.to_manifest()),
+            whitening_manifest,
             sort_keys=True,
             separators=(",", ":"),
         ),
@@ -2486,6 +2548,14 @@ def build_entropy_diagnostics(
         ),
         coverage=coverage,
         provenance_json=json.dumps(provenance, sort_keys=True, separators=(",", ":")),
+        reference_measure_version=pool.reference_measure_version,
+        reference_measure_config_json=json.dumps(
+            pool.reference_measure_config, sort_keys=True, separators=(",", ":")
+        ),
+        reference_weights_fingerprint=pool.reference_weights_fingerprint,
+        reference_measure_diagnostics_json=json.dumps(
+            pool.reference_measure_diagnostics, sort_keys=True, separators=(",", ":")
+        ),
         kernel_operator_fingerprint=operator_fingerprint,
         pool=pool,
         bandwidths=calibration.selected,

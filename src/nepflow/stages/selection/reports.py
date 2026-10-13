@@ -15,8 +15,8 @@ import numpy as np
 
 from nepflow.errors import ArtifactError
 from nepflow.io.atomic import atomic_write_bytes, atomic_write_text
-from nepflow.io.hashing import sha256_bytes, sha256_canonical_json
-from nepflow.io.json import dumps
+from nepflow.io.hashing import sha256_bytes, sha256_canonical_json, sha256_file
+from nepflow.io.json import dumps, loads
 from nepflow.resources.budget import ResourceBudgetService
 
 from .algorithms.information_entropy.diagnostics import (
@@ -32,6 +32,10 @@ PRESENTATION_SCHEMA_VERSION = "entropy-selection-presentation-v1"
 PRESENTATION_ARTIFACT_FILENAME = "entropy_presentation-v1.npz"
 PRESENTATION_GRID_BINS = 48
 PRESENTATION_CHUNK_SIZE = 4096
+EARLY_BANDWIDTH_REPORT_SCHEMA_VERSION = "entropy-bandwidth-calibration-report-v1"
+EARLY_BANDWIDTH_REPORT_RENDERING_VERSION = "candidate-mean-pca-median-source-bandwidth-v1"
+EARLY_BANDWIDTH_REPORT_FILENAME = "descriptor_bandwidth_calibration.png"
+EARLY_BANDWIDTH_REPORT_MANIFEST_FILENAME = "descriptor_bandwidth_calibration.manifest.json"
 
 
 class PresentationError(ValueError):
@@ -235,18 +239,51 @@ class _CandidateProjection:
 
 def _fit_candidate_projection(values: np.ndarray) -> tuple[_CandidateProjection, np.ndarray]:
     matrix = _readonly_array(values, ndim=2, name="candidate descriptors")
-    if matrix.shape[0] == 0 or matrix.shape[1] == 0:
-        raise PresentationError("candidate descriptors must be non-empty")
+    if matrix.shape[0] == 0:
+        raise PresentationError("candidate descriptors must contain at least one candidate")
+    if matrix.shape[1] == 0:
+        projection = _CandidateProjection(
+            np.empty(0, dtype=np.float64),
+            np.empty((2, 0), dtype=np.float64),
+            (0.0, 0.0),
+            "zero-dimensional candidate projection fallback",
+        )
+        return projection, np.zeros((matrix.shape[0], 2), dtype=np.float64)
     if matrix.shape[0] >= 2 and matrix.shape[1] >= 2:
-        from sklearn.decomposition import PCA
+        try:
+            from sklearn.decomposition import PCA
 
-        pca = PCA(n_components=2)
-        coords = np.asarray(pca.fit_transform(matrix), dtype=np.float64)
-        variance = tuple(float(value) for value in pca.explained_variance_ratio_)
+            pca = PCA(n_components=2)
+            coords = np.asarray(pca.fit_transform(matrix), dtype=np.float64)
+            mean = np.asarray(pca.mean_, dtype=np.float64)
+            components = np.asarray(pca.components_, dtype=np.float64)
+            variance = tuple(float(value) for value in pca.explained_variance_ratio_)
+        except ImportError:
+            # Reporting remains available in minimal installations.  This is
+            # the same centred two-component PCA geometry, with deterministic
+            # signs for reproducible PNGs and metadata.
+            mean = np.mean(matrix, axis=0)
+            centred = matrix - mean
+            _, singular_values, vectors = np.linalg.svd(centred, full_matrices=False)
+            components = np.zeros((2, matrix.shape[1]), dtype=np.float64)
+            component_count = min(2, vectors.shape[0])
+            components[:component_count] = vectors[:component_count]
+            for row in range(component_count):
+                pivot = int(np.argmax(np.abs(components[row])))
+                if components[row, pivot] < 0.0:
+                    components[row] *= -1.0
+            coords = np.asarray(centred @ components.T, dtype=np.float64)
+            total = float(np.sum(singular_values * singular_values))
+            variance_values = (
+                singular_values[:2] * singular_values[:2] / total
+                if total > 0.0
+                else np.zeros(2, dtype=np.float64)
+            )
+            variance = tuple(float(value) for value in variance_values)
         if np.all(np.isfinite(coords)) and all(math.isfinite(value) for value in variance):
             projection = _CandidateProjection(
-                np.asarray(pca.mean_, dtype=np.float64),
-                np.asarray(pca.components_, dtype=np.float64),
+                mean,
+                components,
                 variance,
                 "PCA fit to candidate-mean descriptors",
             )
@@ -1193,6 +1230,195 @@ def plot_candidate_bandwidth_summary(
     _save_figure(fig, output_path)
 
 
+def _candidate_median_bandwidths(
+    pool: EntropyPool,
+    bandwidths: FrozenBandwidths,
+) -> np.ndarray:
+    """Aggregate final atomic source bandwidths by canonical candidate owner."""
+
+    values = np.asarray(bandwidths.bandwidths, dtype=np.float64)
+    owners = np.asarray(pool.row_candidate_indices, dtype=np.int64)
+    if values.ndim != 1 or owners.ndim != 1 or values.shape != owners.shape:
+        raise PresentationError(
+            "final source bandwidths and entropy-pool row ownership must be aligned"
+        )
+    if not np.all(np.isfinite(values)) or np.any(values <= 0.0):
+        raise PresentationError("final source bandwidths must be finite and positive")
+    if np.any(owners < 0) or np.any(owners >= len(pool.candidate_ids)):
+        raise PresentationError("entropy-pool row ownership contains an unknown candidate")
+    result = np.empty(len(pool.candidate_ids), dtype=np.float64)
+    for candidate_index in range(len(pool.candidate_ids)):
+        owned = values[owners == candidate_index]
+        if owned.size == 0:
+            raise PresentationError(
+                f"candidate {pool.candidate_ids[candidate_index]!r} owns no source bandwidths"
+            )
+        result[candidate_index] = float(np.median(owned))
+    return result
+
+
+def _early_bandwidth_identity(
+    pool: EntropyPool,
+    bandwidths: FrozenBandwidths,
+    candidate_descriptors: np.ndarray,
+    calibration_fingerprint: str = "",
+) -> dict[str, Any]:
+    matrix = _readonly_array(candidate_descriptors, ndim=2, name="candidate descriptors")
+    if matrix.shape[0] != len(pool.candidate_ids):
+        raise PresentationError("candidate descriptors must follow the entropy-pool candidate order")
+    if bandwidths.pool_fingerprint != pool.fingerprint:
+        raise PresentationError("frozen bandwidths do not belong to the supplied entropy pool")
+    if bandwidths.transform_fingerprint != pool.transform_fingerprint:
+        raise PresentationError("frozen bandwidth transform identity does not match the pool")
+    return {
+        "candidate_ids": list(pool.candidate_ids),
+        "candidate_ordering": "entropy-pool-canonical-order-v1",
+        "candidate_descriptors": _array_metadata(matrix),
+        "representation_fingerprint": pool.representation_fingerprint,
+        "pool_fingerprint": pool.fingerprint,
+        "transform_fingerprint": pool.transform_fingerprint,
+        "frozen_bandwidth_fingerprint": bandwidths.fingerprint,
+        "calibration_fingerprint": str(calibration_fingerprint),
+        "bandwidth_pool_fingerprint": bandwidths.pool_fingerprint,
+        "bandwidth_transform_fingerprint": bandwidths.transform_fingerprint,
+        "k": int(bandwidths.k),
+        "c": float(bandwidths.c),
+        "bandwidth_rule": bandwidths.kernel_bandwidth_rule,
+        "aggregation": "median_per_candidate_source_bandwidth_v1",
+        "rendering_version": EARLY_BANDWIDTH_REPORT_RENDERING_VERSION,
+    }
+
+
+def _early_bandwidth_manifest_matches(
+    manifest_path: Path,
+    plot_path: Path,
+    identity: Mapping[str, Any],
+) -> bool:
+    try:
+        payload = loads(manifest_path.read_text(encoding="utf-8"))
+        if not isinstance(payload, Mapping):
+            return False
+        if payload.get("schema_version") != EARLY_BANDWIDTH_REPORT_SCHEMA_VERSION:
+            return False
+        if payload.get("identity") != identity:
+            return False
+        if payload.get("identity_fingerprint") != sha256_canonical_json(identity):
+            return False
+        artifact = payload.get("artifact")
+        return (
+            isinstance(artifact, Mapping)
+            and artifact.get("path") == plot_path.name
+            and plot_path.is_file()
+            and artifact.get("sha256") == sha256_file(plot_path, required=True)
+        )
+    except (OSError, TypeError, ValueError):
+        return False
+
+
+def write_entropy_bandwidth_calibration_report(
+    pool: EntropyPool,
+    bandwidths: FrozenBandwidths,
+    candidate_descriptors: np.ndarray,
+    reports_dir: Path,
+    *,
+    calibration_fingerprint: str = "",
+) -> dict[str, Any]:
+    """Publish the pre-acquisition candidate PCA bandwidth report.
+
+    This report is deliberately independent of selection diagnostics: it is
+    available as soon as production bandwidth calibration returns.  Candidate
+    colours are medians of the final atomic ``h_a`` values, while all plotting
+    coordinates are candidate-mean whitened descriptors.
+    """
+
+    reports_dir = Path(reports_dir)
+    plot_path = reports_dir / EARLY_BANDWIDTH_REPORT_FILENAME
+    manifest_path = reports_dir / EARLY_BANDWIDTH_REPORT_MANIFEST_FILENAME
+    matrix = _readonly_array(candidate_descriptors, ndim=2, name="candidate descriptors")
+    identity = _early_bandwidth_identity(
+        pool,
+        bandwidths,
+        matrix,
+        calibration_fingerprint=calibration_fingerprint,
+    )
+    if _early_bandwidth_manifest_matches(manifest_path, plot_path, identity):
+        payload = loads(manifest_path.read_text(encoding="utf-8"))
+        return dict(payload)
+
+    medians = _candidate_median_bandwidths(pool, bandwidths)
+    projection, coords = _fit_candidate_projection(matrix)
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.cm import ScalarMappable
+    from matplotlib.colors import Normalize
+
+    minimum = float(np.min(medians))
+    maximum = float(np.max(medians))
+    if math.isclose(minimum, maximum, rel_tol=0.0, abs_tol=0.0):
+        span = max(0.5, abs(minimum) * 0.05)
+        norm = Normalize(vmin=minimum - span, vmax=maximum + span)
+    else:
+        norm = Normalize(vmin=minimum, vmax=maximum)
+    fig, ax = plt.subplots(figsize=(10, 8))
+    ax.scatter(
+        coords[:, 0],
+        coords[:, 1],
+        c=medians,
+        cmap="viridis",
+        norm=norm,
+        s=42,
+        alpha=0.88,
+        edgecolors="black",
+        linewidths=0.25,
+    )
+    colorbar = fig.colorbar(
+        ScalarMappable(norm=norm, cmap="viridis"),
+        ax=ax,
+        label="Median local source bandwidth h_a (whitened-descriptor Euclidean radius)",
+    )
+    colorbar.ax.tick_params(labelsize=8)
+    variance = projection.explained_variance
+    ax.set_xlabel(f"PC1 ({variance[0] * 100:.1f}%)")
+    ax.set_ylabel(f"PC2 ({variance[1] * 100:.1f}%)")
+    ax.set_title("Calibrated candidate source-bandwidth summary")
+    ax.text(
+        0.01,
+        0.01,
+        f"{projection.annotation}; candidates={len(pool.candidate_ids)}; "
+        "PCA is a 2D visualisation only; h_a is calculated in the full "
+        "whitened-descriptor space.",
+        transform=ax.transAxes,
+        fontsize=8,
+        color="dimgray",
+    )
+    if len(pool.candidate_ids) <= 20:
+        for index, candidate_id in enumerate(pool.candidate_ids):
+            ax.annotate(str(candidate_id), (coords[index, 0], coords[index, 1]), fontsize=7)
+    fig.tight_layout()
+    _save_figure(fig, plot_path)
+    metadata = {
+        "schema_version": EARLY_BANDWIDTH_REPORT_SCHEMA_VERSION,
+        "identity": identity,
+        "identity_fingerprint": sha256_canonical_json(identity),
+        "plot": {
+            "explained_variance": [float(value) for value in variance],
+            "candidate_count": len(pool.candidate_ids),
+            "candidate_median_bandwidths": medians.tolist(),
+            "color_scale": "linear viridis",
+            "aggregation": "median_per_candidate_source_bandwidth_v1",
+            "membership_markers": False,
+        },
+        "artifact": {
+            "path": plot_path.name,
+            "sha256": sha256_file(plot_path, required=True),
+        },
+    }
+    atomic_write_text(manifest_path, dumps(metadata, indent=2))
+    return metadata
+
+
 def plot_projected_entropy_densities(
     data: EntropyPresentationData,
     output_path: Path,
@@ -1382,11 +1608,11 @@ def _validate_distribution_shape(value: Any, path: str) -> None:
         ),
     )
     if distribution["q50"] != distribution["median"]:
-        raise _diagnostics_schema_error(f"{path}.q50", "must equal median in v3")
+        raise _diagnostics_schema_error(f"{path}.q50", "must equal median in v4")
 
 
 def _validate_diagnostics_manifest_shape(value: Mapping[str, Any]) -> None:
-    """Validate the presentation-facing portion of the authoritative v3 schema."""
+    """Validate the presentation-facing portion of the authoritative v4 schema."""
 
     manifest = _require_mapping(value, "manifest")
     _require_keys(
@@ -1400,6 +1626,7 @@ def _validate_diagnostics_manifest_shape(value: Mapping[str, Any]) -> None:
             "selection_history",
             "dimensions",
             "representation",
+            "reference_measure",
             "bandwidth",
             "graph",
             "objective",
@@ -1417,7 +1644,15 @@ def _validate_diagnostics_manifest_shape(value: Mapping[str, Any]) -> None:
     _require_keys(
         source,
         "manifest.source_fingerprints",
-        ("representation", "pool", "transform", "calibration", "contributions", "kernel_operator"),
+        (
+            "representation",
+            "pool",
+            "transform",
+            "reference_weights",
+            "calibration",
+            "contributions",
+            "kernel_operator",
+        ),
     )
     identities = _require_mapping(manifest["identities"], "manifest.identities")
     _require_keys(
@@ -1453,6 +1688,22 @@ def _validate_diagnostics_manifest_shape(value: Mapping[str, Any]) -> None:
         ("backend", "magnetic_mode", "fingerprint", "whitening"),
     )
     _require_mapping(representation["whitening"], "manifest.representation.whitening")
+
+    reference_measure = _require_mapping(
+        manifest["reference_measure"], "manifest.reference_measure"
+    )
+    _require_keys(
+        reference_measure,
+        "manifest.reference_measure",
+        ("version", "config", "weights_fingerprint", "diagnostics"),
+    )
+    _require_string_or_none(
+        reference_measure["version"], "manifest.reference_measure.version"
+    )
+    _require_mapping(reference_measure["config"], "manifest.reference_measure.config")
+    _require_mapping(
+        reference_measure["diagnostics"], "manifest.reference_measure.diagnostics"
+    )
 
     bandwidth = _require_mapping(manifest["bandwidth"], "manifest.bandwidth")
     _require_keys(
@@ -1680,6 +1931,8 @@ def render_diagnostics_markdown(
     objective = manifest["objective"]
     graph = manifest["graph"]
     bandwidth = manifest["bandwidth"]
+    reference_measure = manifest["reference_measure"]
+    reference_diagnostics = reference_measure["diagnostics"]
     coverage = manifest["coverage"]
     calibration = bandwidth["calibration"]
     selected = calibration["selected"]
@@ -1718,6 +1971,25 @@ def render_diagnostics_markdown(
         f"- Magnetic mode: `{manifest['representation']['magnetic_mode']}`.",
         f"- Candidate identities={len(manifest['identities']['candidate_ids'])}; "
         f"physical identities={len(set(manifest['identities']['structure_ids']))}.",
+        "",
+        "## Redundancy-aware reference measure",
+        "",
+        f"- Version: `{reference_measure['version']}`; estimator="
+        f"`{reference_measure['config']['estimator']}`; tolerance="
+        f"`{reference_measure['config']['tolerance']}` (inclusive Euclidean radius).",
+        f"- Weight fingerprint: `{reference_measure['weights_fingerprint']}`.",
+        f"- Whitening weighting scheme: `{manifest['representation']['whitening'].get('weighting_scheme_version', 'unweighted')}`; "
+        f"weighted mean fingerprint: `{manifest['representation']['whitening'].get('weighted_mean_fingerprint', 'unknown')}`; "
+        f"weighted covariance fingerprint: `{manifest['representation']['whitening'].get('weighted_mean_covariance_fingerprint', manifest['representation']['whitening'].get('covariance_fingerprint', 'unknown'))}`; "
+        f"effective weighted sample mass: `{manifest['representation']['whitening'].get('effective_weighted_sample_mass', 'unknown')}`.",
+        f"- Occupancy fingerprint: `{reference_diagnostics['occupancy_fingerprint']}`.",
+        f"- Occupancy count: min={reference_diagnostics['occupancy_count']['minimum']}, "
+        f"median={reference_diagnostics['occupancy_count']['median']}, "
+        f"mean={reference_diagnostics['occupancy_count']['mean']}, "
+        f"max={reference_diagnostics['occupancy_count']['maximum']}.",
+        f"- Effective support={reference_diagnostics['effective_support']:.6g}; "
+        f"mass concentration HHI={reference_diagnostics['mass_concentration_hhi']:.6g}; "
+        f"maximum row mass={reference_diagnostics['maximum_row_mass']:.6g}.",
         "",
         "## Bandwidth and kernel operator",
         "",
@@ -1829,7 +2101,7 @@ def render_diagnostics_markdown(
                 "",
                 "## Prefix coverage diagnostics",
                 "",
-                "Prefix coverage is unavailable in this historical v3 manifest; regenerate "
+                "Prefix coverage is unavailable in this historical pre-v4 manifest; regenerate "
                 "scientific diagnostics to produce it.",
             ]
         )
@@ -1855,6 +2127,9 @@ def render_diagnostics_json(
 
 __all__ = [
     "EntropyPresentationData",
+    "EARLY_BANDWIDTH_REPORT_FILENAME",
+    "EARLY_BANDWIDTH_REPORT_MANIFEST_FILENAME",
+    "EARLY_BANDWIDTH_REPORT_SCHEMA_VERSION",
     "PRESENTATION_ARTIFACT_FILENAME",
     "PRESENTATION_SCHEMA_VERSION",
     "PresentationError",
@@ -1869,6 +2144,7 @@ __all__ = [
     "render_diagnostics_json",
     "render_diagnostics_markdown",
     "write_entropy_presentation_artifact",
+    "write_entropy_bandwidth_calibration_report",
     "write_entropy_presentation_reports",
     "write_diagnostics_report",
 ]

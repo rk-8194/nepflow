@@ -35,6 +35,15 @@ from nepflow.resources.budget import (
     build_resource_budget,
 )
 from nepflow.resources.cpu import effective_cpu_allocation
+from nepflow.stages.selection.reference_measure import (
+    DEFAULT_REFERENCE_MEASURE_CHUNK_SIZE,
+    DEFAULT_REFERENCE_MEASURE_TOLERANCE,
+    REFERENCE_MEASURE_VERSION,
+    REFERENCE_MEASURE_WEIGHTING_VERSION,
+    ReferenceMeasure,
+    estimate_reference_measure,
+    reference_weights_fingerprint,
+)
 
 logger = logging.getLogger(__name__)
 DESCRIPTOR_CACHE_SCHEMA_VERSION = DESCRIPTOR_CACHE_SCHEMA
@@ -425,11 +434,12 @@ def compute_descriptors_batched(
 # The local representation below is deliberately independent of NepTrainKit.
 # It is a compact reference backend for information-entropy selection, not a
 # replacement for the existing NEP/FPS representation path above.
-LOCAL_REPRESENTATION_SCHEMA_VERSION = "local-environment-representation-v1"
+LOCAL_REPRESENTATION_SCHEMA_VERSION = "local-environment-representation-v2"
 LOCAL_REPRESENTATION_BACKEND = "invariant-radial-angular-v1"
 LOCAL_ENVIRONMENT_ORDERING_VERSION = "candidate-order-atom-key-v1"
-LOCAL_PREPROCESSING_VERSION = "full-pool-whitening-v1"
-LOCAL_REPRESENTATION_CACHE_SCHEMA_VERSION = "local-representation-cache-v2"
+LOCAL_PREPROCESSING_VERSION = "full-pool-whitening-v2-reference-measure-v1"
+LOCAL_REPRESENTATION_CACHE_SCHEMA_VERSION = "local-representation-cache-v3"
+TARGET_WEIGHTING_VERSION = REFERENCE_MEASURE_WEIGHTING_VERSION
 
 
 def _sha256_array(value: np.ndarray) -> str:
@@ -568,6 +578,8 @@ class WhiteningTransform:
     covariance_fingerprint: str
     eigenvalue_fingerprint: str
     fingerprint: str
+    weighting_fingerprint: str = ""
+    weighting_scheme_version: str = ""
 
     @property
     def retained_dimensions(self) -> int:
@@ -596,13 +608,16 @@ class WhiteningTransform:
     def to_manifest(self) -> dict[str, Any]:
         """Serialize fitted numerical state, not merely its dimensions."""
 
-        return {
+        manifest = {
             "version": LOCAL_PREPROCESSING_VERSION,
             "mean": self.mean.tolist(),
             "eigenvalues": self.eigenvalues.tolist(),
             "eigenvectors": self.eigenvectors.tolist(),
             "retained_indices": list(self.retained_indices),
             "retained_dimensions": self.retained_dimensions,
+            "mean_fingerprint": sha256_bytes(
+                np.asarray(self.mean, dtype="<f8").tobytes()
+            ),
             "tolerance": self.tolerance,
             "regularization": self.regularization,
             "singular_policy": self.singular_policy,
@@ -610,6 +625,11 @@ class WhiteningTransform:
             "eigenvalue_fingerprint": self.eigenvalue_fingerprint,
             "fingerprint": self.fingerprint,
         }
+        if self.weighting_fingerprint:
+            manifest["weighting_fingerprint"] = self.weighting_fingerprint
+            manifest["weighting_semantics"] = "row target probabilities"
+            manifest["weighting_scheme_version"] = self.weighting_scheme_version
+        return manifest
 
 
 @dataclass(frozen=True, slots=True)
@@ -625,6 +645,11 @@ class LocalEnvironmentRepresentation:
     transform: WhiteningTransform
     fingerprint: str
     candidate_content_fingerprints: tuple[str, ...] = field(default_factory=tuple)
+    target_weights: np.ndarray | None = None
+    reference_measure_version: str = ""
+    reference_measure_config: dict[str, Any] = field(default_factory=dict)
+    reference_weights_fingerprint: str = ""
+    reference_measure_diagnostics: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.raw_descriptors.ndim != 2 or self.descriptors.ndim != 2:
@@ -633,6 +658,32 @@ class LocalEnvironmentRepresentation:
             raise ValueError("local descriptor rows and row metadata must have equal length")
         if self.descriptors.shape[0] != len(self.rows):
             raise ValueError("whitened descriptor rows and row metadata must have equal length")
+        if self.target_weights is not None:
+            weights = np.asarray(self.target_weights, dtype=np.float64).copy()
+            if (
+                weights.ndim != 1
+                or weights.shape[0] != len(self.rows)
+                or not np.all(np.isfinite(weights))
+                or np.any(weights <= 0.0)
+                or not math.isclose(float(np.sum(weights)), 1.0, rel_tol=0.0, abs_tol=1.0e-12)
+            ):
+                raise ValueError("local target weights must be finite, positive, and normalized")
+            weights.setflags(write=False)
+            object.__setattr__(self, "target_weights", weights)
+            if str(self.reference_measure_version).strip() != REFERENCE_MEASURE_VERSION:
+                raise ValueError("weighted local representations require the supported reference measure")
+            if not str(self.reference_weights_fingerprint).strip():
+                raise ValueError("weighted local representations require a weights fingerprint")
+            if not isinstance(self.reference_measure_config, dict) or not isinstance(
+                self.reference_measure_diagnostics, dict
+            ):
+                raise ValueError("local reference-measure metadata must be dictionaries")
+            if self.transform.weighting_fingerprint != self.reference_weights_fingerprint:
+                raise ValueError("local transform and reference weights have different identities")
+            if self.transform.weighting_scheme_version != str(
+                self.reference_measure_config.get("weighting_version", TARGET_WEIGHTING_VERSION)
+            ):
+                raise ValueError("local transform and reference weighting schemes differ")
 
     @property
     def local_descriptors(self) -> np.ndarray:
@@ -1372,8 +1423,10 @@ def fit_deterministic_whitening(
     tolerance: float = 1.0e-12,
     regularization: float = 1.0e-12,
     singular_policy: str = "regularize",
+    target_weights: np.ndarray | Sequence[float] | None = None,
+    target_weighting_version: str = TARGET_WEIGHTING_VERSION,
 ) -> WhiteningTransform:
-    """Fit the declared full-pool whitening transform in float64."""
+    """Fit deterministic whitening with optional normalized row probabilities."""
 
     matrix = np.asarray(values, dtype=np.float64)
     if matrix.ndim != 2 or matrix.shape[0] == 0 or matrix.shape[1] == 0:
@@ -1389,9 +1442,34 @@ def fit_deterministic_whitening(
         raise ValueError("regularization must be finite and non-negative")
     if policy not in {"drop", "regularize", "reject"}:
         raise ValueError("singular_policy must be one of: drop, regularize, reject")
-    mean = np.asarray(np.mean(matrix, axis=0, dtype=np.float64), dtype=np.float64)
+    weights_fingerprint = ""
+    weighting_version = ""
+    if target_weights is None:
+        weights = None
+        mean = np.asarray(np.mean(matrix, axis=0, dtype=np.float64), dtype=np.float64)
+    else:
+        weights = np.asarray(target_weights, dtype=np.float64)
+        if (
+            weights.ndim != 1
+            or weights.shape[0] != matrix.shape[0]
+            or not np.all(np.isfinite(weights))
+            or np.any(weights <= 0.0)
+        ):
+            raise ValueError("target_weights must be finite, positive, and row-aligned")
+        weight_total = float(np.sum(weights, dtype=np.float64))
+        if not math.isfinite(weight_total) or weight_total <= 0.0:
+            raise ValueError("target_weights must have a finite positive sum")
+        weights = weights / weight_total
+        weights_fingerprint = reference_weights_fingerprint(weights)
+        weighting_version = str(target_weighting_version).strip()
+        if not weighting_version:
+            raise ValueError("target_weighting_version must not be blank")
+        mean = np.asarray(np.sum(matrix * weights[:, None], axis=0), dtype=np.float64)
     centred = matrix - mean
-    covariance = (centred.T @ centred) / float(matrix.shape[0])
+    if weights is None:
+        covariance = (centred.T @ centred) / float(matrix.shape[0])
+    else:
+        covariance = (centred.T @ (centred * weights[:, None]))
     covariance = (covariance + covariance.T) / 2.0
     eigenvalues, eigenvectors = np.linalg.eigh(covariance)
     order = np.argsort(-eigenvalues, kind="stable")
@@ -1408,8 +1486,7 @@ def fit_deterministic_whitening(
     )
     covariance_fingerprint = sha256_bytes(np.asarray(covariance, dtype="<f8").tobytes())
     eigenvalue_fingerprint = sha256_bytes(np.asarray(eigenvalues, dtype="<f8").tobytes())
-    fingerprint = sha256_canonical_json(
-        {
+    identity_payload = {
             "version": LOCAL_PREPROCESSING_VERSION,
             "mean": sha256_bytes(np.asarray(mean, dtype="<f8").tobytes()),
             "eigenvalues": eigenvalue_fingerprint,
@@ -1418,8 +1495,13 @@ def fit_deterministic_whitening(
             "tolerance": tolerance,
             "regularization": regularization,
             "singular_policy": policy,
+    }
+    if weights_fingerprint:
+        identity_payload["target_weighting"] = {
+            "version": weighting_version,
+            "fingerprint": weights_fingerprint,
         }
-    )
+    fingerprint = sha256_canonical_json(identity_payload)
     return WhiteningTransform(
         mean=mean,
         eigenvalues=eigenvalues,
@@ -1431,6 +1513,8 @@ def fit_deterministic_whitening(
         covariance_fingerprint=covariance_fingerprint,
         eigenvalue_fingerprint=eigenvalue_fingerprint,
         fingerprint=fingerprint,
+        weighting_fingerprint=weights_fingerprint,
+        weighting_scheme_version=weighting_version,
     )
 
 
@@ -1441,6 +1525,7 @@ def _local_identity(
     config: LocalRepresentationConfig,
     species: Sequence[str],
     transform: WhiteningTransform,
+    reference_measure: ReferenceMeasure,
 ) -> dict[str, Any]:
     return {
         "schema_version": LOCAL_REPRESENTATION_SCHEMA_VERSION,
@@ -1455,6 +1540,23 @@ def _local_identity(
             "tolerance": config.whitening_tolerance,
             "regularization": config.whitening_regularization,
             "singular_policy": config.whitening_singular_policy,
+            "weighting_scheme_version": TARGET_WEIGHTING_VERSION,
+        },
+        "reference_measure": {
+            "version": reference_measure.version,
+            "config": {
+                key: value
+                for key, value in reference_measure.config.items()
+                if key != "chunk_size"
+            },
+            "weights_fingerprint": reference_measure.weights_fingerprint,
+            "diagnostics": reference_measure.diagnostics,
+        },
+        "reference_measure_settings": {
+            "version": reference_measure.version,
+            "tolerance": reference_measure.config["tolerance"],
+            "chunk_size": reference_measure.config["chunk_size"],
+            "weighting_version": reference_measure.config["weighting_version"],
         },
         "transform_fingerprint": transform.fingerprint,
         "software_versions": _local_software_versions(),
@@ -1487,8 +1589,16 @@ def build_local_environment_representation(
     local_descriptor_workers: int = 0,
     max_local_descriptor_inflight_bytes: int | None = None,
     resource_budget: ResourceBudgetService | None = None,
+    reference_measure_tolerance: float = DEFAULT_REFERENCE_MEASURE_TOLERANCE,
+    reference_measure_chunk_size: int = DEFAULT_REFERENCE_MEASURE_CHUNK_SIZE,
 ) -> LocalEnvironmentRepresentation:
-    """Build deterministic local rows and fit whitening on the complete pool."""
+    """Build local rows using preliminary measure estimation and final weighted whitening.
+
+    The fixed, reproducible dependency order is raw descriptors -> unweighted
+    preliminary whitening -> reference occupancy probabilities -> weighted
+    final whitening.  The final representation and persisted target weights
+    are then consumed together by entropy selection.
+    """
 
     if not candidates:
         raise ValueError("at least one candidate is required")
@@ -1523,11 +1633,25 @@ def build_local_environment_representation(
     if not np.all(np.isfinite(raw)):
         raise ValueError("local representation contains non-finite values")
     logger.info("Local descriptor whitening started")
+    preliminary_transform = fit_deterministic_whitening(
+        raw,
+        tolerance=settings.whitening_tolerance,
+        regularization=settings.whitening_regularization,
+        singular_policy=settings.whitening_singular_policy,
+    )
+    reference_measure = estimate_reference_measure(
+        preliminary_transform.apply(raw),
+        tolerance=reference_measure_tolerance,
+        chunk_size=reference_measure_chunk_size,
+        preprocessing_transform_fingerprint=preliminary_transform.fingerprint,
+    )
     transform = fit_deterministic_whitening(
         raw,
         tolerance=settings.whitening_tolerance,
         regularization=settings.whitening_regularization,
         singular_policy=settings.whitening_singular_policy,
+        target_weights=reference_measure.probabilities,
+        target_weighting_version=reference_measure.config["weighting_version"],
     )
     whitened = transform.apply(raw)
     logger.info("Local descriptor whitening completed")
@@ -1538,6 +1662,7 @@ def build_local_environment_representation(
         settings,
         all_species,
         transform,
+        reference_measure,
     )
     fingerprint = sha256_canonical_json(identity)
     return LocalEnvironmentRepresentation(
@@ -1550,6 +1675,11 @@ def build_local_environment_representation(
         transform=transform,
         fingerprint=fingerprint,
         candidate_content_fingerprints=content_fingerprints,
+        target_weights=reference_measure.probabilities,
+        reference_measure_version=reference_measure.version,
+        reference_measure_config=reference_measure.config,
+        reference_weights_fingerprint=reference_measure.weights_fingerprint,
+        reference_measure_diagnostics=reference_measure.diagnostics,
     )
 
 
@@ -1587,6 +1717,11 @@ def _write_local_representation_cache(
         "eigenvalues": np.asarray(representation.transform.eigenvalues, dtype=np.float64),
         "eigenvectors": np.asarray(representation.transform.eigenvectors, dtype=np.float64),
         "retained_indices": np.asarray(representation.transform.retained_indices, dtype=np.int64),
+        "target_weights": (
+            np.asarray(representation.target_weights, dtype=np.float64)
+            if representation.target_weights is not None
+            else np.asarray([], dtype=np.float64)
+        ),
     }
     rows_payload = [row.to_dict(index) for index, row in enumerate(representation.rows)]
     persisted = {
@@ -1668,12 +1803,16 @@ def _load_local_representation_cache(
         manifest = read_json_object(manifest_path, error_type=StateError)
         if manifest.get("schema_version") != LOCAL_REPRESENTATION_CACHE_SCHEMA_VERSION:
             return None
-        identity = manifest.get("identity")
-        if not isinstance(identity, dict):
+        identity_payload = manifest.get("identity")
+        if not isinstance(identity_payload, dict):
             return None
+        identity = dict(identity_payload)
         expected = dict(expected_identity_without_transform)
         expected_transform = identity.pop("transform_fingerprint", None)
+        actual_reference_measure = identity.pop("reference_measure", None)
         if identity != expected:
+            return None
+        if not isinstance(actual_reference_measure, dict):
             return None
         if not isinstance(expected_transform, str) or not expected_transform:
             return None
@@ -1693,6 +1832,7 @@ def _load_local_representation_cache(
             eigenvalues = np.asarray(archive["eigenvalues"], dtype=np.float64)
             eigenvectors = np.asarray(archive["eigenvectors"], dtype=np.float64)
             retained_array = np.asarray(archive["retained_indices"], dtype=np.int64)
+            target_weights = np.asarray(archive["target_weights"], dtype=np.float64)
             retained = tuple(int(value) for value in retained_array.tolist())
             loaded_arrays = {
                 "raw_descriptors": raw,
@@ -1701,6 +1841,7 @@ def _load_local_representation_cache(
                 "eigenvalues": eigenvalues,
                 "eigenvectors": eigenvectors,
                 "retained_indices": retained_array,
+            "target_weights": target_weights,
             }
         for name, array in loaded_arrays.items():
             record = artifact_manifest["arrays"].get(name)
@@ -1712,6 +1853,8 @@ def _load_local_representation_cache(
             ):
                 return None
         if raw.ndim != 2 or descriptors.ndim != 2 or raw.shape[0] != descriptors.shape[0]:
+            return None
+        if target_weights.shape != (raw.shape[0],):
             return None
         shape = manifest.get("shape")
         if (
@@ -1730,12 +1873,39 @@ def _load_local_representation_cache(
             return None
         if transform_manifest.get("version") != LOCAL_PREPROCESSING_VERSION:
             return None
+        if actual_reference_measure.get("version") != REFERENCE_MEASURE_VERSION:
+            return None
+        reference_config = actual_reference_measure.get("config")
+        reference_diagnostics = actual_reference_measure.get("diagnostics")
+        if not isinstance(reference_config, dict) or not isinstance(reference_diagnostics, dict):
+            return None
+        if reference_config.get("weighting_version") != TARGET_WEIGHTING_VERSION:
+            return None
+        weights_fingerprint = str(actual_reference_measure.get("weights_fingerprint", ""))
+        if not weights_fingerprint:
+            return None
+        if reference_weights_fingerprint(target_weights) != weights_fingerprint:
+            return None
         transform = fit_deterministic_whitening(
             raw,
             tolerance=float(transform_manifest["tolerance"]),
             regularization=float(transform_manifest["regularization"]),
             singular_policy=str(transform_manifest["singular_policy"]),
+            target_weights=target_weights,
+            target_weighting_version=str(
+                reference_config.get("weighting_version", TARGET_WEIGHTING_VERSION)
+            ),
         )
+        if transform_manifest.get("weighting_fingerprint") != weights_fingerprint:
+            return None
+        if transform_manifest.get("weighting_scheme_version") != reference_config.get(
+            "weighting_version", TARGET_WEIGHTING_VERSION
+        ):
+            return None
+        if transform_manifest.get("mean_fingerprint") != sha256_bytes(
+            np.asarray(mean, dtype="<f8").tobytes()
+        ):
+            return None
         if transform.fingerprint != expected_transform:
             return None
         if transform_manifest.get("fingerprint") != transform.fingerprint:
@@ -1776,7 +1946,10 @@ def _load_local_representation_cache(
             return None
         fingerprint = str(manifest["representation_fingerprint"])
         expected_fingerprint = sha256_canonical_json(
-            {**expected_identity_without_transform, "transform_fingerprint": expected_transform}
+            {
+                **manifest["identity"],
+                "transform_fingerprint": expected_transform,
+            }
         )
         if fingerprint != expected_fingerprint:
             return None
@@ -1794,6 +1967,11 @@ def _load_local_representation_cache(
             candidate_content_fingerprints=tuple(
                 expected_identity_without_transform["candidate_content_fingerprints"]
             ),
+            target_weights=target_weights,
+            reference_measure_version=str(actual_reference_measure["version"]),
+            reference_measure_config=dict(reference_config),
+            reference_weights_fingerprint=weights_fingerprint,
+            reference_measure_diagnostics=dict(reference_diagnostics),
         )
     except (KeyError, OSError, StateError, TypeError, ValueError, EOFError):
         return None
@@ -1809,6 +1987,8 @@ def load_or_calculate_local_representations(
     local_descriptor_workers: int = 0,
     max_local_descriptor_inflight_bytes: int | None = None,
     resource_budget: ResourceBudgetService | None = None,
+    reference_measure_tolerance: float = DEFAULT_REFERENCE_MEASURE_TOLERANCE,
+    reference_measure_chunk_size: int = DEFAULT_REFERENCE_MEASURE_CHUNK_SIZE,
 ) -> LocalEnvironmentRepresentation:
     """Load exact-identity local rows or calculate and publish them."""
 
@@ -1849,6 +2029,13 @@ def load_or_calculate_local_representations(
             "tolerance": settings.whitening_tolerance,
             "regularization": settings.whitening_regularization,
             "singular_policy": settings.whitening_singular_policy,
+            "weighting_scheme_version": TARGET_WEIGHTING_VERSION,
+        },
+        "reference_measure_settings": {
+            "version": REFERENCE_MEASURE_VERSION,
+            "tolerance": float(reference_measure_tolerance),
+            "chunk_size": int(reference_measure_chunk_size),
+            "weighting_version": TARGET_WEIGHTING_VERSION,
         },
         "software_versions": _local_software_versions(),
     }
@@ -1865,6 +2052,8 @@ def load_or_calculate_local_representations(
         local_descriptor_workers=local_descriptor_workers,
         max_local_descriptor_inflight_bytes=max_local_descriptor_inflight_bytes,
         resource_budget=runtime_budget,
+        reference_measure_tolerance=reference_measure_tolerance,
+        reference_measure_chunk_size=reference_measure_chunk_size,
     )
     identity = _local_identity(
         ordered_candidate_ids,
@@ -1873,6 +2062,13 @@ def load_or_calculate_local_representations(
         settings,
         species,
         result.transform,
+        ReferenceMeasure(
+            probabilities=np.asarray(result.target_weights, dtype=np.float64),
+            version=result.reference_measure_version,
+            config=dict(result.reference_measure_config),
+            weights_fingerprint=result.reference_weights_fingerprint,
+            diagnostics=dict(result.reference_measure_diagnostics),
+        ),
     )
     _write_local_representation_cache(cache_path, manifest_path, result, identity)
     return result
@@ -1885,6 +2081,7 @@ __all__ = [
     "LOCAL_REPRESENTATION_BACKEND",
     "LOCAL_REPRESENTATION_CACHE_SCHEMA_VERSION",
     "LOCAL_REPRESENTATION_SCHEMA_VERSION",
+    "TARGET_WEIGHTING_VERSION",
     "LocalEnvironmentRepresentation",
     "LocalEnvironmentRow",
     "LocalDescriptorWorkerError",

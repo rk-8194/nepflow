@@ -27,15 +27,55 @@ def _pool() -> EntropyPool:
     )
 
 
-def test_candidate_weights_are_equal_by_candidate_then_by_row() -> None:
+def test_reference_measure_is_positive_normalized_and_occupancy_aware() -> None:
     pool = _pool()
 
     np.testing.assert_allclose(
         pool.probabilities,
-        [1.0 / 6.0, 1.0 / 6.0, 1.0 / 3.0, 1.0 / 6.0, 1.0 / 6.0],
+        [1.0 / 5.0] * 5,
     )
     assert float(np.sum(pool.probabilities)) == pytest.approx(1.0)
     assert pool.row_candidate_indices.tolist() == [0, 0, 1, 2, 2]
+    assert pool.reference_measure_version == "descriptor-local-occupancy-v1"
+    assert pool.reference_measure_diagnostics["effective_support"] == pytest.approx(5.0)
+
+
+def test_duplicate_rows_do_not_gain_aggregate_target_mass() -> None:
+    base = build_entropy_pool(
+        np.asarray([[0.0], [1.0], [2.0]], dtype=np.float64),
+        row_candidate_ids=["a", "b", "c"],
+        candidate_ids=["a", "b", "c"],
+    )
+    duplicated = build_entropy_pool(
+        np.asarray([[0.0], [0.0], [0.0], [0.0], [1.0], [2.0]], dtype=np.float64),
+        row_candidate_ids=["a", "a2", "a3", "a4", "b", "c"],
+        candidate_ids=["a", "a2", "a3", "a4", "b", "c"],
+    )
+
+    assert float(np.sum(base.probabilities[0])) == pytest.approx(
+        float(np.sum(duplicated.probabilities[:4])), abs=1.0e-12
+    )
+    assert float(duplicated.probabilities[4]) == pytest.approx(
+        float(base.probabilities[1]), abs=1.0e-12
+    )
+    assert float(duplicated.probabilities[5]) == pytest.approx(
+        float(base.probabilities[2]), abs=1.0e-12
+    )
+
+
+def test_reference_measure_ignores_row_metadata_labels() -> None:
+    descriptors = np.asarray([[0.0], [0.0], [1.0], [2.0]], dtype=np.float64)
+    first = build_entropy_pool(
+        descriptors,
+        row_candidate_ids=["a", "a", "b", "c"],
+        candidate_ids=["a", "b", "c"],
+    )
+    second = build_entropy_pool(
+        descriptors,
+        row_candidate_ids=["x", "x", "y", "z"],
+        candidate_ids=["x", "y", "z"],
+    )
+    np.testing.assert_array_equal(first.probabilities, second.probabilities)
 
 
 def test_frozen_bandwidths_are_read_only_and_chunk_independent() -> None:

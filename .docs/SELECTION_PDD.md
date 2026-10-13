@@ -78,6 +78,29 @@ It must be possible to answer:
 - how far omitted structures lie from selected examples;
 - whether rare structure families disappeared during reduction.
 
+For information-entropy selection, the reference population is corrected for
+descriptor-space redundancy. The versioned `descriptor-local-occupancy-v1`
+measure assigns each local row inverse mass proportional to its inclusive
+fixed-radius occupancy, then normalizes all row masses to one. The estimator is
+computed in bounded descriptor blocks and uses no generator-family,
+perturbation-family, or composition labels. Exact and near-duplicate snapshots
+therefore do not gain aggregate target mass merely by multiplicity, while
+isolated valid environments retain positive mass. The measure version,
+tolerance, weight fingerprint, effective support, and occupancy summary are
+persisted in entropy manifests and checkpoints.
+
+The whitening metric uses that same row-level target measure. Its deterministic
+preprocessing contract is `full-pool-whitening-v2-reference-measure-v1`:
+descriptors are first whitened uniformly, the versioned occupancy measure is
+estimated on that preliminary representation, and the raw descriptors are then
+centred and whitened with the resulting normalized positive row probabilities.
+The final transform, weighted covariance fingerprint, weighting scheme, and
+effective weighted sample mass are persisted together. Entropy pool creation
+consumes those persisted probabilities, so row multiplicity cannot alter the
+metric independently of the declared target measure. Cache and checkpoint
+identities include the contract and weight fingerprint; incompatible older
+unweighted artifacts are recomputed.
+
 ### 3.3 Composition and configuration must both be represented
 
 A dataset can be compositionally balanced while missing important structural environments.
@@ -895,6 +918,15 @@ separate, versioned prepartition policy and a recalculated training pool.  The
 legacy `candidate_mean_fps_legacy` policy is retained only as an explicit
 compatibility path; the independent `fps` training algorithm keeps its existing
 candidate-vector test behavior.
+
+Immediately after production bandwidth calibration, the stage publishes the
+identity-checked `reports/descriptor_bandwidth_calibration.png` artifact and
+adjacent manifest. It contains one point per candidate in the already prepared
+candidate-mean whitened-descriptor PCA projection, coloured by that candidate's
+median final atomic source bandwidth. This is a pre-acquisition diagnostic only:
+PCA is not the space used to calculate `h_a`, and it contains no train/test
+membership markers. The later `descriptor_bandwidth.png` report remains the
+post-selection report with membership markers.
 
 ### 26.3 Presentation-only entropy diagnostics
 

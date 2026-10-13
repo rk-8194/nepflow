@@ -136,39 +136,29 @@ A structural-only representation may use the same geometry for several candidate
 
 The information objective requires a well-defined reference distribution.
 
-Because the DFT acquisition unit is a complete candidate, candidates with more atoms must not automatically receive more total probability mass merely because they contain more atoms.
+The canonical finite-pool target measure is versioned as
+`descriptor-local-occupancy-v1`. For each local descriptor row `i`, let
+`o_i` be the number of rows within an inclusive Euclidean radius `tau`,
+including the row itself. The unnormalised density correction is `w_i = 1/o_i`,
+and `p_i = w_i / sum_j w_j`.
 
-Therefore the canonical finite-pool target measure assigns:
+The occupancy count is evaluated in deterministic descriptor blocks; no dense
+`N x N` matrix is created. `tau` is a scientific configuration value (default
+`1e-6` in whitened Euclidean units), and the inclusive boundary,
+self-membership, and positive-mass policy are part of the measure identity.
 
-1. equal probability mass to every candidate;
-2. equal probability mass to every local environment within that candidate.
+Exact and near-duplicate rows therefore share a region's aggregate mass rather
+than increasing it in proportion to snapshot count. An isolated row has
+`o_i=1` and remains eligible with strictly positive mass. The estimator uses
+only descriptor-space similarity: candidate, perturbation, composition, and
+generator labels do not enter it.
 
-For environment (i) belonging to structure (C_{m(i)}):
-
-[
-p_i = rac{1}{M,n_{m(i)}}.
-]
-
-This is a proper probability mass function because:
-
-[
-sum_{i=1}^{N} p_i
-=
-sum_{m=1}^{M}
-sum_{iin C_m}
-rac{1}{M n_m}
-=
-1.
-]
-
-This weighting has two important consequences:
-
-- a 200-atom structure does not count twice as much as an otherwise equivalent 100-atom structure;
-- the full candidate population, rather than the raw atom count, defines the target distribution.
-
-If all candidate structures contain the same number of atoms, this reduces to (p_i=1/N).
-
-No generator-family or perturbation-family weights are applied.
+The target `p` remains distinct from each selected candidate's normalized
+kernel contribution `q_C`. The fixed-budget conditional greedy objective and
+mandatory anchor contract are unchanged. The persisted pool/checkpoint
+identity includes the measure version, configuration, weight fingerprint, and
+effective-support diagnostics, so pre-occupancy equal-candidate caches cannot
+be resumed silently.
 
 ---
 
@@ -252,6 +242,19 @@ is the full-pool covariance decomposition.
 Numerically singular directions must be handled by an explicit eigenvalue tolerance or regularisation policy. The chosen policy and all fitted transform parameters must be recorded in the representation manifest.
 
 The transform is fitted on the full finite candidate pool because the objective is to compress that pool, not to estimate generalisation performance on unseen data.
+
+The preprocessing dependency is resolved by a versioned two-pass procedure,
+`full-pool-whitening-v2-reference-measure-v1`: fit a uniform preliminary
+whitening transform, estimate the `descriptor-local-occupancy-v1` probabilities
+on its whitened rows, then fit the final raw-descriptor whitening transform with
+those normalized positive row weights. The final local rows, entropy pool, and
+all downstream distances use the final transform and exactly the persisted
+probability vector. The weighting scheme/version, probability fingerprint,
+weighted covariance fingerprint, and effective weighted sample mass are part of
+representation manifests, run identities, and dependent cache/checkpoint
+validation. This bounded two-pass contract is deterministic and fails rather
+than silently falling back if weights, identities, or singular-policy metadata
+are invalid.
 
 ---
 
@@ -964,18 +967,20 @@ the algorithm is:
 4. Calculate k-NN radii from the full candidate pool.
 5. Calibrate or load (k, c).
 6. Freeze h_a = c r_k,a.
-7. Build the sparse normalized local-kernel graph.
-8. Aggregate atomic kernels into sparse q_C(i) structure contributions.
-9. Initialise A = A0.
-10. Initialise s_i = beta p_i + sum_{C in A0} q_C(i).
-11. Calculate initial marginal gains for all unselected structures.
-12. Build the lazy-greedy priority queue.
-13. Repeatedly:
+7. Publish the pre-acquisition candidate PCA bandwidth report and identity
+   manifest from the final frozen h_a values.
+8. Build the sparse normalized local-kernel graph.
+9. Aggregate atomic kernels into sparse q_C(i) structure contributions.
+10. Initialise A = A0.
+11. Initialise s_i = beta p_i + sum_{C in A0} q_C(i).
+12. Calculate initial marginal gains for all unselected structures.
+13. Build the lazy-greedy priority queue.
+14. Repeatedly:
       a. certify the best current marginal gain lazily;
       b. add that complete structure to A;
       c. update s_i only on its sparse support;
       d. continue until |A| = K.
-14. Write selected identities, objective history, diagnostics, and fingerprints.
+15. Write selected identities, objective history, diagnostics, and fingerprints.
 ```
 
 No selection step uses DFT energies, forces, DFT runtime, or HPC-specific cost.

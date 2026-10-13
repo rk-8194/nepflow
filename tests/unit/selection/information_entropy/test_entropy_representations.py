@@ -13,12 +13,14 @@ from ase import Atoms
 
 import nepflow.stages.selection.representations as representation_module
 from nepflow.errors import StateError
+from nepflow.stages.selection.algorithms.information_entropy.bandwidth import build_entropy_pool
 from nepflow.stages.selection.representations import (
     LocalRepresentationConfig,
     build_local_environment_representation,
     fit_deterministic_whitening,
     load_or_calculate_local_representations,
 )
+from nepflow.stages.selection.reference_measure import reference_weights_fingerprint
 
 
 def test_entropy_worker_import_does_not_load_neptrainkit() -> None:
@@ -138,6 +140,35 @@ def test_whitening_is_deterministic_and_singular_policy_is_explicit() -> None:
     assert first.retained_dimensions == 1
     with pytest.raises(ValueError, match="singular directions"):
         fit_deterministic_whitening(values, singular_policy="reject")
+
+
+def test_weighted_whitening_matches_hand_calculated_probability_measure() -> None:
+    values = np.asarray([[0.0, 0.0], [2.0, 0.0], [0.0, 1.0]])
+    weights = np.asarray([0.2, 0.3, 0.5])
+    transform = fit_deterministic_whitening(
+        values,
+        target_weights=weights,
+        singular_policy="reject",
+    )
+    expected_mean = np.sum(values * weights[:, None], axis=0)
+    centred = values - expected_mean
+    expected_covariance = centred.T @ (centred * weights[:, None])
+    reconstructed = (
+        transform.eigenvectors
+        @ np.diag(transform.eigenvalues)
+        @ transform.eigenvectors.T
+    )
+    np.testing.assert_allclose(transform.mean, expected_mean, atol=1.0e-14)
+    np.testing.assert_allclose(reconstructed, expected_covariance, atol=1.0e-14)
+    assert transform.weighting_fingerprint == reference_weights_fingerprint(weights)
+
+
+def test_local_representation_and_entropy_pool_share_reference_weights() -> None:
+    representation = _build(_atoms())
+    pool = build_entropy_pool(representation)
+    np.testing.assert_array_equal(pool.probabilities, representation.target_weights)
+    assert pool.reference_weights_fingerprint == representation.transform.weighting_fingerprint
+    assert pool.reference_weights_fingerprint == representation.reference_weights_fingerprint
 
 
 def test_non_soc_magnetic_channels_are_global_spin_rotation_invariant() -> None:
