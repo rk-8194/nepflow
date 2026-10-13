@@ -153,15 +153,19 @@ certification metrics are included in the execution diagnostics.
 
 The scientific kernel rule is separate from support execution. The staged
 production default is `asymmetric_source`: for source row `a` and target row
-`b`, `H(a,b)=h_a` and `W_ab=wendland_c2(d_ab/H(a,b))`. The bounded CPU
-reference oracle also accepts `symmetric_max`, where `H(a,b)=max(h_a,h_b)`.
+`b`, `H(a,b)=h_a` and `W_ab=wendland_c2(d_ab/H(a,b))`. The bounded exact
+support providers also accept `symmetric_max`, where
+`H(a,b)=max(h_a,h_b)`: c=1 can reuse a persisted canonical kNN prefix through
+the deterministic `symmetric_knn_union` reverse index, while general radii use
+`symmetric_tiled_cpu` or `symmetric_tiled_gpu` with CPU-canonical strict
+verification.
 Its raw weights and strict finite-support masks (`d_ab < H(a,b)`) are
 symmetric, but source-column normalization still produces conditional
 probabilities `P(b|a)` whose columns sum to one and need not be symmetric.
 Duplicate descriptor rows retain multiplicity, equality at the support
 boundary contributes zero, and finite-support or FP64-underflow cases do not
-receive artificial floors. Symmetric production LOO/PMF/checkpoint support
-is intentionally deferred to subsequent integration issues.
+receive artificial floors. Symmetric production LOO/PMF/checkpoint workflow
+integration is intentionally deferred to subsequent integration issues.
 
 ## Project Layout
 

@@ -68,6 +68,8 @@ from .models import (
 from .neighbours import (
     ExactKNNPrefixSupport,
     ExactNeighbourResult,
+    ExactSymmetricKNNUnionSupport,
+    ExactTiledCPUSupport,
     IndexedCPUNeighbourIndex,
     RadiusQueryCapacityError,
     TiledCPUNeighbourIndex,
@@ -311,6 +313,7 @@ class _KernelSupportProvider:
         knn_support: ExactNeighbourResult | None = None,
         knn_support_row_ids: Sequence[str] | None = None,
         max_calibration_work_bytes: int | None = None,
+        kernel_bandwidth_rule: str = KERNEL_BANDWIDTH_RULE_ASYMMETRIC_SOURCE,
     ) -> None:
         self.descriptors = _validate_descriptors(descriptors)
         self.backend = backend
@@ -347,6 +350,7 @@ class _KernelSupportProvider:
                 if self.max_radius_query_bytes < 1:
                     raise ValueError("max_radius_query_bytes must be a positive integer")
         self.capacity_context = capacity_context
+        self.kernel_bandwidth_rule = normalize_kernel_bandwidth_rule(kernel_bandwidth_rule)
         self.support_execution = str(kernel_support_execution).strip().lower()
         if self.support_execution == "exact_cpu":
             self.support_execution = KERNEL_SUPPORT_EXECUTION_CPU
@@ -410,13 +414,21 @@ class _KernelSupportProvider:
         if self.support_execution == KERNEL_SUPPORT_EXECUTION_GPU:
             from .gpu_support import ExactTiledGPUSupport
 
+            gpu_host_limit = self.max_radius_query_bytes
+            if max_calibration_work_bytes is not None:
+                gpu_host_limit = min(
+                    gpu_host_limit,
+                    _validate_memory_limit(
+                        max_calibration_work_bytes, "max_calibration_work_bytes"
+                    ),
+                )
             self.gpu_support = ExactTiledGPUSupport(
                 self.descriptors,
                 device=gpu_device,
                 gpu_devices=self.gpu_devices,
                 tile_size=gpu_tile_size,
                 max_device_bytes=max_gpu_support_bytes,
-                max_host_bytes=self.max_radius_query_bytes,
+                max_host_bytes=gpu_host_limit,
                 resource_budget=self.resource_budget,
                 capacity_context=capacity_context,
             )
@@ -425,11 +437,37 @@ class _KernelSupportProvider:
             self.support_batch_size = self.chunk_size
         self.knn_prefix_support: ExactKNNPrefixSupport | None = None
         if knn_support is not None:
-            self.knn_prefix_support = ExactKNNPrefixSupport(
+            expected_knn_backend_fingerprint = getattr(self.index, "fingerprint", "")
+            if (
+                expected_knn_backend_fingerprint
+                and knn_support.backend_fingerprint != expected_knn_backend_fingerprint
+            ):
+                raise ValueError(
+                    "kNN support backend fingerprint does not match the active index"
+                )
+            prefix_type = (
+                ExactSymmetricKNNUnionSupport
+                if self.kernel_bandwidth_rule == KERNEL_BANDWIDTH_RULE_SYMMETRIC_MAX
+                else ExactKNNPrefixSupport
+            )
+            self.knn_prefix_support = prefix_type(
                 self.descriptors,
                 knn_support,
                 grouping_source=self.index,
                 expected_row_ids=knn_support_row_ids,
+                max_radius_query_bytes=self.max_radius_query_bytes,
+                max_calibration_work_bytes=max_calibration_work_bytes,
+                resource_budget=self.resource_budget,
+                capacity_context=capacity_context,
+            )
+        self.symmetric_cpu_support: ExactTiledCPUSupport | None = None
+        if (
+            self.kernel_bandwidth_rule == KERNEL_BANDWIDTH_RULE_SYMMETRIC_MAX
+            and self.support_execution == KERNEL_SUPPORT_EXECUTION_CPU
+        ):
+            self.symmetric_cpu_support = ExactTiledCPUSupport(
+                self.descriptors,
+                tile_size=self.chunk_size,
                 max_radius_query_bytes=self.max_radius_query_bytes,
                 max_calibration_work_bytes=max_calibration_work_bytes,
                 resource_budget=self.resource_budget,
@@ -452,9 +490,29 @@ class _KernelSupportProvider:
         self.support_query_seconds = 0.0
         self.support_query_peak_scratch_bytes = 0
 
-    def support(self, source_index: int, radius: float) -> tuple[np.ndarray, np.ndarray]:
+    def support(
+        self,
+        source_index: int,
+        radius: float,
+        *,
+        target_bandwidths: Sequence[float] | np.ndarray | None = None,
+        kernel_bandwidth_rule: str | None = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
         scale = float(radius)
         started = time.perf_counter()
+        requested_rule = (
+            self.kernel_bandwidth_rule
+            if kernel_bandwidth_rule is None
+            else normalize_kernel_bandwidth_rule(kernel_bandwidth_rule)
+        )
+        if requested_rule == KERNEL_BANDWIDTH_RULE_SYMMETRIC_MAX:
+            offsets, targets, distances = self.support_many(
+                np.asarray([source_index], dtype=np.int64),
+                np.asarray([scale], dtype=np.float64),
+                target_bandwidths=target_bandwidths,
+                kernel_bandwidth_rule=requested_rule,
+            )
+            return targets[: int(offsets[1])], distances[: int(offsets[1])]
         if self.gpu_support is not None:
             offsets, targets, distances = self.gpu_support.support_many(
                 np.asarray([source_index], dtype=np.int64),
@@ -524,15 +582,18 @@ class _KernelSupportProvider:
         self,
         source_indices: Sequence[int] | np.ndarray,
         radii: Sequence[float] | np.ndarray,
+        *,
+        target_bandwidths: Sequence[float] | np.ndarray | None = None,
+        kernel_bandwidth_rule: str | None = None,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Return source supports as bounded CSR arrays.
 
         ``radii`` may be a one-dimensional source-radius vector or a
-        ``(candidate_count, source_count)`` matrix.  The GPU provider uses the
-        latter to screen one conservative per-source superset and the caller
-        applies each candidate's strict radius to the canonical distances.
-        CPU providers use the same maximum-radius superset contract, keeping
-        the accumulation order identical across execution modes.
+        ``(candidate_count, source_count)`` matrix.  Under ``symmetric_max``,
+        ``target_bandwidths`` must cover the full original row pool; providers
+        screen one conservative pair-radius superset and callers apply each
+        candidate's strict pairwise filter to canonical distances.  CPU and
+        GPU providers use the same bounded superset contract.
 
         Indexed CPU support queries share their tree preflight and canonical
         distance pass.  Backends without a batched radius primitive retain the
@@ -540,6 +601,13 @@ class _KernelSupportProvider:
         CSR representation for callers.
         """
 
+        requested_rule = (
+            self.kernel_bandwidth_rule
+            if kernel_bandwidth_rule is None
+            else normalize_kernel_bandwidth_rule(kernel_bandwidth_rule)
+        )
+        if requested_rule != self.kernel_bandwidth_rule:
+            raise ValueError("support query bandwidth rule conflicts with its provider")
         sources = np.asarray(source_indices, dtype=np.int64)
         requested_radii = np.asarray(radii, dtype=np.float64)
         if sources.ndim != 1 or requested_radii.ndim not in (1, 2):
@@ -555,6 +623,29 @@ class _KernelSupportProvider:
             raise ValueError("support_many requires at least one source")
         if not np.all(np.isfinite(requested_radii)) or np.any(requested_radii <= 0.0):
             raise ValueError("support radii must be finite and strictly positive")
+        if requested_rule == KERNEL_BANDWIDTH_RULE_SYMMETRIC_MAX:
+            if target_bandwidths is None:
+                raise ValueError(
+                    "symmetric_max support requires target bandwidths for the full original "
+                    "row pool"
+                )
+            target_values = np.asarray(target_bandwidths)
+            if target_values.dtype != np.dtype(np.float64) or target_values.ndim not in (1, 2):
+                raise ValueError("target bandwidths must be a float64 vector or candidate matrix")
+            if target_values.shape[-1] != self.descriptors.shape[0]:
+                raise ValueError("target bandwidths must cover the full original row pool")
+            if not np.all(np.isfinite(target_values)) or np.any(target_values <= 0.0):
+                raise ValueError("target bandwidths must be finite and strictly positive")
+            if (
+                target_values.ndim == 2
+                and requested_radii.ndim == 2
+                and target_values.shape[0] not in {1, requested_radii.shape[0]}
+            ):
+                raise ValueError("source and target bandwidth candidate counts do not align")
+        elif target_bandwidths is not None:
+            raise ValueError(
+                "target bandwidths are only valid with kernel_bandwidth_rule='symmetric_max'"
+            )
         if (
             self.knn_prefix_support is not None
             and self.knn_prefix_support.eligible(sources, requested_radii)
@@ -563,6 +654,7 @@ class _KernelSupportProvider:
             offsets, targets, distances = self.knn_prefix_support.support_many(
                 sources,
                 requested_radii,
+                target_bandwidths=target_bandwidths,
             )
             for count in np.diff(offsets):
                 support_count = int(count)
@@ -587,6 +679,38 @@ class _KernelSupportProvider:
             else np.max(requested_radii, axis=0)
         )
         started = time.perf_counter()
+        if requested_rule == KERNEL_BANDWIDTH_RULE_SYMMETRIC_MAX:
+            if self.symmetric_cpu_support is not None:
+                offsets, targets, distances = self.symmetric_cpu_support.support_many(
+                    sources,
+                    requested_radii,
+                    target_bandwidths=target_bandwidths,
+                    kernel_bandwidth_rule=requested_rule,
+                )
+            elif self.gpu_support is not None:
+                offsets, targets, distances = self.gpu_support.support_many(
+                    sources,
+                    requested_radii,
+                    target_bandwidths=target_bandwidths,
+                    kernel_bandwidth_rule=requested_rule,
+                )
+            else:  # pragma: no cover - constructor always creates a symmetric provider
+                raise RuntimeError("symmetric support provider was not initialized")
+            counts = np.diff(offsets)
+            for count in counts:
+                support_count = int(count)
+                self.current_support_count = support_count
+                if self.min_support_count is None:
+                    self.min_support_count = support_count
+                else:
+                    self.min_support_count = min(self.min_support_count, support_count)
+                self.support_count_total += support_count
+                self.support_count_samples += 1
+                self.max_support_count = max(self.max_support_count, support_count)
+            self.support_entries += int(targets.size)
+            self.support_query_count += int(sources.size)
+            self.support_query_seconds += max(0.0, time.perf_counter() - started)
+            return offsets, targets, distances
         if self.gpu_support is not None:
             offsets, targets, distances = self.gpu_support.support_many(
                 sources, requested_radii
@@ -689,10 +813,18 @@ class _KernelSupportProvider:
             ),
             "support_execution": self.support_execution,
             "support_execution_version": self.support_execution_version,
+            "kernel_bandwidth_rule": self.kernel_bandwidth_rule,
+            "support_provider_rule": self.kernel_bandwidth_rule,
         }
         if self.gpu_support is not None:
             metrics.update(self.gpu_support.operational_metrics())
-            metrics["support_provider"] = "active_gpu_support"
+            metrics["kernel_bandwidth_rule"] = self.kernel_bandwidth_rule
+            metrics["support_provider_rule"] = self.kernel_bandwidth_rule
+            metrics["support_provider"] = (
+                "symmetric_tiled_gpu"
+                if self.kernel_bandwidth_rule == KERNEL_BANDWIDTH_RULE_SYMMETRIC_MAX
+                else "active_gpu_support"
+            )
             metrics["support_provider_stats_status"] = "active"
             metrics["support_provider_radius_queries"] = None
             metrics["support_provider_distance_evaluations"] = int(
@@ -706,7 +838,11 @@ class _KernelSupportProvider:
                 # separate field so neither execution stage is hidden.
                 metrics["knn_gpu_per_device"] = index_metrics["gpu_per_device"]
         else:
-            metrics["support_provider"] = "active_cpu_support"
+            metrics["support_provider"] = (
+                "symmetric_tiled_cpu"
+                if self.kernel_bandwidth_rule == KERNEL_BANDWIDTH_RULE_SYMMETRIC_MAX
+                else "active_cpu_support"
+            )
             metrics["support_provider_stats_status"] = "active"
             metrics["support_provider_radius_queries"] = int(self.radius_queries)
             metrics["support_provider_distance_evaluations"] = int(
@@ -718,14 +854,31 @@ class _KernelSupportProvider:
             metrics["support_provider_atomic_distance_evaluations"] = int(
                 index_metrics.get("atomic_distance_evaluations", 0) or 0
             )
+        if self.symmetric_cpu_support is not None:
+            metrics.update(self.symmetric_cpu_support.operational_metrics())
+            metrics["support_provider_distance_evaluations"] = int(
+                self.symmetric_cpu_support.distance_evaluations
+            )
+            metrics["support_provider_unique_distance_evaluations"] = int(
+                self.symmetric_cpu_support.distance_evaluations
+            )
+            metrics["support_provider_atomic_distance_evaluations"] = 0
         if self.knn_prefix_support is not None:
             metrics.update(self.knn_prefix_support.operational_metrics())
             if self.knn_prefix_support_used and self.generic_support_used:
-                metrics["support_provider"] = "mixed_exact_knn_prefix_and_generic"
+                metrics["support_provider"] = (
+                    "mixed_symmetric_knn_union_and_tiled"
+                    if self.kernel_bandwidth_rule == KERNEL_BANDWIDTH_RULE_SYMMETRIC_MAX
+                    else "mixed_exact_knn_prefix_and_generic"
+                )
             elif self.knn_prefix_support_used:
                 metrics.update(
                     {
-                        "support_provider": "exact_knn_prefix",
+                        "support_provider": (
+                            "symmetric_knn_union"
+                            if self.kernel_bandwidth_rule == KERNEL_BANDWIDTH_RULE_SYMMETRIC_MAX
+                            else "exact_knn_prefix"
+                        ),
                         "support_provider_stats_status": "active",
                         "support_provider_radius_queries": 0,
                         "support_provider_distance_evaluations": 0,
@@ -762,7 +915,44 @@ class _KernelSupportProvider:
         radius: float,
         target_indices: np.ndarray | None = None,
         distances: np.ndarray | None = None,
+        *,
+        target_bandwidths: np.ndarray | None = None,
+        kernel_bandwidth_rule: str | None = None,
     ) -> float:
+        requested_rule = (
+            self.kernel_bandwidth_rule
+            if kernel_bandwidth_rule is None
+            else normalize_kernel_bandwidth_rule(kernel_bandwidth_rule)
+        )
+        if requested_rule == KERNEL_BANDWIDTH_RULE_SYMMETRIC_MAX:
+            if target_indices is None or distances is None:
+                target_indices, distances = self.support(
+                    source_index,
+                    radius,
+                    target_bandwidths=target_bandwidths,
+                    kernel_bandwidth_rule=requested_rule,
+                )
+            assert target_indices is not None and distances is not None
+            if target_bandwidths is None:
+                raise ValueError(
+                    "symmetric_max normalisation requires target bandwidths aligned with "
+                    "target_indices"
+                )
+            target_values = np.asarray(target_bandwidths)
+            if target_values.ndim == 1 and target_values.shape == (self.descriptors.shape[0],):
+                target_values = target_values[np.asarray(target_indices, dtype=np.int64)]
+            if target_values.shape != np.asarray(target_indices).shape:
+                raise ValueError("target bandwidths must align with target_indices")
+            _effective, _supported, raw = evaluate_raw_kernel_pairs(
+                np.asarray(distances, dtype=np.float64),
+                float(radius),
+                target_values,
+                kernel_bandwidth_rule=requested_rule,
+            )
+            total = float(np.sum(raw, dtype=np.float64))
+            if not math.isfinite(total) or total <= 0.0:
+                raise ValueError(f"source kernel normaliser is invalid for source {source_index}")
+            return total
         key = (int(source_index), float(radius))
         cached = self._normaliser_cache.get(key)
         if cached is not None:
@@ -794,11 +984,13 @@ def source_normalisers(
     gpu_devices: Sequence[int] | str | int | None = None,
     gpu_tile_size: int = 128,
     max_gpu_support_bytes: int | None = None,
+    kernel_bandwidth_rule: str = KERNEL_BANDWIDTH_RULE_ASYMMETRIC_SOURCE,
 ) -> np.ndarray:
     """Return ``Z_b`` over the complete exact compact-kernel support."""
 
     values = _validate_descriptors(descriptors)
     scales = _validate_bandwidths(bandwidths, values.shape[0])
+    bandwidth_rule = normalize_kernel_bandwidth_rule(kernel_bandwidth_rule)
     block = _validate_chunk_size(chunk_size)
     provider = support_provider or _KernelSupportProvider(
         values,
@@ -813,6 +1005,7 @@ def source_normalisers(
         gpu_devices=gpu_devices,
         gpu_tile_size=gpu_tile_size,
         max_gpu_support_bytes=max_gpu_support_bytes,
+        kernel_bandwidth_rule=bandwidth_rule,
     )
     normalisers = np.empty(values.shape[0], dtype=np.float64)
     query_block = min(block, provider.support_batch_size)
@@ -821,16 +1014,34 @@ def source_normalisers(
         offsets, targets, distances = provider.support_many(
             np.arange(start, stop, dtype=np.int64),
             scales[start:stop],
+            target_bandwidths=(
+                scales if bandwidth_rule == KERNEL_BANDWIDTH_RULE_SYMMETRIC_MAX else None
+            ),
+            kernel_bandwidth_rule=bandwidth_rule,
         )
         for offset, source_index in enumerate(range(start, stop)):
             begin = int(offsets[offset])
             end = int(offsets[offset + 1])
-            normalisers[source_index] = provider.normaliser(
-                source_index,
-                float(scales[source_index]),
-                targets[begin:end],
-                distances[begin:end],
-            )
+            if bandwidth_rule == KERNEL_BANDWIDTH_RULE_SYMMETRIC_MAX:
+                _effective, _supported, raw = evaluate_raw_kernel_pairs(
+                    distances[begin:end],
+                    float(scales[source_index]),
+                    scales[targets[begin:end]],
+                    kernel_bandwidth_rule=bandwidth_rule,
+                )
+                total = float(np.sum(raw, dtype=np.float64))
+                if not math.isfinite(total) or total <= 0.0:
+                    raise ValueError(
+                        f"source kernel normaliser is invalid for source {source_index}"
+                    )
+                normalisers[source_index] = total
+            else:
+                normalisers[source_index] = provider.normaliser(
+                    source_index,
+                    float(scales[source_index]),
+                    targets[begin:end],
+                    distances[begin:end],
+                )
     normalisers.setflags(write=False)
     return normalisers
 
@@ -853,6 +1064,7 @@ def iter_normalized_kernel_columns(
     gpu_devices: Sequence[int] | str | int | None = None,
     gpu_tile_size: int = 128,
     max_gpu_support_bytes: int | None = None,
+    kernel_bandwidth_rule: str = KERNEL_BANDWIDTH_RULE_ASYMMETRIC_SOURCE,
 ) -> Iterator[NormalizedKernelColumn]:
     """Yield positive normalized source columns using bounded workspaces.
 
@@ -862,6 +1074,7 @@ def iter_normalized_kernel_columns(
 
     values = _validate_descriptors(descriptors)
     scales = _validate_bandwidths(bandwidths, values.shape[0])
+    bandwidth_rule = normalize_kernel_bandwidth_rule(kernel_bandwidth_rule)
     block = _validate_chunk_size(chunk_size)
     if progress_callback is not None and not callable(progress_callback):
         raise TypeError("progress_callback must be callable")
@@ -878,6 +1091,7 @@ def iter_normalized_kernel_columns(
         gpu_devices=gpu_devices,
         gpu_tile_size=gpu_tile_size,
         max_gpu_support_bytes=max_gpu_support_bytes,
+        kernel_bandwidth_rule=bandwidth_rule,
     )
     if source_indices is None:
         ordered_sources = range(values.shape[0])
@@ -894,6 +1108,10 @@ def iter_normalized_kernel_columns(
         offsets, targets, distances = provider.support_many(
             source_array,
             scales[source_array],
+            target_bandwidths=(
+                scales if bandwidth_rule == KERNEL_BANDWIDTH_RULE_SYMMETRIC_MAX else None
+            ),
+            kernel_bandwidth_rule=bandwidth_rule,
         )
         for offset, source_index in enumerate(source_batch):
             begin = int(offsets[offset])
@@ -901,13 +1119,26 @@ def iter_normalized_kernel_columns(
             scale = scales[source_index]
             target_indices = targets[begin:end]
             source_distances = distances[begin:end]
-            normaliser = provider.normaliser(
-                source_index,
-                float(scale),
-                target_indices,
-                source_distances,
-            )
-            raw = np.asarray(wendland_kernel(source_distances / scale), dtype=np.float64)
+            if bandwidth_rule == KERNEL_BANDWIDTH_RULE_SYMMETRIC_MAX:
+                _effective, _supported, raw = evaluate_raw_kernel_pairs(
+                    source_distances,
+                    float(scale),
+                    scales[target_indices],
+                    kernel_bandwidth_rule=bandwidth_rule,
+                )
+                normaliser = float(np.sum(raw, dtype=np.float64))
+                if not math.isfinite(normaliser) or normaliser <= 0.0:
+                    raise ValueError(
+                        f"source kernel normaliser is invalid for source {source_index}"
+                    )
+            else:
+                normaliser = provider.normaliser(
+                    source_index,
+                    float(scale),
+                    target_indices,
+                    source_distances,
+                )
+                raw = np.asarray(wendland_kernel(source_distances / scale), dtype=np.float64)
             positive = raw > 0.0
             if not np.all(positive):
                 target_indices = target_indices[positive]

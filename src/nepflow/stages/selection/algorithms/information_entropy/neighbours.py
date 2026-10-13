@@ -34,12 +34,14 @@ from .models import (
     GPU_NEIGHBOUR_BACKEND_VERSION,
     INDEXED_NEIGHBOUR_BACKEND_ID,
     INDEXED_NEIGHBOUR_BACKEND_VERSION,
+    KERNEL_BANDWIDTH_RULE_SYMMETRIC_MAX,
     NEIGHBOUR_BACKEND_ID,
     NEIGHBOUR_BACKEND_VERSION,
     NEIGHBOUR_DISTINCT_POLICY,
     NEIGHBOUR_METRIC,
     TILED_NEIGHBOUR_BACKEND_ID,
     TILED_NEIGHBOUR_BACKEND_VERSION,
+    normalize_kernel_bandwidth_rule,
 )
 
 logger = logging.getLogger(__name__)
@@ -658,6 +660,528 @@ class ExactKNNPrefixSupport:
             "knn_support_gpu_fp64_evaluations": 0,
             "knn_support_gpu_tile_scans": 0,
         }
+
+
+class ExactSymmetricKNNUnionSupport(ExactKNNPrefixSupport):
+    """Exact symmetric-max support derived from one canonical kNN prefix.
+
+    For the c=1 bandwidth vector, every directed location edge is admitted
+    only when its canonical kNN distance is strictly below the source kth
+    radius.  The symmetric support is the union of those directed edges and
+    their reverse adjacency.  The reverse index is keyed by unique location,
+    while materialisation expands back to every original row through the
+    grouping inherited from :class:`ExactKNNPrefixSupport`.
+    """
+
+    backend = "symmetric_knn_union"
+    backend_version = "symmetric-knn-union-v1"
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        neighbours = self.neighbours
+        if not neighbours.backend_fingerprint:
+            raise ValueError("symmetric kNN union requires a persisted kNN backend fingerprint")
+        location_count = int(neighbours.unique_locations.shape[0])
+        representative_rows = np.asarray(neighbours.location_representatives, dtype=np.int64)
+        representative_locations = neighbours.row_to_location[representative_rows]
+        if not np.array_equal(
+            representative_locations, np.arange(location_count, dtype=np.int64)
+        ):
+            raise ValueError("kNN prefix representatives are not in canonical location order")
+
+        # Duplicate atomic rows must share the exact same canonical prefix and
+        # kth radius.  This is an identity check, not an approximation.
+        for location in range(location_count):
+            start = int(self.location_indptr[location])
+            stop = int(self.location_indptr[location + 1])
+            rows = self.rows_by_location[start:stop]
+            if not np.all(neighbours.radii[rows] == neighbours.radii[rows[0]]):
+                raise ValueError("duplicate rows at one location have different kNN radii")
+            if not np.all(
+                neighbours.neighbour_indices[rows] == neighbours.neighbour_indices[rows[0]]
+            ) or not np.all(
+                neighbours.neighbour_distances[rows]
+                == neighbours.neighbour_distances[rows[0]]
+            ):
+                raise ValueError("duplicate rows at one location have different kNN prefixes")
+
+        neighbour_locations = np.asarray(
+            neighbours.row_to_location[
+                neighbours.neighbour_indices[representative_rows]
+            ],
+            dtype=np.int64,
+        )
+        neighbour_distances = np.asarray(
+            neighbours.neighbour_distances[representative_rows],
+            dtype=np.float64,
+        )
+        if np.any(
+            neighbour_locations == np.arange(location_count, dtype=np.int64)[:, None]
+        ):
+            raise ValueError("kNN prefix contains a source-location self edge")
+        if np.any(np.diff(neighbour_distances, axis=1) < 0.0):
+            raise ValueError("kNN prefix distances are not canonically ordered")
+
+        edge_count = int(location_count * neighbours.k)
+        reverse_bytes = int(
+            edge_count
+            * (
+                2 * np.dtype(np.int64).itemsize
+                + 2 * np.dtype(np.float64).itemsize
+            )
+            + (location_count + 1) * np.dtype(np.int64).itemsize
+            + 4096
+        )
+        reverse_and_grouping_bytes = reverse_bytes + int(self.grouping_bytes)
+        if reverse_and_grouping_bytes > self.max_workspace_bytes:
+            raise RadiusQueryCapacityError(
+                "symmetric kNN reverse adjacency exceeds its bounded support workspace: "
+                f"requested_bytes={reverse_and_grouping_bytes}, max_support_workspace_bytes="
+                f"{self.max_workspace_bytes}, locations={location_count}, k={neighbours.k}"
+            )
+        source_locations = np.repeat(
+            np.arange(location_count, dtype=np.int64), neighbours.k
+        )
+        target_locations = neighbour_locations.reshape(-1)
+        distances = neighbour_distances.reshape(-1)
+        strict = distances < neighbours.radii[representative_rows][source_locations]
+        source_locations = source_locations[strict]
+        target_locations = target_locations[strict]
+        distances = distances[strict]
+        order = np.lexsort((source_locations, target_locations))
+        source_locations = source_locations[order]
+        target_locations = target_locations[order]
+        distances = distances[order]
+        counts = np.bincount(target_locations, minlength=location_count).astype(
+            np.int64, copy=False
+        )
+        reverse_indptr = np.empty(location_count + 1, dtype=np.int64)
+        reverse_indptr[0] = 0
+        np.cumsum(counts, dtype=np.int64, out=reverse_indptr[1:])
+        reverse_indptr.setflags(write=False)
+        source_locations.setflags(write=False)
+        distances.setflags(write=False)
+        self.reverse_indptr = reverse_indptr
+        self.reverse_source_locations = source_locations
+        self.reverse_distances = distances
+        self.reverse_index_bytes = reverse_bytes
+        self.reused_knn_locations = location_count
+        self.new_distance_evaluations = 0
+
+    def eligible(
+        self,
+        source_indices: np.ndarray,
+        radii: np.ndarray,
+    ) -> bool:
+        expected = self.neighbours.radii[source_indices]
+        if radii.ndim == 1:
+            return np.array_equal(radii, expected)
+        return bool(
+            np.all(np.asarray(radii, dtype=np.float64) == expected[None, :])
+        )
+
+    def support_many(
+        self,
+        source_indices: Sequence[int] | np.ndarray,
+        radii: Sequence[float] | np.ndarray,
+        *,
+        target_bandwidths: np.ndarray | None = None,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        if target_bandwidths is not None:
+            targets = np.asarray(target_bandwidths)
+            if targets.dtype != np.dtype(np.float64) or targets.ndim not in (1, 2):
+                raise ValueError("symmetric kNN target bandwidths must be float64 vectors")
+            if targets.shape[-1] != self.descriptors.shape[0]:
+                raise ValueError("symmetric kNN target bandwidths must cover the full row pool")
+            if not np.all(np.isfinite(targets)) or np.any(targets <= 0.0):
+                raise ValueError("symmetric kNN target bandwidths must be positive")
+            # The reverse-union proof is specific to the c=1 canonical kth
+            # radii.  Reject any other target bandwidth vector rather than
+            # silently returning an incomplete support.
+            expected = self.neighbours.radii
+            if targets.ndim == 1:
+                target_matches = np.array_equal(targets, expected)
+            else:
+                target_matches = bool(np.all(targets == expected[None, :]))
+            if not target_matches:
+                raise ValueError(
+                    "symmetric kNN union requires target bandwidths equal to the canonical "
+                    "kNN radii"
+                )
+        sources = np.asarray(source_indices)
+        requested = np.asarray(radii, dtype=np.float64)
+        if sources.ndim != 1 or sources.size == 0 or sources.dtype.kind not in "iu":
+            raise ValueError("source_indices must be a non-empty integer vector")
+        source_rows = np.asarray(sources, dtype=np.int64)
+        if np.any(source_rows < 0) or np.any(source_rows >= self.descriptors.shape[0]):
+            raise IndexError("source_indices contain a row outside the descriptor rows")
+        if requested.ndim not in (1, 2) or requested.shape[-1] != source_rows.size:
+            raise ValueError("radii must align with source_indices")
+        if not np.all(np.isfinite(requested)) or np.any(requested <= 0.0):
+            raise ValueError("symmetric kNN radii must be finite and positive")
+        if not self.eligible(source_rows, requested):
+            raise ValueError(
+                "symmetric kNN union requires the canonical c=1 kNN bandwidth vector"
+            )
+
+        counts = np.empty(source_rows.size, dtype=np.int64)
+        location_parts: list[np.ndarray] = []
+        distance_parts: list[np.ndarray] = []
+        for local_index, source in enumerate(source_rows):
+            source_location = int(self.neighbours.row_to_location[source])
+            outgoing = self.neighbours.row_to_location[
+                self.neighbours.neighbour_indices[
+                    int(self.neighbours.location_representatives[source_location])
+                ]
+            ]
+            outgoing_distances = self.neighbours.neighbour_distances[
+                int(self.neighbours.location_representatives[source_location])
+            ]
+            outgoing = outgoing[outgoing_distances < self.neighbours.radii[source]]
+            outgoing_distances = outgoing_distances[
+                outgoing_distances < self.neighbours.radii[source]
+            ]
+            incoming_start = int(self.reverse_indptr[source_location])
+            incoming_stop = int(self.reverse_indptr[source_location + 1])
+            incoming = self.reverse_source_locations[incoming_start:incoming_stop]
+            incoming_distances = self.reverse_distances[incoming_start:incoming_stop]
+            locations = np.unique(
+                np.concatenate(
+                    (
+                        np.asarray([source_location], dtype=np.int64),
+                        outgoing,
+                        incoming,
+                    )
+                )
+            )
+            distance_by_location: dict[int, float] = {source_location: 0.0}
+            distance_by_location.update(
+                (int(location), float(distance))
+                for location, distance in zip(outgoing, outgoing_distances, strict=True)
+            )
+            distance_by_location.update(
+                (int(location), float(distance))
+                for location, distance in zip(incoming, incoming_distances, strict=True)
+            )
+            location_distances = np.asarray(
+                [distance_by_location[int(location)] for location in locations],
+                dtype=np.float64,
+            )
+            row_count = sum(
+                int(self.location_indptr[int(location) + 1] - self.location_indptr[int(location)])
+                for location in locations
+            )
+            counts[local_index] = row_count
+            location_parts.append(locations)
+            distance_parts.append(location_distances)
+
+        total_support = int(np.sum(counts, dtype=np.int64))
+        workspace_bytes = int(
+            (source_rows.size + 1) * np.dtype(np.int64).itemsize
+            + total_support * (np.dtype(np.int64).itemsize + np.dtype(np.float64).itemsize)
+            + 64 * max(1, int(np.max(counts)))
+            + 4096
+        )
+        if workspace_bytes > self.max_workspace_bytes:
+            raise RadiusQueryCapacityError(
+                "symmetric kNN support materialisation exceeds memory capacity: "
+                f"requested_bytes={workspace_bytes}, max_support_workspace_bytes="
+                f"{self.max_workspace_bytes}, support_entries={total_support}"
+            )
+        with self.resource_budget.acquire(
+            self.capacity_context or "symmetric kNN support materialisation",
+            max(1, workspace_bytes),
+        ):
+            offsets = np.zeros(source_rows.size + 1, dtype=np.int64)
+            np.cumsum(counts, dtype=np.int64, out=offsets[1:])
+            targets = np.empty(total_support, dtype=np.int64)
+            output_distances = np.empty(total_support, dtype=np.float64)
+            cursor = 0
+            for locations, location_distances in zip(location_parts, distance_parts, strict=True):
+                row_parts = [
+                    self.rows_by_location[
+                        self.location_indptr[int(location)] : self.location_indptr[
+                            int(location) + 1
+                        ]
+                    ]
+                    for location in locations
+                ]
+                rows = np.concatenate(row_parts).astype(np.int64, copy=False)
+                row_distances = np.repeat(
+                    location_distances,
+                    [int(part.size) for part in row_parts],
+                )
+                order = np.argsort(rows, kind="stable")
+                stop = cursor + int(rows.size)
+                targets[cursor:stop] = rows[order]
+                output_distances[cursor:stop] = row_distances[order]
+                cursor = stop
+        offsets.setflags(write=False)
+        targets.setflags(write=False)
+        output_distances.setflags(write=False)
+        self.derived_sources += int(source_rows.size)
+        self.derived_entries += total_support
+        self.query_workspace_peak_bytes = max(self.query_workspace_peak_bytes, workspace_bytes)
+        return offsets, targets, output_distances
+
+    def operational_metrics(self) -> dict[str, int | float | str]:
+        metrics = dict(super().operational_metrics())
+        metrics.update(
+            {
+                "support_provider": self.backend,
+                "support_provider_version": self.backend_version,
+                "kernel_bandwidth_rule": KERNEL_BANDWIDTH_RULE_SYMMETRIC_MAX,
+                "reverse_index_memory_bytes": int(self.reverse_index_bytes),
+                "reused_knn_locations": int(self.reused_knn_locations),
+                "new_distance_evaluations": 0,
+                "support_provider_new_distance_evaluations": 0,
+            }
+        )
+        return metrics
+
+
+class ExactTiledCPUSupport:
+    """Bounded exact CPU support for source/target pair bandwidths.
+
+    The provider performs a count pass followed by a fill pass.  That makes
+    the CSR capacity check happen before the output arrays are allocated and
+    keeps the temporary distance workspace bounded by one source/target tile.
+    """
+
+    backend = "symmetric_tiled_cpu"
+    backend_version = "symmetric-tiled-cpu-v1"
+
+    def __init__(
+        self,
+        descriptors: np.ndarray,
+        *,
+        tile_size: int = 256,
+        max_radius_query_bytes: int | None = None,
+        max_calibration_work_bytes: int | None = None,
+        resource_budget: ResourceBudgetService | None = None,
+        capacity_context: str | None = None,
+    ) -> None:
+        self.descriptors = _validate_descriptors(descriptors)
+        self.tile_size = _validate_chunk_size(tile_size)
+        self.resource_budget = resource_budget or build_resource_budget()
+        self.capacity_context = capacity_context
+        remaining = self.resource_budget.remaining_managed_budget
+        if remaining is None:
+            raise ResourceCapacityError(
+                self.resource_budget.unknown_memory_message("symmetric CPU support"),
+                operation="symmetric CPU support",
+            )
+        limits = [int(remaining)]
+        if max_radius_query_bytes is not None:
+            limits.append(_validate_memory_limit(max_radius_query_bytes, "max_radius_query_bytes"))
+        if max_calibration_work_bytes is not None:
+            limits.append(
+                _validate_memory_limit(
+                    max_calibration_work_bytes, "max_calibration_work_bytes"
+                )
+            )
+        self.max_workspace_bytes = min(limits)
+        dimension = int(self.descriptors.shape[1])
+        per_target = max(64, 16 * dimension + 64)
+        self.target_tile_size = min(
+            self.tile_size,
+            max(1, (self.max_workspace_bytes - 16 * self.tile_size - 8192) // per_target),
+        )
+        if self.max_workspace_bytes < per_target + 8192:
+            raise RadiusQueryCapacityError(
+                "one symmetric CPU support tile exceeds its bounded workspace: "
+                f"requested_bytes={per_target + 8192}, max_support_workspace_bytes="
+                f"{self.max_workspace_bytes}"
+            )
+        self.distance_evaluations = 0
+        self.new_distance_evaluations = 0
+        self.support_query_count = 0
+        self.support_entries = 0
+        self.support_query_seconds = 0.0
+        self.tile_count = 0
+        self.query_workspace_peak_bytes = 0
+        self.support_count_total = 0
+        self.support_count_samples = 0
+        self.min_support_count: int | None = None
+        self.max_support_count = 0
+
+    def _distance_tile(self, source: np.ndarray, targets: np.ndarray) -> np.ndarray:
+        with np.errstate(over="raise", invalid="raise"):
+            try:
+                distances = np.sqrt(
+                    np.sum((targets - source) ** 2, axis=1, dtype=np.float64)
+                )
+            except FloatingPointError as exc:
+                raise ValueError(
+                    "symmetric CPU support distance overflowed or became invalid"
+                ) from exc
+        if not np.all(np.isfinite(distances)):
+            raise ValueError("symmetric CPU support distances must be finite")
+        return np.asarray(distances, dtype=np.float64)
+
+    @staticmethod
+    def _envelope(values: np.ndarray, *, name: str, expected: int) -> tuple[np.ndarray, int]:
+        array = np.asarray(values)
+        if array.dtype != np.dtype(np.float64) or array.ndim not in (1, 2):
+            raise ValueError(f"{name} must be a float64 vector or candidate matrix")
+        if array.shape[-1] != expected or array.shape[0] == 0:
+            raise ValueError(f"{name} does not align with the requested rows")
+        if not np.all(np.isfinite(array)) or np.any(array <= 0.0):
+            raise ValueError(f"{name} must be finite and strictly positive")
+        return (
+            np.ascontiguousarray(array if array.ndim == 1 else np.max(array, axis=0)),
+            1 if array.ndim == 1 else int(array.shape[0]),
+        )
+
+    def support_many(
+        self,
+        source_indices: Sequence[int] | np.ndarray,
+        source_bandwidths: Sequence[float] | np.ndarray,
+        *,
+        target_bandwidths: Sequence[float] | np.ndarray,
+        kernel_bandwidth_rule: str = KERNEL_BANDWIDTH_RULE_SYMMETRIC_MAX,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        if (
+            normalize_kernel_bandwidth_rule(kernel_bandwidth_rule)
+            != KERNEL_BANDWIDTH_RULE_SYMMETRIC_MAX
+        ):
+            raise ValueError("ExactTiledCPUSupport only implements symmetric_max")
+        sources = np.asarray(source_indices)
+        if sources.ndim != 1 or sources.size == 0 or sources.dtype.kind not in "iu":
+            raise ValueError("source_indices must be a non-empty integer vector")
+        source_rows = np.asarray(sources, dtype=np.int64)
+        if np.any(source_rows < 0) or np.any(source_rows >= self.descriptors.shape[0]):
+            raise IndexError("source_indices contain a row outside the descriptor rows")
+        source_env, candidate_count = self._envelope(
+            np.asarray(source_bandwidths), name="source_bandwidths", expected=source_rows.size
+        )
+        target_array = np.asarray(target_bandwidths)
+        if target_array.dtype != np.dtype(np.float64) or target_array.ndim not in (1, 2):
+            raise ValueError("target_bandwidths must be a full-pool float64 vector or matrix")
+        if target_array.shape[-1] != self.descriptors.shape[0]:
+            raise ValueError("target_bandwidths must align with the full original row pool")
+        target_env, target_candidates = self._envelope(
+            target_array, name="target_bandwidths", expected=self.descriptors.shape[0]
+        )
+        if target_candidates not in {1, candidate_count} and target_array.ndim == 2:
+            raise ValueError("source and target bandwidth candidate counts do not align")
+
+        row_count = int(self.descriptors.shape[0])
+        counts = np.zeros(source_rows.size, dtype=np.int64)
+
+        def scan(pass_name: str) -> None:
+            for local_source, source_index in enumerate(source_rows):
+                source_values = self.descriptors[int(source_index)]
+                source_h = float(source_env[local_source])
+                for start in range(0, row_count, self.target_tile_size):
+                    stop = min(start + self.target_tile_size, row_count)
+                    target_indices = np.arange(start, stop, dtype=np.int64)
+                    distances = self._distance_tile(
+                        source_values, self.descriptors[start:stop]
+                    )
+                    self.distance_evaluations += int(target_indices.size)
+                    self.new_distance_evaluations += int(target_indices.size)
+                    self.tile_count += 1
+                    effective = np.maximum(source_h, target_env[start:stop])
+                    keep = distances < effective
+                    if pass_name == "count":
+                        counts[local_source] += int(np.count_nonzero(keep))
+
+        started = time.perf_counter()
+        scan("count")
+        total_support = int(np.sum(counts, dtype=np.int64))
+        workspace_bytes = int(
+            (source_rows.size + 1) * np.dtype(np.int64).itemsize
+            + total_support * 16
+            + self.target_tile_size * (16 * self.descriptors.shape[1] + 64)
+            + 8192
+        )
+        self.query_workspace_peak_bytes = max(self.query_workspace_peak_bytes, workspace_bytes)
+        if workspace_bytes > self.max_workspace_bytes:
+            detail = (
+                f"requested_bytes={workspace_bytes}, max_support_workspace_bytes="
+                f"{self.max_workspace_bytes}, source_count={source_rows.size}, "
+                f"support_entries={total_support}"
+            )
+            if self.capacity_context:
+                detail += f", {self.capacity_context}"
+            raise RadiusQueryCapacityError(
+                "symmetric CPU support exceeds memory capacity: " + detail
+            )
+        with self.resource_budget.acquire(
+            self.capacity_context or "symmetric CPU support materialisation",
+            max(1, workspace_bytes),
+        ):
+            offsets = np.zeros(source_rows.size + 1, dtype=np.int64)
+            np.cumsum(counts, dtype=np.int64, out=offsets[1:])
+            targets = np.empty(total_support, dtype=np.int64)
+            distances_out = np.empty(total_support, dtype=np.float64)
+            cursor_by_source = offsets[:-1].copy()
+            for local_source, source_index in enumerate(source_rows):
+                source_values = self.descriptors[int(source_index)]
+                source_h = float(source_env[local_source])
+                cursor = int(cursor_by_source[local_source])
+                for start in range(0, row_count, self.target_tile_size):
+                    stop = min(start + self.target_tile_size, row_count)
+                    target_indices = np.arange(start, stop, dtype=np.int64)
+                    distances = self._distance_tile(
+                        source_values, self.descriptors[start:stop]
+                    )
+                    self.distance_evaluations += int(target_indices.size)
+                    self.new_distance_evaluations += int(target_indices.size)
+                    self.tile_count += 1
+                    effective = np.maximum(source_h, target_env[start:stop])
+                    keep = distances < effective
+                    kept = int(np.count_nonzero(keep))
+                    if kept:
+                        targets[cursor : cursor + kept] = target_indices[keep]
+                        distances_out[cursor : cursor + kept] = distances[keep]
+                        cursor += kept
+                if cursor != int(offsets[local_source + 1]):
+                    raise RuntimeError("symmetric CPU support fill pass disagreed with count pass")
+        for count in counts:
+            support_count = int(count)
+            self.support_count_total += support_count
+            self.support_count_samples += 1
+            self.max_support_count = max(self.max_support_count, support_count)
+            self.min_support_count = (
+                support_count
+                if self.min_support_count is None
+                else min(self.min_support_count, support_count)
+            )
+        self.support_query_count += int(source_rows.size)
+        self.support_entries += total_support
+        self.support_query_seconds += max(0.0, time.perf_counter() - started)
+        offsets.setflags(write=False)
+        targets.setflags(write=False)
+        distances_out.setflags(write=False)
+        return offsets, targets, distances_out
+
+    def operational_metrics(self) -> dict[str, int | float | str]:
+        return {
+            "support_provider": self.backend,
+            "support_provider_version": self.backend_version,
+            "kernel_bandwidth_rule": KERNEL_BANDWIDTH_RULE_SYMMETRIC_MAX,
+            "support_query_count": int(self.support_query_count),
+            "support_entries": int(self.support_entries),
+            "support_query_seconds": float(self.support_query_seconds),
+            "support_count_min": self.min_support_count,
+            "support_count_mean": (
+                self.support_count_total / self.support_count_samples
+                if self.support_count_samples
+                else None
+            ),
+            "support_count_max": int(self.max_support_count),
+            "distance_evaluations": int(self.distance_evaluations),
+            "new_distance_evaluations": int(self.new_distance_evaluations),
+            "support_provider_new_distance_evaluations": int(self.new_distance_evaluations),
+            "cpu_support_tile_count": int(self.tile_count),
+            "query_workspace_peak_bytes": int(self.query_workspace_peak_bytes),
+        }
+
+
+SymmetricKNNPrefixSupport = ExactSymmetricKNNUnionSupport
+SymmetricTiledCPUSupport = ExactTiledCPUSupport
 
 
 def _validate_row_ids(row_ids: Sequence[str] | None, n_rows: int) -> tuple[str, ...]:
@@ -4740,6 +5264,10 @@ __all__ = [
     "DEFAULT_NEIGHBOUR_CACHE_BYTES",
     "DEFAULT_RADIUS_QUERY_BYTES",
     "ExactKNNPrefixSupport",
+    "ExactSymmetricKNNUnionSupport",
+    "ExactTiledCPUSupport",
+    "SymmetricKNNPrefixSupport",
+    "SymmetricTiledCPUSupport",
     "ExactNeighbourResult",
     "IndexedCPUNeighbourIndex",
     "TiledCPUNeighbourIndex",

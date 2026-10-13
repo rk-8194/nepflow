@@ -23,7 +23,12 @@ from .gpu_devices import (
     normalize_gpu_devices,
     validate_visible_gpu_devices,
 )
-from .models import KERNEL_SUPPORT_EXECUTION_GPU_VERSION
+from .models import (
+    KERNEL_BANDWIDTH_RULE_ASYMMETRIC_SOURCE,
+    KERNEL_BANDWIDTH_RULE_SYMMETRIC_MAX,
+    KERNEL_SUPPORT_EXECUTION_GPU_VERSION,
+    normalize_kernel_bandwidth_rule,
+)
 
 
 _FLOAT64_UNIT_ROUNDOFF = np.finfo(np.float64).eps / 2.0
@@ -186,6 +191,7 @@ class ExactTiledGPUSupport:
             self.gpu_allocation_seconds = 0.0
             self._gpu_target_workspace = None
             self._gpu_radii_workspace = None
+            self._gpu_target_bandwidth_workspace = None
             self.cpu_verification_seconds = 0.0
             self.support_query_count = 0
             self.support_entries = 0
@@ -193,6 +199,7 @@ class ExactTiledGPUSupport:
             self.reused_radius_scans = 0
             self.conservative_candidate_count = 0
             self.support_query_seconds = 0.0
+            self.kernel_bandwidth_rule = KERNEL_BANDWIDTH_RULE_ASYMMETRIC_SOURCE
             self.support_wall_seconds = 0.0
             return
 
@@ -308,6 +315,7 @@ class ExactTiledGPUSupport:
         self.gpu_allocation_seconds = 0.0
         self._gpu_target_workspace = None
         self._gpu_radii_workspace = None
+        self._gpu_target_bandwidth_workspace = None
         self.cpu_verification_seconds = 0.0
         self.support_query_count = 0
         self.support_entries = 0
@@ -315,6 +323,7 @@ class ExactTiledGPUSupport:
         self.reused_radius_scans = 0
         self.conservative_candidate_count = 0
         self.support_query_seconds = 0.0
+        self.kernel_bandwidth_rule = KERNEL_BANDWIDTH_RULE_ASYMMETRIC_SOURCE
         self.support_wall_seconds = 0.0
 
     def _load_cupy(self) -> Any:
@@ -520,6 +529,7 @@ class ExactTiledGPUSupport:
         target_indices: np.ndarray,
         radii: np.ndarray,
         *,
+        target_bandwidths: np.ndarray | None = None,
         source_values: np.ndarray | None = None,
         gpu_sources: Any | None = None,
     ) -> np.ndarray:
@@ -541,6 +551,21 @@ class ExactTiledGPUSupport:
         radii_values = np.ascontiguousarray(radii, dtype=np.float64)
         if radii_values.ndim != 1 or radii_values.size != source_indices.size:
             raise ValueError("screening radii must align with the source tile")
+        if target_bandwidths is None:
+            target_bandwidth_values = None
+        else:
+            target_bandwidth_values = np.ascontiguousarray(
+                target_bandwidths, dtype=np.float64
+            )
+            if (
+                target_bandwidth_values.ndim != 1
+                or target_bandwidth_values.size != target_indices.size
+            ):
+                raise ValueError("target bandwidths must align with the target tile")
+            if not np.all(np.isfinite(target_bandwidth_values)) or np.any(
+                target_bandwidth_values <= 0.0
+            ):
+                raise ValueError("target bandwidths must be finite and strictly positive")
         gpu_started = time.perf_counter()
         with cp.cuda.Device(self.device):
             pool_before = self._memory_pool_snapshot()
@@ -550,8 +575,17 @@ class ExactTiledGPUSupport:
                 self.h2d_bytes += int(source_values.nbytes)
             gpu_targets = self._upload_reusable_tile("_gpu_target_workspace", target_values)
             gpu_radii = self._upload_reusable_tile("_gpu_radii_workspace", radii_values)
+            gpu_target_bandwidths = None
+            if target_bandwidth_values is not None:
+                gpu_target_bandwidths = self._upload_reusable_tile(
+                    "_gpu_target_bandwidth_workspace", target_bandwidth_values
+                )
             self.h2d_seconds += max(0.0, time.perf_counter() - transfer_started)
-            self.h2d_bytes += int(target_values.nbytes + radii_values.nbytes)
+            self.h2d_bytes += int(
+                target_values.nbytes
+                + radii_values.nbytes
+                + (0 if target_bandwidth_values is None else target_bandwidth_values.nbytes)
+            )
             screening_started = time.perf_counter()
             cuda_screening_event = self._cuda_event_start()
             distance_squared = cp.zeros(
@@ -710,8 +744,13 @@ class ExactTiledGPUSupport:
             )
             lower_distance = cp.maximum(0.0, lower_distance - sqrt_error)
             finite = finite & cp.isfinite(lower_distance) & cp.isfinite(upper_distance)
-            potential = lower_distance < gpu_radii[:, None]
-            boundary = potential & (upper_distance >= gpu_radii[:, None])
+            effective_radii = (
+                gpu_radii[:, None]
+                if gpu_target_bandwidths is None
+                else cp.maximum(gpu_radii[:, None], gpu_target_bandwidths[None, :])
+            )
+            potential = lower_distance < effective_radii
+            boundary = potential & (upper_distance >= effective_radii)
             # A non-finite or uncertifiable interval is retained for CPU
             # certification instead of being excluded by a NaN comparison.
             potential = potential | ~finite
@@ -800,20 +839,24 @@ class ExactTiledGPUSupport:
         source_indices: Sequence[int] | np.ndarray,
         radii: Sequence[float] | np.ndarray,
         *,
+        target_bandwidths: Sequence[float] | np.ndarray | None = None,
+        kernel_bandwidth_rule: str = KERNEL_BANDWIDTH_RULE_ASYMMETRIC_SOURCE,
         _record_group: bool = True,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Return an exact source-major CSR support superset.
 
         ``radii`` may be either ``(source_count,)`` for the historical
         single-radius query or ``(candidate_count, source_count)``.  For the
-        latter, one GPU distance pass is screened with the largest radius for
-        each source and canonical CPU distances are returned for that finite
-        superset.  Callers reconstruct each candidate's strict support with
-        ``distances < radii[candidate]``; this preserves duplicate rows,
-        source self-inclusion, and the original target order without retaining
-        a C-by-N-by-N workspace.
+        latter, one GPU distance pass is screened with the largest effective
+        source/target bandwidth for each pair and canonical CPU distances are
+        returned for that finite superset.  Callers reconstruct each
+        candidate's strict support with the selected pair rule; this preserves
+        duplicate rows, source self-inclusion, and the original target order
+        without retaining a C-by-N-by-N workspace.
         """
 
+        bandwidth_rule = normalize_kernel_bandwidth_rule(kernel_bandwidth_rule)
+        self.kernel_bandwidth_rule = bandwidth_rule
         sources = np.asarray(source_indices, dtype=np.int64)
         requested_radii = np.asarray(radii, dtype=np.float64)
         if sources.ndim != 1 or requested_radii.ndim not in (1, 2):
@@ -836,6 +879,30 @@ class ExactTiledGPUSupport:
             raise ValueError("source_indices contains an out-of-range row")
         if not np.all(np.isfinite(requested_radii)) or np.any(requested_radii <= 0.0):
             raise ValueError("GPU support radii must be finite and strictly positive")
+        target_values: np.ndarray | None = None
+        if bandwidth_rule == KERNEL_BANDWIDTH_RULE_SYMMETRIC_MAX:
+            if target_bandwidths is None:
+                raise ValueError(
+                    "symmetric_max GPU support requires target bandwidths for the full "
+                    "original row pool"
+                )
+            target_values = np.asarray(target_bandwidths)
+            if target_values.dtype != np.dtype(np.float64) or target_values.ndim not in (1, 2):
+                raise ValueError("target bandwidths must be a float64 vector or candidate matrix")
+            if target_values.shape[-1] != self.descriptors.shape[0]:
+                raise ValueError("target bandwidths must cover the full original row pool")
+            if not np.all(np.isfinite(target_values)) or np.any(target_values <= 0.0):
+                raise ValueError("target bandwidths must be finite and strictly positive")
+            if (
+                target_values.ndim == 2
+                and requested_radii.ndim == 2
+                and target_values.shape[0] not in {1, requested_radii.shape[0]}
+            ):
+                raise ValueError("source and target bandwidth candidate counts do not align")
+        elif target_bandwidths is not None:
+            raise ValueError(
+                "target bandwidths are only valid with kernel_bandwidth_rule='symmetric_max'"
+            )
         if _record_group and requested_radii.ndim == 2 and requested_radii.shape[0] > 1:
             self.grouped_radius_query_count += 1
             self.reused_radius_scans += max(0, int(requested_radii.shape[0]) - 1)
@@ -860,6 +927,8 @@ class ExactTiledGPUSupport:
                         requested_radii[:, start:stop]
                         if requested_radii.ndim == 2
                         else scales[start:stop],
+                        target_values,
+                        bandwidth_rule,
                     )
                 for worker_index, (_device, start, stop) in enumerate(ranges):
                     if start == stop:
@@ -916,6 +985,8 @@ class ExactTiledGPUSupport:
                     requested_radii[:, start:stop]
                     if requested_radii.ndim == 2
                     else scales[start:stop],
+                    target_bandwidths=target_values,
+                    kernel_bandwidth_rule=bandwidth_rule,
                     _record_group=False,
                 )
                 target_parts.append(tile_targets)
@@ -958,10 +1029,18 @@ class ExactTiledGPUSupport:
             while target_cursor < target_count:
                 target_stop = min(target_cursor + target_tile_size, target_count)
                 target_tile = np.arange(target_cursor, target_stop, dtype=np.int64)
+                target_tile_bandwidths = (
+                    None
+                    if target_values is None
+                    else np.max(target_values[:, target_cursor:target_stop], axis=0)
+                    if target_values.ndim == 2
+                    else target_values[target_cursor:target_stop]
+                )
                 candidate_flat = self._screen_tile(
                     sources,
                     target_tile,
                     scales,
+                    target_bandwidths=target_tile_bandwidths,
                     source_values=source_values,
                     gpu_sources=gpu_sources,
                 )
@@ -987,7 +1066,18 @@ class ExactTiledGPUSupport:
                         0.0, time.perf_counter() - verification_started
                     )
                     self.cpu_rescanned_count += int(candidates.size)
-                    keep = canonical < float(scales[local_source])
+                    if target_values is None:
+                        effective = float(scales[local_source])
+                    else:
+                        effective = np.maximum(
+                            float(scales[local_source]),
+                            (
+                                np.max(target_values[:, candidates], axis=0)
+                                if target_values.ndim == 2
+                                else target_values[candidates]
+                            ),
+                        )
+                    keep = canonical < effective
                     source_targets[local_source].append(candidates[keep])
                     source_distances[local_source].append(canonical[keep])
                 self.target_tiles += 1
@@ -1039,11 +1129,19 @@ class ExactTiledGPUSupport:
         self,
         source_indices: np.ndarray,
         radii: np.ndarray,
+        target_bandwidths: np.ndarray | None = None,
+        kernel_bandwidth_rule: str = KERNEL_BANDWIDTH_RULE_ASYMMETRIC_SOURCE,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Run one single-device worker while its CUDA context is current."""
 
         with self._cp.cuda.Device(self.device):
-            return self.support_many(source_indices, radii, _record_group=False)
+            return self.support_many(
+                source_indices,
+                radii,
+                target_bandwidths=target_bandwidths,
+                kernel_bandwidth_rule=kernel_bandwidth_rule,
+                _record_group=False,
+            )
 
     def operational_metrics(self) -> dict[str, Any]:
         if self._workers:
@@ -1052,6 +1150,12 @@ class ExactTiledGPUSupport:
             aggregate = {
                 "support_execution": self.backend,
                 "support_execution_version": self.backend_version,
+                "kernel_bandwidth_rule": self.kernel_bandwidth_rule,
+                "support_provider": (
+                    "symmetric_tiled_gpu"
+                    if self.kernel_bandwidth_rule == KERNEL_BANDWIDTH_RULE_SYMMETRIC_MAX
+                    else "asymmetric_source"
+                ),
                 "gpu_devices": list(self.gpu_devices),
                 "gpu_device_count": len(self.gpu_devices),
                 "gpu_device": self.device,
@@ -1065,6 +1169,8 @@ class ExactTiledGPUSupport:
                 "gpu_source_tiles": self.source_tiles,
                 "gpu_target_tiles": self.target_tiles,
                 "gpu_fp64_evaluations": self.fp64_evaluations,
+                "new_distance_evaluations": self.fp64_evaluations,
+                "support_provider_new_distance_evaluations": self.fp64_evaluations,
                 "gpu_launch_count": self.gpu_launch_count,
                 "gpu_distance_block_count": self.gpu_distance_block_count,
                 "gpu_kernel_launch_equivalent_count": (
@@ -1159,6 +1265,12 @@ class ExactTiledGPUSupport:
         metrics = {
             "support_execution": self.backend,
             "support_execution_version": self.backend_version,
+            "kernel_bandwidth_rule": self.kernel_bandwidth_rule,
+            "support_provider": (
+                "symmetric_tiled_gpu"
+                if self.kernel_bandwidth_rule == KERNEL_BANDWIDTH_RULE_SYMMETRIC_MAX
+                else "asymmetric_source"
+            ),
             "gpu_device": self.device,
             "gpu_devices": [self.device],
             "gpu_device_count": 1,
@@ -1175,6 +1287,8 @@ class ExactTiledGPUSupport:
             "gpu_source_tiles": self.source_tiles,
             "gpu_target_tiles": self.target_tiles,
             "gpu_fp64_evaluations": self.fp64_evaluations,
+            "new_distance_evaluations": self.fp64_evaluations,
+            "support_provider_new_distance_evaluations": self.fp64_evaluations,
             "gpu_launch_count": self.gpu_launch_count,
             "gpu_distance_block_count": self.gpu_distance_block_count,
             "gpu_kernel_launch_equivalent_count": self.gpu_kernel_launch_equivalent_count,
@@ -1403,6 +1517,7 @@ class ExactTiledGPUSupport:
             with self._cp.cuda.Device(self.device):
                 self._gpu_target_workspace = None
                 self._gpu_radii_workspace = None
+                self._gpu_target_bandwidth_workspace = None
                 for name in ("get_default_memory_pool", "get_default_pinned_memory_pool"):
                     pool_factory = getattr(self._cp, name, None)
                     if pool_factory is not None:

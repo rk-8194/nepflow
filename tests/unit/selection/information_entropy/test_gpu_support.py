@@ -367,6 +367,46 @@ def test_fake_gpu_support_shared_radius_matrix_matches_isolated_queries(
     shared.close()
 
 
+def test_fake_gpu_symmetric_support_uses_full_target_bandwidths(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setitem(sys.modules, "cupy", _fake_cupy())
+    descriptors = np.asarray([[0.0], [1.0], [3.0]], dtype=np.float64)
+    bandwidths = np.asarray([0.5, 2.5, 0.5], dtype=np.float64)
+    provider = ExactTiledGPUSupport(
+        descriptors,
+        tile_size=2,
+        max_device_bytes=64 * 1024,
+        max_host_bytes=1_000_000,
+    )
+    try:
+        offsets, targets, distances = provider.support_many(
+            np.arange(descriptors.shape[0], dtype=np.int64),
+            bandwidths,
+            target_bandwidths=bandwidths,
+            kernel_bandwidth_rule="symmetric_max",
+        )
+        expected_targets: list[int] = []
+        expected_distances: list[float] = []
+        expected_offsets = [0]
+        for source, source_bandwidth in enumerate(bandwidths):
+            exact = np.sqrt(
+                np.sum((descriptors - descriptors[source]) ** 2, axis=1, dtype=np.float64)
+            )
+            keep = exact < np.maximum(source_bandwidth, bandwidths)
+            expected_targets.extend(np.flatnonzero(keep).tolist())
+            expected_distances.extend(exact[keep].tolist())
+            expected_offsets.append(len(expected_targets))
+        np.testing.assert_array_equal(offsets, expected_offsets)
+        np.testing.assert_array_equal(targets, expected_targets)
+        np.testing.assert_array_equal(distances, expected_distances)
+        metrics = provider.operational_metrics()
+        assert metrics["kernel_bandwidth_rule"] == "symmetric_max"
+        assert metrics["support_provider"] == "symmetric_tiled_gpu"
+    finally:
+        provider.close()
+
+
 def test_fake_gpu_calibration_planner_reports_shared_and_singleton_choices(
     monkeypatch: pytest.MonkeyPatch,
 ):

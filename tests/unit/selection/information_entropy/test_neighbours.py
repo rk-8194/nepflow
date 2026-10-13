@@ -8,11 +8,90 @@ import pytest
 from nepflow.resources.budget import build_resource_budget
 from nepflow.stages.selection.algorithms.information_entropy.neighbours import (
     ExactKNNPrefixSupport,
+    ExactSymmetricKNNUnionSupport,
+    ExactTiledCPUSupport,
     IndexedCPUNeighbourIndex,
     RadiusQueryCapacityError,
     compute_exact_neighbours,
     compute_indexed_cpu_neighbours,
 )
+
+
+def _exhaustive_pair_support(
+    descriptors: np.ndarray,
+    source_indices: np.ndarray,
+    bandwidths: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    offsets = [0]
+    targets: list[int] = []
+    distances: list[float] = []
+    for source in source_indices:
+        exact = np.sqrt(
+            np.sum((descriptors - descriptors[int(source)]) ** 2, axis=1, dtype=np.float64)
+        )
+        keep = exact < np.maximum(bandwidths[int(source)], bandwidths)
+        selected = np.flatnonzero(keep)
+        targets.extend(int(value) for value in selected)
+        distances.extend(float(value) for value in exact[selected])
+        offsets.append(len(targets))
+    return (
+        np.asarray(offsets, dtype=np.int64),
+        np.asarray(targets, dtype=np.int64),
+        np.asarray(distances, dtype=np.float64),
+    )
+
+
+def test_symmetric_tiled_cpu_support_matches_exhaustive_pair_reference() -> None:
+    descriptors = np.asarray(
+        [[0.0], [1.0], [1.0], [2.5], [8.0]],
+        dtype=np.float64,
+    )
+    bandwidths = np.asarray([1.25, 2.0, 2.0, 0.75, 7.0], dtype=np.float64)
+    sources = np.asarray([4, 0, 2], dtype=np.int64)
+    provider = ExactTiledCPUSupport(
+        descriptors,
+        tile_size=2,
+        max_radius_query_bytes=1_000_000,
+        max_calibration_work_bytes=1_000_000,
+    )
+    actual = provider.support_many(
+        sources,
+        bandwidths[sources],
+        target_bandwidths=bandwidths,
+    )
+    expected = _exhaustive_pair_support(descriptors, sources, bandwidths)
+    for actual_array, expected_array in zip(actual, expected, strict=True):
+        np.testing.assert_array_equal(actual_array, expected_array)
+    assert provider.operational_metrics()["new_distance_evaluations"] > 0
+
+
+def test_symmetric_knn_union_expands_duplicates_without_duplicate_edges() -> None:
+    descriptors = np.asarray(
+        [[0.0], [1.0], [1.0], [2.5], [8.0]],
+        dtype=np.float64,
+    )
+    neighbours = compute_exact_neighbours(descriptors, 2, chunk_size=1)
+    provider = ExactSymmetricKNNUnionSupport(
+        descriptors,
+        neighbours,
+        max_radius_query_bytes=1_000_000,
+        max_calibration_work_bytes=1_000_000,
+    )
+    sources = np.arange(descriptors.shape[0], dtype=np.int64)
+    actual = provider.support_many(
+        sources,
+        neighbours.radii,
+        target_bandwidths=neighbours.radii,
+    )
+    expected = _exhaustive_pair_support(descriptors, sources, neighbours.radii)
+    for actual_array, expected_array in zip(actual, expected, strict=True):
+        np.testing.assert_array_equal(actual_array, expected_array)
+    for start, stop in zip(actual[0][:-1], actual[0][1:], strict=True):
+        row_targets = actual[1][int(start) : int(stop)]
+        assert np.all(np.diff(row_targets) > 0)
+    metrics = provider.operational_metrics()
+    assert metrics["support_provider"] == "symmetric_knn_union"
+    assert metrics["new_distance_evaluations"] == 0
 
 
 def test_distinct_location_ties_use_smallest_original_representative() -> None:
