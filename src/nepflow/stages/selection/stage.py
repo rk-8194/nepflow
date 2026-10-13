@@ -47,6 +47,7 @@ from .persistence import (
 from .persistence import structure_ids as ordered_structure_ids
 from .reports import (
     plot_descriptor_space,
+    plot_entropy_coverage_diagnostics,
     plot_entropy_convergence,
     write_diagnostics_report,
     write_entropy_presentation_reports,
@@ -82,6 +83,7 @@ def _publication_paths(project_dir: Path) -> tuple[Path, ...]:
         reports / "descriptor_space.png",
         reports / "entropy_diagnostics.md",
         reports / "entropy_convergence.png",
+        reports / "entropy_coverage_diagnostics.png",
         reports / "entropy_presentation-v1.npz",
         reports / "descriptor_bandwidth.png",
         reports / "entropy_probability_projection.png",
@@ -168,10 +170,15 @@ class SelectionStage:
         if state_store is None:
             raise StateError("SelectionStage requires the authoritative StateStore")
 
+        restart_mode = active.options.get("mode") == "restart"
+
         logger.info("Running structure selection")
         prepared = self.prepare(active.project_dir)
         if prepared is None:
             raise ValueError("No generated structures are available for selection")
+
+        candidate_identity_ids = ordered_candidate_ids(prepared["ase_structures"])
+        physical_structure_ids = ordered_structure_ids(prepared["ase_structures"])
 
         started_at = datetime.now(timezone.utc).isoformat()
         runtime_budget: ResourceBudgetService | None = None
@@ -201,8 +208,6 @@ class SelectionStage:
                 resource_budget=runtime_budget,
             )
 
-        candidate_identity_ids = ordered_candidate_ids(prepared["ase_structures"])
-        physical_structure_ids = ordered_structure_ids(prepared["ase_structures"])
         coverage_metrics = {}
         if settings.composition_aware_fps:
             candidate_bins = {
@@ -226,7 +231,11 @@ class SelectionStage:
                         settings,
                     )
                 )
-            if selection_run is not None and selection_run.get("status") == "completed":
+            if (
+                not restart_mode
+                and selection_run is not None
+                and selection_run.get("status") == "completed"
+            ):
                 try:
                     verify_selection_artifacts(
                         active.project_dir,
@@ -249,7 +258,11 @@ class SelectionStage:
                     complete_selection_result(state_store, selection_run)
                 return result
 
-            if selection_run is None:
+            if (
+                restart_mode
+                or selection_run is None
+                or selection_run.get("status") == "invalidated"
+            ):
                 selection_run = persist_selection_result(
                     state_store,
                     active.project_name,
@@ -324,6 +337,7 @@ class SelectionStage:
 
         active = context or self.context
         runtime_budget = resource_budget or build_resource_budget()
+        restart_mode = bool(active is not None and active.options.get("mode") == "restart")
         logger.info("")
         logger.info("Step 2: Computing %s representations", settings.algorithm)
         project_dir = (
@@ -487,50 +501,60 @@ class SelectionStage:
                         settings,
                     )
                 )
-            if existing is not None:
-                if existing.get("status") not in {"completed", "pending"}:
-                    raise StateError(
-                        "Selection run exists in an unsupported recovery state; explicit "
-                        "reconciliation is required before selecting again"
+            if existing is not None and not restart_mode:
+                if existing.get("status") == "invalidated":
+                    # An explicit restart may have failed after invalidating
+                    # the old record.  A later ordinary resume must recompute
+                    # from the current inputs, never restore that historical
+                    # result, so the failed restart remains recoverable.
+                    logger.info(
+                        "  Recomputing after invalidated selection run; historical result "
+                        "is not eligible for restore"
                     )
-                persisted_parameters = existing.get("parameters")
-                if not isinstance(persisted_parameters, dict) or persisted_parameters.get(
-                    "policy"
-                ) != selection_policy(settings):
-                    raise StateError("Persisted selection policy does not match current input")
-                if settings.algorithm == "information_entropy":
-                    persisted_algorithm = persisted_parameters.get("algorithm_id")
-                    if persisted_algorithm is None:
+                else:
+                    if existing.get("status") not in {"completed", "pending"}:
                         raise StateError(
-                            "Persisted selection has no algorithm identity; refusing to reuse it"
+                            "Selection run exists in an unsupported recovery state; explicit "
+                            "reconciliation is required before selecting again"
                         )
-                    if persisted_algorithm == "information_entropy":
-                        entropy_record = persisted_parameters.get("entropy")
-                        if not isinstance(entropy_record, dict):
+                    persisted_parameters = existing.get("parameters")
+                    if not isinstance(persisted_parameters, dict) or persisted_parameters.get(
+                        "policy"
+                    ) != selection_policy(settings):
+                        raise StateError("Persisted selection policy does not match current input")
+                    if settings.algorithm == "information_entropy":
+                        persisted_algorithm = persisted_parameters.get("algorithm_id")
+                        if persisted_algorithm is None:
                             raise StateError(
-                                "Persisted information-entropy record is not a sparse entropy selection"
+                                "Persisted selection has no algorithm identity; refusing to reuse it"
                             )
-                        if persisted_parameters.get("candidate_ids") != candidate_identity_ids:
-                            raise StateError(
-                                "Persisted entropy selection requires the original ordered candidates"
-                            )
-                        if local_representation is None:
-                            raise StateError("Entropy representation is unavailable for restore")
-                        current_pool = build_entropy_pool(local_representation)
-                        if entropy_record.get("pool_fingerprint") != current_pool.fingerprint:
-                            raise StateError(
-                                "Persisted entropy selection fingerprint does not match current representation"
-                            )
-                logger.info(
-                    "  Reconciled %s selection by candidate identity",
-                    existing.get("status", "completed"),
-                )
-                return restore_selection_result(
-                    existing,
-                    representations,
-                    candidate_identity_ids,
-                    candidate_structure_ids=physical_structure_ids,
-                )
+                        if persisted_algorithm == "information_entropy":
+                            entropy_record = persisted_parameters.get("entropy")
+                            if not isinstance(entropy_record, dict):
+                                raise StateError(
+                                    "Persisted information-entropy record is not a sparse entropy selection"
+                                )
+                            if persisted_parameters.get("candidate_ids") != candidate_identity_ids:
+                                raise StateError(
+                                    "Persisted entropy selection requires the original ordered candidates"
+                                )
+                            if local_representation is None:
+                                raise StateError("Entropy representation is unavailable for restore")
+                            current_pool = build_entropy_pool(local_representation)
+                            if entropy_record.get("pool_fingerprint") != current_pool.fingerprint:
+                                raise StateError(
+                                    "Persisted entropy selection fingerprint does not match current representation"
+                                )
+                    logger.info(
+                        "  Reconciled %s selection by candidate identity",
+                        existing.get("status", "completed"),
+                    )
+                    return restore_selection_result(
+                        existing,
+                        representations,
+                        candidate_identity_ids,
+                        candidate_structure_ids=physical_structure_ids,
+                    )
 
         training: Any = select_training_set(
             representations,
@@ -760,10 +784,13 @@ class SelectionStage:
         if repair_only:
             if result.entropy_diagnostics is not None:
                 diagnostics_path = active.project_dir / "reports" / "entropy_diagnostics.md"
-                if not diagnostics_path.is_file():
-                    write_diagnostics_report(result.entropy_diagnostics, diagnostics_path)
+                write_diagnostics_report(result.entropy_diagnostics, diagnostics_path)
                 convergence_path = active.project_dir / "reports" / "entropy_convergence.png"
                 plot_entropy_convergence(result.entropy_diagnostics, convergence_path)
+                plot_entropy_coverage_diagnostics(
+                    result.entropy_diagnostics,
+                    active.project_dir / "reports" / "entropy_coverage_diagnostics.png",
+                )
                 reports_dir = active.project_dir / "reports"
                 presentation_paths = (
                     reports_dir / "entropy_presentation-v1.npz",
@@ -816,6 +843,10 @@ class SelectionStage:
             plot_entropy_convergence(
                 result.entropy_diagnostics,
                 active.project_dir / "reports" / "entropy_convergence.png",
+            )
+            plot_entropy_coverage_diagnostics(
+                result.entropy_diagnostics,
+                active.project_dir / "reports" / "entropy_coverage_diagnostics.png",
             )
             if isinstance(result.entropy_diagnostics.pool, EntropyPool) and isinstance(
                 result.entropy_diagnostics.bandwidths, FrozenBandwidths

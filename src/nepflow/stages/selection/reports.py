@@ -22,6 +22,7 @@ from nepflow.resources.budget import ResourceBudgetService
 from .algorithms.information_entropy.diagnostics import (
     DIAGNOSTICS_SCHEMA_VERSION,
     EntropyScientificDiagnostics,
+    validate_prefix_coverage_manifest,
 )
 from .algorithms.information_entropy.models import EntropyPool, FrozenBandwidths
 
@@ -606,6 +607,108 @@ def plot_entropy_convergence(
     _save_figure(fig, Path(output_path))
 
 
+def plot_entropy_coverage_diagnostics(
+    diagnostics: EntropyScientificDiagnostics | Mapping[str, Any],
+    output_path: Path,
+) -> None:
+    """Plot exact target-support coverage and the saved KL decomposition."""
+
+    if isinstance(diagnostics, EntropyScientificDiagnostics):
+        record = diagnostics
+    elif isinstance(diagnostics, Mapping):
+        record = EntropyScientificDiagnostics.from_manifest(diagnostics)
+    else:
+        raise PresentationError("Entropy coverage requires an EntropyScientificDiagnostics record")
+    manifest = diagnostics_manifest(record)
+    coverage = manifest.get("prefix_coverage")
+    if not isinstance(coverage, Mapping):
+        raise PresentationError(
+            "Entropy prefix coverage is unavailable; scientific diagnostics must be regenerated"
+        )
+    records = coverage.get("records")
+    if not isinstance(records, list) or not records:
+        raise PresentationError("Entropy prefix coverage records are missing")
+    iterations = np.asarray(
+        [int(item["acquisition_iteration"]) for item in records], dtype=np.int64
+    )
+    target_mass = np.asarray(
+        [float(item["target_mass_covered"]) for item in records], dtype=np.float64
+    )
+    row_fraction = np.asarray(
+        [float(item["row_coverage_fraction"]) for item in records], dtype=np.float64
+    )
+    total_kl = np.asarray([float(item["kl_total"]) for item in records], dtype=np.float64)
+    covered_kl = np.asarray([float(item["kl_covered"]) for item in records], dtype=np.float64)
+    uncovered_kl = np.asarray([float(item["kl_uncovered"]) for item in records], dtype=np.float64)
+
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    fig, axes = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
+    marker_size = 3.5 if iterations.size <= 200 else 2.0
+    axes[0].plot(
+        iterations,
+        target_mass,
+        color="tab:blue",
+        linewidth=1.6,
+        marker="o",
+        markersize=marker_size,
+        label="Target probability mass covered",
+    )
+    axes[0].plot(
+        iterations,
+        row_fraction,
+        color="tab:gray",
+        linewidth=1.3,
+        linestyle="--",
+        marker=".",
+        markersize=marker_size,
+        label="Unweighted target-row fraction covered",
+    )
+    axes[0].set_ylabel("Coverage fraction")
+    axes[0].set_ylim(-0.02, 1.02)
+    axes[0].set_title("Exact candidate-support prefix coverage")
+    axes[0].grid(axis="both", alpha=0.25)
+    axes[0].legend()
+    axes[1].plot(
+        iterations,
+        total_kl,
+        color="tab:blue",
+        linewidth=1.6,
+        marker="o",
+        markersize=marker_size,
+        label="Total forward KL",
+    )
+    axes[1].plot(
+        iterations,
+        uncovered_kl,
+        color="tab:orange",
+        linewidth=1.4,
+        linestyle="--",
+        marker=".",
+        markersize=marker_size,
+        label="Uncovered KL",
+    )
+    axes[1].plot(
+        iterations,
+        covered_kl,
+        color="tab:green",
+        linewidth=1.4,
+        linestyle=":",
+        marker="s",
+        markersize=marker_size,
+        label="Covered KL (signed)",
+    )
+    axes[1].set_xlabel("Greedy acquisition iteration (anchors aggregated at 0)")
+    axes[1].set_ylabel("Forward KL decomposition (nats)")
+    axes[1].grid(axis="both", alpha=0.25)
+    axes[1].legend()
+    fig.tight_layout()
+    _save_figure(fig, Path(output_path))
+
+
 def _presentation_lease(
     resource_budget: ResourceBudgetService | None,
     operation: str,
@@ -1184,13 +1287,17 @@ def diagnostics_manifest(
 
     try:
         if isinstance(diagnostics, EntropyScientificDiagnostics):
-            manifest = diagnostics.to_manifest()
+            record = diagnostics
+            manifest = record.to_manifest()
         elif isinstance(diagnostics, Mapping):
             _validate_diagnostics_manifest_shape(diagnostics)
-            manifest = EntropyScientificDiagnostics.from_manifest(diagnostics).to_manifest()
+            record = EntropyScientificDiagnostics.from_manifest(diagnostics)
+            manifest = record.to_manifest()
         else:
             raise TypeError("diagnostics report input must be a scientific diagnostics record")
         _validate_diagnostics_manifest_shape(manifest)
+        if "prefix_coverage" in manifest:
+            validate_prefix_coverage_manifest(manifest["prefix_coverage"], record)
         return manifest
     except PresentationError:
         raise
@@ -1688,6 +1795,44 @@ def render_diagnostics_markdown(
             f"q50={summary['q50']}, q95={summary['q95']}, q99={summary['q99']}, "
             f"weighting={summary['weighting']}."
         )
+    prefix_coverage = manifest.get("prefix_coverage")
+    if prefix_coverage is not None:
+        final = prefix_coverage["records"][-1]
+        lines.extend(
+            [
+                "",
+                "## Prefix coverage diagnostics",
+                "",
+                "Candidate support coverage excludes the strictly positive beta*p baseline. "
+                "Target-mass coverage and unweighted row coverage use different denominators.",
+                "For selected count K, q_t=(beta*p + sum q_C)/(beta+K); "
+                "P_covered=sum p_i over rows reached by any selected q_C, "
+                "and KL_uncovered=P_uncovered*log1p(K/beta).",
+                "Covered KL is the signed remainder KL_total - KL_uncovered; it is not clipped.",
+                f"- beta={prefix_coverage['beta']:.17g}; target rows N="
+                f"{prefix_coverage['target_row_count']}; target mass="
+                f"{prefix_coverage['target_mass']:.17g}.",
+                "",
+                "| Selected count | Target mass covered | Target mass uncovered | Rows covered | "
+                "Row fraction | Total KL (nats) | Covered KL (signed, nats) | "
+                "Uncovered KL (nats) |",
+                "|---:|---:|---:|---:|---:|---:|---:|---:|",
+                f"| {final['selected_count']} | {final['target_mass_covered']:.17g} | "
+                f"{final['target_mass_uncovered']:.17g} | {final['covered_row_count']} | "
+                f"{final['row_coverage_fraction']:.17g} | {final['kl_total']:.17g} | "
+                f"{final['kl_covered']:.17g} | {final['kl_uncovered']:.17g} |",
+            ]
+        )
+    else:
+        lines.extend(
+            [
+                "",
+                "## Prefix coverage diagnostics",
+                "",
+                "Prefix coverage is unavailable in this historical v3 manifest; regenerate "
+                "scientific diagnostics to produce it.",
+            ]
+        )
     return "\n".join(lines) + "\n"
 
 
@@ -1719,6 +1864,7 @@ __all__ = [
     "plot_candidate_bandwidth_summary",
     "plot_descriptor_space",
     "plot_entropy_convergence",
+    "plot_entropy_coverage_diagnostics",
     "plot_projected_entropy_densities",
     "render_diagnostics_json",
     "render_diagnostics_markdown",

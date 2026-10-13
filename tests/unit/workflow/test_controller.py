@@ -39,6 +39,12 @@ def write_valid_config(project_dir: Path) -> None:
     config_path.write_text(VALID_PROJECT_CONFIG, encoding="utf-8")
 
 
+def write_generated_input(project_dir: Path) -> None:
+    generated_path = project_dir / "structures" / "generated" / "generated_structures.xyz"
+    generated_path.parent.mkdir(parents=True, exist_ok=True)
+    generated_path.write_text("generated input\n", encoding="utf-8")
+
+
 def make_controller(tmp_path: Path, marker: str | None = None) -> WorkflowController:
     project_dir = tmp_path / "outputs" / "project_demo"
     write_valid_config(project_dir)
@@ -273,3 +279,89 @@ def test_current_generate_without_override_passes_resume_mode(tmp_path: Path) ->
 
     assert len(contexts) == 1
     assert contexts[0].options["mode"] == "resume"
+
+
+def test_explicit_select_from_select_restarts_pipeline(tmp_path: Path) -> None:
+    controller = make_controller(tmp_path, "select")
+    write_generated_input(controller.project_dir)
+    contexts = []
+
+    def select(context):
+        contexts.append(context)
+        return StageRunResult(
+            stage=WorkflowStage.SELECT,
+            status=StageRunState.COMPLETED,
+            advanced_to=WorkflowStage.RUN_VASP,
+            completed=True,
+        )
+
+    controller.stage_registry.register(WorkflowStage.SELECT, select)
+    controller.stage_override = "select"
+
+    controller.run()
+
+    assert len(contexts) == 1
+    assert contexts[0].options["mode"] == "restart"
+    assert controller.current_stage() is WorkflowStage.RUN_VASP
+
+
+def test_explicit_select_rewinds_completed_workflow_and_invalidates_downstream(
+    tmp_path: Path,
+) -> None:
+    controller = make_controller(tmp_path, "generate")
+    write_generated_input(controller.project_dir)
+    for stage in (
+        WorkflowStage.SELECT,
+        WorkflowStage.RUN_VASP,
+        WorkflowStage.TRAIN_NEP,
+        WorkflowStage.VALIDATE,
+        WorkflowStage.COMPLETED,
+    ):
+        controller.transition_to(stage)
+    with StateStore(controller.state_file) as store:
+        store.upsert_selection_run(
+            "old-selection",
+            "demo",
+            status="completed",
+            method="fps",
+            parameters={"historical": True},
+        )
+
+    contexts = []
+
+    def select(context):
+        contexts.append(context)
+        return StageRunResult(
+            stage=WorkflowStage.SELECT,
+            status=StageRunState.COMPLETED,
+            advanced_to=WorkflowStage.RUN_VASP,
+            completed=True,
+        )
+
+    controller.stage_registry.register(WorkflowStage.SELECT, select)
+    controller.stage_override = "select"
+    controller.run()
+
+    assert len(contexts) == 1
+    assert contexts[0].options["mode"] == "restart"
+    assert controller.project_file.read_text(encoding="utf-8") == "run_vasp"
+    with StateStore(controller.state_file) as store:
+        assert store.get_stage_run("demo:select")["status"] == "completed"
+        assert store.get_stage_run("demo:run_vasp")["status"] == "running"
+        assert store.get_stage_run("demo:train_nep")["status"] == "failed"
+        assert store.get_stage_run("demo:validate")["status"] == "failed"
+        assert store.get_stage_run("demo:completed")["status"] == "failed"
+        assert store.get_selection_run("old-selection")["status"] == "invalidated"
+
+
+def test_explicit_select_missing_generated_input_does_not_rewind_state(
+    tmp_path: Path,
+) -> None:
+    controller = make_controller(tmp_path, "completed")
+    controller.stage_override = "select"
+
+    with pytest.raises(StateError, match="generated structures are missing or empty"):
+        controller.run()
+
+    assert controller.current_stage() is WorkflowStage.COMPLETED
+    assert controller.project_file.read_text(encoding="utf-8") == "completed"

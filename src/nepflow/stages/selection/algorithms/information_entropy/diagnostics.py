@@ -43,6 +43,7 @@ from .models import (
 
 DIAGNOSTICS_SCHEMA_VERSION = "entropy-scientific-diagnostics-v3"
 DIAGNOSTICS_ARRAY_ARTIFACT_SCHEMA = "entropy-diagnostic-arrays-v1"
+PREFIX_COVERAGE_SCHEMA_VERSION = "entropy-prefix-coverage-v1"
 DIAGNOSTICS_NUMERICAL_TOLERANCE = SPARSE_NUMERICAL_TOLERANCE
 QUANTILE_CONVENTION = "weighted-inverse-empirical-cdf-stable-value-row-index-v1"
 
@@ -652,6 +653,10 @@ class EntropyScientificDiagnostics:
         default=None, repr=False, compare=False
     )
     selection_history_json: str = field(default="", repr=False, compare=False)
+    # Prefix metrics are additive presentation evidence.  They are deliberately
+    # excluded from the v3 scientific fingerprint so old scientific identities
+    # remain stable while reports become reproducible from persisted inputs.
+    prefix_coverage_json: str = field(default="", repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if self.schema_version != DIAGNOSTICS_SCHEMA_VERSION:
@@ -878,6 +883,14 @@ class EntropyScientificDiagnostics:
             return value
         return []
 
+    def _prefix_coverage_manifest(self) -> dict[str, Any] | None:
+        if not self.prefix_coverage_json:
+            return None
+        value = json.loads(self.prefix_coverage_json)
+        if not isinstance(value, dict):
+            raise ValueError("restored prefix coverage manifest is not an object")
+        return value
+
     @property
     def fingerprint(self) -> str:
         return self.scientific_fingerprint
@@ -975,6 +988,12 @@ class EntropyScientificDiagnostics:
         return self._selection_history_manifest()
 
     @property
+    def prefix_coverage_records(self) -> dict[str, Any] | None:
+        """Return persisted exact prefix coverage metrics, if available."""
+
+        return self._prefix_coverage_manifest()
+
+    @property
     def calibration_trace(self) -> list[dict[str, Any]]:
         calibration = self._calibration_manifest()
         return [] if calibration is None else list(calibration["attempts"])
@@ -1033,7 +1052,7 @@ class EntropyScientificDiagnostics:
                     "q": _diagnostic_array_metadata(self.final_q),
                 },
             }
-        return {
+        manifest = {
             "schema_version": self.schema_version,
             "scientific_fingerprint": self.scientific_fingerprint,
             "source_fingerprints": {
@@ -1112,6 +1131,10 @@ class EntropyScientificDiagnostics:
                 "recomputation": "float64-p-q-v1",
             },
         }
+        prefix_coverage = self._prefix_coverage_manifest()
+        if prefix_coverage is not None:
+            manifest["prefix_coverage"] = prefix_coverage
+        return manifest
 
     @classmethod
     def from_manifest(
@@ -1194,6 +1217,9 @@ class EntropyScientificDiagnostics:
         history_value = value.get("selection_history", [])
         if not isinstance(history_value, list):
             raise ValueError("entropy diagnostics selection history is malformed")
+        prefix_coverage_value = value.get("prefix_coverage")
+        if prefix_coverage_value is not None and not isinstance(prefix_coverage_value, Mapping):
+            raise ValueError("entropy diagnostics prefix coverage payload is malformed")
         diagnostics = cls(
             schema_version=str(value["schema_version"]),
             candidate_ids=tuple(identity["candidate_ids"]),
@@ -1245,10 +1271,482 @@ class EntropyScientificDiagnostics:
                 None if source.get("contributions") is None else str(source.get("contributions"))
             ),
             selection_history_json=json.dumps(history_value, sort_keys=True, separators=(",", ":")),
+            prefix_coverage_json=(
+                ""
+                if prefix_coverage_value is None
+                else json.dumps(prefix_coverage_value, sort_keys=True, separators=(",", ":"))
+            ),
         )
         if value.get("scientific_fingerprint") != diagnostics.scientific_fingerprint:
             raise ValueError("entropy diagnostics scientific fingerprint does not match payload")
+        if prefix_coverage_value is not None:
+            restored_prefix_coverage = diagnostics.prefix_coverage_records
+            if restored_prefix_coverage is None:
+                raise ValueError("entropy diagnostics prefix coverage payload is unavailable")
+            validate_prefix_coverage_manifest(restored_prefix_coverage, diagnostics)
         return diagnostics
+
+
+def _build_prefix_coverage_manifest(
+    probabilities: Sequence[float] | np.ndarray,
+    *,
+    beta: float,
+    history: EntropySelectionHistory,
+    contributions: SparseCandidateContributions | OutOfCoreSparseCandidateContributions,
+    final_q: Sequence[float] | np.ndarray,
+    final_forward_kl: float,
+    tolerance: float = DIAGNOSTICS_NUMERICAL_TOLERANCE,
+    pool_fingerprint: str | None = None,
+) -> dict[str, Any]:
+    """Build exact support-union metrics in one acquisition-order pass.
+
+    The candidate store is accessed only through ``candidate_row``.  This
+    keeps the calculation bounded by the union of selected sparse supports and
+    an O(N) covered bitset, rather than materialising or rescanning an MxN
+    candidate matrix.
+    """
+
+    p = np.asarray(probabilities, dtype=np.float64)
+    q_final = np.asarray(final_q, dtype=np.float64)
+    if p.ndim != 1 or p.size == 0 or not np.all(np.isfinite(p)) or np.any(p <= 0.0):
+        raise ValueError("prefix coverage requires a finite positive target probability vector")
+    if q_final.shape != p.shape or not np.all(np.isfinite(q_final)) or np.any(q_final <= 0.0):
+        raise ValueError("prefix coverage final q does not align with target probabilities")
+    beta_value = _finite(beta, name="prefix coverage beta")
+    tolerance_value = _finite(tolerance, name="prefix coverage tolerance")
+    if beta_value <= 0.0 or tolerance_value <= 0.0:
+        raise ValueError("prefix coverage beta and tolerance must be positive")
+    target_mass = float(np.sum(p, dtype=np.float64))
+    if not math.isclose(target_mass, 1.0, rel_tol=0.0, abs_tol=tolerance_value):
+        raise ValueError("prefix coverage target probabilities must sum to one")
+    if contributions.n_targets != p.size:
+        raise ValueError("prefix coverage contribution target count does not match p")
+    if tuple(history.acquisition_order) != tuple(step.candidate_id for step in history.steps):
+        raise ValueError("prefix coverage history order is malformed")
+
+    covered = np.zeros(p.size, dtype=bool)
+    selected_sum = np.zeros(p.size, dtype=np.float64)
+    covered_mass = 0.0
+    covered_rows = 0
+    records: list[dict[str, Any]] = []
+
+    def append_record(
+        *,
+        kind: str,
+        candidate_ids: Sequence[str],
+        acquisition_iteration: int,
+        selected_count: int,
+        cross_entropy: float | None,
+        kl_total: float,
+    ) -> None:
+        nonlocal covered_mass, covered_rows
+        uncovered_mass = 1.0 - covered_mass
+        if covered_mass < -tolerance_value or covered_mass > 1.0 + tolerance_value:
+            raise ValueError("prefix coverage target mass is outside [0, 1]")
+        if uncovered_mass < -tolerance_value or uncovered_mass > 1.0 + tolerance_value:
+            raise ValueError("prefix coverage uncovered target mass is outside [0, 1]")
+        covered_mass_value = min(1.0, max(0.0, covered_mass))
+        uncovered_mass_value = 1.0 - covered_mass_value
+        if not math.isfinite(float(kl_total)):
+            raise ValueError("prefix coverage history forward KL must be finite")
+        if float(kl_total) < -tolerance_value:
+            raise ValueError("prefix coverage total forward KL is materially negative")
+        if selected_count == 0:
+            expected_uncovered_kl = 0.0
+        else:
+            expected_uncovered_kl = uncovered_mass_value * math.log1p(
+                selected_count / beta_value
+            )
+        covered_kl = float(kl_total) - expected_uncovered_kl
+        if not math.isfinite(covered_kl):
+            raise ValueError("prefix coverage signed covered KL is not finite")
+        if not math.isclose(
+            float(kl_total),
+            covered_kl + expected_uncovered_kl,
+            rel_tol=0.0,
+            abs_tol=tolerance_value,
+        ):
+            raise ValueError("prefix coverage KL decomposition is inconsistent")
+        records.append(
+            {
+                "kind": kind,
+                "candidate_ids": [str(value) for value in candidate_ids],
+                "acquisition_iteration": int(acquisition_iteration),
+                "selected_count": int(selected_count),
+                "covered_row_count": int(covered_rows),
+                "uncovered_row_count": int(p.size - covered_rows),
+                "row_coverage_fraction": float(covered_rows / p.size),
+                "target_mass_covered": covered_mass_value,
+                "target_mass_uncovered": uncovered_mass_value,
+                "cross_entropy": None if cross_entropy is None else float(cross_entropy),
+                "kl_total": float(kl_total),
+                "kl_covered": covered_kl,
+                "kl_uncovered": expected_uncovered_kl,
+            }
+        )
+
+    anchor_steps = [step for step in history.steps if step.reason == "anchor"]
+    greedy_steps = [step for step in history.steps if step.reason == "greedy"]
+    if len(anchor_steps) + len(greedy_steps) != len(history.steps):
+        raise ValueError("prefix coverage history contains an unsupported step reason")
+
+    for step in anchor_steps:
+        try:
+            row = contributions.candidate_row(step.candidate_id)
+        except (KeyError, IndexError, TypeError, ValueError) as exc:
+            raise ValueError(
+                f"prefix coverage candidate support is missing for {step.candidate_id!r}"
+            ) from exc
+        targets = np.asarray(row.target_indices, dtype=np.int64)
+        values = np.asarray(row.values, dtype=np.float64)
+        if targets.size == 0 or np.any(targets < 0) or np.any(targets >= p.size):
+            raise ValueError(f"prefix coverage support is invalid for {step.candidate_id!r}")
+        new_targets = ~covered[targets]
+        covered[targets[new_targets]] = True
+        covered_mass += float(np.sum(p[targets[new_targets]], dtype=np.float64))
+        covered_rows += int(np.count_nonzero(new_targets))
+        np.add.at(selected_sum, targets, values)
+
+    if anchor_steps:
+        anchor = anchor_steps[0]
+        if any(
+            step.selected_count != anchor.selected_count
+            or step.cross_entropy is None
+            or anchor.cross_entropy is None
+            or not math.isclose(
+                float(step.cross_entropy),
+                float(anchor.cross_entropy),
+                rel_tol=0.0,
+                abs_tol=tolerance_value,
+            )
+            or step.forward_kl is None
+            or anchor.forward_kl is None
+            or not math.isclose(
+                float(step.forward_kl),
+                float(anchor.forward_kl),
+                rel_tol=0.0,
+                abs_tol=tolerance_value,
+            )
+            for step in anchor_steps
+        ):
+            raise ValueError("prefix coverage anchor history is not one aggregate state")
+        if anchor.selected_count != len(anchor_steps):
+            raise ValueError("prefix coverage anchor selected_count is inconsistent")
+        append_record(
+            kind="anchor",
+            candidate_ids=[step.candidate_id for step in anchor_steps],
+            acquisition_iteration=0,
+            selected_count=anchor.selected_count,
+            cross_entropy=anchor.cross_entropy,
+            kl_total=float(anchor.forward_kl),
+        )
+    else:
+        # There is no saved greedy zero-state metric.  This point is explicitly
+        # q_0=p, so it is a labelled baseline and does not claim support coverage.
+        shannon_entropy = float(-np.sum(p * np.log(p), dtype=np.float64))
+        append_record(
+            kind="baseline",
+            candidate_ids=(),
+            acquisition_iteration=0,
+            selected_count=0,
+            cross_entropy=shannon_entropy,
+            kl_total=0.0,
+        )
+
+    expected_iteration = 1
+    expected_count = len(anchor_steps)
+    for step in greedy_steps:
+        if step.acquisition_iteration != expected_iteration:
+            raise ValueError("prefix coverage greedy iterations are not contiguous")
+        expected_count += 1
+        if step.selected_count != expected_count:
+            raise ValueError("prefix coverage greedy selected_count is inconsistent")
+        if step.cross_entropy is None or step.forward_kl is None:
+            raise ValueError("prefix coverage requires saved cross-entropy and forward KL history")
+        try:
+            row = contributions.candidate_row(step.candidate_id)
+        except (KeyError, IndexError, TypeError, ValueError) as exc:
+            raise ValueError(
+                f"prefix coverage candidate support is missing for {step.candidate_id!r}"
+            ) from exc
+        targets = np.asarray(row.target_indices, dtype=np.int64)
+        values = np.asarray(row.values, dtype=np.float64)
+        if targets.size == 0 or np.any(targets < 0) or np.any(targets >= p.size):
+            raise ValueError(f"prefix coverage support is invalid for {step.candidate_id!r}")
+        new_targets = ~covered[targets]
+        covered[targets[new_targets]] = True
+        covered_mass += float(np.sum(p[targets[new_targets]], dtype=np.float64))
+        covered_rows += int(np.count_nonzero(new_targets))
+        np.add.at(selected_sum, targets, values)
+        append_record(
+            kind="greedy",
+            candidate_ids=(step.candidate_id,),
+            acquisition_iteration=step.acquisition_iteration,
+            selected_count=step.selected_count,
+            cross_entropy=step.cross_entropy,
+            kl_total=float(step.forward_kl),
+        )
+        expected_iteration += 1
+
+    selected_ids = tuple(history.acquisition_order)
+    if expected_count != len(selected_ids):
+        raise ValueError("prefix coverage history selected count does not match acquisition order")
+    denominator = beta_value + len(selected_ids)
+    direct_q = (beta_value * p + selected_sum) / denominator
+    if not np.allclose(direct_q, q_final, rtol=0.0, atol=tolerance_value):
+        raise ValueError("prefix coverage terminal q does not match selected sparse supports")
+    direct_kl = float(np.sum(p * np.log(p / direct_q), dtype=np.float64))
+    if not math.isclose(direct_kl, float(final_forward_kl), rel_tol=0.0, abs_tol=tolerance_value):
+        raise ValueError("prefix coverage terminal forward KL does not match final q")
+    if records and not math.isclose(
+        records[-1]["kl_total"], float(final_forward_kl), rel_tol=0.0, abs_tol=tolerance_value
+    ):
+        raise ValueError("prefix coverage terminal history does not match final forward KL")
+    return {
+        "schema_version": PREFIX_COVERAGE_SCHEMA_VERSION,
+        "target_row_count": int(p.size),
+        "target_mass": target_mass,
+        "beta": beta_value,
+        "pool_fingerprint": pool_fingerprint,
+        "candidate_contributions_fingerprint": str(contributions.fingerprint),
+        "acquisition_order": list(selected_ids),
+        "records": records,
+    }
+
+
+def validate_prefix_coverage_manifest(
+    value: Mapping[str, Any],
+    diagnostics: EntropyScientificDiagnostics,
+) -> None:
+    """Validate persisted prefix metrics against restored v3 diagnostics."""
+
+    if (
+        not isinstance(value, Mapping)
+        or value.get("schema_version") != PREFIX_COVERAGE_SCHEMA_VERSION
+    ):
+        raise ValueError("prefix coverage schema version is unsupported")
+    tolerance = float(diagnostics.tolerance)
+    records = value.get("records")
+    if not isinstance(records, list) or not records:
+        raise ValueError("prefix coverage records are missing")
+    if value.get("target_row_count") != diagnostics.atomic_row_count:
+        raise ValueError("prefix coverage row count disagrees with diagnostics")
+    if not math.isclose(
+        float(value.get("target_mass")),
+        diagnostics.target_mass,
+        rel_tol=0.0,
+        abs_tol=tolerance,
+    ):
+        raise ValueError("prefix coverage target mass disagrees with diagnostics")
+    if not math.isclose(float(value.get("beta")), diagnostics.beta, rel_tol=0.0, abs_tol=tolerance):
+        raise ValueError("prefix coverage beta disagrees with diagnostics")
+    if value.get("pool_fingerprint") != diagnostics.pool_fingerprint:
+        raise ValueError("prefix coverage pool identity disagrees with diagnostics")
+    contribution_fingerprint = diagnostics.contributions_source_fingerprint
+    if (
+        not isinstance(value.get("candidate_contributions_fingerprint"), str)
+        or not str(value.get("candidate_contributions_fingerprint")).strip()
+        or contribution_fingerprint is None
+        or value.get("candidate_contributions_fingerprint") != contribution_fingerprint
+    ):
+        raise ValueError("prefix coverage contribution identity disagrees with diagnostics")
+    if tuple(value.get("acquisition_order", ())) != tuple(diagnostics.acquisition_order):
+        raise ValueError("prefix coverage acquisition order disagrees with diagnostics")
+    history = diagnostics.selection_history_records
+    history_ids: list[str] = []
+    greedy_started = False
+    for index, item in enumerate(history):
+        if not isinstance(item, Mapping):
+            raise ValueError(f"prefix coverage history record {index} is malformed")
+        candidate_id = item.get("candidate_id")
+        if not isinstance(candidate_id, str) or not candidate_id.strip():
+            raise ValueError(f"prefix coverage history candidate {index} is invalid")
+        if candidate_id in history_ids:
+            raise ValueError("prefix coverage history candidate IDs are duplicated")
+        history_ids.append(candidate_id)
+        reason = item.get("reason")
+        if reason == "anchor":
+            if greedy_started or item.get("acquisition_iteration") != 0:
+                raise ValueError("prefix coverage anchor history is out of order")
+        elif reason == "greedy":
+            greedy_started = True
+        else:
+            raise ValueError("prefix coverage history reason is invalid")
+    if tuple(history_ids) != tuple(diagnostics.acquisition_order):
+        raise ValueError("prefix coverage history order disagrees with diagnostics")
+    anchors = [item for item in history if item.get("reason") == "anchor"]
+    greedy = [item for item in history if item.get("reason") == "greedy"]
+    for iteration, item in enumerate(greedy, start=1):
+        if item.get("acquisition_iteration") != iteration:
+            raise ValueError("prefix coverage greedy history iterations are not contiguous")
+    expected_selected_count = len(anchors)
+    for item in greedy:
+        expected_selected_count += 1
+        if item.get("selected_count") != expected_selected_count:
+            raise ValueError("prefix coverage greedy selected_count is inconsistent")
+    if anchors:
+        anchor = anchors[0]
+        for item in anchors:
+            if item.get("selected_count") != anchor.get("selected_count"):
+                raise ValueError("prefix coverage anchor selected_count is inconsistent")
+            for name in ("cross_entropy", "forward_kl"):
+                if item.get(name) is None or anchor.get(name) is None or not math.isclose(
+                    float(item[name]), float(anchor[name]), rel_tol=0.0, abs_tol=tolerance
+                ):
+                    raise ValueError("prefix coverage anchor metrics are inconsistent")
+        if anchor.get("selected_count") != len(anchors):
+            raise ValueError("prefix coverage anchor count is inconsistent")
+    expected_records = 1 + len(greedy)
+    if len(records) != expected_records:
+        raise ValueError("prefix coverage record count disagrees with selection history")
+    previous_mass = -tolerance
+    for index, record in enumerate(records):
+        if not isinstance(record, Mapping):
+            raise ValueError(f"prefix coverage record {index} is malformed")
+        kind = record.get("kind")
+        if kind not in {"baseline", "anchor", "greedy"}:
+            raise ValueError(f"prefix coverage record {index} kind is invalid")
+        for name in (
+            "acquisition_iteration",
+            "selected_count",
+            "covered_row_count",
+            "uncovered_row_count",
+        ):
+            item = record.get(name)
+            if isinstance(item, bool) or not isinstance(item, int) or item < 0:
+                raise ValueError(f"prefix coverage record {index}.{name} is invalid")
+        for name in (
+            "row_coverage_fraction",
+            "target_mass_covered",
+            "target_mass_uncovered",
+            "kl_total",
+            "kl_covered",
+            "kl_uncovered",
+        ):
+            number = float(record.get(name))
+            if not math.isfinite(number):
+                raise ValueError(f"prefix coverage record {index}.{name} is not finite")
+        if record["kl_total"] < -tolerance:
+            raise ValueError(f"prefix coverage record {index}.kl_total is materially negative")
+        cross_entropy = record.get("cross_entropy")
+        if cross_entropy is None or not math.isfinite(float(cross_entropy)):
+            raise ValueError(f"prefix coverage record {index}.cross_entropy is invalid")
+        if (
+            record["covered_row_count"] + record["uncovered_row_count"]
+            != diagnostics.atomic_row_count
+        ):
+            raise ValueError(f"prefix coverage record {index} row counts do not add to N")
+        if not 0.0 - tolerance <= record["row_coverage_fraction"] <= 1.0 + tolerance:
+            raise ValueError(f"prefix coverage record {index} row fraction is invalid")
+        if not 0.0 - tolerance <= record["target_mass_covered"] <= 1.0 + tolerance:
+            raise ValueError(f"prefix coverage record {index} covered mass is invalid")
+        if not math.isclose(
+            record["target_mass_uncovered"],
+            1.0 - record["target_mass_covered"],
+            rel_tol=0.0,
+            abs_tol=tolerance,
+        ):
+            raise ValueError(f"prefix coverage record {index} masses do not complement")
+        if record["target_mass_covered"] + tolerance < previous_mass:
+            raise ValueError("prefix coverage target mass is not monotone")
+        previous_mass = record["target_mass_covered"]
+        if not math.isclose(
+            record["covered_row_count"] / diagnostics.atomic_row_count,
+            record["row_coverage_fraction"],
+            rel_tol=0.0,
+            abs_tol=tolerance,
+        ):
+            raise ValueError(f"prefix coverage record {index} row fraction is inconsistent")
+        selected_count = record["selected_count"]
+        expected_uncovered = record["target_mass_uncovered"] * math.log1p(
+            selected_count / diagnostics.beta
+        )
+        if not math.isclose(
+            record["kl_uncovered"],
+            expected_uncovered,
+            rel_tol=0.0,
+            abs_tol=tolerance,
+        ):
+            raise ValueError(f"prefix coverage record {index} uncovered KL is inconsistent")
+        if not math.isclose(
+            record["kl_total"],
+            record["kl_covered"] + record["kl_uncovered"],
+            rel_tol=0.0,
+            abs_tol=tolerance,
+        ):
+            raise ValueError(f"prefix coverage record {index} KL components do not add")
+
+    first = records[0]
+    if anchors:
+        if first["kind"] != "anchor" or first["candidate_ids"] != [
+            item["candidate_id"] for item in anchors
+        ]:
+            raise ValueError("prefix coverage anchor aggregate is inconsistent")
+        if first["acquisition_iteration"] != 0:
+            raise ValueError("prefix coverage anchor iteration is inconsistent")
+        if first["selected_count"] != len(anchors):
+            raise ValueError("prefix coverage anchor count is inconsistent")
+        history_points = [anchors[0]] + greedy
+    else:
+        if (
+            first["kind"] != "baseline"
+            or first["selected_count"] != 0
+            or first["candidate_ids"] != []
+            or first["acquisition_iteration"] != 0
+        ):
+            raise ValueError("prefix coverage baseline is inconsistent")
+        baseline_shannon = float(
+            -np.sum(
+                diagnostics.target_probabilities * np.log(diagnostics.target_probabilities),
+                dtype=np.float64,
+            )
+        )
+        if not math.isclose(
+            first["cross_entropy"], baseline_shannon, rel_tol=0.0, abs_tol=tolerance
+        ):
+            raise ValueError("prefix coverage baseline is not the explicit q0=p state")
+        history_points = [None] + greedy
+    for index, history_item in enumerate(history_points):
+        record = records[index]
+        if history_item is None:
+            if record["kind"] != "baseline":
+                raise ValueError("prefix coverage baseline kind is inconsistent")
+            if not math.isclose(record["kl_total"], 0.0, rel_tol=0.0, abs_tol=tolerance):
+                raise ValueError("prefix coverage baseline KL must be zero")
+            continue
+        expected_kind = "anchor" if anchors and index == 0 else "greedy"
+        if record["kind"] != expected_kind:
+            raise ValueError("prefix coverage record kind is inconsistent with history")
+        if record["kind"] == "greedy":
+            if record["candidate_ids"] != [history_item["candidate_id"]]:
+                raise ValueError("prefix coverage greedy identity is inconsistent")
+            if record["acquisition_iteration"] != history_item["acquisition_iteration"]:
+                raise ValueError("prefix coverage greedy iteration is inconsistent")
+        if record["selected_count"] != history_item["selected_count"]:
+            raise ValueError("prefix coverage history selected_count is inconsistent")
+        if history_item.get("cross_entropy") is None or history_item.get("forward_kl") is None:
+            raise ValueError("prefix coverage history metrics are incomplete")
+        if not math.isclose(
+            record["cross_entropy"],
+            history_item["cross_entropy"],
+            rel_tol=0.0,
+            abs_tol=tolerance,
+        ):
+            raise ValueError("prefix coverage cross-entropy disagrees with history")
+        if not math.isclose(
+            record["kl_total"],
+            history_item["forward_kl"],
+            rel_tol=0.0,
+            abs_tol=tolerance,
+        ):
+            raise ValueError("prefix coverage total KL disagrees with history")
+    if not math.isclose(
+        records[-1]["kl_total"],
+        diagnostics.final_forward_kl,
+        rel_tol=0.0,
+        abs_tol=tolerance,
+    ):
+        raise ValueError("prefix coverage final KL disagrees with diagnostics")
 
 
 def recompute_final_entropy_metrics(
@@ -1742,6 +2240,10 @@ def build_entropy_diagnostics(
         raise ValueError(
             "diagnostics contribution kernel bandwidth rule does not match calibration"
         )
+    if contributions.fingerprint != entropy_result.contributions_fingerprint:
+        raise ValueError("diagnostics contribution identity does not match selection result")
+    if tuple(entropy_result.history.acquisition_order) != tuple(entropy_result.acquisition_order):
+        raise ValueError("diagnostics selection history order does not match selection result")
     if isinstance(graph, SparseAtomicKernelGraph):
         if contributions.graph_fingerprint != graph.fingerprint:
             raise ValueError("diagnostics contribution graph identity does not match graph")
@@ -1920,6 +2422,16 @@ def build_entropy_diagnostics(
         beta=entropy_result.beta,
         selected_count=entropy_result.budget,
     )
+    prefix_coverage = _build_prefix_coverage_manifest(
+        pool.probabilities,
+        beta=entropy_result.beta,
+        history=entropy_result.history,
+        contributions=contributions,
+        final_q=entropy_result.final_normalized_support,
+        final_forward_kl=result["forward_kl"],
+        tolerance=DIAGNOSTICS_NUMERICAL_TOLERANCE,
+        pool_fingerprint=pool.fingerprint,
+    )
     return EntropyScientificDiagnostics(
         schema_version=DIAGNOSTICS_SCHEMA_VERSION,
         candidate_ids=tuple(pool.candidate_ids),
@@ -1983,6 +2495,7 @@ def build_entropy_diagnostics(
         graph_source_fingerprint=operator_fingerprint,
         contributions_source_fingerprint=contributions.fingerprint,
         selection_history=entropy_result.history,
+        prefix_coverage_json=json.dumps(prefix_coverage, sort_keys=True, separators=(",", ":")),
     )
 
 
@@ -1996,6 +2509,7 @@ recompute_entropy_metrics = recompute_final_entropy_metrics
 __all__ = [
     "DIAGNOSTICS_NUMERICAL_TOLERANCE",
     "DIAGNOSTICS_SCHEMA_VERSION",
+    "PREFIX_COVERAGE_SCHEMA_VERSION",
     "QUANTILE_CONVENTION",
     "AtomicCoverageDiagnostics",
     "DiagnosticDistribution",
@@ -2008,6 +2522,7 @@ __all__ = [
     "calibration_attempt_manifest",
     "calibration_from_manifest",
     "calibration_manifest",
+    "validate_prefix_coverage_manifest",
     "nearest_selected_atomic_distances",
     "recompute_entropy_metrics",
     "recompute_final_entropy_metrics",

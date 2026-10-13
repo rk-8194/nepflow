@@ -294,7 +294,13 @@ class WorkflowController:
         self.config = config
         self._startup_validated = True
 
-    def _context(self, *, seeds_only: bool = False, mode: str = "normal") -> StageContext:
+    def _context(
+        self,
+        *,
+        seeds_only: bool = False,
+        mode: str = "normal",
+    ) -> StageContext:
+        options: dict[str, Any] = {"mode": mode}
         return StageContext(
             project_name=self.project_name,
             project_dir=self.project_dir,
@@ -307,7 +313,7 @@ class WorkflowController:
             local_mode=self.local_mode,
             seeds_only=seeds_only,
             slurm_deadline=self.slurm_deadline,
-            options={"mode": mode},
+            options=options,
         )
 
     def current_stage(self) -> WorkflowStage:
@@ -333,6 +339,28 @@ class WorkflowController:
             logger.info(
                 "Approaching SLURM deadline (%.1fs remaining)",
                 self.slurm_deadline - wall_clock_epoch_seconds,
+            )
+
+    def _validate_selection_restart_input(self) -> None:
+        """Check the generated input before changing workflow authority."""
+
+        generated_path = (
+            self.project_dir
+            / "structures"
+            / "generated"
+            / "generated_structures.xyz"
+        )
+        try:
+            ready = generated_path.is_file() and generated_path.stat().st_size > 0
+        except OSError as exc:
+            raise StateError(
+                "Cannot restart selection; generated input cannot be inspected: "
+                f"{generated_path}"
+            ) from exc
+        if not ready:
+            raise StateError(
+                "Cannot restart selection; generated structures are missing or empty: "
+                f"{generated_path}"
             )
 
     def _execute_stage(
@@ -426,13 +454,36 @@ class WorkflowController:
             )
 
         explicit_generate_restart = False
+        explicit_selection_restart = False
         if self.stage_override is not None:
-            explicit_generate_restart = (
-                WorkflowStage.from_legacy(self.stage_override) is WorkflowStage.GENERATE
-            )
-            self.transition_to(self.stage_override)
+            requested_stage = WorkflowStage.from_legacy(self.stage_override)
+            explicit_generate_restart = requested_stage is WorkflowStage.GENERATE
+            explicit_selection_restart = requested_stage is WorkflowStage.SELECT
+            if explicit_selection_restart:
+                self._validate_selection_restart_input()
+                current = self.current_stage()
+                if current is WorkflowStage.GENERATE:
+                    # Generation has just produced the prerequisites; moving
+                    # into select remains an ordinary adjacent transition.
+                    self.transition_to(requested_stage)
+                elif current in {
+                    WorkflowStage.SELECT,
+                    WorkflowStage.RUN_VASP,
+                    WorkflowStage.TRAIN_NEP,
+                    WorkflowStage.VALIDATE,
+                    WorkflowStage.COMPLETED,
+                }:
+                    self.workflow_state.restart_selection(
+                        metadata={"project_name": self.project_name}
+                    )
+                else:
+                    # Preserve the normal guarded transition error for an
+                    # uninitialized project rather than inventing a rewind.
+                    self.transition_to(requested_stage)
+            else:
+                self.transition_to(requested_stage)
 
-        stage = self.current_stage()
+        stage = WorkflowStage.SELECT if explicit_selection_restart else self.current_stage()
         if stage is WorkflowStage.COMPLETED:
             logger.info("Workflow is already complete; no stage will be run")
             return
@@ -448,7 +499,11 @@ class WorkflowController:
         self._check_deadline()
         self._execute_stage(
             stage,
-            mode="restart" if explicit_generate_restart else "resume",
+            mode=(
+                "restart"
+                if explicit_generate_restart or explicit_selection_restart
+                else "resume"
+            ),
         )
 
 

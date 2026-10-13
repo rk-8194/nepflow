@@ -23,6 +23,7 @@ from .checkpointing import (
 from .diagnostics import (
     DIAGNOSTICS_NUMERICAL_TOLERANCE,
     DIAGNOSTICS_SCHEMA_VERSION,
+    PREFIX_COVERAGE_SCHEMA_VERSION,
     QUANTILE_CONVENTION,
     AtomicCoverageDiagnostics,
     DiagnosticDistribution,
@@ -39,6 +40,7 @@ from .diagnostics import (
     recompute_entropy_metrics,
     recompute_final_entropy_metrics,
     validate_calibration_manifest,
+    validate_prefix_coverage_manifest,
     weighted_quantile,
 )
 from .gpu_neighbours import (
@@ -219,6 +221,7 @@ __all__ = [
     "BandwidthCalibrationError",
     "DIAGNOSTICS_NUMERICAL_TOLERANCE",
     "DIAGNOSTICS_SCHEMA_VERSION",
+    "PREFIX_COVERAGE_SCHEMA_VERSION",
     "QUANTILE_CONVENTION",
     "AtomicCoverageDiagnostics",
     "BandwidthCalibrationResult",
@@ -334,6 +337,7 @@ __all__ = [
     "calibration_attempt_manifest",
     "calibration_from_manifest",
     "calibration_manifest",
+    "validate_prefix_coverage_manifest",
     "compare_beta_sensitivity",
     "compare_duplicate_or_thinning",
     "compare_exact_neighbour_backends",

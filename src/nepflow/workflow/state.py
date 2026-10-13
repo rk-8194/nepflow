@@ -260,6 +260,116 @@ class WorkflowState:
             raise StateError(f"Stage transition was not persisted: {typed_target.value}")
         return StageRunStatus.from_mapping(row)
 
+    def restart_selection(
+        self,
+        *,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> StageRunStatus:
+        """Guardedly rewind workflow authority to ``select``.
+
+        This is intentionally separate from ``transition_to``: routine
+        processing remains adjacent-only, while an explicit operator restart
+        invalidates downstream stage authority and prior selection reuse in
+        one ledger transaction.  Scientific files are retained as history.
+        """
+
+        generated_path = (
+            self.marker_path.parent
+            / "structures"
+            / "generated"
+            / "generated_structures.xyz"
+        )
+        try:
+            generated_ready = generated_path.is_file() and generated_path.stat().st_size > 0
+        except OSError as exc:
+            raise StateError(
+                f"Cannot restart selection; generated input cannot be inspected: {generated_path}"
+            ) from exc
+        if not generated_ready:
+            raise StateError(
+                "Cannot restart selection; generated structures are missing or empty: "
+                f"{generated_path}"
+            )
+
+        current = self.reconcile().stage
+        restartable = {
+            WorkflowStage.SELECT,
+            WorkflowStage.RUN_VASP,
+            WorkflowStage.TRAIN_NEP,
+            WorkflowStage.VALIDATE,
+            WorkflowStage.COMPLETED,
+        }
+        if current not in restartable:
+            raise StateError(
+                "Explicit selection restart requires the current workflow stage to be "
+                f"select or later; current stage is {current.value!r}"
+            )
+        previous_runs = {
+            stage.value: self.store.get_stage_run(self._stage_run_id(stage))
+            for stage in (
+                WorkflowStage.SELECT,
+                WorkflowStage.RUN_VASP,
+                WorkflowStage.TRAIN_NEP,
+                WorkflowStage.VALIDATE,
+                WorkflowStage.COMPLETED,
+            )
+        }
+        now = self._timestamp()
+        base_metadata = dict(metadata or {})
+        base_metadata.update(
+            {
+                "source": "explicit_select_restart",
+                "restart_target": WorkflowStage.SELECT.value,
+                "invalidated_at": now,
+            }
+        )
+        # Give the replacement select run a strictly newer ordering key than
+        # the invalidated downstream rows.  The ledger uses started_at when
+        # deciding which stage is authoritative, so equal timestamps would
+        # make the result depend on stage-id tie breaking.
+        select_started_at = (
+            datetime.fromisoformat(now) + timedelta(microseconds=1)
+        ).isoformat()
+        with self.store.transaction():
+            self.store.invalidate_selection_runs(self.project_id)
+            for stage, previous in previous_runs.items():
+                if previous is None and stage != WorkflowStage.SELECT.value:
+                    continue
+                previous_record = None
+                if previous is not None:
+                    previous_record = {
+                        "stage_run_id": previous.get("stage_run_id"),
+                        "status": previous.get("status"),
+                        "started_at": previous.get("started_at"),
+                        "completed_at": previous.get("completed_at"),
+                        "metadata": previous.get("metadata"),
+                    }
+                stage_value = WorkflowStage.from_legacy(stage)
+                stage_metadata = dict(base_metadata)
+                stage_metadata["previous_stage_run"] = previous_record
+                if stage_value is WorkflowStage.SELECT:
+                    self._record_stage(
+                        stage_value,
+                        status=StageRunState.RUNNING,
+                        started_at=select_started_at,
+                        completed_at=None,
+                        metadata=stage_metadata,
+                    )
+                else:
+                    self._record_stage(
+                        stage_value,
+                        status=StageRunState.FAILED,
+                        started_at=now,
+                        completed_at=now,
+                        metadata={**stage_metadata, "invalidated": True},
+                    )
+
+        self._write_marker(WorkflowStage.SELECT)
+        row = self.store.get_stage_run(self._stage_run_id(WorkflowStage.SELECT))
+        if row is None:  # pragma: no cover - guarded by the store write
+            raise StateError("Selection restart was not persisted")
+        return StageRunStatus.from_mapping(row)
+
     def mark_failed(self, error: BaseException) -> StageRunStatus:
         """Record failure of the current stage without advancing it."""
 

@@ -1,5 +1,6 @@
 """Selection orchestration, injection, persistence, and reconciliation tests."""
 
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import ANY, patch
 
@@ -13,6 +14,7 @@ from nepflow.config.models import NepflowConfig, ProjectConfig, SelectionConfig
 from nepflow.stages.selection import stage as selection_stage_module
 from nepflow.stages.selection.models import SelectionResult
 from nepflow.stages.selection.persistence import (
+    complete_selection_result,
     persist_selection_result,
     structure_ids,
 )
@@ -203,6 +205,79 @@ def test_reopen_reconciles_by_identity_after_candidate_reordering(tmp_path):
     current_ids = structure_ids(current)
     assert [current_ids[index] for index in restored.train_indices] == [original_ids[0]]
     assert [current_ids[index] for index in restored.test_indices] == [original_ids[1]]
+
+
+def test_explicit_restart_recomputes_when_completed_selection_matches(tmp_path):
+    settings = SelectionConfig(
+        algorithm="fps",
+        target_train_count=1,
+        target_test_count=1,
+        include_seed_structures=False,
+    )
+    candidates = [_atoms("Si", 0.0), _atoms("Ge", 1.0)]
+    prepared = {
+        "structures": [StructureStub("s0"), StructureStub("s1")],
+        "ase_structures": candidates,
+    }
+    old_result = _result(np.ones((2, 2)))
+    state_path = tmp_path / "state.db"
+    marker = tmp_path / ".project"
+    marker.write_text("select", encoding="utf-8")
+    generated = tmp_path / "structures" / "generated" / "generated_structures.xyz"
+    generated.parent.mkdir(parents=True)
+    generated.write_text("generated input\n", encoding="utf-8")
+
+    with StateStore(state_path) as store:
+        store.upsert_project("demo", name="demo", root_path=str(tmp_path))
+        persisted = persist_selection_result(
+            store,
+            "demo",
+            "demo",
+            str(tmp_path),
+            settings,
+            structure_ids(candidates),
+            old_result,
+        )
+        complete_selection_result(store, persisted)
+        context = replace(
+            _context(tmp_path, store, settings),
+            options={"mode": "restart"},
+        )
+        stage = SelectionStage(context=context)
+        with (
+            patch.object(
+                selection_stage_module,
+                "load_or_calculate_representations",
+                return_value=np.ones((2, 2)),
+            ),
+            patch.object(
+                selection_stage_module,
+                "select_training_set",
+                return_value=([0], 0.5),
+            ) as recompute,
+            patch.object(
+                selection_stage_module,
+                "select_test_set",
+                return_value={
+                    "test_indices": [1],
+                    "test_min_dist": 0.25,
+                    "min_train_test_dist": 1.0,
+                    "mean_train_test_dist": 1.0,
+                    "test_selection_policy": "candidate_mean_fps_legacy",
+                    "test_selection_version": "test",
+                    "test_selection_provenance": {},
+                },
+            ),
+            patch.object(
+                selection_stage_module,
+                "restore_selection_result",
+                side_effect=AssertionError("explicit restart restored an old result"),
+            ),
+        ):
+            result = stage.execute(settings, prepared, context=context)
+
+    recompute.assert_called_once()
+    assert result.train_indices == [0]
 
 
 def test_report_failure_leaves_selection_pending(tmp_path):

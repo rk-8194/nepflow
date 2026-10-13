@@ -267,3 +267,26 @@ class WorkflowRecordsMixin(StateStoreMixinSupport):
             (selection_run_id,),
         )
         return None if row is None else decode_row(row, ("parameters_json",))
+
+    def invalidate_selection_runs(self, project_id: str) -> int:
+        """Mark prior selection results historical before an explicit restart.
+
+        The scientific payload is retained for audit/recovery, but its status
+        is no longer eligible for ordinary final-result restoration.  A new
+        selection result may safely reuse the deterministic run ID afterward.
+        """
+
+        timestamp = now()
+
+        def operation() -> int:
+            cursor = self._connection.execute(
+                """
+                UPDATE selection_runs
+                SET status = 'invalidated', completed_at = ?
+                WHERE project_id = ? AND status IN ('pending', 'completed')
+                """,
+                (timestamp, project_id),
+            )
+            return int(cursor.rowcount)
+
+        return self._write(operation)

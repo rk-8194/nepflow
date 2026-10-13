@@ -152,7 +152,10 @@ Examples:
         type=str,
         choices=["init", "generate", "select", "run_vasp", "train_nep", "validate"],
         default=None,
-        help="Set the workflow stage (overrides .project file)",
+        help=(
+            "Set the workflow stage (overrides .project file); explicit "
+            "'select' restarts selection from generated structures"
+        ),
     )
     parser.add_argument(
         "--local",

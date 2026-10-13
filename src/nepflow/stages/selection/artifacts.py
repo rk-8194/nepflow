@@ -272,7 +272,10 @@ def read_selection_manifest(project_dir: Path) -> dict:
         raise ArtifactError(f"Selection entropy diagnostics are missing: {path}")
     if diagnostics is not None:
         try:
-            from .algorithms.information_entropy.diagnostics import EntropyScientificDiagnostics
+            from .algorithms.information_entropy.diagnostics import (
+                EntropyScientificDiagnostics,
+                validate_prefix_coverage_manifest,
+            )
 
             record = EntropyScientificDiagnostics.from_manifest(
                 diagnostics,
@@ -288,6 +291,20 @@ def read_selection_manifest(project_dir: Path) -> dict:
             raise ArtifactError(
                 f"Selection entropy diagnostics test IDs disagree with manifest: {path}"
             )
+        prefix_coverage = record.prefix_coverage_records
+        if manifest.get("algorithm_id") == "information_entropy":
+            if prefix_coverage is None:
+                raise ArtifactError(
+                    "Selection entropy prefix coverage diagnostics are missing: "
+                    f"{path}"
+                )
+            try:
+                validate_prefix_coverage_manifest(prefix_coverage, record)
+            except (TypeError, ValueError) as exc:
+                raise ArtifactError(
+                    "Selection entropy prefix coverage diagnostics are malformed: "
+                    f"{path}"
+                ) from exc
     for filename in ("train.xyz", "test.xyz"):
         record = artifacts.get(filename)
         artifact_path = selected_dir / filename
@@ -359,6 +376,12 @@ def verify_selection_artifacts(
                 raise ArtifactError(
                     "Selection entropy convergence plot is missing or empty: "
                     f"{convergence_report}"
+                )
+            coverage_report = reports_dir / "entropy_coverage_diagnostics.png"
+            if not coverage_report.is_file() or coverage_report.stat().st_size == 0:
+                raise ArtifactError(
+                    "Selection entropy coverage diagnostics plot is missing or empty: "
+                    f"{coverage_report}"
                 )
     for filename in ("train.xyz", "test.xyz", SELECTION_MANIFEST_FILENAME):
         path = selected_dir / filename
