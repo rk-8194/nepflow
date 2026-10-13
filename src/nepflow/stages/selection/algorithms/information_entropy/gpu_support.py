@@ -427,7 +427,27 @@ class ExactTiledGPUSupport:
             self.gpu_allocation_seconds += max(0.0, time.perf_counter() - allocation_started)
             setattr(self, attribute, existing)
         view = existing[:rows]
-        view[...] = values
+        host_values = values
+        if host_values.dtype != np.dtype(np.float64) or not host_values.flags.c_contiguous:
+            host_values = np.ascontiguousarray(host_values, dtype=np.float64)
+        if host_values.shape != view.shape:
+            raise ValueError(
+                "reusable GPU tile shape changed during bounded host-to-device copy"
+            )
+        # CuPy's explicit ``set`` path performs a bounded H2D copy into the
+        # existing allocation.  The copyto fallback is for minimal test
+        # doubles that expose NumPy arrays instead of CuPy ndarrays; neither
+        # path assigns a NumPy array through CuPy's scalar-fill dispatch.
+        setter = getattr(view, "set", None)
+        if callable(setter):
+            setter(host_values)
+        else:
+            copyto = getattr(self._cp, "copyto", None)
+            if not callable(copyto):
+                raise GPUSupportError(
+                    "exact tiled GPU support requires CuPy's explicit host-to-device copy API"
+                )
+            copyto(view, host_values)
         return view
 
     def _record_memory_pool_growth(

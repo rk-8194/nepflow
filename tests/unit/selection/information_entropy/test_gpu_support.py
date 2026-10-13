@@ -56,6 +56,7 @@ def _fake_cupy(*, device_count: int = 1, free_bytes: int = 64 * 1024 * 1024):
         float64=np.float64,
         asarray=np.asarray,
         asnumpy=np.asarray,
+        copyto=np.copyto,
         zeros=np.zeros,
         ones_like=np.ones_like,
         empty=np.empty,
@@ -103,6 +104,114 @@ def test_gpu_scheduler_partitions_balanced_and_empty_ranges():
         (2, 2, 2),
         (3, 2, 2),
     )
+
+
+def test_fake_gpu_reusable_upload_copies_bounded_tiles_without_aliasing(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setitem(sys.modules, "cupy", _fake_cupy())
+    provider = ExactTiledGPUSupport(
+        np.zeros((4, 2), dtype=np.float64),
+        tile_size=4,
+        max_device_bytes=64 * 1024,
+        max_host_bytes=1_000_000,
+    )
+
+    first_targets = np.ascontiguousarray(
+        np.asarray([[1.0, 2.0], [3.0, 4.0]], dtype=np.float64)
+    )
+    first_view = provider._upload_reusable_tile("_gpu_target_workspace", first_targets)
+    target_workspace = provider._gpu_target_workspace
+    assert target_workspace is not None
+    np.testing.assert_array_equal(first_view, first_targets)
+
+    same_size = np.asarray([[5.0, 6.0], [7.0, 8.0]], dtype=np.float64)
+    same_view = provider._upload_reusable_tile("_gpu_target_workspace", same_size)
+    assert provider._gpu_target_workspace is target_workspace
+    np.testing.assert_array_equal(same_view, same_size)
+
+    non_contiguous = np.asarray(
+        [[11.0, 12.0], [13.0, 14.0]], dtype=np.float32
+    ).T
+    assert not non_contiguous.flags.c_contiguous
+    non_contiguous_view = provider._upload_reusable_tile(
+        "_gpu_target_workspace", non_contiguous
+    )
+    assert provider._gpu_target_workspace is target_workspace
+    np.testing.assert_array_equal(non_contiguous_view, non_contiguous)
+    assert non_contiguous_view.dtype == np.dtype(np.float64)
+    non_contiguous[0, 0] = -99.0
+    assert non_contiguous_view[0, 0] == 11.0
+
+    shorter = np.asarray([[9.0, 10.0]], dtype=np.float64)
+    short_view = provider._upload_reusable_tile("_gpu_target_workspace", shorter)
+    assert provider._gpu_target_workspace is target_workspace
+    np.testing.assert_array_equal(short_view, shorter)
+
+    larger = np.arange(12.0, dtype=np.float64).reshape(6, 2)
+    large_view = provider._upload_reusable_tile("_gpu_target_workspace", larger)
+    assert provider._gpu_target_workspace is not target_workspace
+    np.testing.assert_array_equal(large_view, larger)
+
+    radii = provider._upload_reusable_tile(
+        "_gpu_radii_workspace", np.asarray([1.0, 2.0, 3.0], dtype=np.float64)
+    )
+    np.testing.assert_array_equal(radii, np.asarray([1.0, 2.0, 3.0]))
+    radii_short = provider._upload_reusable_tile(
+        "_gpu_radii_workspace", np.asarray([4.0], dtype=np.float64)
+    )
+    np.testing.assert_array_equal(radii_short, np.asarray([4.0]))
+    provider.close()
+
+
+@pytest.mark.cuda
+def test_cuda_reusable_upload_copies_bounded_tiles() -> None:
+    cp = pytest.importorskip("cupy")
+    if int(cp.cuda.runtime.getDeviceCount()) < 1:
+        pytest.skip("no visible CUDA device")
+
+    provider = ExactTiledGPUSupport(
+        np.zeros((4, 2), dtype=np.float64),
+        tile_size=4,
+        max_device_bytes=64 * 1024,
+        max_host_bytes=1_000_000,
+    )
+    try:
+        with cp.cuda.Device(provider.device):
+            first = provider._upload_reusable_tile(
+                "_gpu_target_workspace",
+                np.asarray([[1.0, 2.0], [3.0, 4.0]], dtype=np.float64),
+            )
+            target_workspace = provider._gpu_target_workspace
+            assert target_workspace is not None
+            np.testing.assert_array_equal(cp.asnumpy(first), [[1.0, 2.0], [3.0, 4.0]])
+            assert int(first.device.id) == provider.device
+
+            steady = provider._upload_reusable_tile(
+                "_gpu_target_workspace",
+                np.asarray([[5.0, 6.0]], dtype=np.float64),
+            )
+            assert provider._gpu_target_workspace is target_workspace
+            np.testing.assert_array_equal(cp.asnumpy(steady), [[5.0, 6.0]])
+
+            grown = provider._upload_reusable_tile(
+                "_gpu_target_workspace",
+                np.arange(12.0, dtype=np.float64).reshape(6, 2),
+            )
+            assert provider._gpu_target_workspace is not target_workspace
+            np.testing.assert_array_equal(cp.asnumpy(grown), np.arange(12.0).reshape(6, 2))
+
+            radii = provider._upload_reusable_tile(
+                "_gpu_radii_workspace",
+                np.asarray([1.0, 2.0, 3.0], dtype=np.float64),
+            )
+            radii_short = provider._upload_reusable_tile(
+                "_gpu_radii_workspace", np.asarray([4.0], dtype=np.float64)
+            )
+            np.testing.assert_array_equal(cp.asnumpy(radii), [1.0, 2.0, 3.0])
+            np.testing.assert_array_equal(cp.asnumpy(radii_short), [4.0])
+    finally:
+        provider.close()
 
 
 def test_missing_cupy_fails_explicitly(monkeypatch: pytest.MonkeyPatch):

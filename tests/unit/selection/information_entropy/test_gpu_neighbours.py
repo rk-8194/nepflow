@@ -740,6 +740,75 @@ def test_fake_gpu_knn_checkpoint_resume_publishes_only_new_ranges(
     assert state["chunk_count"] == 4
 
 
+def test_fake_completed_gpu_checkpoint_projects_all_prefixes_without_recompute(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A completed v3 checkpoint is the source for every requested k prefix."""
+
+    monkeypatch.setitem(sys.modules, "cupy", _fake_cupy())
+    descriptors = np.asarray(
+        [[float(i), float(i % 5), float((i * 11) % 7)] for i in range(14)],
+        dtype=np.float64,
+    )
+    budget = _budget()
+    checkpoint = tmp_path / "calibration"
+    from nepflow.stages.selection.algorithms.information_entropy.gpu_neighbours import (
+        ExactTiledGPUNeighbourIndex,
+        compute_gpu_tiled_neighbours_many,
+    )
+
+    first_index = ExactTiledGPUNeighbourIndex(
+        descriptors,
+        gpu_tile_size=4,
+        max_device_bytes=4096,
+        resource_budget=budget,
+    )
+    first = compute_gpu_tiled_neighbours_many(
+        descriptors,
+        (1, 2, 4, 8),
+        index=first_index,
+        chunk_size=4,
+        resource_budget=budget,
+        checkpoint_path=checkpoint,
+        preserve_checkpoint=True,
+    )
+    assert (checkpoint / "knn.incremental.pointer.json").is_file()
+    first_index.close()
+
+    replay_index = ExactTiledGPUNeighbourIndex(
+        descriptors,
+        gpu_tile_size=4,
+        max_device_bytes=4096,
+        resource_budget=budget,
+    )
+
+    def fail_if_recomputed(*_args: Any, **_kwargs: Any) -> None:
+        pytest.fail("a fully committed kNN checkpoint triggered fresh GPU distances")
+
+    monkeypatch.setattr(replay_index, "_gpu_top_candidates", fail_if_recomputed)
+    replayed = compute_gpu_tiled_neighbours_many(
+        descriptors,
+        (1, 2, 4, 8),
+        index=replay_index,
+        chunk_size=4,
+        resource_budget=budget,
+        checkpoint_path=checkpoint,
+        preserve_checkpoint=True,
+    )
+    for order_k in (1, 2, 4, 8):
+        np.testing.assert_array_equal(
+            replayed[order_k].neighbour_indices,
+            first[order_k].neighbour_indices,
+        )
+        np.testing.assert_array_equal(
+            replayed[order_k].radii,
+            first[order_k].radii,
+        )
+    assert replay_index.memory_metrics()["gpu_fp64_evaluations"] == 0
+    replay_index.close()
+
+
 @pytest.mark.parametrize("device_count", (2, 4))
 def test_fake_multi_gpu_checkpoint_resume_commits_contiguous_prefix(
     monkeypatch: pytest.MonkeyPatch,

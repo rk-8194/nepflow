@@ -21,7 +21,11 @@ from nepflow.resources.budget import (
 )
 from nepflow.stages.selection.representations import LocalEnvironmentRepresentation
 
-from .checkpointing import CheckpointValidationError, VersionedCheckpointStore
+from .checkpointing import (
+    CheckpointValidationError,
+    IncrementalCheckpointStore,
+    VersionedCheckpointStore,
+)
 from .gpu_neighbours import (
     ExactTiledGPUNeighbourIndex,
     compute_gpu_tiled_neighbours_many,
@@ -969,7 +973,17 @@ def calibrate_bandwidth(
     checkpoint_path: str | Path | None = None,
     resume: bool = True,
 ) -> BandwidthCalibrationResult:
-    """Run deterministic manual or bounded-grid finite-pool calibration."""
+    """Run deterministic manual or bounded-grid finite-pool calibration.
+
+    When ``checkpoint_path`` is provided, the canonical kNN checkpoint is a
+    durable input to the calibration grid, not a temporary output of the
+    neighbour call.  It is retained across support, LOO, and result
+    publication failures so a restart can project the same committed k
+    prefixes without repeating the exhaustive search.  The explicit
+    ``resume=False`` operation is the retirement/reset boundary for stale
+    calibration state; successful neighbour completion alone never retires
+    the kNN checkpoint.
+    """
 
     pool = (
         representation_or_pool
@@ -1045,6 +1059,11 @@ def calibrate_bandwidth(
     grid_identity: dict[str, Any] | None = None
     restored_grid: dict[str, Any] | None = None
     if checkpoint_path is not None:
+        # The grid checkpoint records the ordered LOO cursor.  The incremental
+        # ``knn`` checkpoint records the canonical k_max neighbours needed to
+        # reconstruct any unfinished grid row.  Keep both durable inputs until
+        # an explicit non-resume run resets them; this makes a crash after kNN
+        # but before the first grid commit restart-safe.
         grid_store = VersionedCheckpointStore(
             checkpoint_path,
             retention_generations=2,
@@ -1061,6 +1080,29 @@ def calibrate_bandwidth(
         if not resume:
             grid_store.clear(_CALIBRATION_GRID_CHECKPOINT_NAME)
             grid_store.clean_stale(checkpoint_names={_CALIBRATION_GRID_CHECKPOINT_NAME})
+            # ``resume=False`` is the explicit retirement boundary for all
+            # neighbour checkpoint forms this calibration can have created.
+            # Clear both stores because a directory may be reused across CPU
+            # and GPU backends, and clear fallback per-k names as well as the
+            # canonical multi-k name even when this run has no valid index
+            # order to recompute.
+            knn_checkpoint_names = {
+                "knn",
+                *(f"knn-k{candidate_k}" for candidate_k in domain_k),
+            }
+            incremental_store = IncrementalCheckpointStore(
+                checkpoint_path,
+                resource_budget=runtime_budget,
+            )
+            legacy_neighbour_store = VersionedCheckpointStore(
+                checkpoint_path,
+                resource_budget=runtime_budget,
+            )
+            for checkpoint_name in knn_checkpoint_names:
+                incremental_store.clear(checkpoint_name)
+                legacy_neighbour_store.clear(checkpoint_name)
+            incremental_store.clean_stale()
+            legacy_neighbour_store.clean_stale(checkpoint_names=knn_checkpoint_names)
         elif grid_store.exists(_CALIBRATION_GRID_CHECKPOINT_NAME):
             _stored_identity, stored_state, stored_arrays = grid_store.load(
                 _CALIBRATION_GRID_CHECKPOINT_NAME,
@@ -1185,6 +1227,12 @@ def calibrate_bandwidth(
                 "checkpoint_path": checkpoint_path,
                 "checkpoint_name": "knn",
                 "resume": resume,
+                # A persistent calibration checkpoint is the durable handoff
+                # for the expensive kNN phase.  Retain it through all later
+                # support/LOO work so a downstream failure can restart from
+                # the completed canonical k_max result.  resume=False still
+                # clears stale state at the start of the neighbour operation.
+                "preserve_checkpoint": checkpoint_path is not None,
             }
             neighbour_started = time.perf_counter()
             if isinstance(index, ExactTiledGPUNeighbourIndex):
@@ -1907,6 +1955,7 @@ def calibrate_bandwidth(
                     checkpoint_path=checkpoint_path,
                     checkpoint_name=f"knn-k{candidate_k}",
                     resume=resume,
+                    preserve_checkpoint=checkpoint_path is not None,
                 )
                 radii_by_k[candidate_k] = neighbours
             if isinstance(neighbours, str):

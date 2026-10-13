@@ -1,6 +1,7 @@
 """Pool weighting, frozen bandwidth, and calibration reference tests."""
 
 import logging
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -67,6 +68,26 @@ def test_manual_and_single_pair_automatic_calibration_match() -> None:
     np.testing.assert_array_equal(manual.selected.bandwidths, automatic.selected.bandwidths)
     assert manual.objective == pytest.approx(automatic.objective)
     assert [attempt.status for attempt in automatic.attempts] == ["valid"]
+
+
+def test_persistent_calibration_retains_completed_knn_checkpoint(tmp_path: Path) -> None:
+    pool = _pool()
+    checkpoint = tmp_path / "calibration"
+
+    result = calibrate_bandwidth(
+        pool,
+        EntropyBandwidthSettings(
+            mode="automatic",
+            backend="exact_tiled_cpu",
+            k_candidates=(1,),
+            c_candidates=(2.0,),
+            chunk_size=2,
+        ),
+        checkpoint_path=checkpoint,
+    )
+
+    assert result.selected.k == 1
+    assert (checkpoint / "knn.pointer.json").is_file()
 
 
 def test_zero_leave_one_out_support_is_an_invalid_pair() -> None:

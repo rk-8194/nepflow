@@ -3964,6 +3964,7 @@ def compute_tiled_cpu_neighbours_many(
     checkpoint_name: str = "knn",
     checkpoint_every_locations: int = 1,
     resume: bool = True,
+    preserve_checkpoint: bool = False,
 ) -> dict[int, ExactNeighbourResult]:
     """Calculate several exact tiled neighbour orders in one bounded pass."""
 
@@ -4040,6 +4041,7 @@ def compute_tiled_cpu_neighbours_many(
         checkpoint_identity=checkpoint_identity,
         checkpoint_every_locations=checkpoint_every_locations,
         resume=resume,
+        preserve_checkpoint=preserve_checkpoint,
     )
     representation_id = (
         _array_fingerprint(values)
