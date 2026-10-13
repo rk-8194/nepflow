@@ -7,7 +7,9 @@ import pytest
 
 from nepflow.resources.budget import build_resource_budget
 from nepflow.stages.selection.algorithms.information_entropy.neighbours import (
+    ExactKNNPrefixSupport,
     IndexedCPUNeighbourIndex,
+    RadiusQueryCapacityError,
     compute_exact_neighbours,
     compute_indexed_cpu_neighbours,
 )
@@ -40,6 +42,85 @@ def test_chunk_boundaries_do_not_change_exact_answers() -> None:
     np.testing.assert_array_equal(first.neighbour_indices, second.neighbour_indices)
     np.testing.assert_array_equal(first.neighbour_distances, second.neighbour_distances)
     np.testing.assert_array_equal(first.radii, second.radii)
+
+
+@pytest.mark.parametrize("k", [1, 4, 8])
+def test_knn_prefix_support_matches_indexed_radius_oracle(
+    k: int,
+) -> None:
+    locations = np.asarray(
+        [
+            [0.0, 0.0],
+            [1.0, 0.0],
+            [-1.0, 0.0],
+            [0.0, 1.0],
+            [0.0, -1.0],
+            [2.0, 0.0],
+            [-2.0, 0.0],
+            [0.0, 2.0],
+            [0.0, -2.0],
+            [3.0, 0.0],
+            [-3.0, 0.0],
+            [3.0, 3.0],
+        ],
+        dtype=np.float64,
+    )
+    descriptors = locations[[7, 0, 4, 1, 0, 9, 3, 6, 2, 5, 10, 8, 11, 1, 7, 0]]
+    row_ids = tuple(f"row-{index}" for index in range(len(descriptors)))
+    index = IndexedCPUNeighbourIndex(descriptors, max_radius_query_bytes=10_000_000)
+    neighbours = compute_indexed_cpu_neighbours(
+        descriptors,
+        k,
+        index=index,
+        row_ids=row_ids,
+        chunk_size=3,
+    )
+    provider = ExactKNNPrefixSupport(
+        descriptors,
+        neighbours,
+        grouping_source=index,
+        expected_row_ids=row_ids,
+        max_radius_query_bytes=10_000_000,
+        max_calibration_work_bytes=10_000_000,
+    )
+    try:
+        for source_indices in (
+            np.asarray([15, 0, 4], dtype=np.int64),
+            np.asarray([7, 12, 1, 10, 3], dtype=np.int64),
+        ):
+            actual = provider.support_many(source_indices, neighbours.radii[source_indices])
+            expected = index.radius_support_many(
+                source_indices,
+                neighbours.radii[source_indices],
+                chunk_size=3,
+            )
+            for actual_array, expected_array in zip(actual, expected, strict=True):
+                np.testing.assert_array_equal(actual_array, expected_array)
+    finally:
+        index.close()
+
+
+def test_knn_prefix_support_rejects_mismatched_identity_and_capacity() -> None:
+    descriptors = np.asarray(
+        [[0.0], [1.0], [0.0], [2.0], [3.0]],
+        dtype=np.float64,
+    )
+    neighbours = compute_exact_neighbours(descriptors, 1, row_ids=[str(i) for i in range(5)])
+
+    with pytest.raises(ValueError, match="locations do not match"):
+        ExactKNNPrefixSupport(
+            descriptors + 0.25,
+            neighbours,
+            max_radius_query_bytes=10_000_000,
+            max_calibration_work_bytes=10_000_000,
+        )
+    with pytest.raises(RadiusQueryCapacityError, match="grouping"):
+        ExactKNNPrefixSupport(
+            descriptors,
+            neighbours,
+            max_radius_query_bytes=1,
+            max_calibration_work_bytes=1,
+        )
 
 
 @pytest.mark.parametrize(

@@ -16,6 +16,7 @@ from nepflow.stages.selection.algorithms.information_entropy.models import Entro
 from nepflow.stages.selection.algorithms.information_entropy.neighbours import (
     IndexedCPUNeighbourIndex,
     RadiusQueryCapacityError,
+    compute_indexed_cpu_neighbours,
     compute_neighbours,
     compute_radius_support,
 )
@@ -173,6 +174,146 @@ def test_batched_loo_reduces_repeated_indexed_radius_queries() -> None:
     reference_queries = reference_index.radius_queries
 
     assert batched_queries < reference_queries
+
+
+def test_knn_prefix_loo_matches_generic_loo_and_preserves_c_greater_than_one() -> None:
+    descriptors = np.asarray(
+        [
+            [2.0, 0.0],
+            [0.0, 0.0],
+            [1.0, 0.0],
+            [0.0, 0.0],
+            [-1.0, 0.0],
+            [2.0, 0.0],
+            [3.0, 0.0],
+            [1.0, 0.0],
+            [4.0, 0.0],
+            [-2.0, 0.0],
+            [5.0, 0.0],
+            [6.0, 0.0],
+        ],
+        dtype=np.float64,
+    )
+    probabilities = np.full(len(descriptors), 1.0 / len(descriptors), dtype=np.float64)
+    row_ids = tuple(str(index) for index in range(len(descriptors)))
+    knn_index = IndexedCPUNeighbourIndex(
+        descriptors,
+        max_radius_query_bytes=10_000_000,
+    )
+    neighbours = compute_indexed_cpu_neighbours(
+        descriptors,
+        4,
+        index=knn_index,
+        row_ids=row_ids,
+    )
+    limits = {
+        "max_radius_query_bytes": 10_000_000,
+        "max_calibration_work_bytes": 10_000_000,
+    }
+    fast_index: IndexedCPUNeighbourIndex | None = None
+    try:
+        generic_diagnostics: dict[str, object] = {}
+        generic = evaluate_leave_one_out_objectives(
+            descriptors,
+            probabilities,
+            neighbours.radii[None, :],
+            backend="exact_indexed_cpu",
+            index=knn_index,
+            diagnostics=generic_diagnostics,
+            **limits,
+        )[0]
+        fast_index = IndexedCPUNeighbourIndex(
+            descriptors,
+            max_radius_query_bytes=10_000_000,
+        )
+        fast_diagnostics: dict[str, object] = {}
+        fast = evaluate_leave_one_out_objectives(
+            descriptors,
+            probabilities,
+            neighbours.radii[None, :],
+            backend="exact_indexed_cpu",
+            index=fast_index,
+            diagnostics=fast_diagnostics,
+            knn_support=neighbours,
+            knn_support_row_ids=row_ids,
+            **limits,
+        )[0]
+        assert fast.valid == generic.valid
+        assert fast.reason == generic.reason
+        np.testing.assert_array_equal(fast.probabilities, generic.probabilities)
+        assert fast.objective == generic.objective
+        active = fast_diagnostics["loo_active_support_metrics"]
+        assert isinstance(active, dict)
+        assert active["support_provider"] == "exact_knn_prefix"
+        assert active["knn_support_derived_sources"] == len(descriptors)
+        assert active["knn_support_derived_entries"] > 0
+        assert active["support_provider_distance_evaluations"] == 0
+        assert active["support_provider_radius_queries"] == 0
+        assert active["gpu_fp64_evaluations"] == 0
+        assert active["gpu_target_tiles"] == 0
+        assert active["gpu_tile_scans"] == 0
+
+        scaled_diagnostics: dict[str, object] = {}
+        scaled = evaluate_leave_one_out_objectives(
+            descriptors,
+            probabilities,
+            (2.0 * neighbours.radii)[None, :],
+            backend="exact_indexed_cpu",
+            index=fast_index,
+            diagnostics=scaled_diagnostics,
+            knn_support=neighbours,
+            knn_support_row_ids=row_ids,
+            **limits,
+        )[0]
+        generic_scaled = evaluate_leave_one_out_objectives(
+            descriptors,
+            probabilities,
+            (2.0 * neighbours.radii)[None, :],
+            backend="exact_indexed_cpu",
+            index=knn_index,
+            **limits,
+        )[0]
+        assert scaled.valid == generic_scaled.valid
+        assert scaled.reason == generic_scaled.reason
+        np.testing.assert_array_equal(scaled.probabilities, generic_scaled.probabilities)
+        assert scaled.objective == generic_scaled.objective
+        scaled_active = scaled_diagnostics["loo_active_support_metrics"]
+        assert isinstance(scaled_active, dict)
+        assert scaled_active["support_provider"] == "active_cpu_support"
+        assert scaled_active["support_provider_radius_queries"] > 0
+    finally:
+        knn_index.close()
+        if fast_index is not None:
+            fast_index.close()
+
+
+@pytest.mark.parametrize("mode", ["manual", "automatic"])
+def test_bandwidth_calibration_reports_knn_prefix_for_c_one(mode: str) -> None:
+    descriptors = np.asarray(
+        [[float(index), float(index % 3)] for index in range(12)],
+        dtype=np.float64,
+    )
+    row_ids = tuple(f"candidate-{index}" for index in range(len(descriptors)))
+    pool = build_entropy_pool(
+        descriptors,
+        candidate_ids=row_ids,
+        row_candidate_ids=row_ids,
+    )
+    settings = EntropyBandwidthSettings(
+        mode=mode,
+        k=4 if mode == "manual" else None,
+        c=1.0 if mode == "manual" else None,
+        k_candidates=(4,),
+        c_candidates=(1.0,),
+        backend="exact_indexed_cpu",
+        calibration_batch_size=1,
+        max_radius_query_bytes=10_000_000,
+        max_calibration_work_bytes=10_000_000,
+    )
+    result = calibrate_bandwidth(pool, settings)
+    assert result.operational_metrics["support_provider"] == "exact_knn_prefix"
+    assert result.operational_metrics["knn_support_derived_sources"] == len(descriptors)
+    assert result.operational_metrics["support_size_per_c"][0]["support_size"][0] > 0
 
 
 def test_batched_workspace_capacity_fails_before_support_queries() -> None:

@@ -63,6 +63,8 @@ from .models import (
     StreamedKernelExecutionSummary,
 )
 from .neighbours import (
+    ExactKNNPrefixSupport,
+    ExactNeighbourResult,
     IndexedCPUNeighbourIndex,
     RadiusQueryCapacityError,
     TiledCPUNeighbourIndex,
@@ -226,6 +228,9 @@ class _KernelSupportProvider:
         gpu_tile_size: int = 128,
         max_gpu_support_bytes: int | None = None,
         max_gpu_neighbour_bytes: int | None = None,
+        knn_support: ExactNeighbourResult | None = None,
+        knn_support_row_ids: Sequence[str] | None = None,
+        max_calibration_work_bytes: int | None = None,
     ) -> None:
         self.descriptors = _validate_descriptors(descriptors)
         self.backend = backend
@@ -338,6 +343,20 @@ class _KernelSupportProvider:
             self.support_batch_size = self.gpu_support.source_tile_size
         else:
             self.support_batch_size = self.chunk_size
+        self.knn_prefix_support: ExactKNNPrefixSupport | None = None
+        if knn_support is not None:
+            self.knn_prefix_support = ExactKNNPrefixSupport(
+                self.descriptors,
+                knn_support,
+                grouping_source=self.index,
+                expected_row_ids=knn_support_row_ids,
+                max_radius_query_bytes=self.max_radius_query_bytes,
+                max_calibration_work_bytes=max_calibration_work_bytes,
+                resource_budget=self.resource_budget,
+                capacity_context=capacity_context,
+            )
+        self.knn_prefix_support_used = False
+        self.generic_support_used = False
         self.distance_evaluations = 0
         self.index_queries = 0
         self.radius_queries = 0
@@ -456,6 +475,32 @@ class _KernelSupportProvider:
             raise ValueError("support_many requires at least one source")
         if not np.all(np.isfinite(requested_radii)) or np.any(requested_radii <= 0.0):
             raise ValueError("support radii must be finite and strictly positive")
+        if (
+            self.knn_prefix_support is not None
+            and self.knn_prefix_support.eligible(sources, requested_radii)
+        ):
+            started = time.perf_counter()
+            offsets, targets, distances = self.knn_prefix_support.support_many(
+                sources,
+                requested_radii,
+            )
+            for count in np.diff(offsets):
+                support_count = int(count)
+                self.current_support_count = support_count
+                if self.min_support_count is None:
+                    self.min_support_count = support_count
+                else:
+                    self.min_support_count = min(self.min_support_count, support_count)
+                self.support_count_total += support_count
+                self.support_count_samples += 1
+                self.max_support_count = max(self.max_support_count, support_count)
+            self.support_entries += int(targets.size)
+            self.support_query_count += int(sources.size)
+            self.support_query_seconds += max(0.0, time.perf_counter() - started)
+            self.knn_prefix_support_used = True
+            return offsets, targets, distances
+        if self.knn_prefix_support is not None:
+            self.generic_support_used = True
         scales = (
             requested_radii
             if requested_radii.ndim == 1
@@ -593,6 +638,34 @@ class _KernelSupportProvider:
             metrics["support_provider_atomic_distance_evaluations"] = int(
                 index_metrics.get("atomic_distance_evaluations", 0) or 0
             )
+        if self.knn_prefix_support is not None:
+            metrics.update(self.knn_prefix_support.operational_metrics())
+            if self.knn_prefix_support_used and self.generic_support_used:
+                metrics["support_provider"] = "mixed_exact_knn_prefix_and_generic"
+            elif self.knn_prefix_support_used:
+                metrics.update(
+                    {
+                        "support_provider": "exact_knn_prefix",
+                        "support_provider_stats_status": "active",
+                        "support_provider_radius_queries": 0,
+                        "support_provider_distance_evaluations": 0,
+                        "support_provider_unique_distance_evaluations": 0,
+                        "support_provider_atomic_distance_evaluations": 0,
+                        "distance_evaluations": 0,
+                        "unique_distance_evaluations": 0,
+                        "atomic_distance_evaluations": 0,
+                        "radius_queries": 0,
+                        "index_queries": 0,
+                        "gpu_fp64_evaluations": 0,
+                        "gpu_source_tiles": 0,
+                        "gpu_target_tiles": 0,
+                        "gpu_tile_scans": 0,
+                        "gpu_screening_seconds": 0.0,
+                        "query_workspace_peak_bytes": int(
+                            self.knn_prefix_support.query_workspace_peak_bytes
+                        ),
+                    }
+                )
         for key, value in index_metrics.items():
             metrics.setdefault(key, value)
         return metrics
@@ -816,6 +889,7 @@ def evaluate_leave_one_out_objective(
     backend: str = NEIGHBOUR_BACKEND_ID,
     index: IndexedCPUNeighbourIndex | TiledCPUNeighbourIndex | None = None,
     max_radius_query_bytes: int | None = None,
+    max_calibration_work_bytes: int | None = None,
     resource_budget: ResourceBudgetService | None = None,
     capacity_context: str | None = None,
     checkpoint_path: str | Path | None = None,
@@ -830,6 +904,8 @@ def evaluate_leave_one_out_objective(
     gpu_devices: Sequence[int] | str | int | None = None,
     gpu_tile_size: int = 128,
     max_gpu_support_bytes: int | None = None,
+    knn_support: ExactNeighbourResult | None = None,
+    knn_support_row_ids: Sequence[str] | None = None,
 ) -> LeaveOneOutObjective:
     """Evaluate the exact source-normalized finite-pool LOO objective."""
 
@@ -843,6 +919,7 @@ def evaluate_leave_one_out_objective(
             backend=backend,
             index=index,
             max_radius_query_bytes=max_radius_query_bytes,
+            max_calibration_work_bytes=max_calibration_work_bytes,
             resource_budget=resource_budget,
             capacity_context=capacity_context,
             checkpoint_path=checkpoint_path,
@@ -857,6 +934,8 @@ def evaluate_leave_one_out_objective(
             gpu_devices=gpu_devices,
             gpu_tile_size=gpu_tile_size,
             max_gpu_support_bytes=max_gpu_support_bytes,
+            knn_support=knn_support,
+            knn_support_row_ids=knn_support_row_ids,
         )
         return batched[0]
 
@@ -889,6 +968,9 @@ def evaluate_leave_one_out_objective(
         gpu_devices=gpu_devices,
         gpu_tile_size=gpu_tile_size,
         max_gpu_support_bytes=max_gpu_support_bytes,
+        knn_support=knn_support,
+        knn_support_row_ids=knn_support_row_ids,
+        max_calibration_work_bytes=max_calibration_work_bytes,
     )
     numerator = np.zeros(values.shape[0], dtype=np.float64)
     loo_started = time.perf_counter()
@@ -927,6 +1009,8 @@ def evaluate_leave_one_out_objective(
             if metric_name in {
                 "support_execution",
                 "support_execution_version",
+                "support_provider",
+                "support_provider_stats_status",
                 "gpu_device",
                 "gpu_devices",
                 "gpu_device_count",
@@ -939,6 +1023,18 @@ def evaluate_leave_one_out_objective(
                 diagnostics[metric_name] = metric_value
             elif isinstance(metric_value, (int, float, np.integer, np.floating)):
                 diagnostics[metric_name] = metric_value
+        diagnostics["support_size_per_candidate"] = [
+            provider_metrics.get("support_count_mean")
+        ]
+        diagnostics["support_max_per_candidate"] = [
+            provider_metrics.get("support_count_max")
+        ]
+        diagnostics["conservative_candidate_count_per_candidate"] = [
+            provider_metrics.get("support_count_mean")
+        ]
+        diagnostics["conservative_candidate_max_per_candidate"] = [
+            provider_metrics.get("support_count_max")
+        ]
     with np.errstate(divide="ignore", invalid="ignore", over="raise"):
         try:
             loo = numerator / denominators
@@ -990,6 +1086,8 @@ def evaluate_leave_one_out_objectives(
     gpu_devices: Sequence[int] | str | int | None = None,
     gpu_tile_size: int = 128,
     max_gpu_support_bytes: int | None = None,
+    knn_support: ExactNeighbourResult | None = None,
+    knn_support_row_ids: Sequence[str] | None = None,
 ) -> tuple[LeaveOneOutObjective, ...]:
     """Evaluate a bounded batch of exact LOO objectives source-by-source.
 
@@ -1100,6 +1198,9 @@ def evaluate_leave_one_out_objectives(
         gpu_devices=gpu_devices,
         gpu_tile_size=gpu_tile_size,
         max_gpu_support_bytes=max_gpu_support_bytes,
+        knn_support=knn_support,
+        knn_support_row_ids=knn_support_row_ids,
+        max_calibration_work_bytes=work_limit,
     )
     loo_started = time.perf_counter()
     checkpoint_seconds = 0.0
@@ -1616,6 +1717,8 @@ def evaluate_leave_one_out_objectives(
             if metric_name in {
                 "support_execution",
                 "support_execution_version",
+                "support_provider",
+                "support_provider_stats_status",
                 "gpu_device",
                 "gpu_devices",
                 "gpu_device_count",

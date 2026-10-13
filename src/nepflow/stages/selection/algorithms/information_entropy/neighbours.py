@@ -305,6 +305,361 @@ class ExactNeighbourResult:
         return self.neighbour_indices
 
 
+class ExactKNNPrefixSupport:
+    """Derive strict ``c=1`` supports from an exact canonical kNN result.
+
+    The result stores one representative row per distinct neighbour location.
+    This provider expands only the requested source batch back to original
+    rows, preserving the canonical neighbour distance for every duplicate row
+    and the existing source-major CSR contract.
+    """
+
+    def __init__(
+        self,
+        descriptors: np.ndarray,
+        neighbours: ExactNeighbourResult,
+        *,
+        grouping_source: Any | None = None,
+        expected_row_ids: Sequence[str] | None = None,
+        max_radius_query_bytes: int | None = None,
+        max_calibration_work_bytes: int | None = None,
+        resource_budget: ResourceBudgetService | None = None,
+        capacity_context: str | None = None,
+    ) -> None:
+        self.descriptors = _validate_descriptors(descriptors)
+        if not isinstance(neighbours, ExactNeighbourResult):
+            raise TypeError("knn support requires an ExactNeighbourResult")
+        self.neighbours = neighbours
+        self.resource_budget = resource_budget or build_resource_budget()
+        self.capacity_context = capacity_context
+        remaining = self.resource_budget.remaining_managed_budget
+        if remaining is None:
+            raise ResourceCapacityError(
+                self.resource_budget.unknown_memory_message("exact kNN prefix support"),
+                operation="exact kNN prefix support",
+            )
+        if remaining < 1:
+            raise ResourceCapacityError(
+                "exact kNN prefix support has no allocatable runtime memory headroom",
+                operation="exact kNN prefix support",
+                requested_bytes=1,
+                available_bytes=remaining,
+                reserved_headroom_bytes=self.resource_budget.budget.reserved_headroom_bytes,
+            )
+        radius_limit = (
+            max(1, remaining // 2)
+            if max_radius_query_bytes is None
+            else min(
+                _validate_memory_limit(max_radius_query_bytes, "max_radius_query_bytes"),
+                remaining,
+            )
+        )
+        work_limit = (
+            remaining
+            if max_calibration_work_bytes is None
+            else min(
+                _validate_memory_limit(
+                    max_calibration_work_bytes,
+                    "max_calibration_work_bytes",
+                ),
+                remaining,
+            )
+        )
+        self.max_workspace_bytes = min(radius_limit, work_limit)
+        self._validate_neighbour_identity(expected_row_ids)
+
+        self._grouping_build_seconds = 0.0
+        self._owns_grouping = False
+        if grouping_source is not None:
+            source_row_to_location = getattr(grouping_source, "row_to_location", None)
+            source_rows_by_location = getattr(grouping_source, "rows_by_location", None)
+            source_location_indptr = getattr(grouping_source, "location_indptr", None)
+            if (
+                source_row_to_location is None
+                or source_rows_by_location is None
+                or source_location_indptr is None
+            ):
+                raise ValueError("kNN grouping source does not expose the exact row grouping")
+            if not np.array_equal(source_row_to_location, neighbours.row_to_location):
+                raise ValueError("kNN grouping source row identity does not match neighbours")
+            self.rows_by_location = np.asarray(source_rows_by_location, dtype=np.int64)
+            self.location_indptr = np.asarray(source_location_indptr, dtype=np.int64)
+            self._validate_grouping()
+        else:
+            self._build_grouping()
+        self.grouping_bytes = int(self.rows_by_location.nbytes + self.location_indptr.nbytes)
+        self.derived_sources = 0
+        self.derived_entries = 0
+        self.elapsed_seconds = 0.0
+        self.query_workspace_peak_bytes = 0
+
+    def _validate_neighbour_identity(self, expected_row_ids: Sequence[str] | None) -> None:
+        neighbours = self.neighbours
+        row_count = int(self.descriptors.shape[0])
+        location_count = int(neighbours.unique_locations.shape[0])
+        if neighbours.radii.shape != (row_count,):
+            raise ValueError("kNN prefix radii do not align with the descriptor rows")
+        if neighbours.row_to_location.shape != (row_count,):
+            raise ValueError("kNN prefix row ownership does not align with descriptors")
+        if neighbours.unique_locations.shape[1] != self.descriptors.shape[1]:
+            raise ValueError("kNN prefix descriptor dimensionality does not match")
+        if neighbours.location_representatives.shape != (location_count,):
+            raise ValueError("kNN prefix representatives do not align with locations")
+        if neighbours.row_to_location.size and (
+            np.min(neighbours.row_to_location) < 0
+            or np.max(neighbours.row_to_location) >= location_count
+        ):
+            raise ValueError("kNN prefix row ownership is outside the location table")
+        if len(neighbours.row_ids) != row_count or any(
+            not isinstance(value, str) or not value.strip() for value in neighbours.row_ids
+        ):
+            raise ValueError("kNN prefix row identity is missing or misaligned")
+        if expected_row_ids is not None:
+            expected_ids = tuple(str(value) for value in expected_row_ids)
+            if expected_ids != tuple(neighbours.row_ids):
+                raise ValueError("kNN prefix row identity does not match the evaluation pool")
+        if neighbours.k < 1 or neighbours.neighbour_indices.shape != (
+            row_count,
+            neighbours.k,
+        ):
+            raise ValueError("kNN prefix neighbour dimensions are incompatible")
+        if neighbours.k >= location_count:
+            raise ValueError("kNN prefix k must leave at least one non-neighbour location")
+        if not np.array_equal(neighbours.radii, neighbours.neighbour_distances[:, -1]):
+            raise ValueError("kNN prefix radii are not the canonical kth distances")
+        representatives = neighbours.location_representatives
+        if np.any(representatives < 0) or np.any(representatives >= row_count):
+            raise ValueError("kNN prefix representative rows are outside the descriptor pool")
+
+        # Validate the scientific identity in bounded chunks.  Avoid creating
+        # a global N x d reconstruction of the descriptor matrix.
+        for start in range(0, row_count, 4096):
+            stop = min(start + 4096, row_count)
+            locations = neighbours.row_to_location[start:stop]
+            if not np.array_equal(
+                self.descriptors[start:stop], neighbours.unique_locations[locations]
+            ):
+                raise ValueError("kNN prefix locations do not match descriptors")
+            neighbour_rows = neighbours.neighbour_indices[start:stop]
+            if np.any(neighbour_rows < 0) or np.any(neighbour_rows >= row_count):
+                raise ValueError("kNN prefix neighbour rows are outside the descriptor pool")
+            neighbour_locations = neighbours.row_to_location[neighbour_rows]
+            own_locations = locations[:, None]
+            if np.any(neighbour_locations == own_locations):
+                raise ValueError("kNN prefix contains the source location as a neighbour")
+            if neighbours.k > 1:
+                sorted_locations = np.sort(neighbour_locations, axis=1)
+                if np.any(np.diff(sorted_locations, axis=1) == 0):
+                    raise ValueError("kNN prefix contains duplicate neighbour locations")
+            if np.any(
+                representatives[neighbour_locations] != neighbour_rows
+            ):
+                raise ValueError("kNN prefix neighbour rows are not location representatives")
+            distances = neighbours.neighbour_distances[start:stop]
+            if np.any(np.diff(distances, axis=1) < 0.0):
+                raise ValueError("kNN prefix distances are not in canonical order")
+
+    def _build_grouping(self) -> None:
+        row_to_location = self.neighbours.row_to_location
+        location_count = int(self.neighbours.unique_locations.shape[0])
+        grouping_estimate = int(16 * self.descriptors.shape[0] + 16 * location_count + 8192)
+        if grouping_estimate > self.max_workspace_bytes:
+            raise RadiusQueryCapacityError(
+                "exact kNN prefix grouping exceeds its bounded support workspace: "
+                f"requested_bytes={grouping_estimate}, "
+                f"max_radius_query_bytes={self.max_workspace_bytes}"
+            )
+        started = time.perf_counter()
+        with self.resource_budget.acquire(
+            self.capacity_context or "exact kNN prefix grouping",
+            grouping_estimate,
+        ):
+            self.rows_by_location = np.asarray(
+                np.argsort(row_to_location, kind="stable"),
+                dtype=np.int64,
+            )
+            counts = np.bincount(row_to_location, minlength=location_count).astype(
+                np.int64,
+                copy=False,
+            )
+            self.location_indptr = np.empty(location_count + 1, dtype=np.int64)
+            self.location_indptr[0] = 0
+            np.cumsum(counts, dtype=np.int64, out=self.location_indptr[1:])
+        self.rows_by_location.setflags(write=False)
+        self.location_indptr.setflags(write=False)
+        self._owns_grouping = True
+        self._grouping_build_seconds = max(0.0, time.perf_counter() - started)
+        self._validate_grouping()
+
+    def _validate_grouping(self) -> None:
+        row_count = int(self.descriptors.shape[0])
+        location_count = int(self.neighbours.unique_locations.shape[0])
+        if self.rows_by_location.shape != (row_count,):
+            raise ValueError("kNN prefix rows-by-location grouping has the wrong shape")
+        if self.location_indptr.shape != (location_count + 1,):
+            raise ValueError("kNN prefix location grouping has the wrong shape")
+        if (
+            self.location_indptr[0] != 0
+            or self.location_indptr[-1] != row_count
+            or np.any(np.diff(self.location_indptr) < 1)
+            or np.any(self.rows_by_location < 0)
+            or np.any(self.rows_by_location >= row_count)
+        ):
+            raise ValueError("kNN prefix location grouping is invalid")
+        if not np.array_equal(np.sort(self.rows_by_location), np.arange(row_count)):
+            raise ValueError("kNN prefix grouping does not cover every source row once")
+        for location in range(location_count):
+            start = int(self.location_indptr[location])
+            stop = int(self.location_indptr[location + 1])
+            rows = self.rows_by_location[start:stop]
+            if not np.all(self.neighbours.row_to_location[rows] == location):
+                raise ValueError("kNN prefix grouping assigns a row to the wrong location")
+            if int(self.neighbours.location_representatives[location]) != int(rows[0]):
+                raise ValueError("kNN prefix representative is not the earliest source row")
+
+    def eligible(
+        self,
+        source_indices: np.ndarray,
+        radii: np.ndarray,
+    ) -> bool:
+        expected = self.neighbours.radii[source_indices]
+        if radii.ndim == 1:
+            return np.array_equal(radii, expected)
+        return np.array_equal(radii, expected[None, :])
+
+    def support_many(
+        self,
+        source_indices: Sequence[int] | np.ndarray,
+        radii: Sequence[float] | np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        sources = np.asarray(source_indices)
+        if sources.ndim != 1 or sources.size == 0:
+            raise ValueError("source_indices must be a non-empty one-dimensional sequence")
+        if sources.dtype.kind not in "iu" or sources.dtype.kind == "b":
+            raise ValueError("source_indices must contain integer row indices")
+        source_rows = np.asarray(sources, dtype=np.int64)
+        if np.any(source_rows < 0) or np.any(source_rows >= self.descriptors.shape[0]):
+            raise IndexError("source_indices contain a row outside the descriptor rows")
+        requested = np.asarray(radii, dtype=np.float64)
+        if requested.ndim not in (1, 2) or requested.shape[-1] != source_rows.size:
+            raise ValueError(
+                "radii must have shape (source_count,) or (candidate_count, source_count)"
+            )
+        if requested.ndim == 2 and requested.shape[0] == 0:
+            raise ValueError("radii must contain at least one candidate")
+        if not np.all(np.isfinite(requested)) or np.any(requested <= 0.0):
+            raise ValueError("radii must be finite and strictly positive")
+        if not self.eligible(source_rows, requested):
+            raise ValueError("exact kNN prefix support requires radii equal to canonical kNN radii")
+        source_radii = (
+            requested if requested.ndim == 1 else requested[0]
+        )
+        neighbour_locations = self.neighbours.row_to_location[
+            self.neighbours.neighbour_indices[source_rows]
+        ]
+        neighbour_distances = self.neighbours.neighbour_distances[source_rows]
+        counts = np.empty(source_rows.size, dtype=np.int64)
+        for local_index, source in enumerate(source_rows):
+            own_location = int(self.neighbours.row_to_location[source])
+            eligible_locations = neighbour_locations[local_index][
+                neighbour_distances[local_index] < source_radii[local_index]
+            ]
+            locations = np.concatenate(
+                (np.asarray([own_location], dtype=np.int64), eligible_locations)
+            )
+            counts[local_index] = int(
+                np.sum(
+                    self.location_indptr[locations + 1] - self.location_indptr[locations],
+                    dtype=np.int64,
+                )
+            )
+        total_support = int(np.sum(counts, dtype=np.int64))
+        # Admit the returned CSR arrays plus the per-source concatenation and
+        # stable-sort temporaries that coexist with them during expansion.
+        workspace_bytes = int(
+            (source_rows.size + 1) * np.dtype(np.int64).itemsize
+            + total_support * 40
+            + 4096
+        )
+        if workspace_bytes > self.max_workspace_bytes:
+            details = (
+                f"requested_bytes={workspace_bytes}, max_support_workspace_bytes="
+                f"{self.max_workspace_bytes}, source_count={source_rows.size}, "
+                f"support_entries={total_support}"
+            )
+            if self.capacity_context:
+                details += f", {self.capacity_context}"
+            raise RadiusQueryCapacityError(
+                "exact kNN prefix support exceeds memory capacity: " + details
+            )
+
+        started = time.perf_counter()
+        with self.resource_budget.acquire(
+            self.capacity_context or "exact kNN prefix support materialisation",
+            workspace_bytes,
+        ):
+            offsets = np.zeros(source_rows.size + 1, dtype=np.int64)
+            np.cumsum(counts, dtype=np.int64, out=offsets[1:])
+            targets = np.empty(total_support, dtype=np.int64)
+            distances = np.empty(total_support, dtype=np.float64)
+            cursor = 0
+            for local_index, source in enumerate(source_rows):
+                own_location = int(self.neighbours.row_to_location[source])
+                eligible = neighbour_distances[local_index] < source_radii[local_index]
+                locations = np.concatenate(
+                    (
+                        np.asarray([own_location], dtype=np.int64),
+                        neighbour_locations[local_index, eligible],
+                    )
+                )
+                location_distances = np.concatenate(
+                    (
+                        np.asarray([0.0], dtype=np.float64),
+                        neighbour_distances[local_index, eligible],
+                    )
+                )
+                row_parts = [
+                    self.rows_by_location[
+                        self.location_indptr[int(location)] : self.location_indptr[
+                            int(location) + 1
+                        ]
+                    ]
+                    for location in locations
+                ]
+                rows = np.concatenate(row_parts).astype(np.int64, copy=False)
+                row_distances = np.repeat(
+                    location_distances,
+                    [int(part.size) for part in row_parts],
+                )
+                order = np.argsort(rows, kind="stable")
+                stop = cursor + int(rows.size)
+                targets[cursor:stop] = rows[order]
+                distances[cursor:stop] = row_distances[order]
+                cursor = stop
+        if cursor != total_support or np.any(np.diff(offsets) < 1):
+            raise ValueError("exact kNN prefix support materialisation is incomplete")
+        offsets.setflags(write=False)
+        targets.setflags(write=False)
+        distances.setflags(write=False)
+        self.derived_sources += int(source_rows.size)
+        self.derived_entries += total_support
+        self.elapsed_seconds += max(0.0, time.perf_counter() - started)
+        self.query_workspace_peak_bytes = max(self.query_workspace_peak_bytes, workspace_bytes)
+        return offsets, targets, distances
+
+    def operational_metrics(self) -> dict[str, int | float]:
+        return {
+            "knn_support_derived_sources": int(self.derived_sources),
+            "knn_support_derived_entries": int(self.derived_entries),
+            "knn_support_grouping_bytes": int(self.grouping_bytes),
+            "knn_support_grouping_build_seconds": float(self._grouping_build_seconds),
+            "knn_support_elapsed_seconds": float(self.elapsed_seconds),
+            "knn_support_query_workspace_peak_bytes": int(self.query_workspace_peak_bytes),
+            "knn_support_gpu_fp64_evaluations": 0,
+            "knn_support_gpu_tile_scans": 0,
+        }
+
+
 def _validate_row_ids(row_ids: Sequence[str] | None, n_rows: int) -> tuple[str, ...]:
     if row_ids is None:
         return tuple(str(index) for index in range(n_rows))
@@ -4384,6 +4739,7 @@ __all__ = [
     "CalibrationCapacityError",
     "DEFAULT_NEIGHBOUR_CACHE_BYTES",
     "DEFAULT_RADIUS_QUERY_BYTES",
+    "ExactKNNPrefixSupport",
     "ExactNeighbourResult",
     "IndexedCPUNeighbourIndex",
     "TiledCPUNeighbourIndex",

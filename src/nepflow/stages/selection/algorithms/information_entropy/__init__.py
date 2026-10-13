@@ -130,6 +130,7 @@ from .models import (
 )
 from .neighbours import (
     CalibrationCapacityError,
+    ExactKNNPrefixSupport,
     ExactNeighbourResult,
     IndexedCPUNeighbourIndex,
     NeighbourBackendCapabilities,
@@ -216,6 +217,7 @@ __all__ = [
     "EntropyDiagnostics",
     "EntropyScientificDiagnostics",
     "EntropyPool",
+    "ExactKNNPrefixSupport",
     "EntropyObjectiveDiagnostics",
     "EntropyObjectiveState",
     "EntropySelectionCertificationError",

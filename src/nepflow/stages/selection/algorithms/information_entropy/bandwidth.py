@@ -2059,6 +2059,7 @@ def calibrate_bandwidth(
                             backend=selected_settings.backend,
                             index=index,
                             max_radius_query_bytes=selected_settings.radius_query_bytes,
+                            max_calibration_work_bytes=selected_settings.operational_work_bytes,
                             resource_budget=runtime_budget,
                             capacity_context=f"k={candidate_k}, c={c_batch[0]:g}",
                             checkpoint_path=checkpoint_path,
@@ -2073,9 +2074,14 @@ def calibrate_bandwidth(
                             gpu_devices=selected_settings.gpu_devices,
                             gpu_tile_size=selected_settings.gpu_tile_size,
                             max_gpu_support_bytes=selected_settings.max_gpu_support_bytes,
+                            knn_support=(neighbours if frozen.c == 1.0 else None),
+                            knn_support_row_ids=(
+                                _pool_row_ids(pool) if frozen.c == 1.0 else None
+                            ),
                         ),
                     )
                 else:
+                    use_knn_prefix_support = len(c_batch) == 1 and c_batch[0] == 1.0
                     objectives = evaluate_leave_one_out_objectives(
                         pool.descriptors,
                         pool.probabilities,
@@ -2103,6 +2109,10 @@ def calibrate_bandwidth(
                         gpu_devices=selected_settings.gpu_devices,
                         gpu_tile_size=selected_settings.gpu_tile_size,
                         max_gpu_support_bytes=selected_settings.max_gpu_support_bytes,
+                        knn_support=(neighbours if use_knn_prefix_support else None),
+                        knn_support_row_ids=(
+                            _pool_row_ids(pool) if use_knn_prefix_support else None
+                        ),
                     )
                 operational_metrics["loo_seconds"] += max(0.0, time.perf_counter() - loo_started)
                 operational_metrics["loo_pair_count"] += len(c_batch)
