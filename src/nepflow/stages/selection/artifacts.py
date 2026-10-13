@@ -354,6 +354,12 @@ def verify_selection_artifacts(
                     "Selection entropy diagnostics report is missing or empty: "
                     f"{diagnostics_report}"
                 )
+            convergence_report = reports_dir / "entropy_convergence.png"
+            if not convergence_report.is_file() or convergence_report.stat().st_size == 0:
+                raise ArtifactError(
+                    "Selection entropy convergence plot is missing or empty: "
+                    f"{convergence_report}"
+                )
     for filename in ("train.xyz", "test.xyz", SELECTION_MANIFEST_FILENAME):
         path = selected_dir / filename
         if not path.is_file() or path.stat().st_size == 0:

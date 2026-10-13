@@ -460,6 +460,14 @@ class GraphDiagnostics:
     operational_metrics: dict[str, Any] = field(default_factory=dict, compare=False, repr=False)
 
     def __post_init__(self) -> None:
+        def nonnegative_integer(value: Any, *, name: str) -> int:
+            if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
+                raise ValueError(f"graph {name} must be an integer")
+            normalized = int(value)
+            if normalized < 0:
+                raise ValueError(f"graph {name} must be non-negative")
+            return normalized
+
         for name in (
             "atomic_row_count",
             "edge_count",
@@ -468,10 +476,11 @@ class GraphDiagnostics:
             "csr_array_bytes",
             "candidate_csr_array_bytes",
         ):
-            value = int(getattr(self, name))
-            if value < 0:
-                raise ValueError(f"graph {name} must be non-negative")
-            object.__setattr__(self, name, value)
+            object.__setattr__(
+                self,
+                name,
+                nonnegative_integer(getattr(self, name), name=name),
+            )
         if self.atomic_row_count < 1 or self.edge_count < 1:
             raise ValueError("graph diagnostics require a non-empty graph")
         for name in (
@@ -490,8 +499,12 @@ class GraphDiagnostics:
             "candidate_resident_bytes",
         ):
             value = getattr(self, name)
-            if value is not None and int(value) < 0:
-                raise ValueError(f"graph {name} must be non-negative when supplied")
+            if value is not None:
+                object.__setattr__(
+                    self,
+                    name,
+                    nonnegative_integer(value, name=name),
+                )
         if not self.backend.strip() or not self.metric.strip() or not self.backend_version.strip():
             raise ValueError("graph backend identity is required")
         rule = normalize_kernel_bandwidth_rule(self.kernel_bandwidth_rule)
@@ -517,12 +530,21 @@ class GraphDiagnostics:
             and not self.kernel_operator_fingerprint.strip()
         ):
             raise ValueError("kernel_operator_fingerprint must be non-blank when supplied")
-        if self.candidate_storage not in {"memory", "disk"}:
+        if not isinstance(self.candidate_storage, str) or self.candidate_storage not in {
+            "memory",
+            "disk",
+        }:
             raise ValueError("candidate_storage must be 'memory' or 'disk'")
         if self.candidate_storage_path is not None and not isinstance(
             self.candidate_storage_path, str
         ):
             raise ValueError("candidate_storage_path must be a string when supplied")
+        if self.candidate_storage == "memory" and self.candidate_storage_path is not None:
+            raise ValueError("memory candidate storage must not have a storage path")
+        if self.candidate_storage == "disk" and (
+            self.candidate_storage_path is None or not self.candidate_storage_path.strip()
+        ):
+            raise ValueError("disk candidate storage requires a non-empty storage path")
         if not isinstance(self.operational_metrics, dict):
             raise ValueError("graph operational_metrics must be a dictionary")
         object.__setattr__(self, "operational_metrics", dict(self.operational_metrics))
@@ -1422,6 +1444,36 @@ def _graph_from_manifest(value: Mapping[str, Any]) -> GraphDiagnostics:
     source = DiagnosticDistribution.from_manifest(value["source_support"])
     candidate = DiagnosticDistribution.from_manifest(value["candidate_support"])
     memory = value.get("memory", {})
+    if not isinstance(memory, Mapping):
+        raise ValueError("graph memory payload is malformed")
+
+    def nonnegative_integer(name: str, *, default: Any = None) -> int:
+        raw = memory.get(name, default)
+        if isinstance(raw, bool) or not isinstance(raw, (int, np.integer)):
+            raise ValueError(f"graph memory {name} must be an integer")
+        normalized = int(raw)
+        if normalized < 0:
+            raise ValueError(f"graph memory {name} must be non-negative")
+        return normalized
+
+    def nullable_nonnegative_integer(name: str) -> int | None:
+        raw = memory.get(name)
+        if raw is None:
+            return None
+        return nonnegative_integer(name)
+
+    candidate_storage = memory.get("candidate_storage", "memory")
+    if not isinstance(candidate_storage, str) or candidate_storage not in {"memory", "disk"}:
+        raise ValueError("graph memory candidate_storage must be 'memory' or 'disk'")
+    candidate_storage_path = memory.get("candidate_storage_path")
+    if candidate_storage_path is not None and not isinstance(candidate_storage_path, str):
+        raise ValueError("graph memory candidate_storage_path must be a string or null")
+    if candidate_storage == "memory" and candidate_storage_path is not None:
+        raise ValueError("memory candidate storage must not have a storage path")
+    if candidate_storage == "disk" and (
+        candidate_storage_path is None or not candidate_storage_path.strip()
+    ):
+        raise ValueError("disk candidate storage requires a non-empty storage path")
     return GraphDiagnostics(
         atomic_row_count=int(value["atomic_row_count"]),
         edge_count=int(value["edge_count"]),
@@ -1433,23 +1485,11 @@ def _graph_from_manifest(value: Mapping[str, Any]) -> GraphDiagnostics:
         candidate_entry_count=int(value["candidate_entry_count"]),
         candidate_support=candidate,
         candidate_pmf_max_deviation=float(value["candidate_pmf_max_deviation"]),
-        csr_array_bytes=int(memory["csr_array_bytes"]),
-        candidate_csr_array_bytes=int(memory.get("candidate_csr_array_bytes", 0)),
-        indexed_workspace_bytes=(
-            None
-            if memory.get("indexed_workspace_bytes") is None
-            else int(memory["indexed_workspace_bytes"])
-        ),
-        measured_peak_memory_bytes=(
-            None
-            if memory.get("measured_peak_memory_bytes") is None
-            else int(memory["measured_peak_memory_bytes"])
-        ),
-        estimated_peak_memory_bytes=(
-            None
-            if memory.get("estimated_peak_memory_bytes") is None
-            else int(memory["estimated_peak_memory_bytes"])
-        ),
+        csr_array_bytes=nonnegative_integer("csr_array_bytes"),
+        candidate_csr_array_bytes=nonnegative_integer("candidate_csr_array_bytes", default=0),
+        indexed_workspace_bytes=nullable_nonnegative_integer("indexed_workspace_bytes"),
+        measured_peak_memory_bytes=nullable_nonnegative_integer("measured_peak_memory_bytes"),
+        estimated_peak_memory_bytes=nullable_nonnegative_integer("estimated_peak_memory_bytes"),
         backend=str(value["backend"]),
         metric=str(value["metric"]),
         backend_version=str(value["backend_version"]),
@@ -1467,17 +1507,11 @@ def _graph_from_manifest(value: Mapping[str, Any]) -> GraphDiagnostics:
             else str(value["kernel_operator_fingerprint"])
         ),
         contribution_spool_bytes=(
-            None
-            if memory.get("contribution_spool_bytes") is None
-            else int(memory["contribution_spool_bytes"])
+            nullable_nonnegative_integer("contribution_spool_bytes")
         ),
-        candidate_storage=str(memory.get("candidate_storage", "memory")),
-        candidate_storage_path=(
-            None
-            if memory.get("candidate_storage_path") is None
-            else str(memory["candidate_storage_path"])
-        ),
-        candidate_resident_bytes=int(memory.get("candidate_resident_bytes", 0)),
+        candidate_storage=candidate_storage,
+        candidate_storage_path=candidate_storage_path,
+        candidate_resident_bytes=nonnegative_integer("candidate_resident_bytes", default=0),
         operational_metrics=dict(value.get("operations", {})),
         numerical_tolerance=float(
             value.get("numerical_tolerance", DIAGNOSTICS_NUMERICAL_TOLERANCE)

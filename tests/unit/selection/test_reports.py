@@ -1,5 +1,7 @@
 """Selection artifact and reporting contracts."""
 
+import json
+
 import numpy as np
 import pytest
 
@@ -9,15 +11,135 @@ pytest.importorskip("sklearn")
 
 from ase import Atoms
 
+from nepflow.stages.selection.algorithms.information_entropy.diagnostics import (
+    EntropyScientificDiagnostics,
+)
 from nepflow.stages.selection.artifacts import write_selected_structures
 from nepflow.stages.selection.reports import (
     EntropyPresentationData,
+    PresentationError,
+    _validated_entropy_convergence_series,
     load_entropy_presentation_artifact,
     plot_candidate_bandwidth_summary,
     plot_descriptor_space,
+    plot_entropy_convergence,
     plot_projected_entropy_densities,
     write_entropy_presentation_artifact,
 )
+
+
+def _convergence_diagnostics(history, *, final_cross_entropy, final_forward_kl):
+    """Build the small restored-record surface needed by the presentation helper."""
+
+    record = object.__new__(EntropyScientificDiagnostics)
+    object.__setattr__(record, "selection_history", None)
+    object.__setattr__(record, "selection_history_json", json.dumps(history))
+    object.__setattr__(record, "tolerance", 1.0e-12)
+    object.__setattr__(record, "acquisition_order", tuple(item["candidate_id"] for item in history))
+    object.__setattr__(
+        record,
+        "selected_candidate_ids",
+        tuple(item["candidate_id"] for item in history),
+    )
+    object.__setattr__(record, "final_cross_entropy", final_cross_entropy)
+    object.__setattr__(record, "final_forward_kl", final_forward_kl)
+    return record
+
+
+def test_entropy_convergence_collapses_aggregate_anchor_baseline(tmp_path) -> None:
+    history = [
+        {
+            "candidate_id": "a0",
+            "reason": "anchor",
+            "acquisition_iteration": 0,
+            "selected_count": 2,
+            "cross_entropy": 2.0,
+            "forward_kl": 1.0,
+        },
+        {
+            "candidate_id": "a1",
+            "reason": "anchor",
+            "acquisition_iteration": 0,
+            "selected_count": 2,
+            "cross_entropy": 2.0,
+            "forward_kl": 1.0,
+        },
+        {
+            "candidate_id": "g1",
+            "reason": "greedy",
+            "acquisition_iteration": 1,
+            "selected_count": 3,
+            "cross_entropy": 1.8,
+            "forward_kl": 0.8,
+        },
+    ]
+    diagnostics = _convergence_diagnostics(
+        history,
+        final_cross_entropy=1.8,
+        final_forward_kl=0.8,
+    )
+
+    iterations, cross_entropy, forward_kl = _validated_entropy_convergence_series(diagnostics)
+
+    assert iterations.tolist() == [0, 1]
+    assert cross_entropy.tolist() == [2.0, 1.8]
+    assert forward_kl is not None
+    assert forward_kl.tolist() == [1.0, 0.8]
+    plot_entropy_convergence(diagnostics, tmp_path / "reports" / "entropy_convergence.png")
+    assert (tmp_path / "reports" / "entropy_convergence.png").stat().st_size > 0
+
+
+def test_entropy_convergence_without_anchors_starts_at_greedy_iteration_one() -> None:
+    history = [
+        {
+            "candidate_id": "g1",
+            "reason": "greedy",
+            "acquisition_iteration": 1,
+            "selected_count": 1,
+            "cross_entropy": 1.8,
+            "forward_kl": None,
+        },
+        {
+            "candidate_id": "g2",
+            "reason": "greedy",
+            "acquisition_iteration": 2,
+            "selected_count": 2,
+            "cross_entropy": 1.6,
+            "forward_kl": None,
+        },
+    ]
+    diagnostics = _convergence_diagnostics(
+        history,
+        final_cross_entropy=1.6,
+        final_forward_kl=0.6,
+    )
+
+    iterations, cross_entropy, forward_kl = _validated_entropy_convergence_series(diagnostics)
+
+    assert iterations.tolist() == [1, 2]
+    assert cross_entropy.tolist() == [1.8, 1.6]
+    assert forward_kl is None
+
+
+def test_entropy_convergence_rejects_noncontiguous_greedy_iterations() -> None:
+    history = [
+        {
+            "candidate_id": "g1",
+            "reason": "greedy",
+            "acquisition_iteration": 2,
+            "selected_count": 1,
+            "cross_entropy": 1.8,
+            "forward_kl": 0.8,
+        }
+    ]
+    diagnostics = _convergence_diagnostics(
+        history,
+        final_cross_entropy=1.8,
+        final_forward_kl=0.8,
+    )
+
+    with pytest.raises(PresentationError, match="acquisition_iteration must be 1"):
+        _validated_entropy_convergence_series(diagnostics)
 
 
 def test_artifact_writer_preserves_train_and_test_paths(tmp_path) -> None:

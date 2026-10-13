@@ -47,6 +47,7 @@ from .persistence import (
 from .persistence import structure_ids as ordered_structure_ids
 from .reports import (
     plot_descriptor_space,
+    plot_entropy_convergence,
     write_diagnostics_report,
     write_entropy_presentation_reports,
 )
@@ -80,6 +81,7 @@ def _publication_paths(project_dir: Path) -> tuple[Path, ...]:
         selected / "selection_manifest.json",
         reports / "descriptor_space.png",
         reports / "entropy_diagnostics.md",
+        reports / "entropy_convergence.png",
         reports / "entropy_presentation-v1.npz",
         reports / "descriptor_bandwidth.png",
         reports / "entropy_probability_projection.png",
@@ -760,6 +762,8 @@ class SelectionStage:
                 diagnostics_path = active.project_dir / "reports" / "entropy_diagnostics.md"
                 if not diagnostics_path.is_file():
                     write_diagnostics_report(result.entropy_diagnostics, diagnostics_path)
+                convergence_path = active.project_dir / "reports" / "entropy_convergence.png"
+                plot_entropy_convergence(result.entropy_diagnostics, convergence_path)
                 reports_dir = active.project_dir / "reports"
                 presentation_paths = (
                     reports_dir / "entropy_presentation-v1.npz",
@@ -808,6 +812,10 @@ class SelectionStage:
             write_diagnostics_report(
                 result.entropy_diagnostics,
                 active.project_dir / "reports" / "entropy_diagnostics.md",
+            )
+            plot_entropy_convergence(
+                result.entropy_diagnostics,
+                active.project_dir / "reports" / "entropy_convergence.png",
             )
             if isinstance(result.entropy_diagnostics.pool, EntropyPool) and isinstance(
                 result.entropy_diagnostics.bandwidths, FrozenBandwidths

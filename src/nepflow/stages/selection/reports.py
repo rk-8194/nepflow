@@ -13,6 +13,7 @@ from typing import Any, Mapping, Sequence
 
 import numpy as np
 
+from nepflow.errors import ArtifactError
 from nepflow.io.atomic import atomic_write_bytes, atomic_write_text
 from nepflow.io.hashing import sha256_bytes, sha256_canonical_json
 from nepflow.io.json import dumps
@@ -355,6 +356,254 @@ def plot_descriptor_space(
     ax.legend()
     fig.tight_layout()
     _save_figure(fig, output_path)
+
+
+def _finite_convergence_value(value: Any, path: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float, np.number)):
+        raise PresentationError(f"{path} must be a finite number")
+    result = float(value)
+    if not math.isfinite(result):
+        raise PresentationError(f"{path} must be a finite number")
+    return result
+
+
+def _integer_convergence_value(value: Any, path: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
+        raise PresentationError(f"{path} must be an integer")
+    return int(value)
+
+
+def _validated_entropy_convergence_series(
+    diagnostics: EntropyScientificDiagnostics | Mapping[str, Any],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray | None]:
+    """Return exact history values after validating the convergence contract."""
+
+    if isinstance(diagnostics, EntropyScientificDiagnostics):
+        record = diagnostics
+    elif isinstance(diagnostics, Mapping):
+        try:
+            record = EntropyScientificDiagnostics.from_manifest(diagnostics)
+        except (ArtifactError, KeyError, TypeError, ValueError) as exc:
+            raise PresentationError(
+                "Entropy convergence requires a valid scientific diagnostics manifest"
+            ) from exc
+    else:
+        raise PresentationError(
+            "Entropy convergence requires an EntropyScientificDiagnostics record"
+        )
+
+    try:
+        history = record.selection_history_records
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise PresentationError("Entropy convergence selection history is malformed") from exc
+    if not isinstance(history, list) or not history:
+        raise PresentationError(
+            "Entropy convergence requires non-empty selection_history with recorded metrics"
+        )
+    tolerance = float(record.tolerance)
+    if not math.isfinite(tolerance) or tolerance <= 0.0:
+        raise PresentationError("Entropy convergence diagnostics tolerance is invalid")
+
+    anchors: list[dict[str, Any]] = []
+    greedy: list[dict[str, Any]] = []
+    candidate_ids: list[str] = []
+    seen_candidate_ids: set[str] = set()
+    # Historical v3 records may omit forward_kl entirely; in that case the
+    # report remains cross-entropy-only rather than inventing a KL series.
+    forward_present: bool | None = None
+    greedy_phase = False
+    for index, item in enumerate(history):
+        path = f"selection_history[{index}]"
+        if not isinstance(item, Mapping):
+            raise PresentationError(f"{path} must be an object")
+        for key in ("candidate_id", "reason", "acquisition_iteration", "selected_count"):
+            if key not in item:
+                raise PresentationError(f"{path}.{key} is required")
+        candidate_id = item["candidate_id"]
+        if not isinstance(candidate_id, str) or not candidate_id.strip():
+            raise PresentationError(f"{path}.candidate_id must be a non-empty string")
+        if candidate_id in seen_candidate_ids:
+            raise PresentationError(f"{path}.candidate_id is duplicated")
+        seen_candidate_ids.add(candidate_id)
+        candidate_ids.append(candidate_id)
+        reason = item["reason"]
+        if reason not in {"anchor", "greedy"}:
+            raise PresentationError(f"{path}.reason must be 'anchor' or 'greedy'")
+        iteration = _integer_convergence_value(
+            item["acquisition_iteration"], f"{path}.acquisition_iteration"
+        )
+        selected_count = _integer_convergence_value(
+            item["selected_count"], f"{path}.selected_count"
+        )
+        if selected_count < 1:
+            raise PresentationError(f"{path}.selected_count must be positive")
+        if "cross_entropy" not in item or item["cross_entropy"] is None:
+            raise PresentationError(f"{path}.cross_entropy is required")
+        cross_entropy = _finite_convergence_value(
+            item["cross_entropy"], f"{path}.cross_entropy"
+        )
+        forward_kl_value = item.get("forward_kl")
+        if forward_kl_value is None:
+            if forward_present is True:
+                raise PresentationError(
+                    f"{path}.forward_kl is missing while other history entries provide it"
+                )
+            forward_present = False
+        else:
+            if forward_present is False:
+                raise PresentationError(
+                    f"{path}.forward_kl is present while another history entry omits it"
+                )
+            forward_present = True
+            forward_kl = _finite_convergence_value(
+                forward_kl_value, f"{path}.forward_kl"
+            )
+            if forward_kl < -tolerance:
+                raise PresentationError(
+                    f"{path}.forward_kl is materially negative"
+                )
+        normalized = {
+            "candidate_id": candidate_id,
+            "iteration": iteration,
+            "selected_count": selected_count,
+            "cross_entropy": cross_entropy,
+            "forward_kl": None if forward_kl_value is None else forward_kl,
+        }
+        if reason == "anchor":
+            if greedy_phase:
+                raise PresentationError("selection_history anchors must precede greedy entries")
+            if iteration != 0:
+                raise PresentationError(
+                    f"{path}.acquisition_iteration must be zero for an anchor"
+                )
+            anchors.append(normalized)
+        else:
+            greedy_phase = True
+            expected_iteration = len(greedy) + 1
+            if iteration != expected_iteration:
+                raise PresentationError(
+                    f"{path}.acquisition_iteration must be {expected_iteration}"
+                )
+            greedy.append(normalized)
+
+    if tuple(candidate_ids) != tuple(record.acquisition_order):
+        raise PresentationError(
+            "selection_history candidate order does not match diagnostics acquisition_order"
+        )
+    anchor_count = len(anchors)
+    if len(record.selected_candidate_ids) != anchor_count + len(greedy):
+        raise PresentationError(
+            "selection_history length does not match the final selected candidate count"
+        )
+    expected_selected_count = anchor_count
+    if anchors:
+        baseline = anchors[0]
+        for index, item in enumerate(anchors[1:], start=1):
+            if item["selected_count"] != baseline["selected_count"]:
+                raise PresentationError(
+                    f"selection_history[{index}].selected_count disagrees with anchor state"
+                )
+            if not math.isclose(
+                item["cross_entropy"], baseline["cross_entropy"], rel_tol=0.0, abs_tol=tolerance
+            ):
+                raise PresentationError(
+                    f"selection_history[{index}].cross_entropy disagrees with anchor state"
+                )
+            if forward_present and not math.isclose(
+                item["forward_kl"], baseline["forward_kl"], rel_tol=0.0, abs_tol=tolerance
+            ):
+                raise PresentationError(
+                    f"selection_history[{index}].forward_kl disagrees with anchor state"
+                )
+        expected_selected_count = baseline["selected_count"]
+        if expected_selected_count != anchor_count:
+            raise PresentationError("selection_history anchor selected_count is inconsistent")
+    for item in greedy:
+        expected_selected_count += 1
+        if item["selected_count"] != expected_selected_count:
+            raise PresentationError(
+                f"selection_history greedy selected_count is inconsistent at iteration "
+                f"{item['iteration']}"
+            )
+    final_item = greedy[-1] if greedy else (anchors[0] if anchors else None)
+    if final_item is None:
+        raise PresentationError("selection_history contains no plottable acquisition state")
+    if not math.isclose(
+        final_item["cross_entropy"],
+        float(record.final_cross_entropy),
+        rel_tol=0.0,
+        abs_tol=tolerance,
+    ):
+        raise PresentationError(
+            "selection_history final cross_entropy disagrees with diagnostics final_cross_entropy"
+        )
+    if forward_present and not math.isclose(
+        final_item["forward_kl"],
+        float(record.final_forward_kl),
+        rel_tol=0.0,
+        abs_tol=tolerance,
+    ):
+        raise PresentationError(
+            "selection_history final forward_kl disagrees with diagnostics final_forward_kl"
+        )
+
+    points = ([anchors[0]] if anchors else []) + greedy
+    iterations = ([0] if anchors else []) + [item["iteration"] for item in greedy]
+    cross_entropy = [item["cross_entropy"] for item in points]
+    forward_kl = (
+        None
+        if not forward_present
+        else [item["forward_kl"] for item in points]
+    )
+    return (
+        np.asarray(iterations, dtype=np.int64),
+        np.asarray(cross_entropy, dtype=np.float64),
+        None if forward_kl is None else np.asarray(forward_kl, dtype=np.float64),
+    )
+
+
+def plot_entropy_convergence(
+    diagnostics: EntropyScientificDiagnostics | Mapping[str, Any],
+    output_path: Path,
+) -> None:
+    """Plot the exact cross-entropy history and optional forward-KL history."""
+
+    iterations, cross_entropy, forward_kl = _validated_entropy_convergence_series(diagnostics)
+
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    marker_size = 3.5 if iterations.size <= 200 else 2.0
+    fig, ax = plt.subplots(figsize=(9, 5.5))
+    ax.plot(
+        iterations,
+        cross_entropy,
+        color="tab:blue",
+        linewidth=1.6,
+        marker="o",
+        markersize=marker_size,
+        label="Cross-entropy",
+    )
+    if forward_kl is not None:
+        ax.plot(
+            iterations,
+            forward_kl,
+            color="tab:orange",
+            linewidth=1.4,
+            linestyle="--",
+            marker=".",
+            markersize=marker_size,
+            label="Forward KL",
+        )
+    ax.set_xlabel("Greedy acquisition iteration")
+    ax.set_ylabel("Cross-entropy / forward KL (nats)")
+    ax.set_title("Information-entropy convergence")
+    ax.grid(axis="both", alpha=0.25)
+    ax.legend()
+    fig.tight_layout()
+    _save_figure(fig, Path(output_path))
 
 
 def _presentation_lease(
@@ -974,6 +1223,28 @@ def _require_integer(value: Any, path: str) -> None:
         raise _diagnostics_schema_error(path, "expected an integer")
 
 
+def _require_nonnegative_integer(value: Any, path: str) -> None:
+    _require_integer(value, path)
+    if int(value) < 0:
+        raise _diagnostics_schema_error(path, "expected a non-negative integer")
+
+
+def _require_nullable_nonnegative_integer(value: Any, path: str) -> None:
+    if value is not None:
+        _require_nonnegative_integer(value, path)
+
+
+def _require_enum(value: Any, path: str, allowed: Sequence[str]) -> None:
+    if not isinstance(value, str) or value not in allowed:
+        choices = ", ".join(repr(item) for item in allowed)
+        raise _diagnostics_schema_error(path, f"expected one of {choices}")
+
+
+def _require_string_or_none(value: Any, path: str) -> None:
+    if value is not None and not isinstance(value, str):
+        raise _diagnostics_schema_error(path, "expected a string or null")
+
+
 def _require_number(value: Any, path: str) -> None:
     if isinstance(value, bool) or not isinstance(value, (int, float, np.number)):
         raise _diagnostics_schema_error(path, "expected a number")
@@ -1145,6 +1416,26 @@ def _validate_diagnostics_manifest_shape(value: Mapping[str, Any]) -> None:
     )
     _validate_distribution_shape(graph["source_support"], "manifest.graph.source_support")
     _validate_distribution_shape(graph["candidate_support"], "manifest.graph.candidate_support")
+    for key in (
+        "atomic_row_count",
+        "edge_count",
+        "self_edge_count",
+        "candidate_entry_count",
+        "atomic_graph_csr_bytes",
+    ):
+        _require_nonnegative_integer(graph[key], f"manifest.graph.{key}")
+    for key in (
+        "edge_per_row",
+        "edge_density",
+        "source_mass_deviation",
+        "candidate_pmf_max_deviation",
+        "numerical_tolerance",
+    ):
+        _require_number(graph[key], f"manifest.graph.{key}")
+    if not isinstance(graph["atomic_graph_materialized"], bool):
+        raise _diagnostics_schema_error(
+            "manifest.graph.atomic_graph_materialized", "expected a boolean"
+        )
     memory = _require_mapping(graph["memory"], "manifest.graph.memory")
     _require_keys(
         memory,
@@ -1156,11 +1447,62 @@ def _validate_diagnostics_manifest_shape(value: Mapping[str, Any]) -> None:
             "measured_peak_memory_bytes",
             "estimated_peak_memory_bytes",
             "contribution_spool_bytes",
+            "candidate_storage",
+            "candidate_storage_path",
+            "candidate_resident_bytes",
         ),
     )
-    for key, item in memory.items():
-        if item is not None:
-            _require_integer(item, f"manifest.graph.memory.{key}")
+    expected_memory_keys = {
+        "csr_array_bytes",
+        "candidate_csr_array_bytes",
+        "indexed_workspace_bytes",
+        "measured_peak_memory_bytes",
+        "estimated_peak_memory_bytes",
+        "contribution_spool_bytes",
+        "candidate_storage",
+        "candidate_storage_path",
+        "candidate_resident_bytes",
+    }
+    for key in memory:
+        if key not in expected_memory_keys:
+            raise _diagnostics_schema_error(
+                f"manifest.graph.memory.{key}", "unexpected field"
+            )
+    for key in ("csr_array_bytes", "candidate_csr_array_bytes"):
+        _require_nonnegative_integer(memory[key], f"manifest.graph.memory.{key}")
+    for key in (
+        "indexed_workspace_bytes",
+        "measured_peak_memory_bytes",
+        "estimated_peak_memory_bytes",
+        "contribution_spool_bytes",
+    ):
+        _require_nullable_nonnegative_integer(memory[key], f"manifest.graph.memory.{key}")
+    _require_enum(
+        memory["candidate_storage"],
+        "manifest.graph.memory.candidate_storage",
+        ("memory", "disk"),
+    )
+    _require_string_or_none(
+        memory["candidate_storage_path"],
+        "manifest.graph.memory.candidate_storage_path",
+    )
+    candidate_storage_path = memory["candidate_storage_path"]
+    if memory["candidate_storage"] == "memory" and candidate_storage_path is not None:
+        raise _diagnostics_schema_error(
+            "manifest.graph.memory.candidate_storage_path",
+            "must be null when candidate_storage is 'memory'",
+        )
+    if memory["candidate_storage"] == "disk" and (
+        candidate_storage_path is None or not candidate_storage_path.strip()
+    ):
+        raise _diagnostics_schema_error(
+            "manifest.graph.memory.candidate_storage_path",
+            "must be a non-empty string when candidate_storage is 'disk'",
+        )
+    _require_nonnegative_integer(
+        memory["candidate_resident_bytes"],
+        "manifest.graph.memory.candidate_resident_bytes",
+    )
     if graph["atomic_graph_materialized"] is False and graph["atomic_graph_csr_bytes"] != 0:
         raise _diagnostics_schema_error(
             "manifest.graph.atomic_graph_csr_bytes",
@@ -1311,6 +1653,9 @@ def render_diagnostics_markdown(
         f"- Runtime peaks: RSS={metric(contribution_operations, 'process_peak_rss_bytes')}; "
         f"scratch={metric(contribution_operations, 'peak_scratch_bytes')}; "
         f"resource lease={metric(contribution_operations, 'resource_lease_peak_bytes')} bytes.",
+        f"- Candidate contributions: storage=`{memory['candidate_storage']}`; "
+        f"path={memory['candidate_storage_path'] or 'none'}; "
+        f"resident={memory['candidate_resident_bytes']} bytes.",
         f"- Source support: {graph['source_support']['count']} rows, "
         f"q50={graph['source_support']['q50']}, q95={graph['source_support']['q95']}, "
         f"q99={graph['source_support']['q99']} {graph['source_support']['unit']}; "
@@ -1373,6 +1718,7 @@ __all__ = [
     "load_entropy_presentation_artifact",
     "plot_candidate_bandwidth_summary",
     "plot_descriptor_space",
+    "plot_entropy_convergence",
     "plot_projected_entropy_densities",
     "render_diagnostics_json",
     "render_diagnostics_markdown",
