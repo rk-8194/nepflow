@@ -105,8 +105,11 @@ def test_canonical_point_defect_defaults_round_trip_without_chemistry_inference(
         },
     )
     path = write_config(tmp_path, rendered)
-    loaded = load_config(path).generation
+    loaded_config = load_config(path)
+    loaded = loaded_config.generation
     assert loaded.target_n_atoms == 128
+    assert loaded_config.selection.entropy.reference_measure_tolerance == pytest.approx(1.0e-6)
+    assert loaded_config.selection.entropy.reference_measure_chunk_size == 1024
     for field in fields:
         assert getattr(loaded, field) == getattr(expected, field)
     for field in (

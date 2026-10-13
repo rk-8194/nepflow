@@ -219,6 +219,8 @@ _ALLOWED_KEYS: dict[str, frozenset[str]] = {
             "entropy_local_radial_sigma",
             "entropy_local_angular_sigma",
             "entropy_local_species",
+            "entropy_reference_measure_tolerance",
+            "entropy_reference_measure_chunk_size",
             "entropy_whitening_tolerance",
             "entropy_whitening_regularization",
             "entropy_whitening_singular_policy",
