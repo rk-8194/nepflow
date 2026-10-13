@@ -92,12 +92,88 @@ logger = logging.getLogger(__name__)
 _EDGE_SPOOL_DTYPE = np.dtype(([("target", "<i8"), ("value", "<f8")]))
 _EDGE_SPOOL_HEADER = b"NEPFLOW-EXACT-EDGE-SPOOL\0v1\0target-i64-value-f64\0"
 _EDGE_SPOOL_RECORD_BYTES = int(_EDGE_SPOOL_DTYPE.itemsize)
+_INT64_MAX = int(np.iinfo(np.int64).max)
+_PUBLICATION_METADATA_RESERVE_BYTES = 16 * 1024
 
 
 def _validate_spool_limit(value: int | None, name: str) -> int | None:
     if value is None:
         return None
     return _validate_sparse_limit(value, name)
+
+
+def _checked_product(left: int, right: int, *, name: str) -> int:
+    """Multiply resource counts without allowing CSR-sized arithmetic to wrap."""
+
+    result = int(left) * int(right)
+    if result < 0 or result > _INT64_MAX:
+        raise ResourceCapacityError(
+            f"{name} exceeds the int64 capacity: {left} * {right} = {result}",
+            operation="entropy streamed candidate contributions planning",
+            requested_bytes=result if result >= 0 else None,
+            available_bytes=None,
+        )
+    return result
+
+
+def _checked_sum(values: Sequence[int], *, name: str) -> int:
+    result = 0
+    for value in values:
+        result += int(value)
+        if result < 0 or result > _INT64_MAX:
+            raise ResourceCapacityError(
+                f"{name} exceeds the int64 capacity: {result}",
+                operation="entropy streamed candidate contributions planning",
+                requested_bytes=result if result >= 0 else None,
+                available_bytes=None,
+            )
+    return result
+
+
+def _capacity_anchor(path: str | Path | None) -> Path:
+    """Return an existing path suitable for filesystem capacity/stat probes."""
+
+    candidate = Path(path) if path is not None else Path(tempfile.gettempdir())
+    if not candidate.is_absolute():
+        candidate = candidate.absolute()
+    while not candidate.exists() and candidate != candidate.parent:
+        candidate = candidate.parent
+    return candidate
+
+
+def _filesystem_device(path: str | Path | None) -> int | None:
+    try:
+        return int(os.stat(_capacity_anchor(path)).st_dev)
+    except OSError:
+        return None
+
+
+def _usable_bytes(path: str | Path | None) -> int | None:
+    try:
+        usage = shutil.disk_usage(str(_capacity_anchor(path)))
+        free = getattr(usage, "free", None)
+        if free is None and isinstance(usage, tuple) and len(usage) >= 3:
+            free = usage[2]
+        return int(free) if free is not None else None
+    except (AttributeError, OSError, TypeError, ValueError):
+        return None
+
+
+def _directory_bytes(path: str | Path | None) -> int:
+    if path is None:
+        return 0
+    root = Path(path)
+    if not root.exists():
+        return 0
+    try:
+        if root.is_file():
+            return int(root.stat().st_size)
+        return int(sum(child.stat().st_size for child in root.rglob("*") if child.is_file()))
+    except OSError:
+        # A failed probe must not make admission optimistic.  The write itself
+        # remains transactional and the resource lease still reserves the
+        # current spool plus the requested output.
+        return 0
 
 
 def _spool_write_header(handle: Any) -> Any:
@@ -2846,6 +2922,7 @@ def _publish_out_of_core_candidate_store(
         candidate_pmf_max_deviation = float(
             np.max(np.abs(np.add.reduceat(persisted_values, persisted_indptr[:-1]) - 1.0))
         )
+        del persisted_values, persisted_indptr
         file_entries: dict[str, dict[str, Any]] = {}
         for name, path in (
             ("candidate_indptr", indptr_path),
@@ -2860,6 +2937,7 @@ def _publish_out_of_core_candidate_store(
                 "shape": list(array.shape),
                 "sha256": _file_sha256(path),
             }
+            del array
         candidate_fingerprint = sha256_canonical_json(
             {
                 "schema": SPARSE_STREAMED_CANDIDATE_CONTRIBUTION_SCHEMA_VERSION,
@@ -2975,13 +3053,13 @@ def build_streamed_candidate_contributions(
     n_rows = int(values.shape[0])
     candidate_ids = tuple(pool.candidate_ids)
     candidate_count = len(candidate_ids)
-    maximum_entry_count = candidate_count * n_rows
-    if maximum_entry_count > np.iinfo(np.int64).max:
+    maximum_entry_count = int(candidate_count) * int(n_rows)
+    if maximum_entry_count > _INT64_MAX:
         raise ResourceCapacityError(
             "streamed candidate contributions exceed the int64 CSR capacity: "
             f"N={n_rows}, M={candidate_count}, Q_max={maximum_entry_count}",
             operation="entropy streamed candidate contributions",
-            requested_bytes=maximum_entry_count * 16,
+            requested_bytes=None,
             available_bytes=None,
         )
     if entry_limit is None:
@@ -3016,7 +3094,8 @@ def build_streamed_candidate_contributions(
         if derived_spool_limit:
             raise ResourceCapacityError(
                 "streamed candidate contributions have insufficient scratch capacity for "
-                "their temporary spool header",
+                "their temporary spool header; "
+                f"path={runtime_budget.budget.snapshot.scratch_path or tempfile.gettempdir()}",
                 operation="entropy streamed candidate contributions",
                 requested_bytes=len(_EDGE_SPOOL_HEADER),
                 available_bytes=runtime_budget.remaining_managed_budget,
@@ -3027,53 +3106,6 @@ def build_streamed_candidate_contributions(
         raise ValueError(
             "max_contribution_spool_bytes is too small for the candidate contribution spool header"
         )
-    prospective_final_bytes = int(8 * (candidate_count + 1 + candidate_count))
-    prospective_final_bytes += int(16 * maximum_entry_count)
-    if storage_mode == "auto":
-        storage_mode = (
-            "disk"
-            if storage_path is not None
-            or (byte_limit is not None and prospective_final_bytes > byte_limit)
-            or prospective_final_bytes > max(1, remaining_budget // 2)
-            else "memory"
-        )
-    if storage_mode == "memory" and prospective_final_bytes > remaining_budget:
-        raise ResourceCapacityError(
-            "in-memory candidate contribution plan exceeds the runtime memory allowance; "
-            "select storage='disk' for the exact out-of-core plan: "
-            f"N={n_rows}, M={candidate_count}, Q_max={maximum_entry_count}, "
-            f"required_bytes={prospective_final_bytes}, available_bytes={remaining_budget}",
-            operation="entropy streamed candidate contributions planning",
-            requested_bytes=prospective_final_bytes,
-            available_bytes=remaining_budget,
-        )
-    if derived_spool_limit:
-        prospective_scratch_bytes = int(len(_EDGE_SPOOL_HEADER) + 16 * int(entry_limit))
-        if storage_mode == "disk":
-            prospective_scratch_bytes += 8 * (candidate_count + 1 + candidate_count)
-        if prospective_scratch_bytes > spool_limit:
-            raise ResourceCapacityError(
-                "candidate contribution plan exceeds available scratch capacity: "
-                f"N={n_rows}, M={candidate_count}, Q_max={int(entry_limit)}, "
-                f"required_scratch_bytes={prospective_scratch_bytes}, "
-                f"scratch_available_bytes={spool_limit}",
-                operation="entropy streamed candidate contributions planning",
-                requested_bytes=prospective_scratch_bytes,
-                available_bytes=remaining_budget,
-                scratch_needed_bytes=prospective_scratch_bytes,
-                scratch_available_bytes=spool_limit,
-            )
-    logger.info(
-        "Candidate contribution storage plan: storage=%s, N=%d, M=%d, Q_max=%d, "
-        "prospective_final_bytes=%d, memory_limit=%s, scratch_limit=%d",
-        storage_mode,
-        n_rows,
-        candidate_count,
-        maximum_entry_count,
-        prospective_final_bytes,
-        byte_limit if byte_limit is not None else "unbounded",
-        spool_limit,
-    )
     owners = np.asarray(pool.row_candidate_indices, dtype=np.int64)
     source_counts = np.bincount(owners, minlength=candidate_count).astype(np.int64)
     if np.any(source_counts <= 0):
@@ -3084,8 +3116,62 @@ def build_streamed_candidate_contributions(
     candidate_offsets[0] = 0
     np.cumsum(source_counts, dtype=np.int64, out=candidate_offsets[1:])
 
-    initial_runtime_bytes = int(
-        16 * values.nbytes + owners.nbytes + source_order.nbytes + 256 * n_rows
+    fixed_output_bytes = _checked_sum(
+        (
+            _checked_product(candidate_count + 1, 8, name="candidate indptr bytes"),
+            _checked_product(candidate_count, 8, name="candidate source-count bytes"),
+        ),
+        name="fixed candidate CSR metadata bytes",
+    )
+    candidate_manifest_bytes = len(
+        json.dumps(list(candidate_ids), ensure_ascii=False, separators=(",", ":"))
+    )
+    publication_metadata_reserve = max(
+        _PUBLICATION_METADATA_RESERVE_BYTES,
+        _checked_sum(
+            (
+                8192,
+                candidate_manifest_bytes,
+                _checked_product(
+                    512,
+                    candidate_count,
+                    name="candidate publication metadata workspace",
+                ),
+            ),
+            name="candidate publication metadata bytes",
+        ),
+    )
+    initial_runtime_bytes = _checked_sum(
+        (
+            _checked_product(16, int(values.nbytes), name="descriptor planning workspace"),
+            int(owners.nbytes),
+            int(source_order.nbytes),
+            _checked_product(256, n_rows, name="candidate planning workspace"),
+        ),
+        name="initial candidate workspace bytes",
+    )
+    minimum_memory_plan_bytes = _checked_sum(
+        (initial_runtime_bytes, fixed_output_bytes),
+        name="minimum candidate contribution memory plan",
+    )
+    if storage_mode == "auto":
+        storage_mode = (
+            "disk"
+            if storage_path is not None
+            or minimum_memory_plan_bytes > max(1, remaining_budget // 2)
+            else "memory"
+        )
+    logger.info(
+        "Candidate contribution storage plan: storage=%s, N=%d, M=%d, "
+        "Q_max_theoretical=%d, minimum_memory_bytes=%d, memory_limit=%s, "
+        "scratch_limit=%d",
+        storage_mode,
+        n_rows,
+        candidate_count,
+        maximum_entry_count,
+        minimum_memory_plan_bytes,
+        byte_limit if byte_limit is not None else "unbounded",
+        spool_limit,
     )
     operator_fingerprint = _kernel_operator_fingerprint(pool, frozen)
     if storage_mode == "disk" and storage_path is not None:
@@ -3182,18 +3268,25 @@ def build_streamed_candidate_contributions(
             scratch_bytes=len(_EDGE_SPOOL_HEADER),
         )
     except ResourceCapacityError as exc:
+        scratch_available = runtime_budget.remaining_scratch_bytes
+        available_memory = (
+            exc.available_bytes
+            if exc.available_bytes is not None
+            else runtime_budget.remaining_managed_budget
+        )
         raise ResourceCapacityError(
             "streamed candidate contributions cannot reserve initial workspace: "
             f"N={n_rows}, M={candidate_count}, Q=0, E=0, "
+            f"path={runtime_budget.budget.snapshot.scratch_path or tempfile.gettempdir()}, "
             f"requested_bytes={initial_runtime_bytes}, "
-            f"available_bytes={runtime_budget.remaining_managed_budget}, "
-            f"scratch_available_bytes={runtime_budget.budget.scratch_budget_bytes}",
+            f"available_bytes={available_memory}, "
+            f"scratch_available_bytes={scratch_available}",
             operation="entropy streamed candidate contributions",
             requested_bytes=initial_runtime_bytes,
-            available_bytes=runtime_budget.remaining_managed_budget,
+            available_bytes=available_memory,
             reserved_headroom_bytes=runtime_budget.budget.reserved_headroom_bytes,
             scratch_needed_bytes=len(_EDGE_SPOOL_HEADER),
-            scratch_available_bytes=runtime_budget.budget.scratch_budget_bytes,
+            scratch_available_bytes=scratch_available,
         ) from exc
 
     try:
@@ -3232,31 +3325,70 @@ def build_streamed_candidate_contributions(
 
     def estimated_peak_bytes(entry_count: int, support_count: int) -> int:
         resident_entry_count = entry_count if storage_mode == "memory" else 0
-        final_arrays = 8 * (
-            candidate_count + 1 + resident_entry_count + resident_entry_count + candidate_count
+        final_arrays = _checked_sum(
+            (
+                _checked_product(
+                    8,
+                    candidate_count + 1,
+                    name="candidate indptr workspace",
+                ),
+                _checked_product(
+                    8,
+                    candidate_count,
+                    name="candidate source-count workspace",
+                ),
+                _checked_product(
+                    16,
+                    resident_entry_count,
+                    name="resident candidate contribution workspace",
+                ),
+            ),
+            name="candidate final-array workspace",
         )
-        workspace = (
-            values.nbytes
-            + owners.nbytes
-            + source_order.nbytes
-            + source_counts.nbytes
-            + candidate_offsets.nbytes
-            + 8 * n_rows
-            + n_rows
-            + 32 * support_count
-            + (support_provider.index.index_bytes if support_provider.index is not None else 0)
+        workspace = _checked_sum(
+            (
+                int(values.nbytes),
+                int(owners.nbytes),
+                int(source_order.nbytes),
+                int(source_counts.nbytes),
+                int(candidate_offsets.nbytes),
+                _checked_product(8, n_rows, name="support-size workspace"),
+                n_rows,
+                _checked_product(32, support_count, name="support query workspace"),
+                (
+                    support_provider.index.index_bytes
+                    if support_provider.index is not None
+                    else 0
+                ),
+            ),
+            name="candidate workspace",
         )
-        return int(final_arrays + workspace)
+        return _checked_sum((final_arrays, workspace), name="candidate peak workspace")
+
+    def candidate_output_bytes(entry_count: int) -> int:
+        return _checked_sum(
+            (
+                fixed_output_bytes,
+                _checked_product(
+                    16,
+                    entry_count,
+                    name="candidate contribution array bytes",
+                ),
+            ),
+            name="candidate contribution output bytes",
+        )
 
     logger.info(
         "Streamed candidate contributions started: N=%d, M=%d, operator=%s, "
-        "max_entries=%d, max_contribution_bytes=%s, max_spool_bytes=%d",
+        "max_entries=%d, max_contribution_bytes=%s, max_spool_bytes=%d, "
+        "Q_max_theoretical=%d",
         n_rows,
         candidate_count,
         operator_fingerprint,
         entry_limit,
         byte_limit if byte_limit is not None else "unbounded",
         spool_limit,
+        maximum_entry_count,
     )
     started = time.perf_counter()
     phase_seconds: dict[str, float] = {}
@@ -3422,31 +3554,142 @@ def build_streamed_candidate_contributions(
                 candidate_count,
             )
 
+    scratch_directory = runtime_budget.budget.snapshot.scratch_path or None
+    scratch_device = _filesystem_device(scratch_directory)
+    checkpoint_device = (
+        _filesystem_device(aggregation_checkpoint.root)
+        if aggregation_checkpoint is not None
+        else None
+    )
+    checkpoint_same_filesystem = aggregation_checkpoint is not None and (
+        scratch_device is None
+        or checkpoint_device is None
+        or scratch_device == checkpoint_device
+    )
+    checkpoint_bytes_on_disk = (
+        _directory_bytes(aggregation_checkpoint.root)
+        if checkpoint_same_filesystem and aggregation_checkpoint is not None
+        else 0
+    )
+    peak_finalization_reservation_bytes = 0
+
     def resize_workspace(
         requested_bytes: int,
         scratch_bytes: int,
         *,
         source_index: int | None = None,
+        candidate_index: int | None = None,
     ) -> None:
         try:
             lease.resize(requested_bytes, scratch_bytes=scratch_bytes)
             sample_lease()
         except ResourceCapacityError as exc:
+            scratch_available = runtime_budget.budget.scratch_budget_bytes
+            if scratch_available is not None:
+                scratch_available = max(
+                    0,
+                    int(scratch_available)
+                    - max(
+                        0,
+                        int(runtime_budget.reserved_scratch_bytes) - int(lease.scratch_bytes),
+                    ),
+                )
+            available_memory = (
+                exc.available_bytes
+                if exc.available_bytes is not None
+                else runtime_budget.remaining_managed_budget
+            )
             raise ResourceCapacityError(
                 "streamed candidate contributions exceed the runtime resource budget: "
                 f"N={n_rows}, M={candidate_count}, Q={q_observed}, E={implicit_edges}, "
+                f"candidate_index={candidate_index if candidate_index is not None else 'n/a'}, "
                 f"source={source_index if source_index is not None else 'n/a'}, "
+                f"path={scratch_directory or tempfile.gettempdir()}, "
                 f"requested_bytes={requested_bytes}, "
-                f"available_bytes={runtime_budget.remaining_managed_budget}, "
+                f"available_bytes={available_memory}, "
                 f"scratch_needed_bytes={scratch_bytes}, "
-                f"scratch_available_bytes={runtime_budget.budget.scratch_budget_bytes}",
+                f"scratch_available_bytes={scratch_available}",
                 operation="entropy streamed candidate contributions",
                 requested_bytes=requested_bytes,
-                available_bytes=runtime_budget.remaining_managed_budget,
+                available_bytes=available_memory,
                 reserved_headroom_bytes=runtime_budget.budget.reserved_headroom_bytes,
                 scratch_needed_bytes=scratch_bytes,
-                scratch_available_bytes=runtime_budget.budget.scratch_budget_bytes,
+                scratch_available_bytes=scratch_available,
             ) from exc
+
+    def admit_spool_append(
+        *,
+        candidate_index: int,
+        source_index: int,
+        entry_count: int,
+        record_count: int,
+    ) -> int:
+        """Admit one complete candidate row before it changes the spool."""
+
+        prospective_spool_bytes = _checked_sum(
+            (
+                spool_bytes,
+                _checked_product(
+                    record_count,
+                    _EDGE_SPOOL_RECORD_BYTES,
+                    name="candidate contribution spool records",
+                ),
+            ),
+            name="candidate contribution spool bytes",
+        )
+        candidate_label = candidate_ids[candidate_index]
+        path_text = str(scratch_directory or tempfile.gettempdir())
+        if entry_count > entry_limit:
+            raise ValueError(
+                "streamed candidate contributions exceed max_entries before candidate "
+                "spool append: "
+                f"path={path_text}, candidate_index={candidate_index}, "
+                f"candidate={candidate_label!r}, source_index={source_index}, "
+                f"Q={entry_count}, E={implicit_edges}, max_entries={entry_limit}"
+            )
+        if prospective_spool_bytes > spool_limit:
+            message = (
+                "streamed candidate contributions exceed the candidate spool allowance: "
+                f"path={path_text}, candidate_index={candidate_index}, "
+                f"candidate={candidate_label!r}, source_index={source_index}, "
+                f"Q={entry_count}, E={implicit_edges}, "
+                f"requested_scratch_bytes={prospective_spool_bytes}, "
+                f"available_scratch_bytes={spool_limit}, "
+                f"remaining_scratch_allowance={max(0, spool_limit - spool_bytes)}"
+            )
+            if derived_spool_limit:
+                raise ResourceCapacityError(
+                    message,
+                    operation="entropy streamed candidate contributions",
+                    requested_bytes=prospective_spool_bytes,
+                    available_bytes=runtime_budget.remaining_managed_budget,
+                    reserved_headroom_bytes=runtime_budget.budget.reserved_headroom_bytes,
+                    scratch_needed_bytes=prospective_spool_bytes,
+                    scratch_available_bytes=spool_limit,
+                )
+            raise ValueError(message)
+        if byte_limit is not None and candidate_output_bytes(entry_count) > byte_limit:
+            raise ValueError(
+                "streamed candidate contributions exceed max_contribution_bytes before "
+                "candidate spool append: "
+                f"path={path_text}, candidate_index={candidate_index}, "
+                f"candidate={candidate_label!r}, source_index={source_index}, "
+                f"Q={entry_count}, E={implicit_edges}, "
+                f"requested_bytes={candidate_output_bytes(entry_count)}, limit={byte_limit}"
+            )
+        prospective_scratch = prospective_spool_bytes
+        if checkpoint_same_filesystem:
+            prospective_scratch = _checked_sum(
+                (prospective_scratch, checkpoint_bytes_on_disk),
+                name="candidate spool and checkpoint scratch reservation",
+            )
+        resize_workspace(
+            estimated_peak_bytes(entry_count, 0),
+            prospective_scratch,
+            source_index=source_index,
+            candidate_index=candidate_index,
+        )
+        return prospective_spool_bytes
 
     def validate_q_invariants(candidate_index: int, source_index: int) -> None:
         nonlocal last_q_observed
@@ -3470,13 +3713,21 @@ def build_streamed_candidate_contributions(
         last_q_observed = q_observed
 
     peak_estimated_bytes = estimated_peak_bytes(0, 0)
-    if byte_limit is not None and peak_estimated_bytes > byte_limit:
+    if byte_limit is not None and candidate_output_bytes(0) > byte_limit:
         raise ValueError(
             "streamed candidate contributions exceed max_contribution_bytes before "
             "source enumeration: "
-            f"N={n_rows}, M={candidate_count}, Q=0, E=0, requested_bytes={peak_estimated_bytes}, "
+            f"N={n_rows}, M={candidate_count}, Q=0, E=0, "
+            f"requested_bytes={candidate_output_bytes(0)}, "
             f"limit={byte_limit}"
         )
+    minimum_scratch_reservation = _checked_sum(
+        (
+            len(_EDGE_SPOOL_HEADER),
+            checkpoint_bytes_on_disk if checkpoint_same_filesystem else 0,
+        ),
+        name="minimum candidate scratch reservation",
+    )
     spool_bytes = len(_EDGE_SPOOL_HEADER)
     completed_sources = resumed_sources
     next_percent = [1]
@@ -3502,17 +3753,30 @@ def build_streamed_candidate_contributions(
         if progress_callback is not None:
             progress_callback(completed_sources, n_rows)
 
+    publication_target_path: str | None = None
+    publication_target_free_bytes: int | None = None
+    publication_output_bytes = 0
+    publication_same_filesystem = False
+    publication_started = False
     source_phase_started = time.perf_counter()
     try:
-        scratch_directory = runtime_budget.budget.snapshot.scratch_path or None
+        resize_workspace(peak_estimated_bytes, minimum_scratch_reservation)
         with tempfile.TemporaryFile(mode="w+b", dir=scratch_directory) as spool:
             spool_digest = _spool_write_header(spool)
+            resumed_q_cursor = 0
             for completed_index in range(resume_candidate_count):
                 records = np.empty(
                     int(completed_rows[completed_index][0].size), dtype=_EDGE_SPOOL_DTYPE
                 )
                 records["target"] = completed_rows[completed_index][0]
                 records["value"] = completed_rows[completed_index][1]
+                resumed_q_cursor += int(records.shape[0])
+                prospective_spool_bytes = admit_spool_append(
+                    candidate_index=completed_index,
+                    source_index=int(candidate_offsets[completed_index + 1]) - 1,
+                    entry_count=resumed_q_cursor,
+                    record_count=int(records.shape[0]),
+                )
                 spool_started = time.perf_counter()
                 _spool_write_records(spool, spool_digest, records)
                 record_phase(
@@ -3520,7 +3784,7 @@ def build_streamed_candidate_contributions(
                     time.perf_counter() - spool_started,
                     bytes_count=int(records.nbytes),
                 )
-                spool_bytes += int(records.nbytes)
+                spool_bytes = prospective_spool_bytes
             for candidate_index in range(resume_candidate_count, candidate_count):
                 accumulator.fill(0.0)
                 touched.fill(False)
@@ -3621,10 +3885,20 @@ def build_streamed_candidate_contributions(
                     peak_estimated_bytes = max(peak_estimated_bytes, requested_bytes)
                     resize_workspace(
                         requested_bytes,
-                        spool_bytes,
+                        _checked_sum(
+                            (
+                                spool_bytes,
+                                checkpoint_bytes_on_disk
+                                if checkpoint_same_filesystem
+                                else 0,
+                            ),
+                            name="candidate spool and checkpoint reservation",
+                        ),
                         source_index=source_index,
+                        candidate_index=candidate_index,
                     )
-                    if byte_limit is not None and requested_bytes > byte_limit:
+                    resident_output_bytes = candidate_output_bytes(q_observed)
+                    if byte_limit is not None and resident_output_bytes > byte_limit:
                         raise ValueError(
                             "streamed candidate contributions exceed max_contribution_bytes: "
                             f"N={n_rows}, M={candidate_count}, "
@@ -3633,7 +3907,7 @@ def build_streamed_candidate_contributions(
                             f"h_a={scale:.17g}, Q_completed={q_completed}, "
                             f"Q_active={q_active}, Q_observed={q_observed}, "
                             f"E={implicit_edges}, requested_bytes={requested_bytes}, "
-                            f"limit={byte_limit}"
+                            f"resident_output_bytes={resident_output_bytes}, limit={byte_limit}"
                         )
                     report_source(source_index, support_count)
                     record_phase(
@@ -3683,33 +3957,12 @@ def build_streamed_candidate_contributions(
                         f"Q_observed={completed_entries}, E={implicit_edges}, "
                         f"max_entries={entry_limit}, failure=finalization"
                     )
-                prospective_spool_bytes = spool_bytes + support * _EDGE_SPOOL_RECORD_BYTES
-                if prospective_spool_bytes > spool_limit:
-                    if derived_spool_limit:
-                        raise ResourceCapacityError(
-                            "streamed candidate contributions exceed available scratch "
-                            "capacity: "
-                            f"N={n_rows}, M={candidate_count}, Q={completed_entries}, "
-                            f"E={implicit_edges}, candidate={candidate_ids[candidate_index]!r}, "
-                            f"requested_bytes={prospective_spool_bytes}, "
-                            f"scratch_available_bytes={spool_limit}",
-                            operation="entropy streamed candidate contributions",
-                            requested_bytes=prospective_spool_bytes,
-                            available_bytes=runtime_budget.remaining_managed_budget,
-                            reserved_headroom_bytes=runtime_budget.budget.reserved_headroom_bytes,
-                            scratch_needed_bytes=prospective_spool_bytes,
-                            scratch_available_bytes=spool_limit,
-                        )
-                    raise ValueError(
-                        "streamed candidate contribution spool exceeds its capacity: "
-                        f"N={n_rows}, M={candidate_count}, "
-                        f"candidate={candidate_ids[candidate_index]!r}, "
-                        f"n_C={stop_source - start_source}, "
-                        f"Q_completed={q_completed}, Q_active={q_active}, "
-                        f"Q_observed={completed_entries}, "
-                        f"E={implicit_edges}, "
-                        f"requested_bytes={prospective_spool_bytes}, limit={spool_limit}"
-                    )
+                prospective_spool_bytes = admit_spool_append(
+                    candidate_index=candidate_index,
+                    source_index=last_source_index,
+                    entry_count=completed_entries,
+                    record_count=support,
+                )
                 records = np.empty(support, dtype=_EDGE_SPOOL_DTYPE)
                 records["target"] = targets
                 records["value"] = values_for_candidate
@@ -3728,6 +3981,56 @@ def build_streamed_candidate_contributions(
                 q_observed = q_completed
                 validate_q_invariants(candidate_index, last_source_index)
                 if aggregation_checkpoint is not None:
+                    try:
+                        current_checkpoint_manifest_bytes = int(
+                            aggregation_checkpoint.manifest_path.stat().st_size
+                        )
+                    except OSError:
+                        current_checkpoint_manifest_bytes = 0
+                    checkpoint_manifest_reserve = max(
+                        publication_metadata_reserve,
+                        current_checkpoint_manifest_bytes + 4096,
+                    )
+                    checkpoint_write_bytes = _checked_sum(
+                        (
+                            int(targets.nbytes),
+                            int(values_for_candidate.nbytes),
+                            int(support_sizes[candidate_source_indices].nbytes),
+                            checkpoint_manifest_reserve,
+                        ),
+                        name="candidate aggregation checkpoint write bytes",
+                    )
+                    checkpoint_peak_bytes = _checked_sum(
+                        (checkpoint_bytes_on_disk, checkpoint_write_bytes),
+                        name="candidate aggregation checkpoint peak bytes",
+                    )
+                    if checkpoint_same_filesystem:
+                        resize_workspace(
+                            estimated_peak_bytes(q_completed, 0),
+                            _checked_sum(
+                                (spool_bytes, checkpoint_peak_bytes),
+                                name="candidate spool and checkpoint write reservation",
+                            ),
+                            source_index=last_source_index,
+                            candidate_index=candidate_index,
+                        )
+                    else:
+                        checkpoint_free = _usable_bytes(aggregation_checkpoint.root)
+                        if checkpoint_free is None or checkpoint_write_bytes > checkpoint_free:
+                            raise ResourceCapacityError(
+                                "candidate aggregation checkpoint has insufficient "
+                                "filesystem capacity: "
+                                f"path={aggregation_checkpoint.root}, "
+                                f"candidate_index={candidate_index}, "
+                                f"Q={q_completed}, E={implicit_edges}, "
+                                f"requested_scratch_bytes={checkpoint_write_bytes}, "
+                                f"available_scratch_bytes={checkpoint_free}",
+                                operation="entropy streamed candidate contributions",
+                                requested_bytes=estimated_peak_bytes(q_completed, 0),
+                                available_bytes=runtime_budget.remaining_managed_budget,
+                                scratch_needed_bytes=checkpoint_write_bytes,
+                                scratch_available_bytes=checkpoint_free,
+                            )
                     checkpoint_started = time.perf_counter()
                     aggregation_checkpoint.write_row(
                         candidate_index,
@@ -3749,6 +4052,11 @@ def build_streamed_candidate_contributions(
                         + support_sizes[candidate_source_indices].nbytes
                     )
                     checkpoint_writes += 1
+                    checkpoint_bytes_on_disk = (
+                        _directory_bytes(aggregation_checkpoint.root)
+                        if checkpoint_same_filesystem
+                        else checkpoint_bytes_on_disk
+                    )
                     record_phase(
                         "checkpoint_serialization",
                         checkpoint_elapsed,
@@ -3761,8 +4069,17 @@ def build_streamed_candidate_contributions(
                     sample_lease()
                 resize_workspace(
                     estimated_peak_bytes(q_completed, 0),
-                    spool_bytes,
+                    _checked_sum(
+                        (
+                            spool_bytes,
+                            checkpoint_bytes_on_disk
+                            if checkpoint_same_filesystem
+                            else 0,
+                        ),
+                        name="candidate spool and checkpoint reservation",
+                    ),
                     source_index=last_source_index,
+                    candidate_index=candidate_index,
                 )
 
             if completed_sources != n_rows:
@@ -3784,19 +4101,88 @@ def build_streamed_candidate_contributions(
                 )
             final_bytes = estimated_peak_bytes(entry_count, 0)
             peak_estimated_bytes = max(peak_estimated_bytes, final_bytes)
-            final_scratch_bytes = spool_bytes
-            if storage_mode == "disk":
-                final_scratch_bytes += int(
-                    8 * (candidate_count + 1 + candidate_count) + 16 * entry_count
-                )
-            resize_workspace(final_bytes, final_scratch_bytes)
-            if byte_limit is not None and final_bytes > byte_limit and storage_mode == "memory":
+            actual_output_bytes = candidate_output_bytes(entry_count)
+            if byte_limit is not None and actual_output_bytes > byte_limit:
                 raise ValueError(
                     "streamed candidate contributions exceed max_contribution_bytes "
                     "before final CSR: "
                     f"N={n_rows}, M={candidate_count}, Q={entry_count}, E={implicit_edges}, "
-                    f"requested_bytes={final_bytes}, limit={byte_limit}"
+                    f"requested_bytes={actual_output_bytes}, limit={byte_limit}"
                 )
+            final_scratch_bytes = _checked_sum(
+                (
+                    spool_bytes,
+                    checkpoint_bytes_on_disk if checkpoint_same_filesystem else 0,
+                ),
+                name="candidate finalization scratch reservation",
+            )
+            publication_output_bytes = 0
+            publication_target_free_bytes = None
+            publication_target_path = None
+            publication_same_filesystem = False
+            if storage_mode == "disk":
+                publication_target_path = str(
+                    Path(storage_path).parent
+                    if storage_path is not None
+                    else (scratch_directory or tempfile.gettempdir())
+                )
+                publication_output_bytes = _checked_sum(
+                    (actual_output_bytes, publication_metadata_reserve),
+                    name="out-of-core candidate publication bytes",
+                )
+                target_device = _filesystem_device(publication_target_path)
+                publication_same_filesystem = (
+                    scratch_device is None
+                    or target_device is None
+                    or scratch_device == target_device
+                )
+                publication_target_free_bytes = _usable_bytes(publication_target_path)
+                if publication_target_free_bytes is not None and (
+                    publication_output_bytes > publication_target_free_bytes
+                ):
+                    raise ResourceCapacityError(
+                        "out-of-core candidate publication has insufficient target "
+                        "filesystem capacity: "
+                        f"path={publication_target_path}, N={n_rows}, M={candidate_count}, "
+                        f"Q={entry_count}, E={implicit_edges}, "
+                        f"requested_scratch_bytes={publication_output_bytes}, "
+                        f"available_scratch_bytes={publication_target_free_bytes}",
+                        operation="entropy streamed candidate contribution publication",
+                        requested_bytes=final_bytes,
+                        available_bytes=runtime_budget.remaining_managed_budget,
+                        reserved_headroom_bytes=runtime_budget.budget.reserved_headroom_bytes,
+                        scratch_needed_bytes=publication_output_bytes,
+                        scratch_available_bytes=publication_target_free_bytes,
+                    )
+                if publication_target_free_bytes is None and not publication_same_filesystem:
+                    raise ResourceCapacityError(
+                        "out-of-core candidate publication target capacity is unknown: "
+                        f"path={publication_target_path}, N={n_rows}, M={candidate_count}, "
+                        f"Q={entry_count}, E={implicit_edges}, "
+                        f"requested_scratch_bytes={publication_output_bytes}",
+                        operation="entropy streamed candidate contribution publication",
+                        requested_bytes=final_bytes,
+                        available_bytes=runtime_budget.remaining_managed_budget,
+                        reserved_headroom_bytes=runtime_budget.budget.reserved_headroom_bytes,
+                        scratch_needed_bytes=publication_output_bytes,
+                        scratch_available_bytes=None,
+                    )
+                if publication_same_filesystem:
+                    final_scratch_bytes = _checked_sum(
+                        (final_scratch_bytes, publication_output_bytes),
+                        name="same-filesystem candidate publication reservation",
+                    )
+            peak_finalization_reservation_bytes = max(
+                peak_finalization_reservation_bytes,
+                final_scratch_bytes,
+                publication_output_bytes,
+            )
+            resize_workspace(
+                final_bytes,
+                final_scratch_bytes,
+                source_index=last_source_index,
+                candidate_index=candidate_count - 1,
+            )
             finalization_started = time.perf_counter()
             if storage_mode == "memory":
                 target_indices = np.empty(entry_count, dtype=np.int64)
@@ -3843,6 +4229,7 @@ def build_streamed_candidate_contributions(
                     sparse_schema_version=SPARSE_STREAMED_CANDIDATE_CONTRIBUTION_SCHEMA_VERSION,
                 )
             else:
+                publication_started = True
                 contributions = _publish_out_of_core_candidate_store(
                     directory=storage_path,
                     scratch_directory=scratch_directory,
@@ -3880,20 +4267,45 @@ def build_streamed_candidate_contributions(
         source_loop_seconds = max(0.0, time.perf_counter() - source_phase_started)
     except BaseException as exc:
         logger.error("Streamed candidate contributions failed: %s", exc)
+        failure_available_memory = runtime_budget.remaining_managed_budget
+        failure_available_scratch = runtime_budget.remaining_scratch_bytes
+        failure_scratch_needed = (
+            max(spool_bytes, peak_finalization_reservation_bytes)
+            if publication_started
+            else spool_bytes
+        )
         support_provider.close()
         lease.close()
         if isinstance(exc, OSError):
+            failure_path = (
+                publication_target_path
+                if publication_started
+                else str(scratch_directory or tempfile.gettempdir())
+            )
+            failure_operation = (
+                "entropy streamed candidate contribution publication"
+                if publication_started
+                else "entropy streamed candidate contributions"
+            )
+            failure_message = (
+                (
+                    "streamed candidate contribution publication could not be completed: "
+                    if publication_started
+                    else "streamed candidate contribution spool could not be created or written: "
+                )
+                + f"N={n_rows}, M={candidate_count}, Q={q_completed}, E={implicit_edges}, "
+                + f"path={failure_path}, "
+                + f"scratch_needed_bytes={failure_scratch_needed}, "
+                + f"scratch_available_bytes={failure_available_scratch}"
+            )
             raise ResourceCapacityError(
-                "streamed candidate contribution spool could not be created or written: "
-                f"N={n_rows}, M={candidate_count}, Q={q_completed}, E={implicit_edges}, "
-                f"scratch_needed_bytes={spool_bytes}, "
-                f"scratch_available_bytes={runtime_budget.budget.scratch_budget_bytes}",
-                operation="entropy streamed candidate contributions",
+                failure_message,
+                operation=failure_operation,
                 requested_bytes=peak_estimated_bytes,
-                available_bytes=runtime_budget.remaining_managed_budget,
+                available_bytes=failure_available_memory,
                 reserved_headroom_bytes=runtime_budget.budget.reserved_headroom_bytes,
-                scratch_needed_bytes=spool_bytes,
-                scratch_available_bytes=runtime_budget.budget.scratch_budget_bytes,
+                scratch_needed_bytes=failure_scratch_needed,
+                scratch_available_bytes=failure_available_scratch,
             ) from exc
         raise
 
@@ -3909,10 +4321,37 @@ def build_streamed_candidate_contributions(
         "candidate_count": candidate_count,
         "source_count": n_rows,
         "entry_count": int(q_completed),
+        "Q_max_theoretical": int(maximum_entry_count),
+        "Q": int(q_completed),
+        "actual_Q": int(q_completed),
+        "E": int(implicit_edges),
         "source_support_density_mean": float(np.mean(support_sizes)) / n_rows,
         "candidate_support_density_mean": float(np.mean(candidate_support_sizes)) / n_rows,
         "peak_estimated_workspace_bytes": int(peak_estimated_bytes),
+        "cumulative_spool_bytes": int(spool_bytes),
         "peak_scratch_bytes": int(max(peak_scratch_bytes, spool_bytes)),
+        "peak_finalization_reservation_bytes": int(peak_finalization_reservation_bytes),
+        "peak_finalization_scratch_bytes": int(peak_finalization_reservation_bytes),
+        "finalization_output_bytes": int(publication_output_bytes),
+        "peak_spool_bytes": int(spool_bytes),
+        "scratch_capacity_bytes": int(spool_limit),
+        "scratch_reserved_bytes": int(runtime_budget.reserved_scratch_bytes),
+        "scratch_capacity_by_mount": {
+            "spool": {
+                "path": str(scratch_directory or tempfile.gettempdir()),
+                "capacity_bytes": (
+                    int(runtime_budget.budget.scratch_budget_bytes)
+                    if runtime_budget.budget.scratch_budget_bytes is not None
+                    else None
+                ),
+            },
+            "publication": {
+                "path": publication_target_path,
+                "capacity_bytes": publication_target_free_bytes,
+                "same_filesystem_as_spool": publication_same_filesystem,
+                "reserved_bytes": int(publication_output_bytes),
+            },
+        },
         "resource_lease_peak_bytes": int(peak_lease_bytes),
         "checkpoint_writes": checkpoint_writes,
         "checkpoint_bytes": checkpoint_bytes,
