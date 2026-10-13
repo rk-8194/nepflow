@@ -850,6 +850,9 @@ class InformationEntropySelectionAlgorithm:
                     else int(bandwidth.calibration_batch_size)
                 ),
                 kernel_support_execution=str(getattr(bandwidth, "kernel_support_execution", "cpu")),
+                kernel_bandwidth_rule=str(
+                    getattr(bandwidth, "kernel_bandwidth_rule", "asymmetric_source")
+                ),
                 gpu_device=int(getattr(bandwidth, "gpu_device", 0)),
                 gpu_devices=getattr(bandwidth, "gpu_devices", None),
                 gpu_tile_size=int(getattr(bandwidth, "gpu_tile_size", 128)),
@@ -905,6 +908,7 @@ class InformationEntropySelectionAlgorithm:
             name: request.options[name]
             for name in (
                 "kernel_support_execution",
+                "kernel_bandwidth_rule",
                 "gpu_device",
                 "gpu_devices",
                 "gpu_tile_size",
@@ -926,6 +930,7 @@ class InformationEntropySelectionAlgorithm:
             checkpoint_path=request.options.get("calibration_checkpoint_path"),
             resume=bool(request.options.get("resume_checkpoints", True)),
             kernel_support_execution=bandwidth_settings.kernel_support_execution,
+            kernel_bandwidth_rule=bandwidth_settings.kernel_bandwidth_rule,
             gpu_device=bandwidth_settings.gpu_device,
             gpu_devices=bandwidth_settings.gpu_devices,
             gpu_tile_size=bandwidth_settings.gpu_tile_size,

@@ -37,6 +37,8 @@ from .models import (
     GPU_NEIGHBOUR_BACKEND_VERSION,
     INDEXED_NEIGHBOUR_BACKEND_ID,
     INDEXED_NEIGHBOUR_BACKEND_VERSION,
+    KERNEL_BANDWIDTH_RULE_ASYMMETRIC_SOURCE,
+    KERNEL_BANDWIDTH_RULE_SYMMETRIC_MAX,
     KERNEL_FAMILY,
     KERNEL_OPERATOR_SCHEMA_VERSION,
     KERNEL_SUPPORT_EXECUTION_CPU,
@@ -61,6 +63,7 @@ from .models import (
     SparseAtomicKernelGraph,
     SparseCandidateContributions,
     StreamedKernelExecutionSummary,
+    normalize_kernel_bandwidth_rule,
 )
 from .neighbours import (
     ExactKNNPrefixSupport,
@@ -153,6 +156,83 @@ def wendland_kernel(u: Any) -> float | np.ndarray:
 wendland_c2 = wendland_kernel
 wendland = wendland_kernel
 evaluate_wendland_kernel = wendland_kernel
+
+
+def effective_pair_bandwidths(
+    source_bandwidth: float,
+    target_bandwidths: np.ndarray,
+    *,
+    kernel_bandwidth_rule: str = KERNEL_BANDWIDTH_RULE_ASYMMETRIC_SOURCE,
+) -> np.ndarray:
+    """Evaluate the canonical effective bandwidth ``H(a, b)`` for one source.
+
+    ``target_bandwidths`` is ordered by target row ``b`` and ``source_bandwidth``
+    is the scalar ``h_a``.  This helper is intentionally CPU/reference-facing;
+    production support queries still use the legacy source-radius path until
+    the symmetric integration issue is complete.
+    """
+
+    rule = normalize_kernel_bandwidth_rule(kernel_bandwidth_rule)
+    source = float(source_bandwidth)
+    if not math.isfinite(source) or source <= 0.0:
+        raise ValueError("source_bandwidth must be finite and strictly positive")
+    targets = np.asarray(target_bandwidths)
+    if targets.dtype != np.dtype(np.float64):
+        raise ValueError("target_bandwidths must have dtype float64")
+    if targets.ndim != 1 or not np.all(np.isfinite(targets)) or np.any(targets <= 0.0):
+        raise ValueError("target_bandwidths must be a finite, strictly positive vector")
+    if rule == KERNEL_BANDWIDTH_RULE_ASYMMETRIC_SOURCE:
+        return np.full(targets.shape, source, dtype=np.float64)
+    return np.maximum(source, targets)
+
+
+def evaluate_raw_kernel_pairs(
+    distances: np.ndarray,
+    source_bandwidth: float,
+    target_bandwidths: np.ndarray,
+    *,
+    kernel_bandwidth_rule: str = KERNEL_BANDWIDTH_RULE_ASYMMETRIC_SOURCE,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return ``(H, strict_support, W)`` for one source column.
+
+    Support uses the strict FP64 predicate ``d < H``.  Distances and
+    bandwidths are required to be finite, so extreme finite ratios that are
+    outside support are screened without evaluating an infinite ratio.  A
+    positive in-support Wendland value that underflows in FP64 remains zero;
+    no floor or other noncanonical substitute is introduced.  Coincident rows
+    therefore retain their multiplicity and receive the exact value
+    ``wendland_kernel(0) == 1``.
+    """
+
+    distance_values = np.asarray(distances)
+    targets = np.asarray(target_bandwidths)
+    if distance_values.dtype != np.dtype(np.float64):
+        raise ValueError("distances must have dtype float64")
+    if targets.dtype != np.dtype(np.float64):
+        raise ValueError("target_bandwidths must have dtype float64")
+    if distance_values.ndim != 1:
+        raise ValueError("distances must be a one-dimensional vector")
+    if targets.ndim != 1 or targets.shape != distance_values.shape:
+        raise ValueError("target_bandwidths must align with distances")
+    if not np.all(np.isfinite(distance_values)) or np.any(distance_values < 0.0):
+        raise ValueError("distances must be finite and non-negative")
+    effective = effective_pair_bandwidths(
+        source_bandwidth,
+        targets,
+        kernel_bandwidth_rule=kernel_bandwidth_rule,
+    )
+    supported = distance_values < effective
+    raw = np.zeros(distance_values.shape, dtype=np.float64)
+    if np.any(supported):
+        with np.errstate(divide="raise", over="raise", invalid="raise"):
+            ratios = distance_values[supported] / effective[supported]
+        raw[supported] = np.asarray(wendland_kernel(ratios), dtype=np.float64)
+    return effective, supported, raw
+
+
+# Descriptive aliases make the reference contract discoverable without
+# proliferating independent implementations.
+evaluate_raw_kernel = evaluate_raw_kernel_pairs
 
 
 @dataclass(frozen=True, slots=True)
@@ -851,6 +931,7 @@ def normalized_kernel_matrix(
     chunk_size: int = 1024,
     max_dense_entries: int = 1_000_000,
     max_radius_query_bytes: int | None = None,
+    kernel_bandwidth_rule: str = KERNEL_BANDWIDTH_RULE_ASYMMETRIC_SOURCE,
 ) -> np.ndarray:
     """Build a deliberately bounded dense oracle for small correctness tests.
 
@@ -860,15 +941,42 @@ def normalized_kernel_matrix(
     """
 
     values = _validate_descriptors(descriptors)
-    _validate_bandwidths(bandwidths, values.shape[0])
+    scales = _validate_bandwidths(bandwidths, values.shape[0])
+    rule = normalize_kernel_bandwidth_rule(kernel_bandwidth_rule)
     if isinstance(max_dense_entries, bool) or not isinstance(max_dense_entries, int):
         raise ValueError("max_dense_entries must be a positive integer")
     if max_dense_entries < 1 or values.shape[0] * values.shape[0] > max_dense_entries:
         raise ValueError("dense normalized kernel oracle exceeds its explicit memory bound")
     matrix = np.zeros((values.shape[0], values.shape[0]), dtype=np.float64)
+    if rule == KERNEL_BANDWIDTH_RULE_SYMMETRIC_MAX:
+        # Deliberately dense and bounded: this is the small CPU oracle only.
+        # Rows are targets and columns are sources, matching the production
+        # source-column orientation.
+        for source_index in range(values.shape[0]):
+            with np.errstate(over="raise", invalid="raise"):
+                try:
+                    distances = np.sqrt(
+                        np.sum((values - values[source_index]) ** 2, axis=1)
+                    )
+                except FloatingPointError as exc:
+                    raise ValueError("kernel distance overflowed or became invalid") from exc
+            _effective, _supported, raw = evaluate_raw_kernel_pairs(
+                distances,
+                float(scales[source_index]),
+                scales,
+                kernel_bandwidth_rule=rule,
+            )
+            normaliser = float(np.sum(raw, dtype=np.float64))
+            if not math.isfinite(normaliser) or normaliser <= 0.0:
+                raise ValueError(f"source kernel normaliser is invalid for source {source_index}")
+            matrix[:, source_index] = raw / normaliser
+        totals = np.sum(matrix, axis=0, dtype=np.float64)
+        if not np.allclose(totals, 1.0, rtol=0.0, atol=1.0e-12):
+            raise ValueError("reference normalized source kernel columns do not sum to one")
+        return matrix
     for column in iter_normalized_kernel_columns(
         values,
-        np.asarray(bandwidths, dtype=np.float64),
+        scales,
         chunk_size=chunk_size,
         max_radius_query_bytes=max_radius_query_bytes,
     ):
@@ -904,10 +1012,18 @@ def evaluate_leave_one_out_objective(
     gpu_devices: Sequence[int] | str | int | None = None,
     gpu_tile_size: int = 128,
     max_gpu_support_bytes: int | None = None,
+    kernel_bandwidth_rule: str = KERNEL_BANDWIDTH_RULE_ASYMMETRIC_SOURCE,
     knn_support: ExactNeighbourResult | None = None,
     knn_support_row_ids: Sequence[str] | None = None,
 ) -> LeaveOneOutObjective:
     """Evaluate the exact source-normalized finite-pool LOO objective."""
+
+    bandwidth_rule = normalize_kernel_bandwidth_rule(kernel_bandwidth_rule)
+    if bandwidth_rule != KERNEL_BANDWIDTH_RULE_ASYMMETRIC_SOURCE:
+        raise ValueError(
+            "symmetric_max leave-one-out evaluation is not integrated in this release; "
+            "use normalized_kernel_matrix as the bounded CPU reference oracle"
+        )
 
     if checkpoint_path is not None:
         batched = evaluate_leave_one_out_objectives(
@@ -1086,6 +1202,7 @@ def evaluate_leave_one_out_objectives(
     gpu_devices: Sequence[int] | str | int | None = None,
     gpu_tile_size: int = 128,
     max_gpu_support_bytes: int | None = None,
+    kernel_bandwidth_rule: str = KERNEL_BANDWIDTH_RULE_ASYMMETRIC_SOURCE,
     knn_support: ExactNeighbourResult | None = None,
     knn_support_row_ids: Sequence[str] | None = None,
 ) -> tuple[LeaveOneOutObjective, ...]:
@@ -1099,6 +1216,13 @@ def evaluate_leave_one_out_objectives(
     with a final durable cursor and a bounded rolling retention policy; it
     never changes the accumulation order.
     """
+
+    bandwidth_rule = normalize_kernel_bandwidth_rule(kernel_bandwidth_rule)
+    if bandwidth_rule != KERNEL_BANDWIDTH_RULE_ASYMMETRIC_SOURCE:
+        raise ValueError(
+            "symmetric_max leave-one-out evaluation is not integrated in this release; "
+            "use normalized_kernel_matrix as the bounded CPU reference oracle"
+        )
 
     values = _validate_descriptors(descriptors)
     masses = np.asarray(probabilities)
@@ -1841,6 +1965,11 @@ def _validate_sparse_graph_inputs(
         )
     if frozen.metric != NEIGHBOUR_METRIC:
         raise ValueError("sparse kernel construction requires the exact Euclidean metric")
+    if frozen.kernel_bandwidth_rule != KERNEL_BANDWIDTH_RULE_ASYMMETRIC_SOURCE:
+        raise ValueError(
+            "symmetric_max bandwidths are reference-only in this release; "
+            "production sparse kernel construction is not yet integrated"
+        )
     candidate_ids = tuple(pool.candidate_ids)
     if not candidate_ids or len(set(candidate_ids)) != len(candidate_ids):
         raise ValueError("entropy pool candidate IDs must be non-empty and unique")
@@ -1866,7 +1995,7 @@ def _graph_fingerprint(
     target_indices: np.ndarray,
     values: np.ndarray,
 ) -> str:
-    payload = {
+    payload: dict[str, Any] = {
         "schema": SPARSE_KERNEL_GRAPH_SCHEMA_VERSION,
         "pool": pool.fingerprint,
         "transform": pool.transform_fingerprint,
@@ -1890,6 +2019,9 @@ def _graph_fingerprint(
         "target_indices": _array_digest(target_indices),
         "values": _array_digest(values),
     }
+    if bandwidths.kernel_bandwidth_rule != KERNEL_BANDWIDTH_RULE_ASYMMETRIC_SOURCE:
+        payload["kernel_bandwidth_rule"] = bandwidths.kernel_bandwidth_rule
+        payload["kernel_bandwidth_rule_version"] = bandwidths.kernel_bandwidth_rule_version
     return sha256_canonical_json(payload)
 
 
@@ -1899,34 +2031,36 @@ def _kernel_operator_fingerprint(
 ) -> str:
     """Fingerprint the exact kernel operator without materialising its support."""
 
-    return sha256_canonical_json(
-        {
-            "schema": KERNEL_OPERATOR_SCHEMA_VERSION,
-            "pool": pool.fingerprint,
-            "transform": pool.transform_fingerprint,
-            "representation": pool.representation_fingerprint,
-            "candidate_ids": list(pool.candidate_ids),
-            "row_candidate_indices": _array_digest(pool.row_candidate_indices),
-            "bandwidth": bandwidths.fingerprint,
-            "bandwidth_values": _array_digest(bandwidths.bandwidths),
-            "k": bandwidths.k,
-            "c": bandwidths.c,
-            "neighbour_backend": bandwidths.backend,
-            "neighbour_backend_version": bandwidths.backend_version,
-            "neighbour_backend_fingerprint": bandwidths.backend_fingerprint,
-            "metric": bandwidths.metric,
-            "distinct_location_policy": "exact-coordinate-location-v1",
-            "kernel_family": KERNEL_FAMILY,
-            "kernel_version": KERNEL_VERSION,
-            "normalization": "finite-pool-source-column-v1",
-            "source_bandwidth_orientation": "h_a",
-            "duplicate_target_policy": "retain-all-original-pool-rows-v1",
-            "source_reduction_order": "candidate-id-then-original-source-index-v1",
-            "target_order": "ascending-original-pool-row-index",
-            "dtype": "float64",
-            "numerical_tolerance": SPARSE_NUMERICAL_TOLERANCE,
-        }
-    )
+    payload: dict[str, Any] = {
+        "schema": KERNEL_OPERATOR_SCHEMA_VERSION,
+        "pool": pool.fingerprint,
+        "transform": pool.transform_fingerprint,
+        "representation": pool.representation_fingerprint,
+        "candidate_ids": list(pool.candidate_ids),
+        "row_candidate_indices": _array_digest(pool.row_candidate_indices),
+        "bandwidth": bandwidths.fingerprint,
+        "bandwidth_values": _array_digest(bandwidths.bandwidths),
+        "k": bandwidths.k,
+        "c": bandwidths.c,
+        "neighbour_backend": bandwidths.backend,
+        "neighbour_backend_version": bandwidths.backend_version,
+        "neighbour_backend_fingerprint": bandwidths.backend_fingerprint,
+        "metric": bandwidths.metric,
+        "distinct_location_policy": "exact-coordinate-location-v1",
+        "kernel_family": KERNEL_FAMILY,
+        "kernel_version": KERNEL_VERSION,
+        "normalization": "finite-pool-source-column-v1",
+        "source_bandwidth_orientation": "h_a",
+        "duplicate_target_policy": "retain-all-original-pool-rows-v1",
+        "source_reduction_order": "candidate-id-then-original-source-index-v1",
+        "target_order": "ascending-original-pool-row-index",
+        "dtype": "float64",
+        "numerical_tolerance": SPARSE_NUMERICAL_TOLERANCE,
+    }
+    if bandwidths.kernel_bandwidth_rule != KERNEL_BANDWIDTH_RULE_ASYMMETRIC_SOURCE:
+        payload["kernel_bandwidth_rule"] = bandwidths.kernel_bandwidth_rule
+        payload["kernel_bandwidth_rule_version"] = bandwidths.kernel_bandwidth_rule_version
+    return sha256_canonical_json(payload)
 
 
 def _report_graph_progress(
@@ -3778,6 +3912,8 @@ evaluate_loo_objective = evaluate_leave_one_out_objective
 
 
 __all__ = [
+    "KERNEL_BANDWIDTH_RULE_ASYMMETRIC_SOURCE",
+    "KERNEL_BANDWIDTH_RULE_SYMMETRIC_MAX",
     "KERNEL_FAMILY",
     "KERNEL_VERSION",
     "KERNEL_OPERATOR_SCHEMA_VERSION",
@@ -3812,6 +3948,9 @@ __all__ = [
     "evaluate_leave_one_out_batch",
     "evaluate_loo_objective",
     "evaluate_wendland_kernel",
+    "effective_pair_bandwidths",
+    "evaluate_raw_kernel",
+    "evaluate_raw_kernel_pairs",
     "iter_normalized_kernel_columns",
     "normalised_kernel_matrix",
     "normalized_kernel_matrix",

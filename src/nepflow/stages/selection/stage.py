@@ -384,6 +384,17 @@ class SelectionStage:
                 raise ValueError(
                     "selection.entropy.optimizer_method must be lazy_greedy or full_greedy"
                 )
+            kernel_bandwidth_rule = getattr(
+                entropy.bandwidth, "kernel_bandwidth_rule", "asymmetric_source"
+            )
+            if kernel_bandwidth_rule not in {
+                "asymmetric_source",
+                "symmetric_max",
+            }:
+                raise ValueError(
+                    "selection.entropy.bandwidth.kernel_bandwidth_rule must be "
+                    "asymmetric_source or symmetric_max"
+                )
             EntropyBandwidthSettings(
                 mode=entropy.bandwidth.mode,
                 k=entropy.bandwidth.k,
@@ -400,6 +411,7 @@ class SelectionStage:
                 max_calibration_work_bytes=entropy.bandwidth.max_calibration_work_bytes,
                 calibration_batch_size=entropy.bandwidth.calibration_batch_size,
                 kernel_support_execution=entropy.bandwidth.kernel_support_execution,
+                kernel_bandwidth_rule=kernel_bandwidth_rule,
                 gpu_device=entropy.bandwidth.gpu_device,
                 gpu_devices=entropy.bandwidth.gpu_devices,
                 gpu_tile_size=entropy.bandwidth.gpu_tile_size,

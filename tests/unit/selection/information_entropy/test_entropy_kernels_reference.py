@@ -4,7 +4,9 @@ import numpy as np
 import pytest
 
 from nepflow.stages.selection.algorithms.information_entropy.kernels import (
+    effective_pair_bandwidths,
     evaluate_leave_one_out_objective,
+    evaluate_raw_kernel_pairs,
     normalized_kernel_matrix,
     source_normalisers,
     wendland_kernel,
@@ -65,6 +67,49 @@ def test_source_bandwidth_orientation_and_loo_source_exclusion() -> None:
     assert objective.valid
     assert objective.objective is not None
     assert np.all(objective.probabilities > 0.0)
+
+
+def test_symmetric_max_reference_has_symmetric_raw_weights_and_normalized_columns() -> None:
+    descriptors = np.asarray([[0.0], [1.5], [3.0]], dtype=np.float64)
+    bandwidths = np.asarray([1.0, 2.0, 1.0], dtype=np.float64)
+    matrix = normalized_kernel_matrix(
+        descriptors,
+        bandwidths,
+        kernel_bandwidth_rule="symmetric_max",
+    )
+    raw_columns = []
+    for source_index in range(len(descriptors)):
+        distances = np.abs(descriptors[:, 0] - descriptors[source_index, 0])
+        _effective, _support, raw = evaluate_raw_kernel_pairs(
+            distances,
+            float(bandwidths[source_index]),
+            bandwidths,
+            kernel_bandwidth_rule="symmetric_max",
+        )
+        raw_columns.append(raw)
+    raw_matrix = np.column_stack(raw_columns)
+    np.testing.assert_array_equal(raw_matrix, raw_matrix.T)
+    np.testing.assert_allclose(np.sum(matrix, axis=0), 1.0)
+
+    asymmetric = normalized_kernel_matrix(descriptors, bandwidths)
+    assert not np.array_equal(asymmetric, matrix)
+
+
+def test_raw_reference_is_strict_at_boundary_and_retains_duplicate_multiplicity() -> None:
+    effective = effective_pair_bandwidths(
+        1.0,
+        np.asarray([1.0, 1.0, 2.0], dtype=np.float64),
+        kernel_bandwidth_rule="symmetric_max",
+    )
+    _effective, support, raw = evaluate_raw_kernel_pairs(
+        np.asarray([1.0, 0.0, 0.0], dtype=np.float64),
+        1.0,
+        np.asarray([1.0, 1.0, 2.0], dtype=np.float64),
+        kernel_bandwidth_rule="symmetric_max",
+    )
+    np.testing.assert_array_equal(effective, _effective)
+    assert support.tolist() == [False, True, True]
+    np.testing.assert_array_equal(raw, [0.0, 1.0, 1.0])
 
 
 def test_dense_kernel_oracle_has_an_explicit_memory_guard() -> None:

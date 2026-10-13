@@ -36,6 +36,15 @@ CALIBRATION_OPTIMIZER_ID = "bounded-grid"
 CALIBRATION_OPTIMIZER_VERSION = "bounded-grid-v1"
 KERNEL_FAMILY = "wendland_c2"
 KERNEL_VERSION = "wendland-c2-v1"
+# Scientific bandwidth rules are deliberately versioned independently from the
+# Wendland family.  ``asymmetric_source`` is the pre-existing production
+# convention; ``symmetric_max`` is currently a CPU reference/oracle rule.
+KERNEL_BANDWIDTH_RULE_ASYMMETRIC_SOURCE = "asymmetric_source"
+KERNEL_BANDWIDTH_RULE_SYMMETRIC_MAX = "symmetric_max"
+KERNEL_BANDWIDTH_RULES = frozenset(
+    {KERNEL_BANDWIDTH_RULE_ASYMMETRIC_SOURCE, KERNEL_BANDWIDTH_RULE_SYMMETRIC_MAX}
+)
+KERNEL_BANDWIDTH_RULE_SYMMETRIC_MAX_VERSION = "symmetric-max-cpu-reference-v1"
 SPARSE_KERNEL_GRAPH_SCHEMA_VERSION = "sparse-atomic-kernel-graph-v1"
 SPARSE_CANDIDATE_CONTRIBUTION_SCHEMA_VERSION = "sparse-candidate-contributions-v1"
 SPARSE_STREAMED_CANDIDATE_CONTRIBUTION_SCHEMA_VERSION = "sparse-candidate-contributions-streamed-v1"
@@ -48,6 +57,26 @@ DEFAULT_RADIUS_QUERY_BYTES = 256 * 1024 * 1024
 # setting: it changes only restart granularity and never source order or
 # floating-point accumulation order.
 DEFAULT_LOO_CHECKPOINT_EVERY_SOURCES = 4096
+
+
+def normalize_kernel_bandwidth_rule(value: Any) -> str:
+    """Return the canonical scientific kernel-bandwidth rule name."""
+
+    rule = str(value).strip().lower()
+    if rule not in KERNEL_BANDWIDTH_RULES:
+        allowed = ", ".join(sorted(KERNEL_BANDWIDTH_RULES))
+        raise ValueError(f"kernel_bandwidth_rule must be one of: {allowed}")
+    return rule
+
+
+def kernel_bandwidth_rule_version(rule: str) -> str:
+    """Return the reserved version identifier for a non-legacy rule."""
+
+    normalized = normalize_kernel_bandwidth_rule(rule)
+    if normalized == KERNEL_BANDWIDTH_RULE_SYMMETRIC_MAX:
+        return KERNEL_BANDWIDTH_RULE_SYMMETRIC_MAX_VERSION
+    # The empty value intentionally preserves legacy asymmetric identities.
+    return ""
 
 
 def _readonly_float_array(value: Any, *, name: str) -> np.ndarray:
@@ -107,6 +136,7 @@ class EntropyBandwidthSettings:
     max_calibration_work_bytes: int | None = None
     calibration_batch_size: int | None = None
     kernel_support_execution: str = KERNEL_SUPPORT_EXECUTION_CPU
+    kernel_bandwidth_rule: str = KERNEL_BANDWIDTH_RULE_ASYMMETRIC_SOURCE
     gpu_device: int = 0
     gpu_devices: Sequence[int] | str | int | None = None
     gpu_tile_size: int = 128
@@ -132,6 +162,7 @@ class EntropyBandwidthSettings:
             support_execution = KERNEL_SUPPORT_EXECUTION_CPU
         if support_execution not in KERNEL_SUPPORT_EXECUTIONS:
             raise ValueError("kernel_support_execution must be 'cpu' or 'exact_tiled_gpu'")
+        bandwidth_rule = normalize_kernel_bandwidth_rule(self.kernel_bandwidth_rule)
         if (
             isinstance(self.gpu_device, bool)
             or not isinstance(self.gpu_device, (int, np.integer))
@@ -220,6 +251,7 @@ class EntropyBandwidthSettings:
         if self.backend in GPU_NEIGHBOUR_BACKEND_ALIASES:
             object.__setattr__(self, "backend", GPU_NEIGHBOUR_BACKEND_ID)
         object.__setattr__(self, "kernel_support_execution", support_execution)
+        object.__setattr__(self, "kernel_bandwidth_rule", bandwidth_rule)
         object.__setattr__(self, "gpu_device", int(self.gpu_device))
         object.__setattr__(self, "gpu_devices", normalized_devices)
         object.__setattr__(self, "gpu_tile_size", int(self.gpu_tile_size))
@@ -380,6 +412,8 @@ class FrozenBandwidths:
     schema_version: str = BANDWIDTH_SCHEMA_VERSION
     backend_version: str = NEIGHBOUR_BACKEND_VERSION
     backend_fingerprint: str = ""
+    kernel_bandwidth_rule: str = KERNEL_BANDWIDTH_RULE_ASYMMETRIC_SOURCE
+    kernel_bandwidth_rule_version: str = ""
 
     @property
     def h(self) -> np.ndarray:
@@ -426,11 +460,20 @@ class FrozenBandwidths:
                 "bandwidth backend version does not match its configured backend: "
                 f"{self.backend!r} requires {expected_backend_version!r}"
             )
+        bandwidth_rule = normalize_kernel_bandwidth_rule(self.kernel_bandwidth_rule)
+        expected_rule_version = kernel_bandwidth_rule_version(bandwidth_rule)
+        if self.kernel_bandwidth_rule_version not in {"", expected_rule_version}:
+            raise ValueError(
+                "kernel bandwidth rule version does not match its configured rule: "
+                f"{bandwidth_rule!r} requires {expected_rule_version!r}"
+            )
         object.__setattr__(self, "backend", backend)
         object.__setattr__(self, "radii", radii)
         object.__setattr__(self, "bandwidths", bandwidths)
         object.__setattr__(self, "k", int(self.k))
         object.__setattr__(self, "c", float(self.c))
+        object.__setattr__(self, "kernel_bandwidth_rule", bandwidth_rule)
+        object.__setattr__(self, "kernel_bandwidth_rule_version", expected_rule_version)
 
 
 @dataclass(frozen=True, slots=True)
@@ -503,6 +546,12 @@ class BandwidthCalibrationResult:
             for candidate_c in self.c_domain
         )
 
+    @property
+    def kernel_bandwidth_rule(self) -> str:
+        """Scientific pair-bandwidth rule used by the selected bandwidths."""
+
+        return self.selected.kernel_bandwidth_rule
+
     def __post_init__(self) -> None:
         if self.mode not in {"manual", "automatic"}:
             raise ValueError("calibration mode must be manual or automatic")
@@ -536,6 +585,19 @@ class KernelMetadata:
     normalization: str = "finite-pool-source-column-v1"
     source_bandwidth_orientation: str = "h_b"
     self_membership: bool = True
+    kernel_bandwidth_rule: str = KERNEL_BANDWIDTH_RULE_ASYMMETRIC_SOURCE
+    kernel_bandwidth_rule_version: str = ""
+
+    def __post_init__(self) -> None:
+        rule = normalize_kernel_bandwidth_rule(self.kernel_bandwidth_rule)
+        version = kernel_bandwidth_rule_version(rule)
+        if self.kernel_bandwidth_rule_version not in {"", version}:
+            raise ValueError(
+                "kernel bandwidth rule version does not match its configured rule: "
+                f"{rule!r} requires {version!r}"
+            )
+        object.__setattr__(self, "kernel_bandwidth_rule", rule)
+        object.__setattr__(self, "kernel_bandwidth_rule_version", version)
 
 
 @dataclass(frozen=True, slots=True)
@@ -2035,6 +2097,10 @@ __all__ = [
     "FrozenBandwidths",
     "InformationEntropyConfig",
     "KernelMetadata",
+    "KERNEL_BANDWIDTH_RULE_ASYMMETRIC_SOURCE",
+    "KERNEL_BANDWIDTH_RULE_SYMMETRIC_MAX",
+    "KERNEL_BANDWIDTH_RULE_SYMMETRIC_MAX_VERSION",
+    "KERNEL_BANDWIDTH_RULES",
     "KERNEL_FAMILY",
     "KERNEL_VERSION",
     "NEIGHBOUR_BACKEND_ID",
@@ -2071,4 +2137,6 @@ __all__ = [
     "GreedySelectionPerformance",
     "GreedySelectionResult",
     "GreedySelectionStep",
+    "kernel_bandwidth_rule_version",
+    "normalize_kernel_bandwidth_rule",
 ]

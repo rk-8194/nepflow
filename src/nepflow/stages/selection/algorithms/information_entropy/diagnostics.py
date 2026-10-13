@@ -23,6 +23,7 @@ from nepflow.io.atomic import atomic_write_stream
 from nepflow.io.hashing import sha256_bytes, sha256_canonical_json, sha256_file
 
 from .models import (
+    KERNEL_BANDWIDTH_RULE_ASYMMETRIC_SOURCE,
     SPARSE_NUMERICAL_TOLERANCE,
     BandwidthCalibrationResult,
     CalibrationAttempt,
@@ -34,6 +35,8 @@ from .models import (
     SparseAtomicKernelGraph,
     SparseCandidateContributions,
     StreamedKernelExecutionSummary,
+    kernel_bandwidth_rule_version,
+    normalize_kernel_bandwidth_rule,
 )
 
 DIAGNOSTICS_SCHEMA_VERSION = "entropy-scientific-diagnostics-v3"
@@ -827,6 +830,21 @@ class EntropyScientificDiagnostics:
         return self.scientific_fingerprint
 
     @property
+    def kernel_bandwidth_rule(self) -> str:
+        """Return the persisted scientific pair-bandwidth rule."""
+
+        if self.bandwidths is not None:
+            return self.bandwidths.kernel_bandwidth_rule
+        if self.calibration is not None:
+            return self.calibration.kernel_bandwidth_rule
+        manifest = self._calibration_manifest()
+        if manifest is not None:
+            return normalize_kernel_bandwidth_rule(
+                manifest.get("kernel_bandwidth_rule", KERNEL_BANDWIDTH_RULE_ASYMMETRIC_SOURCE)
+            )
+        return KERNEL_BANDWIDTH_RULE_ASYMMETRIC_SOURCE
+
+    @property
     def whitening_manifest(self) -> dict[str, Any]:
         return json.loads(self.whitening_manifest_json)
 
@@ -1240,7 +1258,7 @@ def recompute_final_entropy_metrics(
 def calibration_manifest(calibration: BandwidthCalibrationResult) -> dict[str, Any]:
     """Serialize the complete ordered calibration trace without telemetry."""
 
-    return {
+    manifest = {
         "mode": calibration.mode,
         "k_domain": list(calibration.k_domain),
         "c_domain": list(calibration.c_domain),
@@ -1262,6 +1280,12 @@ def calibration_manifest(calibration: BandwidthCalibrationResult) -> dict[str, A
         "backend_fingerprint": calibration.backend_fingerprint,
         "metric": calibration.selected.metric,
     }
+    if calibration.kernel_bandwidth_rule != KERNEL_BANDWIDTH_RULE_ASYMMETRIC_SOURCE:
+        manifest["kernel_bandwidth_rule"] = calibration.kernel_bandwidth_rule
+        manifest["kernel_bandwidth_rule_version"] = (
+            calibration.selected.kernel_bandwidth_rule_version
+        )
+    return manifest
 
 
 def calibration_attempt_manifest(attempt: CalibrationAttempt) -> dict[str, Any]:
@@ -1290,6 +1314,20 @@ def calibration_from_manifest(value: Mapping[str, Any]) -> dict[str, Any]:
 def validate_calibration_manifest(value: Mapping[str, Any]) -> None:
     if not isinstance(value, Mapping):
         raise ValueError("calibration manifest must be an object")
+    rule = normalize_kernel_bandwidth_rule(
+        value.get("kernel_bandwidth_rule", KERNEL_BANDWIDTH_RULE_ASYMMETRIC_SOURCE)
+    )
+    expected_rule_version = kernel_bandwidth_rule_version(rule)
+    supplied_rule_version = value.get("kernel_bandwidth_rule_version", "")
+    if rule != KERNEL_BANDWIDTH_RULE_ASYMMETRIC_SOURCE and supplied_rule_version != (
+        expected_rule_version
+    ):
+        raise ValueError("symmetric_max calibration manifests require their rule version")
+    if rule == KERNEL_BANDWIDTH_RULE_ASYMMETRIC_SOURCE and supplied_rule_version not in {
+        "",
+        expected_rule_version,
+    }:
+        raise ValueError("calibration manifest has an incompatible kernel bandwidth rule version")
     attempts = value.get("attempts")
     k_domain = value.get("k_domain")
     c_domain = value.get("c_domain")

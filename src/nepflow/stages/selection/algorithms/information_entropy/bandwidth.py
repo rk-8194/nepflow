@@ -43,6 +43,8 @@ from .models import (
     DEFAULT_NEIGHBOUR_BACKEND_ID,
     ENTROPY_OBJECTIVE_SCHEMA_VERSION,
     GPU_NEIGHBOUR_BACKEND_ALIASES,
+    KERNEL_BANDWIDTH_RULE_ASYMMETRIC_SOURCE,
+    KERNEL_BANDWIDTH_RULE_SYMMETRIC_MAX,
     KERNEL_FAMILY,
     KERNEL_OPERATOR_SCHEMA_VERSION,
     KERNEL_SUPPORT_EXECUTION_CPU,
@@ -56,6 +58,8 @@ from .models import (
     EntropyBandwidthSettings,
     EntropyPool,
     FrozenBandwidths,
+    kernel_bandwidth_rule_version,
+    normalize_kernel_bandwidth_rule,
 )
 from .neighbours import (
     ExactNeighbourResult,
@@ -353,8 +357,10 @@ def _freeze_from_neighbours(
     pool: EntropyPool,
     neighbours: ExactNeighbourResult,
     c: float,
+    kernel_bandwidth_rule: str = KERNEL_BANDWIDTH_RULE_ASYMMETRIC_SOURCE,
 ) -> FrozenBandwidths:
     scale = _positive_float(c, "c")
+    bandwidth_rule = normalize_kernel_bandwidth_rule(kernel_bandwidth_rule)
     with np.errstate(over="raise", under="raise", invalid="raise"):
         try:
             bandwidths = np.asarray(scale * neighbours.radii, dtype=np.float64)
@@ -374,6 +380,14 @@ def _freeze_from_neighbours(
         "k": neighbours.k,
         "c": scale,
     }
+    # Keep the legacy asymmetric fingerprint byte-for-byte stable.  A new
+    # scientific rule receives an explicit, versioned identity so it cannot
+    # reuse an asymmetric artifact or be silently relabelled.
+    if bandwidth_rule != KERNEL_BANDWIDTH_RULE_ASYMMETRIC_SOURCE:
+        identity["kernel_bandwidth_rule"] = bandwidth_rule
+        identity["kernel_bandwidth_rule_version"] = kernel_bandwidth_rule_version(
+            bandwidth_rule
+        )
     return FrozenBandwidths(
         radii=neighbours.radii,
         bandwidths=bandwidths,
@@ -387,6 +401,8 @@ def _freeze_from_neighbours(
         metric=neighbours.metric,
         backend_version=neighbours.backend_version,
         backend_fingerprint=neighbours.backend_fingerprint,
+        kernel_bandwidth_rule=bandwidth_rule,
+        kernel_bandwidth_rule_version=kernel_bandwidth_rule_version(bandwidth_rule),
     )
 
 
@@ -410,10 +426,12 @@ def calculate_frozen_bandwidths(
     gpu_devices: Sequence[int] | str | int | None = None,
     gpu_tile_size: int = 128,
     max_gpu_neighbour_bytes: int | None = None,
+    kernel_bandwidth_rule: str = KERNEL_BANDWIDTH_RULE_ASYMMETRIC_SOURCE,
     resource_budget: ResourceBudgetService | None = None,
 ) -> FrozenBandwidths:
     """Calculate and freeze exact full-pool ``r_k`` and ``h=c*r_k``."""
 
+    bandwidth_rule = normalize_kernel_bandwidth_rule(kernel_bandwidth_rule)
     pool = (
         representation_or_pool
         if isinstance(representation_or_pool, EntropyPool)
@@ -475,7 +493,7 @@ def calculate_frozen_bandwidths(
         **neighbour_kwargs,
         resource_budget=service,
     )
-    return _freeze_from_neighbours(pool, neighbours, c)
+    return _freeze_from_neighbours(pool, neighbours, c, bandwidth_rule)
 
 
 freeze_bandwidths = calculate_frozen_bandwidths
@@ -509,6 +527,7 @@ def _settings_from_arguments(
     max_gpu_neighbour_bytes: int | None,
     loo_checkpoint_every_sources: int | None,
     loo_checkpoint_every_seconds: float | None,
+    kernel_bandwidth_rule: str,
 ) -> EntropyBandwidthSettings:
     if settings is not None:
         if any(
@@ -524,9 +543,28 @@ def _settings_from_arguments(
             )
         ):
             raise ValueError("settings cannot be combined with explicit calibration arguments")
+        requested_rule = normalize_kernel_bandwidth_rule(kernel_bandwidth_rule)
         if isinstance(settings, EntropyBandwidthSettings):
+            if (
+                requested_rule != KERNEL_BANDWIDTH_RULE_ASYMMETRIC_SOURCE
+                and requested_rule != settings.kernel_bandwidth_rule
+            ):
+                raise ValueError(
+                    "settings kernel_bandwidth_rule conflicts with the explicit calibration rule"
+                )
             return settings
-        return EntropyBandwidthSettings(**dict(settings))
+        settings_mapping = dict(settings)
+        if "kernel_bandwidth_rule" not in settings_mapping:
+            settings_mapping["kernel_bandwidth_rule"] = requested_rule
+        elif (
+            requested_rule != KERNEL_BANDWIDTH_RULE_ASYMMETRIC_SOURCE
+            and normalize_kernel_bandwidth_rule(settings_mapping["kernel_bandwidth_rule"])
+            != requested_rule
+        ):
+            raise ValueError(
+                "settings kernel_bandwidth_rule conflicts with the explicit calibration rule"
+            )
+        return EntropyBandwidthSettings(**settings_mapping)
     selected_mode = "automatic" if mode is None else mode
     if selected_mode == "manual":
         return EntropyBandwidthSettings(
@@ -543,6 +581,7 @@ def _settings_from_arguments(
             max_calibration_work_bytes=max_calibration_work_bytes,
             calibration_batch_size=calibration_batch_size,
             kernel_support_execution=kernel_support_execution,
+            kernel_bandwidth_rule=kernel_bandwidth_rule,
             gpu_device=gpu_device,
             gpu_devices=gpu_devices,
             gpu_tile_size=gpu_tile_size,
@@ -569,6 +608,7 @@ def _settings_from_arguments(
         max_calibration_work_bytes=max_calibration_work_bytes,
         calibration_batch_size=calibration_batch_size,
         kernel_support_execution=kernel_support_execution,
+        kernel_bandwidth_rule=kernel_bandwidth_rule,
         gpu_device=gpu_device,
         gpu_devices=gpu_devices,
         gpu_tile_size=gpu_tile_size,
@@ -620,6 +660,7 @@ def _calibration_grid_identity(
     support_execution = str(settings.kernel_support_execution).strip().lower()
     if support_execution == "exact_cpu":
         support_execution = KERNEL_SUPPORT_EXECUTION_CPU
+    bandwidth_rule = normalize_kernel_bandwidth_rule(settings.kernel_bandwidth_rule)
     identity = {
         "phase": "calibration-grid",
         "schema": _CALIBRATION_GRID_SCHEMA,
@@ -661,6 +702,9 @@ def _calibration_grid_identity(
     if support_execution == KERNEL_SUPPORT_EXECUTION_GPU:
         identity["kernel_support_execution"] = support_execution
         identity["kernel_support_execution_version"] = KERNEL_SUPPORT_EXECUTION_GPU_VERSION
+    if bandwidth_rule != KERNEL_BANDWIDTH_RULE_ASYMMETRIC_SOURCE:
+        identity["kernel_bandwidth_rule"] = bandwidth_rule
+        identity["kernel_bandwidth_rule_version"] = kernel_bandwidth_rule_version(bandwidth_rule)
     return identity
 
 
@@ -962,6 +1006,7 @@ def calibrate_bandwidth(
     max_calibration_work_bytes: int | None = None,
     calibration_batch_size: int | None = None,
     kernel_support_execution: str = "cpu",
+    kernel_bandwidth_rule: str = KERNEL_BANDWIDTH_RULE_ASYMMETRIC_SOURCE,
     gpu_device: int = 0,
     gpu_devices: Sequence[int] | str | int | None = None,
     gpu_tile_size: int = 128,
@@ -1014,6 +1059,7 @@ def calibrate_bandwidth(
         max_calibration_work_bytes=max_calibration_work_bytes,
         calibration_batch_size=calibration_batch_size,
         kernel_support_execution=kernel_support_execution,
+        kernel_bandwidth_rule=kernel_bandwidth_rule,
         gpu_device=gpu_device,
         gpu_devices=gpu_devices,
         gpu_tile_size=gpu_tile_size,
@@ -1022,6 +1068,11 @@ def calibrate_bandwidth(
         loo_checkpoint_every_sources=loo_checkpoint_every_sources,
         loo_checkpoint_every_seconds=loo_checkpoint_every_seconds,
     )
+    if selected_settings.kernel_bandwidth_rule == KERNEL_BANDWIDTH_RULE_SYMMETRIC_MAX:
+        raise ValueError(
+            "kernel_bandwidth_rule='symmetric_max' is currently available only through "
+            "the bounded CPU reference oracle; production LOO calibration is not yet integrated"
+        )
     selected_settings, runtime_budget = _resolve_runtime_limits(
         selected_settings,
         pool,
@@ -1284,6 +1335,7 @@ def calibrate_bandwidth(
             pool,
             restored_neighbours,
             float(restored_winner["c"]),
+            selected_settings.kernel_bandwidth_rule,
         )
         if restored_frozen.fingerprint != restored_winner["bandwidth_fingerprint"]:
             raise CheckpointValidationError(
@@ -1982,6 +2034,7 @@ def calibrate_bandwidth(
                 pool,
                 neighbours,
                 float(restored_winner["c"]),
+                selected_settings.kernel_bandwidth_rule,
             )
             if restored_frozen.fingerprint != restored_winner["bandwidth_fingerprint"]:
                 raise CheckpointValidationError(
@@ -2036,7 +2089,12 @@ def calibrate_bandwidth(
             frozen_batch: tuple[FrozenBandwidths, ...] = ()
             try:
                 frozen_batch = tuple(
-                    _freeze_from_neighbours(pool, neighbours, candidate_c)
+                    _freeze_from_neighbours(
+                        pool,
+                        neighbours,
+                        candidate_c,
+                        selected_settings.kernel_bandwidth_rule,
+                    )
                     for candidate_c in c_batch
                 )
                 publish_grid(
@@ -2437,6 +2495,11 @@ def calibrate_bandwidth(
             else "complete_ordered_grid_evaluated"
         ),
     }
+    if selected_bandwidths.kernel_bandwidth_rule != KERNEL_BANDWIDTH_RULE_ASYMMETRIC_SOURCE:
+        calibration_payload["kernel_bandwidth_rule"] = selected_bandwidths.kernel_bandwidth_rule
+        calibration_payload["kernel_bandwidth_rule_version"] = (
+            selected_bandwidths.kernel_bandwidth_rule_version
+        )
     return BandwidthCalibrationResult(
         mode=selected_settings.mode,
         selected=selected_bandwidths,

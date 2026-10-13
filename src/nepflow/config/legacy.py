@@ -338,6 +338,7 @@ def _selection_values(config: NepflowConfig) -> dict[str, str]:
         ),
         "entropy_bandwidth_backend": selection.entropy.bandwidth.backend,
         "entropy_bandwidth_metric": selection.entropy.bandwidth.metric,
+        "entropy_kernel_bandwidth_rule": selection.entropy.bandwidth.kernel_bandwidth_rule,
         "entropy_bandwidth_chunk_size": str(selection.entropy.bandwidth.chunk_size),
         "entropy_bandwidth_max_neighbour_entries": ""
         if selection.entropy.bandwidth.max_neighbour_entries is None

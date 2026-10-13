@@ -696,6 +696,9 @@ def parse_selection(values: Mapping[str, str]) -> SelectionConfig:
         kernel_support_execution=value(
             "entropy_kernel_support_execution", "cpu", "kernel_support_execution"
         ),
+        kernel_bandwidth_rule=value(
+            "entropy_kernel_bandwidth_rule", "asymmetric_source", "kernel_bandwidth_rule"
+        ),
         gpu_device=_parse_int(
             value("entropy_gpu_device", "0", "gpu_device"),
             "selection.entropy_gpu_device",

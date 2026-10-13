@@ -140,6 +140,7 @@ explicitly in the selection config. For example:
 ```ini
 entropy_bandwidth_backend=exact_tiled_gpu_knn
 entropy_kernel_support_execution=exact_tiled_gpu
+entropy_kernel_bandwidth_rule=asymmetric_source
 entropy_gpu_devices=0,1,2,3
 ```
 
@@ -149,6 +150,18 @@ requested device fails the run; NEPFlow does not silently fall back to CPU or
 reduce the requested GPU count. kNN and strict-support work are partitioned in
 deterministic source order, and their per-device throughput and transfer/
 certification metrics are included in the execution diagnostics.
+
+The scientific kernel rule is separate from support execution. The staged
+production default is `asymmetric_source`: for source row `a` and target row
+`b`, `H(a,b)=h_a` and `W_ab=wendland_c2(d_ab/H(a,b))`. The bounded CPU
+reference oracle also accepts `symmetric_max`, where `H(a,b)=max(h_a,h_b)`.
+Its raw weights and strict finite-support masks (`d_ab < H(a,b)`) are
+symmetric, but source-column normalization still produces conditional
+probabilities `P(b|a)` whose columns sum to one and need not be symmetric.
+Duplicate descriptor rows retain multiplicity, equality at the support
+boundary contributes zero, and finite-support or FP64-underflow cases do not
+receive artificial floors. Symmetric production LOO/PMF/checkpoint support
+is intentionally deferred to subsequent integration issues.
 
 ## Project Layout
 

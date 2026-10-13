@@ -311,6 +311,11 @@ def validate_config(
             "selection.entropy.bandwidth.kernel_support_execution must be cpu, exact_cpu, "
             "or exact_tiled_gpu"
         )
+    if bandwidth.kernel_bandwidth_rule not in {"asymmetric_source", "symmetric_max"}:
+        raise ConfigurationError(
+            "selection.entropy.bandwidth.kernel_bandwidth_rule must be "
+            "asymmetric_source or symmetric_max"
+        )
     if isinstance(bandwidth.gpu_device, bool) or not isinstance(bandwidth.gpu_device, int):
         raise ConfigurationError("selection.entropy.bandwidth.gpu_device must be an integer")
     if bandwidth.gpu_device < 0:
