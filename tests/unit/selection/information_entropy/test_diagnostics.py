@@ -7,9 +7,14 @@ import numpy as np
 import pytest
 
 from nepflow.resources.budget import build_resource_budget
+from nepflow.stages.selection.algorithms.information_entropy import (
+    diagnostics as diagnostics_module,
+)
 from nepflow.stages.selection.algorithms.information_entropy.diagnostics import (
     DiagnosticDistribution,
     _build_prefix_coverage_manifest,
+    _coverage_host_workspace_bytes,
+    _coverage_tile_plan,
     nearest_selected_atomic_distances,
     recompute_final_entropy_metrics,
     weighted_quantile,
@@ -18,6 +23,7 @@ from nepflow.stages.selection.algorithms.information_entropy.gpu_support import 
     GPUCapacityError,
     GPUCertificationError,
     GPUDeviceValidationError,
+    _distance_interval_workspace_breakdown,
 )
 from nepflow.stages.selection.algorithms.information_entropy.models import (
     EntropyPool,
@@ -123,23 +129,31 @@ def test_exact_coverage_tiling_matches_bounded_cpu_oracle_with_duplicates() -> N
 def _fake_coverage_cupy(
     *,
     device_count: int = 4,
-    free_bytes: int = 64 * 1024 * 1024,
+    free_bytes: int | dict[int, int] = 64 * 1024 * 1024,
     sqrt_fn: object = np.sqrt,
 ):
+    active_device = {"ordinal": 0}
+
     class Device:
         def __init__(self, ordinal: int):
             self.ordinal = ordinal
 
         def __enter__(self):
+            active_device["ordinal"] = self.ordinal
             return self
 
         def __exit__(self, *_args: object) -> None:
             return None
 
-    runtime = types.SimpleNamespace(
-        getDeviceCount=lambda: device_count,
-        memGetInfo=lambda: (free_bytes, free_bytes),
-    )
+    def mem_get_info() -> tuple[int, int]:
+        available = (
+            free_bytes[active_device["ordinal"]]
+            if isinstance(free_bytes, dict)
+            else free_bytes
+        )
+        return available, available
+
+    runtime = types.SimpleNamespace(getDeviceCount=lambda: device_count, memGetInfo=mem_get_info)
     return types.SimpleNamespace(
         float64=np.float64,
         int64=np.int64,
@@ -222,12 +236,143 @@ def test_exact_gpu_coverage_is_exact_for_42d_duplicates_and_multi_gpu_tiles(
     assert metrics["gpu_evaluated_pairs"] == 2 * 12 * 5
     assert metrics["gpu_screened_pairs"] == 12 * 5
     assert metrics["gpu_distance_passes"] == 2
+    assert metrics["gpu_screening_seconds"] >= 0.0
+    assert metrics["candidate_transfer_seconds"] >= 0.0
+    assert metrics["cpu_seed_certification_seconds"] >= 0.0
+    assert metrics["cpu_ambiguous_refinement_seconds"] >= 0.0
     assert metrics["gpu_tile_workspace_bytes"] <= metrics["gpu_tile_workspace_limit_bytes"]
+    assert set(metrics["gpu_resolved_tile_shapes"]) == {str(device) for device in gpu_devices}
+    assert all(
+        metrics["gpu_estimated_peak_device_bytes"][str(device)]
+        <= metrics["gpu_device_limits_bytes"][str(device)]
+        for device in gpu_devices
+    )
     assert 0 < metrics["candidate_transfer_count"] < 2 * metrics["gpu_screened_pairs"]
     assert metrics["cpu_refined_pairs"] < metrics["gpu_screened_pairs"]
+    assert metrics["cpu_seed_batch_count"] < metrics["cpu_seed_pairs"]
     assert metrics["cpu_certified_pairs"] == (
         metrics["cpu_seed_pairs"] + metrics["cpu_refined_pairs"]
     )
+
+
+def test_gpu_workspace_accounting_includes_live_3d_intermediates_and_reduces_tiles() -> None:
+    query_count = 2048
+    reference_count = 2048
+    dimension = 42
+    old_underestimate = 4 * 8 * (
+        query_count * dimension
+        + reference_count * dimension
+        + query_count * reference_count
+    ) + 65_536
+    breakdown = _distance_interval_workspace_breakdown(
+        query_count,
+        reference_count,
+        dimension,
+    )
+
+    assert breakdown["component_array_bytes"] == query_count * reference_count * 8 * 8
+    assert breakdown["component_live_bytes"] > old_underestimate
+    assert breakdown["peak_bytes"] > old_underestimate
+
+    tight_limit = old_underestimate * 2
+    plan = _coverage_tile_plan(
+        query_count,
+        reference_count,
+        dimension,
+        device_limit_bytes=tight_limit,
+        host_limit_bytes=None,
+        device=0,
+    )
+    assert plan["query_tile"] < query_count or plan["reference_tile"] < reference_count
+    assert plan["device_workspace_bytes"] <= tight_limit
+    assert plan["host_workspace_bytes"] == _coverage_host_workspace_bytes(
+        plan["query_tile"], plan["reference_tile"], dimension
+    )
+
+    small = _coverage_tile_plan(
+        query_count,
+        reference_count,
+        dimension,
+        device_limit_bytes=256 * 1024 * 1024,
+        host_limit_bytes=None,
+        device=1,
+    )
+    large = _coverage_tile_plan(
+        query_count,
+        reference_count,
+        dimension,
+        device_limit_bytes=2 * 1024 * 1024 * 1024,
+        host_limit_bytes=None,
+        device=2,
+    )
+    assert small["query_tile"] <= large["query_tile"]
+    assert small["reference_tile"] <= large["reference_tile"]
+
+
+def test_gpu_devices_resolve_tiles_against_different_device_capacities(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setitem(
+        sys.modules,
+        "cupy",
+        _fake_coverage_cupy(
+            free_bytes={0: 2 * 1024 * 1024, 1: 96 * 1024},
+        ),
+    )
+    pool, source_indices, expected = _coverage_gpu_pool()
+    metrics: dict[str, object] = {}
+
+    actual, actual_indices = nearest_selected_atomic_distances(
+        pool,
+        ("selected",),
+        backend="exact_tiled_gpu",
+        gpu_devices=(0, 1),
+        chunk_size=6,
+        gpu_tile_size=6,
+        resource_budget=build_resource_budget(memory_budget_bytes=64 * 1024 * 1024),
+        operational_metrics=metrics,
+    )
+
+    np.testing.assert_array_equal(actual_indices, source_indices)
+    np.testing.assert_array_equal(actual, expected)
+    shapes = metrics["gpu_resolved_tile_shapes"]
+    assert shapes["0"] != shapes["1"]
+    assert metrics["gpu_device_limits_bytes"] == {"0": 2 * 1024 * 1024, "1": 96 * 1024}
+
+
+def test_gpu_seed_certification_uses_bounded_canonical_batches(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setitem(sys.modules, "cupy", _fake_coverage_cupy())
+    pool, source_indices, expected = _coverage_gpu_pool()
+    original = diagnostics_module._canonical_gpu_distances
+    calls: list[tuple[tuple[int, ...], tuple[int, ...]]] = []
+
+    def traced_canonical(query: np.ndarray, targets: np.ndarray) -> np.ndarray:
+        calls.append((tuple(np.asarray(query).shape), tuple(np.asarray(targets).shape)))
+        return original(query, targets)
+
+    monkeypatch.setattr(diagnostics_module, "_canonical_gpu_distances", traced_canonical)
+    metrics: dict[str, object] = {}
+    actual, actual_indices = nearest_selected_atomic_distances(
+        pool,
+        ("selected",),
+        backend="exact_tiled_gpu",
+        gpu_devices=(0, 1, 2, 3),
+        chunk_size=3,
+        gpu_tile_size=3,
+        max_gpu_support_bytes=2 * 1024 * 1024,
+        resource_budget=build_resource_budget(memory_budget_bytes=64 * 1024 * 1024),
+        operational_metrics=metrics,
+    )
+
+    seed_calls = [item for item in calls if len(item[0]) == 2]
+    np.testing.assert_array_equal(actual_indices, source_indices)
+    np.testing.assert_array_equal(actual, expected)
+    assert len(seed_calls) == metrics["cpu_seed_batch_count"]
+    assert len(seed_calls) < metrics["cpu_seed_pairs"]
+    assert all(item[0][0] <= metrics["cpu_seed_batch_size"] for item in seed_calls)
+    assert all(item[0] == item[1] for item in seed_calls)
 
 
 def test_exact_gpu_coverage_rejects_missing_cupy_without_cpu_fallback(
@@ -257,7 +402,7 @@ def test_exact_gpu_coverage_rejects_unavailable_device_and_under_budget_tile(
             gpu_devices=(0, 1),
             resource_budget=build_resource_budget(memory_budget_bytes=64 * 1024 * 1024),
         )
-    with pytest.raises(GPUCapacityError, match="declared device workspace"):
+    with pytest.raises(GPUCapacityError, match="minimum certified tile"):
         nearest_selected_atomic_distances(
             pool,
             ("selected",),

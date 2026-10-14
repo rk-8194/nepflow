@@ -19,7 +19,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from io import BytesIO
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping, Sequence, cast
 
 import numpy as np
 
@@ -41,6 +41,8 @@ from .gpu_support import (
     GPUCapacityError,
     GPUCertificationError,
     GPUDeviceValidationError,
+    _distance_interval_workspace_breakdown,
+    _distance_interval_workspace_bytes,
     _distance_intervals,
 )
 from .models import (
@@ -2157,6 +2159,104 @@ def _coverage_summary(
 _COVERAGE_CPU_ORACLE_PAIR_LIMIT = 250_000
 _COVERAGE_CPU_PAIR_LIMIT = 100_000_000
 _COVERAGE_PROGRESS_INTERVAL_SECONDS = 10.0
+_COVERAGE_SEED_BATCH_SIZE = 256
+
+
+def _coverage_pool_counter(pool: Any, attribute: str) -> int:
+    """Read an optional CuPy memory-pool counter without trusting its API shape."""
+
+    counter: Any = getattr(pool, attribute, None)
+    if not callable(counter):
+        return 0
+    return max(0, int(cast(Any, counter)()))
+
+
+def _coverage_host_workspace_bytes(
+    query_count: int,
+    reference_count: int,
+    dimension_count: int,
+) -> int:
+    """Conservatively reserve host arrays used around one GPU tile."""
+
+    query_count = int(query_count)
+    reference_count = int(reference_count)
+    dimension_count = int(dimension_count)
+    pair_count = query_count * reference_count
+    descriptor_bytes = 8 * (query_count + reference_count) * dimension_count
+    candidate_index_bytes = 8 * max(1, 4 * pair_count)
+    seed_batch_bytes = 8 * max(1, 4 * query_count * dimension_count)
+    canonical_reference_bytes = 8 * max(1, reference_count * dimension_count)
+    fixed_bytes = 65_536
+    raw_bytes = (
+        descriptor_bytes
+        + candidate_index_bytes
+        + seed_batch_bytes
+        + canonical_reference_bytes
+        + fixed_bytes
+    )
+    return (5 * raw_bytes + 3) // 4
+
+
+def _coverage_tile_plan(
+    requested_query_count: int,
+    requested_reference_count: int,
+    dimension_count: int,
+    *,
+    device_limit_bytes: int,
+    host_limit_bytes: int | None,
+    device: int,
+) -> dict[str, int]:
+    """Shrink a tile until both device and admitted host workspaces fit."""
+
+    query_count = max(1, int(requested_query_count))
+    reference_count = max(1, int(requested_reference_count))
+    device_limit_bytes = int(device_limit_bytes)
+    if host_limit_bytes is not None:
+        host_limit_bytes = int(host_limit_bytes)
+    while True:
+        device_workspace = _distance_interval_workspace_bytes(
+            query_count,
+            reference_count,
+            dimension_count,
+        )
+        host_workspace = _coverage_host_workspace_bytes(
+            query_count,
+            reference_count,
+            dimension_count,
+        )
+        device_fits = device_workspace <= device_limit_bytes
+        host_fits = host_limit_bytes is None or host_workspace <= host_limit_bytes
+        if device_fits and host_fits:
+            return {
+                "query_tile": query_count,
+                "reference_tile": reference_count,
+                "device_workspace_bytes": device_workspace,
+                "host_workspace_bytes": host_workspace,
+            }
+        if query_count == 1 and reference_count == 1:
+            if not device_fits:
+                raise GPUCapacityError(
+                    "coverage GPU cannot fit its minimum certified tile: "
+                    f"device={device}, requested_device_bytes={device_workspace}, "
+                    f"available_device_bytes={device_limit_bytes}",
+                    operation="entropy exact tiled GPU coverage device workspace",
+                    requested_bytes=device_workspace,
+                    available_bytes=device_limit_bytes,
+                )
+            raise GPUCapacityError(
+                "coverage GPU cannot fit its minimum host tile workspace: "
+                f"device={device}, requested_host_bytes={host_workspace}, "
+                f"available_host_bytes={host_limit_bytes}",
+                operation="entropy exact tiled GPU coverage host workspace",
+                requested_bytes=host_workspace,
+                available_bytes=host_limit_bytes,
+            )
+        if query_count >= reference_count and query_count > 1:
+            query_count = max(1, query_count // 2)
+        elif reference_count > 1:
+            reference_count = max(1, reference_count // 2)
+        else:
+            query_count = max(1, query_count // 2)
 
 
 def _coverage_source_indices(
@@ -2346,79 +2446,126 @@ def _coverage_gpu_tiled(
         raise ValueError("coverage gpu_tile_size must be positive")
     tile_size = int(gpu_tile_size)
     total_rows, dimension = descriptors.shape
-    query_tile = max(1, min(int(chunk_size), tile_size, total_rows))
-    reference_tile = max(1, min(tile_size, int(source_indices.size)))
+    requested_query_tile = max(1, min(int(chunk_size), tile_size, total_rows))
+    requested_reference_tile = max(1, min(tile_size, int(source_indices.size)))
+    if max_gpu_support_bytes is not None and (
+        isinstance(max_gpu_support_bytes, bool) or int(max_gpu_support_bytes) < 1
+    ):
+        raise ValueError("max_gpu_support_bytes must be positive")
 
     device_limits: dict[int, int] = {}
+    device_pool_bytes: dict[int, dict[str, int]] = {}
+    device_plans: dict[int, dict[str, int]] = {}
+    host_limit = resource_budget.remaining_managed_budget
+    # Each non-empty reference shard runs concurrently below.  Reserve only
+    # that worker's share of the shared host budget during preflight so that
+    # all workers can acquire their tile leases at the same time.
+    concurrent_device_count = max(1, min(len(devices), int(source_indices.size)))
+    host_planning_limit = (
+        None
+        if host_limit is None
+        else max(0, int(host_limit) // concurrent_device_count)
+    )
     for device in devices:
         try:
             with cp.cuda.Device(device):
                 free_bytes, _ = cp.cuda.runtime.memGetInfo()
+                pool_factory = getattr(cp, "get_default_memory_pool", None)
+                pool = pool_factory() if callable(pool_factory) else None
+                pool_total_bytes = _coverage_pool_counter(pool, "total_bytes")
+                pool_used_bytes = _coverage_pool_counter(pool, "used_bytes")
         except Exception as exc:
             raise GPUDeviceValidationError(
                 f"unable to inspect coverage GPU device {device}: {exc}"
             ) from exc
         limit = int(free_bytes)
         if max_gpu_support_bytes is not None:
-            if isinstance(max_gpu_support_bytes, bool) or int(max_gpu_support_bytes) < 1:
-                raise ValueError("max_gpu_support_bytes must be positive")
             limit = min(limit, int(max_gpu_support_bytes))
         device_limits[int(device)] = limit
-    minimum_tile_bytes = int(
-        4
-        * 8
-        * (query_tile * dimension + reference_tile * dimension + query_tile * reference_tile)
-        + 65_536
-    )
-    for device, limit in device_limits.items():
-        if limit < minimum_tile_bytes:
-            raise GPUCapacityError(
-                "coverage GPU tile exceeds the declared device workspace: "
-                f"device={device}, requested_bytes={minimum_tile_bytes}, available_bytes={limit}",
-                operation="entropy exact tiled GPU coverage",
-                requested_bytes=minimum_tile_bytes,
-                available_bytes=limit,
-            )
+        device_pool_bytes[int(device)] = {
+            "pool_reserved_bytes": max(0, pool_total_bytes),
+            "pool_used_bytes": max(0, pool_used_bytes),
+            "peak_pool_reserved_bytes": max(0, pool_total_bytes),
+            "peak_pool_used_bytes": max(0, pool_used_bytes),
+            "initial_free_bytes": max(0, int(free_bytes)),
+        }
+        device_plans[int(device)] = _coverage_tile_plan(
+            requested_query_tile,
+            requested_reference_tile,
+            int(dimension),
+            device_limit_bytes=limit,
+            host_limit_bytes=host_planning_limit,
+            device=int(device),
+        )
     logger.info(
         "Exact coverage start: N=%d, S=%d, d'=%d, backend=exact_tiled_gpu, devices=%s, "
-        "query_tile=%d, reference_tile=%d, estimated_pairs=%d",
+        "requested_query_tile=%d, requested_reference_tile=%d, estimated_pairs=%d",
         total_rows,
         source_indices.size,
         dimension,
         devices,
-        query_tile,
-        reference_tile,
+        requested_query_tile,
+        requested_reference_tile,
         int(total_rows) * int(source_indices.size),
     )
+
+    def observed_device_workspace(device: int) -> int:
+        """Return a conservative observed peak from runtime and pool counters."""
+
+        initial_free = device_pool_bytes[int(device)]["initial_free_bytes"]
+        try:
+            with cp.cuda.Device(device):
+                free_bytes, _ = cp.cuda.runtime.memGetInfo()
+                pool_factory = getattr(cp, "get_default_memory_pool", None)
+                pool = pool_factory() if callable(pool_factory) else None
+                pool_reserved = _coverage_pool_counter(pool, "total_bytes")
+                pool_used = _coverage_pool_counter(pool, "used_bytes")
+        except Exception:
+            return 0
+        pool_metrics = device_pool_bytes[int(device)]
+        pool_metrics["peak_pool_reserved_bytes"] = max(
+            pool_metrics["peak_pool_reserved_bytes"], pool_reserved
+        )
+        pool_metrics["peak_pool_used_bytes"] = max(
+            pool_metrics["peak_pool_used_bytes"], pool_used
+        )
+        return max(0, initial_free - int(free_bytes), int(pool_reserved))
+
     def run_device(
         device: int, reference_start: int, reference_stop: int
-    ) -> tuple[np.ndarray, int, int, int, int]:
-        device_references = np.ascontiguousarray(
-            descriptors[source_indices[reference_start:reference_stop]], dtype=np.float64
+    ) -> tuple[np.ndarray, int, int, int, int, int, float, float, float, float, int]:
+        plan = device_plans[int(device)]
+        query_tile = int(plan["query_tile"])
+        reference_tile = int(plan["reference_tile"])
+        device_reference_indices = np.asarray(
+            source_indices[reference_start:reference_stop], dtype=np.int64
         )
         device_distances = np.full(total_rows, np.inf, dtype=np.float64)
         device_pair_count = 0
         device_candidate_transfer_count = 0
         device_cpu_refined_count = 0
         device_cpu_seed_count = 0
+        device_cpu_seed_batch_count = 0
+        device_cpu_seed_seconds = 0.0
+        device_gpu_screening_seconds = 0.0
+        device_candidate_transfer_seconds = 0.0
+        device_cpu_refinement_seconds = 0.0
+        device_observed_peak_bytes = 0
         for query_start in range(0, total_rows, query_tile):
             query_stop = min(query_start + query_tile, total_rows)
             query = np.ascontiguousarray(descriptors[query_start:query_stop], dtype=np.float64)
             query_count = query_stop - query_start
             gpu_best_reported = None
             gpu_best_positions = None
-            for tile_start in range(0, device_references.shape[0], reference_tile):
-                tile_stop = min(tile_start + reference_tile, device_references.shape[0])
-                references = device_references[tile_start:tile_stop]
-                requested_host = int(
-                    8
-                    * (
-                        4 * query.shape[0] * dimension
-                        + 4 * references.shape[0] * dimension
-                        + 2 * query.shape[0] * references.shape[0]
-                    )
-                    + 65_536
+            for tile_start in range(0, device_reference_indices.size, reference_tile):
+                tile_stop = min(tile_start + reference_tile, device_reference_indices.size)
+                references = np.ascontiguousarray(
+                    descriptors[device_reference_indices[tile_start:tile_stop]], dtype=np.float64
                 )
+                requested_host = _coverage_host_workspace_bytes(
+                    query.shape[0], references.shape[0], dimension
+                )
+                screening_started = time.perf_counter()
                 with resource_budget.acquire(
                     "entropy exact GPU coverage certification tile", max(1, requested_host)
                 ):
@@ -2464,15 +2611,23 @@ def _coverage_gpu_tiled(
                                 tile_positions,
                                 tile_reported,
                             )
+                            device_observed_peak_bytes = max(
+                                device_observed_peak_bytes,
+                                observed_device_workspace(device),
+                            )
                     except Exception as exc:
                         raise GPUCertificationError(
                             f"coverage GPU distance evaluation failed on device {device}: {exc}"
                         ) from exc
+                device_gpu_screening_seconds += max(
+                    0.0, time.perf_counter() - screening_started
+                )
                 device_pair_count += int(query.shape[0] * references.shape[0])
             if gpu_best_reported is None or gpu_best_positions is None:  # pragma: no cover
                 raise GPUCertificationError(
                     f"coverage GPU device {device} received no reference rows"
                 )
+            seed_transfer_started = time.perf_counter()
             try:
                 with cp.cuda.Device(device):
                     seed_positions = np.asarray(
@@ -2485,11 +2640,14 @@ def _coverage_gpu_tiled(
                 raise GPUCertificationError(
                     f"coverage GPU seed compaction failed on device {device}: {exc}"
                 ) from exc
+            device_candidate_transfer_seconds += max(
+                0.0, time.perf_counter() - seed_transfer_started
+            )
             if (
                 seed_positions.shape != (query_count,)
                 or not np.all(seed_reported_finite)
                 or np.any(seed_positions < 0)
-                or np.any(seed_positions >= device_references.shape[0])
+                or np.any(seed_positions >= device_reference_indices.size)
             ):
                 raise GPUCertificationError(
                     "coverage GPU could not establish a finite certified seed for every query"
@@ -2497,30 +2655,34 @@ def _coverage_gpu_tiled(
             device_candidate_transfer_count += int(seed_positions.size)
             device_cpu_seed_count += int(seed_positions.size)
             best = np.full(query_count, np.inf, dtype=np.float64)
-            for query_offset, query_row in enumerate(query):
-                seed_position = int(seed_positions[query_offset])
-                seed_distance = _canonical_gpu_distances(
-                    query_row,
-                    device_references[seed_position : seed_position + 1],
+            seed_reference_indices = device_reference_indices[seed_positions]
+            seed_references = np.ascontiguousarray(
+                descriptors[seed_reference_indices], dtype=np.float64
+            )
+            seed_started = time.perf_counter()
+            for seed_start in range(0, query_count, _COVERAGE_SEED_BATCH_SIZE):
+                seed_stop = min(seed_start + _COVERAGE_SEED_BATCH_SIZE, query_count)
+                seed_distances = _canonical_gpu_distances(
+                    query[seed_start:seed_stop],
+                    seed_references[seed_start:seed_stop],
                 )
-                best[query_offset] = float(seed_distance[0])
+                best[seed_start:seed_stop] = seed_distances
+                device_cpu_seed_batch_count += 1
+            device_cpu_seed_seconds += max(0.0, time.perf_counter() - seed_started)
 
             # The first pass establishes one exact host upper bound per query.
             # The second pass reuses only bounded GPU tiles to screen against
             # that bound, so CPU canonical refinement is limited to pairs whose
             # conservative lower interval still reaches the current best.
-            for tile_start in range(0, device_references.shape[0], reference_tile):
-                tile_stop = min(tile_start + reference_tile, device_references.shape[0])
-                references = device_references[tile_start:tile_stop]
-                requested_host = int(
-                    8
-                    * (
-                        4 * query.shape[0] * dimension
-                        + 4 * references.shape[0] * dimension
-                        + 2 * query.shape[0] * references.shape[0]
-                    )
-                    + 65_536
+            for tile_start in range(0, device_reference_indices.size, reference_tile):
+                tile_stop = min(tile_start + reference_tile, device_reference_indices.size)
+                references = np.ascontiguousarray(
+                    descriptors[device_reference_indices[tile_start:tile_stop]], dtype=np.float64
                 )
+                requested_host = _coverage_host_workspace_bytes(
+                    query.shape[0], references.shape[0], dimension
+                )
+                screening_started = time.perf_counter()
                 with resource_budget.acquire(
                     "entropy exact GPU coverage candidate tile", max(1, requested_host)
                 ):
@@ -2547,8 +2709,13 @@ def _coverage_gpu_tiled(
                                     )[:, None]
                                 )
                             )
+                            candidate_transfer_started = time.perf_counter()
                             candidate_flat = np.asarray(
                                 cp.asnumpy(candidate_device), dtype=np.int64
+                            )
+                            device_candidate_transfer_seconds += max(
+                                0.0,
+                                time.perf_counter() - candidate_transfer_started,
                             )
                             del (
                                 gpu_query,
@@ -2558,10 +2725,17 @@ def _coverage_gpu_tiled(
                                 finite_device,
                                 candidate_device,
                             )
+                            device_observed_peak_bytes = max(
+                                device_observed_peak_bytes,
+                                observed_device_workspace(device),
+                            )
                     except Exception as exc:
                         raise GPUCertificationError(
                             f"coverage GPU candidate compaction failed on device {device}: {exc}"
                         ) from exc
+                device_gpu_screening_seconds += max(
+                    0.0, time.perf_counter() - screening_started
+                )
                 device_pair_count += int(query.shape[0] * references.shape[0])
                 device_candidate_transfer_count += int(candidate_flat.size)
                 if candidate_flat.size:
@@ -2577,8 +2751,12 @@ def _coverage_gpu_tiled(
                         )
                         if positions.size == 0:
                             continue
+                        refinement_started = time.perf_counter()
                         canonical = _canonical_gpu_distances(
                             query[query_offset], references[positions]
+                        )
+                        device_cpu_refinement_seconds += max(
+                            0.0, time.perf_counter() - refinement_started
                         )
                         best[query_offset] = min(
                             best[query_offset], float(np.min(canonical))
@@ -2600,6 +2778,12 @@ def _coverage_gpu_tiled(
             device_candidate_transfer_count,
             device_cpu_refined_count,
             device_cpu_seed_count,
+            device_cpu_seed_batch_count,
+            device_cpu_seed_seconds,
+            device_gpu_screening_seconds,
+            device_candidate_transfer_seconds,
+            device_cpu_refinement_seconds,
+            device_observed_peak_bytes,
         )
 
     ranges = tuple(
@@ -2618,12 +2802,52 @@ def _coverage_gpu_tiled(
     candidate_transfer_count = 0
     cpu_refined_count = 0
     cpu_seed_count = 0
-    for result, worker_pairs, worker_candidates, worker_refined, worker_seeds in results:
+    gpu_screening_seconds = 0.0
+    candidate_transfer_seconds = 0.0
+    cpu_refinement_seconds = 0.0
+    per_device_metrics: dict[str, dict[str, int | float]] = {}
+    for range_item, result in zip(ranges, results, strict=True):
+        device = int(range_item[0])
+        (
+            result,
+            worker_pairs,
+            worker_candidates,
+            worker_refined,
+            worker_seeds,
+            worker_seed_batches,
+            worker_seed_seconds,
+            worker_gpu_screening_seconds,
+            worker_candidate_transfer_seconds,
+            worker_cpu_refinement_seconds,
+            worker_observed_peak,
+        ) = result
         global_distances = np.minimum(global_distances, result)
         pair_count += worker_pairs
         candidate_transfer_count += worker_candidates
         cpu_refined_count += worker_refined
         cpu_seed_count += worker_seeds
+        gpu_screening_seconds += worker_gpu_screening_seconds
+        candidate_transfer_seconds += worker_candidate_transfer_seconds
+        cpu_refinement_seconds += worker_cpu_refinement_seconds
+        per_device_metrics[str(device)] = {
+            "gpu_evaluated_pairs": worker_pairs,
+            "candidate_transfer_count": worker_candidates,
+            "cpu_refined_pairs": worker_refined,
+            "cpu_seed_pairs": worker_seeds,
+            "cpu_seed_batch_count": worker_seed_batches,
+            "cpu_seed_certification_seconds": worker_seed_seconds,
+            "gpu_screening_seconds": worker_gpu_screening_seconds,
+            "candidate_transfer_seconds": worker_candidate_transfer_seconds,
+            "cpu_ambiguous_refinement_seconds": worker_cpu_refinement_seconds,
+            "gpu_observed_peak_bytes": worker_observed_peak,
+        }
+    seed_batch_count = sum(
+        int(item["cpu_seed_batch_count"]) for item in per_device_metrics.values()
+    )
+    seed_seconds = sum(
+        float(item["cpu_seed_certification_seconds"])
+        for item in per_device_metrics.values()
+    )
     if operational_metrics is not None:
         operational_metrics.update(
             {
@@ -2634,8 +2858,54 @@ def _coverage_gpu_tiled(
                 "cpu_refined_pairs": cpu_refined_count,
                 "cpu_seed_pairs": cpu_seed_count,
                 "cpu_certified_pairs": cpu_seed_count + cpu_refined_count,
-                "gpu_tile_workspace_bytes": minimum_tile_bytes,
+                "cpu_seed_batch_count": seed_batch_count,
+                "cpu_seed_batch_size": _COVERAGE_SEED_BATCH_SIZE,
+                "cpu_seed_certification_seconds": seed_seconds,
+                "gpu_screening_seconds": gpu_screening_seconds,
+                "candidate_transfer_seconds": candidate_transfer_seconds,
+                "cpu_ambiguous_refinement_seconds": cpu_refinement_seconds,
+                "cpu_refinement_seconds": cpu_refinement_seconds,
+                "gpu_tile_workspace_bytes": max(
+                    int(plan["device_workspace_bytes"]) for plan in device_plans.values()
+                ),
                 "gpu_tile_workspace_limit_bytes": min(device_limits.values()),
+                "gpu_estimated_peak_device_bytes": {
+                    str(device): int(plan["device_workspace_bytes"])
+                    for device, plan in device_plans.items()
+                },
+                "gpu_workspace_breakdown_by_device": {
+                    str(device): _distance_interval_workspace_breakdown(
+                        int(plan["query_tile"]),
+                        int(plan["reference_tile"]),
+                        int(dimension),
+                    )
+                    for device, plan in device_plans.items()
+                },
+                "gpu_observed_peak_device_bytes": {
+                    device: int(values["gpu_observed_peak_bytes"])
+                    for device, values in per_device_metrics.items()
+                },
+                "gpu_resolved_tile_shapes": {
+                    str(device): {
+                        "query_tile": int(plan["query_tile"]),
+                        "reference_tile": int(plan["reference_tile"]),
+                    }
+                    for device, plan in device_plans.items()
+                },
+                "gpu_host_workspace_bytes_by_device": {
+                    str(device): int(plan["host_workspace_bytes"])
+                    for device, plan in device_plans.items()
+                },
+                "gpu_host_workspace_limit_bytes": host_limit,
+                "gpu_host_workspace_planning_limit_bytes": host_planning_limit,
+                "gpu_host_concurrency": concurrent_device_count,
+                "gpu_device_limits_bytes": {
+                    str(device): int(limit) for device, limit in device_limits.items()
+                },
+                "gpu_memory_pool_bytes_by_device": {
+                    str(device): dict(values) for device, values in device_pool_bytes.items()
+                },
+                "gpu_per_device": per_device_metrics,
             }
         )
     return global_distances

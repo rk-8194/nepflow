@@ -37,6 +37,77 @@ _FLOAT64_MIN_SUBNORMAL = float(np.nextafter(np.float64(0.0), np.float64(1.0)))
 _DISTANCE_BLOCK_WIDTH = 8
 
 
+def _distance_interval_workspace_breakdown(
+    query_count: int,
+    target_count: int,
+    dimension_count: int,
+) -> dict[str, int]:
+    """Conservatively estimate the peak live CuPy workspace for one tile.
+
+    The interval reducer deliberately keeps only one descriptor block live,
+    but expression evaluation can overlap several three-dimensional
+    temporaries and reduction buffers.  The counts below are therefore live
+    allocation reservations, not just the final array sizes.  They are
+    intentionally conservative so capacity planning fails before CuPy can
+    attempt an oversized allocation.
+    """
+
+    query_count = int(query_count)
+    target_count = int(target_count)
+    dimension_count = int(dimension_count)
+    if query_count < 1 or target_count < 1 or dimension_count < 1:
+        raise ValueError("GPU interval workspace dimensions must be positive")
+    pair_count = query_count * target_count
+    block_width = min(_DISTANCE_BLOCK_WIDTH, dimension_count)
+    component_array_bytes = 8 * pair_count * block_width
+    pair_array_bytes = 8 * pair_count
+    descriptor_bytes = 8 * (query_count + target_count) * dimension_count
+    best_vector_bytes = 8 * (4 * query_count + 2 * target_count)
+    # delta/scale/square/reduction expression overlap.  The pair count also
+    # includes accumulators, interval endpoints, masks, and reduction state.
+    component_live_bytes = 12 * component_array_bytes
+    pair_live_bytes = 32 * pair_array_bytes
+    fixed_allocator_bytes = 65_536
+    raw_peak_bytes = (
+        component_live_bytes
+        + pair_live_bytes
+        + descriptor_bytes
+        + best_vector_bytes
+        + fixed_allocator_bytes
+    )
+    # Reserve an additional 25% for allocator alignment and implementation-
+    # specific reduction temporaries not exposed by the CuPy API.
+    peak_bytes = (5 * raw_peak_bytes + 3) // 4
+    return {
+        "query_count": query_count,
+        "target_count": target_count,
+        "dimension_count": dimension_count,
+        "block_width": block_width,
+        "component_array_bytes": component_array_bytes,
+        "component_live_bytes": component_live_bytes,
+        "pair_array_bytes": pair_array_bytes,
+        "pair_live_bytes": pair_live_bytes,
+        "descriptor_bytes": descriptor_bytes,
+        "best_vector_bytes": best_vector_bytes,
+        "fixed_allocator_bytes": fixed_allocator_bytes,
+        "peak_bytes": peak_bytes,
+    }
+
+
+def _distance_interval_workspace_bytes(
+    query_count: int,
+    target_count: int,
+    dimension_count: int,
+) -> int:
+    """Return the conservative peak-live device reservation for one tile."""
+
+    return _distance_interval_workspace_breakdown(
+        query_count,
+        target_count,
+        dimension_count,
+    )["peak_bytes"]
+
+
 def _distance_intervals(
     cp: Any,
     gpu_sources: Any,
