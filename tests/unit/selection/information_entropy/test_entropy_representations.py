@@ -11,10 +11,14 @@ from pathlib import Path
 import numpy as np
 import pytest
 from ase import Atoms
+from ase.build import bulk
 
 import nepflow.stages.selection.representations as representation_module
 from nepflow.errors import StateError
 from nepflow.stages.selection.algorithms.information_entropy.bandwidth import build_entropy_pool
+from nepflow.stages.selection.algorithms.information_entropy.neighbours import (
+    compute_exact_neighbours,
+)
 from nepflow.stages.selection.representations import (
     LocalRepresentationConfig,
     build_local_environment_representation,
@@ -107,6 +111,156 @@ def test_translation_and_global_spatial_rotation_invariance() -> None:
     expected = _build(original).raw_descriptors
     np.testing.assert_allclose(_build(translated).raw_descriptors, expected, atol=1.0e-12)
     np.testing.assert_allclose(_build(rotated).raw_descriptors, expected, atol=1.0e-12)
+
+
+def test_periodic_bcc_w_symmetry_fixture_reports_raw_and_final_knn_evidence(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Measure bcc-W equivalence without changing descriptor science.
+
+    The fixture deliberately records, rather than assumes, how crystallographic
+    equivalence propagates through raw descriptors, preliminary whitening, and
+    final weighted whitening.  The rattled structure remains in the same pool
+    so the regularised final transform has a meaningful non-zero eigenspectrum.
+    """
+
+    base = bulk("W", "bcc", a=3.165, cubic=True).repeat((4, 4, 4))
+    translated = base.copy()
+    translated.positions += np.asarray([0.371, -0.219, 0.143])
+    translated.wrap()
+    permutation = np.roll(np.arange(len(base), dtype=np.int64), 19)
+    permuted = base[permutation]
+    rattled = base.copy()
+    rng = np.random.default_rng(128)
+    rattled.positions += rng.normal(0.0, 0.01, size=rattled.positions.shape)
+    rattled.wrap()
+
+    config = LocalRepresentationConfig(
+        cutoff=5.0,
+        radial_bins=8,
+        angular_bins=8,
+        species=("Cr", "W"),
+        whitening_tolerance=1.0e-12,
+        whitening_regularization=1.0e-12,
+        whitening_singular_policy="regularize",
+    )
+    representation = build_local_environment_representation(
+        [base, translated, permuted, rattled],
+        config=config,
+        candidate_ids=["bcc-base", "bcc-translated", "bcc-permuted", "bcc-rattled"],
+        structure_ids=["bcc-base", "bcc-translated", "bcc-permuted", "bcc-rattled"],
+        local_descriptor_workers=1,
+        reference_measure_tolerance=1.0e-6,
+    )
+    assert representation.raw_descriptors.shape == (512, 42)
+    assert representation.descriptors.shape == (512, 42)
+
+    blocks = {
+        candidate: representation.raw_descriptors[offset * 128 : (offset + 1) * 128]
+        for offset, candidate in enumerate(
+            ("bcc-base", "bcc-translated", "bcc-permuted", "bcc-rattled")
+        )
+    }
+    final_blocks = {
+        candidate: representation.descriptors[offset * 128 : (offset + 1) * 128]
+        for offset, candidate in enumerate(
+            ("bcc-base", "bcc-translated", "bcc-permuted", "bcc-rattled")
+        )
+    }
+
+    def pairwise_stats(first: np.ndarray, second: np.ndarray) -> dict[str, float]:
+        distances = np.sqrt(
+            np.sum(
+                (first[:, None, :] - second[None, :, :]) ** 2,
+                axis=2,
+                dtype=np.float64,
+            )
+        )
+        return {
+            "min": float(np.min(distances)),
+            "median": float(np.median(distances)),
+            "max": float(np.max(distances)),
+        }
+
+    preliminary_transform = fit_deterministic_whitening(
+        representation.raw_descriptors,
+        tolerance=1.0e-12,
+        regularization=1.0e-12,
+        singular_policy="regularize",
+    )
+    preliminary = preliminary_transform.apply(representation.raw_descriptors)
+    preliminary_blocks = {
+        candidate: preliminary[offset * 128 : (offset + 1) * 128]
+        for offset, candidate in enumerate(
+            ("bcc-base", "bcc-translated", "bcc-permuted", "bcc-rattled")
+        )
+    }
+    neighbour_result = compute_exact_neighbours(
+        representation.descriptors,
+        8,
+        chunk_size=16,
+        representation_fingerprint=representation.transform_fingerprint,
+    )
+    floor = 1.0e-6
+    raw_radii = neighbour_result.radii
+    radius_evidence = {
+        "minimum": float(np.min(raw_radii)),
+        "p1": float(np.percentile(raw_radii, 1.0)),
+        "median": float(np.percentile(raw_radii, 50.0)),
+        "maximum": float(np.max(raw_radii)),
+        "below_floor_rows": int(np.count_nonzero(raw_radii < floor)),
+        "equal_floor_rows": int(np.count_nonzero(raw_radii == floor)),
+        "at_or_above_floor_rows": int(np.count_nonzero(raw_radii >= floor)),
+        "below_floor_locations": int(
+            np.count_nonzero(raw_radii[neighbour_result.location_representatives] < floor)
+        ),
+        "distinct_locations": int(neighbour_result.unique_locations.shape[0]),
+        "exact_duplicate_rows": int(
+            raw_radii.size - neighbour_result.unique_locations.shape[0]
+        ),
+    }
+    raw_unique_counts = {
+        candidate: int(np.unique(values, axis=0).shape[0])
+        for candidate, values in blocks.items()
+    }
+    preliminary_unique_counts = {
+        candidate: int(np.unique(values, axis=0).shape[0])
+        for candidate, values in preliminary_blocks.items()
+    }
+    final_unique_counts = {
+        candidate: int(np.unique(values, axis=0).shape[0])
+        for candidate, values in final_blocks.items()
+    }
+    caplog.set_level(logging.INFO)
+    logger = logging.getLogger(__name__)
+    logger.info(
+        "bcc-W entropy evidence: raw_unique=%s, preliminary_unique=%s, final_unique=%s, "
+        "raw_base_translated=%s, preliminary_base_translated=%s, final_base_translated=%s, "
+        "raw_base_permuted=%s, preliminary_base_permuted=%s, final_base_permuted=%s, "
+        "raw_base_rattled=%s, preliminary_base_rattled=%s, final_base_rattled=%s, "
+        "regularised_dimensions=%d, near_null_raw=%d, near_null_final=%d, "
+        "raw_eigenvalues=%s, final_eigenvalues=%s, radii=%s",
+        raw_unique_counts,
+        preliminary_unique_counts,
+        final_unique_counts,
+        pairwise_stats(blocks["bcc-base"], blocks["bcc-translated"]),
+        pairwise_stats(preliminary_blocks["bcc-base"], preliminary_blocks["bcc-translated"]),
+        pairwise_stats(final_blocks["bcc-base"], final_blocks["bcc-translated"]),
+        pairwise_stats(blocks["bcc-base"], blocks["bcc-permuted"]),
+        pairwise_stats(preliminary_blocks["bcc-base"], preliminary_blocks["bcc-permuted"]),
+        pairwise_stats(final_blocks["bcc-base"], final_blocks["bcc-permuted"]),
+        pairwise_stats(blocks["bcc-base"], blocks["bcc-rattled"]),
+        pairwise_stats(preliminary_blocks["bcc-base"], preliminary_blocks["bcc-rattled"]),
+        pairwise_stats(final_blocks["bcc-base"], final_blocks["bcc-rattled"]),
+        representation.transform.retained_dimensions,
+        int(np.count_nonzero(preliminary_transform.eigenvalues <= 1.0e-12)),
+        int(np.count_nonzero(representation.transform.eigenvalues <= 1.0e-12)),
+        preliminary_transform.eigenvalues.tolist(),
+        representation.transform.eigenvalues.tolist(),
+        radius_evidence,
+    )
+    assert any("bcc-W entropy evidence:" in record.getMessage() for record in caplog.records)
+    assert np.any(np.linalg.norm(blocks["bcc-base"] - blocks["bcc-rattled"], axis=1) > 1.0e-12)
 
 
 def test_atom_order_permutation_and_species_channels_are_respected() -> None:

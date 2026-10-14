@@ -1168,6 +1168,27 @@ all-singleton pool emits a warning without changing the configured radius or
 weights. Runtime worker and workspace limits remain operational and do not
 enter scientific fingerprints.
 
+For production `c=1` and `symmetric_max`, the exact kth-distinct-location
+result is reused by both leave-one-out calibration and streamed contributions.
+If the declared reference-measure floor changes any raw radius, the provider
+adds only strict `d < f` pairs between locations whose raw radii are both below
+the floor, using a bounded exact indexed subset query. It expands exact
+location multiplicities, preserves original-row ordering, and removes overlaps
+with the outgoing/reverse kNN union. The provider reports either
+`symmetric_knn_union` or `symmetric_knn_floor_augmented`; a zero sub-floor
+count is recorded as an exact-reuse no-op. Effective source/target radii and
+all pool, row-order, transform, and backend identities are checked at the
+handoff boundary, with an explicit generic exact path and reason when reuse is
+not eligible. This operational path does not change kernel PMFs, scientific
+fingerprints, or selection rankings.
+
+Calibration diagnostics distinguish preliminary occupancy statistics from final
+weighted-whitened kNN statistics. For each selected k they record final-space
+`N`, dimension, bitwise-distinct locations, exact duplicates, raw and effective
+kth-distinct radius quantiles, floor activation counts, provider identity,
+additional floor pairs, canonical distance evaluations, and whitening and
+representation fingerprints.
+
 ---
 
 ## 37. Future Implementation Guidance

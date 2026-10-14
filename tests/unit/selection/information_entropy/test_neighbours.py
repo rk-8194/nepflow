@@ -94,6 +94,35 @@ def test_symmetric_knn_union_expands_duplicates_without_duplicate_edges() -> Non
     assert metrics["new_distance_evaluations"] == 0
 
 
+def test_symmetric_knn_union_augments_only_the_strict_floor_subset() -> None:
+    descriptors = np.asarray([[0.0], [1.0], [2.0], [4.0]], dtype=np.float64)
+    neighbours = compute_exact_neighbours(descriptors, 1, chunk_size=1)
+    floor = 1.1
+    effective = np.maximum(neighbours.radii, floor)
+    provider = ExactSymmetricKNNUnionSupport(
+        descriptors,
+        neighbours,
+        effective_radii=effective,
+        declared_floor=floor,
+        max_radius_query_bytes=1_000_000,
+        max_calibration_work_bytes=1_000_000,
+    )
+    sources = np.arange(descriptors.shape[0], dtype=np.int64)
+    actual = provider.support_many(
+        sources,
+        effective,
+        target_bandwidths=effective,
+    )
+    expected = _exhaustive_pair_support(descriptors, sources, effective)
+    for actual_array, expected_array in zip(actual, expected, strict=True):
+        np.testing.assert_array_equal(actual_array, expected_array)
+    metrics = provider.operational_metrics()
+    assert metrics["support_provider"] == "symmetric_knn_floor_augmented"
+    assert metrics["floor_subfloor_location_count"] == 3
+    assert metrics["floor_augmented_support_pairs"] == 4
+    assert metrics["floor_new_canonical_distance_evaluations"] > 0
+
+
 def test_distinct_location_ties_use_smallest_original_representative() -> None:
     descriptors = np.asarray(
         [[0.0, 0.0], [1.0, 0.0], [-1.0, 0.0], [0.0, 0.0]],

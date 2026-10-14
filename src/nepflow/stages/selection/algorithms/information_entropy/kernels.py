@@ -11,7 +11,7 @@ import shutil
 import tempfile
 import time
 import uuid
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -33,6 +33,7 @@ from .checkpointing import (
 from .models import (
     DEFAULT_LOO_CHECKPOINT_EVERY_SOURCES,
     DEFAULT_RADIUS_QUERY_BYTES,
+    DEFAULT_REFERENCE_MEASURE_TOLERANCE,
     GPU_NEIGHBOUR_BACKEND_ID,
     GPU_NEIGHBOUR_BACKEND_VERSION,
     INDEXED_NEIGHBOUR_BACKEND_ID,
@@ -386,6 +387,73 @@ def _distance_block(
     return distances
 
 
+def _knn_radius_operational_diagnostics(
+    pool: EntropyPool,
+    neighbours: ExactNeighbourResult,
+    effective_radii: np.ndarray,
+    *,
+    c: float,
+) -> dict[str, Any]:
+    """Return final-space raw/effective kNN evidence for execution summaries."""
+
+    raw = np.asarray(neighbours.radii, dtype=np.float64)
+    effective = np.asarray(effective_radii, dtype=np.float64)
+    representative_rows = np.asarray(neighbours.location_representatives, dtype=np.int64)
+    distinct_raw = raw[representative_rows]
+    floor = float(
+        pool.reference_measure_config.get(
+            "tolerance", DEFAULT_REFERENCE_MEASURE_TOLERANCE
+        )
+    )
+
+    def radius_stats(values: np.ndarray) -> dict[str, Any]:
+        q = np.percentile(values, [1.0, 10.0, 50.0, 90.0, 99.0])
+        return {
+            "min": float(np.min(values)),
+            "p1": float(q[0]),
+            "p10": float(q[1]),
+            "p50": float(q[2]),
+            "p90": float(q[3]),
+            "p99": float(q[4]),
+            "max": float(np.max(values)),
+            "units": "final_weighted_whitened_descriptor_euclidean",
+        }
+
+    def floor_counts(values: np.ndarray) -> dict[str, Any]:
+        below = int(np.count_nonzero(values < floor))
+        equal = int(np.count_nonzero(values == floor))
+        return {
+            "below_floor_count": below,
+            "below_floor_fraction": below / values.size,
+            "equal_floor_count": equal,
+            "equal_floor_fraction": equal / values.size,
+            "at_or_above_floor_count": int(np.count_nonzero(values >= floor)),
+            "at_or_above_floor_fraction": int(np.count_nonzero(values >= floor))
+            / values.size,
+        }
+
+    return {
+        "k": int(neighbours.k),
+        "c": float(c),
+        "floor": floor,
+        "N": int(raw.size),
+        "dimension": int(pool.descriptors.shape[1]),
+        "distinct_locations": int(neighbours.unique_locations.shape[0]),
+        "exact_duplicate_rows": int(raw.size - neighbours.unique_locations.shape[0]),
+        "raw_radius_statistics": radius_stats(raw),
+        "raw_distinct_location_radius_statistics": radius_stats(distinct_raw),
+        "effective_radius_statistics": radius_stats(effective),
+        "raw_row_floor_counts": floor_counts(raw),
+        "raw_distinct_location_floor_counts": floor_counts(distinct_raw),
+        "effective_bandwidth_changed_count": int(np.count_nonzero(raw != effective)),
+        "effective_bandwidth_changed_fraction": int(np.count_nonzero(raw != effective))
+        / raw.size,
+        "whitening_scheme": "final_weighted_deterministic_whitening",
+        "whitening_fingerprint": pool.transform_fingerprint,
+        "representation_fingerprint": pool.representation_fingerprint,
+    }
+
+
 class _KernelSupportProvider:
     """Exact compact-support queries shared by normalisation and graph passes."""
 
@@ -409,6 +477,9 @@ class _KernelSupportProvider:
         knn_support_row_ids: Sequence[str] | None = None,
         max_calibration_work_bytes: int | None = None,
         kernel_bandwidth_rule: str = KERNEL_BANDWIDTH_RULE_SYMMETRIC_MAX,
+        knn_effective_radii: np.ndarray | None = None,
+        knn_floor: float | None = None,
+        expected_knn_representation_fingerprint: str | None = None,
     ) -> None:
         self.descriptors = _validate_descriptors(descriptors)
         self.backend = backend
@@ -506,32 +577,24 @@ class _KernelSupportProvider:
             self.index = None
         else:
             raise ValueError(f"configured neighbour backend is unavailable: {backend!r}")
-        if self.support_execution == KERNEL_SUPPORT_EXECUTION_GPU:
-            from .gpu_support import ExactTiledGPUSupport
-
-            gpu_host_limit = self.max_radius_query_bytes
-            if max_calibration_work_bytes is not None:
-                gpu_host_limit = min(
-                    gpu_host_limit,
-                    _validate_memory_limit(
-                        max_calibration_work_bytes, "max_calibration_work_bytes"
-                    ),
-                )
-            self.gpu_support = ExactTiledGPUSupport(
-                self.descriptors,
-                device=gpu_device,
-                gpu_devices=self.gpu_devices,
-                tile_size=gpu_tile_size,
-                max_device_bytes=max_gpu_support_bytes,
-                max_host_bytes=gpu_host_limit,
-                resource_budget=self.resource_budget,
-                capacity_context=capacity_context,
-            )
-            self.support_batch_size = self.gpu_support.source_tile_size
-        else:
-            self.support_batch_size = self.chunk_size
+        self._gpu_device = int(gpu_device)
+        self._gpu_tile_size = int(gpu_tile_size)
+        self._max_gpu_support_bytes = max_gpu_support_bytes
+        self._max_calibration_work_bytes = max_calibration_work_bytes
+        self.support_batch_size = self.chunk_size
         self.knn_prefix_support: ExactKNNPrefixSupport | None = None
+        self.knn_support_eligibility_reason = (
+            "no kNN result supplied; generic support is required"
+        )
         if knn_support is not None:
+            if (
+                expected_knn_representation_fingerprint is not None
+                and knn_support.representation_fingerprint
+                != expected_knn_representation_fingerprint
+            ):
+                raise ValueError(
+                    "kNN support representation fingerprint does not match the evaluation pool"
+                )
             expected_knn_backend_fingerprint = getattr(self.index, "fingerprint", "")
             if (
                 expected_knn_backend_fingerprint
@@ -545,31 +608,34 @@ class _KernelSupportProvider:
                 if self.kernel_bandwidth_rule == KERNEL_BANDWIDTH_RULE_SYMMETRIC_MAX
                 else ExactKNNPrefixSupport
             )
+            prefix_kwargs: dict[str, Any] = {
+                "grouping_source": self.index,
+                "expected_row_ids": knn_support_row_ids,
+                "max_radius_query_bytes": self.max_radius_query_bytes,
+                "max_calibration_work_bytes": max_calibration_work_bytes,
+                "resource_budget": self.resource_budget,
+                "capacity_context": capacity_context,
+            }
+            if prefix_type is ExactSymmetricKNNUnionSupport:
+                prefix_kwargs.update(
+                    effective_radii=knn_effective_radii,
+                    declared_floor=knn_floor,
+                )
             self.knn_prefix_support = prefix_type(
                 self.descriptors,
                 knn_support,
-                grouping_source=self.index,
-                expected_row_ids=knn_support_row_ids,
-                max_radius_query_bytes=self.max_radius_query_bytes,
-                max_calibration_work_bytes=max_calibration_work_bytes,
-                resource_budget=self.resource_budget,
-                capacity_context=capacity_context,
+                **prefix_kwargs,
             )
+            self.knn_support_eligibility_reason = (
+                "supplied kNN result validated; effective source and target radii "
+                "are checked for every support query"
+            )
+        elif self.support_execution == KERNEL_SUPPORT_EXECUTION_GPU:
+            self._ensure_gpu_support()
         self.symmetric_cpu_support: ExactTiledCPUSupport | None = None
-        if (
-            self.kernel_bandwidth_rule == KERNEL_BANDWIDTH_RULE_SYMMETRIC_MAX
-            and self.support_execution == KERNEL_SUPPORT_EXECUTION_CPU
-        ):
-            self.symmetric_cpu_support = ExactTiledCPUSupport(
-                self.descriptors,
-                tile_size=self.chunk_size,
-                max_radius_query_bytes=self.max_radius_query_bytes,
-                max_calibration_work_bytes=max_calibration_work_bytes,
-                resource_budget=self.resource_budget,
-                capacity_context=capacity_context,
-            )
         self.knn_prefix_support_used = False
         self.generic_support_used = False
+        self._knn_ineligibility_logged = False
         self.distance_evaluations = 0
         self.index_queries = 0
         self.radius_queries = 0
@@ -584,6 +650,46 @@ class _KernelSupportProvider:
         self.support_query_count = 0
         self.support_query_seconds = 0.0
         self.support_query_peak_scratch_bytes = 0
+
+    def _ensure_gpu_support(self) -> Any:
+        """Create generic GPU support only when a kNN query cannot serve it."""
+
+        if self.gpu_support is not None:
+            return self.gpu_support
+        from .gpu_support import ExactTiledGPUSupport
+
+        gpu_host_limit = self.max_radius_query_bytes
+        if self._max_calibration_work_bytes is not None:
+            gpu_host_limit = min(
+                gpu_host_limit,
+                _validate_memory_limit(
+                    self._max_calibration_work_bytes, "max_calibration_work_bytes"
+                ),
+            )
+        self.gpu_support = ExactTiledGPUSupport(
+            self.descriptors,
+            device=self._gpu_device,
+            gpu_devices=self.gpu_devices,
+            tile_size=self._gpu_tile_size,
+            max_device_bytes=self._max_gpu_support_bytes,
+            max_host_bytes=gpu_host_limit,
+            resource_budget=self.resource_budget,
+            capacity_context=self.capacity_context,
+        )
+        self.support_batch_size = self.gpu_support.source_tile_size
+        return self.gpu_support
+
+    def _ensure_symmetric_cpu_support(self) -> ExactTiledCPUSupport:
+        if self.symmetric_cpu_support is None:
+            self.symmetric_cpu_support = ExactTiledCPUSupport(
+                self.descriptors,
+                tile_size=self.chunk_size,
+                max_radius_query_bytes=self.max_radius_query_bytes,
+                max_calibration_work_bytes=self._max_calibration_work_bytes,
+                resource_budget=self.resource_budget,
+                capacity_context=self.capacity_context,
+            )
+        return self.symmetric_cpu_support
 
     def support(
         self,
@@ -608,8 +714,9 @@ class _KernelSupportProvider:
                 kernel_bandwidth_rule=requested_rule,
             )
             return targets[: int(offsets[1])], distances[: int(offsets[1])]
-        if self.gpu_support is not None:
-            offsets, targets, distances = self.gpu_support.support_many(
+        if self.support_execution == KERNEL_SUPPORT_EXECUTION_GPU:
+            gpu_support = self._ensure_gpu_support()
+            offsets, targets, distances = gpu_support.support_many(
                 np.asarray([source_index], dtype=np.int64),
                 np.asarray([scale], dtype=np.float64),
                 kernel_bandwidth_rule=self.kernel_bandwidth_rule,
@@ -742,10 +849,17 @@ class _KernelSupportProvider:
             raise ValueError(
                 "target bandwidths are only valid with kernel_bandwidth_rule='symmetric_max'"
             )
-        if (
-            self.knn_prefix_support is not None
-            and self.knn_prefix_support.eligible(sources, requested_radii)
-        ):
+        knn_eligible = False
+        if self.knn_prefix_support is not None:
+            if isinstance(self.knn_prefix_support, ExactSymmetricKNNUnionSupport):
+                knn_eligible = self.knn_prefix_support.eligible(
+                    sources,
+                    requested_radii,
+                    target_values if requested_rule == KERNEL_BANDWIDTH_RULE_SYMMETRIC_MAX else None,
+                )
+            else:
+                knn_eligible = self.knn_prefix_support.eligible(sources, requested_radii)
+        if knn_eligible:
             started = time.perf_counter()
             offsets, targets, distances = self.knn_prefix_support.support_many(
                 sources,
@@ -769,6 +883,16 @@ class _KernelSupportProvider:
             return offsets, targets, distances
         if self.knn_prefix_support is not None:
             self.generic_support_used = True
+            self.knn_support_eligibility_reason = (
+                "supplied kNN result was not eligible for the requested effective "
+                "source/target radii; exact generic support was selected"
+            )
+            if not self._knn_ineligibility_logged:
+                logger.warning(
+                    "Exact kNN support reuse rejected at support-query identity boundary: %s",
+                    self.knn_support_eligibility_reason,
+                )
+                self._knn_ineligibility_logged = True
         scales = (
             requested_radii
             if requested_radii.ndim == 1
@@ -776,15 +900,17 @@ class _KernelSupportProvider:
         )
         started = time.perf_counter()
         if requested_rule == KERNEL_BANDWIDTH_RULE_SYMMETRIC_MAX:
-            if self.symmetric_cpu_support is not None:
-                offsets, targets, distances = self.symmetric_cpu_support.support_many(
+            if self.support_execution == KERNEL_SUPPORT_EXECUTION_CPU:
+                cpu_support = self._ensure_symmetric_cpu_support()
+                offsets, targets, distances = cpu_support.support_many(
                     sources,
                     requested_radii,
                     target_bandwidths=target_bandwidths,
                     kernel_bandwidth_rule=requested_rule,
                 )
-            elif self.gpu_support is not None:
-                offsets, targets, distances = self.gpu_support.support_many(
+            elif self.support_execution == KERNEL_SUPPORT_EXECUTION_GPU:
+                gpu_support = self._ensure_gpu_support()
+                offsets, targets, distances = gpu_support.support_many(
                     sources,
                     requested_radii,
                     target_bandwidths=target_bandwidths,
@@ -807,8 +933,9 @@ class _KernelSupportProvider:
             self.support_query_count += int(sources.size)
             self.support_query_seconds += max(0.0, time.perf_counter() - started)
             return offsets, targets, distances
-        if self.gpu_support is not None:
-            offsets, targets, distances = self.gpu_support.support_many(
+        if self.support_execution == KERNEL_SUPPORT_EXECUTION_GPU:
+            gpu_support = self._ensure_gpu_support()
+            offsets, targets, distances = gpu_support.support_many(
                 sources,
                 requested_radii,
                 kernel_bandwidth_rule=self.kernel_bandwidth_rule,
@@ -965,20 +1092,27 @@ class _KernelSupportProvider:
             )
             metrics["support_provider_atomic_distance_evaluations"] = 0
         if self.knn_prefix_support is not None:
-            metrics.update(self.knn_prefix_support.operational_metrics())
+            knn_metrics = self.knn_prefix_support.operational_metrics()
+            metrics.update(knn_metrics)
             if self.knn_prefix_support_used and self.generic_support_used:
                 metrics["support_provider"] = (
-                    "mixed_symmetric_knn_union_and_tiled"
-                    if self.kernel_bandwidth_rule == KERNEL_BANDWIDTH_RULE_SYMMETRIC_MAX
-                    else "mixed_exact_knn_prefix_and_generic"
+                    "symmetric_tiled_gpu"
+                    if self.support_execution == KERNEL_SUPPORT_EXECUTION_GPU
+                    else "symmetric_tiled_cpu"
+                )
+                metrics["knn_support_reuse_fallback_provider"] = knn_metrics.get(
+                    "support_provider"
                 )
             elif self.knn_prefix_support_used:
                 metrics.update(
                     {
                         "support_provider": (
-                            "symmetric_knn_union"
+                            knn_metrics.get("support_provider", "symmetric_knn_union")
                             if self.kernel_bandwidth_rule == KERNEL_BANDWIDTH_RULE_SYMMETRIC_MAX
                             else "exact_knn_prefix"
+                        ),
+                        "support_provider_version": knn_metrics.get(
+                            "support_provider_version", "symmetric-knn-union-v1"
                         ),
                         "support_provider_stats_status": "active",
                         "support_provider_radius_queries": 0,
@@ -1000,6 +1134,10 @@ class _KernelSupportProvider:
                         ),
                     }
                 )
+        metrics["knn_support_reuse_reason"] = self.knn_support_eligibility_reason
+        metrics["knn_support_reuse_attempted"] = self.knn_prefix_support is not None
+        metrics["knn_support_reuse_used"] = self.knn_prefix_support_used
+        metrics["generic_support_used"] = self.generic_support_used
         for key, value in index_metrics.items():
             metrics.setdefault(key, value)
         return metrics
@@ -1009,6 +1147,9 @@ class _KernelSupportProvider:
 
         if self.gpu_support is not None:
             self.gpu_support.close()
+        floor_index = getattr(self.knn_prefix_support, "floor_index", None)
+        if floor_index is not None:
+            floor_index.close()
 
     def normaliser(
         self,
@@ -1366,6 +1507,9 @@ def evaluate_leave_one_out_objective(
     kernel_bandwidth_rule: str = KERNEL_BANDWIDTH_RULE_SYMMETRIC_MAX,
     knn_support: ExactNeighbourResult | None = None,
     knn_support_row_ids: Sequence[str] | None = None,
+    knn_effective_radii: np.ndarray | None = None,
+    knn_floor: float | None = None,
+    expected_knn_representation_fingerprint: str | None = None,
 ) -> LeaveOneOutObjective:
     """Evaluate the exact source-normalized finite-pool LOO objective."""
 
@@ -1399,6 +1543,9 @@ def evaluate_leave_one_out_objective(
             kernel_bandwidth_rule=bandwidth_rule,
             knn_support=knn_support,
             knn_support_row_ids=knn_support_row_ids,
+            knn_effective_radii=knn_effective_radii,
+            knn_floor=knn_floor,
+            expected_knn_representation_fingerprint=expected_knn_representation_fingerprint,
         )
         return batched[0]
 
@@ -1435,6 +1582,9 @@ def evaluate_leave_one_out_objective(
         knn_support=knn_support,
         knn_support_row_ids=knn_support_row_ids,
         max_calibration_work_bytes=max_calibration_work_bytes,
+        knn_effective_radii=knn_effective_radii,
+        knn_floor=knn_floor,
+        expected_knn_representation_fingerprint=expected_knn_representation_fingerprint,
     )
     numerator = np.zeros(values.shape[0], dtype=np.float64)
     incoming_geometric = np.zeros(values.shape[0], dtype=np.int64)
@@ -1504,7 +1654,9 @@ def evaluate_leave_one_out_objective(
                 "kernel_bandwidth_rule",
                 "support_provider_rule",
                 "support_provider_version",
+                "knn_support_reuse_reason",
                 "kernel_bandwidth_rule_version",
+                "floor_statement",
             }:
                 diagnostics[metric_name] = metric_value
             elif isinstance(metric_value, bool):
@@ -1514,6 +1666,10 @@ def evaluate_leave_one_out_objective(
         diagnostics["support_size_per_candidate"] = [
             provider_metrics.get("support_count_mean")
         ]
+        diagnostics["loo_provider_identity"] = provider_metrics.get("support_provider")
+        diagnostics["loo_provider_reuse_reason"] = provider_metrics.get(
+            "knn_support_reuse_reason"
+        )
         diagnostics["support_max_per_candidate"] = [
             provider_metrics.get("support_count_max")
         ]
@@ -1591,6 +1747,9 @@ def evaluate_leave_one_out_objectives(
     kernel_bandwidth_rule: str = KERNEL_BANDWIDTH_RULE_SYMMETRIC_MAX,
     knn_support: ExactNeighbourResult | None = None,
     knn_support_row_ids: Sequence[str] | None = None,
+    knn_effective_radii: np.ndarray | None = None,
+    knn_floor: float | None = None,
+    expected_knn_representation_fingerprint: str | None = None,
 ) -> tuple[LeaveOneOutObjective, ...]:
     """Evaluate a bounded batch of exact LOO objectives source-by-source.
 
@@ -1708,6 +1867,9 @@ def evaluate_leave_one_out_objectives(
         knn_support=knn_support,
         knn_support_row_ids=knn_support_row_ids,
         max_calibration_work_bytes=work_limit,
+        knn_effective_radii=knn_effective_radii,
+        knn_floor=knn_floor,
+        expected_knn_representation_fingerprint=expected_knn_representation_fingerprint,
     )
     loo_started = time.perf_counter()
     checkpoint_seconds = 0.0
@@ -1772,6 +1934,20 @@ def evaluate_leave_one_out_objectives(
             "source_order": "ascending-original-pool-row-index",
             "k_c_batch_shape": [batch_count, row_count],
             "numerical_tolerance": SPARSE_NUMERICAL_TOLERANCE,
+            "support_provider_contract": (
+                "floor-aware-symmetric-knn-v1"
+                if bandwidth_rule == KERNEL_BANDWIDTH_RULE_SYMMETRIC_MAX
+                else "generic-exact-v1"
+            ),
+            "knn_support_fingerprint": (
+                knn_support.fingerprint if knn_support is not None else ""
+            ),
+            "knn_effective_radii": (
+                _array_digest(np.asarray(knn_effective_radii, dtype=np.float64))
+                if knn_effective_radii is not None
+                else ""
+            ),
+            "knn_floor": None if knn_floor is None else float(knn_floor),
         }
         if bandwidth_rule != KERNEL_BANDWIDTH_RULE_ASYMMETRIC_SOURCE:
             checkpoint_identity["kernel_bandwidth_rule"] = bandwidth_rule
@@ -2298,7 +2474,9 @@ def evaluate_leave_one_out_objectives(
                 "kernel_bandwidth_rule",
                 "support_provider_rule",
                 "support_provider_version",
+                "knn_support_reuse_reason",
                 "kernel_bandwidth_rule_version",
+                "floor_statement",
             }:
                 diagnostics[metric_name] = metric_value
             elif isinstance(metric_value, bool):
@@ -2318,6 +2496,10 @@ def evaluate_leave_one_out_objectives(
             )
         diagnostics["support_size_per_candidate"] = provider_metrics.get(
             "support_size_per_candidate", operational_metrics["support_size_per_candidate"]
+        )
+        diagnostics["loo_provider_identity"] = provider_metrics.get("support_provider")
+        diagnostics["loo_provider_reuse_reason"] = provider_metrics.get(
+            "knn_support_reuse_reason"
         )
         diagnostics["support_max_per_candidate"] = provider_metrics.get(
             "support_max_per_candidate", operational_metrics["support_max_per_candidate"]
@@ -2626,6 +2808,27 @@ def build_sparse_atomic_kernel_graph(
         kernel_bandwidth_rule=frozen.kernel_bandwidth_rule,
         knn_support=knn_support,
         knn_support_row_ids=knn_support_row_ids,
+        knn_effective_radii=(
+            frozen.radii
+            if frozen.c == 1.0
+            and frozen.kernel_bandwidth_rule == KERNEL_BANDWIDTH_RULE_SYMMETRIC_MAX
+            and knn_support is not None
+            else None
+        ),
+        knn_floor=(
+            float(
+                pool.reference_measure_config.get(
+                    "tolerance", DEFAULT_REFERENCE_MEASURE_TOLERANCE
+                )
+            )
+            if frozen.c == 1.0
+            and frozen.kernel_bandwidth_rule == KERNEL_BANDWIDTH_RULE_SYMMETRIC_MAX
+            and knn_support is not None
+            else None
+        ),
+        expected_knn_representation_fingerprint=(
+            pool.representation_fingerprint if knn_support is not None else None
+        ),
     )
     if (
         frozen.backend
@@ -2864,6 +3067,7 @@ def _publish_out_of_core_candidate_store(
     candidate_support_max: int,
     contribution_spool_bytes: int,
     estimated_peak_memory_bytes: int,
+    operational_diagnostics: Mapping[str, Any] | None = None,
 ) -> OutOfCoreSparseCandidateContributions:
     """Promote a verified candidate spool into memory-mapped CSR arrays."""
 
@@ -2975,6 +3179,7 @@ def _publish_out_of_core_candidate_store(
             "candidate_pmf_max_deviation": candidate_pmf_max_deviation,
             "contribution_spool_bytes": int(contribution_spool_bytes),
             "estimated_peak_memory_bytes": int(estimated_peak_memory_bytes),
+            "operational_diagnostics": dict(operational_diagnostics or {}),
             "files": file_entries,
         }
         manifest_path = temporary / "manifest.json"
@@ -3216,6 +3421,7 @@ def build_streamed_candidate_contributions(
                 "candidate_pmf_max_deviation",
                 "contribution_spool_bytes",
                 "estimated_peak_memory_bytes",
+                "operational_diagnostics",
             )
             if any(name not in metadata for name in required_metadata):
                 raise ValueError(
@@ -3254,6 +3460,7 @@ def build_streamed_candidate_contributions(
                 candidate_resident_bytes=existing.resident_array_bytes,
                 kernel_bandwidth_rule=frozen.kernel_bandwidth_rule,
                 kernel_bandwidth_rule_version=frozen.kernel_bandwidth_rule_version,
+                operational_metrics=dict(metadata.get("operational_diagnostics", {})),
             )
             logger.info(
                 "Reusing verified out-of-core candidate contributions: path=%s, Q=%d",
@@ -3306,6 +3513,27 @@ def build_streamed_candidate_contributions(
             kernel_bandwidth_rule=frozen.kernel_bandwidth_rule,
             knn_support=knn_support,
             knn_support_row_ids=knn_support_row_ids,
+            knn_effective_radii=(
+                frozen.radii
+                if frozen.c == 1.0
+                and frozen.kernel_bandwidth_rule == KERNEL_BANDWIDTH_RULE_SYMMETRIC_MAX
+                and knn_support is not None
+                else None
+            ),
+            knn_floor=(
+                float(
+                    pool.reference_measure_config.get(
+                        "tolerance", DEFAULT_REFERENCE_MEASURE_TOLERANCE
+                    )
+                )
+                if frozen.c == 1.0
+                and frozen.kernel_bandwidth_rule == KERNEL_BANDWIDTH_RULE_SYMMETRIC_MAX
+                and knn_support is not None
+                else None
+            ),
+            expected_knn_representation_fingerprint=(
+                pool.representation_fingerprint if knn_support is not None else None
+            ),
         )
         if (
             frozen.backend
@@ -3459,6 +3687,32 @@ def build_streamed_candidate_contributions(
             "bandwidth": frozen.fingerprint,
             "entry_limit": int(entry_limit),
             "numerical_tolerance": SPARSE_NUMERICAL_TOLERANCE,
+            "support_provider_contract": (
+                "floor-aware-symmetric-knn-v1"
+                if frozen.kernel_bandwidth_rule == KERNEL_BANDWIDTH_RULE_SYMMETRIC_MAX
+                else "generic-exact-v1"
+            ),
+            "knn_support_fingerprint": (
+                knn_support.fingerprint if knn_support is not None else ""
+            ),
+            "knn_effective_radii": (
+                _array_digest(np.asarray(frozen.radii, dtype=np.float64))
+                if knn_support is not None
+                and frozen.c == 1.0
+                and frozen.kernel_bandwidth_rule == KERNEL_BANDWIDTH_RULE_SYMMETRIC_MAX
+                else ""
+            ),
+            "knn_floor": (
+                float(
+                    pool.reference_measure_config.get(
+                        "tolerance", DEFAULT_REFERENCE_MEASURE_TOLERANCE
+                    )
+                )
+                if knn_support is not None
+                and frozen.c == 1.0
+                and frozen.kernel_bandwidth_rule == KERNEL_BANDWIDTH_RULE_SYMMETRIC_MAX
+                else None
+            ),
         }
         normalized_support_execution = str(kernel_support_execution).strip().lower()
         if normalized_support_execution == "exact_cpu":
@@ -4255,6 +4509,28 @@ def build_streamed_candidate_contributions(
                     candidate_support_max=int(np.max(candidate_support_sizes)),
                     contribution_spool_bytes=spool_bytes,
                     estimated_peak_memory_bytes=peak_estimated_bytes,
+                    operational_diagnostics={
+                        **support_provider.operational_metrics(),
+                        **(
+                            {
+                                "knn_radius_diagnostics": (
+                                    _knn_radius_operational_diagnostics(
+                                        pool,
+                                        knn_support,
+                                        frozen.radii,
+                                        c=frozen.c,
+                                    )
+                                )
+                            }
+                            if (
+                                knn_support is not None
+                                and frozen.c == 1.0
+                                and frozen.kernel_bandwidth_rule
+                                == KERNEL_BANDWIDTH_RULE_SYMMETRIC_MAX
+                            )
+                            else {}
+                        ),
+                    },
                 )
             record_phase(
                 "candidate_csr_finalization",
@@ -4311,6 +4587,17 @@ def build_streamed_candidate_contributions(
 
     sample_lease()
     provider_metrics = support_provider.operational_metrics()
+    if (
+        knn_support is not None
+        and frozen.c == 1.0
+        and frozen.kernel_bandwidth_rule == KERNEL_BANDWIDTH_RULE_SYMMETRIC_MAX
+    ):
+        provider_metrics["knn_radius_diagnostics"] = _knn_radius_operational_diagnostics(
+            pool,
+            knn_support,
+            frozen.radii,
+            c=frozen.c,
+        )
     support_provider.close()
     operational_metrics = {
         "wall_seconds": max(0.0, time.perf_counter() - started),

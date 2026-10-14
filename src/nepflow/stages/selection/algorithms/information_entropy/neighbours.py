@@ -677,11 +677,69 @@ class ExactSymmetricKNNUnionSupport(ExactKNNPrefixSupport):
     backend = "symmetric_knn_union"
     backend_version = "symmetric-knn-union-v1"
 
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        super().__init__(*args, **kwargs)
+    def __init__(
+        self,
+        descriptors: np.ndarray,
+        neighbours: ExactNeighbourResult,
+        *,
+        effective_radii: Sequence[float] | np.ndarray | None = None,
+        declared_floor: float | None = None,
+        floor: float | None = None,
+        **kwargs: Any,
+    ) -> None:
+        """Construct the exact union and, when required, its floor augmentation."""
+
+        if floor is not None:
+            if declared_floor is not None and float(floor) != float(declared_floor):
+                raise ValueError("floor and declared_floor must agree")
+            declared_floor = float(floor)
+        super().__init__(descriptors, neighbours, **kwargs)
         neighbours = self.neighbours
         if not neighbours.backend_fingerprint:
             raise ValueError("symmetric kNN union requires a persisted kNN backend fingerprint")
+
+        raw_radii = np.asarray(neighbours.radii, dtype=np.float64)
+        if effective_radii is None:
+            effective = raw_radii.copy()
+            if declared_floor is not None:
+                raise ValueError(
+                    "declared_floor requires the complete effective_radii vector"
+                )
+            declared_floor_value: float | None = None
+        else:
+            effective = np.asarray(effective_radii)
+            if effective.dtype != np.dtype(np.float64) or effective.shape != raw_radii.shape:
+                raise ValueError("effective_radii must be a full-pool float64 vector")
+            if not np.all(np.isfinite(effective)) or np.any(effective <= 0.0):
+                raise ValueError("effective_radii must be finite and strictly positive")
+            if declared_floor is None:
+                raise ValueError("effective_radii requires a declared floor")
+            declared_floor_value = float(declared_floor)
+            if not np.isfinite(declared_floor_value) or declared_floor_value <= 0.0:
+                raise ValueError("declared_floor must be finite and strictly positive")
+            expected_effective = np.maximum(raw_radii, declared_floor_value)
+            if not np.array_equal(effective, expected_effective):
+                raise ValueError(
+                    "effective_radii is not the canonical max(raw_radii, declared_floor) vector"
+                )
+            effective = np.array(effective, dtype=np.float64, copy=True)
+        effective.setflags(write=False)
+        self.effective_radii = effective
+        self.declared_floor = declared_floor_value
+        self.subfloor_row_count = int(
+            np.count_nonzero(raw_radii < declared_floor_value)
+            if declared_floor_value is not None
+            else 0
+        )
+        self.subfloor_location_count = 0
+        self.floor_augmented_support_pairs = 0
+        self.floor_distance_evaluations = 0
+        self.floor_index: IndexedCPUNeighbourIndex | None = None
+        self.floor_extra_indptr = np.zeros(
+            neighbours.unique_locations.shape[0] + 1, dtype=np.int64
+        )
+        self.floor_extra_locations = np.empty(0, dtype=np.int64)
+        self.floor_extra_distances = np.empty(0, dtype=np.float64)
         location_count = int(neighbours.unique_locations.shape[0])
         representative_rows = np.asarray(neighbours.location_representatives, dtype=np.int64)
         representative_locations = neighbours.row_to_location[representative_rows]
@@ -768,18 +826,182 @@ class ExactSymmetricKNNUnionSupport(ExactKNNPrefixSupport):
         self.reverse_index_bytes = reverse_bytes
         self.reused_knn_locations = location_count
         self.new_distance_evaluations = 0
+        if declared_floor_value is not None:
+            self._build_floor_augmentation(
+                raw_radii,
+                declared_floor_value,
+            )
+            if self.subfloor_location_count:
+                self.backend = "symmetric_knn_floor_augmented"
+                self.backend_version = "symmetric-knn-floor-augmented-v1"
+            if self.subfloor_location_count == 0:
+                logger.info(
+                    "Exact symmetric kNN floor augmentation is a no-op: zero raw "
+                    "sub-floor radii; raw kNN support reuse is exact"
+                )
+
+    def _build_floor_augmentation(
+        self,
+        raw_radii: np.ndarray,
+        declared_floor: float,
+    ) -> None:
+        """Build only the strict floor edges absent from the original union."""
+
+        neighbours = self.neighbours
+        location_count = int(neighbours.unique_locations.shape[0])
+        representative_rows = np.asarray(neighbours.location_representatives, dtype=np.int64)
+        subfloor_locations = np.flatnonzero(
+            raw_radii[representative_rows] < declared_floor
+        ).astype(np.int64, copy=False)
+        self.subfloor_location_count = int(subfloor_locations.size)
+        if subfloor_locations.size < 2:
+            # A one-location subset has no cross-location pair to add.
+            return
+
+        subset_descriptor_bytes = int(
+            subfloor_locations.size * neighbours.unique_locations.shape[1] * np.dtype(np.float64).itemsize
+        )
+        subset_workspace = int(
+            subset_descriptor_bytes + 32 * subfloor_locations.size + 8192
+        )
+        if subset_workspace > self.max_workspace_bytes:
+            raise RadiusQueryCapacityError(
+                "floor-augmentation subset index exceeds its bounded support workspace: "
+                f"requested_bytes={subset_workspace}, "
+                f"max_support_workspace_bytes={self.max_workspace_bytes}, "
+                f"subfloor_locations={subfloor_locations.size}"
+            )
+        subset_descriptors = np.ascontiguousarray(
+            neighbours.unique_locations[subfloor_locations], dtype=np.float64
+        )
+        subset_index = IndexedCPUNeighbourIndex(
+            subset_descriptors,
+            max_index_bytes=self.max_workspace_bytes,
+            max_radius_query_bytes=self.max_workspace_bytes,
+            resource_budget=self.resource_budget,
+        )
+        self.floor_index = subset_index
+        subset_sources = np.arange(subfloor_locations.size, dtype=np.int64)
+        floor_radii = np.full(subfloor_locations.size, declared_floor, dtype=np.float64)
+        offsets, targets, distances = subset_index.radius_support_many(
+            subset_sources,
+            floor_radii,
+            chunk_size=min(1024, max(1, subfloor_locations.size)),
+            context=self.capacity_context or "exact symmetric kNN floor augmentation",
+        )
+        self.floor_distance_evaluations = int(subset_index.unique_distance_evaluations)
+        self.new_distance_evaluations = self.floor_distance_evaluations
+
+        # Build a compact location-level view of the original union.  This is
+        # used only once to remove overlaps; duplicate atomic rows are expanded
+        # from the inherited grouping during each support query.
+        # Only below-floor source locations need an overlap lookup.  Build it
+        # from the existing outgoing and reverse CSR arrays instead of growing
+        # a Q-sized Python/list-of-arrays structure with repeated appends.
+        original_by_source: dict[int, np.ndarray] = {}
+        for global_source in subfloor_locations:
+            representative = int(neighbours.location_representatives[int(global_source)])
+            outgoing_distances = neighbours.neighbour_distances[representative]
+            outgoing = neighbours.row_to_location[
+                neighbours.neighbour_indices[representative]
+            ][outgoing_distances < raw_radii[representative]]
+            incoming_start = int(self.reverse_indptr[int(global_source)])
+            incoming_stop = int(self.reverse_indptr[int(global_source) + 1])
+            incoming = self.reverse_source_locations[incoming_start:incoming_stop]
+            original_by_source[int(global_source)] = np.unique(
+                np.concatenate((outgoing, incoming))
+            )
+
+        extra_by_source: dict[int, np.ndarray] = {}
+        distance_by_source: dict[int, np.ndarray] = {}
+        empty_locations = np.empty(0, dtype=np.int64)
+        empty_distances = np.empty(0, dtype=np.float64)
+        subset_to_location = subfloor_locations
+        for subset_source, global_source in enumerate(subfloor_locations):
+            begin = int(offsets[subset_source])
+            end = int(offsets[subset_source + 1])
+            global_targets = subset_to_location[targets[begin:end]]
+            candidate_distances = distances[begin:end]
+            nonself = global_targets != int(global_source)
+            global_targets = global_targets[nonself]
+            candidate_distances = candidate_distances[nonself]
+            existing = original_by_source[int(global_source)]
+            is_new = (
+                ~np.isin(global_targets, existing, assume_unique=True)
+                if existing.size
+                else np.ones(global_targets.shape, dtype=bool)
+            )
+            new_targets = np.asarray(global_targets[is_new], dtype=np.int64)
+            new_distances = np.asarray(candidate_distances[is_new], dtype=np.float64)
+            order = np.argsort(new_targets, kind="stable")
+            extra_by_source[int(global_source)] = new_targets[order]
+            distance_by_source[int(global_source)] = new_distances[order]
+
+        extra_total = sum(int(values.size) for values in extra_by_source.values())
+        extra_workspace = int(
+            8 * (location_count + 1)
+            + 16 * extra_total
+            + 16 * subfloor_locations.size
+            + 4096
+        )
+        if extra_workspace > self.max_workspace_bytes:
+            raise RadiusQueryCapacityError(
+                "floor-augmentation support materialisation exceeds its bounded workspace: "
+                f"requested_bytes={extra_workspace}, "
+                f"max_support_workspace_bytes={self.max_workspace_bytes}, "
+                f"additional_pairs={extra_total}"
+            )
+        extra_indptr = np.zeros(location_count + 1, dtype=np.int64)
+        for source in range(location_count):
+            extra_indptr[source + 1] = extra_indptr[source] + extra_by_source.get(
+                source, empty_locations
+            ).size
+        extra_count = int(extra_indptr[-1])
+        extra_locations = np.empty(extra_count, dtype=np.int64)
+        extra_distances = np.empty(extra_count, dtype=np.float64)
+        cursor = 0
+        for source in range(location_count):
+            source_locations = extra_by_source.get(source, empty_locations)
+            source_distances = distance_by_source.get(source, empty_distances)
+            stop = cursor + int(source_locations.size)
+            extra_locations[cursor:stop] = source_locations
+            extra_distances[cursor:stop] = source_distances
+            cursor = stop
+        extra_indptr.setflags(write=False)
+        extra_locations.setflags(write=False)
+        extra_distances.setflags(write=False)
+        self.floor_extra_indptr = extra_indptr
+        self.floor_extra_locations = extra_locations
+        self.floor_extra_distances = extra_distances
+        self.floor_augmented_support_pairs = extra_count
+        logger.info(
+            "Exact symmetric kNN floor augmentation completed: subfloor_rows=%d, "
+            "subfloor_locations=%d, additional_pairs=%d, distance_evaluations=%d",
+            self.subfloor_row_count,
+            self.subfloor_location_count,
+            self.floor_augmented_support_pairs,
+            self.floor_distance_evaluations,
+        )
 
     def eligible(
         self,
         source_indices: np.ndarray,
         radii: np.ndarray,
+        target_bandwidths: np.ndarray | None = None,
     ) -> bool:
-        expected = self.neighbours.radii[source_indices]
+        expected = self.effective_radii[source_indices]
         if radii.ndim == 1:
-            return np.array_equal(radii, expected)
-        return bool(
-            np.all(np.asarray(radii, dtype=np.float64) == expected[None, :])
-        )
+            source_matches = np.array_equal(radii, expected)
+        else:
+            source_matches = bool(
+                np.all(np.asarray(radii, dtype=np.float64) == expected[None, :])
+            )
+        if target_bandwidths is None:
+            return source_matches
+        targets = np.asarray(target_bandwidths, dtype=np.float64)
+        if targets.ndim == 1:
+            return source_matches and np.array_equal(targets, self.effective_radii)
+        return source_matches and bool(np.all(targets == self.effective_radii[None, :]))
 
     def support_many(
         self,
@@ -799,7 +1021,7 @@ class ExactSymmetricKNNUnionSupport(ExactKNNPrefixSupport):
             # The reverse-union proof is specific to the c=1 canonical kth
             # radii.  Reject any other target bandwidth vector rather than
             # silently returning an incomplete support.
-            expected = self.neighbours.radii
+            expected = self.effective_radii
             if targets.ndim == 1:
                 target_matches = np.array_equal(targets, expected)
             else:
@@ -820,9 +1042,9 @@ class ExactSymmetricKNNUnionSupport(ExactKNNPrefixSupport):
             raise ValueError("radii must align with source_indices")
         if not np.all(np.isfinite(requested)) or np.any(requested <= 0.0):
             raise ValueError("symmetric kNN radii must be finite and positive")
-        if not self.eligible(source_rows, requested):
+        if not self.eligible(source_rows, requested, target_bandwidths):
             raise ValueError(
-                "symmetric kNN union requires the canonical c=1 kNN bandwidth vector"
+                "symmetric kNN union requires the canonical effective c=1 bandwidth vector"
             )
 
         counts = np.empty(source_rows.size, dtype=np.int64)
@@ -852,6 +1074,11 @@ class ExactSymmetricKNNUnionSupport(ExactKNNPrefixSupport):
                         np.asarray([source_location], dtype=np.int64),
                         outgoing,
                         incoming,
+                        self.floor_extra_locations[
+                            self.floor_extra_indptr[source_location] : self.floor_extra_indptr[
+                                source_location + 1
+                            ]
+                        ],
                     )
                 )
             )
@@ -864,6 +1091,17 @@ class ExactSymmetricKNNUnionSupport(ExactKNNPrefixSupport):
                 (int(location), float(distance))
                 for location, distance in zip(incoming, incoming_distances, strict=True)
             )
+            extra_start = int(self.floor_extra_indptr[source_location])
+            extra_stop = int(self.floor_extra_indptr[source_location + 1])
+            if extra_stop > extra_start:
+                distance_by_location.update(
+                    (int(location), float(distance))
+                    for location, distance in zip(
+                        self.floor_extra_locations[extra_start:extra_stop],
+                        self.floor_extra_distances[extra_start:extra_stop],
+                        strict=True,
+                    )
+                )
             location_distances = np.asarray(
                 [distance_by_location[int(location)] for location in locations],
                 dtype=np.float64,
@@ -925,8 +1163,19 @@ class ExactSymmetricKNNUnionSupport(ExactKNNPrefixSupport):
         self.query_workspace_peak_bytes = max(self.query_workspace_peak_bytes, workspace_bytes)
         return offsets, targets, output_distances
 
-    def operational_metrics(self) -> dict[str, int | float | str]:
+    def operational_metrics(self) -> dict[str, Any]:
         metrics = dict(super().operational_metrics())
+        floor_index_metrics = (
+            self.floor_index.memory_metrics() if self.floor_index is not None else {}
+        )
+        floor_query_seconds = sum(
+            float(floor_index_metrics.get(key, 0.0) or 0.0)
+            for key in (
+                "radius_preflight_count_seconds",
+                "radius_retrieval_seconds",
+                "canonical_distance_verification_seconds",
+            )
+        )
         metrics.update(
             {
                 "support_provider": self.backend,
@@ -934,10 +1183,40 @@ class ExactSymmetricKNNUnionSupport(ExactKNNPrefixSupport):
                 "kernel_bandwidth_rule": KERNEL_BANDWIDTH_RULE_SYMMETRIC_MAX,
                 "reverse_index_memory_bytes": int(self.reverse_index_bytes),
                 "reused_knn_locations": int(self.reused_knn_locations),
-                "new_distance_evaluations": 0,
-                "support_provider_new_distance_evaluations": 0,
+                "new_distance_evaluations": int(self.new_distance_evaluations),
+                "support_provider_new_distance_evaluations": int(
+                    self.new_distance_evaluations
+                ),
+                "floor_declared": self.declared_floor,
+                "floor_subfloor_row_count": int(self.subfloor_row_count),
+                "floor_subfloor_location_count": int(self.subfloor_location_count),
+                "floor_augmented_support_pairs": int(self.floor_augmented_support_pairs),
+                "floor_new_canonical_distance_evaluations": int(
+                    self.floor_distance_evaluations
+                ),
+                "floor_subset_index_build_seconds": float(
+                    floor_index_metrics.get("tree_build_seconds", 0.0) or 0.0
+                ),
+                "floor_subset_query_seconds": floor_query_seconds,
+                "floor_subset_radius_queries": int(
+                    floor_index_metrics.get("radius_queries", 0) or 0
+                ),
+                "floor_augmentation_noop": bool(self.floor_augmented_support_pairs == 0),
+                "floor_statement": (
+                    "zero sub-floor radii means floor augmentation is a no-op and raw "
+                    "kNN reuse is exact"
+                    if self.subfloor_location_count == 0
+                    else (
+                        "floor augmentation produced no new strict sub-floor pairs"
+                        if self.floor_augmented_support_pairs == 0
+                        else "floor augmentation added the exact strict sub-floor support subset"
+                    )
+                ),
             }
         )
+        if self.subfloor_location_count:
+            metrics["support_provider"] = "symmetric_knn_floor_augmented"
+            metrics["support_provider_version"] = "symmetric-knn-floor-augmented-v1"
         return metrics
 
 
@@ -2468,7 +2747,11 @@ class IndexedCPUNeighbourIndex:
                 has_excluded_candidate = np.ones(query_count, dtype=bool)
                 for offset, query_location in enumerate(range(start, stop)):
                     candidates = candidate_matrix[offset]
-                    valid = (candidates >= 0) & (candidates != query_location)
+                    valid = (
+                        (candidates >= 0)
+                        & (candidates < n_locations)
+                        & (candidates != query_location)
+                    )
                     candidates = candidates[valid]
                     reported_distances = tree_distance_matrix[offset][valid]
                     if candidates.shape[0] < order_k:

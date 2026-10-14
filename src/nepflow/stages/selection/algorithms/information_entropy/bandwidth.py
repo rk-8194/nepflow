@@ -475,9 +475,84 @@ def _effective_bandwidth_radii(pool: EntropyPool, radii: np.ndarray) -> np.ndarr
 
 
 def _can_reuse_raw_knn_support(pool: EntropyPool, radii: np.ndarray) -> bool:
-    """Reuse the exact kNN prefix only when the reference floor is inactive."""
+    """Return whether the raw vector needs no floor augmentation.
+
+    This compatibility helper is diagnostic only.  It is deliberately not
+    used to decide whether the exact kNN result is handed to a symmetric
+    support provider; a mixed raw/effective vector is served by the exact
+    floor-augmented provider.
+    """
 
     return bool(np.array_equal(np.asarray(radii), _effective_bandwidth_radii(pool, radii)))
+
+
+def _knn_radius_diagnostics(
+    pool: EntropyPool,
+    neighbours: ExactNeighbourResult,
+    *,
+    c: float,
+) -> dict[str, Any]:
+    """Describe raw and effective kNN radii in the final pool descriptor space."""
+
+    raw = np.asarray(neighbours.radii, dtype=np.float64)
+    effective = _effective_bandwidth_radii(pool, raw)
+    floor = _reference_measure_radius_floor(pool)
+    representative_rows = np.asarray(neighbours.location_representatives, dtype=np.int64)
+    distinct_raw = raw[representative_rows]
+
+    def stats(values: np.ndarray) -> dict[str, float | str]:
+        quantiles = np.percentile(values, [1.0, 10.0, 50.0, 90.0, 99.0])
+        return {
+            "min": float(np.min(values)),
+            "p1": float(quantiles[0]),
+            "p10": float(quantiles[1]),
+            "p50": float(quantiles[2]),
+            "p90": float(quantiles[3]),
+            "p99": float(quantiles[4]),
+            "max": float(np.max(values)),
+            "units": "final_weighted_whitened_descriptor_euclidean",
+        }
+
+    def floor_counts(values: np.ndarray) -> dict[str, int | float]:
+        below = int(np.count_nonzero(values < floor))
+        equal = int(np.count_nonzero(values == floor))
+        above = int(np.count_nonzero(values >= floor))
+        return {
+            "below_floor_count": below,
+            "below_floor_fraction": below / values.size,
+            "equal_floor_count": equal,
+            "equal_floor_fraction": equal / values.size,
+            "at_or_above_floor_count": above,
+            "at_or_above_floor_fraction": above / values.size,
+        }
+
+    effective_changed = int(np.count_nonzero(effective != raw))
+    diagnostics: dict[str, Any] = {
+        "k": int(neighbours.k),
+        "c": float(c),
+        "floor": float(floor),
+        "N": int(raw.size),
+        "dimension": int(pool.descriptors.shape[1]),
+        "distinct_locations": int(neighbours.unique_locations.shape[0]),
+        "exact_duplicate_rows": int(raw.size - neighbours.unique_locations.shape[0]),
+        "raw_radius_statistics": stats(raw),
+        "raw_distinct_location_radius_statistics": stats(distinct_raw),
+        "effective_radius_statistics": stats(effective),
+        "raw_row_floor_counts": floor_counts(raw),
+        "raw_distinct_location_floor_counts": floor_counts(distinct_raw),
+        "effective_bandwidth_changed_count": effective_changed,
+        "effective_bandwidth_changed_fraction": effective_changed / raw.size,
+        "whitening_scheme": "final_weighted_deterministic_whitening",
+        "whitening_fingerprint": pool.transform_fingerprint,
+        "representation_fingerprint": pool.representation_fingerprint,
+        "distinct_location_policy": neighbours.distinct_location_policy,
+        "raw_kth_distinct_location_radii": True,
+    }
+    if effective_changed == 0:
+        diagnostics["floor_statement"] = (
+            "zero sub-floor radii means floor augmentation is a no-op and raw kNN reuse is exact"
+        )
+    return diagnostics
 
 
 def _progress_timing(completed: int, total: int, started: float) -> tuple[float, float]:
@@ -2308,11 +2383,33 @@ def calibrate_bandwidth(
                             knn_support=(
                                 neighbours
                                 if frozen.c == 1.0
-                                and _can_reuse_raw_knn_support(pool, neighbours.radii)
+                                and frozen.kernel_bandwidth_rule
+                                == KERNEL_BANDWIDTH_RULE_SYMMETRIC_MAX
                                 else None
                             ),
                             knn_support_row_ids=(
                                 _pool_row_ids(pool) if frozen.c == 1.0 else None
+                            ),
+                            knn_effective_radii=(
+                                frozen.radii
+                                if frozen.c == 1.0
+                                and frozen.kernel_bandwidth_rule
+                                == KERNEL_BANDWIDTH_RULE_SYMMETRIC_MAX
+                                else None
+                            ),
+                            knn_floor=(
+                                _reference_measure_radius_floor(pool)
+                                if frozen.c == 1.0
+                                and frozen.kernel_bandwidth_rule
+                                == KERNEL_BANDWIDTH_RULE_SYMMETRIC_MAX
+                                else None
+                            ),
+                            expected_knn_representation_fingerprint=(
+                                pool.representation_fingerprint
+                                if frozen.c == 1.0
+                                and frozen.kernel_bandwidth_rule
+                                == KERNEL_BANDWIDTH_RULE_SYMMETRIC_MAX
+                                else None
                             ),
                         ),
                     )
@@ -2349,11 +2446,25 @@ def calibrate_bandwidth(
                         knn_support=(
                             neighbours
                             if use_knn_prefix_support
-                            and _can_reuse_raw_knn_support(pool, neighbours.radii)
                             else None
                         ),
                         knn_support_row_ids=(
                             _pool_row_ids(pool) if use_knn_prefix_support else None
+                        ),
+                        knn_effective_radii=(
+                            frozen_batch[0].radii
+                            if use_knn_prefix_support
+                            else None
+                        ),
+                        knn_floor=(
+                            _reference_measure_radius_floor(pool)
+                            if use_knn_prefix_support
+                            else None
+                        ),
+                        expected_knn_representation_fingerprint=(
+                            pool.representation_fingerprint
+                            if use_knn_prefix_support
+                            else None
                         ),
                     )
                 operational_metrics["loo_seconds"] += max(0.0, time.perf_counter() - loo_started)
@@ -2363,6 +2474,14 @@ def calibrate_bandwidth(
                 )
                 if not isinstance(active_support_metrics, Mapping):
                     active_support_metrics = {}
+                operational_metrics["loo_provider_identity"] = active_support_metrics.get(
+                    "loo_provider_identity",
+                    active_support_metrics.get("support_provider"),
+                )
+                operational_metrics["loo_provider_reuse_reason"] = (
+                    active_support_metrics.get("loo_provider_reuse_reason")
+                    or active_support_metrics.get("knn_support_reuse_reason")
+                )
                 actual_gpu_pairs = int(
                     active_support_metrics.get("gpu_fp64_evaluations", 0) or 0
                 )
@@ -2688,9 +2807,46 @@ def calibrate_bandwidth(
             selected_bandwidths.kernel_bandwidth_rule_version
         )
     selected_neighbours = radii_by_k.get(selected_bandwidths.k)
+    if isinstance(selected_neighbours, ExactNeighbourResult):
+        radius_diagnostics = _knn_radius_diagnostics(
+            pool,
+            selected_neighbours,
+            c=selected_bandwidths.c,
+        )
+        operational_metrics["knn_radius_diagnostics"] = radius_diagnostics
+        operational_metrics["knn_final_weighted_whitened_N"] = radius_diagnostics["N"]
+        operational_metrics["knn_final_weighted_whitened_dimension"] = radius_diagnostics[
+            "dimension"
+        ]
+        operational_metrics["knn_bitwise_distinct_locations"] = radius_diagnostics[
+            "distinct_locations"
+        ]
+        operational_metrics["knn_exact_duplicate_rows"] = radius_diagnostics[
+            "exact_duplicate_rows"
+        ]
+        logger.info(
+            "Entropy kNN radius diagnostics: k=%d, c=%.17g, N=%d, d'=%d, Q=%d, "
+            "exact_duplicate_rows=%d, raw_below_floor=%d/%d, effective_changed=%d, "
+            "floor=%.17g, whitening_fingerprint=%s",
+            selected_bandwidths.k,
+            selected_bandwidths.c,
+            radius_diagnostics["N"],
+            radius_diagnostics["dimension"],
+            radius_diagnostics["distinct_locations"],
+            radius_diagnostics["exact_duplicate_rows"],
+            radius_diagnostics["raw_row_floor_counts"]["below_floor_count"],
+            radius_diagnostics["N"],
+            radius_diagnostics["effective_bandwidth_changed_count"],
+            radius_diagnostics["floor"],
+            pool.transform_fingerprint,
+        )
     if isinstance(selected_neighbours, str) or (
         isinstance(selected_neighbours, ExactNeighbourResult)
-        and not _can_reuse_raw_knn_support(pool, selected_neighbours.radii)
+        and (
+            selected_bandwidths.c != 1.0
+            or selected_bandwidths.kernel_bandwidth_rule
+            != KERNEL_BANDWIDTH_RULE_SYMMETRIC_MAX
+        )
     ):
         selected_neighbours = None
     return BandwidthCalibrationResult(

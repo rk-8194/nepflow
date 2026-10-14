@@ -1386,6 +1386,28 @@ streamed execution summary, including separate per-device metrics, without
 changing scientific fingerprints. Checkpoint publication is centralized per
 workstream, and resumed ranges are not repeated or double-counted.
 
+For `c=1` with `symmetric_max`, calibration hands the validated exact
+kth-distinct-location result to both LOO and streamed contribution
+construction even when the reference-measure floor changes some radii. The
+support provider uses the original outgoing/reverse strict kNN union and
+performs one bounded exact indexed radius search only over locations with raw
+`r_i < f`; its strict `d(i,j) < f` results are deduplicated against that union
+and expanded back to atomic rows. Zero sub-floor radii are explicitly reported
+as a no-op and reuse is exact. Effective source and target radii, row ordering,
+pool/backend fingerprints, and checkpoint identities are validated before
+reuse; a pool, row-order, or backend identity mismatch fails at the handoff
+boundary, while a requested radius mismatch is logged and uses the declared
+generic exact provider rather than silently accepting an incomplete prefix.
+The operational identity is `symmetric_knn_union` or
+`symmetric_knn_floor_augmented`, with additional
+floor-pair and canonical-distance counters kept out of scientific fingerprints.
+
+Each selected k also records final-weighted-whitened `N`, dimension, bitwise
+distinct-location and exact-duplicate counts, raw/effective radius quantiles,
+floor activation counts, and whitening/representation fingerprints. These
+diagnostics are separate from preliminary occupancy grouping and do not alter
+the entropy objective.
+
 The indexed exact CPU backend may also certify a kNN prefix without a radius
 enumeration. It requests one additional `cKDTree.query(eps=0)` location,
 recomputes the retained and excluded distances with the canonical float64
