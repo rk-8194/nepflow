@@ -739,6 +739,13 @@ class SelectionStage:
                 raise StateError("Information-entropy selection did not retain contributions")
             if not isinstance(local_representation, LocalEnvironmentRepresentation):
                 raise StateError("Information-entropy selection did not retain closure inputs")
+            logger.info(
+                "  Exact coverage diagnostics starting after test holdout: backend=%s, "
+                "gpu_devices=%s, gpu_tile_size=%d",
+                entropy.bandwidth.kernel_support_execution,
+                entropy.bandwidth.gpu_devices,
+                entropy.bandwidth.gpu_tile_size,
+            )
             entropy_diagnostics = build_entropy_diagnostics(
                 pool,
                 calibration,
@@ -751,6 +758,12 @@ class SelectionStage:
                 ],
                 candidates=prepared["ase_structures"],
                 selected_indices=train_indices,
+                coverage_backend=entropy.bandwidth.kernel_support_execution,
+                gpu_device=entropy.bandwidth.gpu_device,
+                gpu_devices=entropy.bandwidth.gpu_devices,
+                gpu_tile_size=entropy.bandwidth.gpu_tile_size,
+                max_gpu_support_bytes=entropy.bandwidth.max_gpu_support_bytes,
+                resource_budget=runtime_budget,
             )
         if settings.algorithm == "information_entropy":
             entropy_provenance["seed_anchor_policy"] = effective_seed_policy

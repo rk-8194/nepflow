@@ -1497,12 +1497,126 @@ class IncrementalCheckpointStore:
 
 
 class CandidateAggregationCheckpoint:
-    """Append-only, row-granular checkpoint for candidate CSR aggregation."""
+    """Batched, row-granular checkpoint for candidate CSR aggregation.
+
+    Candidate directories are published atomically as soon as their arrays are
+    durable.  The growing manifest is published only at bounded commit points,
+    so a cancelled run still resumes from a contiguous durable prefix without
+    rewriting all previous metadata for every candidate.
+    """
+
+    DEFAULT_COMMIT_EVERY_CANDIDATES = 32
+    DEFAULT_COMMIT_EVERY_SECONDS = 30.0
 
     def __init__(self, root: str | Path) -> None:
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
         self.manifest_path = self.root / "aggregation-manifest.json"
+        self._manifest_cache: dict[str, Any] | None = None
+        self._pending_rows: dict[str, dict[str, Any]] = {}
+        self._bytes_on_disk: int | None = None
+        self._manifest_bytes = 0
+        self._metrics: dict[str, float | int] = {
+            "manifest_commits": 0,
+            "manifest_bytes_written": 0,
+            "row_bytes_written": 0,
+            "manifest_seconds": 0.0,
+            "row_serialization_seconds": 0.0,
+            "filesystem_stat_seconds": 0.0,
+        }
+
+    def _path_bytes(self, path: Path) -> int:
+        started = time.perf_counter()
+        try:
+            if path.is_file():
+                return int(path.stat().st_size)
+            if not path.is_dir():
+                return 0
+            total = 0
+            for child in path.rglob("*"):
+                if child.is_file():
+                    total += int(child.stat().st_size)
+            return int(total)
+        except OSError as exc:
+            raise CheckpointValidationError(
+                f"unable to account checkpoint bytes below {path}"
+            ) from exc
+        finally:
+            self._metrics["filesystem_stat_seconds"] = float(
+                self._metrics["filesystem_stat_seconds"]
+            ) + max(0.0, time.perf_counter() - started)
+
+    def _refresh_bytes(self) -> None:
+        self._bytes_on_disk = self._path_bytes(self.root)
+        try:
+            self._manifest_bytes = (
+                int(self.manifest_path.stat().st_size)
+                if self.manifest_path.is_file()
+                else 0
+            )
+        except OSError as exc:
+            raise CheckpointValidationError(
+                "unable to stat candidate aggregation manifest"
+            ) from exc
+
+    def _row_bytes(self, path: Path) -> int:
+        """Account one known row layout without scanning the checkpoint root."""
+
+        started = time.perf_counter()
+        if not path.exists():
+            return 0
+        if not path.is_dir():
+            raise CheckpointValidationError(f"candidate aggregation row is not a directory: {path}")
+        total = 0
+        known = {
+            "target_indices.npy",
+            "values.npy",
+            "source_support.npy",
+            "manifest.json",
+        }
+        try:
+            children = {child.name: child for child in path.iterdir()}
+            if set(children).difference(known):
+                raise CheckpointValidationError(
+                    f"candidate aggregation row contains an unknown file: {path.name}"
+                )
+            for child in children.values():
+                if not child.is_file():
+                    raise CheckpointValidationError(
+                        f"candidate aggregation row contains a non-file entry: {child}"
+                    )
+                total += int(child.stat().st_size)
+        except OSError as exc:
+            raise CheckpointValidationError(
+                f"unable to account candidate aggregation row: {path}"
+            ) from exc
+        finally:
+            self._metrics["filesystem_stat_seconds"] = float(
+                self._metrics["filesystem_stat_seconds"]
+            ) + max(0.0, time.perf_counter() - started)
+        return int(total)
+
+    @property
+    def bytes_on_disk(self) -> int:
+        """Durable bytes, refreshed only on initialization/explicit cleanup."""
+
+        if self._bytes_on_disk is None:
+            self._refresh_bytes()
+        assert self._bytes_on_disk is not None
+        return int(self._bytes_on_disk)
+
+    @property
+    def manifest_bytes(self) -> int:
+        if self._bytes_on_disk is None:
+            self._refresh_bytes()
+        return int(self._manifest_bytes)
+
+    @property
+    def pending_row_count(self) -> int:
+        return len(self._pending_rows)
+
+    def metrics_snapshot(self) -> dict[str, float | int]:
+        return dict(self._metrics)
 
     def initialize(self, identity: Mapping[str, Any], candidate_ids: tuple[str, ...]) -> None:
         fingerprint = sha256_canonical_json(dict(identity))
@@ -1521,18 +1635,27 @@ class CandidateAggregationCheckpoint:
                 raise CheckpointValidationError(
                     "candidate aggregation checkpoint identity or candidate order does not match"
                 )
-            return
-        self._write_manifest(
-            {
+            if not isinstance(manifest.get("completed"), dict):
+                raise CheckpointValidationError(
+                    "candidate aggregation checkpoint completed rows are invalid"
+                )
+            self._manifest_cache = manifest
+        else:
+            self._manifest_cache = {
                 "schema": CHECKPOINT_SCHEMA_VERSION,
                 "identity": dict(identity),
                 "identity_fingerprint": fingerprint,
                 "candidate_ids": list(candidate_ids),
                 "completed": {},
             }
-        )
+            self._write_manifest(self._manifest_cache)
+        self._pending_rows.clear()
+        # The only recursive accounting pass is at initialization/resume.
+        self._refresh_bytes()
 
     def _read_manifest(self) -> dict[str, Any]:
+        if self._manifest_cache is not None:
+            return self._manifest_cache
         try:
             manifest = json.loads(self.manifest_path.read_text(encoding="utf-8"))
         except (OSError, ValueError) as exc:
@@ -1541,9 +1664,11 @@ class CandidateAggregationCheckpoint:
             raise CheckpointValidationError(
                 "candidate aggregation checkpoint schema is incompatible"
             )
+        self._manifest_cache = manifest
         return manifest
 
-    def _write_manifest(self, manifest: Mapping[str, Any]) -> None:
+    def _write_manifest(self, manifest: Mapping[str, Any]) -> int:
+        started = time.perf_counter()
         temporary = self.root / f".aggregation-manifest-{uuid.uuid4().hex}.tmp"
         try:
             with temporary.open("w", encoding="utf-8", newline="\n") as handle:
@@ -1551,8 +1676,18 @@ class CandidateAggregationCheckpoint:
                 handle.write("\n")
                 handle.flush()
                 os.fsync(handle.fileno())
+            byte_count = int(temporary.stat().st_size)
             _atomic_replace(temporary, self.manifest_path)
+            _fsync_directory(self.root)
+            self._metrics["manifest_bytes_written"] = int(
+                self._metrics["manifest_bytes_written"]
+            ) + byte_count
+            self._metrics["manifest_commits"] = int(self._metrics["manifest_commits"]) + 1
+            return byte_count
         finally:
+            self._metrics["manifest_seconds"] = float(
+                self._metrics["manifest_seconds"]
+            ) + max(0.0, time.perf_counter() - started)
             temporary.unlink(missing_ok=True)
 
     def write_row(
@@ -1568,11 +1703,19 @@ class CandidateAggregationCheckpoint:
         source_support: np.ndarray | None = None,
         self_edge_count: int = 0,
         source_mass_max_deviation: float = 0.0,
+        commit: bool = True,
     ) -> None:
-        manifest = self._read_manifest()
+        self._read_manifest()
+        key = str(int(candidate_index))
+        if key in self._pending_rows:
+            raise CheckpointValidationError(
+                f"candidate aggregation checkpoint row is already pending: {candidate_index}"
+            )
         row_name = f"row-{int(candidate_index):08d}"
         temporary = self.root / f".{row_name}-{uuid.uuid4().hex}.tmp"
         final = self.root / row_name
+        started = time.perf_counter()
+        previous_bytes = self._row_bytes(final) if final.exists() else 0
         temporary.mkdir()
         try:
             target_path = temporary / "target_indices.npy"
@@ -1613,13 +1756,50 @@ class CandidateAggregationCheckpoint:
             if final.exists():
                 shutil.rmtree(final)
             _atomic_replace(temporary, final)
-            completed = dict(manifest.get("completed", {}))
-            completed[str(int(candidate_index))] = row_manifest
-            manifest["completed"] = completed
-            self._write_manifest(manifest)
+            final_bytes = self._row_bytes(final)
+            self._bytes_on_disk = max(
+                0,
+                self.bytes_on_disk - previous_bytes + final_bytes,
+            )
+            self._metrics["row_bytes_written"] = int(
+                self._metrics["row_bytes_written"]
+            ) + final_bytes
+            self._pending_rows[key] = row_manifest
+            if commit:
+                self.commit()
         except BaseException:
             shutil.rmtree(temporary, ignore_errors=True)
             raise
+        finally:
+            self._metrics["row_serialization_seconds"] = float(
+                self._metrics["row_serialization_seconds"]
+            ) + max(0.0, time.perf_counter() - started)
+
+    def commit(self) -> bool:
+        """Publish all complete pending rows in one atomic manifest snapshot."""
+
+        if not self._pending_rows:
+            return False
+        manifest = self._read_manifest()
+        completed = dict(manifest.get("completed", {}))
+        completed.update(
+            {
+                key: self._pending_rows[key]
+                for key in sorted(self._pending_rows, key=lambda value: int(value))
+            }
+        )
+        updated = dict(manifest)
+        updated["completed"] = completed
+        old_manifest_bytes = self.manifest_bytes
+        new_manifest_bytes = self._write_manifest(updated)
+        self._manifest_cache = updated
+        self._manifest_bytes = new_manifest_bytes
+        self._bytes_on_disk = max(
+            0,
+            self.bytes_on_disk - old_manifest_bytes + new_manifest_bytes,
+        )
+        self._pending_rows.clear()
+        return True
 
     def load_rows(self) -> dict[int, tuple[np.ndarray, np.ndarray, dict[str, Any]]]:
         manifest = self._read_manifest()
@@ -1699,6 +1879,7 @@ class CandidateAggregationCheckpoint:
             else:
                 path.unlink(missing_ok=True)
             removed += 1
+        self._refresh_bytes()
         return removed
 
     def clear(self) -> None:
@@ -1708,6 +1889,10 @@ class CandidateAggregationCheckpoint:
             elif path.is_file() and path.name.startswith("."):
                 path.unlink(missing_ok=True)
         self.manifest_path.unlink(missing_ok=True)
+        self._manifest_cache = None
+        self._pending_rows.clear()
+        self._bytes_on_disk = 0
+        self._manifest_bytes = 0
 
 
 __all__ = [

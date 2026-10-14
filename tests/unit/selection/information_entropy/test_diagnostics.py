@@ -3,16 +3,20 @@
 import numpy as np
 import pytest
 
+from nepflow.resources.budget import build_resource_budget
 from nepflow.stages.selection.algorithms.information_entropy.diagnostics import (
     DiagnosticDistribution,
     _build_prefix_coverage_manifest,
+    nearest_selected_atomic_distances,
     recompute_final_entropy_metrics,
     weighted_quantile,
 )
 from nepflow.stages.selection.algorithms.information_entropy.models import (
+    EntropyPool,
     EntropySelectionHistory,
     EntropySelectionStep,
     SparseCandidateContributions,
+    reference_weights_fingerprint,
 )
 
 
@@ -60,6 +64,52 @@ def test_distribution_manifest_retains_metric_contract() -> None:
     restored = DiagnosticDistribution.from_manifest(summary.to_manifest())
     assert restored == summary
     assert restored.to_manifest()["quantile_convention"]
+
+
+def test_exact_coverage_tiling_matches_bounded_cpu_oracle_with_duplicates() -> None:
+    descriptors = np.zeros((6, 42), dtype=np.float64)
+    descriptors[3, 0] = 1.0
+    descriptors[4, 0] = 2.0
+    descriptors[5, 0] = 1.0
+    probabilities = np.full(6, 1.0 / 6.0, dtype=np.float64)
+    pool = EntropyPool(
+        descriptors,
+        tuple(range(6)),
+        ("candidate-b", "candidate-a", "candidate-c"),
+        np.array([0, 0, 1, 1, 2, 2], dtype=np.int64),
+        probabilities,
+        "transform",
+        "representation",
+        "pool",
+        reference_weights_fingerprint=reference_weights_fingerprint(probabilities),
+    )
+    budget = build_resource_budget(memory_budget_bytes=256 * 1024 * 1024)
+
+    tiled, source_indices = nearest_selected_atomic_distances(
+        pool,
+        ("candidate-a",),
+        backend="cpu",
+        chunk_size=2,
+        resource_budget=budget,
+    )
+    oracle, oracle_indices = nearest_selected_atomic_distances(
+        pool,
+        ("candidate-a",),
+        backend="cpu_oracle",
+        chunk_size=5,
+        resource_budget=budget,
+    )
+
+    expected = np.min(
+        np.linalg.norm(
+            descriptors[:, None, :] - descriptors[np.array([2, 3])][None, :, :], axis=2
+        ),
+        axis=1,
+    )
+    assert source_indices.tolist() == [2, 3]
+    assert oracle_indices.tolist() == [2, 3]
+    np.testing.assert_array_equal(tiled, expected)
+    np.testing.assert_array_equal(tiled, oracle)
 
 
 def test_prefix_coverage_matches_sparse_union_and_preserves_signed_covered_kl() -> None:

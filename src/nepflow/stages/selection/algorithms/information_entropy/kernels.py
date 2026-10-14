@@ -160,23 +160,6 @@ def _usable_bytes(path: str | Path | None) -> int | None:
         return None
 
 
-def _directory_bytes(path: str | Path | None) -> int:
-    if path is None:
-        return 0
-    root = Path(path)
-    if not root.exists():
-        return 0
-    try:
-        if root.is_file():
-            return int(root.stat().st_size)
-        return int(sum(child.stat().st_size for child in root.rglob("*") if child.is_file()))
-    except OSError:
-        # A failed probe must not make admission optimistic.  The write itself
-        # remains transactional and the resource lease still reserves the
-        # current spool plus the requested output.
-        return 0
-
-
 def _spool_write_header(handle: Any) -> Any:
     handle.write(_EDGE_SPOOL_HEADER)
     digest = hashlib.sha256()
@@ -3225,6 +3208,12 @@ def build_streamed_candidate_contributions(
     gpu_devices: Sequence[int] | str | int | None = None,
     gpu_tile_size: int = 128,
     max_gpu_support_bytes: int | None = None,
+    checkpoint_commit_every_candidates: int = (
+        CandidateAggregationCheckpoint.DEFAULT_COMMIT_EVERY_CANDIDATES
+    ),
+    checkpoint_commit_every_seconds: float = (
+        CandidateAggregationCheckpoint.DEFAULT_COMMIT_EVERY_SECONDS
+    ),
     knn_support: ExactNeighbourResult | None = None,
     knn_support_row_ids: Sequence[str] | None = None,
 ) -> tuple[
@@ -3255,6 +3244,16 @@ def build_streamed_candidate_contributions(
         )
     if progress_callback is not None and not callable(progress_callback):
         raise TypeError("progress_callback must be callable")
+    if (
+        isinstance(checkpoint_commit_every_candidates, bool)
+        or int(checkpoint_commit_every_candidates) < 1
+    ):
+        raise ValueError("checkpoint_commit_every_candidates must be positive")
+    if (
+        not math.isfinite(float(checkpoint_commit_every_seconds))
+        or float(checkpoint_commit_every_seconds) <= 0.0
+    ):
+        raise ValueError("checkpoint_commit_every_seconds must be finite and positive")
     storage_mode = str(storage).strip().lower()
     if storage_mode not in {"auto", "memory", "disk"}:
         raise ValueError("storage must be 'auto', 'memory', or 'disk'")
@@ -3676,6 +3675,11 @@ def build_streamed_candidate_contributions(
         if checkpoint_path is None
         else CandidateAggregationCheckpoint(Path(checkpoint_path) / checkpoint_name)
     )
+    checkpoint_rows = 0
+    checkpoint_manifest_seconds = 0.0
+    checkpoint_manifest_bytes_written = 0
+    checkpoint_filesystem_stat_seconds = 0.0
+    checkpoint_last_commit = time.perf_counter()
     completed_rows: dict[int, tuple[np.ndarray, np.ndarray, dict[str, Any]]] = {}
     resume_candidate_count = 0
     resumed_sources = 0
@@ -3735,6 +3739,9 @@ def build_streamed_candidate_contributions(
             )
         aggregation_checkpoint.initialize(checkpoint_identity, candidate_ids)
         aggregation_checkpoint.clean_stale()
+        checkpoint_manifest_bytes_written = int(
+            aggregation_checkpoint.metrics_snapshot().get("manifest_bytes_written", 0)
+        )
         if resume and aggregation_checkpoint.manifest_path.is_file():
             completed_rows = aggregation_checkpoint.load_rows()
             while resume_candidate_count in completed_rows:
@@ -3833,10 +3840,14 @@ def build_streamed_candidate_contributions(
         or scratch_device == checkpoint_device
     )
     checkpoint_bytes_on_disk = (
-        _directory_bytes(aggregation_checkpoint.root)
+        aggregation_checkpoint.bytes_on_disk
         if checkpoint_same_filesystem and aggregation_checkpoint is not None
         else 0
     )
+    if aggregation_checkpoint is not None:
+        checkpoint_filesystem_stat_seconds = float(
+            aggregation_checkpoint.metrics_snapshot().get("filesystem_stat_seconds", 0.0)
+        )
     peak_finalization_reservation_bytes = 0
 
     def resize_workspace(
@@ -4247,12 +4258,7 @@ def build_streamed_candidate_contributions(
                 q_observed = q_completed
                 validate_q_invariants(candidate_index, last_source_index)
                 if aggregation_checkpoint is not None:
-                    try:
-                        current_checkpoint_manifest_bytes = int(
-                            aggregation_checkpoint.manifest_path.stat().st_size
-                        )
-                    except OSError:
-                        current_checkpoint_manifest_bytes = 0
+                    current_checkpoint_manifest_bytes = aggregation_checkpoint.manifest_bytes
                     checkpoint_manifest_reserve = max(
                         publication_metadata_reserve,
                         current_checkpoint_manifest_bytes + 4096,
@@ -4309,22 +4315,18 @@ def build_streamed_candidate_contributions(
                         source_support=support_sizes[candidate_source_indices].copy(),
                         self_edge_count=candidate_self_edges,
                         source_mass_max_deviation=candidate_source_mass_deviation,
+                        commit=False,
                     )
                     checkpoint_elapsed = max(0.0, time.perf_counter() - checkpoint_started)
                     checkpoint_seconds += checkpoint_elapsed
+                    checkpoint_rows += 1
                     checkpoint_bytes += int(
                         targets.nbytes
                         + values_for_candidate.nbytes
                         + support_sizes[candidate_source_indices].nbytes
                     )
-                    checkpoint_writes += 1
-                    checkpoint_bytes_on_disk = (
-                        _directory_bytes(aggregation_checkpoint.root)
-                        if checkpoint_same_filesystem
-                        else checkpoint_bytes_on_disk
-                    )
                     record_phase(
-                        "checkpoint_serialization",
+                        "checkpoint_array_serialization",
                         checkpoint_elapsed,
                         bytes_count=int(
                             targets.nbytes
@@ -4332,6 +4334,56 @@ def build_streamed_candidate_contributions(
                             + support_sizes[candidate_source_indices].nbytes
                         ),
                     )
+                    checkpoint_bytes_on_disk = (
+                        aggregation_checkpoint.bytes_on_disk
+                        if checkpoint_same_filesystem
+                        else checkpoint_bytes_on_disk
+                    )
+                    should_commit = (
+                        aggregation_checkpoint.pending_row_count
+                        >= int(checkpoint_commit_every_candidates)
+                        or time.perf_counter() - checkpoint_last_commit
+                        >= float(checkpoint_commit_every_seconds)
+                    )
+                    if should_commit:
+                        commit_started = time.perf_counter()
+                        aggregation_checkpoint.commit()
+                        commit_elapsed = max(0.0, time.perf_counter() - commit_started)
+                        checkpoint_seconds += commit_elapsed
+                        checkpoint_manifest_seconds += commit_elapsed
+                        checkpoint_writes += 1
+                        checkpoint_last_commit = time.perf_counter()
+                        checkpoint_bytes_on_disk = (
+                            aggregation_checkpoint.bytes_on_disk
+                            if checkpoint_same_filesystem
+                            else checkpoint_bytes_on_disk
+                        )
+                        metrics = aggregation_checkpoint.metrics_snapshot()
+                        manifest_bytes_total = int(
+                            metrics.get("manifest_bytes_written", 0)
+                        )
+                        manifest_bytes_delta = max(
+                            0,
+                            manifest_bytes_total - checkpoint_manifest_bytes_written,
+                        )
+                        checkpoint_manifest_bytes_written = manifest_bytes_total
+                        current_stat_seconds = float(
+                            metrics.get("filesystem_stat_seconds", 0.0)
+                        )
+                        stat_delta = max(
+                            0.0,
+                            current_stat_seconds - checkpoint_filesystem_stat_seconds,
+                        )
+                        checkpoint_filesystem_stat_seconds = current_stat_seconds
+                        record_phase(
+                            "checkpoint_manifest_publication",
+                            commit_elapsed,
+                            bytes_count=manifest_bytes_delta,
+                        )
+                        record_phase(
+                            "checkpoint_filesystem_metadata",
+                            stat_delta,
+                        )
                     sample_lease()
                 resize_workspace(
                     estimated_peak_bytes(q_completed, 0),
@@ -4348,6 +4400,38 @@ def build_streamed_candidate_contributions(
                     candidate_index=candidate_index,
                 )
 
+            if aggregation_checkpoint is not None and aggregation_checkpoint.pending_row_count:
+                commit_started = time.perf_counter()
+                aggregation_checkpoint.commit()
+                commit_elapsed = max(0.0, time.perf_counter() - commit_started)
+                checkpoint_seconds += commit_elapsed
+                checkpoint_manifest_seconds += commit_elapsed
+                checkpoint_writes += 1
+                checkpoint_last_commit = time.perf_counter()
+                checkpoint_bytes_on_disk = (
+                    aggregation_checkpoint.bytes_on_disk
+                    if checkpoint_same_filesystem
+                    else checkpoint_bytes_on_disk
+                )
+                metrics = aggregation_checkpoint.metrics_snapshot()
+                manifest_bytes_total = int(metrics.get("manifest_bytes_written", 0))
+                manifest_bytes_delta = max(
+                    0,
+                    manifest_bytes_total - checkpoint_manifest_bytes_written,
+                )
+                checkpoint_manifest_bytes_written = manifest_bytes_total
+                current_stat_seconds = float(metrics.get("filesystem_stat_seconds", 0.0))
+                stat_delta = max(
+                    0.0,
+                    current_stat_seconds - checkpoint_filesystem_stat_seconds,
+                )
+                checkpoint_filesystem_stat_seconds = current_stat_seconds
+                record_phase(
+                    "checkpoint_manifest_publication",
+                    commit_elapsed,
+                    bytes_count=manifest_bytes_delta,
+                )
+                record_phase("checkpoint_filesystem_metadata", stat_delta)
             if completed_sources != n_rows:
                 raise ValueError("streamed candidate contribution did not query every source row")
             entry_count = q_completed
@@ -4611,8 +4695,9 @@ def build_streamed_candidate_contributions(
             c=frozen.c,
         )
     support_provider.close()
+    overall_elapsed = max(0.0, time.perf_counter() - started)
     operational_metrics = {
-        "wall_seconds": max(0.0, time.perf_counter() - started),
+        "wall_seconds": overall_elapsed,
         "source_loop_seconds": source_loop_seconds,
         "source_throughput_per_second": (
             completed_sources / source_loop_seconds if source_loop_seconds > 0.0 else 0.0
@@ -4653,8 +4738,12 @@ def build_streamed_candidate_contributions(
         },
         "resource_lease_peak_bytes": int(peak_lease_bytes),
         "checkpoint_writes": checkpoint_writes,
+        "checkpoint_rows": checkpoint_rows,
         "checkpoint_bytes": checkpoint_bytes,
+        "checkpoint_manifest_bytes_written": checkpoint_manifest_bytes_written,
         "checkpoint_seconds": checkpoint_seconds,
+        "checkpoint_manifest_seconds": checkpoint_manifest_seconds,
+        "checkpoint_filesystem_stat_seconds": checkpoint_filesystem_stat_seconds,
         "process_peak_rss_bytes": _measured_peak_memory_bytes(),
         "phase_seconds": dict(phase_seconds),
         "phase_counts": dict(phase_counts),
@@ -4733,6 +4822,7 @@ def build_streamed_candidate_contributions(
         summary.candidate_csr_array_bytes,
         summary.contribution_spool_bytes,
         summary.estimated_peak_memory_bytes,
+        overall_elapsed,
         operational_metrics["source_throughput_per_second"],
         operational_metrics["source_support_density_mean"],
         operational_metrics["candidate_support_density_mean"],

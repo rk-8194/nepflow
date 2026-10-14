@@ -12,7 +12,10 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import math
+import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from io import BytesIO
 from pathlib import Path
@@ -22,7 +25,26 @@ import numpy as np
 
 from nepflow.io.atomic import atomic_write_stream
 from nepflow.io.hashing import sha256_bytes, sha256_canonical_json, sha256_file
+from nepflow.resources.budget import (
+    ResourceBudgetService,
+    ResourceCapacityError,
+    build_resource_budget,
+)
 
+from .gpu_devices import (
+    contiguous_gpu_ranges,
+    normalize_gpu_devices,
+    validate_visible_gpu_devices,
+)
+from .gpu_neighbours import _canonical_distances as _canonical_gpu_distances
+from .gpu_neighbours import (
+    _direct_cpu_relative_bound,
+    _gamma_bound,
+    _outward_lower,
+    _outward_upper,
+    _safe_fp64_distance_pairs,
+)
+from .gpu_support import GPUCapacityError, GPUCertificationError, GPUDeviceValidationError
 from .models import (
     KERNEL_BANDWIDTH_RULE_ASYMMETRIC_SOURCE,
     KERNEL_BANDWIDTH_RULE_SYMMETRIC_MAX,
@@ -40,6 +62,8 @@ from .models import (
     kernel_bandwidth_rule_version,
     normalize_kernel_bandwidth_rule,
 )
+
+logger = logging.getLogger(__name__)
 
 DIAGNOSTICS_SCHEMA_VERSION = "entropy-scientific-diagnostics-v4"
 DIAGNOSTICS_ARRAY_ARTIFACT_SCHEMA = "entropy-diagnostic-arrays-v1"
@@ -2132,38 +2156,504 @@ def _coverage_summary(
     )
 
 
+_COVERAGE_CPU_ORACLE_PAIR_LIMIT = 250_000
+_COVERAGE_CPU_PAIR_LIMIT = 100_000_000
+_COVERAGE_PROGRESS_INTERVAL_SECONDS = 10.0
+
+
+def _coverage_source_indices(
+    pool: EntropyPool, selected_candidate_ids: Sequence[str]
+) -> np.ndarray:
+    selected = {str(value) for value in selected_candidate_ids}
+    if not selected:
+        raise ValueError("coverage requires at least one selected candidate")
+    candidate_positions = {value: index for index, value in enumerate(pool.candidate_ids)}
+    missing = selected.difference(candidate_positions)
+    if missing:
+        raise ValueError("coverage selected candidate IDs are absent from the pool")
+    source_indices = np.flatnonzero(
+        np.isin(
+            np.asarray(pool.row_candidate_indices, dtype=np.int64),
+            [candidate_positions[value] for value in selected],
+        )
+    )
+    if source_indices.size == 0:
+        raise ValueError("coverage selected candidates own no atomic rows")
+    return source_indices.astype(np.int64, copy=False)
+
+
+def _coverage_log_progress(
+    *,
+    backend: str,
+    completed: int,
+    total: int,
+    started: float,
+    device: int | None = None,
+) -> None:
+    elapsed = max(0.0, time.perf_counter() - started)
+    throughput = completed / elapsed if elapsed > 0.0 else 0.0
+    device_label = "" if device is None else f", device={device}"
+    logger.info(
+        "Exact coverage progress: backend=%s%s, query_rows=%d/%d, elapsed=%.1fs, "
+        "throughput=%.1f rows/s",
+        backend,
+        device_label,
+        completed,
+        total,
+        elapsed,
+        throughput,
+    )
+
+
+def _coverage_cpu_oracle(
+    descriptors: np.ndarray,
+    source_indices: np.ndarray,
+    *,
+    chunk_size: int,
+    started: float,
+    progress_callback: Any | None,
+) -> np.ndarray:
+    """Small, explicitly bounded reference implementation for tests/oracles."""
+
+    from scipy.spatial import cKDTree  # pyright: ignore[reportAttributeAccessIssue]
+
+    tree = cKDTree(descriptors[source_indices], compact_nodes=True)
+    distances = np.empty(descriptors.shape[0], dtype=np.float64)
+    last_log = started
+    for start in range(0, descriptors.shape[0], chunk_size):
+        stop = min(start + chunk_size, descriptors.shape[0])
+        distances[start:stop] = tree.query(descriptors[start:stop], k=1, workers=1)[0]
+        if (
+            stop == descriptors.shape[0]
+            or stop - start == chunk_size
+            and time.perf_counter() - last_log >= _COVERAGE_PROGRESS_INTERVAL_SECONDS
+        ):
+            _coverage_log_progress(
+                backend="cpu_oracle",
+                completed=stop,
+                total=descriptors.shape[0],
+                started=started,
+            )
+            last_log = time.perf_counter()
+        if progress_callback is not None:
+            progress_callback(stop, descriptors.shape[0])
+    return distances
+
+
+def _coverage_cpu_tiled(
+    descriptors: np.ndarray,
+    source_indices: np.ndarray,
+    *,
+    chunk_size: int,
+    resource_budget: ResourceBudgetService,
+    max_pair_work: int,
+    started: float,
+    progress_callback: Any | None,
+) -> np.ndarray:
+    total_rows, dimension = descriptors.shape
+    pair_work = int(total_rows) * int(source_indices.size)
+    if pair_work > int(max_pair_work):
+        raise ResourceCapacityError(
+            "exact CPU coverage exceeds its bounded pair-work admission: "
+            f"N={total_rows}, S={source_indices.size}, pairs={pair_work}, "
+            f"max_pairs={max_pair_work}; select the explicit GPU coverage backend "
+            "or raise max_cpu_pair_work",
+            operation="entropy exact CPU coverage",
+            requested_bytes=None,
+            available_bytes=resource_budget.remaining_managed_budget,
+        )
+    query_tile = max(1, min(int(chunk_size), total_rows))
+    reference_tile = max(1, min(256, int(source_indices.size)))
+    references = np.ascontiguousarray(descriptors[source_indices], dtype=np.float64)
+    distances = np.empty(total_rows, dtype=np.float64)
+    last_log = started
+    for query_start in range(0, total_rows, query_tile):
+        query_stop = min(query_start + query_tile, total_rows)
+        query = descriptors[query_start:query_stop]
+        best = np.full(query_stop - query_start, np.inf, dtype=np.float64)
+        for reference_start in range(0, references.shape[0], reference_tile):
+            reference_stop = min(reference_start + reference_tile, references.shape[0])
+            reference = references[reference_start:reference_stop]
+            requested = int(
+                8
+                * (
+                    4 * query.shape[0] * dimension
+                    + 4 * reference.shape[0] * dimension
+                    + 2 * query.shape[0] * reference.shape[0]
+                )
+                + 65_536
+            )
+            with resource_budget.acquire("entropy exact CPU coverage tile", max(1, requested)):
+                try:
+                    with np.errstate(over="raise", invalid="raise"):
+                        delta = query[:, None, :] - reference[None, :, :]
+                        tile_distances = np.sqrt(
+                            np.sum(delta * delta, axis=2, dtype=np.float64)
+                        )
+                except FloatingPointError as exc:
+                    raise ValueError(
+                        "exact CPU coverage distance overflowed or became invalid"
+                    ) from exc
+            if not np.all(np.isfinite(tile_distances)) or np.any(tile_distances < 0.0):
+                raise ValueError("coverage nearest distances are not finite and non-negative")
+            best = np.minimum(best, np.min(tile_distances, axis=1))
+        distances[query_start:query_stop] = best
+        now = time.perf_counter()
+        if (
+            query_stop == total_rows
+            or now - last_log >= _COVERAGE_PROGRESS_INTERVAL_SECONDS
+        ):
+            _coverage_log_progress(
+                backend="cpu_tiled",
+                completed=query_stop,
+                total=total_rows,
+                started=started,
+            )
+            last_log = now
+        if progress_callback is not None:
+            progress_callback(query_stop, total_rows)
+    return distances
+
+
+def _coverage_gpu_tiled(
+    descriptors: np.ndarray,
+    source_indices: np.ndarray,
+    *,
+    chunk_size: int,
+    gpu_device: int,
+    gpu_devices: Sequence[int] | str | int | None,
+    gpu_tile_size: int,
+    max_gpu_support_bytes: int | None,
+    resource_budget: ResourceBudgetService,
+    started: float,
+    progress_callback: Any | None,
+) -> np.ndarray:
+    try:
+        import cupy as cp  # type: ignore[import-not-found]
+    except ImportError as exc:
+        raise GPUDeviceValidationError(
+            "exact_tiled_gpu coverage requires optional CuPy; no CPU fallback is performed"
+        ) from exc
+    try:
+        devices = normalize_gpu_devices(gpu_devices, gpu_device=gpu_device)
+        validate_visible_gpu_devices(cp, devices)
+    except Exception as exc:
+        if isinstance(exc, GPUDeviceValidationError):
+            raise
+        raise GPUDeviceValidationError(
+            f"requested coverage GPU devices are unavailable: {exc}"
+        ) from exc
+    if isinstance(gpu_tile_size, bool) or int(gpu_tile_size) < 1:
+        raise ValueError("coverage gpu_tile_size must be positive")
+    tile_size = int(gpu_tile_size)
+    total_rows, dimension = descriptors.shape
+    query_tile = max(1, min(int(chunk_size), tile_size, total_rows))
+    reference_tile = max(1, min(tile_size, int(source_indices.size)))
+    max_safe_component = float(
+        np.sqrt(np.finfo(np.float64).max / (16.0 * max(1, int(dimension))))
+    )
+    one_evaluation_bound = _gamma_bound(int(dimension))
+    direct_bound = _direct_cpu_relative_bound(one_evaluation_bound)
+    denominator = float(_outward_upper(1.0 + direct_bound))
+    if not np.isfinite(denominator) or denominator <= 1.0:
+        raise GPUCertificationError("coverage GPU FP64 certification bound is not representable")
+
+    device_limits: dict[int, int] = {}
+    for device in devices:
+        try:
+            with cp.cuda.Device(device):
+                free_bytes, _ = cp.cuda.runtime.memGetInfo()
+        except Exception as exc:
+            raise GPUDeviceValidationError(
+                f"unable to inspect coverage GPU device {device}: {exc}"
+            ) from exc
+        limit = int(free_bytes)
+        if max_gpu_support_bytes is not None:
+            if isinstance(max_gpu_support_bytes, bool) or int(max_gpu_support_bytes) < 1:
+                raise ValueError("max_gpu_support_bytes must be positive")
+            limit = min(limit, int(max_gpu_support_bytes))
+        device_limits[int(device)] = limit
+    minimum_tile_bytes = int(
+        4
+        * 8
+        * (query_tile * dimension + reference_tile * dimension + query_tile * reference_tile)
+        + 65_536
+    )
+    for device, limit in device_limits.items():
+        if limit < minimum_tile_bytes:
+            raise GPUCapacityError(
+                "coverage GPU tile exceeds the declared device workspace: "
+                f"device={device}, requested_bytes={minimum_tile_bytes}, available_bytes={limit}",
+                operation="entropy exact tiled GPU coverage",
+                requested_bytes=minimum_tile_bytes,
+                available_bytes=limit,
+            )
+    logger.info(
+        "Exact coverage start: N=%d, S=%d, d'=%d, backend=exact_tiled_gpu, devices=%s, "
+        "query_tile=%d, reference_tile=%d, estimated_pairs=%d",
+        total_rows,
+        source_indices.size,
+        dimension,
+        devices,
+        query_tile,
+        reference_tile,
+        int(total_rows) * int(source_indices.size),
+    )
+    def run_device(device: int, reference_start: int, reference_stop: int) -> np.ndarray:
+        device_references = np.ascontiguousarray(
+            descriptors[source_indices[reference_start:reference_stop]], dtype=np.float64
+        )
+        device_distances = np.full(total_rows, np.inf, dtype=np.float64)
+        for query_start in range(0, total_rows, query_tile):
+            query_stop = min(query_start + query_tile, total_rows)
+            query = np.ascontiguousarray(descriptors[query_start:query_stop], dtype=np.float64)
+            best = np.full(query_stop - query_start, np.inf, dtype=np.float64)
+            for tile_start in range(0, device_references.shape[0], reference_tile):
+                tile_stop = min(tile_start + reference_tile, device_references.shape[0])
+                references = device_references[tile_start:tile_stop]
+                requested_host = int(
+                    8
+                    * (
+                        4 * query.shape[0] * dimension
+                        + 4 * references.shape[0] * dimension
+                        + 2 * query.shape[0] * references.shape[0]
+                    )
+                    + 65_536
+                )
+                with resource_budget.acquire(
+                    "entropy exact GPU coverage certification tile", max(1, requested_host)
+                ):
+                    try:
+                        with cp.cuda.Device(device):
+                            gpu_query = cp.asarray(
+                                query, dtype=getattr(cp, "float64", np.float64)
+                            )
+                            gpu_reference = cp.asarray(
+                                references, dtype=getattr(cp, "float64", np.float64)
+                            )
+                            delta = gpu_query[:, None, :] - gpu_reference[None, :, :]
+                            gpu_distances = cp.sqrt(cp.sum(delta * delta, axis=2))
+                            reported = np.asarray(cp.asnumpy(gpu_distances), dtype=np.float64)
+                    except Exception as exc:
+                        raise GPUCertificationError(
+                            f"coverage GPU distance evaluation failed on device {device}: {exc}"
+                        ) from exc
+                if reported.shape != (query.shape[0], references.shape[0]) or not np.all(
+                    np.isfinite(reported)
+                ):
+                    raise GPUCertificationError(
+                        "coverage GPU produced a non-finite or incorrectly shaped distance tile"
+                    )
+                local_indices = np.arange(tile_start, tile_stop, dtype=np.int64)
+                for query_offset, query_row in enumerate(query):
+                    safe, lower = _safe_fp64_distance_pairs(
+                        query_row,
+                        references,
+                        max_safe_component=max_safe_component,
+                        relative_bound=one_evaluation_bound,
+                    )
+                    lower = np.asarray(lower, dtype=np.float64)
+                    with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+                        lower[safe] = np.asarray(
+                            _outward_lower(reported[query_offset, safe] / denominator),
+                            dtype=np.float64,
+                        )
+                    possible = (~safe) | ~np.isfinite(lower) | (lower <= best[query_offset])
+                    candidates = local_indices[possible]
+                    if candidates.size == 0:
+                        continue
+                    canonical = _canonical_gpu_distances(query_row, references[possible])
+                    best[query_offset] = min(best[query_offset], float(np.min(canonical)))
+            device_distances[query_start:query_stop] = best
+            _coverage_log_progress(
+                backend="exact_tiled_gpu",
+                completed=query_stop,
+                total=total_rows,
+                started=started,
+                device=device,
+            )
+            if progress_callback is not None:
+                progress_callback(query_stop, total_rows)
+        return device_distances
+
+    ranges = tuple(
+        item
+        for item in contiguous_gpu_ranges(int(source_indices.size), devices)
+        if item[1] != item[2]
+    )
+    global_distances = np.full(total_rows, np.inf, dtype=np.float64)
+    if len(ranges) == 1:
+        results = [run_device(*ranges[0])]
+    else:
+        with ThreadPoolExecutor(max_workers=len(ranges)) as executor:
+            futures = [executor.submit(run_device, *item) for item in ranges]
+            results = [future.result() for future in futures]
+    for result in results:
+        global_distances = np.minimum(global_distances, result)
+    return global_distances
+
+
 def nearest_selected_atomic_distances(
     pool: EntropyPool,
     selected_candidate_ids: Sequence[str],
     *,
     chunk_size: int = 4096,
+    backend: str = "cpu",
+    gpu_device: int = 0,
+    gpu_devices: Sequence[int] | str | int | None = None,
+    gpu_tile_size: int = 128,
+    max_gpu_support_bytes: int | None = None,
+    resource_budget: ResourceBudgetService | None = None,
+    max_cpu_pair_work: int = _COVERAGE_CPU_PAIR_LIMIT,
+    progress_callback: Any | None = None,
+    operational_metrics: dict[str, Any] | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Compute exact nearest-selected distances with bounded indexed queries."""
+    """Compute exact nearest-selected distances with explicit bounded backends.
 
-    selected = set(str(value) for value in selected_candidate_ids)
-    if not selected:
-        raise ValueError("coverage requires at least one selected candidate")
-    if not selected.issubset(set(pool.candidate_ids)):
-        raise ValueError("coverage selected candidate IDs are absent from the pool")
-    source_mask = np.isin(
-        pool.row_candidate_indices, [pool.candidate_ids.index(value) for value in selected]
-    )
-    source_indices = np.flatnonzero(source_mask)
-    if source_indices.size == 0:
-        raise ValueError("coverage selected candidates own no atomic rows")
+    ``cpu_oracle`` is intentionally limited to small reference cases.  The
+    default CPU path is tiled and admitted against both memory and pair work;
+    the GPU path partitions selected references across the explicitly requested
+    visible devices and certifies every retained boundary against the canonical
+    NumPy float64 distance primitive.
+    """
+
+    descriptors = np.asarray(pool.descriptors, dtype=np.float64)
+    if descriptors.ndim != 2 or descriptors.shape[0] == 0 or descriptors.shape[1] == 0:
+        raise ValueError("coverage descriptors must be a non-empty two-dimensional matrix")
+    if not np.all(np.isfinite(descriptors)):
+        raise ValueError("coverage descriptors must be finite")
     if isinstance(chunk_size, bool) or int(chunk_size) < 1:
         raise ValueError("coverage chunk_size must be positive")
-    from scipy.spatial import cKDTree  # pyright: ignore[reportAttributeAccessIssue]
-
-    tree = cKDTree(
-        np.asarray(pool.descriptors[source_indices], dtype=np.float64), compact_nodes=True
+    if isinstance(max_cpu_pair_work, bool) or int(max_cpu_pair_work) < 1:
+        raise ValueError("max_cpu_pair_work must be positive")
+    if progress_callback is not None and not callable(progress_callback):
+        raise TypeError("coverage progress_callback must be callable")
+    normalized_backend = str(backend).strip().lower()
+    if normalized_backend == "exact_cpu":
+        normalized_backend = "cpu"
+    if normalized_backend not in {"cpu", "cpu_oracle", "exact_tiled_gpu"}:
+        raise ValueError(
+            "coverage backend must be 'cpu', 'cpu_oracle', or 'exact_tiled_gpu'"
+        )
+    source_indices = _coverage_source_indices(pool, selected_candidate_ids)
+    total_rows, dimension = descriptors.shape
+    pair_work = int(total_rows) * int(source_indices.size)
+    if normalized_backend == "cpu_oracle" and pair_work > _COVERAGE_CPU_ORACLE_PAIR_LIMIT:
+        raise ResourceCapacityError(
+            "coverage CPU oracle is deliberately limited to small reference cases: "
+            f"N={total_rows}, S={source_indices.size}, pairs={pair_work}, "
+            f"oracle_limit={_COVERAGE_CPU_ORACLE_PAIR_LIMIT}; use backend='cpu'",
+            operation="entropy coverage CPU oracle",
+            requested_bytes=None,
+            available_bytes=None,
+        )
+    effective_backend = normalized_backend
+    if (
+        normalized_backend == "cpu"
+        and pair_work <= _COVERAGE_CPU_ORACLE_PAIR_LIMIT
+        and dimension <= 16
+    ):
+        effective_backend = "cpu_oracle"
+    started = time.perf_counter()
+    logger.info(
+        "Exact coverage start: N=%d, S=%d, d'=%d, backend=%s, devices=%s, "
+        "query_tile=%d, reference_tile=%s, estimated_pairs=%d",
+        total_rows,
+        source_indices.size,
+        dimension,
+        effective_backend,
+        (gpu_devices if gpu_devices is not None else (gpu_device,))
+        if effective_backend == "exact_tiled_gpu"
+        else "cpu",
+        min(int(chunk_size), total_rows),
+        int(gpu_tile_size) if effective_backend == "exact_tiled_gpu" else min(256, source_indices.size),
+        pair_work,
     )
-    distances = np.empty(pool.descriptors.shape[0], dtype=np.float64)
-    for start in range(0, pool.descriptors.shape[0], int(chunk_size)):
-        stop = min(start + int(chunk_size), pool.descriptors.shape[0])
-        distances[start:stop] = tree.query(pool.descriptors[start:stop], k=1, workers=1)[0]
+    runtime_budget = resource_budget or build_resource_budget()
+    if effective_backend == "cpu_oracle":
+        distances = _coverage_cpu_oracle(
+            descriptors,
+            source_indices,
+            chunk_size=int(chunk_size),
+            started=started,
+            progress_callback=progress_callback,
+        )
+    elif effective_backend == "cpu_tiled":  # pragma: no cover - defensive alias
+        distances = _coverage_cpu_tiled(
+            descriptors,
+            source_indices,
+            chunk_size=int(chunk_size),
+            resource_budget=runtime_budget,
+            max_pair_work=int(max_cpu_pair_work),
+            started=started,
+            progress_callback=progress_callback,
+        )
+    elif effective_backend == "cpu":
+        distances = _coverage_cpu_tiled(
+            descriptors,
+            source_indices,
+            chunk_size=int(chunk_size),
+            resource_budget=runtime_budget,
+            max_pair_work=int(max_cpu_pair_work),
+            started=started,
+            progress_callback=progress_callback,
+        )
+    else:
+        distances = _coverage_gpu_tiled(
+            descriptors,
+            source_indices,
+            chunk_size=int(chunk_size),
+            gpu_device=int(gpu_device),
+            gpu_devices=gpu_devices,
+            gpu_tile_size=int(gpu_tile_size),
+            max_gpu_support_bytes=max_gpu_support_bytes,
+            resource_budget=runtime_budget,
+            started=started,
+            progress_callback=progress_callback,
+        )
+    # A selected row is its own exact reference.  Keep this explicit so the
+    # identity contract remains visible even if a future backend changes its
+    # reduction order.
+    distances[source_indices] = 0.0
     if not np.all(np.isfinite(distances)) or np.any(distances < 0.0):
         raise ValueError("coverage nearest distances are not finite and non-negative")
+    _coverage_log_progress(
+        backend=effective_backend,
+        completed=total_rows,
+        total=total_rows,
+        started=started,
+    )
+    logger.info(
+        "Exact coverage completed: backend=%s, N=%d, S=%d, elapsed=%.3fs, "
+        "throughput=%.1f rows/s",
+        effective_backend,
+        total_rows,
+        source_indices.size,
+        max(0.0, time.perf_counter() - started),
+        total_rows / max(time.perf_counter() - started, np.finfo(float).tiny),
+    )
+    if operational_metrics is not None:
+        operational_metrics.update(
+            {
+                "backend": effective_backend,
+                "devices": (
+                    tuple(normalize_gpu_devices(gpu_devices, gpu_device=gpu_device))
+                    if effective_backend == "exact_tiled_gpu"
+                    else ()
+                ),
+                "rows": total_rows,
+                "selected_reference_rows": int(source_indices.size),
+                "dimension": int(dimension),
+                "estimated_pair_work": pair_work,
+                "query_tile": min(int(chunk_size), total_rows),
+                "reference_tile": (
+                    int(gpu_tile_size)
+                    if effective_backend == "exact_tiled_gpu"
+                    else min(256, int(source_indices.size))
+                ),
+                "elapsed_seconds": max(0.0, time.perf_counter() - started),
+            }
+        )
     return distances, source_indices
 
 
@@ -2261,6 +2751,14 @@ def build_entropy_diagnostics(
     candidates: Sequence[Any] | None = None,
     selected_indices: Sequence[int] | None = None,
     chunk_size: int = 4096,
+    coverage_backend: str = "cpu",
+    kernel_support_execution: str | None = None,
+    gpu_device: int = 0,
+    gpu_devices: Sequence[int] | str | int | None = None,
+    gpu_tile_size: int = 128,
+    max_gpu_support_bytes: int | None = None,
+    resource_budget: ResourceBudgetService | None = None,
+    max_cpu_pair_work: int = _COVERAGE_CPU_PAIR_LIMIT,
 ) -> EntropyScientificDiagnostics:
     """Build the closure record from validated scientific pipeline records."""
 
@@ -2300,8 +2798,23 @@ def build_entropy_diagnostics(
         if contributions.kernel_operator_fingerprint != graph.kernel_operator_fingerprint:
             raise ValueError("diagnostics contribution operator identity does not match execution")
         operator_fingerprint = graph.kernel_operator_fingerprint
+    coverage_metrics: dict[str, Any] = {}
     distances, _ = nearest_selected_atomic_distances(
-        pool, entropy_result.selected_candidate_ids, chunk_size=chunk_size
+        pool,
+        entropy_result.selected_candidate_ids,
+        chunk_size=chunk_size,
+        backend=(
+            kernel_support_execution
+            if kernel_support_execution is not None
+            else coverage_backend
+        ),
+        gpu_device=gpu_device,
+        gpu_devices=gpu_devices,
+        gpu_tile_size=gpu_tile_size,
+        max_gpu_support_bytes=max_gpu_support_bytes,
+        resource_budget=resource_budget,
+        max_cpu_pair_work=max_cpu_pair_work,
+        operational_metrics=coverage_metrics,
     )
     selected_set = set(entropy_result.selected_candidate_ids)
     owners = np.asarray(pool.row_candidate_indices, dtype=np.int64)
@@ -2426,6 +2939,7 @@ def build_entropy_diagnostics(
         operational_metrics={
             "calibration": dict(calibration.operational_metrics),
             "contributions": dict(getattr(graph, "operational_metrics", {})),
+            "coverage": coverage_metrics,
         },
     )
     raw = np.asarray(local_representation.raw_descriptors, dtype=np.float64)

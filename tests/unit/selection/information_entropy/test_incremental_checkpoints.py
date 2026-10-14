@@ -8,6 +8,7 @@ import pytest
 from nepflow.resources.budget import ResourceCapacityError, build_resource_budget
 from nepflow.stages.selection.algorithms.information_entropy import checkpointing
 from nepflow.stages.selection.algorithms.information_entropy.checkpointing import (
+    CandidateAggregationCheckpoint,
     CheckpointValidationError,
     IncrementalCheckpointStore,
 )
@@ -17,6 +18,33 @@ def _chunk(start: int, length: int, k: int) -> tuple[np.ndarray, np.ndarray]:
     indices = np.arange(start * k, (start + length) * k, dtype=np.int64).reshape(length, k)
     distances = np.arange(start * k, (start + length) * k, dtype=np.float64).reshape(length, k)
     return indices, distances
+
+
+def test_candidate_aggregation_batches_manifest_publication(tmp_path) -> None:
+    checkpoint = CandidateAggregationCheckpoint(tmp_path / "aggregation")
+    checkpoint.initialize({"pool": "fixture", "order": "candidate"}, ("a", "b", "c"))
+
+    for candidate_index, candidate_id in enumerate(("a", "b", "c")):
+        checkpoint.write_row(
+            candidate_index,
+            candidate_id,
+            np.array([candidate_index], dtype=np.int64),
+            np.array([1.0], dtype=np.float64),
+            source_cursor=candidate_index + 1,
+            q_completed=candidate_index + 1,
+            implicit_edges=candidate_index,
+            source_support=np.array([1], dtype=np.int64),
+            commit=False,
+        )
+
+    assert checkpoint.pending_row_count == 3
+    assert checkpoint.manifest_path.read_text(encoding="utf-8").count('"completed":{}') == 1
+    assert checkpoint.commit()
+    assert checkpoint.pending_row_count == 0
+    assert len(checkpoint.load_rows()) == 3
+    metrics = checkpoint.metrics_snapshot()
+    assert metrics["manifest_commits"] == 2
+    assert checkpoint.bytes_on_disk > checkpoint.manifest_bytes
 
 
 def test_incremental_store_restores_contiguous_read_only_prefix(tmp_path) -> None:
