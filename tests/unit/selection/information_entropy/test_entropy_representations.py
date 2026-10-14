@@ -1,6 +1,7 @@
 """Regression coverage for the potential-independent entropy representation."""
 
 import logging
+import math
 import os
 import re
 import subprocess
@@ -161,6 +162,42 @@ def test_weighted_whitening_matches_hand_calculated_probability_measure() -> Non
     np.testing.assert_allclose(transform.mean, expected_mean, atol=1.0e-14)
     np.testing.assert_allclose(reconstructed, expected_covariance, atol=1.0e-14)
     assert transform.weighting_fingerprint == reference_weights_fingerprint(weights)
+
+
+def test_weighted_whitening_preserves_already_normalized_reference_bytes() -> None:
+    occupancy = np.asarray([61, 29, 38], dtype=np.float64)
+    probabilities = np.asarray(
+        (1.0 / occupancy) / math.fsum(float(value) for value in 1.0 / occupancy),
+        dtype=np.float64,
+    )
+    assert float(np.sum(probabilities, dtype=np.float64)) != 1.0
+    assert math.isclose(
+        float(np.sum(probabilities, dtype=np.float64)),
+        1.0,
+        rel_tol=0.0,
+        abs_tol=1.0e-12,
+    )
+
+    values = np.arange(probabilities.size * 2, dtype=np.float64).reshape(probabilities.size, 2)
+    transform = fit_deterministic_whitening(
+        values,
+        target_weights=probabilities,
+        singular_policy="regularize",
+    )
+
+    assert transform.weighting_fingerprint == reference_weights_fingerprint(probabilities)
+
+
+def test_weighted_whitening_normalizes_genuinely_unnormalized_inputs_once() -> None:
+    values = np.asarray([[0.0], [1.0], [2.0]], dtype=np.float64)
+    supplied = np.asarray([1.0, 2.0, 3.0], dtype=np.float64)
+    original = supplied.copy()
+    expected = supplied / np.sum(supplied, dtype=np.float64)
+
+    transform = fit_deterministic_whitening(values, target_weights=supplied)
+
+    np.testing.assert_array_equal(supplied, original)
+    assert transform.weighting_fingerprint == reference_weights_fingerprint(expected)
 
 
 def test_local_representation_and_entropy_pool_share_reference_weights() -> None:

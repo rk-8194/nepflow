@@ -674,6 +674,8 @@ class LocalEnvironmentRepresentation:
                 raise ValueError("weighted local representations require the supported reference measure")
             if not str(self.reference_weights_fingerprint).strip():
                 raise ValueError("weighted local representations require a weights fingerprint")
+            if reference_weights_fingerprint(weights) != self.reference_weights_fingerprint:
+                raise ValueError("local target weights and reference fingerprint differ")
             if not isinstance(self.reference_measure_config, dict) or not isinstance(
                 self.reference_measure_diagnostics, dict
             ):
@@ -1448,7 +1450,9 @@ def fit_deterministic_whitening(
         weights = None
         mean = np.asarray(np.mean(matrix, axis=0, dtype=np.float64), dtype=np.float64)
     else:
-        weights = np.asarray(target_weights, dtype=np.float64)
+        # Copy before any normalization so a public caller's vector is never
+        # mutated and the exact supplied float64 values can be retained.
+        weights = np.asarray(target_weights, dtype=np.float64).copy()
         if (
             weights.ndim != 1
             or weights.shape[0] != matrix.shape[0]
@@ -1459,7 +1463,8 @@ def fit_deterministic_whitening(
         weight_total = float(np.sum(weights, dtype=np.float64))
         if not math.isfinite(weight_total) or weight_total <= 0.0:
             raise ValueError("target_weights must have a finite positive sum")
-        weights = weights / weight_total
+        if not math.isclose(weight_total, 1.0, rel_tol=0.0, abs_tol=1.0e-12):
+            weights = weights / weight_total
         weights_fingerprint = reference_weights_fingerprint(weights)
         weighting_version = str(target_weighting_version).strip()
         if not weighting_version:
