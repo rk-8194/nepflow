@@ -1,5 +1,8 @@
 """Focused scientific closure diagnostics regression tests."""
 
+import sys
+import types
+
 import numpy as np
 import pytest
 
@@ -10,6 +13,11 @@ from nepflow.stages.selection.algorithms.information_entropy.diagnostics import 
     nearest_selected_atomic_distances,
     recompute_final_entropy_metrics,
     weighted_quantile,
+)
+from nepflow.stages.selection.algorithms.information_entropy.gpu_support import (
+    GPUCapacityError,
+    GPUCertificationError,
+    GPUDeviceValidationError,
 )
 from nepflow.stages.selection.algorithms.information_entropy.models import (
     EntropyPool,
@@ -110,6 +118,178 @@ def test_exact_coverage_tiling_matches_bounded_cpu_oracle_with_duplicates() -> N
     assert oracle_indices.tolist() == [2, 3]
     np.testing.assert_array_equal(tiled, expected)
     np.testing.assert_array_equal(tiled, oracle)
+
+
+def _fake_coverage_cupy(
+    *,
+    device_count: int = 4,
+    free_bytes: int = 64 * 1024 * 1024,
+    sqrt_fn: object = np.sqrt,
+):
+    class Device:
+        def __init__(self, ordinal: int):
+            self.ordinal = ordinal
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+    runtime = types.SimpleNamespace(
+        getDeviceCount=lambda: device_count,
+        memGetInfo=lambda: (free_bytes, free_bytes),
+    )
+    return types.SimpleNamespace(
+        float64=np.float64,
+        int64=np.int64,
+        abs=np.abs,
+        argmin=np.argmin,
+        asarray=np.asarray,
+        asnumpy=np.asarray,
+        flatnonzero=np.flatnonzero,
+        isfinite=np.isfinite,
+        min=np.min,
+        maximum=np.maximum,
+        ones_like=np.ones_like,
+        full=np.full,
+        sqrt=sqrt_fn,
+        sum=np.sum,
+        where=np.where,
+        zeros=np.zeros,
+        cuda=types.SimpleNamespace(Device=Device, runtime=runtime),
+    )
+
+
+def _coverage_gpu_pool() -> tuple[EntropyPool, np.ndarray, np.ndarray]:
+    generator = np.random.default_rng(19)
+    descriptors = generator.normal(size=(12, 42)).astype(np.float64)
+    descriptors[1] = descriptors[0]
+    descriptors[2] = descriptors[0] + 1.0e-14
+    descriptors[3] = descriptors[4]
+    descriptors[5] = descriptors[4] + 1.0e-15
+    descriptors[6] = descriptors[4] + 4.0
+    descriptors[7] = descriptors[4] - 4.0
+    probabilities = np.full(12, 1.0 / 12.0, dtype=np.float64)
+    pool = EntropyPool(
+        descriptors,
+        tuple(range(12)),
+        ("selected", "other"),
+        np.asarray([0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1], dtype=np.int64),
+        probabilities,
+        "transform",
+        "representation",
+        "pool",
+        reference_weights_fingerprint=reference_weights_fingerprint(probabilities),
+    )
+    source_indices = np.arange(5, dtype=np.int64)
+    expected = np.sqrt(
+        np.sum(
+            (descriptors[:, None, :] - descriptors[source_indices][None, :, :]) ** 2,
+            axis=2,
+        )
+    ).min(axis=1)
+    return pool, source_indices, expected
+
+
+@pytest.mark.parametrize("gpu_devices", [(0,), (0, 1, 2, 3)])
+@pytest.mark.parametrize("gpu_tile_size", [2, 3, 5])
+def test_exact_gpu_coverage_is_exact_for_42d_duplicates_and_multi_gpu_tiles(
+    monkeypatch: pytest.MonkeyPatch,
+    gpu_devices: tuple[int, ...],
+    gpu_tile_size: int,
+) -> None:
+    monkeypatch.setitem(sys.modules, "cupy", _fake_coverage_cupy())
+    pool, source_indices, expected = _coverage_gpu_pool()
+    metrics: dict[str, object] = {}
+
+    actual, actual_indices = nearest_selected_atomic_distances(
+        pool,
+        ("selected",),
+        backend="exact_tiled_gpu",
+        gpu_devices=gpu_devices,
+        chunk_size=3,
+        gpu_tile_size=gpu_tile_size,
+        max_gpu_support_bytes=2 * 1024 * 1024,
+        resource_budget=build_resource_budget(memory_budget_bytes=64 * 1024 * 1024),
+        operational_metrics=metrics,
+    )
+
+    np.testing.assert_array_equal(actual_indices, source_indices)
+    np.testing.assert_array_equal(actual, expected)
+    assert metrics["backend"] == "exact_tiled_gpu"
+    assert metrics["devices"] == gpu_devices
+    assert metrics["gpu_evaluated_pairs"] == 2 * 12 * 5
+    assert metrics["gpu_screened_pairs"] == 12 * 5
+    assert metrics["gpu_distance_passes"] == 2
+    assert metrics["gpu_tile_workspace_bytes"] <= metrics["gpu_tile_workspace_limit_bytes"]
+    assert 0 < metrics["candidate_transfer_count"] < 2 * metrics["gpu_screened_pairs"]
+    assert metrics["cpu_refined_pairs"] < metrics["gpu_screened_pairs"]
+    assert metrics["cpu_certified_pairs"] == (
+        metrics["cpu_seed_pairs"] + metrics["cpu_refined_pairs"]
+    )
+
+
+def test_exact_gpu_coverage_rejects_missing_cupy_without_cpu_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setitem(sys.modules, "cupy", None)
+    pool, _source_indices, _expected = _coverage_gpu_pool()
+    with pytest.raises(GPUDeviceValidationError, match="no CPU fallback"):
+        nearest_selected_atomic_distances(
+            pool,
+            ("selected",),
+            backend="exact_tiled_gpu",
+            resource_budget=build_resource_budget(memory_budget_bytes=64 * 1024 * 1024),
+        )
+
+
+def test_exact_gpu_coverage_rejects_unavailable_device_and_under_budget_tile(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setitem(sys.modules, "cupy", _fake_coverage_cupy(device_count=1))
+    pool, _source_indices, _expected = _coverage_gpu_pool()
+    with pytest.raises(GPUDeviceValidationError, match="unavailable"):
+        nearest_selected_atomic_distances(
+            pool,
+            ("selected",),
+            backend="exact_tiled_gpu",
+            gpu_devices=(0, 1),
+            resource_budget=build_resource_budget(memory_budget_bytes=64 * 1024 * 1024),
+        )
+    with pytest.raises(GPUCapacityError, match="declared device workspace"):
+        nearest_selected_atomic_distances(
+            pool,
+            ("selected",),
+            backend="exact_tiled_gpu",
+            gpu_devices=(0,),
+            gpu_tile_size=3,
+            max_gpu_support_bytes=1,
+            resource_budget=build_resource_budget(memory_budget_bytes=64 * 1024 * 1024),
+        )
+
+
+def test_exact_gpu_coverage_fails_closed_on_unprovable_gpu_intervals(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def invalid_sqrt(value: object) -> np.ndarray:
+        return np.full(np.shape(value), np.nan, dtype=np.float64)
+
+    monkeypatch.setitem(
+        sys.modules,
+        "cupy",
+        _fake_coverage_cupy(sqrt_fn=invalid_sqrt),
+    )
+    pool, _source_indices, _expected = _coverage_gpu_pool()
+    with pytest.raises(GPUCertificationError, match="finite certified seed"):
+        nearest_selected_atomic_distances(
+            pool,
+            ("selected",),
+            backend="exact_tiled_gpu",
+            gpu_devices=(0,),
+            gpu_tile_size=3,
+            resource_budget=build_resource_budget(memory_budget_bytes=64 * 1024 * 1024),
+        )
 
 
 def test_prefix_coverage_matches_sparse_union_and_preserves_signed_covered_kl() -> None:

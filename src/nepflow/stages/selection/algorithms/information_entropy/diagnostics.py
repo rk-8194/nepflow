@@ -37,14 +37,12 @@ from .gpu_devices import (
     validate_visible_gpu_devices,
 )
 from .gpu_neighbours import _canonical_distances as _canonical_gpu_distances
-from .gpu_neighbours import (
-    _direct_cpu_relative_bound,
-    _gamma_bound,
-    _outward_lower,
-    _outward_upper,
-    _safe_fp64_distance_pairs,
+from .gpu_support import (
+    GPUCapacityError,
+    GPUCertificationError,
+    GPUDeviceValidationError,
+    _distance_intervals,
 )
-from .gpu_support import GPUCapacityError, GPUCertificationError, GPUDeviceValidationError
 from .models import (
     KERNEL_BANDWIDTH_RULE_ASYMMETRIC_SOURCE,
     KERNEL_BANDWIDTH_RULE_SYMMETRIC_MAX,
@@ -2327,6 +2325,7 @@ def _coverage_gpu_tiled(
     resource_budget: ResourceBudgetService,
     started: float,
     progress_callback: Any | None,
+    operational_metrics: dict[str, Any] | None,
 ) -> np.ndarray:
     try:
         import cupy as cp  # type: ignore[import-not-found]
@@ -2349,14 +2348,6 @@ def _coverage_gpu_tiled(
     total_rows, dimension = descriptors.shape
     query_tile = max(1, min(int(chunk_size), tile_size, total_rows))
     reference_tile = max(1, min(tile_size, int(source_indices.size)))
-    max_safe_component = float(
-        np.sqrt(np.finfo(np.float64).max / (16.0 * max(1, int(dimension))))
-    )
-    one_evaluation_bound = _gamma_bound(int(dimension))
-    direct_bound = _direct_cpu_relative_bound(one_evaluation_bound)
-    denominator = float(_outward_upper(1.0 + direct_bound))
-    if not np.isfinite(denominator) or denominator <= 1.0:
-        raise GPUCertificationError("coverage GPU FP64 certification bound is not representable")
 
     device_limits: dict[int, int] = {}
     for device in devices:
@@ -2399,15 +2390,23 @@ def _coverage_gpu_tiled(
         reference_tile,
         int(total_rows) * int(source_indices.size),
     )
-    def run_device(device: int, reference_start: int, reference_stop: int) -> np.ndarray:
+    def run_device(
+        device: int, reference_start: int, reference_stop: int
+    ) -> tuple[np.ndarray, int, int, int, int]:
         device_references = np.ascontiguousarray(
             descriptors[source_indices[reference_start:reference_stop]], dtype=np.float64
         )
         device_distances = np.full(total_rows, np.inf, dtype=np.float64)
+        device_pair_count = 0
+        device_candidate_transfer_count = 0
+        device_cpu_refined_count = 0
+        device_cpu_seed_count = 0
         for query_start in range(0, total_rows, query_tile):
             query_stop = min(query_start + query_tile, total_rows)
             query = np.ascontiguousarray(descriptors[query_start:query_stop], dtype=np.float64)
-            best = np.full(query_stop - query_start, np.inf, dtype=np.float64)
+            query_count = query_stop - query_start
+            gpu_best_reported = None
+            gpu_best_positions = None
             for tile_start in range(0, device_references.shape[0], reference_tile):
                 tile_stop = min(tile_start + reference_tile, device_references.shape[0])
                 references = device_references[tile_start:tile_stop]
@@ -2431,39 +2430,160 @@ def _coverage_gpu_tiled(
                             gpu_reference = cp.asarray(
                                 references, dtype=getattr(cp, "float64", np.float64)
                             )
-                            delta = gpu_query[:, None, :] - gpu_reference[None, :, :]
-                            gpu_distances = cp.sqrt(cp.sum(delta * delta, axis=2))
-                            reported = np.asarray(cp.asnumpy(gpu_distances), dtype=np.float64)
+                            reported_device, _lower_device, finite_device = _distance_intervals(
+                                cp,
+                                gpu_query,
+                                gpu_reference,
+                            )
+                            finite_reported = cp.where(
+                                finite_device,
+                                reported_device,
+                                np.inf,
+                            )
+                            tile_positions = cp.argmin(finite_reported, axis=1)
+                            tile_reported = cp.min(finite_reported, axis=1)
+                            tile_positions = tile_positions + tile_start
+                            if gpu_best_reported is None:
+                                gpu_best_reported = tile_reported
+                                gpu_best_positions = tile_positions
+                            else:
+                                improved = tile_reported < gpu_best_reported
+                                gpu_best_reported = cp.where(
+                                    improved, tile_reported, gpu_best_reported
+                                )
+                                gpu_best_positions = cp.where(
+                                    improved, tile_positions, gpu_best_positions
+                                )
+                            del (
+                                gpu_query,
+                                gpu_reference,
+                                reported_device,
+                                _lower_device,
+                                finite_device,
+                                finite_reported,
+                                tile_positions,
+                                tile_reported,
+                            )
                     except Exception as exc:
                         raise GPUCertificationError(
                             f"coverage GPU distance evaluation failed on device {device}: {exc}"
                         ) from exc
-                if reported.shape != (query.shape[0], references.shape[0]) or not np.all(
-                    np.isfinite(reported)
+                device_pair_count += int(query.shape[0] * references.shape[0])
+            if gpu_best_reported is None or gpu_best_positions is None:  # pragma: no cover
+                raise GPUCertificationError(
+                    f"coverage GPU device {device} received no reference rows"
+                )
+            try:
+                with cp.cuda.Device(device):
+                    seed_positions = np.asarray(
+                        cp.asnumpy(gpu_best_positions), dtype=np.int64
+                    )
+                    seed_reported_finite = np.asarray(
+                        cp.asnumpy(cp.isfinite(gpu_best_reported)), dtype=bool
+                    )
+            except Exception as exc:
+                raise GPUCertificationError(
+                    f"coverage GPU seed compaction failed on device {device}: {exc}"
+                ) from exc
+            if (
+                seed_positions.shape != (query_count,)
+                or not np.all(seed_reported_finite)
+                or np.any(seed_positions < 0)
+                or np.any(seed_positions >= device_references.shape[0])
+            ):
+                raise GPUCertificationError(
+                    "coverage GPU could not establish a finite certified seed for every query"
+                )
+            device_candidate_transfer_count += int(seed_positions.size)
+            device_cpu_seed_count += int(seed_positions.size)
+            best = np.full(query_count, np.inf, dtype=np.float64)
+            for query_offset, query_row in enumerate(query):
+                seed_position = int(seed_positions[query_offset])
+                seed_distance = _canonical_gpu_distances(
+                    query_row,
+                    device_references[seed_position : seed_position + 1],
+                )
+                best[query_offset] = float(seed_distance[0])
+
+            # The first pass establishes one exact host upper bound per query.
+            # The second pass reuses only bounded GPU tiles to screen against
+            # that bound, so CPU canonical refinement is limited to pairs whose
+            # conservative lower interval still reaches the current best.
+            for tile_start in range(0, device_references.shape[0], reference_tile):
+                tile_stop = min(tile_start + reference_tile, device_references.shape[0])
+                references = device_references[tile_start:tile_stop]
+                requested_host = int(
+                    8
+                    * (
+                        4 * query.shape[0] * dimension
+                        + 4 * references.shape[0] * dimension
+                        + 2 * query.shape[0] * references.shape[0]
+                    )
+                    + 65_536
+                )
+                with resource_budget.acquire(
+                    "entropy exact GPU coverage candidate tile", max(1, requested_host)
                 ):
-                    raise GPUCertificationError(
-                        "coverage GPU produced a non-finite or incorrectly shaped distance tile"
+                    try:
+                        with cp.cuda.Device(device):
+                            gpu_query = cp.asarray(
+                                query, dtype=getattr(cp, "float64", np.float64)
+                            )
+                            gpu_reference = cp.asarray(
+                                references, dtype=getattr(cp, "float64", np.float64)
+                            )
+                            _reported_device, lower_device, finite_device = _distance_intervals(
+                                cp,
+                                gpu_query,
+                                gpu_reference,
+                            )
+                            candidate_device = cp.flatnonzero(
+                                (~finite_device)
+                                | (
+                                    lower_device
+                                    <= cp.asarray(
+                                        best,
+                                        dtype=getattr(cp, "float64", np.float64),
+                                    )[:, None]
+                                )
+                            )
+                            candidate_flat = np.asarray(
+                                cp.asnumpy(candidate_device), dtype=np.int64
+                            )
+                            del (
+                                gpu_query,
+                                gpu_reference,
+                                _reported_device,
+                                lower_device,
+                                finite_device,
+                                candidate_device,
+                            )
+                    except Exception as exc:
+                        raise GPUCertificationError(
+                            f"coverage GPU candidate compaction failed on device {device}: {exc}"
+                        ) from exc
+                device_pair_count += int(query.shape[0] * references.shape[0])
+                device_candidate_transfer_count += int(candidate_flat.size)
+                if candidate_flat.size:
+                    candidate_query, candidate_reference = np.divmod(
+                        candidate_flat, references.shape[0]
                     )
-                local_indices = np.arange(tile_start, tile_stop, dtype=np.int64)
-                for query_offset, query_row in enumerate(query):
-                    safe, lower = _safe_fp64_distance_pairs(
-                        query_row,
-                        references,
-                        max_safe_component=max_safe_component,
-                        relative_bound=one_evaluation_bound,
-                    )
-                    lower = np.asarray(lower, dtype=np.float64)
-                    with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
-                        lower[safe] = np.asarray(
-                            _outward_lower(reported[query_offset, safe] / denominator),
-                            dtype=np.float64,
+                    for query_offset in np.unique(candidate_query):
+                        query_offset = int(query_offset)
+                        positions = candidate_reference[candidate_query == query_offset]
+                        seed_position = int(seed_positions[query_offset])
+                        positions = np.unique(
+                            positions[(positions + tile_start) != seed_position]
                         )
-                    possible = (~safe) | ~np.isfinite(lower) | (lower <= best[query_offset])
-                    candidates = local_indices[possible]
-                    if candidates.size == 0:
-                        continue
-                    canonical = _canonical_gpu_distances(query_row, references[possible])
-                    best[query_offset] = min(best[query_offset], float(np.min(canonical)))
+                        if positions.size == 0:
+                            continue
+                        canonical = _canonical_gpu_distances(
+                            query[query_offset], references[positions]
+                        )
+                        best[query_offset] = min(
+                            best[query_offset], float(np.min(canonical))
+                        )
+                        device_cpu_refined_count += int(positions.size)
             device_distances[query_start:query_stop] = best
             _coverage_log_progress(
                 backend="exact_tiled_gpu",
@@ -2474,7 +2594,13 @@ def _coverage_gpu_tiled(
             )
             if progress_callback is not None:
                 progress_callback(query_stop, total_rows)
-        return device_distances
+        return (
+            device_distances,
+            device_pair_count,
+            device_candidate_transfer_count,
+            device_cpu_refined_count,
+            device_cpu_seed_count,
+        )
 
     ranges = tuple(
         item
@@ -2488,8 +2614,30 @@ def _coverage_gpu_tiled(
         with ThreadPoolExecutor(max_workers=len(ranges)) as executor:
             futures = [executor.submit(run_device, *item) for item in ranges]
             results = [future.result() for future in futures]
-    for result in results:
+    pair_count = 0
+    candidate_transfer_count = 0
+    cpu_refined_count = 0
+    cpu_seed_count = 0
+    for result, worker_pairs, worker_candidates, worker_refined, worker_seeds in results:
         global_distances = np.minimum(global_distances, result)
+        pair_count += worker_pairs
+        candidate_transfer_count += worker_candidates
+        cpu_refined_count += worker_refined
+        cpu_seed_count += worker_seeds
+    if operational_metrics is not None:
+        operational_metrics.update(
+            {
+                "gpu_evaluated_pairs": pair_count,
+                "gpu_screened_pairs": pair_count // 2,
+                "gpu_distance_passes": 2,
+                "candidate_transfer_count": candidate_transfer_count,
+                "cpu_refined_pairs": cpu_refined_count,
+                "cpu_seed_pairs": cpu_seed_count,
+                "cpu_certified_pairs": cpu_seed_count + cpu_refined_count,
+                "gpu_tile_workspace_bytes": minimum_tile_bytes,
+                "gpu_tile_workspace_limit_bytes": min(device_limits.values()),
+            }
+        )
     return global_distances
 
 
@@ -2610,6 +2758,7 @@ def nearest_selected_atomic_distances(
             resource_budget=runtime_budget,
             started=started,
             progress_callback=progress_callback,
+            operational_metrics=operational_metrics,
         )
     # A selected row is its own exact reference.  Keep this explicit so the
     # identity contract remains visible even if a future backend changes its

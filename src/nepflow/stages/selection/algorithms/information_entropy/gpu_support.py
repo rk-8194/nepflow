@@ -37,6 +37,131 @@ _FLOAT64_MIN_SUBNORMAL = float(np.nextafter(np.float64(0.0), np.float64(1.0)))
 _DISTANCE_BLOCK_WIDTH = 8
 
 
+def _distance_intervals(
+    cp: Any,
+    gpu_sources: Any,
+    gpu_targets: Any,
+) -> tuple[Any, Any, Any]:
+    """Return GPU-reported distances and conservative FP64 intervals.
+
+    All pairwise arithmetic stays on the device.  The returned ``finite``
+    mask is deliberately conservative: an unprovable pair remains eligible
+    for canonical CPU certification rather than being excluded.
+    """
+
+    source_count = int(gpu_sources.shape[0])
+    target_count = int(gpu_targets.shape[0])
+    dimension_count = int(gpu_sources.shape[1])
+    distance_squared = cp.zeros((source_count, target_count), dtype=cp.float64)
+    square_error = cp.zeros((source_count, target_count), dtype=cp.float64)
+    unit_roundoff = _FLOAT64_UNIT_ROUNDOFF
+    min_subnormal = _FLOAT64_MIN_SUBNORMAL
+    sum_operation = getattr(cp, "sum", None)
+    if sum_operation is None:
+        raise GPUSupportError(
+            "exact tiled GPU support requires CuPy's float64 reduction primitive"
+        )
+    for block_start in range(0, dimension_count, _DISTANCE_BLOCK_WIDTH):
+        block_stop = min(block_start + _DISTANCE_BLOCK_WIDTH, dimension_count)
+        block_width = block_stop - block_start
+        target_block = gpu_targets[None, :, block_start:block_stop]
+        source_block = gpu_sources[:, None, block_start:block_stop]
+        delta = target_block - source_block
+        coordinate_scale = cp.abs(target_block) + cp.abs(source_block)
+        coordinate_scale = (
+            coordinate_scale
+            + 2.0 * unit_roundoff * coordinate_scale
+            + 2.0 * min_subnormal
+        )
+        block_distance_squared = sum_operation(delta * delta, axis=2, dtype=cp.float64)
+        scale_sum = sum_operation(coordinate_scale, axis=2, dtype=cp.float64)
+        scale_squared_sum = sum_operation(
+            coordinate_scale * coordinate_scale,
+            axis=2,
+            dtype=cp.float64,
+        )
+        block_unit_roundoff = block_width * unit_roundoff
+        block_gamma = (
+            block_unit_roundoff / (1.0 - block_unit_roundoff)
+            if block_unit_roundoff < 1.0
+            else np.inf
+        )
+        scale_sum_upper = (
+            scale_sum * (1.0 + 2.0 * block_gamma) + block_width * min_subnormal
+        )
+        scale_squared_upper = (
+            scale_squared_sum
+            * (1.0 + 4.0 * unit_roundoff)
+            * (1.0 + 2.0 * block_gamma)
+            + block_width * min_subnormal
+        )
+        quadratic_coefficient = (
+            2.0 * unit_roundoff
+            + unit_roundoff * unit_roundoff
+            + unit_roundoff * (1.0 + unit_roundoff) ** 2
+        )
+        linear_coefficient = min_subnormal * (
+            2.0
+            + 2.0 * unit_roundoff
+            + 2.0 * unit_roundoff * (1.0 + unit_roundoff)
+        )
+        constant_error = block_width * (
+            min_subnormal + min_subnormal * min_subnormal * (1.0 + unit_roundoff)
+        )
+        block_square_error = (
+            quadratic_coefficient * scale_squared_upper
+            + linear_coefficient * scale_sum_upper
+            + constant_error
+        )
+        block_square_error = (
+            2.0 * block_square_error
+            + 4.0
+            * block_gamma
+            * (cp.abs(block_distance_squared) + cp.abs(block_square_error))
+            + (4.0 * block_width + 4.0) * min_subnormal
+        )
+        distance_squared += block_distance_squared
+        square_error += block_square_error
+
+    if dimension_count * unit_roundoff < 1.0:
+        summation_gamma = (dimension_count * unit_roundoff) / (
+            1.0 - dimension_count * unit_roundoff
+        )
+        sum_upper = (
+            distance_squared + 2.0 * square_error + 2.0 * dimension_count * min_subnormal
+        )
+        square_error = (
+            2.0 * square_error
+            + 2.0 * summation_gamma * sum_upper
+            + (2.0 * dimension_count + 1.0) * min_subnormal
+        )
+    else:  # pragma: no cover - impossible for supported descriptor widths
+        square_error = cp.ones_like(distance_squared) * np.inf
+
+    finite = cp.isfinite(distance_squared) & cp.isfinite(square_error)
+    interval_roundoff = (
+        4.0 * unit_roundoff * (cp.abs(distance_squared) + cp.abs(square_error))
+        + 4.0 * min_subnormal
+    )
+    finite = finite & cp.isfinite(interval_roundoff)
+    lower_squared = cp.maximum(
+        0.0,
+        distance_squared - square_error - interval_roundoff,
+    )
+    lower_distance = cp.sqrt(lower_squared)
+    upper_distance = cp.sqrt(
+        cp.maximum(0.0, distance_squared + square_error + interval_roundoff)
+    )
+    sqrt_error = (
+        3.0 * unit_roundoff * cp.maximum(1.0, upper_distance) + 3.0 * min_subnormal
+    )
+    lower_distance = cp.maximum(0.0, lower_distance - sqrt_error)
+    finite = finite & cp.isfinite(lower_distance) & cp.isfinite(upper_distance)
+    reported_distance = cp.sqrt(distance_squared)
+    finite = finite & cp.isfinite(reported_distance)
+    return reported_distance, lower_distance, finite
+
+
 class GPUSupportError(RuntimeError):
     """Base error for an explicitly requested GPU support execution."""
 
