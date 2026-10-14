@@ -47,10 +47,10 @@ from .persistence import (
 from .persistence import structure_ids as ordered_structure_ids
 from .reports import (
     plot_descriptor_space,
-    plot_entropy_coverage_diagnostics,
     plot_entropy_convergence,
-    write_entropy_bandwidth_calibration_report,
+    plot_entropy_coverage_diagnostics,
     write_diagnostics_report,
+    write_entropy_bandwidth_calibration_report,
     write_entropy_presentation_reports,
 )
 from .representations import (

@@ -11,10 +11,10 @@ pytest.importorskip("sklearn")
 
 from ase import Atoms
 
+from nepflow.stages.selection.algorithms.information_entropy.bandwidth import build_entropy_pool
 from nepflow.stages.selection.algorithms.information_entropy.diagnostics import (
     EntropyScientificDiagnostics,
 )
-from nepflow.stages.selection.algorithms.information_entropy.bandwidth import build_entropy_pool
 from nepflow.stages.selection.algorithms.information_entropy.models import FrozenBandwidths
 from nepflow.stages.selection.artifacts import write_selected_structures
 from nepflow.stages.selection.reports import (
@@ -26,8 +26,8 @@ from nepflow.stages.selection.reports import (
     plot_descriptor_space,
     plot_entropy_convergence,
     plot_projected_entropy_densities,
-    write_entropy_presentation_artifact,
     write_entropy_bandwidth_calibration_report,
+    write_entropy_presentation_artifact,
 )
 
 

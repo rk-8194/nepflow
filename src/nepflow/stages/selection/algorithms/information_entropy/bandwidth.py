@@ -19,11 +19,11 @@ from nepflow.resources.budget import (
     ResourceCapacityError,
     build_resource_budget,
 )
-from nepflow.stages.selection.representations import LocalEnvironmentRepresentation
 from nepflow.stages.selection.reference_measure import (
     estimate_reference_measure,
     reference_weights_fingerprint,
 )
+from nepflow.stages.selection.representations import LocalEnvironmentRepresentation
 
 from .checkpointing import (
     CheckpointValidationError,
@@ -43,13 +43,13 @@ from .models import (
     BANDWIDTH_SCHEMA_VERSION,
     CALIBRATION_OPTIMIZER_ID,
     CALIBRATION_OPTIMIZER_VERSION,
-    DEFAULT_REFERENCE_MEASURE_CHUNK_SIZE,
-    DEFAULT_REFERENCE_MEASURE_TOLERANCE,
     DEFAULT_LOO_CHECKPOINT_EVERY_SOURCES,
     DEFAULT_NEIGHBOUR_BACKEND_ID,
-    KERNEL_BANDWIDTH_RULE_ASYMMETRIC_SOURCE,
+    DEFAULT_REFERENCE_MEASURE_CHUNK_SIZE,
+    DEFAULT_REFERENCE_MEASURE_TOLERANCE,
     ENTROPY_OBJECTIVE_SCHEMA_VERSION,
     GPU_NEIGHBOUR_BACKEND_ALIASES,
+    KERNEL_BANDWIDTH_RULE_ASYMMETRIC_SOURCE,
     KERNEL_BANDWIDTH_RULE_SYMMETRIC_MAX,
     KERNEL_FAMILY,
     KERNEL_OPERATOR_SCHEMA_VERSION,
@@ -1501,37 +1501,49 @@ def calibrate_bandwidth(
                 "preserve_checkpoint": checkpoint_path is not None,
             }
             neighbour_started = time.perf_counter()
-            if isinstance(index, ExactTiledGPUNeighbourIndex):
-                radii_by_k.update(
-                    compute_gpu_tiled_neighbours_many(
-                        pool.descriptors,
-                        indexed_orders,
-                        index=index,
-                        **common_neighbour_options,
+            try:
+                if isinstance(index, ExactTiledGPUNeighbourIndex):
+                    radii_by_k.update(
+                        compute_gpu_tiled_neighbours_many(
+                            pool.descriptors,
+                            indexed_orders,
+                            index=index,
+                            **common_neighbour_options,
+                        )
                     )
-                )
-            elif isinstance(index, TiledCPUNeighbourIndex):
-                radii_by_k.update(
-                    compute_tiled_cpu_neighbours_many(
-                        pool.descriptors,
-                        indexed_orders,
-                        index=index,
-                        **common_neighbour_options,
+                elif isinstance(index, TiledCPUNeighbourIndex):
+                    radii_by_k.update(
+                        compute_tiled_cpu_neighbours_many(
+                            pool.descriptors,
+                            indexed_orders,
+                            index=index,
+                            **common_neighbour_options,
+                        )
                     )
-                )
-            elif isinstance(index, IndexedCPUNeighbourIndex):
-                radii_by_k.update(
-                    compute_indexed_cpu_neighbours_many(
-                        pool.descriptors,
-                        indexed_orders,
-                        index=index,
-                        **common_neighbour_options,
+                elif isinstance(index, IndexedCPUNeighbourIndex):
+                    radii_by_k.update(
+                        compute_indexed_cpu_neighbours_many(
+                            pool.descriptors,
+                            indexed_orders,
+                            index=index,
+                            **common_neighbour_options,
+                        )
                     )
-                )
-            else:
-                raise RuntimeError(
-                    "automatic entropy calibration has no compatible neighbour index"
-                )
+                else:
+                    raise RuntimeError(
+                        "automatic entropy calibration has no compatible neighbour index"
+                    )
+            except RadiusQueryCapacityError as exc:
+                # kNN construction is a required operational phase, not an
+                # invalid scientific (k, c) candidate.  Include the first
+                # canonical pair context so callers can diagnose the bounded
+                # request without searching a later generic error.
+                representative_k = max(indexed_orders)
+                representative_c = float(domain_c[0])
+                raise RadiusQueryCapacityError(
+                    f"N={pool.descriptors.shape[0]}, d'={pool.descriptors.shape[1]}, "
+                    f"k={representative_k}, c={representative_c:g}: {exc}"
+                ) from exc
             operational_metrics["neighbour_query_seconds"] += max(
                 0.0, time.perf_counter() - neighbour_started
             )

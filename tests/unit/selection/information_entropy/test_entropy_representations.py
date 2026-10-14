@@ -19,13 +19,13 @@ from nepflow.stages.selection.algorithms.information_entropy.bandwidth import bu
 from nepflow.stages.selection.algorithms.information_entropy.neighbours import (
     compute_exact_neighbours,
 )
+from nepflow.stages.selection.reference_measure import reference_weights_fingerprint
 from nepflow.stages.selection.representations import (
     LocalRepresentationConfig,
     build_local_environment_representation,
     fit_deterministic_whitening,
     load_or_calculate_local_representations,
 )
-from nepflow.stages.selection.reference_measure import reference_weights_fingerprint
 
 
 def test_entropy_worker_import_does_not_load_neptrainkit() -> None:

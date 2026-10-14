@@ -29,7 +29,6 @@ from .models import (
     normalize_kernel_bandwidth_rule,
 )
 
-
 _FLOAT64_UNIT_ROUNDOFF = np.finfo(np.float64).eps / 2.0
 _FLOAT64_MIN_SUBNORMAL = float(np.nextafter(np.float64(0.0), np.float64(1.0)))
 # A subdimension block is deliberately small.  It bounds the only temporary

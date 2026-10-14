@@ -1,7 +1,7 @@
 """Regression tests for the issue #154 entropy profiling diagnostics."""
 
+import importlib.util
 import json
-import runpy
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -16,14 +16,21 @@ from nepflow.stages.selection.algorithms.information_entropy.models import (
     INDEXED_NEIGHBOUR_BACKEND_ID,
 )
 
-_BENCHMARK: dict[str, Any] = runpy.run_path(
-    str(
-        Path(__file__).resolve().parents[4]
-        / "utilities"
-        / "perf"
-        / "benchmark_information_entropy_scaling.py"
-    )
+_BENCHMARK_PATH = (
+    Path(__file__).resolve().parents[4]
+    / "utilities"
+    / "perf"
+    / "benchmark_information_entropy_scaling.py"
 )
+_BENCHMARK_SPEC = importlib.util.spec_from_file_location(
+    "nepflow_test_benchmark_information_entropy_scaling",
+    _BENCHMARK_PATH,
+)
+assert _BENCHMARK_SPEC is not None and _BENCHMARK_SPEC.loader is not None
+_BENCHMARK_MODULE = importlib.util.module_from_spec(_BENCHMARK_SPEC)
+sys.modules[_BENCHMARK_SPEC.name] = _BENCHMARK_MODULE
+_BENCHMARK_SPEC.loader.exec_module(_BENCHMARK_MODULE)
+_BENCHMARK: dict[str, Any] = vars(_BENCHMARK_MODULE)
 
 
 def _prepare_fixture(*, checkpoint_enabled: bool) -> tuple[Any, Any, Any, Any, Any, Any]:
@@ -165,6 +172,8 @@ def test_knn_only_mode_skips_contributions_and_loo(monkeypatch: Any, tmp_path: P
     neighbours = SimpleNamespace(
         neighbour_indices=np.zeros((4, 1), dtype=np.int64),
         unique_locations=np.zeros((4, 42), dtype=np.float64),
+        backend_version="test-backend-v1",
+        backend_fingerprint="test-backend-fingerprint",
     )
     index = SimpleNamespace(close=lambda: None)
     preparation = {

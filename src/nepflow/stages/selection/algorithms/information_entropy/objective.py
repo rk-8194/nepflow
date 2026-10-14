@@ -132,29 +132,6 @@ def _validate_objective_inputs(
     if np.any(row_counts <= 0):
         missing = candidate_ids[int(np.flatnonzero(row_counts <= 0)[0])]
         raise ValueError(f"candidate {missing!r} owns no pool rows")
-    expected_probabilities = np.asarray(
-        [1.0 / (candidate_count * int(row_counts[index])) for index in row_candidates],
-        dtype=np.float64,
-    )
-    if not np.allclose(
-        probabilities,
-        expected_probabilities,
-        rtol=0.0,
-        atol=SPARSE_NUMERICAL_TOLERANCE,
-    ):
-        raise ValueError("pool probabilities do not equal the canonical candidate-row masses")
-    candidate_masses = np.bincount(
-        row_candidates,
-        weights=probabilities,
-        minlength=candidate_count,
-    )
-    if not np.allclose(
-        candidate_masses,
-        np.full(candidate_count, 1.0 / candidate_count, dtype=np.float64),
-        rtol=0.0,
-        atol=SPARSE_NUMERICAL_TOLERANCE,
-    ):
-        raise ValueError("each candidate must carry target probability mass 1/M")
 
     if contributions.row_count != target_count:
         raise ValueError("candidate contribution row_count does not match the entropy pool")

@@ -159,6 +159,7 @@ def test_batched_loo_reduces_repeated_indexed_radius_queries() -> None:
         bandwidths,
         backend="exact_indexed_cpu",
         index=batched_index,
+        kernel_bandwidth_rule="asymmetric_source",
     )
     batched_queries = batched_index.radius_queries
 
@@ -170,6 +171,7 @@ def test_batched_loo_reduces_repeated_indexed_radius_queries() -> None:
             candidate_bandwidths,
             backend="exact_indexed_cpu",
             index=reference_index,
+            kernel_bandwidth_rule="asymmetric_source",
         )
     reference_queries = reference_index.radius_queries
 

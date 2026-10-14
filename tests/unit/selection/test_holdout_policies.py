@@ -71,11 +71,15 @@ def test_extrapolative_policy_uses_local_rows_not_candidate_means() -> None:
             [1.0, 1.0],
             [1.0, -1.0],
             [3.0, 3.0],
-            [-1.0, -3.0],
+            [4.0, 2.0],
         ],
         dtype=np.float64,
     )
-    representation = _representation(descriptors, ("c0", "c0", "c1", "c1", "c2", "c2"))
+    representation = _representation(
+        descriptors,
+        ("c0", "c0", "c1", "c1", "c2", "c2"),
+        ("s0", "s1", "s2"),
+    )
 
     result = select_local_test_holdout(
         representation,
@@ -95,10 +99,14 @@ def test_extrapolative_policy_uses_local_rows_not_candidate_means() -> None:
 
 def test_representative_and_extrapolative_are_reproducible_but_distinct() -> None:
     descriptors = np.asarray(
-        [[0.0, 0.0], [2.0, 0.0], [1.0, 1.0], [1.0, -1.0], [3.0, 3.0], [-1.0, -3.0]],
+        [[0.0, 0.0], [2.0, 0.0], [1.0, 1.0], [1.0, -1.0], [3.0, 3.0], [4.0, 2.0]],
         dtype=np.float64,
     )
-    representation = _representation(descriptors, ("c0", "c0", "c1", "c1", "c2", "c2"))
+    representation = _representation(
+        descriptors,
+        ("c0", "c0", "c1", "c1", "c2", "c2"),
+        ("s0", "s1", "s2"),
+    )
     structures = _structures(3)
     kwargs: dict[str, Any] = {
         "representation": representation,
@@ -112,12 +120,12 @@ def test_representative_and_extrapolative_are_reproducible_but_distinct() -> Non
     representative = select_local_test_holdout(
         **kwargs,
         policy="representative",
-        signature_bins=1,
+        signature_bins=2,
     )
     repeated = select_local_test_holdout(
         **kwargs,
         policy="representative",
-        signature_bins=1,
+        signature_bins=2,
     )
     extrapolative = select_local_test_holdout(
         **kwargs,

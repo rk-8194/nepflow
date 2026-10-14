@@ -2,8 +2,7 @@
 
 from __future__ import annotations
 
-import builtins
-import importlib
+import subprocess
 import sys
 import threading
 import types
@@ -71,18 +70,28 @@ def _fake_cupy(*, device_count: int = 1, free_bytes: int = 64 * 1024 * 1024):
     )
 
 
-def test_gpu_support_module_is_lazy_and_cpu_import_is_cuda_free(monkeypatch: pytest.MonkeyPatch):
-    module_name = "nepflow.stages.selection.algorithms.information_entropy.gpu_support"
-    module = importlib.import_module(module_name)
-    original_import = builtins.__import__
+def test_gpu_support_module_is_lazy_and_cpu_import_is_cuda_free():
+    code = """
+import builtins
+import importlib
 
-    def reject_cupy(name: str, *args: object, **kwargs: object):
-        if name == "cupy":
-            raise AssertionError("CPU import attempted to load CuPy")
-        return original_import(name, *args, **kwargs)
+original_import = builtins.__import__
 
-    monkeypatch.setattr(builtins, "__import__", reject_cupy)
-    importlib.reload(module)
+def reject_cupy(name, *args, **kwargs):
+    if name == "cupy":
+        raise AssertionError("CPU import attempted to load CuPy")
+    return original_import(name, *args, **kwargs)
+
+builtins.__import__ = reject_cupy
+importlib.import_module("nepflow.stages.selection.algorithms.information_entropy.gpu_support")
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", code],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
 
 
 def test_explicit_gpu_settings_validate_without_cuda():
@@ -305,7 +314,9 @@ def test_fake_gpu_support_preserves_strict_ulp_duplicates_and_original_rows(
         max_device_bytes=64 * 1024,
         max_host_bytes=1_000_000,
     )
-    offsets, targets, distances = provider.support_many(np.arange(4), radii)
+    offsets, targets, distances = provider.support_many(
+        np.arange(4), radii, kernel_bandwidth_rule="asymmetric_source"
+    )
     expected_targets: list[int] = []
     expected_distances: list[float] = []
     expected_offsets = [0]
@@ -342,7 +353,9 @@ def test_fake_gpu_support_shared_radius_matrix_matches_isolated_queries(
         max_device_bytes=64 * 1024,
         max_host_bytes=1_000_000,
     )
-    offsets, targets, distances = shared.support_many(sources, radii)
+    offsets, targets, distances = shared.support_many(
+        sources, radii, kernel_bandwidth_rule="asymmetric_source"
+    )
     for candidate_index in range(radii.shape[0]):
         for source_index in range(sources.size):
             begin = int(offsets[source_index])
@@ -475,8 +488,12 @@ def test_fake_multi_gpu_support_merges_contiguous_ranges_deterministically(
         return original_worker_query(self, *args, **kwargs)
 
     monkeypatch.setattr(ExactTiledGPUSupport, "_support_many_on_device", synchronized_worker_query)
-    expected = single.support_many(sources, radii)
-    actual = multi.support_many(sources, radii)
+    expected = single.support_many(
+        sources, radii, kernel_bandwidth_rule="asymmetric_source"
+    )
+    actual = multi.support_many(
+        sources, radii, kernel_bandwidth_rule="asymmetric_source"
+    )
     for left, right in zip(expected, actual, strict=True):
         np.testing.assert_array_equal(left, right)
     metrics = multi.operational_metrics()

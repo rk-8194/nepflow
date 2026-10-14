@@ -299,9 +299,6 @@ def test_fake_gpu_boundary_filter_keeps_opposite_rounding_near_tie(
     descriptors[3, 0] = -1.0
     oracle = compute_exact_neighbours(descriptors, 1, chunk_size=2, resource_budget=_budget())
 
-    from nepflow.stages.selection.algorithms.information_entropy.gpu_neighbours import (
-        ExactTiledGPUNeighbourIndex,
-    )
 
     index = ExactTiledGPUNeighbourIndex(
         descriptors,
@@ -310,7 +307,6 @@ def test_fake_gpu_boundary_filter_keeps_opposite_rounding_near_tie(
         resource_budget=_budget(),
     )
     source_location = int(index.row_to_location[0])
-    candidate_location = int(index.row_to_location[1])
     selected_locations = np.asarray(
         [source_location, int(index.row_to_location[2]), int(index.row_to_location[3])],
         dtype=np.int64,

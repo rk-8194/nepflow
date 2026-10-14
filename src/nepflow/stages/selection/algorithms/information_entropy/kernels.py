@@ -861,11 +861,17 @@ class _KernelSupportProvider:
                 knn_eligible = self.knn_prefix_support.eligible(sources, requested_radii)
         if knn_eligible:
             started = time.perf_counter()
-            offsets, targets, distances = self.knn_prefix_support.support_many(
-                sources,
-                requested_radii,
-                target_bandwidths=target_bandwidths,
-            )
+            if isinstance(self.knn_prefix_support, ExactSymmetricKNNUnionSupport):
+                offsets, targets, distances = self.knn_prefix_support.support_many(
+                    sources,
+                    requested_radii,
+                    target_bandwidths=target_bandwidths,
+                )
+            else:
+                offsets, targets, distances = self.knn_prefix_support.support_many(
+                    sources,
+                    requested_radii,
+                )
             for count in np.diff(offsets):
                 support_count = int(count)
                 self.current_support_count = support_count
@@ -3269,6 +3275,12 @@ def build_streamed_candidate_contributions(
         )
     if entry_limit is None:
         entry_limit = maximum_entry_count
+    if entry_limit < candidate_count:
+        raise ValueError(
+            "streamed candidate contributions cannot satisfy the non-empty candidate "
+            "support contract: "
+            f"N={n_rows}, M={candidate_count}, Q=0, max_entries={entry_limit}"
+        )
     runtime_budget = (
         resource_budget or getattr(index, "resource_budget", None) or build_resource_budget()
     )

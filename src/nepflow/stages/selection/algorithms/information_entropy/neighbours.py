@@ -1268,10 +1268,16 @@ class ExactTiledCPUSupport:
             max(1, (self.max_workspace_bytes - 16 * self.tile_size - 8192) // per_target),
         )
         if self.max_workspace_bytes < per_target + 8192:
-            raise RadiusQueryCapacityError(
+            details = (
                 "one symmetric CPU support tile exceeds its bounded workspace: "
-                f"requested_bytes={per_target + 8192}, max_support_workspace_bytes="
-                f"{self.max_workspace_bytes}"
+                f"N={self.descriptors.shape[0]}, d'={self.descriptors.shape[1]}, "
+                f"requested_bytes={per_target + 8192}, "
+                f"max_support_workspace_bytes={self.max_workspace_bytes}"
+            )
+            if self.capacity_context:
+                details += f", {self.capacity_context}"
+            raise RadiusQueryCapacityError(
+                details
             )
         self.distance_evaluations = 0
         self.new_distance_evaluations = 0
@@ -1813,6 +1819,29 @@ class IndexedCPUNeighbourIndex:
                 metrics[f"{alias}_count"] = metrics[f"{phase}_count"]
             if f"{alias}_bytes" not in metrics and f"{phase}_bytes" in metrics:
                 metrics[f"{alias}_bytes"] = metrics[f"{phase}_bytes"]
+        # These phases are optional: certified kNN prefixes can bypass every
+        # radius query, and checkpointing is caller-controlled.  Keep their
+        # documented counters stable so diagnostics consumers do not need to
+        # distinguish an absent phase from a phase that executed zero times.
+        for phase in (
+            "knn_tree_query",
+            "knn_boundary_certification",
+            "radius_preflight_count",
+            "radius_retrieval",
+            "canonical_distance_verification",
+            "checkpoint_serialization",
+            "checkpoint_fsync",
+            "checkpoint_digest",
+            "checkpoint_read",
+            "query_neighbours_many_projection",
+        ):
+            metrics.setdefault(f"{phase}_seconds", 0.0)
+            metrics.setdefault(f"{phase}_count", 0)
+            metrics.setdefault(f"{phase}_bytes", 0)
+        metrics["radius_preflight_count"] = int(
+            metrics.get("radius_preflight_count_count", 0)
+        )
+        metrics.setdefault("radius_preflight_calls", metrics["radius_preflight_count"])
         return metrics
 
     def query_nearest_distances(
