@@ -172,6 +172,8 @@ class ValidationStage:
             gpus_per_node=int(config.slurm.gpumd_gpus),
             mpi_ranks=max(1, int(config.slurm.gpumd_gpus)),
             walltime=config.slurm.gpumd_walltime,
+            account=config.slurm.account,
+            partition=config.slurm.validation_partition,
         )
 
     def run(self, context: StageContext | None = None) -> ValidationStageResult:

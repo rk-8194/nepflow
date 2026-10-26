@@ -421,6 +421,10 @@ def _slurm_values(config: NepflowConfig) -> dict[str, str]:
     slurm = config.slurm
     values = {
         "enabled": _bool_text(slurm.enabled),
+        "account": slurm.account or "",
+        "dft_partition": slurm.dft_partition or "",
+        "training_partition": slurm.training_partition or "",
+        "validation_partition": slurm.validation_partition or "",
         "max_concurrent": str(slurm.max_concurrent),
         "walltime": slurm.walltime,
         "poll_interval": str(slurm.poll_interval),

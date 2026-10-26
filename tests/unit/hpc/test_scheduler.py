@@ -110,6 +110,24 @@ def test_resources_validate_gpu_and_memory_semantics() -> None:
         JobResources(nodes=0)
 
 
+def test_scheduler_routing_directives_are_optional_and_typed() -> None:
+    routed = JobResources(
+        nodes=1,
+        gpus_per_node=1,
+        mpi_ranks=1,
+        walltime="03:00:00",
+        account="FUPB2_MALPSAMS",
+        partition="boost_fua_prod",
+    )
+    directives = render_sbatch_directives(routed)
+    assert "#SBATCH --account=FUPB2_MALPSAMS" in directives
+    assert "#SBATCH --partition=boost_fua_prod" in directives
+
+    defaults = render_sbatch_directives(JobResources())
+    assert not any("--account=" in directive for directive in defaults)
+    assert not any("--partition=" in directive for directive in defaults)
+
+
 def test_shared_header_replaces_resources_but_preserves_site_prologue() -> None:
     header = "#!/bin/bash\n#SBATCH --partition=gpu\n#SBATCH --nodes=99\nmodule load cuda\nexport SITE_FLAG=1\n"
     rendered = render_slurm_header(
@@ -137,6 +155,24 @@ def test_failed_squeue_is_scheduler_error_not_empty_query() -> None:
 
     assert raised.value.kind == "command_failed"
     assert raised.value.returncode == 1
+
+
+def test_failed_submit_includes_scheduler_stderr() -> None:
+    runner = StubProcessRunner(
+        [
+            completed(
+                ("sbatch", "script.slurm"),
+                stderr="sbatch: error: invalid account",
+                returncode=1,
+            )
+        ]
+    )
+    scheduler = SlurmScheduler(process_runner=runner)
+
+    with pytest.raises(SchedulerError, match="stderr: sbatch: error: invalid account") as raised:
+        scheduler.submit(["sbatch", "script.slurm"])
+
+    assert raised.value.stderr == "sbatch: error: invalid account"
 
 
 def test_scheduler_query_and_job_name_lookup() -> None:

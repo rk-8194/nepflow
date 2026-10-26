@@ -2,10 +2,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
+from nepflow.config.models import NepflowConfig, SlurmConfig
 from nepflow.domain.datasets import DatasetIdentity
 from nepflow.domain.identities import (
     ArtifactIdentity,
@@ -24,6 +26,7 @@ from nepflow.hpc.jobs import (
 from nepflow.mlip.simulation import StaticPrediction
 from nepflow.stages.validation.protocols import ValidationCaseSpec, ValidationReference
 from nepflow.stages.validation.reconciliation import ValidationReconciliationOrchestrator
+from nepflow.stages.validation.stage import ValidationStage
 from nepflow.state.store import StateStore
 
 
@@ -121,6 +124,24 @@ def _store(path: Path, dataset: DatasetIdentity, model: ModelRunRecord) -> State
     store.upsert_dataset(dataset)
     store.upsert_model_run(model, status="completed")
     return store
+
+
+def test_validation_resources_use_only_validation_partition() -> None:
+    config = NepflowConfig(
+        slurm=SlurmConfig(
+            account="project-account",
+            dft_partition="dft-gpu",
+            training_partition="train-gpu",
+            validation_partition="validation-gpu",
+        )
+    )
+    stage = ValidationStage(context=SimpleNamespace(config=config))
+
+    resources = stage._resources(None)
+
+    assert resources is not None
+    assert resources.account == "project-account"
+    assert resources.partition == "validation-gpu"
 
 
 def _prediction(case: ValidationCaseSpec, model: ModelRunRecord) -> StaticPrediction:

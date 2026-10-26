@@ -347,6 +347,10 @@ _ALLOWED_KEYS: dict[str, frozenset[str]] = {
     "slurm": frozenset(
         {
             "enabled",
+            "account",
+            "dft_partition",
+            "training_partition",
+            "validation_partition",
             "max_concurrent",
             "walltime",
             "train_nep_walltime",

@@ -1,6 +1,7 @@
 import tempfile
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -8,6 +9,7 @@ pytest.importorskip("ase")
 pytest.importorskip("pymatgen")
 
 from nepflow.config import load_config, render_default_config  # noqa: E402
+from nepflow.hpc.resources import JobResources  # noqa: E402
 from nepflow.stages.dft import DftStage  # noqa: E402
 from nepflow.stages.dft.orchestrator import DftPreparationResult  # noqa: E402
 from nepflow.state import StateStore  # noqa: E402
@@ -81,3 +83,55 @@ def test_blank_hpc_command_is_an_explicit_error() -> None:
                 DftStage(orchestrator=orchestrator).run(
                     make_context(project_dir, config, state_store)
                 )
+
+
+def test_dft_recovery_preserves_scheduler_routing(monkeypatch, tmp_path: Path) -> None:
+    config = initialized_config(tmp_path)
+    config = replace(
+        config,
+        slurm=replace(
+            config.slurm,
+            account="project-account",
+            dft_partition="dft-gpu",
+            training_partition="train-gpu",
+            validation_partition="validation-gpu",
+        ),
+    )
+
+    class FakeRecoveryPolicy:
+        def __init__(self, _config) -> None:
+            pass
+
+        def decide(self, **_kwargs):
+            return SimpleNamespace(
+                retry=True,
+                retry_level=1,
+                reason="retry",
+                nodes=2,
+                gpus_per_node=2,
+            )
+
+        def apply(self, _decision, _directory) -> None:
+            pass
+
+    monkeypatch.setitem(
+        DftStage._build_recovery_policy.__globals__,
+        "VaspRecoveryPolicy",
+        FakeRecoveryPolicy,
+    )
+    policy = DftStage._build_recovery_policy(config)
+    record = SimpleNamespace(
+        resources=JobResources(nodes=1, gpus_per_node=1, mpi_ranks=1),
+        retry_level=0,
+        inputs=SimpleNamespace(
+            calculation=SimpleNamespace(ncore=None, kpar=None),
+            working_directory=tmp_path,
+        ),
+    )
+
+    decision = policy(record, SimpleNamespace(recoverable=True, reason="oom"))
+
+    assert decision.resources.account == "project-account"
+    assert decision.resources.partition == "dft-gpu"
+    assert decision.resources.nodes == 2
+    assert decision.resources.gpus_per_node == 2

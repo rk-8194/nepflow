@@ -426,6 +426,15 @@ model_run_id=
 [slurm]
 enabled=false
 
+# Optional scheduler account shared by DFT, training and validation jobs.
+# Leave blank to use the site's scheduler default.
+account=
+
+# Optional per-workload partitions. Leave blank to use the site's default.
+dft_partition=
+training_partition=
+validation_partition=
+
 # Maximum concurrent VASP jobs for this project (squeue-filtered by project name)
 max_concurrent=20
 

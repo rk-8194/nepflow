@@ -1,3 +1,4 @@
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -9,6 +10,7 @@ from nepflow.config import (
     load_legacy_config,
     render_default_config,
 )
+from nepflow.config.validation import validate_config
 from nepflow.errors import ConfigurationError
 
 BASE_CONFIG = """
@@ -52,6 +54,47 @@ def test_loader_builds_immutable_typed_root_and_applies_defaults(tmp_path: Path)
     assert config.selection.algorithm == "information_entropy"
     with pytest.raises(AttributeError):
         config.project = config.project
+
+
+def test_slurm_routing_values_parse_and_blank_values_are_none(tmp_path: Path) -> None:
+    source = BASE_CONFIG + """
+
+[slurm]
+account = project-account
+dft_partition = dft-gpu
+training_partition =
+validation_partition = validation-gpu
+"""
+    config = load_config(write_config(tmp_path, source))
+
+    assert config.slurm.account == "project-account"
+    assert config.slurm.dft_partition == "dft-gpu"
+    assert config.slurm.training_partition is None
+    assert config.slurm.validation_partition == "validation-gpu"
+
+
+def test_default_config_declares_typed_slurm_routing_and_rejects_injection(
+    tmp_path: Path,
+) -> None:
+    rendered = render_default_config(
+        "demo",
+        {
+            "elements": "W",
+            "gas_elements": "",
+            "crystal_structures": "bcc",
+            "target_n_atoms": "128",
+            "scp_address": "",
+        },
+    )
+    assert "account=\n" in rendered
+    assert "dft_partition=\n" in rendered
+    assert "training_partition=\n" in rendered
+    assert "validation_partition=\n" in rendered
+
+    config = load_config(write_config(tmp_path, BASE_CONFIG))
+    invalid = replace(config.slurm, account="acct\n#SBATCH --partition=unsafe")
+    with pytest.raises(ConfigurationError, match="control characters"):
+        validate_config(replace(config, slurm=invalid))
 
 
 def test_canonical_point_defect_defaults_round_trip_without_chemistry_inference(

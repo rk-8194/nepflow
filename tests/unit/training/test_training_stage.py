@@ -134,3 +134,20 @@ def test_training_stage_delegates_preparation_to_backend_and_campaign(tmp_path: 
     run_directory = backend.requests[0].working_directory
     assert (run_directory / "train.xyz").read_text(encoding="utf-8") == "train\n"
     assert (run_directory / "test.xyz").read_text(encoding="utf-8") == "test\n"
+
+
+def test_training_resources_use_only_training_partition() -> None:
+    config = replace(
+        NepflowConfig(),
+        slurm=SlurmConfig(
+            account="project-account",
+            dft_partition="dft-gpu",
+            training_partition="train-gpu",
+            validation_partition="validation-gpu",
+        ),
+    )
+
+    resources = TrainingStage._resources(config)
+
+    assert resources.account == "project-account"
+    assert resources.partition == "train-gpu"

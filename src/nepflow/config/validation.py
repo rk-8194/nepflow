@@ -561,6 +561,15 @@ def validate_config(
     _validate_time("slurm.train_nep_walltime", config.slurm.train_nep_walltime)
     _validate_time("slurm.gpumd_walltime", config.slurm.gpumd_walltime)
     _validate_time("slurm.memory_walltime", config.slurm.memory_walltime)
+    for field_name in (
+        "account",
+        "dft_partition",
+        "training_partition",
+        "validation_partition",
+    ):
+        _validate_scheduler_routing_value(
+            f"slurm.{field_name}", getattr(config.slurm, field_name)
+        )
 
     return config
 
@@ -937,3 +946,16 @@ def _require_range(
 def _validate_time(name: str, value: str | None) -> None:
     if value is not None and not TIME_PATTERN.fullmatch(value):
         raise ConfigurationError(f"{name} must use HH:MM:SS format")
+
+
+def _validate_scheduler_routing_value(name: str, value: str | None) -> None:
+    """Reject scheduler routing values that can inject directives or arguments."""
+
+    if value is None:
+        return
+    if not isinstance(value, str):
+        raise ConfigurationError(f"{name} must be a string or None")
+    if not value.strip():
+        raise ConfigurationError(f"{name} must be None or non-blank")
+    if any(ord(character) < 32 or ord(character) == 127 for character in value):
+        raise ConfigurationError(f"{name} must not contain control characters")

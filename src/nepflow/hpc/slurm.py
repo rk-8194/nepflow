@@ -272,8 +272,15 @@ class SlurmScheduler:
                 kind=f"process_{exc.kind}",
             ) from exc
         if result.returncode != 0:
+            stderr = (result.stderr or "").strip()
+            message = (
+                f"Scheduler command failed with exit code {result.returncode}: "
+                f"{' '.join(command_values)}"
+            )
+            if stderr:
+                message += f" stderr: {stderr}"
             raise SchedulerError(
-                f"Scheduler command failed with exit code {result.returncode}: {' '.join(command_values)}",
+                message,
                 command=result.command,
                 cwd=result.cwd,
                 returncode=result.returncode,

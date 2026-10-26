@@ -544,6 +544,10 @@ class SlurmConfig:
     """Shared scheduler settings for all stage launchers."""
 
     enabled: bool = False
+    account: str | None = None
+    dft_partition: str | None = None
+    training_partition: str | None = None
+    validation_partition: str | None = None
     max_concurrent: int = 20
     walltime: str = "03:00:00"
     train_nep_walltime: str | None = None

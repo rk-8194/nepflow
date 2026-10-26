@@ -764,6 +764,10 @@ Good:
 scientific_hash = hash_incar(strip_runtime_parameters(incar))
 ```
 
+Scheduler routing such as SLURM account and workload partition is operational
+metadata. It belongs in typed runtime resources and submission directives, but
+must not enter scientific calculation, dataset, model, or validation identities.
+
 Bad:
 
 ```python

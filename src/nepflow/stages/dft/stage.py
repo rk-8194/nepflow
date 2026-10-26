@@ -150,6 +150,8 @@ class DftStage:
             gpus_per_node=1,
             mpi_ranks=1,
             walltime=config.dft_recovery.vasp_walltime,
+            account=config.slurm.account,
+            partition=config.slurm.dft_partition,
         )
         records = tuple(
             self._execution_record(item, state_store, resources)
@@ -196,6 +198,8 @@ class DftStage:
                 gpus_per_node=gpus_per_node,
                 mpi_ranks=gpus_per_node,
                 walltime=config.dft_recovery.vasp_walltime,
+                account=config.slurm.account,
+                partition=config.slurm.dft_partition,
             )
             return DftRecoveryDecision(
                 retry=True,

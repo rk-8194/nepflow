@@ -87,7 +87,14 @@ class TrainingStage:
     @staticmethod
     def _resources(config: Any) -> JobResources:
         walltime = config.slurm.train_nep_walltime or config.slurm.walltime
-        return JobResources(nodes=1, gpus_per_node=1, mpi_ranks=1, walltime=walltime)
+        return JobResources(
+            nodes=1,
+            gpus_per_node=1,
+            mpi_ranks=1,
+            walltime=walltime,
+            account=config.slurm.account,
+            partition=config.slurm.training_partition,
+        )
 
     @staticmethod
     def _materialize_dataset_inputs(dataset_path: Path, run_directory: Path) -> None:

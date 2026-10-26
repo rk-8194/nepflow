@@ -950,6 +950,10 @@ def parse_slurm(
     )
     slurm = SlurmConfig(
         enabled=_parse_bool(values.get("enabled", "false"), "slurm.enabled"),
+        account=_optional_string(values.get("account")),
+        dft_partition=_optional_string(values.get("dft_partition")),
+        training_partition=_optional_string(values.get("training_partition")),
+        validation_partition=_optional_string(values.get("validation_partition")),
         max_concurrent=_parse_int(values.get("max_concurrent", "20"), "slurm.max_concurrent"),
         walltime=values.get("walltime", "03:00:00").strip(),
         train_nep_walltime=_optional_string(values.get("train_nep_walltime")),
