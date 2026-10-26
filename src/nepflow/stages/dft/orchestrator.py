@@ -51,6 +51,7 @@ _STALE_OUTPUTS = (
     "vasprun.xml",
     "OSZICAR",
     "vasp_output.log",
+    ".vasp_exit_code",
     ".vasp_oom_detected",
     "CHG",
     "CHGCAR",

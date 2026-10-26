@@ -130,7 +130,7 @@ class DftStage:
             runner_path.parent.mkdir(parents=True, exist_ok=True)
             atomic_write_text(
                 runner_path,
-                "#!/usr/bin/env bash\nset -e\n" + backend.render_runner_script(),
+                "#!/usr/bin/env bash\n" + backend.render_runner_script(),
                 encoding="utf-8",
             )
             execution_orchestrator = DftReconciliationOrchestrator(
@@ -192,11 +192,12 @@ class DftStage:
                     reason=decision.reason,
                 )
             vasp_policy.apply(decision, record.inputs.working_directory)
+            nodes = decision.nodes or 1
             gpus_per_node = decision.gpus_per_node or starting_gpus_per_node
             resources = JobResources(
-                nodes=decision.nodes or 1,
+                nodes=nodes,
                 gpus_per_node=gpus_per_node,
-                mpi_ranks=gpus_per_node,
+                mpi_ranks=nodes * gpus_per_node,
                 walltime=config.dft_recovery.vasp_walltime,
                 account=config.slurm.account,
                 partition=config.slurm.dft_partition,

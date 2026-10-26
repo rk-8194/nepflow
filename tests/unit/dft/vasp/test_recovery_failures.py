@@ -2,7 +2,7 @@ import pytest
 
 import nepflow.dft.vasp.recovery as recovery_module
 from nepflow.config.models import NepflowConfig
-from nepflow.dft.backend import DftCompletionEvidence, DftFailureEvidence
+from nepflow.dft.backend import DftCompletionEvidence, DftFailureEvidence, DftInputArtifacts
 from nepflow.dft.vasp.backend import VaspBackend
 from nepflow.dft.vasp.failures import (
     VaspFailureEvidence,
@@ -23,7 +23,9 @@ def test_failure_classification_distinguishes_oom_from_incomplete(tmp_path) -> N
     oom = tmp_path / "oom"
     oom.mkdir()
     (oom / ".vasp_oom_detected").write_text("1")
+    (oom / ".vasp_exit_code").write_text("137")
     evidence = VaspFailureEvidence.from_job_directory(oom)
+    assert (oom / ".vasp_exit_code").read_text() == "137"
     assert classify_failure(evidence).kind == "out_of_memory"
 
     incomplete = tmp_path / "incomplete"
@@ -73,6 +75,75 @@ def test_backend_classifies_process_evidence_without_fabricating_paths() -> None
     )
     assert oom.kind == "out_of_memory"
     assert oom.recoverable
+
+
+def test_backend_reads_runner_exit_evidence_for_scheduler_reconciliation(tmp_path) -> None:
+    calculation = DftCalculationIdentity("structure", "incar", "potcar")
+    working = tmp_path / "failed"
+    working.mkdir()
+    (working / ".vasp_exit_code").write_text("9")
+    backend = VaspBackend()
+    completion = backend.parse_completion(
+        DftInputArtifacts(calculation=calculation, working_directory=working, files=())
+    )
+
+    assert completion.returncode == 9
+    failure = backend.classify_failure(
+        DftFailureEvidence(calculation=calculation, completion=completion)
+    )
+    assert failure.kind == "vasp_execution_failed"
+    assert not failure.recoverable
+
+
+@pytest.mark.parametrize(
+    ("name", "log", "exit_code", "scheduler_state", "expected_kind", "recoverable"),
+    (
+        (
+            "missing-executable",
+            "prterun was unable to find the specified executable file: vasp_std\n",
+            None,
+            "failed",
+            "vasp_execution_failed",
+            False,
+        ),
+        ("runner-exit", "", 127, None, "vasp_execution_failed", False),
+        ("slurm-oom", "", None, "oom", "out_of_memory", True),
+        ("runner-oom", "", 137, None, "out_of_memory", True),
+        ("timeout", "", None, "timeout", "timeout", False),
+        ("cancelled", "", None, "cancelled", "cancelled", False),
+        ("scheduler-failed", "", None, "failed", "scheduler_execution_failed", False),
+        ("empty", "", None, None, "incomplete_output", True),
+    ),
+)
+def test_backend_classifies_scheduler_and_runner_evidence(
+    tmp_path,
+    name: str,
+    log: str,
+    exit_code: int | None,
+    scheduler_state: str | None,
+    expected_kind: str,
+    recoverable: bool,
+) -> None:
+    working = tmp_path / name
+    working.mkdir()
+    if log:
+        (working / "vasp_output.log").write_text(log)
+    if exit_code is not None:
+        (working / ".vasp_exit_code").write_text(str(exit_code))
+    calculation = DftCalculationIdentity("structure", "incar", "potcar")
+
+    failure = VaspBackend().classify_failure(
+        DftFailureEvidence(
+            calculation=calculation,
+            completion=DftCompletionEvidence(completed=False),
+            working_directory=working,
+            scheduler_state=scheduler_state,
+            scheduler_reason="test scheduler reason" if scheduler_state else None,
+        )
+    )
+
+    assert failure.kind == expected_kind
+    assert failure.recoverable is recoverable
 
 
 def test_recovery_application_fails_explicitly_and_preserves_scientific_hash(tmp_path) -> None:

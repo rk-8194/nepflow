@@ -124,7 +124,7 @@ def test_dft_recovery_preserves_scheduler_routing(monkeypatch, tmp_path: Path) -
         resources=JobResources(nodes=1, gpus_per_node=1, mpi_ranks=1),
         retry_level=0,
         inputs=SimpleNamespace(
-            calculation=SimpleNamespace(ncore=None, kpar=None),
+            calculation=SimpleNamespace(ncore=None, kpar=None, calculation_id="scientific-id"),
             working_directory=tmp_path,
         ),
     )
@@ -135,3 +135,5 @@ def test_dft_recovery_preserves_scheduler_routing(monkeypatch, tmp_path: Path) -
     assert decision.resources.partition == "dft-gpu"
     assert decision.resources.nodes == 2
     assert decision.resources.gpus_per_node == 2
+    assert decision.resources.mpi_ranks == 4
+    assert record.inputs.calculation.calculation_id == "scientific-id"

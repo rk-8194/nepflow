@@ -15,6 +15,7 @@ from .outputs import outcar_is_complete
 
 OOM_MARKER = ".vasp_oom_detected"
 LEGACY_OOM_MARKER = ".vasp_oom_marker"
+EXIT_CODE_MARKER = ".vasp_exit_code"
 
 
 @dataclass(frozen=True, slots=True)
@@ -35,6 +36,13 @@ class VaspFailureEvidence:
             output_log = log_path.read_text(encoding="utf-8", errors="replace")
         except OSError:
             output_log = ""
+        try:
+            returncode = int(
+                (job_directory / EXIT_CODE_MARKER).read_text(encoding="utf-8").strip()
+            )
+        except (OSError, ValueError):
+            returncode = None
+        output_lower = output_log.lower()
         return cls(
             job_directory=job_directory,
             completed=outcar_is_complete(job_directory / "OUTCAR"),
@@ -42,8 +50,10 @@ class VaspFailureEvidence:
                 (job_directory / OOM_MARKER).exists()
                 or (job_directory / LEGACY_OOM_MARKER).exists()
             )
-            or "oom_kill" in output_log,
+            or "oom_kill" in output_lower
+            or "out of memory" in output_lower,
             output_log=output_log,
+            returncode=returncode,
         )
 
 
@@ -51,7 +61,7 @@ def classify_failure(evidence: VaspFailureEvidence) -> DftFailure:
     """Classify only VASP-visible evidence, preserving launcher semantics."""
     if evidence.completed:
         return DftFailure(kind="completed", recoverable=False, reason="completed")
-    if evidence.oom_marker:
+    if evidence.oom_marker or evidence.returncode == 137:
         return DftFailure(
             kind="out_of_memory",
             recoverable=True,
@@ -89,6 +99,7 @@ def has_oom_marker(job_directory: Path) -> bool:
 __all__ = [
     "OOM_MARKER",
     "LEGACY_OOM_MARKER",
+    "EXIT_CODE_MARKER",
     "VaspFailureEvidence",
     "classify_failure",
     "has_oom_marker",

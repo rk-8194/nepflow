@@ -170,6 +170,10 @@ class DftFailureEvidence:
     completion: DftCompletionEvidence
     process: ProcessResult | None = None
     markers: tuple[str, ...] = ()
+    working_directory: Path | None = None
+    scheduler_state: str | None = None
+    scheduler_reason: str | None = None
+    scheduler_exit_code: int | None = None
 
 
 @dataclass(frozen=True, slots=True)

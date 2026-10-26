@@ -257,8 +257,6 @@ class VaspBackend:
     def render_runner_script(self) -> str:
         """Render the backend runner body without scheduler directives."""
         bash_command = " ".join(self._command).replace("{ntasks}", "$TOTAL_RANKS")
-        if "mpirun" in bash_command and "--bind-to" not in bash_command:
-            bash_command = bash_command.replace("mpirun", "mpirun --bind-to none", 1)
         body = r"""
 STRUCT_DIR="${1:-.}"
 if [ -z "$STRUCT_DIR" ]; then
@@ -282,19 +280,24 @@ NNODES=${SLURM_NNODES:-1}
 TOTAL_RANKS=${SLURM_NTASKS:-${SLURM_NNODES:-1}}
 
 VASP_LOG="${STRUCT_DIR}/vasp_output.log"
-__VASP_CMD__ > "$VASP_LOG" 2>&1
+rm -f "$STRUCT_DIR/.vasp_oom_detected"
+printf '%s\n' "Resolved VASP command: __VASP_CMD__" > "$VASP_LOG"
+printf '%s\n' "Resolved MPI ranks: $TOTAL_RANKS" >> "$VASP_LOG"
+__VASP_CMD__ >> "$VASP_LOG" 2>&1
 VASP_EXIT=$?
+VASP_EXIT_MARKER="$STRUCT_DIR/.vasp_exit_code"
+VASP_EXIT_MARKER_TMP="${VASP_EXIT_MARKER}.$$"
+# Keep a numeric zero marker on success so every attempt has durable exit evidence.
+printf '%s\n' "$VASP_EXIT" > "$VASP_EXIT_MARKER_TMP" && mv -f "$VASP_EXIT_MARKER_TMP" "$VASP_EXIT_MARKER"
 
-if grep -q "oom_kill" "$VASP_LOG" 2>/dev/null || [ $VASP_EXIT -eq 137 ]; then
+if grep -Eiq "oom_kill|out[[:space:]_-]*of[[:space:]_-]*memory|killed" "$VASP_LOG" 2>/dev/null || [ "$VASP_EXIT" -eq 137 ]; then
     echo "1" > "$STRUCT_DIR/.vasp_oom_detected"
-    exit 1
 fi
 
-if [ $VASP_EXIT -eq 0 ]; then
+if [ "$VASP_EXIT" -eq 0 ]; then
     rm -f CHG CHGCAR WAVECAR CONTCAR DOSCAR EIGENVAL PCDAT
-    exit 0
 fi
-exit 1
+exit "$VASP_EXIT"
 """
         return body.replace("__VASP_CMD__", bash_command)
 
@@ -306,10 +309,22 @@ exit 1
         """Read backend completion markers independently of scheduler state."""
         completed = outcar_is_complete(inputs.working_directory / "OUTCAR")
         markers = VASP_COMPLETION_MARKERS if completed else ()
+        if (inputs.working_directory / ".vasp_oom_detected").is_file():
+            markers = (*markers, "oom_kill")
+        returncode = None if process is None else process.returncode
+        if process is None:
+            try:
+                returncode = int(
+                    (inputs.working_directory / ".vasp_exit_code")
+                    .read_text(encoding="utf-8")
+                    .strip()
+                )
+            except (OSError, ValueError):
+                returncode = None
         return DftCompletionEvidence(
             completed=completed,
             markers=tuple(markers),
-            returncode=None if process is None else process.returncode,
+            returncode=returncode,
         )
 
     def parse_result(self, inputs: DftInputArtifacts) -> DftResult:
@@ -363,7 +378,16 @@ exit 1
         )
 
     def classify_failure(self, evidence: DftFailureEvidence) -> DftFailure:
-        """Classify process and VASP evidence for retry or terminal policy."""
+        """Classify combined scheduler, runner, and VASP evidence."""
+        filesystem = (
+            VaspFailureEvidence.from_job_directory(evidence.working_directory)
+            if evidence.working_directory is not None
+            else VaspFailureEvidence(
+                job_directory=None,
+                completed=False,
+                oom_marker=False,
+            )
+        )
         process_output = "\n".join(
             value
             for value in (
@@ -377,20 +401,106 @@ exit 1
             if evidence.process is None
             else evidence.process.returncode
         )
-        output_lower = process_output.lower()
-        output_parts = tuple(evidence.markers) + ((process_output,) if process_output else ())
-        return classify_failure(
-            VaspFailureEvidence(
-                job_directory=None,
-                completed=evidence.completion.completed,
-                oom_marker=(
-                    any("oom" in marker.lower() for marker in evidence.markers)
-                    or "oom" in output_lower
-                    or returncode == 137
-                ),
-                output_log="\n".join(output_parts),
-                returncode=returncode,
+        runner_exit_code = (
+            evidence.process.returncode
+            if evidence.process is not None
+            else filesystem.returncode
+        )
+        if runner_exit_code is None:
+            runner_exit_code = returncode
+        output_parts = tuple(
+            value
+            for value in (
+                filesystem.output_log,
+                process_output,
+                "\n".join(evidence.markers),
             )
+            if value
+        )
+        output_log = "\n".join(output_parts)
+        output_lower = output_log.lower()
+        runtime_output = "\n".join(
+            line
+            for line in output_log.splitlines()
+            if not line.startswith("Resolved VASP command:")
+            and not line.startswith("Resolved MPI ranks:")
+        ).strip()
+        scheduler_state = (evidence.scheduler_state or "").strip().lower()
+        scheduler_reason = (evidence.scheduler_reason or "").strip()
+        scheduler_reason_lower = scheduler_reason.lower()
+        scheduler_oom = scheduler_state in {"oom", "out_of_memory"} or (
+            "oom" in scheduler_reason_lower
+            or "out of memory" in scheduler_reason_lower
+            or "out_of_memory" in scheduler_reason_lower
+        )
+        scheduler_timeout = scheduler_state in {"timeout", "timed_out"} or (
+            "timeout" in scheduler_reason_lower or "time limit" in scheduler_reason_lower
+        )
+        scheduler_cancelled = scheduler_state in {"cancelled", "canceled"}
+
+        if evidence.completion.completed or filesystem.completed:
+            return DftFailure(kind="completed", recoverable=False, reason="completed")
+        if scheduler_timeout:
+            return DftFailure(
+                kind="timeout",
+                recoverable=False,
+                reason=scheduler_reason or "SLURM reported a timeout",
+            )
+        if scheduler_cancelled:
+            return DftFailure(
+                kind="cancelled",
+                recoverable=False,
+                reason=scheduler_reason or "SLURM cancelled the VASP job",
+            )
+        if (
+            scheduler_oom
+            or filesystem.oom_marker
+            or "oom_kill" in output_lower
+            or "out of memory" in output_lower
+            or runner_exit_code == 137
+            or any("oom" in marker.lower() for marker in evidence.markers)
+        ):
+            return classify_failure(
+                VaspFailureEvidence(
+                    job_directory=filesystem.job_directory,
+                    completed=False,
+                    oom_marker=True,
+                    output_log=output_log,
+                    returncode=runner_exit_code,
+                )
+            )
+        if runner_exit_code not in (None, 0):
+            return DftFailure(
+                kind="vasp_execution_failed",
+                recoverable=False,
+                reason=f"VASP runner exited with return code {runner_exit_code}",
+            )
+        if runtime_output:
+            return classify_failure(
+                VaspFailureEvidence(
+                    job_directory=filesystem.job_directory,
+                    completed=False,
+                    oom_marker=False,
+                    output_log=runtime_output,
+                    returncode=runner_exit_code,
+                )
+            )
+        if (
+            scheduler_state in {"failed", "node_fail", "boot_fail"}
+            or evidence.scheduler_exit_code not in (None, 0)
+        ):
+            return DftFailure(
+                kind="scheduler_execution_failed",
+                recoverable=False,
+                reason=(
+                    scheduler_reason
+                    or f"SLURM reported a failed VASP job (exit code {evidence.scheduler_exit_code})"
+                ),
+            )
+        return DftFailure(
+            kind="incomplete_output",
+            recoverable=True,
+            reason="VASP left no completion or failure evidence",
         )
 
     def validate_calculation_identity(

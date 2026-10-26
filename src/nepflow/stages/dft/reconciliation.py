@@ -78,6 +78,7 @@ class DftExecutionRecord:
     retry_level: int = 0
     resources: JobResources | None = None
     metadata: Mapping[str, Any] = field(default_factory=dict)
+    failure_evidence: Mapping[str, Any] | None = None
 
     def with_status(
         self,
@@ -86,6 +87,7 @@ class DftExecutionRecord:
         job_id: str | None = None,
         retry_level: int | None = None,
         resources: JobResources | None = None,
+        failure_evidence: Mapping[str, Any] | None = None,
     ) -> "DftExecutionRecord":
         """Return an immutable status update without changing input state."""
         return replace(
@@ -94,6 +96,9 @@ class DftExecutionRecord:
             job_id=job_id,
             retry_level=self.retry_level if retry_level is None else retry_level,
             resources=self.resources if resources is None else resources,
+            failure_evidence=(
+                self.failure_evidence if failure_evidence is None else failure_evidence
+            ),
         )
 
 
@@ -220,7 +225,8 @@ class DftReconciliationOrchestrator:
         if not record.job_id:
             raise ValueError(f"Submitted DFT attempt {record.attempt_id} has no scheduler job ID")
         scheduler_result = self.scheduler.reconcile(record.job_id)
-        job_state = scheduler_result.job.state
+        job = scheduler_result.job
+        job_state = job.state
         if job_state == SchedulerJobState.UNKNOWN:
             raise StateError(f"Scheduler returned an unknown state for DFT job {record.job_id}")
         if job_state == SchedulerJobState.PENDING:
@@ -250,6 +256,10 @@ class DftReconciliationOrchestrator:
                 calculation=record.inputs.calculation,
                 completion=completion,
                 markers=markers,
+                working_directory=record.inputs.working_directory,
+                scheduler_state=job.state.value,
+                scheduler_reason=job.reason,
+                scheduler_exit_code=job.exit_code,
             )
         )
         if self.performance_recorder is not None:
@@ -258,7 +268,17 @@ class DftReconciliationOrchestrator:
         if decision.retry:
             # Retain the failed attempt before creating a new identity so a
             # restart cannot submit the same failed attempt twice.
-            failed = record.with_status("failed")
+            failed = record.with_status(
+                "failed",
+                failure_evidence={
+                    "kind": failure.kind,
+                    "reason": failure.reason,
+                    "scheduler_state": job.state.value,
+                    "scheduler_reason": job.reason,
+                    "scheduler_exit_code": job.exit_code,
+                    "runner_exit_code": completion.returncode,
+                },
+            )
             self._save(failed, reason=failure.reason)
             retry = DftExecutionRecord(
                 inputs=record.inputs,
@@ -272,7 +292,17 @@ class DftReconciliationOrchestrator:
             )
             return self._save(retry, reason=decision.reason)
         return self._save(
-            record.with_status("failed"),
+            record.with_status(
+                "failed",
+                failure_evidence={
+                    "kind": failure.kind,
+                    "reason": failure.reason,
+                    "scheduler_state": job.state.value,
+                    "scheduler_reason": job.reason,
+                    "scheduler_exit_code": job.exit_code,
+                    "runner_exit_code": completion.returncode,
+                },
+            ),
             reason=failure.reason,
         )
 
@@ -283,6 +313,8 @@ class DftReconciliationOrchestrator:
             self.script_path,
             job_name=record.job_name or record.inputs.calculation.calculation_id,
             resources=record.resources,
+            stdout_path=record.inputs.working_directory / "vasp_%j.out",
+            stderr_path=record.inputs.working_directory / "vasp_%j.err",
             cwd=record.inputs.working_directory,
         )
         return self._save(

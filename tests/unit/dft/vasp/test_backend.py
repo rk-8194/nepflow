@@ -1,3 +1,7 @@
+import os
+import shutil
+import subprocess
+
 import pytest
 from ase import Atoms
 from ase.io import write as ase_write
@@ -74,6 +78,43 @@ def test_vasp_runner_renderer_owns_only_backend_body() -> None:
 
     script = backend.render_runner_script()
 
+    assert "set -e" not in script
     assert "$TOTAL_RANKS" in script
-    assert "mpirun --bind-to none" in script
+    assert "mpirun --bind-to none" not in script
+    assert "VASP_EXIT=$?" in script
+    assert ".vasp_exit_code" in script
+    assert ".vasp_oom_detected" in script
+    assert "Resolved VASP command:" in script
+    assert "Resolved MPI ranks:" in script
     assert "#SBATCH" not in script
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash is required for runner test")
+@pytest.mark.parametrize(("exit_code", "oom_expected"), ((0, False), (7, False), (137, True)))
+def test_vasp_runner_persists_exit_and_oom_evidence(
+    tmp_path, exit_code: int, oom_expected: bool
+) -> None:
+    command = tmp_path / "fake_vasp.sh"
+    command.write_text(
+        "#!/usr/bin/env bash\n"
+        + ("echo 'oom_kill'\n" if oom_expected else "")
+        + f"exit {exit_code}\n",
+        encoding="utf-8",
+    )
+    command.chmod(0o755)
+    working = tmp_path / "job"
+    working.mkdir()
+    (working / "INCAR").write_text("ENCUT = 520\n", encoding="utf-8")
+    runner = VaspBackend(command=("bash", str(command))).render_runner_script()
+
+    completed = subprocess.run(
+        ["bash", "-c", runner, "run_vasp.sh", str(working)],
+        check=False,
+        env={**os.environ, "SLURM_NTASKS": "4"},
+    )
+
+    assert completed.returncode == exit_code
+    assert (working / ".vasp_exit_code").read_text(encoding="utf-8").strip() == str(exit_code)
+    assert (working / ".vasp_oom_detected").exists() is oom_expected
+    log = (working / "vasp_output.log").read_text(encoding="utf-8")
+    assert "Resolved MPI ranks: 4" in log

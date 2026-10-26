@@ -65,6 +65,7 @@ class FakeScheduler:
         self.query_error = query_error
         self.active: tuple[SlurmJobRecord, ...] = ()
         self.submissions: list[Path] = []
+        self.submission_kwargs: list[dict[str, Any]] = []
 
     def list_active_jobs(self, **_kwargs: Any) -> QueueQueryResult:
         if self.query_error is not None:
@@ -74,8 +75,9 @@ class FakeScheduler:
     def reconcile(self, job_id: str, **_kwargs: Any) -> ReconciledJobResult:
         return self.jobs[job_id]
 
-    def submit_script(self, script_path: str | Path, **_kwargs: Any) -> SubmissionResult:
+    def submit_script(self, script_path: str | Path, **kwargs: Any) -> SubmissionResult:
         self.submissions.append(Path(script_path))
+        self.submission_kwargs.append(kwargs)
         return SubmissionResult(
             job_id=f"job-{len(self.submissions)}",
             stdout="",
@@ -100,6 +102,7 @@ class FakeBackend:
         self.completion_calls = 0
         self.result_calls = 0
         self.failure_calls = 0
+        self.failure_evidence: list[DftFailureEvidence] = []
 
     def parse_completion(self, inputs: DftInputArtifacts, process=None) -> DftCompletionEvidence:
         del inputs, process
@@ -123,7 +126,7 @@ class FakeBackend:
         )
 
     def classify_failure(self, evidence: DftFailureEvidence) -> DftFailure:
-        del evidence
+        self.failure_evidence.append(evidence)
         self.failure_calls += 1
         return self.failure
 
@@ -271,6 +274,65 @@ def test_recoverable_failure_uses_typed_recovery_decision(
     assert result.records[0].status == "pending"
     assert decisions == [("out_of_memory", 0)]
     assert store.saved[1][2] == "typed-recovery"
+    assert store.saved[0][0].failure_evidence == {
+        "kind": "out_of_memory",
+        "reason": "OOM",
+        "scheduler_state": "oom",
+        "scheduler_reason": None,
+        "scheduler_exit_code": None,
+        "runner_exit_code": None,
+    }
+
+
+def test_terminal_scheduler_evidence_is_forwarded_to_backend(
+    inputs: DftInputArtifacts,
+) -> None:
+    store = FakeStateStore()
+    scheduler = FakeScheduler(
+        {
+            "job-1": ReconciledJobResult(
+                job_id="job-1",
+                job=SlurmJobRecord(
+                    job_id="job-1",
+                    name="dft",
+                    state=SchedulerJobState.FAILED,
+                    reason="missing executable",
+                    exit_code=127,
+                ),
+                source="fake",
+            )
+        }
+    )
+    backend = FakeBackend(failure=DftFailure("vasp_execution_failed", False, "missing executable"))
+    record = DftExecutionRecord(
+        inputs=inputs,
+        attempt_id="attempt-1",
+        status="submitted",
+        job_id="job-1",
+    )
+    reconciler = DftReconciliationOrchestrator(
+        scheduler=scheduler,
+        backend=backend,
+        state_store=store,
+        script_path=Path("run_vasp.sh"),
+    )
+
+    result = reconciler.reconcile_once((record,))
+
+    assert result.records[0].status == "failed"
+    evidence = backend.failure_evidence[0]
+    assert evidence.working_directory == inputs.working_directory
+    assert evidence.scheduler_state == "failed"
+    assert evidence.scheduler_reason == "missing executable"
+    assert evidence.scheduler_exit_code == 127
+    assert store.saved[0][0].failure_evidence == {
+        "kind": "vasp_execution_failed",
+        "reason": "missing executable",
+        "scheduler_state": "failed",
+        "scheduler_reason": "missing executable",
+        "scheduler_exit_code": 127,
+        "runner_exit_code": None,
+    }
 
 
 def test_pending_submits_when_capacity_is_available(inputs: DftInputArtifacts) -> None:
@@ -291,6 +353,15 @@ def test_pending_submits_when_capacity_is_available(inputs: DftInputArtifacts) -
     assert result.records[0].status == "submitted"
     assert result.records[0].job_id == "job-1"
     assert scheduler.submissions == [Path("run_vasp.sh")]
+    assert scheduler.submission_kwargs == [
+        {
+            "job_name": "structure-1",
+            "resources": None,
+            "stdout_path": inputs.working_directory / "vasp_%j.out",
+            "stderr_path": inputs.working_directory / "vasp_%j.err",
+            "cwd": inputs.working_directory,
+        }
+    ]
 
 
 def test_pending_waits_when_capacity_is_full(inputs: DftInputArtifacts) -> None:

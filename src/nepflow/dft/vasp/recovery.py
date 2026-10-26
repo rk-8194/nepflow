@@ -205,6 +205,7 @@ class VaspRecoveryPolicy:
             "vasprun.xml",
             "OSZICAR",
             "vasp_output.log",
+            ".vasp_exit_code",
             ".vasp_oom_detected",
         ):
             (Path(working_directory) / filename).unlink(missing_ok=True)

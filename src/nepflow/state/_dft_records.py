@@ -347,7 +347,13 @@ class DftRecordsMixin(StateStoreMixinSupport):
         calculation_id: str,
     ) -> None:
         resources = None if record.resources is None else asdict(record.resources)
-        failure_evidence = {"reason": reason} if reason is not None else None
+        failure_evidence = getattr(record, "failure_evidence", None)
+        if failure_evidence is not None:
+            failure_evidence = dict(failure_evidence)
+        if reason is not None:
+            if failure_evidence is None:
+                failure_evidence = {}
+            failure_evidence["reason"] = reason
         if existing_attempt is None:
             attempts = self.list_dft_attempts(calculation_id)
             attempt_number = max((int(item["attempt_number"]) for item in attempts), default=0) + 1
