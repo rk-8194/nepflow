@@ -1,7 +1,10 @@
 import pytest
 from ase import Atoms
+from ase.io import write as ase_write
 
 from nepflow.config.models import VaspConfig
+from nepflow.dft.backend import DftInputRequest
+from nepflow.dft.vasp.backend import VaspBackend
 from nepflow.dft.vasp.inputs import (
     canonical_poscar_bytes,
     canonical_poscar_text,
@@ -9,7 +12,7 @@ from nepflow.dft.vasp.inputs import (
     inject_incar_defaults,
     read_identity,
 )
-from nepflow.domain.identities import DftCalculationIdentity
+from nepflow.domain.identities import DftCalculationIdentity, StructureIdentity
 from nepflow.errors import StateError
 from nepflow.io.json import write_json
 
@@ -57,3 +60,23 @@ def test_unknown_identity_schema_is_rejected(tmp_path) -> None:
 
     with pytest.raises(StateError, match="schema"):
         read_identity(tmp_path)
+
+
+def test_read_only_prepared_loader_rejects_changed_input(tmp_path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "INCAR").write_text("ENCUT = 520\n")
+    (source / "POTCAR").write_bytes(b"Si-potcar")
+    atoms = Atoms("Si", cell=[3, 3, 3], positions=[[0, 0, 0]], pbc=True)
+    ase_write(source / "POSCAR", atoms, format="vasp")
+    request = DftInputRequest(
+        structure=StructureIdentity.from_atoms(atoms),
+        source_structure=source,
+        working_directory=tmp_path / "job",
+    )
+    backend = VaspBackend(command=("vasp_std",))
+    prepared = backend.prepare_inputs(request)
+    (prepared.working_directory / "INCAR").write_text("ENCUT = 999\n")
+
+    with pytest.raises(StateError, match="match calculation identity"):
+        backend.load_prepared_inputs(request, expected_calculation=prepared.calculation)

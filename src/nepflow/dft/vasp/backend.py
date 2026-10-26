@@ -23,8 +23,9 @@ from nepflow.domain.identities import (
     ArtifactIdentity,
     DftCalculationIdentity,
     StructureIdentity,
+    calculate_structure_id,
 )
-from nepflow.errors import BackendError, ValidationError
+from nepflow.errors import BackendError, StateError, ValidationError
 from nepflow.io.atomic import atomic_write_bytes, atomic_write_text
 from nepflow.io.json import write_json
 
@@ -32,7 +33,9 @@ from .failures import VaspFailureEvidence, classify_failure
 from .inputs import (
     canonical_poscar_bytes,
     hash_incar_text,
+    hash_potcar_bytes,
     identity_for_structure,
+    read_identity,
 )
 from .outputs import (
     VASP_COMPLETION_MARKERS,
@@ -241,6 +244,56 @@ class VaspBackend:
             calculation=calculation,
             working_directory=working,
             files=tuple(files),
+            requirements=request.requirements,
+        )
+
+    def load_prepared_inputs(
+        self,
+        request: DftInputRequest,
+        *,
+        expected_calculation: DftCalculationIdentity | None = None,
+    ) -> DftInputArtifacts:
+        """Load and verify prepared VASP inputs without changing the directory."""
+        working = Path(request.working_directory)
+        paths = {name: working / name for name in ("POSCAR", "INCAR", "POTCAR")}
+        missing = [name for name, path in paths.items() if not path.is_file()]
+        if missing:
+            raise StateError(
+                f"Prepared VASP inputs are missing {', '.join(missing)} in {working}"
+            )
+
+        identity = read_identity(working)
+        if not identity:
+            raise StateError(f"Prepared VASP identity sidecar is missing in {working}")
+        expected = expected_calculation or self.calculation_identity(request)
+        if expected.structure_id != request.structure.structure_id:
+            raise StateError("Expected VASP calculation does not match the requested structure")
+        expected_payload = expected.to_dict()
+        for key in ("structure_id", "incar_hash", "potcar_hash", "calculation_id"):
+            if identity.get(key) != expected_payload.get(key):
+                raise StateError(
+                    f"Prepared VASP identity mismatch for {key} in {working}"
+                )
+
+        try:
+            atoms = ase_read(str(paths["POSCAR"]), index=0)
+            incar_hash = hash_incar_text(paths["INCAR"].read_text(encoding="utf-8"))
+            potcar_hash = hash_potcar_bytes(paths["POTCAR"].read_bytes())
+            prepared = DftCalculationIdentity(
+                structure_id=calculate_structure_id(atoms),
+                incar_hash=incar_hash,
+                potcar_hash=potcar_hash,
+            )
+        except Exception as exc:
+            raise StateError(f"Prepared VASP inputs are unreadable in {working}") from exc
+        if prepared.calculation_id != expected.calculation_id:
+            raise StateError(
+                f"Prepared VASP files do not match calculation identity in {working}"
+            )
+        return DftInputArtifacts(
+            calculation=expected,
+            working_directory=working,
+            files=tuple(paths.values()),
             requirements=request.requirements,
         )
 

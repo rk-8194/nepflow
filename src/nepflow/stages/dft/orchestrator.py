@@ -182,6 +182,34 @@ def _attempt_number(attempt: Mapping[str, object]) -> int:
     return int(value) if isinstance(value, (int, float, str)) else 1
 
 
+def _active_attempt_for_working_directory(
+    state_store: StateStore,
+    working_directory: Path,
+) -> dict[str, object] | None:
+    """Find an authoritative active attempt owning a prepared directory."""
+
+    target = Path(working_directory).resolve()
+    # Inspect attempt rows as well as calculation rows.  A controller may have
+    # persisted the attempt transition before the calculation summary update;
+    # the attempt is still authoritative for whether this directory is live.
+    for calculation in state_store.list_dft_calculations():
+        calculation_id = calculation.get("calculation_id")
+        if not isinstance(calculation_id, str):
+            continue
+        for attempt in state_store.list_dft_attempts(calculation_id):
+            if _is_benchmark_attempt(attempt):
+                continue
+            if attempt.get("status") not in {"submitted", "running"}:
+                continue
+            metadata = attempt.get("metadata")
+            if not isinstance(metadata, Mapping):
+                continue
+            value = metadata.get("working_directory")
+            if isinstance(value, str) and Path(value).resolve() == target:
+                return attempt
+    return None
+
+
 class VaspPreparationOrchestrator:
     """Prepare VASP inputs and record typed calculation/reuse state."""
 
@@ -246,13 +274,19 @@ class VaspPreparationOrchestrator:
                 )
                 attempts = _scientific_attempts(state_store, calculation.calculation_id)
                 latest_attempt = attempts[-1] if attempts else None
-                persisted_status = (
-                    None if latest_attempt is None else str(latest_attempt.get("status"))
+                persisted_calculation = state_store.get_dft_calculation(
+                    calculation.calculation_id
                 )
                 persisted_status = (
-                    "submitted"
-                    if persisted_status == "running"
-                    else "pending"
+                    None
+                    if latest_attempt is None
+                    else str(latest_attempt.get("status"))
+                )
+                if persisted_status is None and persisted_calculation is not None:
+                    raw_status = persisted_calculation.get("status")
+                    persisted_status = str(raw_status) if raw_status else None
+                persisted_status = (
+                    "pending"
                     if persisted_status == "prepared"
                     else persisted_status
                 )
@@ -264,9 +298,50 @@ class VaspPreparationOrchestrator:
                         else 0
                     ),
                 }
+                active_status = current_status["status"] in {"submitted", "running"}
+                protected_status = active_status or current_status["status"] in {
+                    "completed",
+                    "reused",
+                }
+                if not current_match:
+                    active_owner = _active_attempt_for_working_directory(
+                        state_store,
+                        spec.working_directory,
+                    )
+                    if active_owner is not None:
+                        raise StateError(
+                            "Cannot replace prepared VASP inputs owned by an active attempt: "
+                            f"{spec.working_directory}"
+                        )
+                if protected_status and not current_match:
+                    raise StateError(
+                        "Persisted DFT attempt has no matching prepared VASP identity sidecar: "
+                        f"{spec.working_directory}"
+                    )
+
+                artifacts: DftInputArtifacts | None = None
+                if current_match:
+                    loader = getattr(backend, "load_prepared_inputs", None)
+                    if not callable(loader):
+                        if protected_status:
+                            raise StateError(
+                                "Backend cannot validate existing prepared VASP inputs for "
+                                f"{spec.working_directory}"
+                            )
+                    else:
+                        try:
+                            artifacts = loader(
+                                request,
+                                expected_calculation=calculation,
+                            )
+                        except StateError:
+                            if protected_status:
+                                raise
+
                 current_evidence = None
                 if current_match and current_status["status"] in {
                     "submitted",
+                    "running",
                     "completed",
                     "reused",
                 }:
@@ -281,11 +356,10 @@ class VaspPreparationOrchestrator:
                         ),
                     )
 
-                if not current_match or (
-                    current_status["status"] not in {"submitted"} and current_evidence is None
-                ):
-                    clean_stale_outputs(spec.working_directory)
-                artifacts = backend.prepare_inputs(request)
+                if artifacts is None:
+                    if not current_match:
+                        clean_stale_outputs(spec.working_directory)
+                    artifacts = backend.prepare_inputs(request)
 
                 resolved = current_evidence or self._resolve_historical_output(
                     state_store,
@@ -293,6 +367,14 @@ class VaspPreparationOrchestrator:
                     canonical_path=spec.working_directory / "OUTCAR",
                     project_dir=project_dir,
                 )
+                if (
+                    current_status["status"] in {"completed", "reused"}
+                    and resolved is None
+                ):
+                    raise StateError(
+                        "Persisted completed DFT calculation has no verified output: "
+                        f"{calculation.calculation_id}"
+                    )
                 if current_match and persisted_status == "failed":
                     status = "failed"
                 elif (
@@ -301,8 +383,12 @@ class VaspPreparationOrchestrator:
                     and resolved is None
                 ):
                     status = persisted_status
-                elif current_match and current_status["status"] == "submitted" and resolved is None:
-                    status = "submitted"
+                elif (
+                    current_match
+                    and current_status["status"] in {"submitted", "running"}
+                    and resolved is None
+                ):
+                    status = current_status["status"]
                 elif resolved is not None:
                     status = (
                         "reused"
@@ -434,7 +520,11 @@ class VaspPreparationOrchestrator:
                 )
                 state_store.upsert_dft_calculation(
                     calculation,
-                    status="completed" if item.reused_output is not None else "prepared",
+                    status=(
+                        "completed"
+                        if item.reused_output is not None
+                        else item.status
+                    ),
                     selected=True,
                     reused_from_calculation_id=(
                         calculation.calculation_id if item.reused else None

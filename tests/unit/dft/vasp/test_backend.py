@@ -33,6 +33,13 @@ def test_vasp_backend_prepares_canonical_inputs_and_argument_command(tmp_path) -
     assert prepared.calculation.incar_hash
     assert (prepared.working_directory / "POSCAR").exists()
     assert backend.execution_command(prepared) == ("vasp_std", "--test")
+    loaded = backend.load_prepared_inputs(request, expected_calculation=prepared.calculation)
+    assert loaded.calculation == prepared.calculation
+    assert loaded.files == (
+        prepared.working_directory / "POSCAR",
+        prepared.working_directory / "INCAR",
+        prepared.working_directory / "POTCAR",
+    )
 
     canonical = identity_for_structure(
         atoms,

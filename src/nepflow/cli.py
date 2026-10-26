@@ -76,7 +76,9 @@ from nepflow.workflow import (  # noqa: E402
     SelfResubmitExit,
     StageContext,
     StageRegistry,
+    StageRunState,
     WorkflowController,
+    WorkflowStage,
 )
 
 logger = logging.getLogger(__name__)
@@ -362,9 +364,35 @@ def _run_controller(
             logger.warning("Already past SLURM deadline - resubmitting immediately")
             _resubmit_slurm_job(debug=args.debug)
             return
-        controller.run()
-        logger.info("Workflow completed successfully")
-        print("Workflow completed successfully")
+        result = controller.run()
+        if result is not None and result.status is StageRunState.FAILED:
+            message = result.message or f"Stage {result.stage.value} failed"
+            _report_workflow_failure(RuntimeError(message), debug=args.debug)
+            sys.exit(1)
+        if result is not None and result.status is not StageRunState.COMPLETED:
+            message = result.message or f"Stage {result.stage.value} remains in progress"
+            logger.info("Workflow remains in progress: %s", message)
+            print(f"Workflow remains in progress: {message}")
+            return
+        if result is None and controller.current_stage() is not WorkflowStage.COMPLETED:
+            stage = controller.current_stage().value
+            logger.info("Workflow remains at stage %s", stage)
+            print(f"Workflow remains at stage {stage}")
+            return
+        if result is not None and result.advanced_to is not None:
+            logger.info(
+                "Workflow stage %s completed successfully; advancing to %s",
+                result.stage.value,
+                result.advanced_to.value,
+            )
+            print(
+                "Workflow stage "
+                f"{result.stage.value} completed successfully; "
+                f"advancing to {result.advanced_to.value}"
+            )
+        else:
+            logger.info("Workflow completed successfully")
+            print("Workflow completed successfully")
     except SelfResubmitExit as exc:
         logger.info("Workflow resubmit triggered: %s", exc)
         _resubmit_slurm_job(debug=args.debug)

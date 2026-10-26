@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -37,6 +37,7 @@ from nepflow.stages.dft.reconciliation import (
     DftRecoveryDecision,
 )
 from nepflow.stages.dft.stage import DftStageResult
+from nepflow.workflow.resubmission import SelfResubmitExit
 from nepflow.workflow.stages import StageRunState, WorkflowStage
 
 
@@ -84,6 +85,36 @@ class FakeScheduler:
             stderr="",
             command=("sbatch", str(script_path)),
         )
+
+
+class LifecycleScheduler(FakeScheduler):
+    """Fake scheduler whose submitted jobs occupy slots until reconciled."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.max_observed_active = 0
+        self.active_ids: set[str] = set()
+
+    def list_active_jobs(self, **kwargs: Any) -> QueueQueryResult:
+        result = super().list_active_jobs(**kwargs)
+        self.max_observed_active = max(self.max_observed_active, len(result.active_jobs))
+        return result
+
+    def submit_script(self, script_path: str | Path, **kwargs: Any) -> SubmissionResult:
+        submission = super().submit_script(script_path, **kwargs)
+        self.jobs[submission.job_id] = _job(submission.job_id, SchedulerJobState.NOT_FOUND)
+        self.active = tuple(
+            SlurmJobRecord(job_id=job_id, name="dft", state=SchedulerJobState.PENDING)
+            for job_id in sorted(self.active_ids | {submission.job_id})
+        )
+        self.active_ids.add(submission.job_id)
+        return submission
+
+    def reconcile(self, job_id: str, **kwargs: Any) -> ReconciledJobResult:
+        result = super().reconcile(job_id, **kwargs)
+        self.active_ids.discard(job_id)
+        self.active = tuple(item for item in self.active if item.job_id != job_id)
+        return result
 
 
 class FakeBackend:
@@ -386,6 +417,129 @@ def test_pending_waits_when_capacity_is_full(inputs: DftInputArtifacts) -> None:
     assert store.saved == []
 
 
+def test_reconcile_until_terminal_refills_capacity_until_all_five_complete(
+    inputs: DftInputArtifacts,
+) -> None:
+    scheduler = LifecycleScheduler()
+    store = FakeStateStore()
+    sleeps: list[float] = []
+    reconciler = DftReconciliationOrchestrator(
+        scheduler=scheduler,
+        backend=FakeBackend(completed=True),
+        state_store=store,
+        max_concurrent=2,
+        script_path=Path("run_vasp.sh"),
+        sleeper=sleeps.append,
+    )
+    records = tuple(
+        DftExecutionRecord(
+            inputs=replace(
+                inputs,
+                calculation=DftCalculationIdentity(
+                    structure_id=f"structure-{index}",
+                    incar_hash="incar-1",
+                    potcar_hash="potcar-1",
+                ),
+            ),
+            attempt_id=f"attempt-{index}",
+            status="pending",
+        )
+        for index in range(5)
+    )
+
+    result = reconciler.reconcile_until_terminal(
+        records,
+        poll_interval_seconds=1,
+        slurm_deadline=None,
+    )
+
+    assert result.all_terminal is True
+    assert result.all_successful is True
+    assert len(scheduler.submissions) == 5
+    assert scheduler.max_observed_active <= 2
+    assert len(sleeps) > 0
+
+
+def test_reconcile_until_terminal_does_not_stop_for_one_terminal_failure(
+    inputs: DftInputArtifacts,
+) -> None:
+    class MixedBackend(FakeBackend):
+        def parse_completion(self, current_inputs, process=None):
+            self.completion_calls += 1
+            return DftCompletionEvidence(
+                completed=current_inputs.calculation.structure_id != "structure-0"
+            )
+
+        def classify_failure(self, evidence):
+            self.failure_calls += 1
+            return DftFailure("execution_failed", False, "terminal failure")
+
+    scheduler = LifecycleScheduler()
+    store = FakeStateStore()
+    reconciler = DftReconciliationOrchestrator(
+        scheduler=scheduler,
+        backend=MixedBackend(completed=True),
+        state_store=store,
+        max_concurrent=2,
+        script_path=Path("run_vasp.sh"),
+        sleeper=lambda _seconds: None,
+    )
+    records = tuple(
+        DftExecutionRecord(
+            inputs=replace(
+                inputs,
+                calculation=DftCalculationIdentity(
+                    structure_id=f"structure-{index}",
+                    incar_hash="incar-1",
+                    potcar_hash="potcar-1",
+                ),
+            ),
+            attempt_id=f"attempt-{index}",
+            status="pending",
+        )
+        for index in range(3)
+    )
+
+    result = reconciler.reconcile_until_terminal(
+        records,
+        poll_interval_seconds=0,
+        slurm_deadline=None,
+    )
+
+    assert result.all_terminal is True
+    assert result.any_failed is True
+    assert result.records[0].status == "failed"
+    assert result.records[1].status == "completed"
+    assert result.records[2].status == "completed"
+    assert len(scheduler.submissions) == 3
+
+
+def test_reconcile_until_terminal_raises_resubmit_after_persisting_pass(
+    inputs: DftInputArtifacts,
+) -> None:
+    scheduler = FakeScheduler()
+    store = FakeStateStore()
+    clock_values = iter((0.0, 10.0))
+    reconciler = DftReconciliationOrchestrator(
+        scheduler=scheduler,
+        backend=FakeBackend(),
+        state_store=store,
+        script_path=Path("run_vasp.sh"),
+        clock=lambda: next(clock_values),
+    )
+    record = DftExecutionRecord(inputs=inputs, attempt_id="attempt-1", status="pending")
+
+    with pytest.raises(SelfResubmitExit):
+        reconciler.reconcile_until_terminal(
+            (record,),
+            poll_interval_seconds=20,
+            slurm_deadline=5.0,
+        )
+
+    assert scheduler.submissions == [Path("run_vasp.sh")]
+    assert store.saved[0][0].status == "submitted"
+
+
 def test_restart_does_not_duplicate_submission(inputs: DftInputArtifacts) -> None:
     scheduler = FakeScheduler({"job-1": _job("job-1", SchedulerJobState.PENDING)})
     store = FakeStateStore()
@@ -421,6 +575,23 @@ def test_failed_dft_stage_does_not_advance_to_training(
 
     assert workflow_result.stage is WorkflowStage.RUN_VASP
     assert workflow_result.status is StageRunState.FAILED
+    assert workflow_result.completed is False
+    assert workflow_result.advanced_to is None
+
+
+def test_nonterminal_dft_snapshot_with_one_failure_stays_running(
+    record: DftExecutionRecord,
+) -> None:
+    snapshot = DftReconciliationResult(
+        (record.with_status("failed"), record.with_status("pending", job_id=None))
+    )
+
+    workflow_result = DftStageResult(
+        preparation=DftPreparationResult(()),
+        execution=snapshot,
+    ).as_workflow_result()
+
+    assert workflow_result.status is StageRunState.RUNNING
     assert workflow_result.completed is False
     assert workflow_result.advanced_to is None
 

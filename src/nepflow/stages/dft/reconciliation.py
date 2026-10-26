@@ -9,9 +9,11 @@ launcher markers.
 
 from __future__ import annotations
 
+import logging
+import time
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Mapping, Protocol, Sequence
+from typing import Any, Callable, Mapping, Protocol, Sequence
 
 from nepflow.dft.backend import (
     DftBackend,
@@ -23,6 +25,9 @@ from nepflow.errors import StateError
 from nepflow.hpc.jobs import SchedulerJobState
 from nepflow.hpc.resources import JobResources
 from nepflow.hpc.scheduler import Scheduler
+from nepflow.workflow.resubmission import SelfResubmitExit
+
+logger = logging.getLogger(__name__)
 
 
 class ExecutionStateStore(Protocol):
@@ -163,6 +168,8 @@ class DftReconciliationOrchestrator:
         performance_recorder: Any | None = None,
         job_name_prefix: str | None = None,
         persist_result_artifact: bool = True,
+        sleeper: Callable[[float], None] | None = None,
+        clock: Callable[[], float] | None = None,
     ) -> None:
         if max_concurrent < 1:
             raise ValueError("max_concurrent must be positive")
@@ -178,6 +185,8 @@ class DftReconciliationOrchestrator:
         self.performance_recorder = performance_recorder
         self.job_name_prefix = job_name_prefix
         self.persist_result_artifact = persist_result_artifact
+        self._sleep = time.sleep if sleeper is None else sleeper
+        self._clock = time.time if clock is None else clock
 
     def reconcile_once(
         self,
@@ -194,6 +203,7 @@ class DftReconciliationOrchestrator:
             name_prefix=self.job_name_prefix,
         ).active_jobs
         active_count = len(active_jobs)
+        active_job_ids = {job.job_id for job in active_jobs}
         submitted_this_pass = 0
         reconciled: list[DftExecutionRecord] = []
 
@@ -205,6 +215,13 @@ class DftReconciliationOrchestrator:
             if record.status in {"submitted", "running"}:
                 updated = self._reconcile_submitted(record)
                 reconciled.append(updated)
+                if (
+                    updated.status not in {"submitted", "running"}
+                    and record.job_id is not None
+                    and record.job_id in active_job_ids
+                ):
+                    active_count = max(0, active_count - 1)
+                    active_job_ids.discard(record.job_id)
                 continue
 
             if record.status in {"pending", "prepared"}:
@@ -219,6 +236,49 @@ class DftReconciliationOrchestrator:
             raise ValueError(f"Unknown DFT execution status: {record.status}")
 
         return DftReconciliationResult(tuple(reconciled))
+
+    def reconcile_until_terminal(
+        self,
+        records: Sequence[DftExecutionRecord],
+        *,
+        poll_interval_seconds: int,
+        slurm_deadline: float | None,
+    ) -> DftReconciliationResult:
+        """Reconcile repeatedly until all attempts are terminal or resubmit time."""
+        if poll_interval_seconds < 0:
+            raise ValueError("poll_interval_seconds must not be negative")
+
+        current = tuple(records)
+        while True:
+            if slurm_deadline is not None and self._clock() >= slurm_deadline:
+                raise SelfResubmitExit(
+                    "SLURM walltime deadline reached during DFT reconciliation"
+                )
+
+            result = self.reconcile_once(current)
+            current = result.records
+            counts = result.counts
+            logger.info(
+                "DFT reconciliation: completed=%d reused=%d running=%d "
+                "submitted/queued=%d pending/waiting=%d failed=%d total=%d",
+                counts.get("completed", 0),
+                counts.get("reused", 0),
+                counts.get("running", 0),
+                counts.get("submitted", 0),
+                counts.get("pending", 0) + counts.get("prepared", 0),
+                counts.get("failed", 0),
+                len(current),
+            )
+            if result.all_terminal:
+                return result
+
+            if slurm_deadline is not None and self._clock() >= slurm_deadline:
+                raise SelfResubmitExit(
+                    "SLURM walltime deadline reached during DFT reconciliation"
+                )
+
+            if poll_interval_seconds > 0:
+                self._sleep(poll_interval_seconds)
 
     def _reconcile_submitted(self, record: DftExecutionRecord) -> DftExecutionRecord:
         """Resolve one submitted attempt and persist completion or retry evidence."""

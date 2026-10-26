@@ -44,7 +44,7 @@ class DftStageResult:
 
     def as_workflow_result(self) -> StageRunResult:
         execution = self.execution
-        failed = execution is not None and execution.any_failed
+        failed = execution is not None and execution.all_terminal and execution.any_failed
         complete = execution is not None and execution.all_successful
         status = (
             StageRunState.FAILED if failed else StageRunState.COMPLETED if complete else self.status
@@ -157,7 +157,22 @@ class DftStage:
             self._execution_record(item, state_store, resources)
             for item in preparation.calculations
         )
-        execution = execution_orchestrator.reconcile_once(records)
+        reconcile_until_terminal = getattr(
+            execution_orchestrator,
+            "reconcile_until_terminal",
+            None,
+        )
+        if callable(reconcile_until_terminal):
+            execution = reconcile_until_terminal(
+                records,
+                poll_interval_seconds=config.slurm.poll_interval,
+                slurm_deadline=active_context.slurm_deadline,
+            )
+        else:
+            # Keep injected legacy test doubles preparation-only/non-executing
+            # compatible.  Production composition always supplies the typed
+            # DftReconciliationOrchestrator above.
+            execution = execution_orchestrator.reconcile_once(records)
         return DftStageResult(preparation=preparation, execution=execution)
 
     @staticmethod

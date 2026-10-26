@@ -281,6 +281,24 @@ def test_current_generate_without_override_passes_resume_mode(tmp_path: Path) ->
     assert contexts[0].options["mode"] == "resume"
 
 
+def test_controller_run_returns_executed_stage_result(tmp_path: Path) -> None:
+    controller = make_controller(tmp_path, "generate")
+    expected = StageRunResult(
+        stage=WorkflowStage.GENERATE,
+        status=StageRunState.COMPLETED,
+        advanced_to=WorkflowStage.SELECT,
+        completed=True,
+    )
+    controller.stage_registry.register(
+        WorkflowStage.GENERATE,
+        lambda _context: expected,
+    )
+
+    result = controller.run()
+
+    assert result == expected
+
+
 def test_explicit_select_from_select_restarts_pipeline(tmp_path: Path) -> None:
     controller = make_controller(tmp_path, "select")
     write_generated_input(controller.project_dir)

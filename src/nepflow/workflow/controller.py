@@ -394,10 +394,10 @@ class WorkflowController:
             self.workflow_state.transition_to(result.advanced_to)
         return result
 
-    def _run_debug(self) -> None:
+    def _run_debug(self) -> StageRunResult | None:
         current = self.current_stage()
         if current is WorkflowStage.COMPLETED:
-            return
+            return None
         stages = self.stage_registry.stages()
         if current is WorkflowStage.INIT:
             start_index = 1
@@ -407,29 +407,39 @@ class WorkflowController:
             except ValueError as exc:
                 raise StateError(f"No workflow handler is registered for {current.value}") from exc
 
+        last_result: StageRunResult | None = None
         for stage in stages[start_index:]:
             result = self._execute_stage(stage, mode="debug")
+            last_result = result
             if result.advanced_to is None:
-                return
+                return result
+        return last_result
 
-    def _run_local(self) -> None:
+    def _run_local(self) -> StageRunResult | None:
+        last_result: StageRunResult | None = None
         stage = self.current_stage()
         if stage is WorkflowStage.INIT:
-            self._execute_stage(stage, mode="local")
+            last_result = self._execute_stage(stage, mode="local")
             stage = self.current_stage()
         if stage is WorkflowStage.GENERATE:
             # Local mode deliberately leaves generation running so an HPC run
             # can resume with perturbations.
-            self._execute_stage(
+            last_result = self._execute_stage(
                 stage,
                 seeds_only=True,
                 mode="local",
                 advance=False,
             )
             self.workflow_state.set_status(stage, StageRunState.RUNNING)
+        return last_result
 
-    def run(self) -> None:
-        """Run one workflow unit, or all units in debug mode."""
+    def run(self) -> StageRunResult | None:
+        """Run one workflow unit, or all units in debug mode.
+
+        The returned result is the executed workflow unit's typed outcome.
+        ``None`` means no stage was executed, such as an already completed
+        workflow or initialization-only invocation.
+        """
 
         if self.init_mode:
             self.stage_registry.execute(
@@ -446,7 +456,7 @@ class WorkflowController:
                     f"current stage is {current.value!r}"
                 )
             if not self.local_mode and not self.debug:
-                return
+                return None
 
         if not self._startup_validated:
             raise StateError(
@@ -486,18 +496,16 @@ class WorkflowController:
         stage = WorkflowStage.SELECT if explicit_selection_restart else self.current_stage()
         if stage is WorkflowStage.COMPLETED:
             logger.info("Workflow is already complete; no stage will be run")
-            return
+            return None
 
         if self.debug:
-            self._run_debug()
-            return
+            return self._run_debug()
 
         if self.local_mode:
-            self._run_local()
-            return
+            return self._run_local()
 
         self._check_deadline()
-        self._execute_stage(
+        return self._execute_stage(
             stage,
             mode=(
                 "restart"
