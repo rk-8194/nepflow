@@ -253,6 +253,7 @@ def append_vasp_memory(path: Path, observation: VaspMemoryObservation) -> None:
                     f"{observation.avg_loop_time:.4f}",
                     observation.oom,
                 )
+            )
             handle.flush()
             os.fsync(handle.fileno())
 
