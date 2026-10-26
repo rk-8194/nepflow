@@ -2,14 +2,24 @@
 
 from __future__ import annotations
 
+import logging
 import shlex
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import asdict, dataclass
 
 from nepflow.config import NepflowConfig
 from nepflow.dft.backend import DftBackend
 from nepflow.dft.vasp.backend import VaspBackend
+from nepflow.dft.vasp.resource_memory import (
+    VaspMemoryObservation,
+    default_vasp_resources,
+    extract_resource_features,
+    load_vasp_memory,
+    predict_vasp_params,
+    resolve_memory_path,
+)
 from nepflow.dft.vasp.recovery import VaspRecoveryPolicy
-from nepflow.errors import StateError
+from nepflow.errors import StateError, VaspError
 from nepflow.hpc.resources import JobResources
 from nepflow.hpc.scheduler import Scheduler
 from nepflow.io.atomic import atomic_write_text
@@ -31,6 +41,8 @@ from .reconciliation import (
     DftRecoveryDecision,
 )
 from .reports import DftPerformanceRecorder
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -117,6 +129,44 @@ class DftStage:
             state_store=state_store,
             datasets=self.datasets,
         )
+
+        memory_path = resolve_memory_path(active_context.project_dir)
+        memory: tuple[VaspMemoryObservation, ...] | None = None
+
+        def get_memory() -> tuple[VaspMemoryObservation, ...]:
+            nonlocal memory
+            if memory is None:
+                memory = load_vasp_memory(memory_path)
+                logger.info(
+                    "Resolved VASP resource memory %s (%d observations; %d successful)",
+                    memory_path,
+                    len(memory),
+                    sum(item.oom != 1 for item in memory),
+                )
+            return memory
+
+        if any(
+            (
+                not item.reused
+                and (attempts := _scientific_attempts(state_store, item.calculation.calculation_id))
+                and _attempt_number(attempts[-1]) == 1
+                and str(attempts[-1].get("status", "")) in {"pending", "prepared"}
+            )
+            for item in preparation.calculations
+        ):
+            get_memory()
+
+        records = tuple(
+            self._execution_record_for_item(
+                item,
+                state_store,
+                config=config,
+                project_root=active_context.project_dir,
+                memory_loader=get_memory,
+            )
+            for item in preparation.calculations
+        )
+
         if self.orchestrator is not None and self.execution_orchestrator is None:
             return DftStageResult(preparation=preparation)
 
@@ -142,21 +192,13 @@ class DftStage:
                 script_path=runner_path,
                 job_name_prefix=f"nf_{active_context.project_name}_",
                 recovery_policy=self._build_recovery_policy(config),
-                performance_recorder=DftPerformanceRecorder(state_store),
+                performance_recorder=DftPerformanceRecorder(
+                    state_store,
+                    memory_path=memory_path,
+                    project_root=active_context.project_dir,
+                    config=config,
+                ),
             )
-
-        resources = JobResources(
-            nodes=1,
-            gpus_per_node=1,
-            mpi_ranks=1,
-            walltime=config.dft_recovery.vasp_walltime,
-            account=config.slurm.account,
-            partition=config.slurm.dft_partition,
-        )
-        records = tuple(
-            self._execution_record(item, state_store, resources)
-            for item in preparation.calculations
-        )
         reconcile_until_terminal = getattr(
             execution_orchestrator,
             "reconcile_until_terminal",
@@ -186,20 +228,50 @@ class DftStage:
                     retry_level=record.retry_level,
                     reason=failure.reason,
                 )
+            metadata = getattr(record, "metadata", {})
+            if not isinstance(metadata, Mapping):
+                metadata = {}
+            decision_metadata = metadata.get("resource_decision", {})
+            if not isinstance(decision_metadata, Mapping):
+                decision_metadata = {}
             starting_gpus_per_node = (
-                record.resources.gpus_per_node if record.resources is not None else 1
+                int(
+                    decision_metadata.get(
+                        "initial_gpus_per_node",
+                        record.resources.gpus_per_node if record.resources is not None else 1,
+                    )
+                )
             )
-            initial_ncore = record.inputs.calculation.ncore or max(
-                2,
-                config.hpc.cores_per_node // max(1, starting_gpus_per_node),
+            initial_ncore = int(
+                decision_metadata.get(
+                    "initial_ncore",
+                    record.inputs.calculation.ncore
+                    or max(2, config.hpc.cores_per_node // max(1, starting_gpus_per_node)),
+                )
             )
-            initial_kpar = record.inputs.calculation.kpar or 1
-            decision = vasp_policy.decide(
-                starting_gpu=starting_gpus_per_node,
-                initial_ncore=initial_ncore,
-                initial_kpar=initial_kpar,
-                retry_level=record.retry_level,
+            initial_kpar = int(decision_metadata.get("initial_kpar", record.inputs.calculation.kpar or 1))
+            initial_nodes = int(
+                decision_metadata.get(
+                    "initial_nodes", record.resources.nodes if record.resources is not None else 1
+                )
             )
+            try:
+                decision = vasp_policy.decide(
+                    starting_gpu=starting_gpus_per_node,
+                    initial_ncore=initial_ncore,
+                    initial_kpar=initial_kpar,
+                    initial_nodes=initial_nodes,
+                    retry_level=record.retry_level,
+                )
+            except TypeError as exc:
+                if "initial_nodes" not in str(exc):
+                    raise
+                decision = vasp_policy.decide(
+                    starting_gpu=starting_gpus_per_node,
+                    initial_ncore=initial_ncore,
+                    initial_kpar=initial_kpar,
+                    retry_level=record.retry_level,
+                )
             if not decision.retry:
                 return DftRecoveryDecision(
                     retry=False,
@@ -257,6 +329,147 @@ class DftStage:
             ),
             retry_level=(max(0, _attempt_number(latest) - 1) if latest is not None else 0),
             resources=resources,
+        )
+
+    @classmethod
+    def _execution_record_for_item(
+        cls,
+        item: PreparedCalculation,
+        state_store,
+        *,
+        config: NepflowConfig,
+        project_root,
+        memory_loader,
+    ) -> DftExecutionRecord:
+        """Build one record, selecting and persisting resources for new attempts."""
+
+        attempts = _scientific_attempts(state_store, item.calculation.calculation_id)
+        latest = attempts[-1] if attempts else None
+        persisted = cls._persisted_resource_decision(latest)
+        if (
+            persisted is None
+            and latest is not None
+            and _attempt_number(latest) == 1
+            and str(latest.get("status", "")) in {"pending", "prepared"}
+            and not item.reused
+        ):
+            try:
+                features = extract_resource_features(
+                    item.artifacts.working_directory,
+                    project_root,
+                    config=config,
+                )
+                observations = memory_loader()
+                prediction = predict_vasp_params(
+                    observations,
+                    n_atoms=features[0],
+                    n_electrons=features[1],
+                    n_kpoints_irr=features[2],
+                    config=config,
+                )
+                reason = "sufficient .vasp_memory data" if prediction is not None else "insufficient .vasp_memory data"
+            except (OSError, UnicodeError, StateError, VaspError, ValueError) as exc:
+                prediction = None
+                features = None
+                reason = f"feature estimation unavailable: {exc}"
+                logger.warning(
+                    "Could not derive VASP resource features for %s (%s): %s",
+                    item.calculation.calculation_id,
+                    item.artifacts.working_directory,
+                    exc,
+                )
+            if prediction is None:
+                prediction = default_vasp_resources(config)
+                source = f"default: {reason}"
+            else:
+                source = prediction.source
+            from nepflow.dft.vasp.recovery import write_incar_resource_parameters
+
+            write_incar_resource_parameters(
+                item.artifacts.working_directory,
+                prediction.ncore,
+                prediction.kpar,
+            )
+            resources = JobResources(
+                nodes=prediction.nodes,
+                gpus_per_node=prediction.gpus_per_node,
+                mpi_ranks=prediction.mpi_ranks,
+                walltime=config.dft_recovery.vasp_walltime,
+                account=config.slurm.account,
+                partition=config.slurm.dft_partition,
+            )
+            metadata = dict(latest.get("metadata", {})) if isinstance(latest.get("metadata"), Mapping) else {}
+            metadata["resource_decision"] = {
+                "initial_ncore": prediction.ncore,
+                "initial_kpar": prediction.kpar,
+                "initial_nodes": prediction.nodes,
+                "initial_gpus_per_node": prediction.gpus_per_node,
+                "resource_source": prediction.source,
+                "n_atoms": None if features is None else features[0],
+                "n_electrons": None if features is None else features[1],
+                "n_kpoints_irr": None if features is None else features[2],
+                "features": (
+                    {
+                        "n_atoms": features[0],
+                        "n_electrons": features[1],
+                        "n_kpoints_irr": features[2],
+                    }
+                    if features is not None
+                    else None
+                ),
+            }
+            state_store.update_dft_attempt(
+                str(latest["attempt_id"]),
+                resources=asdict(resources),
+                metadata=metadata,
+            )
+            logger.info(
+                "%s/%s: NCORE=%d KPAR=%d nodes=%d gpus=%d%s (%s)",
+                item.spec.dataset,
+                item.spec.working_directory.name,
+                prediction.ncore,
+                prediction.kpar,
+                prediction.nodes,
+                prediction.gpus_per_node,
+                f" kpts={features[2]}" if features is not None else "",
+                source,
+            )
+            persisted = (resources, metadata)
+        elif persisted is None:
+            metadata = dict(latest.get("metadata", {})) if latest and isinstance(latest.get("metadata"), Mapping) else {}
+            resources = cls._resources_from_attempt(latest, config)
+            persisted = (resources, metadata)
+
+        resources, metadata = persisted
+        return cls._execution_record(item, state_store, resources).with_metadata(metadata)
+
+    @staticmethod
+    def _persisted_resource_decision(latest):
+        if not latest or not isinstance(latest.get("resources"), Mapping):
+            return None
+        metadata = latest.get("metadata", {})
+        decision = metadata.get("resource_decision") if isinstance(metadata, Mapping) else None
+        if not isinstance(decision, Mapping):
+            # A resource row from an older state is still safer to reuse than
+            # silently predicting a different submitted attempt.
+            return None
+        return DftStage._resources_from_attempt(latest, None), dict(metadata)
+
+    @staticmethod
+    def _resources_from_attempt(latest, config) -> JobResources:
+        if latest and isinstance(latest.get("resources"), Mapping):
+            values = dict(latest["resources"])
+            values.pop("total_gpus", None)
+            return JobResources(**values)
+        if config is None:
+            return JobResources()
+        return JobResources(
+            nodes=1,
+            gpus_per_node=1,
+            mpi_ranks=1,
+            walltime=config.dft_recovery.vasp_walltime,
+            account=config.slurm.account,
+            partition=config.slurm.dft_partition,
         )
 
     @staticmethod

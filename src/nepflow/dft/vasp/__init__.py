@@ -52,6 +52,22 @@ from .recovery import (
     decide_retry,
     write_incar_resource_parameters,
 )
+from .resource_memory import (
+    CSV_COLUMNS,
+    VASP_MEMORY_COLUMNS,
+    VaspMemoryObservation,
+    VaspResourcePrediction,
+    append_vasp_memory,
+    default_vasp_resources,
+    estimate_kpoints_irr,
+    estimate_n_electrons,
+    extract_resource_features,
+    load_vasp_memory,
+    parse_zval,
+    predict_vasp_params,
+    read_incar_resource_parameters,
+    resolve_memory_path,
+)
 
 __all__ = [
     "ResolvedVaspOutput",
@@ -99,4 +115,18 @@ __all__ = [
     "set_incar_parameters",
     "strip_resource_incar_params",
     "write_incar_resource_parameters",
+    "CSV_COLUMNS",
+    "VASP_MEMORY_COLUMNS",
+    "VaspMemoryObservation",
+    "VaspResourcePrediction",
+    "append_vasp_memory",
+    "default_vasp_resources",
+    "estimate_kpoints_irr",
+    "estimate_n_electrons",
+    "extract_resource_features",
+    "load_vasp_memory",
+    "parse_zval",
+    "predict_vasp_params",
+    "read_incar_resource_parameters",
+    "resolve_memory_path",
 ]

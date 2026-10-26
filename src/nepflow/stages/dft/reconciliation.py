@@ -106,6 +106,11 @@ class DftExecutionRecord:
             ),
         )
 
+    def with_metadata(self, metadata: Mapping[str, Any]) -> "DftExecutionRecord":
+        """Return this record with canonical persisted execution metadata."""
+
+        return replace(self, metadata=dict(metadata))
+
 
 @dataclass(frozen=True, slots=True)
 class DftReconciliationResult:
@@ -349,6 +354,7 @@ class DftReconciliationOrchestrator:
                 retry_level=decision.retry_level,
                 resources=decision.resources or record.resources,
                 job_name=record.job_name,
+                metadata=record.metadata,
             )
             return self._save(retry, reason=decision.reason)
         return self._save(

@@ -4,10 +4,22 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Protocol
+
+from ase.io import read as ase_read
 
 from nepflow.dft.backend import DftFailure
 from nepflow.dft.vasp.outputs import parse_performance_evidence
+from nepflow.dft.vasp.resource_memory import (
+    VaspMemoryObservation,
+    append_vasp_memory,
+    estimate_n_electrons,
+    estimate_kpoints_irr,
+    read_incar_resource_parameters,
+    resolve_memory_path,
+)
+from nepflow.errors import VaspError
 
 from .reconciliation import DftExecutionRecord
 
@@ -59,10 +71,26 @@ class DftPerformanceSink(Protocol):
 class DftPerformanceRecorder:
     """Persist backend performance/failure evidence as idempotent events."""
 
-    def __init__(self, state_store: Any) -> None:
+    def __init__(
+        self,
+        state_store: Any,
+        *,
+        memory_path: Any | None = None,
+        project_root: Any | None = None,
+        config: Any | None = None,
+    ) -> None:
         self.state_store = state_store
+        self.project_root = None if project_root is None else Path(project_root)
+        self.memory_path = (
+            Path(memory_path)
+            if memory_path is not None
+            else (resolve_memory_path(self.project_root) if self.project_root is not None else None)
+        )
+        self.config = config
 
     def record_completion(self, record: DftExecutionRecord, result: Any) -> None:
+        if record.status == "reused":
+            return
         outcar = record.inputs.working_directory / "OUTCAR"
         try:
             evidence = parse_performance_evidence(
@@ -84,12 +112,7 @@ class DftPerformanceRecorder:
                 result,
             )
             return
-        if (
-            not evidence.loop_times
-            or evidence.total_ranks is None
-            or evidence.irreducible_kpoints is None
-            or evidence.electrons is None
-        ):
+        if not evidence.loop_times:
             self._record(
                 record,
                 DftPerformanceRecord(
@@ -112,9 +135,13 @@ class DftPerformanceRecorder:
             electrons=evidence.electrons,
             average_loop_time=evidence.average_loop_time,
         )
+        self._append_memory_observation(record, evidence, oom=0)
         self._record(record, performance, result)
 
     def record_failure(self, record: DftExecutionRecord, failure: DftFailure) -> None:
+        if failure.kind == "out_of_memory":
+            evidence = self._read_optional_evidence(record)
+            self._append_memory_observation(record, evidence, oom=1)
         self._record(
             record,
             DftPerformanceRecord(
@@ -125,6 +152,74 @@ class DftPerformanceRecorder:
                 failure_reason=failure.reason,
             ),
             None,
+        )
+
+    @staticmethod
+    def _read_optional_evidence(record: DftExecutionRecord):
+        try:
+            return parse_performance_evidence(
+                (record.inputs.working_directory / "OUTCAR").read_text(
+                    encoding="utf-8", errors="replace"
+                )
+            )
+        except OSError:
+            return None
+
+    def _append_memory_observation(self, record: DftExecutionRecord, evidence: Any, *, oom: int) -> None:
+        if self.memory_path is None:
+            return
+        try:
+            atoms = len(ase_read(str(record.inputs.working_directory / "POSCAR")))
+            observed_kpoints = None if evidence is None else evidence.irreducible_kpoints
+            observed_electrons = None if evidence is None else evidence.electrons
+            if observed_kpoints is None:
+                if self.project_root is None:
+                    return
+                observed_kpoints = estimate_kpoints_irr(
+                    record.inputs.working_directory / "POSCAR",
+                    self.project_root,
+                    config=self.config,
+                    incar_path=record.inputs.working_directory / "INCAR",
+                )
+            if observed_electrons is None:
+                if self.project_root is None:
+                    return
+                observed_electrons = estimate_n_electrons(
+                    record.inputs.working_directory / "POSCAR", self.project_root
+                )
+            ncore, kpar = read_incar_resource_parameters(record.inputs.working_directory / "INCAR")
+            resources = record.resources
+            if resources is None:
+                return
+            loop_time = 0.0 if oom else (0.0 if evidence is None else evidence.average_loop_time)
+            if not loop_time and oom == 0:
+                return
+            append_vasp_memory(
+                self.memory_path,
+                VaspMemoryObservation(
+                    n_atoms=atoms,
+                    n_kpoints_irr=int(observed_kpoints or 0),
+                    n_electrons=int(round(float(observed_electrons or 0))),
+                    nodes=resources.nodes,
+                    total_gpus=resources.total_gpus,
+                    ncore=ncore,
+                    kpar=kpar,
+                    avg_loop_time=float(loop_time),
+                    oom=oom,
+                ),
+            )
+        except (OSError, UnicodeError, ValueError, VaspError) as exc:
+            # Performance provenance remains in StateStore; a missing optional
+            # append must not erase or reclassify a completed DFT result.
+            self._record_memory_append_failure(record, exc)
+
+    def _record_memory_append_failure(self, record: DftExecutionRecord, exc: Exception) -> None:
+        self.state_store.append_event(
+            f"dft-performance-memory:{record.attempt_id}",
+            "dft_attempt",
+            record.attempt_id,
+            "legacy_memory_append_failed",
+            {"error": str(exc), "path": None if self.memory_path is None else str(self.memory_path)},
         )
 
     def _record(

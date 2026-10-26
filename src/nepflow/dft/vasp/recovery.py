@@ -17,6 +17,8 @@ def build_retry_levels_for_config(
     initial_ncore: int,
     initial_kpar: int,
     config: NepflowConfig,
+    *,
+    initial_nodes: int = 1,
 ) -> list[tuple[int, int, int, int]]:
     """Build explicit retry levels from typed HPC configuration.
 
@@ -30,6 +32,7 @@ def build_retry_levels_for_config(
         starting_gpus_per_node,
         initial_ncore,
         initial_kpar,
+        initial_nodes=initial_nodes,
         cores=config.hpc.cores_per_node,
         gpus_per_node=config.hpc.gpus_per_node,
         max_nodes=config.hpc.max_nodes,
@@ -41,6 +44,7 @@ def _build_retry_levels(
     initial_ncore: int,
     initial_kpar: int,
     *,
+    initial_nodes: int = 1,
     cores: int,
     gpus_per_node: int,
     max_nodes: int,
@@ -52,7 +56,8 @@ def _build_retry_levels(
 
     levels: list[tuple[int, int, int, int]] = []
     seen = set()
-    initial_key = (initial_ncore, initial_kpar, 1, starting_gpus_per_node)
+    initial_nodes = max(1, initial_nodes)
+    initial_key = (initial_ncore, initial_kpar, initial_nodes, starting_gpus_per_node)
 
     def add(ncore: int, kpar: int, nodes: int, gpus_per_node: int) -> None:
         key = (ncore, kpar, nodes, gpus_per_node)
@@ -62,24 +67,25 @@ def _build_retry_levels(
 
     valid_kpars = sorted(k for k in (2**i for i in range(0, 8)) if k <= gpus_per_node) or [1]
 
-    def sweep_gpu_tier(gpu_count: int) -> None:
+    def sweep_gpu_tier(gpu_count: int, nodes: int) -> None:
         for kpar in valid_kpars:
             for ncore in valid_ncores:
-                add(ncore, kpar, 1, gpu_count)
+                add(ncore, kpar, nodes, gpu_count)
 
-    sweep_gpu_tier(starting_gpus_per_node)
+    sweep_gpu_tier(starting_gpus_per_node, initial_nodes)
 
     valid_gpus = sorted(g for g in [1, 2, 4, 8] if g <= gpus_per_node)
     for gpu in valid_gpus:
         if gpu > starting_gpus_per_node:
-            sweep_gpu_tier(gpu)
+            sweep_gpu_tier(gpu, initial_nodes)
 
     highest_gpus_per_node = valid_gpus[-1] if valid_gpus else starting_gpus_per_node
     nodes = 2
     while nodes <= max_nodes:
-        kpar = nodes * highest_gpus_per_node
-        for ncore in valid_ncores:
-            add(ncore, kpar, nodes, highest_gpus_per_node)
+        if nodes > initial_nodes:
+            kpar = nodes * highest_gpus_per_node
+            for ncore in valid_ncores:
+                add(ncore, kpar, nodes, highest_gpus_per_node)
         nodes *= 2
     return levels
 
@@ -105,17 +111,28 @@ def write_incar_resource_parameters(
     try:
         content = incar_path.read_text(encoding="utf-8")
         output = []
+        seen_ncore = False
+        seen_kpar = False
         for line in content.splitlines(keepends=True):
             stripped = line.strip()
             if not stripped or stripped.startswith("#"):
                 output.append(line)
             elif re.match(r"^NCORE\s*=", stripped, re.IGNORECASE):
                 output.append(f"NCORE = {ncore}\n")
+                seen_ncore = True
             elif re.match(r"^KPAR\s*=", stripped, re.IGNORECASE):
                 output.append(f"KPAR = {kpar}\n")
+                seen_kpar = True
             else:
                 output.append(line)
-        atomic_write_text(incar_path, "".join(output), encoding="utf-8")
+        rendered = "".join(output)
+        if rendered and not rendered.endswith("\n"):
+            rendered += "\n"
+        if not seen_ncore:
+            rendered += f"NCORE = {ncore}\n"
+        if not seen_kpar:
+            rendered += f"KPAR = {kpar}\n"
+        atomic_write_text(incar_path, rendered, encoding="utf-8")
     except (OSError, UnicodeError) as exc:
         if warn is not None:
             warn(f"    Failed to write INCAR: {exc}")
@@ -163,6 +180,7 @@ class VaspRecoveryPolicy:
         initial_ncore: int,
         initial_kpar: int,
         retry_level: int,
+        initial_nodes: int = 1,
     ) -> VaspRecoveryDecision:
         """Choose the next resource tier without mutating calculation files."""
         levels = build_retry_levels_for_config(
@@ -170,6 +188,7 @@ class VaspRecoveryPolicy:
             initial_ncore,
             initial_kpar,
             self.config,
+            initial_nodes=initial_nodes,
         )
         return decide_retry(
             levels,
