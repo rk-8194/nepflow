@@ -21,12 +21,14 @@ from ase.io import write
 
 from nepflow.config.models import ALL_SOURCES
 from nepflow.domain.identities import (
+    StructureIdentity,
     annotate_candidate_id,
     annotate_structure_ids,
     calculate_structure_id,
 )
 from nepflow.domain.structures import GeneratedStructureRecord
 from nepflow.resources.cpu import effective_cpu_allocation
+from nepflow.stages.generation.artifacts import canonicalize_extxyz_structure
 from nepflow.stages.generation.supercell import build_target_supercell, require_parent_topology
 from nepflow.stages.generation.validation import (
     CandidateValidationIssue,
@@ -1459,16 +1461,23 @@ class PerturbationCoordinator:
         for candidate, record in zip(result.candidates, result.provenance_records):
             if not isinstance(record, GeneratedStructureRecord):
                 raise TypeError("Perturbation task provenance must be GeneratedStructureRecord")
-            structure_id = record.structure_id
+            canonical_candidate = canonicalize_extxyz_structure(candidate)
+            annotate_candidate_id(canonical_candidate)
+            canonical_record = GeneratedStructureRecord(
+                identity=StructureIdentity.from_atoms(canonical_candidate),
+                provenance=record.provenance,
+                metadata=record.metadata,
+            )
+            structure_id = canonical_record.structure_id
             operation_key = (structure_id, record.provenance.operation_id)
             if operation_key not in seen_operation_ids:
-                retained_records.append(record)
+                retained_records.append(canonical_record)
                 seen_operation_ids.add(operation_key)
             if structure_id in seen_structure_ids:
                 self._duplicate_count += 1
                 continue
             seen_structure_ids.add(structure_id)
-            representatives.append(candidate)
+            representatives.append(canonical_candidate)
         return representatives
 
     def _execute(

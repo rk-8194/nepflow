@@ -60,21 +60,27 @@ def structure_ids(structures: Sequence[Any]) -> list[str]:
 def candidate_ids(structures: Sequence[Any]) -> list[str]:
     """Return the authoritative ordered candidate IDs for selection.
 
-    Older non-magnetic artifacts have no explicit candidate ID.  Their
-    deterministic compatibility rule is ``candidate_id == structure_id``.
-    Magnetic state metadata is sufficient to derive the versioned candidate ID
-    when an artifact predates explicit candidate-ID serialization.
+    Explicit candidate IDs are accepted only when they agree with geometry
+    and magnetic-state metadata. Older non-magnetic artifacts have no explicit
+    candidate ID; their deterministic compatibility rule is
+    ``candidate_id == structure_id``. Magnetic state metadata is sufficient to
+    derive the versioned candidate ID when an artifact predates explicit
+    candidate-ID serialization.
     """
 
     result: list[str] = []
     physical_ids = structure_ids(structures)
-    for structure, structure_id in zip(structures, physical_ids):
+    for index, (structure, structure_id) in enumerate(zip(structures, physical_ids)):
         explicit = _identity_value(structure, "candidate_id")
-        if explicit is not None:
-            result.append(explicit)
-            continue
         state_id = _identity_value(structure, "magnetic_state_id")
-        result.append(calculate_candidate_id(structure_id, state_id))
+        expected = calculate_candidate_id(structure_id, state_id)
+        if explicit is not None and explicit != expected:
+            raise StateError(
+                "Selection candidate identity mismatch: "
+                f"candidate index={index}; recomputed physical ID={structure_id}; "
+                f"expected candidate ID={expected}; embedded candidate ID={explicit!r}"
+            )
+        result.append(expected if explicit is None else explicit)
     if len(set(result)) != len(result):
         raise StateError("Selection candidate IDs are not unique")
     return result

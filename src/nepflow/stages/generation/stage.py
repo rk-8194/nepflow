@@ -463,15 +463,47 @@ class GenerationStage:
         candidate_structure_ids: list[str] = []
         counts_by_config: dict[str, int] = {}
         counts_by_family: dict[str, int] = {}
-        for candidate in candidates:
-            structure_id = str(
-                candidate.info.get("structure_id") or calculate_structure_id(candidate)
+        seen_physical_ids: dict[str, bool] = {}
+        seen_candidate_ids: set[str] = set()
+        for index, candidate in enumerate(candidates):
+            structure_id = calculate_structure_id(candidate)
+            embedded_structure_id = candidate.info.get("structure_id")
+            magnetic_state_id = candidate.info.get("magnetic_state_id")
+            expected_candidate_id = calculate_candidate_id(structure_id, magnetic_state_id)
+            embedded_candidate_id = candidate.info.get("candidate_id")
+            if (
+                embedded_structure_id != structure_id
+                or embedded_candidate_id != expected_candidate_id
+            ):
+                raise StateError(
+                    "Persisted generated candidate identity mismatch: "
+                    f"candidate index={index}; recomputed physical ID={structure_id}; "
+                    f"embedded physical ID={embedded_structure_id!r}; "
+                    f"expected candidate ID={expected_candidate_id}; "
+                    f"embedded candidate ID={embedded_candidate_id!r}; "
+                    f"artifact path={candidate_path}"
+                )
+            if expected_candidate_id in seen_candidate_ids:
+                raise StateError(
+                    "Persisted generated candidate artifact contains repeated candidate ID: "
+                    f"candidate index={index}; candidate ID={expected_candidate_id}; "
+                    f"artifact path={candidate_path}"
+                )
+            seen_candidate_ids.add(expected_candidate_id)
+            is_magnetic = magnetic_state_id is not None
+            previous_magnetic = seen_physical_ids.get(structure_id)
+            if structure_id in seen_physical_ids and (not is_magnetic or not previous_magnetic):
+                raise StateError(
+                    "Persisted generated candidate artifact contains repeated non-magnetic "
+                    f"physical identity at candidate index={index}: structure_id={structure_id}; "
+                    f"artifact path={candidate_path}"
+                )
+            seen_physical_ids[structure_id] = (
+                is_magnetic
+                if previous_magnetic is None
+                else previous_magnetic and is_magnetic
             )
-            candidate_id = str(
-                candidate.info.get("candidate_id")
-                or calculate_candidate_id(structure_id, candidate.info.get("magnetic_state_id"))
-            )
-            candidate_ids.append(candidate_id)
+            candidate_ids.append(expected_candidate_id)
             candidate_structure_ids.append(structure_id)
             config_type = str(candidate.info.get("configurational_type", "unknown"))
             family = str(candidate.info.get("perturbation_type", "unknown"))

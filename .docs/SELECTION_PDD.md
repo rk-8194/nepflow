@@ -1042,6 +1042,9 @@ Selection must fail or produce an explicit incomplete result when:
 - the candidate fingerprint does not match the representation cache;
 - output manifests cannot be written consistently.
 
+Selection must reject an explicit candidate identity when it is inconsistent
+with the physical identity recomputed from the supplied candidate artifact.
+
 Selection should not silently weaken hard scientific constraints to complete successfully.
 
 ---

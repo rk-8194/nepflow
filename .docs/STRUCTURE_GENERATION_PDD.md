@@ -257,6 +257,12 @@ A structure identity must be based only on the physical atomic configuration req
 
 Metadata such as generator name or perturbation type must not alter physical identity.
 
+For lossy or textual structure formats, the reopened canonical artifact
+representation is the identity boundary. IDs embedded in a persisted
+candidate must describe the geometry that downstream stages actually reopen.
+Exact deduplication must therefore be applied to that canonical persisted
+representation before sparse selection.
+
 ### 7.2 Provenance identity
 
 A separate provenance record shall describe the generation path.

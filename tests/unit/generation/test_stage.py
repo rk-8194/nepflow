@@ -11,7 +11,11 @@ from ase import Atoms
 from ase.io import read, write
 
 from nepflow.config.models import CompositionConfig, GenerationConfig
-from nepflow.domain.identities import ArtifactIdentity, calculate_structure_id
+from nepflow.domain.identities import (
+    ArtifactIdentity,
+    annotate_candidate_id,
+    calculate_structure_id,
+)
 from nepflow.domain.structures import (
     GeneratedStructureRecord,
     StructureIdentity,
@@ -60,6 +64,8 @@ class FakeCoordinator:
         self.calls.append((base_structures, output_dir, kwargs))
         output_dir.mkdir(parents=True, exist_ok=True)
         path = output_dir / "generated_structures.xyz"
+        for structure in base_structures:
+            annotate_candidate_id(structure)
         write(str(path), base_structures)
         return path
 

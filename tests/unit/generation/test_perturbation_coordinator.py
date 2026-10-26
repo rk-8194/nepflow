@@ -6,6 +6,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import MappingProxyType
+from typing import cast
 
 import numpy as np
 import pytest
@@ -43,6 +44,7 @@ from nepflow.stages.generation.perturbations.models import (
     PerturbationRejection,
     PerturbationSettings,
     PerturbationTask,
+    PerturbationTaskResult,
     derive_child_seed,
 )
 from nepflow.stages.generation.perturbations.provenance import (
@@ -1327,6 +1329,54 @@ def test_final_deduplication_keeps_unperturbed_representative_and_all_paths() ->
     assert [record.structure_id for record in records] == [
         calculate_structure_id(base),
         calculate_structure_id(base),
+    ]
+
+
+def test_final_deduplication_uses_extxyz_canonical_geometry() -> None:
+    base = base_atoms()
+    first = base.copy()
+    second = base.copy()
+    second.positions[0, 0] += 1.0e-10
+    first_record = annotate_generation_provenance(
+        first,
+        base,
+        "unperturbed",
+        operation_id="operation:first",
+    )
+    second_record = annotate_generation_provenance(
+        second,
+        base,
+        "unperturbed",
+        operation_id="operation:second",
+    )
+    assert first_record.structure_id != second_record.structure_id
+
+    coordinator = PerturbationCoordinator(settings=PerturbationSettings(target_n_atoms=4))
+    result = PerturbationTaskResult(
+        task=cast(PerturbationTask, None),
+        candidates=(first, second),
+        provenance_records=(first_record, second_record),
+    )
+    seen_structure_ids: set[str] = set()
+    seen_operation_ids: set[tuple[str, str]] = set()
+    retained_records = []
+
+    representatives = coordinator._deduplicate_result(
+        result,
+        seen_structure_ids=seen_structure_ids,
+        seen_operation_ids=seen_operation_ids,
+        retained_records=retained_records,
+    )
+
+    assert len(representatives) == 1
+    assert coordinator.get_summary()["duplicate_count"] == 1
+    assert len(retained_records) == 2
+    assert {record.structure_id for record in retained_records} == {
+        calculate_structure_id(representatives[0])
+    }
+    assert [record.provenance.operation_id for record in retained_records] == [
+        "operation:first",
+        "operation:second",
     ]
 
 

@@ -6,8 +6,10 @@ import pytest
 
 pytest.importorskip("ase")
 from ase import Atoms
+from ase.io import read
 
 from nepflow.config.models import CompositionConfig, GenerationConfig
+from nepflow.domain.identities import calculate_candidate_id, calculate_structure_id
 from nepflow.io.json import read_json_object
 from nepflow.stages.generation.models import GenerationRequest
 from nepflow.stages.generation.perturbations.coordinator import PerturbationCoordinator
@@ -102,6 +104,26 @@ def test_final_manifest_is_authoritative_and_stable_across_reruns(tmp_path: Path
     assert manifest["candidate_artifact"]["sha256"] == first.manifest.candidate_artifact.sha256
     assert manifest["accepted_candidate_count"] == len(manifest["candidate_ids"])
     assert len(set(manifest["candidate_ids"])) == manifest["accepted_candidate_count"]
+    persisted_candidates = read(str(candidate_path), index=":")
+    persisted_candidates = (
+        list(persisted_candidates)
+        if isinstance(persisted_candidates, list)
+        else [persisted_candidates]
+    )
+    recomputed_structure_ids = [calculate_structure_id(item) for item in persisted_candidates]
+    recomputed_candidate_ids = [
+        calculate_candidate_id(structure_id, candidate.info.get("magnetic_state_id"))
+        for structure_id, candidate in zip(recomputed_structure_ids, persisted_candidates)
+    ]
+    assert manifest["candidate_structure_ids"] == recomputed_structure_ids
+    assert manifest["candidate_ids"] == recomputed_candidate_ids
+    assert len(set(recomputed_candidate_ids)) == len(recomputed_candidate_ids)
+    non_magnetic_structure_ids = [
+        structure_id
+        for structure_id, candidate in zip(recomputed_structure_ids, persisted_candidates)
+        if candidate.info.get("magnetic_state_id") is None
+    ]
+    assert len(non_magnetic_structure_ids) == len(set(non_magnetic_structure_ids))
     assert manifest["requested_family_counts"]["volume_profile"] == 1
     assert manifest["realised_family_counts"]["volume_profile"] == 1
     assert manifest["duplicates_removed"] == 0

@@ -8,6 +8,7 @@ pytest.importorskip("NepTrainKit")
 from ase import Atoms
 
 from nepflow.config.models import SelectionConfig
+from nepflow.domain.identities import calculate_candidate_id, calculate_structure_id
 from nepflow.errors import ArtifactError, StateError
 from nepflow.stages.selection.artifacts import write_selected_structures
 from nepflow.stages.selection.models import SelectionResult
@@ -28,8 +29,19 @@ from nepflow.state import StateStore
 def _pair() -> list[Atoms]:
     first = Atoms("Fe", positions=[[0.0, 0.0, 0.0]], cell=np.eye(3) * 4.0, pbc=True)
     second = first.copy()
-    first.info.update({"candidate_id": "candidate_fm", "magnetic_state_id": "state-fm"})
-    second.info.update({"candidate_id": "candidate_afm", "magnetic_state_id": "state-afm"})
+    structure_id = calculate_structure_id(first)
+    first.info.update(
+        {
+            "candidate_id": calculate_candidate_id(structure_id, "state-fm"),
+            "magnetic_state_id": "state-fm",
+        }
+    )
+    second.info.update(
+        {
+            "candidate_id": calculate_candidate_id(structure_id, "state-afm"),
+            "magnetic_state_id": "state-afm",
+        }
+    )
     return [first, second]
 
 
@@ -56,11 +68,22 @@ def _result() -> SelectionResult:
 def test_candidate_ids_are_unique_while_structure_ids_repeat() -> None:
     structures = _pair()
 
-    assert candidate_ids(structures) == ["candidate_fm", "candidate_afm"]
+    assert candidate_ids(structures) == [
+        structures[0].info["candidate_id"],
+        structures[1].info["candidate_id"],
+    ]
     assert structure_ids(structures)[0] == structure_ids(structures)[1]
     assert candidate_set_fingerprint(candidate_ids(structures)) == candidate_set_fingerprint(
         list(reversed(candidate_ids(structures)))
     )
+
+
+def test_candidate_ids_reject_stale_explicit_identity() -> None:
+    structure = Atoms("Fe", positions=[[0.0, 0.0, 0.0]], cell=np.eye(3) * 4.0, pbc=True)
+    structure.info["candidate_id"] = "stale-candidate-id"
+
+    with pytest.raises(StateError, match="identity mismatch"):
+        candidate_ids([structure])
 
 
 def test_selection_state_rejects_magnetic_train_test_physical_identity_reuse(tmp_path) -> None:
