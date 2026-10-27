@@ -223,6 +223,7 @@ def test_accounting_reconciles_a_job_that_left_the_queue() -> None:
     assert result.job.state is SchedulerJobState.COMPLETED
     assert result.job.stdout_path == Path("out")
     assert SACCT_FORMAT in runner.calls[1][0]
+    assert SACCT_FORMAT == "JobIDRaw,JobName,State,Reason,ExitCode,StdOut,StdErr"
 
 
 def test_reconciliation_does_not_infer_completion_without_accounting() -> None:

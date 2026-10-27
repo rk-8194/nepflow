@@ -23,7 +23,10 @@ from .process import ProcessRunner
 from .resources import JobResources, render_sbatch_directives
 
 SQUEUE_FORMAT = "%i|%j|%T|%R"
-SACCT_FORMAT = "JobIDRaw|JobName|State|Reason|ExitCode|StdOut|StdErr"
+# ``--parsable2`` controls sacct's pipe-delimited output.  The format option
+# still uses SLURM's comma-separated field-list syntax; passing pipes here is
+# interpreted as one (invalid) field name on production clusters.
+SACCT_FORMAT = "JobIDRaw,JobName,State,Reason,ExitCode,StdOut,StdErr"
 
 _STATE_ALIASES = {
     "PD": SchedulerJobState.PENDING,
