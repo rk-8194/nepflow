@@ -154,6 +154,7 @@ class TrainingCampaign:
         max_attempts: int = 1,
         resources: JobResources | None = None,
         dataset_path: str | Path | None = None,
+        site_prologue: tuple[str, ...] = (),
     ) -> None:
         if not campaign_id.strip():
             raise ValueError("campaign_id must not be blank")
@@ -182,6 +183,7 @@ class TrainingCampaign:
             backend=self.backend,
             resources=self.resources,
             input_for=self._input_for,
+            site_prologue=site_prologue,
         )
 
     @classmethod

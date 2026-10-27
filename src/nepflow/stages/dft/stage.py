@@ -20,7 +20,13 @@ from nepflow.dft.vasp.resource_memory import (
 )
 from nepflow.dft.vasp.recovery import VaspRecoveryPolicy
 from nepflow.errors import StateError, VaspError
-from nepflow.hpc.resources import JobResources
+from nepflow.hpc.resources import (
+    SITE_ENVIRONMENT_PROLOGUE,
+    JobResources,
+    load_site_environment_prologue,
+    render_shell_script,
+    require_resolvable_command_without_prologue,
+)
 from nepflow.hpc.scheduler import Scheduler
 from nepflow.io.atomic import atomic_write_text
 from nepflow.workflow.controller import StageContext
@@ -106,6 +112,7 @@ class DftStage:
         if active_context is None:
             raise ValueError("DftStage requires a StageContext")
         config = self._validate_inputs(active_context)
+        site_prologue = load_site_environment_prologue(active_context.project_dir)
         state_store = active_context.state_store
         if state_store is None:
             raise TypeError("DftStage requires the controller StateStore")
@@ -177,11 +184,19 @@ class DftStage:
                 raise StateError("DftStage requires an injected scheduler for execution")
             if not isinstance(backend, VaspBackend):
                 raise TypeError("Default DFT execution requires a backend with a runner renderer")
+            require_resolvable_command_without_prologue(
+                backend.executable_identity,
+                site_prologue,
+                source=active_context.project_dir / SITE_ENVIRONMENT_PROLOGUE,
+            )
             runner_path = active_context.project_dir / "vasp" / "run_vasp.sh"
             runner_path.parent.mkdir(parents=True, exist_ok=True)
             atomic_write_text(
                 runner_path,
-                "#!/usr/bin/env bash\n" + backend.render_runner_script(),
+                render_shell_script(
+                    backend.render_runner_script(),
+                    site_prologue=site_prologue,
+                ),
                 encoding="utf-8",
             )
             execution_orchestrator = DftReconciliationOrchestrator(

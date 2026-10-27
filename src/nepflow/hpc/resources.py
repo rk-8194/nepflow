@@ -1,15 +1,31 @@
-"""Typed SLURM resource values and shared directive rendering."""
+"""Typed SLURM resources and shared HPC script/prologue rendering."""
 
 from __future__ import annotations
 
 import math
+import os
 import re
+import shutil
+import subprocess
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Sequence
+
+from nepflow.errors import ConfigurationError
 
 MemoryValue = int | str
+
+SITE_ENVIRONMENT_PROLOGUE = Path("config/slurm/header.slurm")
+DEFAULT_SITE_ENVIRONMENT_PROLOGUE = """#!/usr/bin/env bash
+# Site environment setup for child HPC jobs.
+# Scheduler resources belong in project.config; #SBATCH directives are not allowed here.
+# Example:
+# module purge
+# module load <vasp-module>
+# source <site-environment-script>
+# export <runtime-variable>=<value>
+"""
 
 _WALLTIME_PATTERN = re.compile(
     r"^(?:(?P<days>\d+)-)?(?P<hours>\d+):(?P<minutes>[0-5]\d):(?P<seconds>[0-5]\d)$"
@@ -254,6 +270,148 @@ def _directive_key(line: str) -> str | None:
     )
 
 
+def normalize_site_environment_prologue(
+    content: str,
+    *,
+    source: str | Path = SITE_ENVIRONMENT_PROLOGUE,
+) -> tuple[str, ...]:
+    """Validate and normalize a shell-only site environment prologue.
+
+    Scheduler directives are intentionally forbidden here.  Typed project
+    configuration and ``JobResources`` are the sole owners of scheduler and
+    resource policy.  Shebangs are removed because final scripts render one
+    canonical interpreter line.
+    """
+
+    if not isinstance(content, str):
+        raise ConfigurationError(f"Site environment prologue is not text: {source}")
+    normalized: list[str] = []
+    for line_number, line in enumerate(content.splitlines(), start=1):
+        stripped = line.strip()
+        if stripped.startswith("#!"):
+            continue
+        if stripped.startswith("#SBATCH"):
+            directive = _directive_key(stripped)
+            detail = directive or stripped.removeprefix("#SBATCH").strip() or "directive"
+            raise ConfigurationError(
+                f"Site environment prologue {source} contains forbidden scheduler "
+                f"directive {detail!r} on line {line_number}; configure scheduler "
+                "resources in project.config"
+            )
+        normalized.append(line.rstrip())
+    while normalized and not normalized[0].strip():
+        normalized.pop(0)
+    while normalized and not normalized[-1].strip():
+        normalized.pop()
+    return tuple(normalized)
+
+
+def load_site_environment_prologue(project_dir: str | Path) -> tuple[str, ...]:
+    """Load the project's optional shell bootstrap from its canonical path.
+
+    A missing file is an explicit empty-prologue policy.  Callers that require
+    an executable unavailable in the current environment should pair this
+    with :func:`require_resolvable_command_without_prologue` before submission.
+    """
+
+    path = Path(project_dir) / SITE_ENVIRONMENT_PROLOGUE
+    try:
+        content = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return ()
+    except IsADirectoryError as exc:
+        raise ConfigurationError(f"Site environment prologue is not a file: {path}") from exc
+    except (OSError, UnicodeError) as exc:
+        raise ConfigurationError(f"Could not read site environment prologue: {path}") from exc
+    prologue = normalize_site_environment_prologue(content, source=path)
+    bash = shutil.which("bash")
+    if bash is not None:
+        try:
+            syntax = subprocess.run(
+                (bash, "-n"),
+                input=render_shell_script("", site_prologue=prologue),
+                text=True,
+                capture_output=True,
+                check=False,
+                timeout=10,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise ConfigurationError(
+                f"Could not validate site environment prologue syntax: {path}"
+            ) from exc
+        if syntax.returncode != 0:
+            detail = (syntax.stderr or syntax.stdout or "invalid bash syntax").strip()
+            raise ConfigurationError(
+                f"Site environment prologue has invalid bash syntax: {path}: {detail}"
+            )
+    return prologue
+
+
+def render_shell_script(
+    body: str,
+    *,
+    site_prologue: Iterable[str] = (),
+) -> str:
+    """Render one canonical bash script around a validated site prologue."""
+
+    prologue = normalize_site_environment_prologue(
+        "\n".join(str(line).rstrip("\n") for line in site_prologue),
+        source="site environment prologue",
+    )
+    body_lines = [line for line in str(body).splitlines() if not line.strip().startswith("#!")]
+    while body_lines and not body_lines[0].strip():
+        body_lines.pop(0)
+    while body_lines and not body_lines[-1].strip():
+        body_lines.pop()
+    lines = ["#!/usr/bin/env bash"]
+    if prologue:
+        lines.extend(("", *prologue))
+    if body_lines:
+        lines.extend(("", *body_lines))
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def require_resolvable_command_without_prologue(
+    command: Sequence[str | Path],
+    site_prologue: Iterable[str],
+    *,
+    source: str | Path,
+) -> None:
+    """Fail before submission when an empty prologue cannot expose a command."""
+
+    if any(line.strip() and not line.lstrip().startswith("#") for line in site_prologue):
+        return
+    values = [os.path.expanduser(os.path.expandvars(os.fspath(part))) for part in command]
+    if not values:
+        raise ConfigurationError("Configured HPC execution command is empty")
+    launchers = {"mpirun", "mpiexec", "prterun", "srun"}
+    first = Path(values[0]).name.lower()
+    candidate = values[0]
+    if first in launchers:
+        candidates = [
+            value
+            for value in values[1:]
+            if value
+            and not value.startswith("-")
+            and not value.isdigit()
+            and "{ntasks}" not in value
+        ]
+        if candidates:
+            candidate = candidates[-1]
+    candidate_path = Path(candidate)
+    available = (
+        candidate_path.is_file() and os.access(candidate_path, os.X_OK)
+        if any(separator in candidate for separator in ("/", "\\"))
+        else shutil.which(candidate) is not None
+    )
+    if not available:
+        raise ConfigurationError(
+            f"Site environment prologue {source} is missing or contains no bootstrap "
+            f"commands, and configured executable {candidate!r} is not resolvable; "
+            f"configure {SITE_ENVIRONMENT_PROLOGUE} before submitting child jobs"
+        )
+
+
 def render_slurm_header(
     resources: JobResources,
     *,
@@ -292,9 +450,11 @@ def render_slurm_header(
         for line in base_lines
         if not line.startswith("#!") and _directive_key(line) not in replacement_keys
     ]
-    prologue = [line.rstrip("\n") for line in site_prologue]
+    prologue = normalize_site_environment_prologue(
+        "\n".join(str(line).rstrip("\n") for line in site_prologue),
+        source="site environment prologue",
+    )
     lines = [
-        shebang,
         *render_sbatch_directives(
             resources,
             job_name=job_name,
@@ -304,7 +464,20 @@ def render_slurm_header(
     ]
     lines.extend(preserved)
     lines.extend(prologue)
-    return "\n".join(lines).rstrip() + "\n"
+    rendered = render_shell_script("\n".join(lines), site_prologue=())
+    if shebang != "#!/usr/bin/env bash":
+        rendered = shebang + rendered[rendered.index("\n") :]
+    return rendered
 
 
-__all__ = ["JobResources", "render_sbatch_directives", "render_slurm_header"]
+__all__ = [
+    "DEFAULT_SITE_ENVIRONMENT_PROLOGUE",
+    "JobResources",
+    "SITE_ENVIRONMENT_PROLOGUE",
+    "load_site_environment_prologue",
+    "normalize_site_environment_prologue",
+    "render_sbatch_directives",
+    "render_shell_script",
+    "render_slurm_header",
+    "require_resolvable_command_without_prologue",
+]

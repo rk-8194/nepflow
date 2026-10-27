@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Callable, Sequence
 
 from nepflow.errors import StateError
-from nepflow.hpc.resources import JobResources
+from nepflow.hpc.resources import JobResources, load_site_environment_prologue
 from nepflow.hpc.scheduler import Scheduler
 from nepflow.io.hashing import sha256_bytes, sha256_file
 from nepflow.io.json import canonical_json_bytes
@@ -331,6 +331,7 @@ class TrainingStage:
             max_attempts=config.train_nep.max_resubmit + 1,
             resources=self._resources(config),
             dataset_path=dataset_path,
+            site_prologue=load_site_environment_prologue(context.project_dir),
         )
         campaign.ensure(
             {

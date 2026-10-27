@@ -62,6 +62,7 @@ from nepflow.application.runtime import (  # noqa: E402
 )
 from nepflow.config.loader import canonical_config_path  # noqa: E402
 from nepflow.errors import (  # noqa: E402
+    ConfigurationError,
     ProcessError,
     StateError,
     ValidationError,
@@ -427,6 +428,7 @@ def _run_controller(
         ValueError,
         IOError,
         RuntimeError,
+        ConfigurationError,
         StateError,
         ValidationError,
         SchedulerError,
@@ -458,6 +460,7 @@ def _run_rollback(args: argparse.Namespace, controller: WorkflowController) -> N
         ValueError,
         IOError,
         RuntimeError,
+        ConfigurationError,
         StateError,
         ValidationError,
         SchedulerError,

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+import shlex
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -11,7 +13,8 @@ from nepflow.domain.identities import ValidationRunIdentity
 from nepflow.domain.models import ModelRunRecord, ValidationRunRecord
 from nepflow.errors import StateError
 from nepflow.hpc.jobs import SchedulerJobState
-from nepflow.hpc.resources import JobResources
+from nepflow.hpc.resources import JobResources, render_shell_script
+from nepflow.io.atomic import atomic_write_text
 from nepflow.io.json import to_jsonable
 from nepflow.mlip.gpumd import GpumdBackend
 from nepflow.mlip.simulation import StaticPrediction
@@ -130,6 +133,7 @@ class ValidationReconciliationOrchestrator:
         max_attempts: int = 1,
         resources: JobResources | None = None,
         job_name_prefix: str | None = None,
+        site_prologue: tuple[str, ...] = (),
     ) -> None:
         if max_concurrent < 1:
             raise ValueError("max_concurrent must be positive")
@@ -169,6 +173,7 @@ class ValidationReconciliationOrchestrator:
         self.max_attempts = max_attempts
         self.resources = resources
         self.job_name_prefix = job_name_prefix
+        self.site_prologue = tuple(site_prologue)
         self._ensure_run()
         self._ensure_cases()
 
@@ -450,11 +455,32 @@ class ValidationReconciliationOrchestrator:
             f"{self.job_name_prefix or 'validation'}-{record.case.ordinal:04d}-a{record.attempt_number:03d}"
         )
         try:
-            submission = self.scheduler.submit(
-                tuple(command),
-                cwd=record.case.working_directory,
-                resources=self.resources,
-            )
+            submit_script = getattr(self.scheduler, "submit_script", None)
+            if callable(submit_script):
+                script_path = (
+                    record.case.working_directory
+                    / f"run_validation_a{record.attempt_number:04d}.sh"
+                )
+                script_body = "set -eu\nexec " + " ".join(
+                    shlex.quote(os.path.expandvars(str(part))) for part in command
+                )
+                atomic_write_text(
+                    script_path,
+                    render_shell_script(script_body, site_prologue=self.site_prologue),
+                    encoding="utf-8",
+                )
+                submission = submit_script(
+                    script_path,
+                    cwd=record.case.working_directory,
+                    resources=self.resources,
+                    job_name=job_name,
+                )
+            else:
+                submission = self.scheduler.submit(
+                    tuple(command),
+                    cwd=record.case.working_directory,
+                    resources=self.resources,
+                )
         except Exception as exc:
             # Scheduler adapter failures become an explicit failed/retry
             # transition.  They are never converted into an empty queue.

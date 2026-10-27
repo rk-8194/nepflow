@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping
 
 from nepflow.errors import StateError
-from nepflow.hpc.resources import JobResources
+from nepflow.hpc.resources import JobResources, render_shell_script
 from nepflow.io.atomic import atomic_write_text
 from nepflow.io.hashing import sha256_bytes, sha256_file
 from nepflow.io.json import canonical_json_bytes, to_jsonable
@@ -28,10 +28,12 @@ class TrainingExecution:
         backend: Any,
         resources: JobResources | None,
         input_for: Callable[[Any], Any],
+        site_prologue: tuple[str, ...] = (),
     ) -> None:
         self.backend = backend
         self.resources = resources
         self.input_for = input_for
+        self.site_prologue = tuple(site_prologue)
 
     @staticmethod
     def attempt_directory(candidate: Any, attempt_number: int) -> Path:
@@ -77,15 +79,15 @@ class TrainingExecution:
             if not destination.is_file():
                 shutil.copy2(source, destination)
 
-    @staticmethod
-    def _script_content(execution_directory: Path, command: tuple[Any, ...]) -> str:
-        return (
-            "#!/bin/sh\nset -eu\ncd "
+    def _script_content(self, execution_directory: Path, command: tuple[Any, ...]) -> str:
+        body = (
+            "set -eu\ncd "
             + shlex.quote(str(execution_directory))
             + "\n"
             + " ".join(shlex.quote(os.path.expandvars(str(part))) for part in command)
             + "\n"
         )
+        return render_shell_script(body, site_prologue=self.site_prologue)
 
     @staticmethod
     def _write_script_file(

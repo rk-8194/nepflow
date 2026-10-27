@@ -10,7 +10,7 @@ from typing import Any, cast
 
 from nepflow.domain.identities import ValidationRunIdentity
 from nepflow.errors import StateError
-from nepflow.hpc.resources import JobResources
+from nepflow.hpc.resources import JobResources, load_site_environment_prologue
 from nepflow.hpc.scheduler import Scheduler
 from nepflow.mlip.gpumd import GpumdBackend
 from nepflow.mlip.simulation import StaticPrediction, StaticPredictionBackend
@@ -221,6 +221,9 @@ class ValidationStage:
                 max_attempts=self.max_attempts,
                 resources=self._resources(active),
                 job_name_prefix=f"nf_validation_{active.project_name}_" if active else None,
+                site_prologue=(
+                    load_site_environment_prologue(project_dir) if active is not None else ()
+                ),
             )
         execution = orchestrator.reconcile_once()
         metrics = None

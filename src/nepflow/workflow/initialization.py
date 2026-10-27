@@ -13,6 +13,11 @@ from nepflow.config.creation import (
     write_validated_config,
 )
 from nepflow.errors import ConfigurationError, StateError
+from nepflow.hpc.resources import (
+    DEFAULT_SITE_ENVIRONMENT_PROLOGUE,
+    SITE_ENVIRONMENT_PROLOGUE,
+)
+from nepflow.io.atomic import atomic_write_text
 from nepflow.io.hashing import sha256_canonical_json
 from nepflow.state import CURRENT_SCHEMA_VERSION, StateStore
 
@@ -135,6 +140,14 @@ class ProjectCreationService:
         for directory in directories:
             directory.mkdir(parents=True, exist_ok=True)
             logger.debug("Created directory: %s", directory)
+        prologue_path = self.project_dir / SITE_ENVIRONMENT_PROLOGUE
+        if not prologue_path.exists():
+            atomic_write_text(
+                prologue_path,
+                DEFAULT_SITE_ENVIRONMENT_PROLOGUE,
+                encoding="utf-8",
+            )
+            logger.debug("Created site environment prologue template: %s", prologue_path)
 
     def setup_config(
         self,

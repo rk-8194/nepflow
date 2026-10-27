@@ -20,7 +20,7 @@ from nepflow.dft.vasp.inputs import set_incar_parameters
 from nepflow.dft.vasp.outputs import VaspPerformanceEvidence, parse_performance_evidence
 from nepflow.domain.identities import StructureIdentity
 from nepflow.errors import StateError
-from nepflow.hpc.resources import JobResources
+from nepflow.hpc.resources import JobResources, render_shell_script
 from nepflow.hpc.scheduler import Scheduler
 from nepflow.io.atomic import atomic_write_text
 from nepflow.io.hashing import sha256_canonical_json
@@ -571,12 +571,14 @@ class VaspBenchmarkRunner:
         scheduler: Scheduler,
         state_store: Any,
         max_concurrent: int = 1,
+        site_prologue: tuple[str, ...] = (),
     ) -> None:
         self.plan = plan
         self.backend = backend
         self.scheduler = scheduler
         self.state_store = state_store
         self.max_concurrent = max_concurrent
+        self.site_prologue = tuple(site_prologue)
         self._executions: tuple[VaspBenchmarkExecution, ...] | None = None
 
     def prepare(self) -> tuple[VaspBenchmarkExecution, ...]:
@@ -591,7 +593,10 @@ class VaspBenchmarkRunner:
         runner_path = self.runner_path
         atomic_write_text(
             runner_path,
-            "#!/usr/bin/env bash\nset -e\n" + render_runner(),
+            render_shell_script(
+                "set -e\n" + render_runner(),
+                site_prologue=self.site_prologue,
+            ),
             encoding="utf-8",
         )
         executions = [self._prepare_case(case, DftExecutionRecord) for case in self.plan.cases]
