@@ -19,6 +19,7 @@ from nepflow.state import StateStore
 
 from .resubmission import ReconciliationResult, ReconciliationSource
 from .stages import (
+    RollbackResult,
     StageRunState,
     StageRunStatus,
     WorkflowStage,
@@ -260,81 +261,130 @@ class WorkflowState:
             raise StateError(f"Stage transition was not persisted: {typed_target.value}")
         return StageRunStatus.from_mapping(row)
 
-    def restart_selection(
+    _ROLLBACK_ORDER: tuple[WorkflowStage, ...] = (
+        WorkflowStage.INIT,
+        WorkflowStage.GENERATE,
+        WorkflowStage.SELECT,
+        WorkflowStage.RUN_VASP,
+        WorkflowStage.TRAIN_NEP,
+        WorkflowStage.VALIDATE,
+        WorkflowStage.COMPLETED,
+    )
+
+    def validate_rollback_target(
         self,
+        target: WorkflowStage | str,
+        *,
+        original: WorkflowStage | str | None = None,
+    ) -> WorkflowStage:
+        """Validate target ordering and the restart prerequisites it owns."""
+
+        typed_target = parse_legacy_stage(target)
+        if typed_target in {WorkflowStage.INIT, WorkflowStage.COMPLETED}:
+            raise StateError(f"Stage cannot be a rollback target: {typed_target.value}")
+        current = (
+            WorkflowStage.from_legacy(original)
+            if original is not None
+            else self.reconcile().stage
+        )
+        if self._ROLLBACK_ORDER.index(typed_target) > self._ROLLBACK_ORDER.index(current):
+            raise StateError(
+                f"Cannot rollback from {current.value!r} to later stage {typed_target.value!r}"
+            )
+        if typed_target is WorkflowStage.SELECT:
+            path = (
+                self.marker_path.parent
+                / "structures"
+                / "generated"
+                / "generated_structures.xyz"
+            )
+            try:
+                ready = path.is_file() and path.stat().st_size > 0
+            except OSError as exc:
+                raise StateError(
+                    f"Cannot rollback selection; generated input cannot be inspected: {path}"
+                ) from exc
+            if not ready:
+                raise StateError(
+                    "Cannot rollback selection; generated structures are missing or empty: "
+                    f"{path}"
+                )
+        if typed_target is WorkflowStage.RUN_VASP:
+            selected_dir = self.marker_path.parent / "structures" / "selected"
+            missing = []
+            for dataset in ("train", "test"):
+                path = selected_dir / f"{dataset}.xyz"
+                try:
+                    ready = path.is_file() and path.stat().st_size > 0
+                except OSError as exc:
+                    raise StateError(
+                        f"Cannot rollback DFT; selected input cannot be inspected: {path}"
+                    ) from exc
+                if not ready:
+                    missing.append(path)
+            if missing:
+                raise StateError(
+                    "Cannot rollback DFT; selected input(s) are missing or empty: "
+                    + ", ".join(str(path) for path in missing)
+                )
+        return typed_target
+
+    def rollback(
+        self,
+        target: WorkflowStage | str,
         *,
         metadata: Mapping[str, Any] | None = None,
-    ) -> StageRunStatus:
-        """Guardedly rewind workflow authority to ``select``.
+    ) -> RollbackResult:
+        """Atomically rewind stage authority and invalidate downstream state."""
 
-        This is intentionally separate from ``transition_to``: routine
-        processing remains adjacent-only, while an explicit operator restart
-        invalidates downstream stage authority and prior selection reuse in
-        one ledger transaction.  Scientific files are retained as history.
-        """
-
-        generated_path = (
-            self.marker_path.parent
-            / "structures"
-            / "generated"
-            / "generated_structures.xyz"
-        )
-        try:
-            generated_ready = generated_path.is_file() and generated_path.stat().st_size > 0
-        except OSError as exc:
-            raise StateError(
-                f"Cannot restart selection; generated input cannot be inspected: {generated_path}"
-            ) from exc
-        if not generated_ready:
-            raise StateError(
-                "Cannot restart selection; generated structures are missing or empty: "
-                f"{generated_path}"
-            )
-
+        typed_target = parse_legacy_stage(target)
         current = self.reconcile().stage
-        restartable = {
-            WorkflowStage.SELECT,
-            WorkflowStage.RUN_VASP,
-            WorkflowStage.TRAIN_NEP,
-            WorkflowStage.VALIDATE,
-            WorkflowStage.COMPLETED,
-        }
-        if current not in restartable:
-            raise StateError(
-                "Explicit selection restart requires the current workflow stage to be "
-                f"select or later; current stage is {current.value!r}"
-            )
-        previous_runs = {
-            stage.value: self.store.get_stage_run(self._stage_run_id(stage))
-            for stage in (
-                WorkflowStage.SELECT,
-                WorkflowStage.RUN_VASP,
-                WorkflowStage.TRAIN_NEP,
-                WorkflowStage.VALIDATE,
-                WorkflowStage.COMPLETED,
-            )
-        }
+        self.validate_rollback_target(typed_target, original=current)
         now = self._timestamp()
         base_metadata = dict(metadata or {})
         base_metadata.update(
             {
-                "source": "explicit_select_restart",
-                "restart_target": WorkflowStage.SELECT.value,
+                "source": "explicit_workflow_rollback",
+                "rollback_target": typed_target.value,
+                "original_stage": current.value,
                 "invalidated_at": now,
             }
         )
-        # Give the replacement select run a strictly newer ordering key than
-        # the invalidated downstream rows.  The ledger uses started_at when
-        # deciding which stage is authoritative, so equal timestamps would
-        # make the result depend on stage-id tie breaking.
-        select_started_at = (
-            datetime.fromisoformat(now) + timedelta(microseconds=1)
-        ).isoformat()
+        target_index = self._ROLLBACK_ORDER.index(typed_target)
+        invalidated = tuple(
+            stage
+            for stage in self._ROLLBACK_ORDER[target_index:]
+            if stage not in {WorkflowStage.INIT, WorkflowStage.COMPLETED}
+        )
+
         with self.store.transaction():
-            self.store.invalidate_selection_runs(self.project_id)
-            for stage, previous in previous_runs.items():
-                if previous is None and stage != WorkflowStage.SELECT.value:
-                    continue
+            if typed_target in {WorkflowStage.GENERATE, WorkflowStage.SELECT}:
+                self.store.invalidate_selection_runs(self.project_id)
+                self.store.invalidate_dft_calculations(
+                    source="explicit_workflow_rollback",
+                )
+                self.store.invalidate_downstream_records(
+                    self.project_id,
+                    source="explicit_workflow_rollback",
+                )
+            elif typed_target is WorkflowStage.TRAIN_NEP:
+                self.store.invalidate_model_runs(
+                    self.project_id,
+                    source="explicit_workflow_rollback",
+                )
+            elif typed_target is WorkflowStage.VALIDATE:
+                self.store.invalidate_validation_runs(
+                    self.project_id,
+                    source="explicit_workflow_rollback",
+                )
+            elif typed_target is WorkflowStage.RUN_VASP:
+                self.store.invalidate_downstream_records(
+                    self.project_id,
+                    source="explicit_workflow_rollback",
+                )
+
+            for stage in invalidated:
+                previous = self.store.get_stage_run(self._stage_run_id(stage))
                 previous_record = None
                 if previous is not None:
                     previous_record = {
@@ -344,104 +394,35 @@ class WorkflowState:
                         "completed_at": previous.get("completed_at"),
                         "metadata": previous.get("metadata"),
                     }
-                stage_value = WorkflowStage.from_legacy(stage)
                 stage_metadata = dict(base_metadata)
                 stage_metadata["previous_stage_run"] = previous_record
-                if stage_value is WorkflowStage.SELECT:
+                if stage is typed_target:
+                    started_at = (
+                        datetime.fromisoformat(now) + timedelta(microseconds=1)
+                    ).isoformat()
                     self._record_stage(
-                        stage_value,
+                        stage,
                         status=StageRunState.RUNNING,
-                        started_at=select_started_at,
+                        started_at=started_at,
                         completed_at=None,
                         metadata=stage_metadata,
                     )
-                else:
+                elif previous is not None:
                     self._record_stage(
-                        stage_value,
+                        stage,
                         status=StageRunState.FAILED,
                         started_at=now,
                         completed_at=now,
                         metadata={**stage_metadata, "invalidated": True},
                     )
 
-        self._write_marker(WorkflowStage.SELECT)
-        row = self.store.get_stage_run(self._stage_run_id(WorkflowStage.SELECT))
-        if row is None:  # pragma: no cover - guarded by the store write
-            raise StateError("Selection restart was not persisted")
-        return StageRunStatus.from_mapping(row)
-
-    def restart_dft(
-        self,
-        *,
-        metadata: Mapping[str, Any] | None = None,
-    ) -> StageRunStatus:
-        """Rewind workflow authority to ``run_vasp`` for an explicit restart."""
-
-        current = self.reconcile().stage
-        restartable = {
-            WorkflowStage.RUN_VASP,
-            WorkflowStage.TRAIN_NEP,
-            WorkflowStage.VALIDATE,
-            WorkflowStage.COMPLETED,
-        }
-        if current not in restartable:
-            raise StateError(
-                "Explicit DFT restart requires the current workflow stage to be "
-                f"run_vasp or later; current stage is {current.value!r}"
-            )
-
-        previous_runs = {
-            stage.value: self.store.get_stage_run(self._stage_run_id(stage))
-            for stage in restartable
-        }
-        now = self._timestamp()
-        base_metadata = dict(metadata or {})
-        base_metadata.update(
-            {
-                "source": "explicit_run_vasp_restart",
-                "restart_target": WorkflowStage.RUN_VASP.value,
-                "invalidated_at": now,
-            }
+        self._write_marker(typed_target)
+        return RollbackResult(
+            target=typed_target,
+            original_stage=current,
+            invalidated_stages=invalidated,
+            cleanup_summary={},
         )
-        run_vasp_started_at = (
-            datetime.fromisoformat(now) + timedelta(microseconds=1)
-        ).isoformat()
-        with self.store.transaction():
-            for stage, previous in previous_runs.items():
-                if previous is None:
-                    continue
-                previous_record = {
-                    "stage_run_id": previous.get("stage_run_id"),
-                    "status": previous.get("status"),
-                    "started_at": previous.get("started_at"),
-                    "completed_at": previous.get("completed_at"),
-                    "metadata": previous.get("metadata"),
-                }
-                stage_value = WorkflowStage.from_legacy(stage)
-                stage_metadata = dict(base_metadata)
-                stage_metadata["previous_stage_run"] = previous_record
-                if stage_value is WorkflowStage.RUN_VASP:
-                    self._record_stage(
-                        stage_value,
-                        status=StageRunState.RUNNING,
-                        started_at=run_vasp_started_at,
-                        completed_at=None,
-                        metadata=stage_metadata,
-                    )
-                else:
-                    self._record_stage(
-                        stage_value,
-                        status=StageRunState.FAILED,
-                        started_at=now,
-                        completed_at=now,
-                        metadata={**stage_metadata, "invalidated": True},
-                    )
-
-        self._write_marker(WorkflowStage.RUN_VASP)
-        row = self.store.get_stage_run(self._stage_run_id(WorkflowStage.RUN_VASP))
-        if row is None:  # pragma: no cover - guarded by the store write
-            raise StateError("DFT restart was not persisted")
-        return StageRunStatus.from_mapping(row)
 
     def mark_failed(self, error: BaseException) -> StageRunStatus:
         """Record failure of the current stage without advancing it."""

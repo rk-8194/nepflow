@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
+from uuid import uuid4
 
 from nepflow.cli_wizard import CONFIG_PROMPTS, ConfigWizard
-from nepflow.errors import ValidationError
+from nepflow.errors import StateError, ValidationError
+from nepflow.hpc.jobs import SchedulerJobState
 from nepflow.hpc.process import ProcessRunner
 from nepflow.hpc.slurm import SlurmScheduler
-from nepflow.stages.dft import DftRestartService, DftStage
+from nepflow.stages.dft import DftRollbackService, DftStage
 from nepflow.stages.generation import GenerationStage
 from nepflow.stages.generation.debug import run_debug
 from nepflow.stages.generation.generators.base import ConfigurationalGenerator
@@ -338,27 +340,98 @@ def _register_scheduler_stages(
     *,
     scheduler: SlurmScheduler,
 ) -> None:
-    restart_service = DftRestartService(scheduler)
+    rollback_service = DftRollbackService(scheduler)
+
+    def rollback_scheduler_events(
+        context: StageContext,
+        entity_type: str,
+    ) -> dict[str, object]:
+        """Cancel active campaign jobs and append a historical cancellation event."""
+
+        if context.state_store is None:
+            raise ValidationError("Scheduler rollback requires the authoritative StateStore")
+        events = context.state_store.list_events(entity_type=entity_type)
+        latest: dict[str, tuple[dict[str, object], str]] = {}
+        for event in events:
+            payload = event.get("payload")
+            if not isinstance(payload, dict):
+                continue
+            key = payload.get("attempt_id") or payload.get("case_id")
+            if key:
+                latest[str(key)] = (dict(payload), str(event.get("entity_id")))
+        cancelled: list[str] = []
+        for payload, entity_id in latest.values():
+            status = str(payload.get("status", ""))
+            job_id = payload.get("job_id")
+            if status not in {"submitting", "submitted", "running"} or not job_id:
+                continue
+            job_id = str(job_id)
+            reconciliation = scheduler.reconcile(job_id)
+            if reconciliation.job.state is SchedulerJobState.UNKNOWN:
+                raise StateError(f"Cannot determine scheduler state for rollback job {job_id}")
+            if reconciliation.job.state.is_active:
+                scheduler.cancel(job_id)
+                reconciliation = scheduler.reconcile(job_id)
+                if reconciliation.job.state is SchedulerJobState.UNKNOWN:
+                    raise StateError(f"Cannot confirm cancellation of rollback job {job_id}")
+                if reconciliation.job.state.is_active:
+                    raise StateError(f"Rollback job {job_id} remains active after cancellation")
+            elif (
+                reconciliation.job.state.is_terminal
+                and reconciliation.job.state is not SchedulerJobState.NOT_FOUND
+            ):
+                # A stale campaign projection may point at a job that already
+                # reached a terminal state. Preserve that evidence unchanged.
+                continue
+            payload.update(
+                {
+                    "status": "cancelled",
+                    "failure_reason": "explicit_workflow_rollback",
+                }
+            )
+            event_key = payload.get("attempt_id") or payload.get("case_id") or uuid4().hex
+            context.state_store.append_event(
+                f"rollback:{entity_type}:{event_key}:{uuid4().hex}",
+                entity_type,
+                entity_id,
+                "rollback_cancelled",
+                payload,
+            )
+            cancelled.append(job_id)
+        return {"cancelled_job_ids": tuple(cancelled), "cancelled_count": len(cancelled)}
 
     def run_dft(context: StageContext) -> StageRunResult:
         return DftStage(scheduler=scheduler).run(context).as_workflow_result()
 
-    def restart_run_vasp(context: StageContext) -> None:
+    def rollback_run_vasp(context: StageContext) -> dict[str, object]:
         if context.state_store is None:
-            raise ValidationError("DFT restart requires the authoritative StateStore")
-        restart_service.restart(
+            raise ValidationError("DFT rollback requires the authoritative StateStore")
+        result = rollback_service.rollback(
             project_dir=context.project_dir,
             project_name=context.project_name,
             state_store=context.state_store,
             scheduler=scheduler,
             poll_interval_seconds=context.config.slurm.poll_interval,
         )
+        return {
+            "cancelled_attempt_ids": result.cancelled_attempt_ids,
+            "cancelled_job_ids": result.cancelled_job_ids,
+            "execution_generations": result.execution_generations,
+        }
 
     def run_validation(context: StageContext) -> StageRunResult:
         return ValidationStage(context=context, scheduler=scheduler).run().as_workflow_result()
 
     registry.register(WorkflowStage.RUN_VASP, run_dft)
-    registry.register_auxiliary("restart_run_vasp", restart_run_vasp)
+    registry.register_rollback(WorkflowStage.RUN_VASP, rollback_run_vasp)
+    registry.register_rollback(
+        WorkflowStage.TRAIN_NEP,
+        lambda context: rollback_scheduler_events(context, "training_attempt"),
+    )
+    registry.register_rollback(
+        WorkflowStage.VALIDATE,
+        lambda context: rollback_scheduler_events(context, "validation_attempt"),
+    )
     registry.register(
         WorkflowStage.TRAIN_NEP,
         lambda context: TrainingStage(scheduler=scheduler).run(context),

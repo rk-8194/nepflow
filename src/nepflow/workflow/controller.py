@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import time
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -14,7 +14,13 @@ from nepflow.errors import ConfigurationError, StateError
 from nepflow.state import StateStore
 
 from .resubmission import ReconciliationResult, SelfResubmitExit
-from .stages import StageRunResult, StageRunState, StageRunStatus, WorkflowStage
+from .stages import (
+    RollbackResult,
+    StageRunResult,
+    StageRunState,
+    StageRunStatus,
+    WorkflowStage,
+)
 from .state import WorkflowState
 
 logger = logging.getLogger(__name__)
@@ -45,6 +51,7 @@ class StageHandler(Protocol):
 
 
 StageReconciler = Callable[[StageContext], None]
+RollbackHandler = Callable[[StageContext], Mapping[str, Any] | None]
 
 
 @dataclass(frozen=True, slots=True)
@@ -78,6 +85,7 @@ class StageRegistry:
     def __init__(self) -> None:
         self._bindings: dict[WorkflowStage, StageBinding] = {}
         self._auxiliary: dict[str, StageHandler] = {}
+        self._rollback_handlers: dict[WorkflowStage, RollbackHandler] = {}
 
     def register(
         self,
@@ -122,6 +130,16 @@ class StageRegistry:
         if key in self._auxiliary:
             raise StateError(f"Auxiliary workflow handler is already registered: {key}")
         self._auxiliary[key] = handler
+
+    def register_rollback(self, stage: WorkflowStage | str, handler: RollbackHandler) -> None:
+        """Register target-specific external cleanup for an explicit rollback."""
+
+        typed_stage = WorkflowStage.from_legacy(stage)
+        if typed_stage in {WorkflowStage.INIT, WorkflowStage.COMPLETED}:
+            raise StateError(f"Stage cannot be a rollback target: {typed_stage.value}")
+        if typed_stage in self._rollback_handlers:
+            raise StateError(f"Rollback handler is already registered: {typed_stage.value}")
+        self._rollback_handlers[typed_stage] = handler
 
     def binding(self, stage: WorkflowStage | str) -> StageBinding:
         """Return a registered stage binding or raise ``StateError``."""
@@ -176,6 +194,23 @@ class StageRegistry:
     def execute_auxiliary(self, name: str, context: StageContext) -> StageRunResult | None:
         """Execute a named auxiliary handler without changing workflow state."""
         return self.auxiliary(name)(context)
+
+    def rollback(self, stage: WorkflowStage, context: StageContext) -> Mapping[str, Any]:
+        """Run target-specific external cleanup, if the application owns any."""
+
+        typed_stage = WorkflowStage.from_legacy(stage)
+        handler = self._rollback_handlers.get(typed_stage)
+        if handler is None:
+            return {}
+        summary = handler(context)
+        if summary is None:
+            return {}
+        if not isinstance(summary, Mapping):
+            raise StateError(
+                f"Rollback handler for {typed_stage.value} returned "
+                f"{type(summary).__name__}, expected a mapping"
+            )
+        return dict(summary)
 
 
 class WorkflowController:
@@ -299,8 +334,11 @@ class WorkflowController:
         *,
         seeds_only: bool = False,
         mode: str = "normal",
+        options: Mapping[str, Any] | None = None,
     ) -> StageContext:
-        options: dict[str, Any] = {"mode": mode}
+        context_options: dict[str, Any] = {"mode": mode}
+        if options:
+            context_options.update(options)
         return StageContext(
             project_name=self.project_name,
             project_dir=self.project_dir,
@@ -313,7 +351,7 @@ class WorkflowController:
             local_mode=self.local_mode,
             seeds_only=seeds_only,
             slurm_deadline=self.slurm_deadline,
-            options=options,
+            options=context_options,
         )
 
     def current_stage(self) -> WorkflowStage:
@@ -328,6 +366,33 @@ class WorkflowController:
         """Validate and persist one explicit workflow transition."""
         return self.workflow_state.transition_to(stage)
 
+    def rollback(self, target: WorkflowStage | str) -> RollbackResult:
+        """Perform an explicit operator rollback without executing its target."""
+
+        typed_target = WorkflowStage.from_legacy(target)
+        if typed_target in {WorkflowStage.INIT, WorkflowStage.COMPLETED}:
+            raise StateError(
+                f"Rollback target must be a runnable stage, got {typed_target.value!r}"
+            )
+        original = self.current_stage()
+        self.workflow_state.validate_rollback_target(typed_target, original=original)
+        context = self._context(
+            mode="rollback",
+            options={
+                "rollback_target": typed_target.value,
+                "rollback_original_stage": original.value,
+            },
+        )
+        cleanup_summary = self.stage_registry.rollback(typed_target, context)
+        state_result = self.workflow_state.rollback(
+            typed_target,
+            metadata={
+                "project_name": self.project_name,
+                "cleanup_summary": dict(cleanup_summary),
+            },
+        )
+        return replace(state_result, cleanup_summary=dict(cleanup_summary))
+
     def _check_deadline(self) -> None:
         if self.slurm_deadline is None:
             return
@@ -339,50 +404,6 @@ class WorkflowController:
             logger.info(
                 "Approaching SLURM deadline (%.1fs remaining)",
                 self.slurm_deadline - wall_clock_epoch_seconds,
-            )
-
-    def _validate_selection_restart_input(self) -> None:
-        """Check the generated input before changing workflow authority."""
-
-        generated_path = (
-            self.project_dir
-            / "structures"
-            / "generated"
-            / "generated_structures.xyz"
-        )
-        try:
-            ready = generated_path.is_file() and generated_path.stat().st_size > 0
-        except OSError as exc:
-            raise StateError(
-                "Cannot restart selection; generated input cannot be inspected: "
-                f"{generated_path}"
-            ) from exc
-        if not ready:
-            raise StateError(
-                "Cannot restart selection; generated structures are missing or empty: "
-                f"{generated_path}"
-            )
-
-    def _validate_dft_restart_input(self) -> None:
-        """Check selected structures before entering the DFT stage."""
-
-        selected_dir = self.project_dir / "structures" / "selected"
-        missing = []
-        for dataset in ("train", "test"):
-            path = selected_dir / f"{dataset}.xyz"
-            try:
-                ready = path.is_file() and path.stat().st_size > 0
-            except OSError as exc:
-                raise StateError(
-                    "Cannot restart DFT; selected input cannot be inspected: "
-                    f"{path}"
-                ) from exc
-            if not ready:
-                missing.append(path)
-        if missing:
-            raise StateError(
-                "Cannot restart DFT; selected input(s) are missing or empty: "
-                + ", ".join(str(path) for path in missing)
             )
 
     def _execute_stage(
@@ -485,68 +506,18 @@ class WorkflowController:
                 f"Project '{self.project_name}' is not initialized; run the initialization stage first"
             )
 
-        explicit_generate_restart = False
-        explicit_selection_restart = False
-        explicit_dft_restart = False
-        dft_restart_performed = False
         if self.stage_override is not None:
             requested_stage = WorkflowStage.from_legacy(self.stage_override)
-            explicit_generate_restart = requested_stage is WorkflowStage.GENERATE
-            explicit_selection_restart = requested_stage is WorkflowStage.SELECT
-            explicit_dft_restart = requested_stage is WorkflowStage.RUN_VASP
-            if explicit_selection_restart:
-                self._validate_selection_restart_input()
-                current = self.current_stage()
-                if current is WorkflowStage.GENERATE:
-                    # Generation has just produced the prerequisites; moving
-                    # into select remains an ordinary adjacent transition.
-                    self.transition_to(requested_stage)
-                elif current in {
-                    WorkflowStage.SELECT,
-                    WorkflowStage.RUN_VASP,
-                    WorkflowStage.TRAIN_NEP,
-                    WorkflowStage.VALIDATE,
-                    WorkflowStage.COMPLETED,
-                }:
-                    self.workflow_state.restart_selection(
-                        metadata={"project_name": self.project_name}
-                    )
-                else:
-                    # Preserve the normal guarded transition error for an
-                    # uninitialized project rather than inventing a rewind.
-                    self.transition_to(requested_stage)
-            elif explicit_dft_restart:
-                current = self.current_stage()
-                if current is WorkflowStage.SELECT:
-                    self._validate_dft_restart_input()
-                    self.transition_to(requested_stage)
-                elif current in {
-                    WorkflowStage.RUN_VASP,
-                    WorkflowStage.TRAIN_NEP,
-                    WorkflowStage.VALIDATE,
-                    WorkflowStage.COMPLETED,
-                }:
-                    self.stage_registry.execute_auxiliary(
-                        "restart_run_vasp",
-                        self._context(mode="restart"),
-                    )
-                    self.workflow_state.restart_dft(
-                        metadata={"project_name": self.project_name}
-                    )
-                    dft_restart_performed = True
-                else:
-                    # INIT and GENERATE retain the ordinary guarded error:
-                    # selected structures are not yet authoritative.
-                    self.transition_to(requested_stage)
-            else:
-                self.transition_to(requested_stage)
+            current = self.current_stage()
+            if current is not requested_stage:
+                raise StateError(
+                    f"--stage {requested_stage.value} does not match the authoritative "
+                    f"current stage {current.value}; use --rollback {requested_stage.value} "
+                    "if a rewind is intended"
+                )
+            logger.info("Resuming authoritative workflow stage: %s", current.value)
 
-        if explicit_selection_restart:
-            stage = WorkflowStage.SELECT
-        elif explicit_dft_restart:
-            stage = WorkflowStage.RUN_VASP
-        else:
-            stage = self.current_stage()
+        stage = self.current_stage()
         if stage is WorkflowStage.COMPLETED:
             logger.info("Workflow is already complete; no stage will be run")
             return None
@@ -560,15 +531,7 @@ class WorkflowController:
         self._check_deadline()
         return self._execute_stage(
             stage,
-            mode=(
-                "restart"
-                if (
-                    explicit_generate_restart
-                    or explicit_selection_restart
-                    or dft_restart_performed
-                )
-                else "resume"
-            ),
+            mode="resume",
         )
 
 
@@ -576,6 +539,7 @@ __all__ = [
     "StageBinding",
     "StageContext",
     "StageHandler",
+    "RollbackHandler",
     "StageRegistry",
     "WorkflowController",
 ]

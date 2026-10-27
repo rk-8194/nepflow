@@ -222,6 +222,65 @@ class RunRecordsMixin(StateStoreMixinSupport):
 
         return self.upsert_model_run(record, **kwargs)
 
+    def invalidate_model_runs(self, project_id: str, *, source: str) -> int:
+        """Invalidate model and validation authority for one project."""
+
+        timestamp = now()
+
+        def operation() -> int:
+            rows = self._connection.execute(
+                "SELECT m.model_run_id, m.execution_metadata_json "
+                "FROM model_runs AS m JOIN datasets AS d ON d.dataset_id = m.dataset_id "
+                "WHERE d.project_id = ? AND m.status NOT IN ('invalidated', 'superseded')",
+                (project_id,),
+            ).fetchall()
+            for row in rows:
+                metadata = decode_json(row["execution_metadata_json"], "execution_metadata_json")
+                if not isinstance(metadata, dict):
+                    metadata = {}
+                metadata.update({"invalidated_at": timestamp, "invalidation_source": source})
+                self._connection.execute(
+                    "UPDATE model_runs SET status = 'invalidated', execution_metadata_json = ?, "
+                    "updated_at = ? WHERE model_run_id = ?",
+                    (encode_json(metadata), timestamp, row["model_run_id"]),
+                )
+            self._invalidate_validation_for_project(project_id, timestamp, source)
+            return len(rows)
+
+        return self._write(operation)
+
+    def invalidate_validation_runs(self, project_id: str, *, source: str) -> int:
+        """Invalidate validation authority while retaining models and results."""
+
+        timestamp = now()
+        return self._write(
+            lambda: self._invalidate_validation_for_project(project_id, timestamp, source)
+        )
+
+    def _invalidate_validation_for_project(
+        self,
+        project_id: str,
+        timestamp: str,
+        source: str,
+    ) -> int:
+        rows = self._connection.execute(
+            "SELECT v.validation_run_id, v.metadata_json "
+            "FROM validation_runs AS v JOIN datasets AS d ON d.dataset_id = v.dataset_id "
+            "WHERE d.project_id = ? AND v.status NOT IN ('invalidated', 'superseded')",
+            (project_id,),
+        ).fetchall()
+        for row in rows:
+            metadata = decode_json(row["metadata_json"], "metadata_json")
+            if not isinstance(metadata, dict):
+                metadata = {}
+            metadata.update({"invalidated_at": timestamp, "invalidation_source": source})
+            self._connection.execute(
+                "UPDATE validation_runs SET status = 'invalidated', metadata_json = ?, "
+                "updated_at = ? WHERE validation_run_id = ?",
+                (encode_json(metadata), timestamp, row["validation_run_id"]),
+            )
+        return len(rows)
+
     def get_validation_run(self, validation_run_id: str) -> dict[str, Any] | None:
         """Return one authoritative validation-run record."""
 

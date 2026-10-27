@@ -291,6 +291,20 @@ class SlurmScheduler:
         return result
 
     @staticmethod
+    def _is_missing_job_error(error: SchedulerError) -> bool:
+        """Recognize SLURM's stale job-ID response without weakening _run."""
+
+        if error.returncode != 1:
+            return False
+        text = " ".join(
+            part for part in (error.stderr, error.stdout, str(error)) if part
+        ).lower()
+        return (
+            "slurm_load_jobs error: invalid job id specified" in text
+            or "invalid job id specified" in text
+        )
+
+    @staticmethod
     def _directive_arguments(directives: Sequence[str]) -> list[str]:
         return [directive.removeprefix("#SBATCH ") for directive in directives]
 
@@ -350,7 +364,17 @@ class SlurmScheduler:
         if not job_id.strip():
             raise ValueError("job_id must not be blank")
         command = ("scancel", job_id)
-        result = self._run(command, cwd=None, timeout=timeout)
+        try:
+            result = self._run(command, cwd=None, timeout=timeout)
+        except SchedulerError as exc:
+            if not self._is_missing_job_error(exc):
+                raise
+            return CancellationResult(
+                job_id=job_id,
+                stdout=exc.stdout or "",
+                stderr=exc.stderr or "",
+                command=tuple(os.fspath(part) for part in command),
+            )
         return CancellationResult(
             job_id=job_id,
             stdout=result.stdout or "",
@@ -391,7 +415,12 @@ class SlurmScheduler:
 
     def queue_status(self, job_id: str, *, timeout: float | None = None) -> QueueStatusResult:
         """Query queue state; a missing row is distinct from query failure."""
-        query = self._queue_query(job_id=job_id, active_only=False, timeout=timeout)
+        try:
+            query = self._queue_query(job_id=job_id, active_only=False, timeout=timeout)
+        except SchedulerError as exc:
+            if not self._is_missing_job_error(exc):
+                raise
+            return QueueStatusResult(job_id=job_id, job=None)
         job = next((candidate for candidate in query.jobs if candidate.job_id == job_id), None)
         return QueueStatusResult(job_id=job_id, job=job)
 

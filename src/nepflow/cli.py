@@ -87,6 +87,25 @@ process_runner = create_process_runner(logger)
 scheduler = create_scheduler(process_runner)
 
 
+class _CliArgumentParser(argparse.ArgumentParser):
+    """Argument parser with cross-option validation for operator commands."""
+
+    def parse_args(self, args=None, namespace=None):  # type: ignore[no-untyped-def]
+        parsed = super().parse_args(args=args, namespace=namespace)
+        conflicts = []
+        if parsed.rollback is not None and parsed.stage is not None:
+            conflicts.append("--rollback cannot be combined with --stage")
+        if parsed.rollback is not None and parsed.init:
+            conflicts.append("--rollback cannot be combined with --init")
+        if parsed.rollback is not None and parsed.local:
+            conflicts.append("--rollback cannot be combined with --local")
+        if parsed.rollback is not None and parsed.config:
+            conflicts.append("--rollback cannot be combined with --config")
+        if conflicts:
+            self.error("; ".join(conflicts))
+        return parsed
+
+
 def _build_generation_stage(context: StageContext) -> GenerationStage:
     """Preserve the historical CLI composition seam."""
 
@@ -121,7 +140,7 @@ def _resolve_project_config_path(project_name: str, output_dir: Path) -> Path:
 
 def create_parser() -> argparse.ArgumentParser:
     """Create CLI argument parser."""
-    parser = argparse.ArgumentParser(
+    parser = _CliArgumentParser(
         description="NEPFlow: HPC workflow orchestrator for VASP->NEP->GPUMD pipelines",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
@@ -155,10 +174,16 @@ Examples:
         choices=["init", "generate", "select", "run_vasp", "train_nep", "validate"],
         default=None,
         help=(
-            "Set the workflow stage; explicit 'select' restarts selection, "
-            "and explicit 'run_vasp' cancels active VASP jobs and restarts "
-            "the DFT stage from selected structures"
+            "Select the authoritative workflow stage to execute or resume; "
+            "the requested stage must already be current"
         ),
+    )
+    parser.add_argument(
+        "--rollback",
+        type=str,
+        choices=["generate", "select", "run_vasp", "train_nep", "validate"],
+        default=None,
+        help="Explicitly rewind/reset a stage, then exit without executing it",
     )
     parser.add_argument(
         "--local",
@@ -398,7 +423,45 @@ def _run_controller(
         logger.info("Workflow resubmit triggered: %s", exc)
         _resubmit_slurm_job(debug=args.debug)
         logger.info("Resubmission initiated, exiting")
-    except (ValueError, IOError, RuntimeError, StateError, ValidationError) as exc:
+    except (
+        ValueError,
+        IOError,
+        RuntimeError,
+        StateError,
+        ValidationError,
+        SchedulerError,
+    ) as exc:
+        _report_workflow_failure(exc, debug=args.debug)
+        sys.exit(1)
+
+
+def _run_rollback(args: argparse.Namespace, controller: WorkflowController) -> None:
+    """Dispatch the immediate operator rollback command."""
+
+    try:
+        original = controller.current_stage()
+        logger.info("Operator-requested rollback: %s (current: %s)", args.rollback, original.value)
+        result = controller.rollback(args.rollback)
+        invalidated = ", ".join(stage.value for stage in result.invalidated_stages)
+        logger.info("Rollback cleanup summary: %s", result.cleanup_summary or "none")
+        logger.info("Rollback downstream invalidation summary: %s", invalidated or "none")
+        logger.info("Final authoritative stage: %s", result.target.value)
+        logger.info(
+            "Rollback complete; NEPFlow is exiting without executing stage %s",
+            result.target.value,
+        )
+        print(
+            f"Rollback complete: {original.value} -> {result.target.value}; "
+            "NEPFlow is exiting without executing the stage"
+        )
+    except (
+        ValueError,
+        IOError,
+        RuntimeError,
+        StateError,
+        ValidationError,
+        SchedulerError,
+    ) as exc:
         _report_workflow_failure(exc, debug=args.debug)
         sys.exit(1)
 
@@ -411,6 +474,9 @@ def main() -> None:
         _open_project_config(args)
         return
     _configure_project_logging(args)
+    if args.rollback is not None:
+        _run_rollback(args, _create_controller(args, None))
+        return
     slurm_deadline = _resolve_slurm_deadline()
     _run_controller(args, _create_controller(args, slurm_deadline), slurm_deadline)
 

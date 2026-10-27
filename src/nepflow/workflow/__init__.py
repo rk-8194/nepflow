@@ -4,6 +4,7 @@ from .controller import (
     StageBinding,
     StageContext,
     StageRegistry,
+    RollbackHandler,
     WorkflowController,
 )
 from .initialization import ProjectCreationService
@@ -21,6 +22,7 @@ from .stages import (
     StageRunResult,
     StageRunState,
     StageRunStatus,
+    RollbackResult,
     WorkflowStage,
     is_valid_transition,
     parse_legacy_stage,
@@ -38,6 +40,8 @@ __all__ = [
     "submit_resubmission",
     "StageBinding",
     "StageContext",
+    "RollbackHandler",
+    "RollbackResult",
     "ProjectCreationService",
     "StageRegistry",
     "StageResult",

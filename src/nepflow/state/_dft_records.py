@@ -166,11 +166,11 @@ class DftRecordsMixin(StateStoreMixinSupport):
 
         return self._write(operation)
 
-    def cancel_dft_attempts_for_restart(
+    def cancel_dft_attempts_for_rollback(
         self,
         attempt_ids: Sequence[str],
         *,
-        reason: str = "explicit_run_vasp_restart",
+        reason: str = "explicit_run_vasp_rollback",
     ) -> int:
         """Record operator cancellation while retaining attempt history."""
 
@@ -205,11 +205,13 @@ class DftRecordsMixin(StateStoreMixinSupport):
 
         return self._write(operation)
 
+    cancel_dft_attempts_for_restart = cancel_dft_attempts_for_rollback
+
     def begin_dft_execution_generation(
         self,
         project_id: str,
         *,
-        source: str = "explicit_run_vasp_restart",
+        source: str = "explicit_run_vasp_rollback",
         selected_only: bool = True,
     ) -> dict[str, int]:
         """Start a fresh DFT generation and invalidate dependent authority."""
@@ -233,8 +235,8 @@ class DftRecordsMixin(StateStoreMixinSupport):
                 metadata.update(
                     {
                         "dft_execution_generation": generation,
-                        "restart_timestamp": timestamp,
-                        "restart_source": source,
+                        "rollback_timestamp": timestamp,
+                        "rollback_source": source,
                         "previous_accepted_attempt_id": previous_attempt,
                     }
                 )
@@ -246,7 +248,7 @@ class DftRecordsMixin(StateStoreMixinSupport):
                 )
                 if previous_attempt:
                     self._connection.execute(
-                        "UPDATE artifacts SET retention_status = 'superseded_by_restart' "
+                        "UPDATE artifacts SET retention_status = 'superseded_by_rollback' "
                         "WHERE originating_attempt_id = ?",
                         (previous_attempt,),
                     )
@@ -256,11 +258,41 @@ class DftRecordsMixin(StateStoreMixinSupport):
 
         return self._write(operation)
 
+    def invalidate_dft_calculations(
+        self,
+        *,
+        source: str = "explicit_workflow_rollback",
+    ) -> int:
+        """Invalidate DFT authority while retaining calculations and attempts."""
+
+        timestamp = now()
+
+        def operation() -> int:
+            rows = self._connection.execute(
+                "SELECT calculation_id, metadata_json FROM dft_calculations "
+                "WHERE status NOT IN ('invalidated', 'superseded')"
+            ).fetchall()
+            for row in rows:
+                metadata = decode_json(row["metadata_json"], "metadata_json")
+                if not isinstance(metadata, Mapping):
+                    metadata = {}
+                metadata = dict(metadata)
+                metadata.update({"invalidated_at": timestamp, "invalidation_source": source})
+                self._connection.execute(
+                    "UPDATE dft_calculations SET status = 'invalidated', "
+                    "accepted_attempt_id = NULL, metadata_json = ?, updated_at = ? "
+                    "WHERE calculation_id = ?",
+                    (encode_json(metadata), timestamp, row["calculation_id"]),
+                )
+            return len(rows)
+
+        return self._write(operation)
+
     def invalidate_downstream_records(
         self,
         project_id: str,
         *,
-        source: str = "explicit_run_vasp_restart",
+        source: str = "explicit_workflow_rollback",
     ) -> int:
         """Mark datasets, model runs, and validation runs as historical."""
 

@@ -7,7 +7,7 @@ conversion here prevents each caller from inventing its own string handling.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Mapping
 
@@ -239,7 +239,31 @@ class StageRunResult:
 StageResult = StageRunResult
 
 
+@dataclass(frozen=True, slots=True)
+class RollbackResult:
+    """Evidence returned by an explicit workflow rollback."""
+
+    target: WorkflowStage
+    original_stage: WorkflowStage
+    invalidated_stages: tuple[WorkflowStage, ...] = ()
+    cleanup_summary: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "target", WorkflowStage.from_legacy(self.target))
+        object.__setattr__(
+            self,
+            "original_stage",
+            WorkflowStage.from_legacy(self.original_stage),
+        )
+        object.__setattr__(
+            self,
+            "invalidated_stages",
+            tuple(WorkflowStage.from_legacy(stage) for stage in self.invalidated_stages),
+        )
+
+
 __all__ = [
+    "RollbackResult",
     "StageResult",
     "StageRun",
     "StageRunResult",

@@ -1,4 +1,4 @@
-"""Operator-requested restart of one project's DFT execution campaign."""
+"""Operator-requested rollback cleanup for one project's DFT campaign."""
 
 from __future__ import annotations
 
@@ -15,22 +15,22 @@ from nepflow.state import StateStore
 
 
 @dataclass(frozen=True, slots=True)
-class DftRestartResult:
-    """Evidence returned after a DFT restart boundary is committed."""
+class DftRollbackResult:
+    """Evidence returned after DFT rollback cleanup has completed."""
 
     cancelled_attempt_ids: tuple[str, ...]
     cancelled_job_ids: tuple[str, ...]
     execution_generations: dict[str, int]
 
 
-class DftRestartService:
-    """Cancel authoritative child jobs, invalidate DFT state, and reset jobs."""
+class DftRollbackService:
+    """Cancel authoritative child jobs and reset only the DFT work area."""
 
     def __init__(self, scheduler: Scheduler, *, sleeper: Any = time.sleep) -> None:
         self.scheduler = scheduler
         self._sleep = sleeper
 
-    def restart(
+    def rollback(
         self,
         *,
         project_dir: Path,
@@ -39,8 +39,8 @@ class DftRestartService:
         scheduler: Scheduler | None = None,
         poll_interval_seconds: int,
         datasets: tuple[str, ...] = ("train", "test"),
-    ) -> DftRestartResult:
-        """Perform the destructive DFT restart in its required order."""
+    ) -> DftRollbackResult:
+        """Perform explicit rollback cleanup in its required order."""
 
         if poll_interval_seconds < 0:
             raise ValueError("poll_interval_seconds must not be negative")
@@ -53,18 +53,25 @@ class DftRestartService:
         attempt_ids = tuple(str(item["attempt_id"]) for item in attempts)
         job_ids = tuple(str(item["job_id"]) for item in attempts)
         if attempt_ids:
-            state_store.cancel_dft_attempts_for_restart(attempt_ids)
+            cancel_attempts = getattr(state_store, "cancel_dft_attempts_for_rollback", None)
+            if cancel_attempts is None:
+                cancel_attempts = state_store.cancel_dft_attempts_for_restart
+            cancel_attempts(attempt_ids)
         generations = state_store.begin_dft_execution_generation(
             project_name,
-            source="explicit_run_vasp_restart",
+            source="explicit_run_vasp_rollback",
             selected_only=True,
         )
         self._clear_jobs_directory(project_dir)
-        return DftRestartResult(
+        return DftRollbackResult(
             cancelled_attempt_ids=attempt_ids,
             cancelled_job_ids=job_ids,
             execution_generations=generations,
         )
+
+    # Backward-compatible spelling for non-CLI library callers.  The
+    # application composition intentionally registers only ``rollback``.
+    restart = rollback
 
     @staticmethod
     def _validate_selected_inputs(project_dir: Path, datasets: tuple[str, ...]) -> None:
@@ -76,14 +83,14 @@ class DftRestartService:
                 ready = path.is_file() and path.stat().st_size > 0
             except OSError as exc:
                 raise StateError(
-                    "Cannot restart DFT; selected input cannot be inspected: "
+                    "Cannot rollback DFT; selected input cannot be inspected: "
                     f"{path}"
                 ) from exc
             if not ready:
                 missing.append(path)
         if missing:
             raise StateError(
-                "Cannot restart DFT; selected input(s) are missing or empty: "
+                "Cannot rollback DFT; selected input(s) are missing or empty: "
                 + ", ".join(str(path) for path in missing)
             )
 
@@ -106,7 +113,7 @@ class DftRestartService:
                 job_id = attempt.get("job_id")
                 if not isinstance(job_id, str) or not job_id.strip():
                     raise StateError(
-                        "Cannot restart DFT; authoritative live attempt has no persisted job ID: "
+                        "Cannot rollback DFT; authoritative live attempt has no persisted job ID: "
                         f"{attempt.get('attempt_id')}"
                     )
                 live.append(attempt)
@@ -149,4 +156,12 @@ class DftRestartService:
             raise StateError(f"Could not reset DFT jobs directory {jobs_dir}") from exc
 
 
-__all__ = ["DftRestartResult", "DftRestartService"]
+DftRestartResult = DftRollbackResult
+DftRestartService = DftRollbackService
+
+__all__ = [
+    "DftRollbackResult",
+    "DftRollbackService",
+    "DftRestartResult",
+    "DftRestartService",
+]
