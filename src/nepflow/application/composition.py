@@ -9,7 +9,7 @@ from nepflow.cli_wizard import CONFIG_PROMPTS, ConfigWizard
 from nepflow.errors import ValidationError
 from nepflow.hpc.process import ProcessRunner
 from nepflow.hpc.slurm import SlurmScheduler
-from nepflow.stages.dft import DftStage
+from nepflow.stages.dft import DftRestartService, DftStage
 from nepflow.stages.generation import GenerationStage
 from nepflow.stages.generation.debug import run_debug
 from nepflow.stages.generation.generators.base import ConfigurationalGenerator
@@ -338,13 +338,27 @@ def _register_scheduler_stages(
     *,
     scheduler: SlurmScheduler,
 ) -> None:
+    restart_service = DftRestartService(scheduler)
+
     def run_dft(context: StageContext) -> StageRunResult:
         return DftStage(scheduler=scheduler).run(context).as_workflow_result()
+
+    def restart_run_vasp(context: StageContext) -> None:
+        if context.state_store is None:
+            raise ValidationError("DFT restart requires the authoritative StateStore")
+        restart_service.restart(
+            project_dir=context.project_dir,
+            project_name=context.project_name,
+            state_store=context.state_store,
+            scheduler=scheduler,
+            poll_interval_seconds=context.config.slurm.poll_interval,
+        )
 
     def run_validation(context: StageContext) -> StageRunResult:
         return ValidationStage(context=context, scheduler=scheduler).run().as_workflow_result()
 
     registry.register(WorkflowStage.RUN_VASP, run_dft)
+    registry.register_auxiliary("restart_run_vasp", restart_run_vasp)
     registry.register(
         WorkflowStage.TRAIN_NEP,
         lambda context: TrainingStage(scheduler=scheduler).run(context),

@@ -22,6 +22,7 @@ from .reports import (
     benchmark_plot_data,
     summarize_benchmark_results,
 )
+from .restart import DftRestartResult, DftRestartService
 from .stage import DftStage, DftStageResult
 
 __all__ = [
@@ -29,6 +30,8 @@ __all__ = [
     "DftPreparationResult",
     "DftStage",
     "DftStageResult",
+    "DftRestartResult",
+    "DftRestartService",
     "DftExecutionRecord",
     "DftRecoveryDecision",
     "DftRecoveryPolicy",

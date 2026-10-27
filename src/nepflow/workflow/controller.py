@@ -363,6 +363,28 @@ class WorkflowController:
                 f"{generated_path}"
             )
 
+    def _validate_dft_restart_input(self) -> None:
+        """Check selected structures before entering the DFT stage."""
+
+        selected_dir = self.project_dir / "structures" / "selected"
+        missing = []
+        for dataset in ("train", "test"):
+            path = selected_dir / f"{dataset}.xyz"
+            try:
+                ready = path.is_file() and path.stat().st_size > 0
+            except OSError as exc:
+                raise StateError(
+                    "Cannot restart DFT; selected input cannot be inspected: "
+                    f"{path}"
+                ) from exc
+            if not ready:
+                missing.append(path)
+        if missing:
+            raise StateError(
+                "Cannot restart DFT; selected input(s) are missing or empty: "
+                + ", ".join(str(path) for path in missing)
+            )
+
     def _execute_stage(
         self,
         stage: WorkflowStage,
@@ -465,10 +487,13 @@ class WorkflowController:
 
         explicit_generate_restart = False
         explicit_selection_restart = False
+        explicit_dft_restart = False
+        dft_restart_performed = False
         if self.stage_override is not None:
             requested_stage = WorkflowStage.from_legacy(self.stage_override)
             explicit_generate_restart = requested_stage is WorkflowStage.GENERATE
             explicit_selection_restart = requested_stage is WorkflowStage.SELECT
+            explicit_dft_restart = requested_stage is WorkflowStage.RUN_VASP
             if explicit_selection_restart:
                 self._validate_selection_restart_input()
                 current = self.current_stage()
@@ -490,10 +515,38 @@ class WorkflowController:
                     # Preserve the normal guarded transition error for an
                     # uninitialized project rather than inventing a rewind.
                     self.transition_to(requested_stage)
+            elif explicit_dft_restart:
+                current = self.current_stage()
+                if current is WorkflowStage.SELECT:
+                    self._validate_dft_restart_input()
+                    self.transition_to(requested_stage)
+                elif current in {
+                    WorkflowStage.RUN_VASP,
+                    WorkflowStage.TRAIN_NEP,
+                    WorkflowStage.VALIDATE,
+                    WorkflowStage.COMPLETED,
+                }:
+                    self.stage_registry.execute_auxiliary(
+                        "restart_run_vasp",
+                        self._context(mode="restart"),
+                    )
+                    self.workflow_state.restart_dft(
+                        metadata={"project_name": self.project_name}
+                    )
+                    dft_restart_performed = True
+                else:
+                    # INIT and GENERATE retain the ordinary guarded error:
+                    # selected structures are not yet authoritative.
+                    self.transition_to(requested_stage)
             else:
                 self.transition_to(requested_stage)
 
-        stage = WorkflowStage.SELECT if explicit_selection_restart else self.current_stage()
+        if explicit_selection_restart:
+            stage = WorkflowStage.SELECT
+        elif explicit_dft_restart:
+            stage = WorkflowStage.RUN_VASP
+        else:
+            stage = self.current_stage()
         if stage is WorkflowStage.COMPLETED:
             logger.info("Workflow is already complete; no stage will be run")
             return None
@@ -509,7 +562,11 @@ class WorkflowController:
             stage,
             mode=(
                 "restart"
-                if explicit_generate_restart or explicit_selection_restart
+                if (
+                    explicit_generate_restart
+                    or explicit_selection_restart
+                    or dft_restart_performed
+                )
                 else "resume"
             ),
         )

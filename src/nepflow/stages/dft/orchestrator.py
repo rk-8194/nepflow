@@ -43,6 +43,7 @@ from nepflow.domain.identities import (
 from nepflow.errors import StateError
 from nepflow.io.hashing import sha256_file
 from nepflow.state import StateStore
+from nepflow.state._dft_records import dft_attempt_id
 
 logger = logging.getLogger(__name__)
 
@@ -162,13 +163,28 @@ def clean_stale_outputs(working_directory: Path) -> None:
 def _scientific_attempts(
     state_store: StateStore,
     calculation_id: str,
+    *,
+    execution_generation: int | None = None,
 ) -> list[dict[str, object]]:
     """Exclude explicitly namespaced benchmark observations from DFT resume."""
+
+    if execution_generation is None:
+        calculation = state_store.get_dft_calculation(calculation_id)
+        metadata = {} if calculation is None else calculation.get("metadata", {})
+        try:
+            execution_generation = (
+                int(metadata.get("dft_execution_generation", 0))
+                if isinstance(metadata, Mapping)
+                else 0
+            )
+        except (TypeError, ValueError):
+            execution_generation = 0
 
     return [
         attempt
         for attempt in state_store.list_dft_attempts(calculation_id)
         if not _is_benchmark_attempt(attempt)
+        and _attempt_generation(attempt) == execution_generation
     ]
 
 
@@ -180,6 +196,39 @@ def _is_benchmark_attempt(attempt: Mapping[str, object]) -> bool:
 def _attempt_number(attempt: Mapping[str, object]) -> int:
     value = attempt.get("attempt_number", 1)
     return int(value) if isinstance(value, (int, float, str)) else 1
+
+
+def _attempt_generation(attempt: Mapping[str, object]) -> int:
+    metadata = attempt.get("metadata")
+    if not isinstance(metadata, Mapping):
+        return 0
+    try:
+        return int(metadata.get("dft_execution_generation", 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _attempt_retry_level(attempt: Mapping[str, object]) -> int:
+    metadata = attempt.get("metadata")
+    if isinstance(metadata, Mapping) and "retry_level" in metadata:
+        try:
+            return max(0, int(metadata["retry_level"]))
+        except (TypeError, ValueError):
+            pass
+    return max(0, _attempt_number(attempt) - 1)
+
+
+def _calculation_generation(state_store: StateStore, calculation_id: str) -> int:
+    calculation = state_store.get_dft_calculation(calculation_id)
+    metadata = {} if calculation is None else calculation.get("metadata", {})
+    try:
+        return (
+            int(metadata.get("dft_execution_generation", 0))
+            if isinstance(metadata, Mapping)
+            else 0
+        )
+    except (TypeError, ValueError):
+        return 0
 
 
 def _active_attempt_for_working_directory(
@@ -196,10 +245,21 @@ def _active_attempt_for_working_directory(
         calculation_id = calculation.get("calculation_id")
         if not isinstance(calculation_id, str):
             continue
+        calculation_metadata = calculation.get("metadata")
+        try:
+            generation = (
+                int(calculation_metadata.get("dft_execution_generation", 0))
+                if isinstance(calculation_metadata, Mapping)
+                else 0
+            )
+        except (TypeError, ValueError):
+            generation = 0
         for attempt in state_store.list_dft_attempts(calculation_id):
             if _is_benchmark_attempt(attempt):
                 continue
             if attempt.get("status") not in {"submitted", "running"}:
+                continue
+            if _attempt_generation(attempt) != generation:
                 continue
             metadata = attempt.get("metadata")
             if not isinstance(metadata, Mapping):
@@ -293,7 +353,7 @@ class VaspPreparationOrchestrator:
                 current_status = {
                     "status": persisted_status or "pending",
                     "retry_level": (
-                        max(0, _attempt_number(latest_attempt) - 1)
+                        _attempt_retry_level(latest_attempt)
                         if latest_attempt is not None
                         else 0
                     ),
@@ -465,8 +525,12 @@ class VaspPreparationOrchestrator:
         row = state_store.get_dft_calculation(calculation.calculation_id)
         if row is None or row.get("status") != "completed":
             return None
+        generation = _calculation_generation(state_store, calculation.calculation_id)
         attempt_id = row.get("accepted_attempt_id")
         if not isinstance(attempt_id, str) or not attempt_id:
+            return None
+        accepted_attempt = state_store.get_dft_attempt(attempt_id)
+        if accepted_attempt is None or _attempt_generation(accepted_attempt) != generation:
             return None
         for artifact in state_store.list_artifacts(originating_attempt_id=attempt_id):
             if artifact.get("artifact_type") != "vasp_outcar":
@@ -518,6 +582,16 @@ class VaspPreparationOrchestrator:
                         "selected_index": item.spec.selected_index,
                     },
                 )
+                persisted_calculation = state_store.get_dft_calculation(
+                    calculation.calculation_id
+                )
+                persisted_metadata = (
+                    dict(persisted_calculation.get("metadata", {}))
+                    if isinstance(persisted_calculation, Mapping)
+                    and isinstance(persisted_calculation.get("metadata"), Mapping)
+                    else {}
+                )
+                generation = _calculation_generation(state_store, calculation.calculation_id)
                 state_store.upsert_dft_calculation(
                     calculation,
                     status=(
@@ -530,6 +604,7 @@ class VaspPreparationOrchestrator:
                         calculation.calculation_id if item.reused else None
                     ),
                     metadata={
+                        **persisted_metadata,
                         "project_name": item.spec.project_name,
                         "dataset": item.spec.dataset,
                         "selected_index": item.spec.selected_index,
@@ -542,18 +617,27 @@ class VaspPreparationOrchestrator:
                     },
                 )
                 attempts = _scientific_attempts(state_store, calculation.calculation_id)
-                attempt_id = (
-                    str(attempts[0]["attempt_id"])
+                attempt_number = (
+                    _attempt_number(attempts[-1])
                     if attempts
-                    else f"{calculation.calculation_id}:attempt:1"
+                    else state_store.allocate_dft_attempt_number(calculation.calculation_id)
+                )
+                attempt_id = (
+                    str(attempts[-1]["attempt_id"])
+                    if attempts
+                    else dft_attempt_id(calculation.calculation_id, attempt_number, generation)
                 )
                 if not attempts:
                     state_store.create_dft_attempt(
                         calculation.calculation_id,
                         attempt_id,
-                        attempt_number=1,
+                        attempt_number=attempt_number,
                         status="completed" if item.reused_output is not None else item.status,
-                        metadata={"working_directory": str(item.spec.working_directory)},
+                        metadata={
+                            "working_directory": str(item.spec.working_directory),
+                            "dft_execution_generation": generation,
+                            "retry_level": 0,
+                        },
                     )
                 if item.reused_output is not None:
                     from nepflow.domain.identities import ArtifactIdentity

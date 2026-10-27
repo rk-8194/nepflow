@@ -14,7 +14,9 @@ from nepflow.errors import ArtifactError, StateError
 from nepflow.io.json import read_json_object
 
 VASP_REGISTRY_VERSION = 1
-VALID_VASP_STATUSES = frozenset({"pending", "submitted", "completed", "reused", "failed", "oom"})
+VALID_VASP_STATUSES = frozenset(
+    {"pending", "submitted", "completed", "reused", "failed", "oom", "cancelled"}
+)
 
 
 def get_nepflow_root(project_dir: Path) -> Path:

@@ -155,8 +155,9 @@ Examples:
         choices=["init", "generate", "select", "run_vasp", "train_nep", "validate"],
         default=None,
         help=(
-            "Set the workflow stage (overrides .project file); explicit "
-            "'select' restarts selection from generated structures"
+            "Set the workflow stage; explicit 'select' restarts selection, "
+            "and explicit 'run_vasp' cancels active VASP jobs and restarts "
+            "the DFT stage from selected structures"
         ),
     )
     parser.add_argument(

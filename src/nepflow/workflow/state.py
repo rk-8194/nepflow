@@ -370,6 +370,79 @@ class WorkflowState:
             raise StateError("Selection restart was not persisted")
         return StageRunStatus.from_mapping(row)
 
+    def restart_dft(
+        self,
+        *,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> StageRunStatus:
+        """Rewind workflow authority to ``run_vasp`` for an explicit restart."""
+
+        current = self.reconcile().stage
+        restartable = {
+            WorkflowStage.RUN_VASP,
+            WorkflowStage.TRAIN_NEP,
+            WorkflowStage.VALIDATE,
+            WorkflowStage.COMPLETED,
+        }
+        if current not in restartable:
+            raise StateError(
+                "Explicit DFT restart requires the current workflow stage to be "
+                f"run_vasp or later; current stage is {current.value!r}"
+            )
+
+        previous_runs = {
+            stage.value: self.store.get_stage_run(self._stage_run_id(stage))
+            for stage in restartable
+        }
+        now = self._timestamp()
+        base_metadata = dict(metadata or {})
+        base_metadata.update(
+            {
+                "source": "explicit_run_vasp_restart",
+                "restart_target": WorkflowStage.RUN_VASP.value,
+                "invalidated_at": now,
+            }
+        )
+        run_vasp_started_at = (
+            datetime.fromisoformat(now) + timedelta(microseconds=1)
+        ).isoformat()
+        with self.store.transaction():
+            for stage, previous in previous_runs.items():
+                if previous is None:
+                    continue
+                previous_record = {
+                    "stage_run_id": previous.get("stage_run_id"),
+                    "status": previous.get("status"),
+                    "started_at": previous.get("started_at"),
+                    "completed_at": previous.get("completed_at"),
+                    "metadata": previous.get("metadata"),
+                }
+                stage_value = WorkflowStage.from_legacy(stage)
+                stage_metadata = dict(base_metadata)
+                stage_metadata["previous_stage_run"] = previous_record
+                if stage_value is WorkflowStage.RUN_VASP:
+                    self._record_stage(
+                        stage_value,
+                        status=StageRunState.RUNNING,
+                        started_at=run_vasp_started_at,
+                        completed_at=None,
+                        metadata=stage_metadata,
+                    )
+                else:
+                    self._record_stage(
+                        stage_value,
+                        status=StageRunState.FAILED,
+                        started_at=now,
+                        completed_at=now,
+                        metadata={**stage_metadata, "invalidated": True},
+                    )
+
+        self._write_marker(WorkflowStage.RUN_VASP)
+        row = self.store.get_stage_run(self._stage_run_id(WorkflowStage.RUN_VASP))
+        if row is None:  # pragma: no cover - guarded by the store write
+            raise StateError("DFT restart was not persisted")
+        return StageRunStatus.from_mapping(row)
+
     def mark_failed(self, error: BaseException) -> StageRunStatus:
         """Record failure of the current stage without advancing it."""
 

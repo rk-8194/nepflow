@@ -25,6 +25,7 @@ from nepflow.errors import StateError
 from nepflow.hpc.jobs import SchedulerJobState
 from nepflow.hpc.resources import JobResources
 from nepflow.hpc.scheduler import Scheduler
+from nepflow.state._dft_records import dft_attempt_id
 from nepflow.workflow.resubmission import SelfResubmitExit
 
 logger = logging.getLogger(__name__)
@@ -81,6 +82,7 @@ class DftExecutionRecord:
     job_id: str | None = None
     job_name: str | None = None
     retry_level: int = 0
+    attempt_number: int | None = None
     resources: JobResources | None = None
     metadata: Mapping[str, Any] = field(default_factory=dict)
     failure_evidence: Mapping[str, Any] | None = None
@@ -126,7 +128,10 @@ class DftReconciliationResult:
     @property
     def all_terminal(self) -> bool:
         """Return whether every record is completed, reused, or failed."""
-        return all(record.status in {"completed", "reused", "failed"} for record in self.records)
+        return all(
+            record.status in {"completed", "reused", "failed", "cancelled"}
+            for record in self.records
+        )
 
     @property
     def all_successful(self) -> bool:
@@ -158,7 +163,7 @@ class DftReconciliationOrchestrator:
     Failed attempts are retained before a new retry record is created.
     """
 
-    _TERMINAL_STATUSES = frozenset({"completed", "reused", "failed"})
+    _TERMINAL_STATUSES = frozenset({"completed", "reused", "failed", "cancelled"})
 
     def __init__(
         self,
@@ -345,13 +350,13 @@ class DftReconciliationOrchestrator:
                 },
             )
             self._save(failed, reason=failure.reason)
+            next_attempt_number = self._next_attempt_number(record)
             retry = DftExecutionRecord(
                 inputs=record.inputs,
-                attempt_id=(
-                    f"{record.inputs.calculation.calculation_id}:attempt:{record.retry_level + 2}"
-                ),
+                attempt_id=self._next_attempt_id(record, next_attempt_number),
                 status="pending",
                 retry_level=decision.retry_level,
+                attempt_number=next_attempt_number,
                 resources=decision.resources or record.resources,
                 job_name=record.job_name,
                 metadata=record.metadata,
@@ -371,6 +376,23 @@ class DftReconciliationOrchestrator:
             ),
             reason=failure.reason,
         )
+
+    def _next_attempt_number(self, record: DftExecutionRecord) -> int:
+        allocator = getattr(self.state_store, "allocate_dft_attempt_number", None)
+        if callable(allocator):
+            return int(allocator(record.inputs.calculation.calculation_id))
+        if record.attempt_number is not None:
+            return int(record.attempt_number) + 1
+        return int(record.retry_level) + 2
+
+    def _next_attempt_id(self, record: DftExecutionRecord, number: int | None = None) -> str:
+        number = self._next_attempt_number(record) if number is None else number
+        metadata = record.metadata
+        try:
+            generation = int(metadata.get("dft_execution_generation", 0))
+        except (TypeError, ValueError):
+            generation = 0
+        return dft_attempt_id(record.inputs.calculation.calculation_id, number, generation)
 
     def _submit(self, record: DftExecutionRecord) -> DftExecutionRecord:
         if self.script_path is None:

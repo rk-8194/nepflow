@@ -32,6 +32,7 @@ from .orchestrator import (
     PreparedCalculation,
     VaspPreparationOrchestrator,
     _attempt_number,
+    _attempt_retry_level,
     _scientific_attempts,
 )
 from .reconciliation import (
@@ -149,7 +150,7 @@ class DftStage:
             (
                 not item.reused
                 and (attempts := _scientific_attempts(state_store, item.calculation.calculation_id))
-                and _attempt_number(attempts[-1]) == 1
+                and _attempt_retry_level(attempts[-1]) == 0
                 and str(attempts[-1].get("status", "")) in {"pending", "prepared"}
             )
             for item in preparation.calculations
@@ -327,7 +328,8 @@ class DftStage:
             job_name=(
                 f"nf_{item.spec.project_name}_{item.spec.dataset}_{item.spec.selected_index:04d}"
             ),
-            retry_level=(max(0, _attempt_number(latest) - 1) if latest is not None else 0),
+            retry_level=(_attempt_retry_level(latest) if latest is not None else 0),
+            attempt_number=(_attempt_number(latest) if latest is not None else 1),
             resources=resources,
         )
 
@@ -349,7 +351,7 @@ class DftStage:
         if (
             persisted is None
             and latest is not None
-            and _attempt_number(latest) == 1
+            and _attempt_retry_level(latest) == 0
             and str(latest.get("status", "")) in {"pending", "prepared"}
             and not item.reused
         ):

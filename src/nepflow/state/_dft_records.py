@@ -153,6 +153,190 @@ class DftRecordsMixin(StateStoreMixinSupport):
             )
         )
 
+    def allocate_dft_attempt_number(self, calculation_id: str) -> int:
+        """Allocate the next monotonically increasing attempt number."""
+
+        def operation() -> int:
+            row = self._connection.execute(
+                "SELECT COALESCE(MAX(attempt_number), 0) + 1 AS next_number "
+                "FROM dft_attempts WHERE calculation_id = ?",
+                (calculation_id,),
+            ).fetchone()
+            return int(row["next_number"])
+
+        return self._write(operation)
+
+    def cancel_dft_attempts_for_restart(
+        self,
+        attempt_ids: Sequence[str],
+        *,
+        reason: str = "explicit_run_vasp_restart",
+    ) -> int:
+        """Record operator cancellation while retaining attempt history."""
+
+        timestamp = now()
+
+        def operation() -> int:
+            updated = 0
+            for attempt_id in attempt_ids:
+                row = self._connection.execute(
+                    "SELECT status, metadata_json FROM dft_attempts WHERE attempt_id = ?",
+                    (attempt_id,),
+                ).fetchone()
+                if row is None:
+                    raise StateError(f"Unknown DFT attempt: {attempt_id}")
+                metadata = decode_json(row["metadata_json"], "metadata_json")
+                if not isinstance(metadata, Mapping):
+                    metadata = {}
+                metadata = dict(metadata)
+                metadata.update(
+                    {
+                        "cancel_reason": reason,
+                        "cancelled_by_operator": True,
+                    }
+                )
+                cursor = self._connection.execute(
+                    "UPDATE dft_attempts SET status = 'cancelled', completed_at = ?, "
+                    "metadata_json = ? WHERE attempt_id = ? AND status IN ('submitted', 'running')",
+                    (timestamp, encode_json(metadata), attempt_id),
+                )
+                updated += int(cursor.rowcount > 0)
+            return updated
+
+        return self._write(operation)
+
+    def begin_dft_execution_generation(
+        self,
+        project_id: str,
+        *,
+        source: str = "explicit_run_vasp_restart",
+        selected_only: bool = True,
+    ) -> dict[str, int]:
+        """Start a fresh DFT generation and invalidate dependent authority."""
+
+        timestamp = now()
+
+        def operation() -> dict[str, int]:
+            query = "SELECT * FROM dft_calculations"
+            if selected_only:
+                query += " WHERE selected = 1"
+            rows = self._connection.execute(query).fetchall()
+            generations: dict[str, int] = {}
+            for row in rows:
+                metadata = decode_json(row["metadata_json"], "metadata_json")
+                if not isinstance(metadata, Mapping):
+                    metadata = {}
+                metadata = dict(metadata)
+                previous_generation = int(metadata.get("dft_execution_generation", 0))
+                generation = previous_generation + 1
+                previous_attempt = row["accepted_attempt_id"]
+                metadata.update(
+                    {
+                        "dft_execution_generation": generation,
+                        "restart_timestamp": timestamp,
+                        "restart_source": source,
+                        "previous_accepted_attempt_id": previous_attempt,
+                    }
+                )
+                self._connection.execute(
+                    "UPDATE dft_calculations SET status = 'pending', "
+                    "accepted_attempt_id = NULL, reused_from_calculation_id = NULL, "
+                    "metadata_json = ?, updated_at = ? WHERE calculation_id = ?",
+                    (encode_json(metadata), timestamp, row["calculation_id"]),
+                )
+                if previous_attempt:
+                    self._connection.execute(
+                        "UPDATE artifacts SET retention_status = 'superseded_by_restart' "
+                        "WHERE originating_attempt_id = ?",
+                        (previous_attempt,),
+                    )
+                generations[str(row["calculation_id"])] = generation
+            self._invalidate_downstream_in_transaction(project_id, timestamp, source)
+            return generations
+
+        return self._write(operation)
+
+    def invalidate_downstream_records(
+        self,
+        project_id: str,
+        *,
+        source: str = "explicit_run_vasp_restart",
+    ) -> int:
+        """Mark datasets, model runs, and validation runs as historical."""
+
+        timestamp = now()
+        return self._write(
+            lambda: self._invalidate_downstream_in_transaction(project_id, timestamp, source)
+        )
+
+    def _invalidate_downstream_in_transaction(
+        self,
+        project_id: str,
+        timestamp: str,
+        source: str,
+    ) -> int:
+        changed = 0
+        dataset_rows = self._connection.execute(
+            "SELECT dataset_id, manifest_json FROM datasets WHERE project_id = ? "
+            "AND status NOT IN ('invalidated', 'superseded')",
+            (project_id,),
+        ).fetchall()
+        dataset_ids = [str(row["dataset_id"]) for row in dataset_rows]
+        for row in dataset_rows:
+            manifest = decode_json(row["manifest_json"], "manifest_json")
+            if not isinstance(manifest, Mapping):
+                manifest = {}
+            manifest = dict(manifest)
+            manifest.update(
+                {
+                    "invalidated_at": timestamp,
+                    "invalidation_source": source,
+                }
+            )
+            self._connection.execute(
+                "UPDATE datasets SET status = 'invalidated', manifest_json = ?, updated_at = ? "
+                "WHERE dataset_id = ?",
+                (encode_json(manifest), timestamp, row["dataset_id"]),
+            )
+            changed += 1
+        if dataset_ids:
+            placeholders = ", ".join("?" for _ in dataset_ids)
+            model_rows = self._connection.execute(
+                f"SELECT model_run_id, execution_metadata_json FROM model_runs "
+                f"WHERE dataset_id IN ({placeholders}) AND status NOT IN ('invalidated', 'superseded')",
+                dataset_ids,
+            ).fetchall()
+            for row in model_rows:
+                metadata = decode_json(row["execution_metadata_json"], "execution_metadata_json")
+                if not isinstance(metadata, Mapping):
+                    metadata = {}
+                metadata = dict(metadata)
+                metadata.update({"invalidated_at": timestamp, "invalidation_source": source})
+                self._connection.execute(
+                    "UPDATE model_runs SET status = 'invalidated', execution_metadata_json = ?, "
+                    "updated_at = ? WHERE model_run_id = ?",
+                    (encode_json(metadata), timestamp, row["model_run_id"]),
+                )
+                changed += 1
+            validation_rows = self._connection.execute(
+                f"SELECT validation_run_id, metadata_json FROM validation_runs "
+                f"WHERE dataset_id IN ({placeholders}) AND status NOT IN ('invalidated', 'superseded')",
+                dataset_ids,
+            ).fetchall()
+            for row in validation_rows:
+                metadata = decode_json(row["metadata_json"], "metadata_json")
+                if not isinstance(metadata, Mapping):
+                    metadata = {}
+                metadata = dict(metadata)
+                metadata.update({"invalidated_at": timestamp, "invalidation_source": source})
+                self._connection.execute(
+                    "UPDATE validation_runs SET status = 'invalidated', metadata_json = ?, "
+                    "updated_at = ? WHERE validation_run_id = ?",
+                    (encode_json(metadata), timestamp, row["validation_run_id"]),
+                )
+                changed += 1
+        return changed
+
     def _write_dft_attempt(
         self,
         calculation_id: str,
@@ -355,8 +539,9 @@ class DftRecordsMixin(StateStoreMixinSupport):
                 failure_evidence = {}
             failure_evidence["reason"] = reason
         if existing_attempt is None:
-            attempts = self.list_dft_attempts(calculation_id)
-            attempt_number = max((int(item["attempt_number"]) for item in attempts), default=0) + 1
+            attempt_number = getattr(record, "attempt_number", None)
+            if attempt_number is None:
+                attempt_number = self.allocate_dft_attempt_number(calculation_id)
             self.create_dft_attempt(
                 calculation_id,
                 record.attempt_id,
@@ -374,7 +559,7 @@ class DftRecordsMixin(StateStoreMixinSupport):
             resources=resources,
             job_id=record.job_id,
             failure_evidence=failure_evidence,
-            completed_at=now() if record.status in {"completed", "failed"} else None,
+            completed_at=now() if record.status in {"completed", "failed", "cancelled"} else None,
             metadata=metadata,
         )
 
@@ -523,6 +708,14 @@ class DftRecordsMixin(StateStoreMixinSupport):
         return require_state_row(self.get_dft_attempt(attempt_id), "DFT attempt")
 
 
+def dft_attempt_id(calculation_id: str, attempt_number: int, generation: int = 0) -> str:
+    """Build a collision-free persisted DFT attempt identity."""
+
+    if generation <= 0:
+        return f"{calculation_id}:attempt:{attempt_number}"
+    return f"{calculation_id}:attempt:{attempt_number}:generation:{generation}"
+
+
 def _calculation_keys(payload: Mapping[str, Any]) -> tuple[str, str]:
     calculation_id = payload.get("calculation_id")
     structure_id = payload.get("structure_id")
@@ -561,6 +754,11 @@ def _execution_metadata(
         metadata.update(dict(record.metadata))
     metadata["working_directory"] = str(record.inputs.working_directory)
     metadata["execution_status"] = record.status
+    metadata["retry_level"] = int(getattr(record, "retry_level", 0))
+    if isinstance(getattr(record, "metadata", None), Mapping):
+        generation = record.metadata.get("dft_execution_generation")
+        if generation is not None:
+            metadata["dft_execution_generation"] = int(generation)
     if reason is not None:
         metadata["last_failure_reason"] = reason
     return metadata
