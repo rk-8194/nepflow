@@ -6,6 +6,7 @@ import pytest
 from ase import Atoms
 from ase.calculators.singlepoint import SinglePointCalculator
 
+from nepflow.dft.vasp.inputs import calculate_poscar_hash
 from nepflow.dft.vasp.outputs import (
     ResolvedVaspOutput,
     VaspJobEvidence,
@@ -45,6 +46,7 @@ def _identity(atoms: Atoms) -> dict[str, str]:
     structure_id = calculate_structure_id(atoms)
     calculation = DftCalculationIdentity(
         structure_id=structure_id,
+        poscar_hash=calculate_poscar_hash(atoms),
         incar_hash="incar-id",
         potcar_hash="potcar-id",
     )
@@ -102,6 +104,30 @@ def test_result_preserves_energy_forces_and_requires_verified_identity(tmp_path)
     assert result.energy_ev == -4.5
     np.testing.assert_allclose(result.forces_ev_per_angstrom, [[0.1, 0.2, 0.3]])
     assert not result.forces_ev_per_angstrom.flags.writeable
+
+
+def test_result_uses_verified_source_identity_not_poscar_round_trip_identity(tmp_path) -> None:
+    outcar = _copy_outcar_fixture(tmp_path, "valid_outcar")
+    expected_atoms = _labelled_atoms()
+    calculation = DftCalculationIdentity(
+        structure_id="authoritative-selected-structure-id",
+        poscar_hash=calculate_poscar_hash(expected_atoms),
+        incar_hash="incar-id",
+        potcar_hash="potcar-id",
+    )
+    identity = calculation.to_dict()
+    evidence = ResolvedVaspOutput(outcar, tuple(sorted(identity.items())), "test")
+
+    result = parse_outcar_result(
+        outcar,
+        expected_atoms,
+        calculation_identity=identity,
+        identity_evidence=evidence,
+        reader=lambda _: expected_atoms,
+    )
+
+    assert result.accepted
+    assert result.structure_id == calculation.structure_id
 
 
 def test_direct_parse_without_identity_evidence_is_rejected(tmp_path) -> None:

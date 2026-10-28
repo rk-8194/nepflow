@@ -1,16 +1,27 @@
 import os
 import shutil
 import subprocess
+from pathlib import Path
 
+import numpy as np
 import pytest
 from ase import Atoms
+from ase.calculators.singlepoint import SinglePointCalculator
 from ase.io import write as ase_write
 
-from nepflow.dft.backend import DftBackend, DftInputRequest
+from nepflow.dft.backend import DftBackend, DftInputArtifacts, DftInputRequest
 from nepflow.dft.vasp.backend import VaspBackend
-from nepflow.dft.vasp.inputs import hash_incar_text, identity_for_structure, read_identity
+from nepflow.dft.vasp.inputs import (
+    canonical_poscar_bytes,
+    hash_incar_text,
+    hash_potcar_bytes,
+    identity_for_structure,
+    read_identity,
+)
+from nepflow.dft.vasp.outputs import parse_outcar_result
 from nepflow.domain.identities import DftCalculationIdentity, StructureIdentity
-from nepflow.errors import BackendError
+from nepflow.errors import BackendError, ValidationError
+from nepflow.io.hashing import sha256_bytes
 from nepflow.io.json import read_json
 
 
@@ -31,6 +42,7 @@ def test_vasp_backend_prepares_canonical_inputs_and_argument_command(tmp_path) -
     assert isinstance(backend, DftBackend)
     prepared = backend.prepare_inputs(request)
     assert prepared.calculation.incar_hash
+    assert prepared.calculation.poscar_hash == sha256_bytes(canonical_poscar_bytes(atoms))
     assert (prepared.working_directory / "POSCAR").exists()
     assert backend.execution_command(prepared) == ("vasp_std", "--test")
     loaded = backend.load_prepared_inputs(request, expected_calculation=prepared.calculation)
@@ -63,6 +75,7 @@ def test_vasp_backend_prepares_canonical_inputs_and_argument_command(tmp_path) -
     assert persisted == prepared.calculation.to_dict()
     reconstructed = DftCalculationIdentity(
         structure_id=sidecar["structure_id"],
+        poscar_hash=sidecar["poscar_hash"],
         incar_hash=sidecar["incar_hash"],
         potcar_hash=sidecar["potcar_hash"],
     )
@@ -78,6 +91,81 @@ def test_vasp_backend_prepares_canonical_inputs_and_argument_command(tmp_path) -
     (prepared.working_directory / "OUTCAR").write_text("parseable labels but incomplete\n")
     with pytest.raises(BackendError, match="incomplete"):
         backend.parse_result(prepared)
+
+
+def test_vasp_backend_rejects_non_periodic_source_before_materialization(tmp_path) -> None:
+    source = tmp_path / "source.extxyz"
+    atoms = Atoms("Si", cell=[3, 3, 3], positions=[[0, 0, 0]], pbc=(True, True, False))
+    ase_write(source, atoms, format="extxyz")
+    (tmp_path / "INCAR").write_text("ENCUT = 520\n", encoding="utf-8")
+    (tmp_path / "POTCAR").write_bytes(b"Si-potcar")
+    request = DftInputRequest(
+        structure=StructureIdentity.from_atoms(atoms),
+        source_structure=source,
+        working_directory=tmp_path / "job",
+    )
+
+    with pytest.raises(ValidationError, match="periodic in all three"):
+        VaspBackend().prepare_inputs(request)
+
+    assert not request.working_directory.exists()
+
+
+def test_completed_result_uses_authoritative_calculation_structure_id(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    working = tmp_path / "job"
+    working.mkdir()
+    atoms = Atoms(
+        "Si2",
+        cell=[3, 3, 3],
+        scaled_positions=[[0, 0, 0], [0.5, 0.5, 0.5]],
+        pbc=True,
+    )
+    poscar_bytes = canonical_poscar_bytes(atoms)
+    incar_text = "ENCUT = 520\n"
+    potcar_bytes = b"Si-potcar"
+    calculation = DftCalculationIdentity(
+        structure_id="authoritative-selected-structure-id",
+        poscar_hash=sha256_bytes(poscar_bytes),
+        incar_hash=hash_incar_text(incar_text),
+        potcar_hash=hash_potcar_bytes(potcar_bytes),
+    )
+    (working / "POSCAR").write_bytes(poscar_bytes)
+    (working / "INCAR").write_text(incar_text, encoding="utf-8")
+    (working / "POTCAR").write_bytes(potcar_bytes)
+    fixture = Path(__file__).parents[3] / "fixtures" / "outcar" / "valid_outcar"
+    shutil.copyfile(fixture, working / "OUTCAR")
+    inputs = DftInputArtifacts(
+        calculation=calculation,
+        working_directory=working,
+        files=(working / "POSCAR", working / "INCAR", working / "POTCAR"),
+    )
+
+    def parse_with_complete_labels(outcar_path, expected_atoms, **kwargs):
+        labelled = expected_atoms.copy()
+        labelled.calc = SinglePointCalculator(
+            labelled,
+            energy=-10.5,
+            forces=np.zeros((len(labelled), 3)),
+        )
+        return parse_outcar_result(
+            outcar_path,
+            expected_atoms,
+            reader=lambda _: labelled,
+            **kwargs,
+        )
+
+    monkeypatch.setattr(
+        "nepflow.dft.vasp.backend.parse_outcar_result",
+        parse_with_complete_labels,
+    )
+
+    result = VaspBackend().parse_result(inputs)
+
+    assert result.structure.structure_id == calculation.structure_id
+    assert result.calculation == calculation
 
 
 def test_vasp_runner_renderer_owns_only_backend_body() -> None:

@@ -18,7 +18,7 @@ from nepflow.config.models import (  # noqa: E402
     NepflowConfig,
     NepTrainingConfig,
 )
-from nepflow.dft.vasp.inputs import read_identity  # noqa: E402
+from nepflow.dft.vasp.inputs import calculate_poscar_hash, read_identity  # noqa: E402
 from nepflow.dft.vasp.outputs import parse_outcar_result  # noqa: E402
 from nepflow.domain.datasets import (  # noqa: E402
     DatasetIdentity,
@@ -108,11 +108,12 @@ def test_deterministic_dft_to_validation_identity_trace() -> None:
         outcar_path = vasp_job / "OUTCAR"
         shutil.copy2(OUTCAR_FIXTURE, outcar_path)
         selected = read_dft_fixture_as_vasp_result()
-        calculation_identity = {
-            "structure_hash": calculate_structure_id(selected),
-            "incar_hash": "incar-hash-v1",
-            "potcar_hash": "potcar-hash-v1",
-        }
+        calculation_identity = DftCalculationIdentity(
+            structure_id=calculate_structure_id(selected),
+            poscar_hash=calculate_poscar_hash(selected),
+            incar_hash="incar-hash-v1",
+            potcar_hash="potcar-hash-v1",
+        ).to_dict()
         (vasp_job / ".vasp_identity").write_text(json.dumps(calculation_identity), encoding="utf-8")
 
         accepted = parse_outcar_result(
@@ -125,7 +126,7 @@ def test_deterministic_dft_to_validation_identity_trace() -> None:
         )
 
         assert accepted.accepted, accepted.rejection_reason
-        assert accepted.structure_id == calculation_identity["structure_hash"]
+        assert accepted.structure_id == calculation_identity["structure_id"]
         assert accepted.calculation_identity == tuple(sorted(calculation_identity.items()))
         assert accepted.source_outcar_hash == sha256_file(outcar_path)
 

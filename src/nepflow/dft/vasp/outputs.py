@@ -13,10 +13,7 @@ import numpy as np
 from ase.atoms import Atoms
 from ase.io import read as ase_read
 
-from nepflow.domain.identities import (
-    calculate_structure_id,
-    normalise_dft_calculation_identity,
-)
+from nepflow.domain.identities import normalise_dft_calculation_identity
 from nepflow.domain.units import (
     ENERGY_UNIT_EV,
     FORCE_UNIT_EV_PER_ANGSTROM,
@@ -325,7 +322,13 @@ class VaspRegistryEvidence:
     calculation_identity: Mapping[str, object]
 
 
-_IDENTITY_KEYS = ("structure_id", "incar_hash", "potcar_hash", "calculation_id")
+_IDENTITY_KEYS = (
+    "structure_id",
+    "poscar_hash",
+    "incar_hash",
+    "potcar_hash",
+    "calculation_id",
+)
 
 
 def _validated_identity(
@@ -438,17 +441,19 @@ def parse_outcar_result(
 ) -> VaspParseResult:
     """Parse one identity-bound OUTCAR into an accepted/rejected result.
 
-    ``ase_atoms`` supplies the expected structure identity.  Accepted forces
-    have shape ``(n_atoms, 3)`` in eV/Angstrom, positions/lattice are Angstrom,
-    and optional virial is a positive-compression Cartesian ``(3, 3)`` tensor
-    in eV.  Identity or label failures become a rejected result with a stable
-    reason; no placeholder scientific values are emitted.
+    ``ase_atoms`` supplies the expected VASP atom/species/order representation.
+    The verified calculation identity remains the sole owner of the upstream
+    physical structure ID. Accepted forces have shape ``(n_atoms, 3)`` in
+    eV/Angstrom, positions/lattice are Angstrom, and optional virial is a
+    positive-compression Cartesian ``(3, 3)`` tensor in eV. Identity or label
+    failures become a rejected result with a stable reason; no placeholder
+    scientific values are emitted.
     """
     if reader is None:
         reader = cast(Callable[[str], Atoms], ase_read)
     identity_reader = read_identity if identity_reader is None else identity_reader
-    structure_id = calculate_structure_id(ase_atoms)
     identity_items_source = dict(calculation_identity or {})
+    structure_id = str(identity_items_source.get("structure_id", ""))
     identity_items = tuple(
         sorted((str(key), str(value)) for key, value in identity_items_source.items())
     )
@@ -467,6 +472,7 @@ def parse_outcar_result(
         calculation_identity,
         label="expected VASP identity",
     )
+    structure_id = comparison_identity["structure_id"]
 
     if identity_evidence is None:
         source_identity = identity_reader(Path(outcar_path).parent)

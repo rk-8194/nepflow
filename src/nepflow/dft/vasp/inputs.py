@@ -9,11 +9,12 @@ calculation identity.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Mapping
 
 import numpy as np
+from ase.atoms import Atoms
 
 from nepflow.config import load_config
 from nepflow.config.models import VaspConfig
@@ -23,13 +24,22 @@ from nepflow.domain.identities import (
     calculate_structure_id,
     normalise_dft_calculation_identity,
 )
-from nepflow.errors import StateError
+from nepflow.errors import StateError, ValidationError
 from nepflow.io.hashing import sha256_bytes
 from nepflow.io.json import read_json
 
 
-def canonical_poscar_text(atoms) -> str:
+def _require_vasp_periodicity(atoms: Atoms) -> None:
+    """Reject structures whose ASE PBC semantics cannot be encoded by VASP."""
+
+    pbc = np.asarray(atoms.get_pbc(), dtype=bool)
+    if pbc.shape != (3,) or not bool(np.all(pbc)):
+        raise ValidationError("VASP input structures must be periodic in all three directions")
+
+
+def canonical_poscar_text(atoms: Atoms) -> str:
     """Return NEPFlow's deterministic VASP5 POSCAR representation."""
+    _require_vasp_periodicity(atoms)
     symbols = np.array(atoms.get_chemical_symbols())
     unique_elements = sorted(set(symbols))
 
@@ -41,10 +51,10 @@ def canonical_poscar_text(atoms) -> str:
         sorted_indices.extend(indices.tolist())
         counts.append(int(mask.sum()))
 
-    cell = atoms.get_cell()
+    cell = np.asarray(atoms.get_cell(), dtype=float)
     frac_positions = atoms.get_scaled_positions()
-    info = atoms.info if hasattr(atoms, "info") else {}
-    comment = info.get("config_type", " ".join(unique_elements))
+    # Mutable annotations and provenance labels are not scientific VASP input.
+    comment = " ".join(unique_elements)
 
     lines = [str(comment), "1.0"]
     for row in cell:
@@ -58,9 +68,21 @@ def canonical_poscar_text(atoms) -> str:
     return "\n".join(lines) + "\n"
 
 
-def canonical_poscar_bytes(atoms) -> bytes:
+def canonical_poscar_bytes(atoms: Atoms) -> bytes:
     """Return canonical POSCAR bytes for structure hashing."""
     return canonical_poscar_text(atoms).encode("utf-8")
+
+
+def _hash_poscar_bytes(poscar_bytes: bytes) -> str:
+    """Hash already-rendered canonical POSCAR bytes without re-rendering."""
+
+    return sha256_bytes(poscar_bytes)
+
+
+def calculate_poscar_hash(atoms: Atoms) -> str:
+    """Return the SHA-256 of NEPFlow's canonical scientific POSCAR bytes."""
+
+    return _hash_poscar_bytes(canonical_poscar_bytes(atoms))
 
 
 def strip_resource_incar_params(incar_text: str) -> str:
@@ -158,6 +180,13 @@ class VaspInputIdentity:
     """Typed scientific identity assembled from canonical VASP inputs."""
 
     calculation: DftCalculationIdentity
+    poscar_bytes: bytes | None = field(default=None, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        if self.poscar_bytes is None:
+            return
+        if self.calculation.poscar_hash != _hash_poscar_bytes(self.poscar_bytes):
+            raise ValueError("VASP identity poscar_hash does not match its canonical bytes")
 
     @property
     def structure_id(self) -> str:
@@ -172,16 +201,23 @@ class VaspInputIdentity:
         return self.calculation.potcar_hash
 
     @property
+    def poscar_hash(self) -> str | None:
+        return self.calculation.poscar_hash
+
+    @property
     def calculation_id(self) -> str:
         return self.calculation.calculation_id
 
     def as_dict(self) -> dict[str, str]:
-        return {
+        result = {
             "structure_id": self.structure_id,
             "incar_hash": self.incar_hash,
             "potcar_hash": self.potcar_hash,
             "calculation_id": self.calculation_id,
         }
+        if self.poscar_hash is not None:
+            result["poscar_hash"] = self.poscar_hash
+        return result
 
 
 @dataclass(frozen=True, slots=True)
@@ -220,9 +256,14 @@ def build_input_context(project_dir: Path) -> VaspInputContext | None:
     return VaspInputContext(hash_incar_text(incar_text), potcar_data)
 
 
-def identity_for_structure(atoms, input_context: Mapping[str, object]) -> VaspInputIdentity:
+def identity_for_structure(
+    atoms: Atoms,
+    input_context: Mapping[str, object],
+) -> VaspInputIdentity:
     """Assemble the typed identity used by preparation and reuse lookup."""
+    _require_vasp_periodicity(atoms)
     structure_id = calculate_structure_id(atoms)
+    poscar_bytes = canonical_poscar_bytes(atoms)
     potcar_data = input_context["potcar_data"]
     if not isinstance(potcar_data, Mapping):
         raise TypeError("VASP input context has invalid POTCAR data")
@@ -237,9 +278,11 @@ def identity_for_structure(atoms, input_context: Mapping[str, object]) -> VaspIn
     return VaspInputIdentity(
         DftCalculationIdentity(
             structure_id=structure_id,
+            poscar_hash=_hash_poscar_bytes(poscar_bytes),
             incar_hash=incar_hash,
             potcar_hash=potcar_hash,
-        )
+        ),
+        poscar_bytes=poscar_bytes,
     )
 
 
@@ -283,6 +326,7 @@ __all__ = [
     "VaspInputIdentity",
     "canonical_poscar_bytes",
     "canonical_poscar_text",
+    "calculate_poscar_hash",
     "build_input_context",
     "hash_incar_text",
     "hash_potcar_bytes",

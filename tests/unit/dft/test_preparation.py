@@ -53,10 +53,7 @@ def test_restart_reuses_prepared_inputs_for_existing_attempt(
             *prepared.artifacts.files,
             prepared.artifacts.working_directory / ".vasp_identity",
         )
-        snapshots = {
-            path: (path.read_bytes(), path.stat().st_mtime_ns)
-            for path in persisted_files
-        }
+        snapshots = {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in persisted_files}
         attempt = state_store.list_dft_attempts(prepared.calculation.calculation_id)[0]
         attempt_id = str(attempt["attempt_id"])
         if persisted_status != "pending":
@@ -76,12 +73,12 @@ def test_restart_reuses_prepared_inputs_for_existing_attempt(
 
         assert backend.prepare_calls == 1
         assert second.calculations[0].status == persisted_status
-        assert second.calculations[0].calculation.calculation_id == prepared.calculation.calculation_id
+        assert (
+            second.calculations[0].calculation.calculation_id == prepared.calculation.calculation_id
+        )
         persisted_attempt = state_store.list_dft_attempts(prepared.calculation.calculation_id)[0]
         assert persisted_attempt["attempt_id"] == attempt_id
-        assert persisted_attempt["job_id"] == (
-            "job-1" if persisted_status != "pending" else None
-        )
+        assert persisted_attempt["job_id"] == ("job-1" if persisted_status != "pending" else None)
         for path, (content, mtime) in snapshots.items():
             assert path.read_bytes() == content
             assert path.stat().st_mtime_ns == mtime
@@ -167,9 +164,7 @@ def test_changed_identity_does_not_replace_an_active_working_directory(
         )
         prepared = first.calculations[0]
         attempt = state_store.list_dft_attempts(prepared.calculation.calculation_id)[0]
-        state_store.update_dft_attempt(
-            str(attempt["attempt_id"]), status="running", job_id="job-1"
-        )
+        state_store.update_dft_attempt(str(attempt["attempt_id"]), status="running", job_id="job-1")
         snapshots = {
             path: path.read_bytes()
             for path in (
@@ -191,7 +186,7 @@ def test_changed_identity_does_not_replace_an_active_working_directory(
             )
 
         assert backend.prepare_calls == 1
-        assert {path: path.read_bytes() for path in prepared.artifacts.files} == snapshots
+        assert {path: path.read_bytes() for path in snapshots} == snapshots
 
 
 def test_completed_calculation_reuses_inputs_and_output_read_only(tmp_path: Path) -> None:
