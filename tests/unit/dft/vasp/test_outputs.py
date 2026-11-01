@@ -86,6 +86,12 @@ def test_performance_parser_preserves_memory_utility_fields() -> None:
 def test_result_preserves_energy_forces_and_requires_verified_identity(tmp_path) -> None:
     outcar = _copy_outcar_fixture(tmp_path, "valid_outcar")
     expected_atoms = _labelled_atoms()
+    expected_atoms.calc = SinglePointCalculator(
+        expected_atoms,
+        energy=-4.5,
+        forces=np.array([[0.1, 0.2, 0.3]]),
+        stress=np.zeros(6),
+    )
     identity = _identity(expected_atoms)
     evidence = ResolvedVaspOutput(
         outcar,

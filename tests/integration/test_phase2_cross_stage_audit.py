@@ -74,6 +74,7 @@ def read_dft_fixture_as_vasp_result():
         atoms,
         energy=energy,
         forces=forces,
+        stress=np.zeros(6),
     )
     return atoms
 

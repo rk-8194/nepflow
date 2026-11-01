@@ -156,9 +156,7 @@ def parse_virial_from_outcar(outcar_path: Path, volume: float) -> np.ndarray | N
     invalid at the conversion boundary.
     """
     try:
-        # Keep the verified Phase 2 text semantics for the canonical virial
-        # result even when ASE offers a different OUTCAR interpretation.
-        stress = parse_stress_from_outcar(outcar_path, prefer_ase=False)
+        stress = parse_stress_from_outcar(outcar_path)
         if stress is None:
             return None
         return virial_from_stress(stress, float(volume))
@@ -539,7 +537,6 @@ def parse_outcar_result(
 
     parsed = _parse_vasp_structure_fields(
         atoms,
-        outcar_path,
         require_virial=require_virial,
     )
     if isinstance(parsed, str):
@@ -595,7 +592,6 @@ def _rejected_parse_result(
 
 def _parse_vasp_structure_fields(
     atoms: Atoms,
-    outcar_path: Path,
     *,
     require_virial: bool,
 ) -> (
@@ -635,7 +631,18 @@ def _parse_vasp_structure_fields(
         # rejects the result rather than being silently defaulted.
         return f"invalid_structure_geometry:{type(exc).__name__}"
 
-    virial = parse_virial_from_outcar(outcar_path, volume)
+    try:
+        stress = np.asarray(atoms.get_stress(voigt=False), dtype=float)
+    except Exception:
+        virial = None
+    else:
+        if stress.shape != (3, 3) or not np.all(np.isfinite(stress)):
+            virial = None
+        else:
+            try:
+                virial = virial_from_stress(stress, volume)
+            except (TypeError, ValueError):
+                virial = None
     if require_virial and virial is None:
         return "missing_required_virial"
 
