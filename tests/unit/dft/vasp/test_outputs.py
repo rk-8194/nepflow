@@ -94,7 +94,6 @@ def test_result_preserves_energy_forces_and_requires_verified_identity(tmp_path)
     )
     result = parse_outcar_result(
         outcar,
-        expected_atoms,
         require_virial=True,
         calculation_identity=identity,
         identity_evidence=evidence,
@@ -120,7 +119,6 @@ def test_result_uses_verified_source_identity_not_poscar_round_trip_identity(tmp
 
     result = parse_outcar_result(
         outcar,
-        expected_atoms,
         calculation_identity=identity,
         identity_evidence=evidence,
         reader=lambda _: expected_atoms,
@@ -135,7 +133,6 @@ def test_direct_parse_without_identity_evidence_is_rejected(tmp_path) -> None:
     identity = _identity(_labelled_atoms())
     result = parse_outcar_result(
         outcar,
-        _labelled_atoms(),
         calculation_identity=identity,
         reader=lambda _: _labelled_atoms(),
     )
@@ -150,7 +147,6 @@ def test_expected_identity_and_matching_sidecar_are_accepted(tmp_path) -> None:
 
     result = parse_outcar_result(
         outcar,
-        atoms,
         calculation_identity=identity,
         reader=lambda _: atoms,
     )
@@ -167,7 +163,6 @@ def test_mismatched_verified_evidence_is_rejected(tmp_path) -> None:
 
     result = parse_outcar_result(
         outcar,
-        atoms,
         calculation_identity=expected,
         identity_evidence=ResolvedVaspOutput(
             outcar,
@@ -184,7 +179,6 @@ def test_parse_without_expected_identity_is_rejected(tmp_path) -> None:
     outcar = _copy_outcar_fixture(tmp_path)
     result = parse_outcar_result(
         outcar,
-        _labelled_atoms(),
         reader=lambda _: _labelled_atoms(),
     )
     assert result.rejection_reason == "missing_calculation_identity"
@@ -194,7 +188,6 @@ def test_required_virial_is_not_replaced_with_an_empty_tensor(tmp_path) -> None:
     outcar = _copy_outcar_fixture(tmp_path)
     result = parse_outcar_result(
         outcar,
-        _labelled_atoms(),
         require_virial=True,
         calculation_identity=_identity(_labelled_atoms()),
         identity_evidence=ResolvedVaspOutput(
@@ -254,7 +247,6 @@ def test_verified_resolution_owns_current_reuse_and_registry_rules(tmp_path) -> 
     assert registry.verification_source == "completed_registry_key"
     parsed = parse_outcar_result(
         historical_outcar,
-        atoms,
         calculation_identity=identity,
         identity_evidence=registry,
         reader=lambda _: atoms,

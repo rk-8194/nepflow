@@ -1201,7 +1201,6 @@ def _resolve_selected_calculation(
     )
     result = parse_outcar_result(
         outcar_path,
-        atoms,
         require_virial=False,
         calculation_identity=identity,
         identity_evidence=evidence,

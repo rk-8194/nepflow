@@ -143,8 +143,8 @@ def test_completed_result_uses_authoritative_calculation_structure_id(
         files=(working / "POSCAR", working / "INCAR", working / "POTCAR"),
     )
 
-    def parse_with_complete_labels(outcar_path, expected_atoms, **kwargs):
-        labelled = expected_atoms.copy()
+    def parse_with_complete_labels(outcar_path, **kwargs):
+        labelled = atoms.copy()
         labelled.calc = SinglePointCalculator(
             labelled,
             energy=-10.5,
@@ -152,7 +152,6 @@ def test_completed_result_uses_authoritative_calculation_structure_id(
         )
         return parse_outcar_result(
             outcar_path,
-            expected_atoms,
             reader=lambda _: labelled,
             **kwargs,
         )

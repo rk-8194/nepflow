@@ -393,12 +393,6 @@ exit "$VASP_EXIT"
             raise BackendError(f"Required VASP output artifact is missing: {outcar}")
         if not outcar_is_complete(outcar):
             raise BackendError(f"VASP OUTCAR is incomplete: {outcar}")
-        try:
-            expected = cast(Atoms, ase_read(str(inputs.working_directory / "POSCAR")))
-        except Exception as exc:
-            # The prepared POSCAR is required evidence for output identity;
-            # an ASE read failure must reject the completed output.
-            raise BackendError("Could not read prepared VASP POSCAR") from exc
         identity = inputs.calculation.to_dict()
         evidence = ResolvedVaspOutput(
             outcar_path=outcar,
@@ -407,7 +401,6 @@ exit "$VASP_EXIT"
         )
         parsed: VaspParseResult = parse_outcar_result(
             outcar,
-            expected,
             require_virial=inputs.requirements.virial_requested,
             calculation_identity=identity,
             identity_evidence=evidence,

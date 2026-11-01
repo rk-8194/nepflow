@@ -431,7 +431,6 @@ def _resolve_current_job_output(
 
 def parse_outcar_result(
     outcar_path: Path,
-    ase_atoms: Atoms,
     require_virial: bool = False,
     calculation_identity: Mapping[str, str] | None = None,
     identity_evidence: ResolvedVaspOutput | None = None,
@@ -441,13 +440,14 @@ def parse_outcar_result(
 ) -> VaspParseResult:
     """Parse one identity-bound OUTCAR into an accepted/rejected result.
 
-    ``ase_atoms`` supplies the expected VASP atom/species/order representation.
-    The verified calculation identity remains the sole owner of the upstream
-    physical structure ID. Accepted forces have shape ``(n_atoms, 3)`` in
-    eV/Angstrom, positions/lattice are Angstrom, and optional virial is a
-    positive-compression Cartesian ``(3, 3)`` tensor in eV. Identity or label
-    failures become a rejected result with a stable reason; no placeholder
-    scientific values are emitted.
+    The verified calculation identity and identity evidence establish which
+    calculation the OUTCAR belongs to. Species, positions, and forces are
+    read from the OUTCAR and retain its native VASP ordering; accepted labels
+    remain internally aligned in that ordering. Accepted forces have shape
+    ``(n_atoms, 3)`` in eV/Angstrom, positions/lattice are Angstrom, and
+    optional virial is a positive-compression Cartesian ``(3, 3)`` tensor in
+    eV. Identity or label failures become a rejected result with a stable
+    reason; no placeholder scientific values are emitted.
     """
     if reader is None:
         reader = cast(Callable[[str], Atoms], ase_read)
@@ -539,7 +539,6 @@ def parse_outcar_result(
 
     parsed = _parse_vasp_structure_fields(
         atoms,
-        ase_atoms,
         outcar_path,
         require_virial=require_virial,
     )
@@ -596,7 +595,6 @@ def _rejected_parse_result(
 
 def _parse_vasp_structure_fields(
     atoms: Atoms,
-    expected_atoms: Atoms,
     outcar_path: Path,
     *,
     require_virial: bool,
@@ -612,12 +610,7 @@ def _parse_vasp_structure_fields(
     ]
     | str
 ):
-    expected_species = tuple(expected_atoms.get_chemical_symbols())
     actual_species = tuple(atoms.get_chemical_symbols())
-    if len(atoms) != len(expected_atoms):
-        return f"atom_count_mismatch:expected={len(expected_atoms)}:actual={len(atoms)}"
-    if actual_species != expected_species:
-        return f"species_mismatch:expected={expected_species}:actual={actual_species}"
 
     try:
         energy = float(atoms.get_potential_energy())
@@ -665,7 +658,6 @@ def _parse_vasp_structure_fields(
 
 def parse_outcar(
     outcar_path: Path,
-    ase_atoms: Atoms,
     require_virial: bool = False,
     calculation_identity: Mapping[str, str] | None = None,
     identity_evidence: ResolvedVaspOutput | None = None,
@@ -680,7 +672,6 @@ def parse_outcar(
     """
     result = parse_outcar_result(
         outcar_path,
-        ase_atoms,
         require_virial=require_virial,
         calculation_identity=calculation_identity,
         identity_evidence=identity_evidence,

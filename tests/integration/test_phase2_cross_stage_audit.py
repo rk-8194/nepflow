@@ -118,7 +118,6 @@ def test_deterministic_dft_to_validation_identity_trace() -> None:
 
         accepted = parse_outcar_result(
             outcar_path,
-            selected,
             require_virial=True,
             calculation_identity=calculation_identity,
             reader=lambda _path: read_dft_fixture_as_vasp_result(),
