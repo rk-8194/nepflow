@@ -6,6 +6,7 @@ import logging
 import shlex
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass
+from pathlib import Path
 
 from nepflow.config import NepflowConfig
 from nepflow.dft.backend import DftBackend
@@ -29,6 +30,7 @@ from nepflow.hpc.resources import (
 )
 from nepflow.hpc.scheduler import Scheduler
 from nepflow.io.atomic import atomic_write_text
+from nepflow.io.json import to_jsonable, write_json
 from nepflow.workflow.controller import StageContext
 from nepflow.workflow.stages import StageRunResult, StageRunState, WorkflowStage
 
@@ -52,6 +54,145 @@ from .reports import DftPerformanceRecorder
 logger = logging.getLogger(__name__)
 
 
+def _write_failure_report(
+    project_dir: Path,
+    state_store: object,
+    preparation: DftPreparationResult,
+    execution: DftReconciliationResult,
+) -> Path | None:
+    """Persist terminal DFT failures using the authoritative StateStore rows."""
+
+    failed_records = tuple(
+        record
+        for record in execution.records
+        if record.status in {"failed", "cancelled"}
+    )
+    if not failed_records:
+        return None
+
+    prepared_by_calculation = {
+        item.calculation.calculation_id: item for item in preparation.calculations
+    }
+    get_calculation = getattr(state_store, "get_dft_calculation", None)
+    list_attempts = getattr(state_store, "list_dft_attempts", None)
+    get_attempt = getattr(state_store, "get_dft_attempt", None)
+    failures: list[dict[str, object]] = []
+    for record in failed_records:
+        calculation_id = record.inputs.calculation.calculation_id
+        calculation = get_calculation(calculation_id) if callable(get_calculation) else None
+        if callable(get_calculation) and calculation is None:
+            raise StateError(f"Missing authoritative DFT calculation state: {calculation_id}")
+        if calculation is not None and not isinstance(calculation, Mapping):
+            raise StateError(f"Malformed DFT calculation state: {calculation_id}")
+        item = prepared_by_calculation.get(calculation_id)
+        calculation_metadata = (
+            calculation.get("metadata", {})
+            if isinstance(calculation, Mapping)
+            else {}
+        )
+        if not isinstance(calculation_metadata, Mapping):
+            raise StateError(f"Malformed DFT calculation metadata: {calculation_id}")
+
+        attempt = get_attempt(record.attempt_id) if callable(get_attempt) else None
+        if attempt is not None and not isinstance(attempt, Mapping):
+            raise StateError(f"Malformed DFT attempt state: {record.attempt_id}")
+        if attempt is None and callable(list_attempts):
+            attempts = list_attempts(calculation_id)
+            if not isinstance(attempts, (list, tuple)):
+                raise StateError(f"Malformed DFT attempt history: {calculation_id}")
+            attempt = next(
+                (
+                    candidate
+                    for candidate in attempts
+                    if isinstance(candidate, Mapping)
+                    and candidate.get("attempt_id") == record.attempt_id
+                ),
+                None,
+            )
+        if callable(get_attempt) and attempt is None:
+            raise StateError(f"Missing authoritative DFT attempt state: {record.attempt_id}")
+        if callable(list_attempts) and attempt is None:
+            raise StateError(f"Missing authoritative DFT attempt state: {record.attempt_id}")
+
+        evidence = record.failure_evidence
+        if isinstance(attempt, Mapping) and attempt.get("failure_evidence") is not None:
+            evidence = attempt.get("failure_evidence")
+        if evidence is not None and not isinstance(evidence, Mapping):
+            raise StateError(f"Malformed DFT failure evidence: {record.attempt_id}")
+        evidence = {} if evidence is None else dict(evidence)
+        attempt_metadata = (
+            attempt.get("metadata", {}) if isinstance(attempt, Mapping) else {}
+        )
+        if not isinstance(attempt_metadata, Mapping):
+            raise StateError(f"Malformed DFT attempt metadata: {record.attempt_id}")
+
+        dataset = calculation_metadata.get("dataset")
+        selected_index = calculation_metadata.get("selected_index")
+        working_directory = attempt_metadata.get("working_directory")
+        if dataset is None and item is not None:
+            dataset = item.spec.dataset
+        if selected_index is None and item is not None:
+            selected_index = item.spec.selected_index
+        if working_directory is None:
+            working_directory = str(record.inputs.working_directory)
+        failures.append(
+            {
+                "dataset": dataset,
+                "selected_structure_index": selected_index,
+                "structure_id": record.inputs.calculation.structure_id,
+                "calculation_id": calculation_id,
+                "status": record.status,
+                "final_attempt_id": record.attempt_id,
+                "attempt_number": (
+                    attempt.get("attempt_number")
+                    if isinstance(attempt, Mapping)
+                    else record.attempt_number
+                ),
+                "retry_level": attempt_metadata.get("retry_level", record.retry_level),
+                "failure_kind": evidence.get("kind"),
+                "failure_reason": evidence.get("reason"),
+                "scheduler_state": evidence.get("scheduler_state"),
+                "scheduler_reason": evidence.get("scheduler_reason"),
+                "scheduler_exit_code": evidence.get("scheduler_exit_code"),
+                "working_directory": working_directory,
+            }
+        )
+
+    failures.sort(
+        key=lambda item: (
+            str(item.get("dataset", "")),
+            (
+                -1
+                if item.get("selected_structure_index") is None
+                else int(item["selected_structure_index"])
+            ),
+            str(item.get("calculation_id", "")),
+        )
+    )
+    report_path = Path(project_dir) / "reports" / "dft_campaign_failures.json"
+    write_json(
+        report_path,
+        {
+            "schema_version": "nepflow.dft_campaign_failure_report.v1",
+            "summary": {
+                "total": execution.total_count,
+                "completed": execution.completed_count,
+                "reused": execution.reused_count,
+                "failed": execution.failed_count,
+                "cancelled": execution.cancelled_count,
+                "successful": execution.successful_count,
+            },
+            "failures": to_jsonable(failures),
+        },
+    )
+    logger.warning(
+        "Persisted DFT campaign failure report with %d terminal failures: %s",
+        len(failures),
+        report_path,
+    )
+    return report_path
+
+
 @dataclass(frozen=True, slots=True)
 class DftStageResult:
     """Typed result returned after DFT preparation."""
@@ -60,30 +201,58 @@ class DftStageResult:
     execution: DftReconciliationResult | None = None
     stage: WorkflowStage = WorkflowStage.RUN_VASP
     status: StageRunState = StageRunState.RUNNING
+    failure_report_path: Path | None = None
 
     def as_workflow_result(self) -> StageRunResult:
         execution = self.execution
-        failed = execution is not None and execution.all_terminal and execution.any_failed
-        complete = execution is not None and execution.all_successful
-        status = (
-            StageRunState.FAILED if failed else StageRunState.COMPLETED if complete else self.status
+        if execution is None or not execution.all_terminal:
+            status = StageRunState.RUNNING
+            complete = False
+            advanced_to = None
+            reconciliation_message = "reconciliation pending"
+        elif execution.successful_count:
+            status = StageRunState.COMPLETED
+            complete = True
+            advanced_to = WorkflowStage.TRAIN_NEP
+            reconciliation_message = "reconciliation complete"
+            if execution.failed_count or execution.cancelled_count:
+                logger.warning(
+                    "DFT campaign completed with %d terminal calculation failures; "
+                    "proceeding with %d successful calculations",
+                    execution.failed_count + execution.cancelled_count,
+                    execution.successful_count,
+                )
+        else:
+            status = StageRunState.FAILED
+            complete = False
+            advanced_to = None
+            reconciliation_message = (
+                "reconciliation complete but no usable completed/reused DFT results remain"
+            )
+
+        summary = (
+            f"Resolved {0 if execution is None else execution.total_count} DFT calculations; "
+            f"{0 if execution is None else execution.completed_count} completed; "
+            f"{0 if execution is None else execution.reused_count} reused; "
+            f"{0 if execution is None else execution.failed_count} failed; "
+            f"{0 if execution is None else execution.cancelled_count} cancelled; "
+            f"{0 if execution is None else execution.non_terminal_count} non-terminal; "
+            f"{reconciliation_message}"
         )
+        if (
+            execution is not None
+            and execution.all_terminal
+            and not execution.successful_count
+        ):
+            summary += "; cannot advance to training without usable DFT data"
+        if self.failure_report_path is not None:
+            summary += f"; failure report: {self.failure_report_path}"
         return StageRunResult(
             stage=self.stage,
             status=status,
-            advanced_to=WorkflowStage.TRAIN_NEP if complete else None,
+            advanced_to=advanced_to,
             completed=complete,
-            message=(
-                f"Prepared {self.preparation.prepared_count} calculations; "
-                f"{self.preparation.reused_count} reused"
-                + (
-                    "; reconciliation failed"
-                    if failed
-                    else "; reconciliation complete"
-                    if complete
-                    else "; reconciliation pending"
-                )
-            ),
+            message=summary,
         )
 
 
@@ -231,7 +400,17 @@ class DftStage:
             # compatible.  Production composition always supplies the typed
             # DftReconciliationOrchestrator above.
             execution = execution_orchestrator.reconcile_once(records)
-        return DftStageResult(preparation=preparation, execution=execution)
+        failure_report_path = _write_failure_report(
+            active_context.project_dir,
+            state_store,
+            preparation,
+            execution,
+        )
+        return DftStageResult(
+            preparation=preparation,
+            execution=execution,
+            failure_report_path=failure_report_path,
+        )
 
     @staticmethod
     def _build_recovery_policy(config: NepflowConfig):

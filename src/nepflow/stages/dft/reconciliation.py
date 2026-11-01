@@ -141,6 +141,49 @@ class DftReconciliationResult:
         )
 
     @property
+    def total_count(self) -> int:
+        """Return the total number of reconciled calculations."""
+        return len(self.records)
+
+    @property
+    def completed_count(self) -> int:
+        """Return the number of calculations completed by this campaign."""
+        return sum(record.status == "completed" for record in self.records)
+
+    @property
+    def reused_count(self) -> int:
+        """Return the number of verified calculations reused by this campaign."""
+        return sum(record.status == "reused" for record in self.records)
+
+    @property
+    def failed_count(self) -> int:
+        """Return the number of terminal failed calculations."""
+        return sum(record.status == "failed" for record in self.records)
+
+    @property
+    def cancelled_count(self) -> int:
+        """Return the number of terminal cancelled calculations."""
+        return sum(record.status == "cancelled" for record in self.records)
+
+    @property
+    def successful_count(self) -> int:
+        """Return the number of usable completed or reused calculations."""
+        return self.completed_count + self.reused_count
+
+    @property
+    def usable_count(self) -> int:
+        """Return the number of usable downstream DFT results."""
+        return self.successful_count
+
+    @property
+    def non_terminal_count(self) -> int:
+        """Return the number of calculations still requiring reconciliation."""
+        return sum(
+            record.status not in {"completed", "reused", "failed", "cancelled"}
+            for record in self.records
+        )
+
+    @property
     def any_failed(self) -> bool:
         """Return whether at least one calculation reached irrecoverable failure."""
         return any(record.status == "failed" for record in self.records)
@@ -270,13 +313,14 @@ class DftReconciliationOrchestrator:
             counts = result.counts
             logger.info(
                 "DFT reconciliation: completed=%d reused=%d running=%d "
-                "submitted/queued=%d pending/waiting=%d failed=%d total=%d",
+                "submitted/queued=%d pending/waiting=%d failed=%d cancelled=%d total=%d",
                 counts.get("completed", 0),
                 counts.get("reused", 0),
                 counts.get("running", 0),
                 counts.get("submitted", 0),
                 counts.get("pending", 0) + counts.get("prepared", 0),
                 counts.get("failed", 0),
+                counts.get("cancelled", 0),
                 len(current),
             )
             if result.all_terminal:

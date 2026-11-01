@@ -579,6 +579,32 @@ def test_failed_dft_stage_does_not_advance_to_training(
     assert workflow_result.advanced_to is None
 
 
+def test_terminal_dft_failures_complete_stage_when_usable_results_remain(
+    record: DftExecutionRecord,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    snapshot = DftReconciliationResult(
+        (
+            record.with_status("completed"),
+            record.with_status("failed"),
+            record.with_status("reused"),
+        )
+    )
+
+    with caplog.at_level("WARNING"):
+        workflow_result = DftStageResult(
+            preparation=DftPreparationResult(()),
+            execution=snapshot,
+        ).as_workflow_result()
+
+    assert workflow_result.status is StageRunState.COMPLETED
+    assert workflow_result.completed is True
+    assert workflow_result.advanced_to is WorkflowStage.TRAIN_NEP
+    assert "Resolved 3 DFT calculations" in workflow_result.message
+    assert "1 failed" in workflow_result.message
+    assert "proceeding with 2 successful calculations" in caplog.text
+
+
 def test_nonterminal_dft_snapshot_with_one_failure_stays_running(
     record: DftExecutionRecord,
 ) -> None:

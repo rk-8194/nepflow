@@ -109,7 +109,13 @@ class DatasetBuildReport:
         )
         return len(self.requested_members) - 1
 
-    def record_rejection(self, reason: str, *, member_index: int | None = None) -> None:
+    def record_rejection(
+        self,
+        reason: str,
+        *,
+        member_index: int | None = None,
+        details: Mapping[str, Any] | None = None,
+    ) -> None:
         """Record a visible rejection reason and optionally update its member."""
         reason = str(reason)
         self.rejected_reason_counts[reason] = self.rejected_reason_counts.get(reason, 0) + 1
@@ -117,6 +123,8 @@ class DatasetBuildReport:
             member = self.requested_members[member_index]
             member["status"] = "rejected"
             member["rejection_reason"] = reason
+            if details is not None:
+                member["rejection_details"] = to_jsonable(details)
 
     def record_acceptance(
         self,
@@ -238,6 +246,7 @@ def _rejection(
     reason: str,
     *,
     member_index: int | None = None,
+    details: Mapping[str, Any] | None = None,
 ) -> None:
     logger.warning(
         "[%s] Rejecting requested dataset member%s: %s",
@@ -245,7 +254,7 @@ def _rejection(
         "" if member_index is None else f" #{member_index}",
         reason,
     )
-    report.record_rejection(reason, member_index=member_index)
+    report.record_rejection(reason, member_index=member_index, details=details)
 
 
 def _result_from_mapping(value: Mapping[str, Any]) -> VaspParseResult:
@@ -852,6 +861,12 @@ def _process_dataset_split(
     rendered: list[dict[str, Any]] = []
     for ordinal, item in enumerate(records):
         member_index = report.record_requested(_record_structure_id(item), ordinal)
+        rejection_details = (
+            item.get("terminal_failure")
+            if isinstance(item, Mapping)
+            and isinstance(item.get("terminal_failure"), Mapping)
+            else None
+        )
         try:
             result = item if isinstance(item, VaspParseResult) else _result_from_mapping(item)
             if not result.accepted:
@@ -859,6 +874,7 @@ def _process_dataset_split(
                     report,
                     result.rejection_reason or "record_rejected",
                     member_index=member_index,
+                    details=rejection_details,
                 )
                 continue
             _require_state_authority(state_store, result)
@@ -899,17 +915,21 @@ def _validate_dataset_reports(
     for split in (DatasetSplit.TRAIN, DatasetSplit.TEST):
         if reports[split].rejected_count < 0:
             raise RuntimeError(f"Dataset report over-accepted {split.value} records")
-    total_rejected = sum(report.rejected_count for report in reports.values())
-    if total_rejected and not allow_partial:
+    unexpected_rejected = sum(
+        count
+        for report in reports.values()
+        for reason, count in report.rejected_reason_counts.items()
+        if not reason.startswith("terminal_dft_failure:")
+    )
+    if unexpected_rejected and not allow_partial:
         raise RuntimeError(
             "Dataset creation rejected selected structures; "
             "set train_nep.allow_partial_dataset=true to allow explicit partial data"
         )
-    if (
-        not reports[DatasetSplit.TRAIN].accepted_count
-        or not reports[DatasetSplit.TEST].accepted_count
-    ):
-        raise RuntimeError("No valid structures found; cannot create a training dataset")
+    if not reports[DatasetSplit.TRAIN].accepted_count:
+        raise RuntimeError("No valid training structures remain after DFT resolution")
+    if not reports[DatasetSplit.TEST].accepted_count:
+        raise RuntimeError("No valid test structures remain after DFT resolution")
 
 
 def _apply_selection_metadata(
@@ -938,11 +958,12 @@ def resolve_selected_dft_results(
     state_store: Any,
     *,
     reader: Any | None = None,
-) -> dict[DatasetSplit, tuple[VaspParseResult, ...]]:
+) -> dict[DatasetSplit, tuple[VaspParseResult | Mapping[str, Any], ...]]:
     """Load selected structures and resolve their exact accepted DFT results.
 
     This canonical ``TrainingStage`` adapter requires manifest-bound accepted
-    DFT results and rejects unverified filesystem-only records.
+    DFT results.  Authoritative terminal DFT failures become explicit rejected
+    members; unverified filesystem-only records remain hard errors.
     """
 
     if reader is None:
@@ -952,7 +973,7 @@ def resolve_selected_dft_results(
     by_structure = _index_selected_calculations(state_store)
     selection_manifest = read_selection_manifest(project_dir)
 
-    resolved: dict[DatasetSplit, tuple[VaspParseResult, ...]] = {}
+    resolved: dict[DatasetSplit, tuple[VaspParseResult | Mapping[str, Any], ...]] = {}
     for split in (DatasetSplit.TRAIN, DatasetSplit.TEST):
         source = Path(project_dir) / "structures" / "selected" / f"{split.value}.xyz"
         if not source.is_file():
@@ -977,15 +998,28 @@ def resolve_selected_dft_results(
 
 def _index_selected_calculations(state_store: Any) -> dict[str, list[Mapping[str, Any]]]:
     calculations = state_store.list_dft_calculations(
-        statuses=("completed",),
+        statuses=("completed", "failed", "cancelled"),
         selected_only=True,
     )
     by_structure: dict[str, list[Mapping[str, Any]]] = {}
     for calculation in calculations:
+        if not isinstance(calculation, Mapping):
+            raise StateError("StateStore returned a malformed DFT calculation record")
         identity = calculation.get("identity", {})
+        if not isinstance(identity, Mapping):
+            raise StateError("StateStore DFT calculation identity is malformed")
+        calculation_id = calculation.get("calculation_id")
+        if not isinstance(calculation_id, str) or not calculation_id:
+            raise StateError("StateStore DFT calculation is missing calculation_id")
+        if identity.get("calculation_id") != calculation_id:
+            raise StateError(f"StateStore DFT calculation identity mismatch: {calculation_id}")
         structure_id = identity.get("structure_id", calculation.get("structure_id"))
-        if structure_id:
-            by_structure.setdefault(str(structure_id), []).append(calculation)
+        if not isinstance(structure_id, str) or not structure_id:
+            raise StateError("StateStore DFT calculation is missing structure identity")
+        status = calculation.get("status")
+        if status not in {"completed", "failed", "cancelled"}:
+            raise StateError(f"StateStore returned unsupported selected DFT status: {status!r}")
+        by_structure.setdefault(structure_id, []).append(calculation)
     return by_structure
 
 
@@ -994,8 +1028,8 @@ def _resolve_selected_split(
     split: DatasetSplit,
     by_structure: Mapping[str, Sequence[Mapping[str, Any]]],
     state_store: Any,
-) -> list[VaspParseResult]:
-    results: list[VaspParseResult] = []
+) -> list[VaspParseResult | Mapping[str, Any]]:
+    results: list[VaspParseResult | Mapping[str, Any]] = []
     for atoms in structures:
         structure_id = calculate_structure_id(atoms)
         requested_calculation_id = atoms.info.get("calculation_id")
@@ -1009,18 +1043,135 @@ def _resolve_selected_split(
             ]
         if len(candidates) != 1:
             raise RuntimeError(
-                f"StateStore must resolve exactly one completed {split.value} DFT "
+                f"StateStore must resolve exactly one terminal {split.value} DFT "
                 f"calculation for structure_id={structure_id}; found {len(candidates)}"
             )
-        results.append(
-            _resolve_selected_calculation(
-                atoms,
-                structure_id,
-                candidates[0],
-                state_store,
+        calculation = candidates[0]
+        status = calculation.get("status")
+        if status in {"failed", "cancelled"}:
+            results.append(
+                _terminal_failure_dataset_member(
+                    split,
+                    structure_id,
+                    calculation,
+                    state_store,
+                )
             )
-        )
+        elif status == "completed":
+            results.append(
+                _resolve_selected_calculation(
+                    atoms,
+                    structure_id,
+                    calculation,
+                    state_store,
+                )
+            )
+        else:
+            raise StateError(
+                "StateStore returned unsupported selected DFT status for "
+                f"{structure_id}: {status!r}"
+            )
     return results
+
+
+def _terminal_failure_dataset_member(
+    split: DatasetSplit,
+    structure_id: str,
+    calculation: Mapping[str, Any],
+    state_store: Any,
+) -> Mapping[str, Any]:
+    """Represent an authoritative terminal DFT failure without parsing files."""
+
+    calculation_id = calculation.get("calculation_id")
+    if not isinstance(calculation_id, str) or not calculation_id:
+        raise StateError("StateStore terminal DFT calculation is missing calculation_id")
+    identity = calculation.get("identity")
+    if not isinstance(identity, Mapping):
+        raise StateError(f"StateStore DFT identity is malformed for {calculation_id}")
+    if identity.get("calculation_id") != calculation_id:
+        raise StateError(f"StateStore DFT identity mismatch for {calculation_id}")
+    if identity.get("structure_id") != structure_id:
+        raise StateError(f"StateStore DFT identity mismatch for {calculation_id}")
+    if calculation.get("accepted_attempt_id") is not None:
+        raise StateError(
+            "Terminal failed DFT calculation has an accepted attempt: "
+            f"{calculation_id}"
+        )
+
+    list_attempts = getattr(state_store, "list_dft_attempts", None)
+    if not callable(list_attempts):
+        raise TypeError("authoritative dataset building requires StateStore DFT attempt APIs")
+    attempts = list_attempts(calculation_id)
+    if not isinstance(attempts, (list, tuple)) or not attempts:
+        raise StateError(
+            "StateStore has no attempts for terminal DFT calculation "
+            f"{calculation_id}"
+        )
+    if any(not isinstance(attempt, Mapping) for attempt in attempts):
+        raise StateError(f"StateStore DFT attempt history is malformed for {calculation_id}")
+    scientific_attempts = [
+        attempt
+        for attempt in attempts
+        if not (
+            isinstance(attempt.get("metadata"), Mapping)
+            and attempt["metadata"].get("execution_kind") == "vasp_benchmark"
+        )
+    ]
+    if len(scientific_attempts) != len(attempts):
+        attempts = scientific_attempts
+    if not attempts:
+        raise StateError(f"StateStore DFT attempt history is malformed for {calculation_id}")
+    try:
+        final_attempt = max(attempts, key=lambda attempt: int(attempt["attempt_number"]))
+        final_attempt_number = int(final_attempt["attempt_number"])
+        if final_attempt_number < 1:
+            raise ValueError("attempt number must be positive")
+    except (KeyError, TypeError, ValueError) as exc:
+        raise StateError(
+            f"StateStore DFT attempt number is malformed for {calculation_id}"
+        ) from exc
+    final_attempt_id = final_attempt.get("attempt_id")
+    if not isinstance(final_attempt_id, str) or not final_attempt_id:
+        raise StateError(f"StateStore DFT attempt identity is malformed for {calculation_id}")
+    expected_status = str(calculation.get("status"))
+    if final_attempt.get("status") != expected_status:
+        raise StateError(
+            f"StateStore terminal DFT status does not match final attempt for {calculation_id}"
+        )
+    evidence = final_attempt.get("failure_evidence", {})
+    if evidence is None:
+        evidence = {}
+    if not isinstance(evidence, Mapping):
+        raise StateError(
+            f"StateStore DFT failure evidence is malformed for {calculation_id}"
+        )
+    attempt_metadata = final_attempt.get("metadata", {})
+    if not isinstance(attempt_metadata, Mapping):
+        raise StateError(
+            f"StateStore DFT attempt metadata is malformed for {calculation_id}"
+        )
+    failure_details = {
+        "split": split.value,
+        "structure_id": structure_id,
+        "calculation_id": calculation_id,
+        "status": expected_status,
+        "final_attempt_id": final_attempt_id,
+        "attempt_number": final_attempt_number,
+        "retry_level": attempt_metadata.get("retry_level"),
+        "failure_kind": evidence.get("kind"),
+        "failure_reason": evidence.get("reason"),
+        "scheduler_state": evidence.get("scheduler_state"),
+        "scheduler_reason": evidence.get("scheduler_reason"),
+        "scheduler_exit_code": evidence.get("scheduler_exit_code"),
+        "working_directory": attempt_metadata.get("working_directory"),
+    }
+    return {
+        "status": "rejected",
+        "structure_id": structure_id,
+        "calculation_identity": dict(identity),
+        "rejection_reason": f"terminal_dft_failure:{expected_status}",
+        "terminal_failure": failure_details,
+    }
 
 
 def _resolve_selected_calculation(

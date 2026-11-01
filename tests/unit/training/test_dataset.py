@@ -14,6 +14,7 @@ from nepflow.stages.training.dataset import (
     DatasetSplit,
     build_training_dataset,
     load_materialized_dataset,
+    prepare_training_dataset,
     write_nep_dataset,
 )
 
@@ -174,6 +175,45 @@ def test_build_training_dataset_preserves_authoritative_members_and_splits(tmp_p
     test_path.write_bytes(test_original + b"\n")
     with pytest.raises(StateError, match="changed"):
         load_materialized_dataset(result.dataset_path, state_store)
+
+
+def test_terminal_dft_failures_are_explicit_dataset_exclusions(tmp_path: Path) -> None:
+    train = _result("terminal-train")
+    test = _result("terminal-test")
+    terminal = {
+        "status": "rejected",
+        "structure_id": "terminal-failed",
+        "calculation_identity": {"calculation_id": "calculation-terminal-failed"},
+        "rejection_reason": "terminal_dft_failure:failed",
+        "terminal_failure": {
+            "status": "failed",
+            "calculation_id": "calculation-terminal-failed",
+            "final_attempt_id": "attempt-calculation-terminal-failed",
+            "failure_kind": "execution_failed",
+            "failure_reason": "terminal failure",
+        },
+    }
+    state_store = FakeStateStore([train, test])
+
+    preparation = prepare_training_dataset(
+        {
+            DatasetSplit.TRAIN: (train, terminal),
+            DatasetSplit.TEST: (test,),
+        },
+        tmp_path / "preview",
+        state_store=state_store,
+    )
+
+    assert preparation.reports[DatasetSplit.TRAIN].accepted_count == 1
+    assert preparation.reports[DatasetSplit.TRAIN].rejected_reason_counts == {
+        "terminal_dft_failure:failed": 1
+    }
+    rejected = preparation.metadata["requested_members"][1]
+    assert rejected["status"] == "rejected"
+    assert rejected["rejection_reason"] == "terminal_dft_failure:failed"
+    assert rejected["rejection_details"]["final_attempt_id"] == (
+        "attempt-calculation-terminal-failed"
+    )
 
 
 def test_writer_failure_does_not_prepare_dataset_in_state_store(
