@@ -991,7 +991,13 @@ def resolve_selected_dft_results(
                 f"Selected {split.value} structure content does not match its manifest"
             )
         resolved[split] = tuple(
-            _resolve_selected_split(structures, split, by_structure, state_store)
+            _resolve_selected_split(
+                structures,
+                split,
+                by_structure,
+                state_store,
+                project_dir,
+            )
         )
     return resolved
 
@@ -1028,6 +1034,7 @@ def _resolve_selected_split(
     split: DatasetSplit,
     by_structure: Mapping[str, Sequence[Mapping[str, Any]]],
     state_store: Any,
+    project_dir: Path,
 ) -> list[VaspParseResult | Mapping[str, Any]]:
     results: list[VaspParseResult | Mapping[str, Any]] = []
     for atoms in structures:
@@ -1060,10 +1067,10 @@ def _resolve_selected_split(
         elif status == "completed":
             results.append(
                 _resolve_selected_calculation(
-                    atoms,
                     structure_id,
                     calculation,
                     state_store,
+                    project_dir,
                 )
             )
         else:
@@ -1175,10 +1182,10 @@ def _terminal_failure_dataset_member(
 
 
 def _resolve_selected_calculation(
-    atoms: Any,
     structure_id: str,
     calculation: Mapping[str, Any],
     state_store: Any,
+    project_dir: Path,
 ) -> VaspParseResult:
     identity = dict(calculation.get("identity", {}))
     calculation_id = str(calculation["calculation_id"])
@@ -1189,9 +1196,20 @@ def _resolve_selected_calculation(
     outcars = [artifact for artifact in artifacts if artifact.get("artifact_type") == "vasp_outcar"]
     if len(outcars) != 1:
         raise RuntimeError(f"StateStore has no unique accepted OUTCAR for {calculation_id}")
-    outcar_path = Path(str(outcars[0].get("path", "")))
-    if not outcar_path.is_file() or sha256_file(outcar_path) != outcars[0].get("sha256"):
-        raise RuntimeError(f"Accepted OUTCAR artifact is missing or changed for {calculation_id}")
+    artifact = outcars[0]
+    outcar_path = state_store.resolve_artifact_path(
+        artifact,
+        project_dir,
+        allow_legacy_absolute=True,
+    )
+    if not outcar_path.is_file():
+        raise RuntimeError(
+            f"Accepted OUTCAR artifact is missing for {calculation_id}: {outcar_path}"
+        )
+    if sha256_file(outcar_path) != artifact.get("sha256"):
+        raise RuntimeError(
+            f"Accepted OUTCAR artifact hash mismatch for {calculation_id}: {outcar_path}"
+        )
     evidence = ResolvedVaspOutput(
         outcar_path=outcar_path,
         calculation_identity=tuple(
