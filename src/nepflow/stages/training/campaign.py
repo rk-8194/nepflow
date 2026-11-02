@@ -866,7 +866,22 @@ class TrainingCampaign:
         if manifest_path.is_file():
             self._persist_manifest_completed_artifact(candidate, collected, attempt, manifest_path)
             return
-        self._record_completed_model(candidate, collected)
+        self._record_completed_model(candidate, collected, attempt)
+
+    @staticmethod
+    def _completion_evidence(
+        candidate: TrainingCandidate,
+        collected: CollectedModelArtifacts,
+        attempt: TrainingAttempt,
+    ) -> dict[str, Any]:
+        return {
+            "model_run_id": candidate.model_run_id,
+            "attempt_id": attempt.attempt_id,
+            "attempt_number": attempt.attempt_number,
+            "scheduler_state": SchedulerJobState.COMPLETED.value,
+            "artifact_path": str(Path(collected.artifact.model.path or "").resolve()),
+            "artifact_sha256": collected.artifact.model.sha256,
+        }
 
     def _persist_manifest_completed_artifact(
         self,
@@ -893,18 +908,24 @@ class TrainingCampaign:
             raise StateError("Collected NEP input does not match the candidate identity")
         manifest["potential_artifact_path"] = str(artifact_path.resolve())
         manifest["attempt_id"] = attempt.attempt_id
+        manifest["completion_evidence"] = {
+            **dict(manifest.get("completion_evidence", {})),
+            **self._completion_evidence(candidate, collected, attempt),
+        }
         write_model_run_manifest(manifest_path, manifest)
         update_model_run_status(
             candidate.run_directory,
             "completed",
             state_store=self.state_store,
             model_run_id=candidate.model_run_id,
+            completion_evidence=self._completion_evidence(candidate, collected, attempt),
         )
 
     def _record_completed_model(
         self,
         candidate: TrainingCandidate,
         collected: CollectedModelArtifacts,
+        attempt: TrainingAttempt,
     ) -> None:
         upsert_model_run = getattr(self.state_store, "upsert_model_run", None)
         if callable(upsert_model_run):
@@ -915,6 +936,9 @@ class TrainingCampaign:
                     execution_metadata={
                         "campaign_id": self.campaign_id,
                         "potential_path": str(candidate.run_directory),
+                        "completion_evidence": self._completion_evidence(
+                            candidate, collected, attempt
+                        ),
                         "dataset_path": (
                             None if self.dataset_path is None else str(self.dataset_path.resolve())
                         ),
@@ -1052,10 +1076,28 @@ class TrainingCampaign:
         scheduler_state: SchedulerJobState,
         progress: dict[str, Any] | None,
     ) -> TrainingCandidate:
+        if scheduler_state is not SchedulerJobState.COMPLETED:
+            return self._fail_candidate(
+                candidate,
+                attempt,
+                f"scheduler_{scheduler_state.value}",
+                scheduler_state,
+            )
         # Completion is read only from the active attempt directory.  A model
         # file left by an earlier failed attempt cannot complete a retry.
         completion = self.backend.parse_completion(execution_directory)
         if completion.completed:
+            marker = completion.success_marker
+            if marker is not None and (
+                marker.get("model_run_id") != candidate.model_run_id
+                or marker.get("attempt_id") != attempt.attempt_id
+                or marker.get("attempt_number") != attempt.attempt_number
+                or completion.process_exit_code != 0
+            ):
+                raise StateError(
+                    "Backend completion evidence does not belong to the active training "
+                    "attempt"
+                )
             collected = self.backend.collect_model_artifacts(
                 execution_directory,
                 self._input_for(candidate),

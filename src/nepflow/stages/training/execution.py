@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import shlex
@@ -57,7 +58,13 @@ class TrainingExecution:
         if not command:
             raise StateError(f"NEP backend returned an empty command for {candidate.model_run_id}")
         script_path = execution_directory / "train_nep.sh"
-        script_content = self._script_content(execution_directory, command)
+        script_content = self._script_content(
+            execution_directory,
+            command,
+            model_run_id=candidate.model_run_id,
+            attempt_id=attempt.attempt_id,
+            attempt_number=attempt.attempt_number,
+        )
         self._write_script_file(script_path, script_content, rewrite, attempt)
         execution_config = self._execution_config(
             candidate, attempt, command, execution_directory, script_path
@@ -79,13 +86,50 @@ class TrainingExecution:
             if not destination.is_file():
                 shutil.copy2(source, destination)
 
-    def _script_content(self, execution_directory: Path, command: tuple[Any, ...]) -> str:
+    def _script_content(
+        self,
+        execution_directory: Path,
+        command: tuple[Any, ...],
+        *,
+        model_run_id: str = "",
+        attempt_id: str = "",
+        attempt_number: int = 0,
+    ) -> str:
+        success_marker = ".nepflow_training_success.json"
+        marker_template = json.dumps(
+            {
+                "schema_version": "nepflow.training_success.v1",
+                "model_run_id": model_run_id,
+                "attempt_id": attempt_id,
+                "attempt_number": attempt_number,
+                "process_exit_code": 0,
+                "completion_timestamp": "__NEPFLOW_COMPLETION_TIMESTAMP__",
+                "command": [str(part) for part in command],
+            },
+            separators=(",", ":"),
+        )
+        marker_prefix, marker_suffix = marker_template.split(
+            '"__NEPFLOW_COMPLETION_TIMESTAMP__"', 1
+        )
         body = (
-            "set -eu\ncd "
+            "set -euo pipefail\ncd "
             + shlex.quote(str(execution_directory))
             + "\n"
+            + "success_marker="
+            + shlex.quote(success_marker)
+            + "\n"
+            + "rm -f -- \"$success_marker\"\n"
+            + "success_marker_tmp=\"${success_marker}.tmp.$$\"\n"
+            + "trap 'rm -f -- \"$success_marker_tmp\"' EXIT\n"
             + " ".join(shlex.quote(os.path.expandvars(str(part))) for part in command)
             + "\n"
+            + "completion_timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)\n"
+            + "printf '%s%s%s\\n' "
+            + shlex.quote(marker_prefix + '"')
+            + " \"$completion_timestamp\" "
+            + shlex.quote('"' + marker_suffix)
+            + " > \"$success_marker_tmp\"\n"
+            + "mv -f -- \"$success_marker_tmp\" \"$success_marker\"\n"
         )
         return render_shell_script(body, site_prologue=self.site_prologue)
 

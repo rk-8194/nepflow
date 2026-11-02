@@ -159,6 +159,7 @@ def update_model_run_status(
     error: str | None = None,
     state_store: Any | None = None,
     model_run_id: str | None = None,
+    completion_evidence: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     potential_path = Path(potential_path)
     manifest_path = potential_path / MODEL_RUN_MANIFEST_FILENAME
@@ -277,6 +278,8 @@ def update_model_run_status(
             artifact = None
         if error:
             execution_metadata["error"] = error
+        if completion_evidence is not None:
+            execution_metadata["completion_evidence"] = dict(completion_evidence)
         state_store.upsert_model_run(
             ModelRunRecord(
                 identity=authoritative_identity,
@@ -287,6 +290,8 @@ def update_model_run_status(
             completed_at=completed_at,
         )
     manifest["status"] = status
+    if completion_evidence is not None:
+        evidence.update(dict(completion_evidence))
     manifest["completion_evidence"] = evidence
     manifest["updated_at"] = _now()
     write_model_run_manifest(manifest_path, manifest)

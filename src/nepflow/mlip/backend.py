@@ -10,7 +10,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol, runtime_checkable
+from typing import Any, Mapping, Protocol, runtime_checkable
 
 from nepflow.config.models import CompositionConfig, NepTrainingConfig
 from nepflow.domain.datasets import TrainingDatasetManifest
@@ -68,14 +68,28 @@ class TrainingProgress:
 
 @dataclass(frozen=True, slots=True)
 class TrainingCompletion:
-    """Completion evidence before the required model artifact is collected."""
+    """Typed backend evidence before the required model artifact is collected.
+
+    ``completed`` is a conclusion from the complete evidence set, not an
+    indication that a model-shaped file happens to exist.  The optional fields
+    keep the interface backend-neutral while allowing callers to audit the
+    process marker and the exact generation evidence used for that conclusion.
+    """
 
     completed: bool
     artifact_paths: tuple[Path, ...] = ()
+    target_generation: int | None = None
+    observed_generation: int | None = None
+    process_exit_code: int | None = None
+    success_marker: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
-        if self.completed and not self.artifact_paths:
-            raise MlipError("completed NEP training requires at least one model artifact")
+        if self.completed and len(self.artifact_paths) != 1:
+            raise MlipError("completed training requires exactly one model artifact")
+        for name in ("target_generation", "observed_generation"):
+            value = getattr(self, name)
+            if value is not None and value < 0:
+                raise MlipError(f"training {name} cannot be negative")
 
 
 @dataclass(frozen=True, slots=True)
@@ -110,7 +124,7 @@ class MlipBackend(Protocol):
         ...
 
     def parse_completion(self, run_directory: Path) -> TrainingCompletion:
-        """Determine completion from backend output evidence."""
+        """Determine completion from authoritative backend output evidence."""
         ...
 
     def collect_model_artifacts(

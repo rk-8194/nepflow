@@ -61,7 +61,7 @@ class NepBackend:
         return parse_progress(run_directory)
 
     def parse_completion(self, run_directory: Path) -> TrainingCompletion:
-        """Return completion evidence only when required NEP output exists."""
+        """Return completion evidence only when the full attempt contract passes."""
         return parse_completion(run_directory)
 
     def collect_model_artifacts(

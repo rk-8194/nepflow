@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
 
-from nepflow.config.models import NepTrainingConfig
+from nepflow.config.models import CompositionConfig, NepTrainingConfig
 from nepflow.domain.datasets import DatasetIdentity, TrainingDatasetManifest
 from nepflow.domain.identities import ArtifactIdentity
 from nepflow.domain.models import ModelArtifactMetadata
@@ -19,8 +20,12 @@ from nepflow.mlip.backend import (
     CollectedModelArtifacts,
     TrainingCompletion,
     TrainingInput,
+    TrainingInputRequest,
     TrainingProgress,
 )
+from nepflow.mlip.nep.backend import NepBackend
+from nepflow.mlip.nep.inputs import NepHyperparameters
+from nepflow.mlip.nep.outputs import SUCCESS_MARKER_NAME, SUCCESS_MARKER_SCHEMA
 from nepflow.stages.training.campaign import TrainingAttempt, TrainingCampaign
 from nepflow.stages.training.optimisation import ControlledSweep
 from nepflow.state.store import StateStore
@@ -161,6 +166,7 @@ def test_single_candidate_state_table_and_exact_artifact(tmp_path: Path) -> None
         assert len(scheduler.submissions) == 1
 
         scheduler.states[candidate.job_id or "job-1"] = SchedulerJobState.RUNNING
+        (candidate.run_directory / "nep.txt").write_text("checkpoint", encoding="utf-8")
         running = campaign.reconcile()
         assert running.candidates[0].status == "running"
         assert running.candidates[0].progress == {"generation": 4, "loss": 0.25}
@@ -262,8 +268,108 @@ def test_failed_candidate_history_is_retained_and_not_promoted(tmp_path: Path) -
         assert result.status == "failed"
         assert result.candidates[0].status == "failed"
         assert result.promotion_decision is None
-        assert campaign.attempts(candidate.model_run_id)[0].failure_reason == "backend_failed"
+        assert campaign.attempts(candidate.model_run_id)[0].failure_reason == "scheduler_failed"
         assert store.get_model_run(candidate.model_run_id)["status"] == "failed"
+
+
+def test_cancelled_checkpoint_is_never_promoted(tmp_path: Path) -> None:
+    scheduler = FakeScheduler()
+    backend = FakeBackend()
+    backend.completed = True
+    with StateStore(tmp_path / "state.db") as store:
+        campaign = _campaign(tmp_path, store, scheduler, backend, max_attempts=1)
+        candidate = campaign.create_run(_input(tmp_path, "cancelled"), ordinal=0)
+        campaign.reconcile()
+        (candidate.run_directory / "nep.txt").write_text("checkpoint", encoding="utf-8")
+        scheduler.states[candidate.job_id or "job-1"] = SchedulerJobState.CANCELLED
+
+        result = campaign.reconcile()
+
+        assert result.candidates[0].status == "failed"
+        assert result.candidates[0].failure_reason == "scheduler_cancelled"
+        assert not store.list_model_artifacts(candidate.model_run_id)
+
+
+def test_completed_scheduler_without_success_marker_is_not_promoted(tmp_path: Path) -> None:
+    scheduler = FakeScheduler()
+    backend = NepBackend()
+    training = NepTrainingConfig()
+    composition = CompositionConfig(elements=("W",))
+    settings = NepHyperparameters.from_config(composition, training)
+    inputs = backend.render_training_input(
+        TrainingInputRequest(
+            dataset=_dataset(),
+            hyperparameters=training,
+            composition=composition,
+            working_directory=tmp_path / "canonical",
+            hyperparameters_hash=settings.identity_hash(),
+        )
+    )
+    with StateStore(tmp_path / "state.db") as store:
+        campaign = _campaign(tmp_path, store, scheduler, backend, max_attempts=1)
+        candidate = campaign.create_run(inputs, ordinal=0)
+        campaign.reconcile()
+        attempt = campaign.attempts(candidate.model_run_id)[0]
+        assert attempt.execution_directory is not None
+        attempt.execution_directory.joinpath("nep.txt").write_text("checkpoint\n")
+        attempt.execution_directory.joinpath("loss.out").write_text("250000 0.2\n")
+        scheduler.states[candidate.job_id or "job-1"] = SchedulerJobState.COMPLETED
+
+        result = campaign.reconcile()
+
+        assert result.candidates[0].status == "failed"
+        assert not store.list_model_artifacts(candidate.model_run_id)
+
+
+def test_completed_scheduler_with_valid_current_attempt_evidence_is_promoted(
+    tmp_path: Path,
+) -> None:
+    scheduler = FakeScheduler()
+    backend = NepBackend()
+    training = NepTrainingConfig()
+    composition = CompositionConfig(elements=("W",))
+    settings = NepHyperparameters.from_config(composition, training)
+    inputs = backend.render_training_input(
+        TrainingInputRequest(
+            dataset=_dataset(),
+            hyperparameters=training,
+            composition=composition,
+            working_directory=tmp_path / "canonical-valid",
+            hyperparameters_hash=settings.identity_hash(),
+        )
+    )
+    with StateStore(tmp_path / "state.db") as store:
+        campaign = _campaign(tmp_path, store, scheduler, backend, max_attempts=1)
+        candidate = campaign.create_run(inputs, ordinal=0)
+        campaign.reconcile()
+        attempt = campaign.attempts(candidate.model_run_id)[0]
+        assert attempt.execution_directory is not None
+        attempt.execution_directory.joinpath("nep.txt").write_text("model\n")
+        attempt.execution_directory.joinpath("loss.out").write_text("250000 0.2\n")
+        attempt.execution_directory.joinpath(SUCCESS_MARKER_NAME).write_text(
+            json.dumps(
+                {
+                    "schema_version": SUCCESS_MARKER_SCHEMA,
+                    "model_run_id": candidate.model_run_id,
+                    "attempt_id": attempt.attempt_id,
+                    "attempt_number": attempt.attempt_number,
+                    "process_exit_code": 0,
+                    "completion_timestamp": "2026-11-02T10:00:00Z",
+                }
+            ),
+            encoding="utf-8",
+        )
+        scheduler.states[candidate.job_id or "job-1"] = SchedulerJobState.COMPLETED
+
+        result = campaign.reconcile()
+
+        assert result.candidates[0].status == "completed"
+        row = store.get_model_run(candidate.model_run_id)
+        assert row is not None
+        assert row["status"] == "completed"
+        assert row["execution_metadata"]["completion_evidence"]["attempt_id"] == (
+            attempt.attempt_id
+        )
 
 
 def test_retry_keeps_model_run_nonterminal_until_attempts_are_exhausted(tmp_path: Path) -> None:
