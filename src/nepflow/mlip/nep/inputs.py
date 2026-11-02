@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -221,6 +222,7 @@ class NepInputRenderer:
                 "nep_input", content.encode("utf-8"), path=str(output_path)
             ),
             hyperparameters_hash=expected_hash,
+            target_generations=hyperparameters.generations,
         )
 
     def render_hyperparameters(
@@ -244,7 +246,50 @@ class NepInputRenderer:
                 "nep_input", content.encode("utf-8"), path=str(output_path)
             ),
             hyperparameters_hash=hyperparameters.identity_hash(),
+            target_generations=hyperparameters.generations,
         )
+
+    @staticmethod
+    def rewrite_generation(content: str, segment_target_generations: int) -> str:
+        """Rewrite exactly one generation directive without changing other settings."""
+
+        if segment_target_generations <= 0:
+            raise MlipError("attempt generation budget must be positive")
+        lines = content.splitlines()
+        matches: list[int] = []
+        for index, line in enumerate(lines):
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            fields = stripped.split(maxsplit=1)
+            if fields and fields[0] == "generation":
+                if len(fields) != 2 or not re.fullmatch(
+                    r"[0-9]+(?:\s+#.*)?", fields[1]
+                ):
+                    raise MlipError("canonical NEP input has an invalid generation directive")
+                matches.append(index)
+        if len(matches) != 1:
+            raise MlipError(
+                "canonical NEP input must contain exactly one generation directive"
+            )
+        index = matches[0]
+        suffix = ""
+        if "#" in lines[index]:
+            suffix = lines[index][lines[index].index("#") :]
+        lines[index] = f"generation {segment_target_generations}{(' ' + suffix) if suffix else ''}"
+        return "\n".join(lines) + ("\n" if content.endswith(("\n", "\r")) else "")
+
+    def materialize_attempt_input(
+        self,
+        inputs: TrainingInput,
+        destination: Path,
+        segment_target_generations: int,
+    ) -> ArtifactIdentity:
+        """Write one attempt-local input with a derived generation budget."""
+
+        content = self.rewrite_generation(inputs.content, segment_target_generations)
+        atomic_write_text(destination, content, encoding="utf-8")
+        return ArtifactIdentity.from_file("nep_input_attempt", destination)
 
     def render_content(
         self,

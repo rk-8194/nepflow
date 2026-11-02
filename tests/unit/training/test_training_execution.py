@@ -21,6 +21,9 @@ def test_training_script_records_success_only_after_backend_command(tmp_path: Pa
         model_run_id="model-run-1",
         attempt_id="model-run-1:attempt:1",
         attempt_number=1,
+        execution_generation=2,
+        generation_offset=180000,
+        segment_target_generations=320000,
     )
 
     command_position = script.index("nep --quiet")
@@ -29,6 +32,8 @@ def test_training_script_records_success_only_after_backend_command(tmp_path: Pa
     assert "rm -f -- \"$success_marker\"" in script
     assert ".nepflow_training_success.json" in script
     assert "model-run-1" in script
+    assert '"generation_offset":180000' in script
+    assert '"segment_target_generations":320000' in script
     assert command_position < marker_position
 
 

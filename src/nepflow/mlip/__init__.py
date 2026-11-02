@@ -3,6 +3,7 @@
 from .backend import (
     CollectedModelArtifacts,
     MlipBackend,
+    TrainingCheckpoint,
     TrainingCompletion,
     TrainingInput,
     TrainingInputRequest,
@@ -23,6 +24,7 @@ __all__ = [
     "StaticPredictionBackend",
     "StaticPredictionRequest",
     "TrainingCompletion",
+    "TrainingCheckpoint",
     "TrainingInput",
     "TrainingInputRequest",
     "TrainingProgress",

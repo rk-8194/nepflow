@@ -6,9 +6,10 @@ import shlex
 from pathlib import Path
 from typing import Sequence
 
-from nepflow.domain.identities import ModelRunIdentity
+from nepflow.domain.identities import ArtifactIdentity, ModelRunIdentity
 from nepflow.mlip.backend import (
     CollectedModelArtifacts,
+    TrainingCheckpoint,
     TrainingCompletion,
     TrainingInput,
     TrainingInputRequest,
@@ -17,7 +18,7 @@ from nepflow.mlip.backend import (
 
 from .inputs import NepInputRenderer
 from .metrics import classify_training_error, parse_progress
-from .outputs import collect_model_artifacts, parse_completion
+from .outputs import collect_model_artifacts, parse_checkpoint, parse_completion
 
 
 class NepBackend:
@@ -50,6 +51,20 @@ class NepBackend:
 
         return self._command
 
+    def materialize_attempt_input(
+        self,
+        inputs: TrainingInput,
+        destination: Path,
+        segment_target_generations: int,
+    ) -> ArtifactIdentity:
+        """Write a segment-local input without changing the canonical input."""
+
+        return self.renderer.materialize_attempt_input(
+            inputs,
+            destination,
+            segment_target_generations,
+        )
+
     @property
     def command(self) -> tuple[str, ...]:
         """Expose configured backend arguments to a scheduler-script caller."""
@@ -63,6 +78,10 @@ class NepBackend:
     def parse_completion(self, run_directory: Path) -> TrainingCompletion:
         """Return completion evidence only when the full attempt contract passes."""
         return parse_completion(run_directory)
+
+    def parse_checkpoint(self, run_directory: Path) -> TrainingCheckpoint | None:
+        """Return verified attempt-local restart evidence, when present."""
+        return parse_checkpoint(run_directory)
 
     def collect_model_artifacts(
         self,

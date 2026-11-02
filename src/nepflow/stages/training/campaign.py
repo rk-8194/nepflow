@@ -26,6 +26,7 @@ from nepflow.io.json import to_jsonable
 from nepflow.mlip.backend import (
     CollectedModelArtifacts,
     MlipBackend,
+    TrainingCheckpoint,
     TrainingInput,
 )
 from nepflow.mlip.nep.artifacts import (
@@ -62,6 +63,11 @@ class TrainingAttempt:
     execution_config_hash: str | None = None
     execution_config: Mapping[str, Any] | None = None
     execution_generation: int = 1
+    generation_offset: int = 0
+    segment_target_generations: int = 0
+    checkpoint_generation: int | None = None
+    restart_source_attempt_id: str | None = None
+    checkpoint_metadata: Mapping[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,6 +91,8 @@ class TrainingCandidate:
     training_input: TrainingInput | None = field(default=None, compare=False, repr=False)
     dataset_path: Path | None = field(default=None, compare=False)
     execution_generation: int = 1
+    target_generations: int = 0
+    committed_generations: int = 0
 
     @property
     def active(self) -> bool:
@@ -441,6 +449,8 @@ class TrainingCampaign:
                 None if payload.get("dataset_path") is None else Path(str(payload["dataset_path"]))
             ),
             execution_generation=int(payload.get("execution_generation", 1)),
+            target_generations=int(payload.get("target_generations", 0)),
+            committed_generations=int(payload.get("committed_generations", 0)),
         )
 
     def candidates(self) -> tuple[TrainingCandidate, ...]:
@@ -483,6 +493,17 @@ class TrainingCampaign:
                     execution_config_hash=payload.get("execution_config_hash"),
                     execution_config=payload.get("execution_config"),
                     execution_generation=int(payload.get("execution_generation", 1)),
+                    generation_offset=int(payload.get("generation_offset", 0)),
+                    segment_target_generations=int(
+                        payload.get("segment_target_generations", 0)
+                    ),
+                    checkpoint_generation=(
+                        None
+                        if payload.get("checkpoint_generation") is None
+                        else int(payload["checkpoint_generation"])
+                    ),
+                    restart_source_attempt_id=payload.get("restart_source_attempt_id"),
+                    checkpoint_metadata=payload.get("checkpoint_metadata"),
                 )
             )
         return tuple(sorted(records, key=lambda item: (item.attempt_number, item.attempt_id)))
@@ -560,6 +581,12 @@ class TrainingCampaign:
         if payload.get("nep_in_sha256") != identity.nep_in_sha256:
             raise StateError(f"Candidate identity conflict: {model_run_id}")
         candidate = self._candidate_from_payload(payload)
+        if candidate.target_generations <= 0 and training_input.target_generations > 0:
+            candidate = self._save_candidate(
+                candidate,
+                target_generations=training_input.target_generations,
+                committed_generations=0,
+            )
         self._input_for(candidate)
         return candidate
 
@@ -604,6 +631,7 @@ class TrainingCampaign:
         candidate_ordinal = (
             candidate.ordinal if candidate is not None else (0 if ordinal is None else int(ordinal))
         )
+        target_generations = int(getattr(training_input, "target_generations", 0))
         return {
             "campaign_id": self.campaign_id,
             "dataset_id": self.dataset_id,
@@ -623,6 +651,8 @@ class TrainingCampaign:
             "progress": None,
             "failure_reason": None,
             "execution_generation": self._current_execution_generation(),
+            "target_generations": target_generations,
+            "committed_generations": 0,
         }
 
     def _persist_candidate(
@@ -679,6 +709,8 @@ class TrainingCampaign:
             "progress": candidate.progress,
             "failure_reason": candidate.failure_reason,
             "execution_generation": candidate.execution_generation,
+            "target_generations": candidate.target_generations,
+            "committed_generations": candidate.committed_generations,
             "dataset_path": (
                 None if candidate.dataset_path is None else str(candidate.dataset_path)
             ),
@@ -706,6 +738,11 @@ class TrainingCampaign:
             "execution_config_hash": attempt.execution_config_hash,
             "execution_config": attempt.execution_config,
             "execution_generation": attempt.execution_generation,
+            "generation_offset": attempt.generation_offset,
+            "segment_target_generations": attempt.segment_target_generations,
+            "checkpoint_generation": attempt.checkpoint_generation,
+            "restart_source_attempt_id": attempt.restart_source_attempt_id,
+            "checkpoint_metadata": attempt.checkpoint_metadata,
         }
         payload.update(changes)
         self._append("training_attempt", self.campaign_id, "status", payload)
@@ -730,6 +767,15 @@ class TrainingCampaign:
             execution_config_hash=payload.get("execution_config_hash"),
             execution_config=payload.get("execution_config"),
             execution_generation=int(payload.get("execution_generation", 1)),
+            generation_offset=int(payload.get("generation_offset", 0)),
+            segment_target_generations=int(payload.get("segment_target_generations", 0)),
+            checkpoint_generation=(
+                None
+                if payload.get("checkpoint_generation") is None
+                else int(payload["checkpoint_generation"])
+            ),
+            restart_source_attempt_id=payload.get("restart_source_attempt_id"),
+            checkpoint_metadata=payload.get("checkpoint_metadata"),
         )
 
     def _input_for(self, candidate: TrainingCandidate) -> TrainingInput:
@@ -741,6 +787,7 @@ class TrainingCampaign:
         if candidate.training_input is not None:
             return candidate.training_input
         identity = ArtifactIdentity.from_file("nep_input", input_path)
+        content = input_path.read_text(encoding="utf-8")
         dataset = TrainingDatasetManifest(
             identity=DatasetIdentity(
                 candidate.dataset_id,
@@ -751,9 +798,10 @@ class TrainingCampaign:
         return TrainingInput(
             dataset=dataset,
             working_directory=candidate.run_directory,
-            content="",
+            content=content,
             nep_in=identity,
             hyperparameters_hash=candidate.hyperparameters_hash,
+            target_generations=candidate.target_generations,
         )
 
     def _submit(self, candidate: TrainingCandidate) -> TrainingCandidate:
@@ -806,13 +854,71 @@ class TrainingCampaign:
             failure_reason=None,
         )
 
+    def _latest_verified_checkpoint(
+        self, candidate: TrainingCandidate
+    ) -> TrainingAttempt | None:
+        """Return the latest committed checkpoint in the current execution generation."""
+
+        for attempt in reversed(self.attempts(candidate.model_run_id)):
+            if attempt.status != "checkpointed" or attempt.checkpoint_generation is None:
+                continue
+            if not isinstance(attempt.checkpoint_metadata, Mapping):
+                raise StateError(
+                    f"Checkpointed attempt has no checkpoint metadata: {attempt.attempt_id}"
+                )
+            committed = attempt.generation_offset + attempt.checkpoint_generation
+            if committed != candidate.committed_generations:
+                continue
+            return attempt
+        if candidate.committed_generations > 0:
+            raise StateError(
+                f"No verified checkpoint accounts for committed generations of "
+                f"{candidate.model_run_id}"
+            )
+        return None
+
+    @staticmethod
+    def _checkpoint_metadata(checkpoint: TrainingCheckpoint) -> dict[str, Any]:
+        return {
+            "restart_path": str(checkpoint.restart_path.resolve()),
+            "restart_sha256": checkpoint.restart_sha256,
+            "model_path": str(checkpoint.model_path.resolve()),
+            "model_sha256": checkpoint.model_sha256,
+            "metadata": dict(checkpoint.metadata),
+        }
+
     def _prepare_submission_attempt(
         self,
         candidate: TrainingCandidate,
         current: TrainingAttempt | None,
     ) -> TrainingAttempt:
+        source = self._latest_verified_checkpoint(candidate)
+        target_generations = candidate.target_generations
+        generation_offset = candidate.committed_generations
+        segment_target = (
+            target_generations - generation_offset if target_generations > 0 else 0
+        )
+        if target_generations > 0 and segment_target <= 0:
+            raise StateError(
+                f"Candidate {candidate.model_run_id} has no remaining generation budget"
+            )
+        source_id = None if source is None else source.attempt_id
+        source_metadata = None if source is None else source.checkpoint_metadata
+        planned = {
+            "generation_offset": generation_offset,
+            "segment_target_generations": segment_target,
+            "restart_source_attempt_id": source_id,
+            "checkpoint_metadata": source_metadata,
+        }
         if current is not None and current.status == "submitting":
             attempt = current
+            for key, value in planned.items():
+                existing_value = getattr(attempt, key)
+                if existing_value not in (None, 0) and existing_value != value:
+                    raise StateError(
+                        f"Persisted execution plan changed for active attempt {attempt.attempt_id}"
+                    )
+            attempt = self._save_attempt(attempt, **planned)
         else:
             number = 1 if current is None else current.attempt_number + 1
             generation = self._current_execution_generation()
@@ -835,6 +941,10 @@ class TrainingCampaign:
                     f"nepflow-{self.campaign_id}-{candidate.model_run_id[-12:]}{job_suffix}"
                 ),
                 execution_generation=generation,
+                generation_offset=generation_offset,
+                segment_target_generations=segment_target,
+                restart_source_attempt_id=source_id,
+                checkpoint_metadata=source_metadata,
             )
             self._save_attempt(attempt)
 
@@ -921,6 +1031,21 @@ class TrainingCampaign:
             "attempt_number": attempt.attempt_number,
             "execution_generation": attempt.execution_generation,
             "scheduler_state": SchedulerJobState.COMPLETED.value,
+            "target_generations": candidate.target_generations,
+            "committed_generations": candidate.target_generations,
+            "final_segment_generation_offset": attempt.generation_offset,
+            "final_segment_target_generations": attempt.segment_target_generations,
+            "final_segment_observed_generations": attempt.progress.get(
+                "segment_generation"
+            )
+            if isinstance(attempt.progress, Mapping)
+            else None,
+            "restart_source_attempt_id": attempt.restart_source_attempt_id,
+            "restart_checkpoint_sha256": (
+                attempt.checkpoint_metadata.get("restart_sha256")
+                if isinstance(attempt.checkpoint_metadata, Mapping)
+                else None
+            ),
             "artifact_path": str(Path(collected.artifact.model.path or "").resolve()),
             "artifact_sha256": collected.artifact.model.sha256,
         }
@@ -1024,21 +1149,28 @@ class TrainingCampaign:
         scheduler_state: SchedulerJobState,
     ) -> TrainingCandidate:
         """Persist an attempt failure and create only an explicitly allowed retry."""
+        next_status = "pending" if attempt.attempt_number < self.max_attempts else "failed"
+        terminal_reason = reason
+        if (
+            next_status == "failed"
+            and candidate.target_generations > 0
+            and candidate.committed_generations < candidate.target_generations
+        ):
+            terminal_reason = "training_generation_target_incomplete_after_max_resubmit"
         self._save_attempt(
             attempt,
             status="failed",
             scheduler_state=scheduler_state.value,
-            failure_reason=reason,
+            failure_reason=terminal_reason,
         )
-        next_status = "pending" if attempt.attempt_number < self.max_attempts else "failed"
         if next_status == "failed":
-            self._persist_failed_model(candidate, reason)
+            self._persist_failed_model(candidate, terminal_reason)
         return self._save_candidate(
             candidate,
             status=next_status,
             attempt_number=attempt.attempt_number,
             job_id=None,
-            failure_reason=reason,
+            failure_reason=terminal_reason,
         )
 
     def _reconcile_active(self, candidate: TrainingCandidate) -> TrainingCandidate:
@@ -1051,7 +1183,7 @@ class TrainingCampaign:
         attempt = self._active_attempt(candidate)
         execution_directory = attempt.execution_directory or candidate.run_directory
         progress = self.backend.parse_progress(execution_directory)
-        progress_payload = self._progress_payload(progress)
+        progress_payload = self._progress_payload(candidate, attempt, progress)
         if state is SchedulerJobState.UNKNOWN:
             raise StateError(f"Scheduler returned an unknown state for {candidate.job_id}")
         if state is SchedulerJobState.PENDING:
@@ -1073,6 +1205,14 @@ class TrainingCampaign:
                 state,
             )
 
+        if state is SchedulerJobState.TIMEOUT:
+            return self._reconcile_timeout(
+                candidate,
+                attempt,
+                execution_directory,
+                progress_payload,
+            )
+
         return self._reconcile_terminal_attempt(
             candidate,
             attempt,
@@ -1090,10 +1230,22 @@ class TrainingCampaign:
         return attempts[-1]
 
     @staticmethod
-    def _progress_payload(progress: Any) -> dict[str, Any] | None:
+    def _progress_payload(
+        candidate: TrainingCandidate,
+        attempt: TrainingAttempt,
+        progress: Any,
+    ) -> dict[str, Any] | None:
         if progress is None:
             return None
-        return {"generation": progress.generation, "loss": progress.loss}
+        return {
+            "segment_generation": progress.generation,
+            "segment_target_generations": attempt.segment_target_generations,
+            "generation_offset": attempt.generation_offset,
+            "observed_cumulative_generation": attempt.generation_offset + progress.generation,
+            "committed_generations": candidate.committed_generations,
+            "target_generations": candidate.target_generations,
+            "loss": progress.loss,
+        }
 
     def _save_active_progress(
         self,
@@ -1135,29 +1287,54 @@ class TrainingCampaign:
                 marker.get("model_run_id") != candidate.model_run_id
                 or marker.get("attempt_id") != attempt.attempt_id
                 or marker.get("attempt_number") != attempt.attempt_number
+                or marker.get("execution_generation") != attempt.execution_generation
+                or marker.get("generation_offset") != attempt.generation_offset
+                or marker.get("segment_target_generations")
+                != attempt.segment_target_generations
                 or completion.process_exit_code != 0
             ):
                 raise StateError(
                     "Backend completion evidence does not belong to the active training "
                     "attempt"
                 )
+            if candidate.target_generations > 0:
+                if completion.segment_target_generations != attempt.segment_target_generations:
+                    raise StateError("Completion segment target does not match persisted attempt")
+                if (
+                    attempt.generation_offset + attempt.segment_target_generations
+                    != candidate.target_generations
+                ):
+                    raise StateError(
+                        "Successful NEP segment does not close the candidate generation target"
+                    )
             collected = self.backend.collect_model_artifacts(
                 execution_directory,
                 self._input_for(candidate),
             )
-            self._persist_completed_artifact(candidate, collected, attempt)
-            self._save_attempt(
+            completed_attempt = self._save_attempt(
                 attempt,
                 status="completed",
                 scheduler_state=scheduler_state.value,
                 progress=progress,
             )
+            self._persist_completed_artifact(candidate, collected, completed_attempt)
+            final_progress = progress
+            if candidate.target_generations > 0 and isinstance(progress, Mapping):
+                final_progress = {
+                    **dict(progress),
+                    "committed_generations": candidate.target_generations,
+                }
             return self._save_candidate(
                 candidate,
                 status="completed",
-                progress=progress,
+                progress=final_progress,
                 job_id=candidate.job_id,
                 failure_reason=None,
+                committed_generations=(
+                    candidate.target_generations
+                    if candidate.target_generations > 0
+                    else candidate.committed_generations
+                ),
             )
 
         classifier = getattr(self.backend, "classify_error", None)
@@ -1170,6 +1347,74 @@ class TrainingCampaign:
             or f"scheduler_{scheduler_state.value}_without_backend_completion"
         )
         return self._fail_candidate(candidate, attempt, reason, scheduler_state)
+
+    def _reconcile_timeout(
+        self,
+        candidate: TrainingCandidate,
+        attempt: TrainingAttempt,
+        execution_directory: Path,
+        progress: dict[str, Any] | None,
+    ) -> TrainingCandidate:
+        parser = getattr(self.backend, "parse_checkpoint", None)
+        checkpoint = parser(execution_directory) if callable(parser) else None
+        if checkpoint is None:
+            reason = "scheduler_timeout_without_checkpoint"
+            if (
+                attempt.attempt_number >= self.max_attempts
+                and candidate.target_generations > 0
+                and candidate.committed_generations < candidate.target_generations
+            ):
+                reason = "training_generation_target_incomplete_after_max_resubmit"
+            return self._fail_candidate(
+                candidate,
+                attempt,
+                reason,
+                SchedulerJobState.TIMEOUT,
+            )
+        if checkpoint.local_generation <= 0 or (
+            attempt.segment_target_generations > 0
+            and checkpoint.local_generation > attempt.segment_target_generations
+        ):
+            raise StateError("Verified checkpoint exceeds the persisted attempt segment budget")
+        new_committed = attempt.generation_offset + checkpoint.local_generation
+        if candidate.target_generations > 0 and new_committed > candidate.target_generations:
+            raise StateError("Verified checkpoint exceeds the candidate generation target")
+        metadata = self._checkpoint_metadata(checkpoint)
+        self._save_attempt(
+            attempt,
+            status="checkpointed",
+            scheduler_state=SchedulerJobState.TIMEOUT.value,
+            progress=progress,
+            checkpoint_generation=checkpoint.local_generation,
+            checkpoint_metadata=metadata,
+        )
+        if candidate.target_generations > 0 and new_committed >= candidate.target_generations:
+            reason = "training_generation_target_incomplete_after_timeout"
+            self._persist_failed_model(candidate, reason)
+            return self._save_candidate(
+                candidate,
+                status="failed",
+                job_id=None,
+                committed_generations=new_committed,
+                failure_reason=reason,
+                progress=progress,
+            )
+        next_status = "pending" if attempt.attempt_number < self.max_attempts else "failed"
+        reason = (
+            None
+            if next_status == "pending"
+            else "training_generation_target_incomplete_after_max_resubmit"
+        )
+        if reason is not None:
+            self._persist_failed_model(candidate, reason)
+        return self._save_candidate(
+            candidate,
+            status=next_status,
+            job_id=None,
+            committed_generations=new_committed,
+            failure_reason=reason,
+            progress=progress,
+        )
 
     def _derive_status(self, candidates: Sequence[TrainingCandidate]) -> str:
         if not candidates:

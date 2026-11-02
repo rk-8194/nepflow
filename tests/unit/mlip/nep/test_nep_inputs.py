@@ -123,3 +123,14 @@ def test_invalid_nonempty_weights_are_not_replaced_by_equal_weights() -> None:
     config = make_train_config(weights="1")
     with pytest.raises(ValueError, match="weights"):
         NepHyperparameters.from_config(config.composition, config.train_nep)
+
+
+def test_attempt_input_rewrites_only_the_generation_budget() -> None:
+    config = make_train_config(generation=500000)
+    hyperparameters = NepHyperparameters.from_config(config.composition, config.train_nep)
+    renderer = NepInputRenderer()
+    content = renderer.render_content(hyperparameters)
+    rendered = renderer.rewrite_generation(content, 320000)
+    assert "generation 320000" in rendered
+    assert "generation 500000" not in rendered
+    assert "type 2 Si Ge" in rendered

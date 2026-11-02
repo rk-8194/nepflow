@@ -40,6 +40,14 @@ class TrainingInput:
     content: str
     nep_in: ArtifactIdentity
     hyperparameters_hash: str
+    # Zero is retained as a compatibility value for lightweight test/fake
+    # backends that predate the typed generation contract.  The canonical NEP
+    # renderer always supplies a positive value.
+    target_generations: int = 0
+
+    def __post_init__(self) -> None:
+        if self.target_generations < 0:
+            raise MlipError("training target generations cannot be negative")
 
     @property
     def model_run_identity(self) -> ModelRunIdentity:
@@ -78,18 +86,48 @@ class TrainingCompletion:
 
     completed: bool
     artifact_paths: tuple[Path, ...] = ()
-    target_generation: int | None = None
-    observed_generation: int | None = None
+    segment_target_generations: int | None = None
+    segment_observed_generations: int | None = None
     process_exit_code: int | None = None
     success_marker: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
         if self.completed and len(self.artifact_paths) != 1:
             raise MlipError("completed training requires exactly one model artifact")
-        for name in ("target_generation", "observed_generation"):
+        for name in ("segment_target_generations", "segment_observed_generations"):
             value = getattr(self, name)
             if value is not None and value < 0:
                 raise MlipError(f"training {name} cannot be negative")
+
+    @property
+    def target_generation(self) -> int | None:
+        """Backward-compatible alias for the segment-local target."""
+
+        return self.segment_target_generations
+
+    @property
+    def observed_generation(self) -> int | None:
+        """Backward-compatible alias for the segment-local observation."""
+
+        return self.segment_observed_generations
+
+
+@dataclass(frozen=True, slots=True)
+class TrainingCheckpoint:
+    """Verified backend checkpoint evidence for one scheduler attempt."""
+
+    local_generation: int
+    restart_path: Path
+    restart_sha256: str
+    model_path: Path
+    model_sha256: str
+    metadata: Mapping[str, Any]
+
+    def __post_init__(self) -> None:
+        if self.local_generation <= 0:
+            raise MlipError("training checkpoint generation must be positive")
+        if not self.restart_sha256 or not self.model_sha256:
+            raise MlipError("training checkpoint artifacts require hashes")
 
 
 @dataclass(frozen=True, slots=True)
@@ -127,6 +165,10 @@ class MlipBackend(Protocol):
         """Determine completion from authoritative backend output evidence."""
         ...
 
+    def parse_checkpoint(self, run_directory: Path) -> TrainingCheckpoint | None:
+        """Return verified resumable checkpoint evidence, when present."""
+        ...
+
     def collect_model_artifacts(
         self,
         run_directory: Path,
@@ -143,6 +185,7 @@ class MlipBackend(Protocol):
 __all__ = [
     "CollectedModelArtifacts",
     "MlipBackend",
+    "TrainingCheckpoint",
     "TrainingCompletion",
     "TrainingInput",
     "TrainingInputRequest",

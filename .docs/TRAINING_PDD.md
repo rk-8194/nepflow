@@ -955,6 +955,15 @@ Where supported by the backend, a failed or interrupted training run should resu
 
 Checkpoint reuse must preserve model_run identity only if the mathematical training process remains equivalent.
 
+For GPUMD NEP training, NEPFlow owns the cumulative scientific generation
+target.  The generation value in a resumed `nep.in` and the generation rows in
+`loss.out` are local to that scheduler segment; `nep.restart` carries optimiser
+state but does not carry the global generation count.  A checkpoint advances
+durable cumulative progress only after `nep.restart`, `nep.txt`, and local
+progress have been verified together.  Every resumed worker receives only the
+remaining generation budget.  The canonical model identity remains based on
+the full configured target, not on how many scheduler segments were needed.
+
 ### 31.3 Invalid hyperparameter trial
 
 A trial that consistently fails because of its parameter configuration should be marked invalid/permanently failed.
@@ -984,6 +993,12 @@ Where available, the stage should extract:
 - regularisation loss;
 - elapsed time;
 - estimated remaining time.
+
+For the GPUMD NEP backend, progress must distinguish segment-local generation
+from cumulative observed and committed generation.  A local counter reset on
+restart is not evidence that cumulative training restarted, and provisional
+active progress must not be committed until a verified checkpoint or a
+successful final worker completion is persisted.
 
 Progress metrics should be persisted as time series where practical.
 

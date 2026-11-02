@@ -172,7 +172,15 @@ def test_single_candidate_state_table_and_exact_artifact(tmp_path: Path) -> None
         (candidate.run_directory / "nep.txt").write_text("checkpoint", encoding="utf-8")
         running = campaign.reconcile()
         assert running.candidates[0].status == "running"
-        assert running.candidates[0].progress == {"generation": 4, "loss": 0.25}
+        assert running.candidates[0].progress == {
+            "segment_generation": 4,
+            "segment_target_generations": 0,
+            "generation_offset": 0,
+            "observed_cumulative_generation": 4,
+            "committed_generations": 0,
+            "target_generations": 0,
+            "loss": 0.25,
+        }
 
         backend.completed = True
         scheduler.states["job-1"] = SchedulerJobState.COMPLETED
@@ -281,6 +289,63 @@ def test_scheduler_submission_failure_remains_an_error_and_keeps_intent(
         assert len(scheduler.submissions) == 1
 
 
+def test_timeout_checkpoint_commits_local_progress_and_submits_remaining_segment(
+    tmp_path: Path,
+) -> None:
+    scheduler = FakeScheduler()
+    backend = NepBackend()
+    training = NepTrainingConfig(generations=500000, max_resubmit=2)
+    composition = CompositionConfig(elements=("W",))
+    settings = NepHyperparameters.from_config(composition, training)
+    inputs = backend.render_training_input(
+        TrainingInputRequest(
+            dataset=_dataset(),
+            hyperparameters=training,
+            composition=composition,
+            working_directory=tmp_path / "checkpoint-candidate",
+            hyperparameters_hash=settings.identity_hash(),
+        )
+    )
+    with StateStore(tmp_path / "state.db") as store:
+        campaign = _campaign(tmp_path, store, scheduler, backend, max_attempts=3)
+        candidate = campaign.create_run(inputs, ordinal=0)
+        first = campaign.reconcile()
+        first_attempt = campaign.attempts(candidate.model_run_id)[0]
+        assert first.candidates[0].target_generations == 500000
+        assert first_attempt.generation_offset == 0
+        assert first_attempt.segment_target_generations == 500000
+        assert first_attempt.execution_directory is not None
+        assert "generation 500000" in first_attempt.execution_directory.joinpath(
+            "nep.in"
+        ).read_text(encoding="utf-8")
+        first_attempt.execution_directory.joinpath("nep.restart").write_bytes(b"restart-1")
+        first_attempt.execution_directory.joinpath("nep.txt").write_text(
+            "checkpoint-1\n", encoding="utf-8"
+        )
+        first_attempt.execution_directory.joinpath("loss.out").write_text(
+            "# columns generation loss\n180000 0.2\n", encoding="utf-8"
+        )
+        scheduler.states[candidate.job_id or "job-1"] = SchedulerJobState.TIMEOUT
+
+        resumed = campaign.reconcile()
+
+        attempts = campaign.attempts(candidate.model_run_id)
+        assert attempts[0].status == "checkpointed"
+        assert resumed.candidates[0].committed_generations == 180000
+        assert attempts[1].generation_offset == 180000
+        assert attempts[1].segment_target_generations == 320000
+        assert attempts[1].restart_source_attempt_id == attempts[0].attempt_id
+        assert attempts[1].execution_directory is not None
+        assert "generation 320000" in attempts[1].execution_directory.joinpath(
+            "nep.in"
+        ).read_text(encoding="utf-8")
+        assert attempts[1].execution_directory.joinpath("nep.restart").read_bytes() == b"restart-1"
+        assert attempts[1].execution_directory.joinpath("nep.txt").read_text(encoding="utf-8") == (
+            "checkpoint-1\n"
+        )
+        assert not attempts[1].execution_directory.joinpath("loss.out").exists()
+
+
 def test_failed_candidate_history_is_retained_and_not_promoted(tmp_path: Path) -> None:
     scheduler = FakeScheduler()
     backend = FakeBackend()
@@ -379,6 +444,9 @@ def test_completed_scheduler_with_valid_current_attempt_evidence_is_promoted(
                     "model_run_id": candidate.model_run_id,
                     "attempt_id": attempt.attempt_id,
                     "attempt_number": attempt.attempt_number,
+                    "execution_generation": attempt.execution_generation,
+                    "generation_offset": attempt.generation_offset,
+                    "segment_target_generations": attempt.segment_target_generations,
                     "process_exit_code": 0,
                     "completion_timestamp": "2026-11-02T10:00:00Z",
                 }

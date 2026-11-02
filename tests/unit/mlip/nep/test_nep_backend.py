@@ -43,6 +43,7 @@ def test_backend_renders_identity_bound_input_and_keeps_resources_out(tmp_path: 
 
     assert "type 1 W" in baseline.content
     assert "generation 250000" in baseline.content
+    assert baseline.target_generations == 250000
     assert baseline.model_run_identity == changed_resources.model_run_identity
     assert backend.training_command(baseline) == (
         "mpirun",
@@ -69,6 +70,9 @@ def test_backend_progress_completion_and_exact_artifact_collection(tmp_path: Pat
                 "model_run_id": "model-run",
                 "attempt_id": "model-run:attempt:1",
                 "attempt_number": 1,
+                "execution_generation": 1,
+                "generation_offset": 0,
+                "segment_target_generations": 250000,
                 "process_exit_code": 0,
                 "completion_timestamp": "2026-11-02T10:00:00Z",
             }
@@ -109,6 +113,9 @@ def test_backend_success_marker_below_target_generation_is_not_completion(tmp_pa
                 "model_run_id": "model-run",
                 "attempt_id": "model-run:attempt:1",
                 "attempt_number": 1,
+                "execution_generation": 1,
+                "generation_offset": 0,
+                "segment_target_generations": 250000,
                 "process_exit_code": 0,
                 "completion_timestamp": "2026-11-02T10:00:00Z",
             }
@@ -137,3 +144,46 @@ def test_backend_malformed_marker_or_progress_is_explicitly_rejected(tmp_path: P
 
     with pytest.raises(MlipError, match="progress"):
         backend.parse_completion(run_directory)
+
+
+def test_gpumd_progress_headers_are_ignored_but_bad_data_is_rejected(tmp_path: Path) -> None:
+    backend = NepBackend()
+    inputs = backend.render_training_input(_request(tmp_path))
+    run_directory = inputs.working_directory
+    run_directory.joinpath("loss.out").write_text(
+        "# format_version 1\n"
+        "# output_interval 1000\n"
+        "# columns generation loss\n"
+        "1000 1.0\n"
+        "# columns generation loss\n"
+        "2000 0.5\n",
+        encoding="utf-8",
+    )
+
+    progress = backend.parse_progress(run_directory)
+    assert progress is not None
+    assert progress.generation == 2000
+
+    run_directory.joinpath("loss.out").write_text("# header\nnot data\n", encoding="utf-8")
+    with pytest.raises(MlipError, match="progress"):
+        backend.parse_progress(run_directory)
+
+
+def test_backend_returns_verified_local_checkpoint_evidence(tmp_path: Path) -> None:
+    backend = NepBackend()
+    inputs = backend.render_training_input(
+        _request(tmp_path, NepTrainingConfig(generations=500000))
+    )
+    run_directory = inputs.working_directory
+    run_directory.joinpath("nep.restart").write_bytes(b"restart")
+    run_directory.joinpath("nep.txt").write_text("checkpoint\n", encoding="utf-8")
+    run_directory.joinpath("loss.out").write_text(
+        "# columns generation loss\n180000 0.2\n", encoding="utf-8"
+    )
+
+    checkpoint = backend.parse_checkpoint(run_directory)
+
+    assert checkpoint is not None
+    assert checkpoint.local_generation == 180000
+    assert checkpoint.restart_sha256
+    assert checkpoint.model_sha256

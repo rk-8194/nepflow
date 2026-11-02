@@ -27,18 +27,36 @@ def parse_progress_line(line: str) -> TrainingProgress | None:
 
 
 def parse_progress(run_directory: Path) -> TrainingProgress | None:
-    """Read the last valid progress line from NEP's ``loss.out``."""
+    """Read the last local progress row from NEP's ``loss.out``."""
+
+    history = parse_progress_history(run_directory)
+    return history[-1] if history else None
+
+
+def parse_progress_history(run_directory: Path) -> tuple[TrainingProgress, ...]:
+    """Parse one attempt's complete ``loss.out`` progress history.
+
+    GPUMD emits comment/header records, including repeated headers after a
+    restart.  Comments are metadata, while every other non-empty row must be
+    a valid numeric progress row; silently skipping malformed data would make
+    checkpoint evidence ambiguous.
+    """
 
     source = Path(run_directory) / "loss.out"
     try:
         lines = source.read_text(encoding="utf-8", errors="replace").splitlines()
     except OSError:
-        return None
-    for line in reversed(lines):
-        result = parse_progress_line(line.strip())
-        if result is not None:
-            return result
-    return None
+        return ()
+    history: list[TrainingProgress] = []
+    for line_number, raw_line in enumerate(lines, start=1):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        result = parse_progress_line(line)
+        if result is None:
+            raise MlipError(f"Malformed NEP progress row at line {line_number}: {raw_line!r}")
+        history.append(result)
+    return tuple(history)
 
 
 def classify_training_error(run_directory: Path) -> str | None:
@@ -69,4 +87,9 @@ def classify_training_error(run_directory: Path) -> str | None:
     return None
 
 
-__all__ = ["classify_training_error", "parse_progress", "parse_progress_line"]
+__all__ = [
+    "classify_training_error",
+    "parse_progress",
+    "parse_progress_history",
+    "parse_progress_line",
+]

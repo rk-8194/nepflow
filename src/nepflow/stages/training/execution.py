@@ -64,7 +64,7 @@ class TrainingExecution:
             getattr(attempt, "execution_generation", 1),
         )
         execution_directory.mkdir(parents=True, exist_ok=True)
-        self._copy_inputs(candidate.run_directory, execution_directory)
+        self._copy_inputs(candidate, attempt, execution_directory)
         command = tuple(self.backend.training_command(self.input_for(candidate)))
         if not command:
             raise StateError(f"NEP backend returned an empty command for {candidate.model_run_id}")
@@ -75,6 +75,13 @@ class TrainingExecution:
             model_run_id=candidate.model_run_id,
             attempt_id=attempt.attempt_id,
             attempt_number=attempt.attempt_number,
+            execution_generation=getattr(attempt, "execution_generation", 1),
+            generation_offset=getattr(attempt, "generation_offset", 0),
+            segment_target_generations=getattr(
+                attempt,
+                "segment_target_generations",
+                getattr(candidate, "target_generations", 0),
+            ),
         )
         self._write_script_file(script_path, script_content, rewrite, attempt)
         execution_config = self._execution_config(
@@ -83,9 +90,11 @@ class TrainingExecution:
         execution_config_hash = sha256_bytes(canonical_json_bytes(execution_config))
         return script_path, execution_config_hash, execution_config
 
-    @staticmethod
-    def _copy_inputs(source_directory: Path, execution_directory: Path) -> None:
+    def _copy_inputs(self, candidate: Any, attempt: Any, execution_directory: Path) -> None:
+        source_directory = Path(candidate.run_directory)
         for filename in ("nep.in", "train.xyz", "test.xyz"):
+            if filename == "nep.in":
+                continue
             source = source_directory / filename
             if not source.is_file():
                 continue
@@ -97,6 +106,52 @@ class TrainingExecution:
             if not destination.is_file():
                 shutil.copy2(source, destination)
 
+        training_input = self.input_for(candidate)
+        segment_target = int(
+            getattr(attempt, "segment_target_generations", 0)
+            or getattr(candidate, "target_generations", 0)
+        )
+        attempt_input = execution_directory / "nep.in"
+        materialize = getattr(self.backend, "materialize_attempt_input", None)
+        if callable(materialize) and segment_target > 0:
+            materialize(training_input, attempt_input, segment_target)
+        else:
+            source = source_directory / "nep.in"
+            if not source.is_file():
+                raise StateError(f"Canonical NEP input is missing: {source}")
+            if attempt_input.is_file() and sha256_file(attempt_input) != sha256_file(source):
+                raise StateError(
+                    f"Attempt execution input conflicts with candidate identity: {attempt_input}"
+                )
+            if not attempt_input.is_file():
+                shutil.copy2(source, attempt_input)
+
+        restart_source = getattr(attempt, "restart_source_attempt_id", None)
+        if restart_source is None:
+            return
+        metadata = getattr(attempt, "checkpoint_metadata", None)
+        if not isinstance(metadata, Mapping):
+            raise StateError(
+                f"Attempt {attempt.attempt_id} has no persisted checkpoint metadata for resume"
+            )
+        for name, path_key, hash_key in (
+            ("nep.restart", "restart_path", "restart_sha256"),
+            ("nep.txt", "model_path", "model_sha256"),
+        ):
+            source = Path(str(metadata.get(path_key, ""))).resolve()
+            expected_hash = str(metadata.get(hash_key, ""))
+            if not source.is_file() or not expected_hash or sha256_file(source) != expected_hash:
+                raise StateError(
+                    f"Persisted checkpoint artifact for {restart_source} is missing or changed: "
+                    f"{source}"
+                )
+            destination = execution_directory / name
+            shutil.copy2(source, destination)
+            if sha256_file(destination) != expected_hash:
+                raise StateError(
+                    f"Copied checkpoint artifact failed hash verification: {destination}"
+                )
+
     def _script_content(
         self,
         execution_directory: Path,
@@ -105,14 +160,20 @@ class TrainingExecution:
         model_run_id: str = "",
         attempt_id: str = "",
         attempt_number: int = 0,
+        execution_generation: int = 1,
+        generation_offset: int = 0,
+        segment_target_generations: int = 0,
     ) -> str:
         success_marker = ".nepflow_training_success.json"
         marker_template = json.dumps(
             {
-                "schema_version": "nepflow.training_success.v1",
+                "schema_version": "nepflow.training_success.v2",
                 "model_run_id": model_run_id,
                 "attempt_id": attempt_id,
                 "attempt_number": attempt_number,
+                "execution_generation": execution_generation,
+                "generation_offset": generation_offset,
+                "segment_target_generations": segment_target_generations,
                 "process_exit_code": 0,
                 "completion_timestamp": "__NEPFLOW_COMPLETION_TIMESTAMP__",
                 "command": [str(part) for part in command],
@@ -174,8 +235,32 @@ class TrainingExecution:
         execution_directory: Path,
         script_path: Path,
     ) -> dict[str, Any]:
+        attempt_input_sha256 = sha256_file(execution_directory / "nep.in")
         return to_jsonable(
             {
+                "target_generations": getattr(candidate, "target_generations", 0),
+                "generation_offset": getattr(attempt, "generation_offset", 0),
+                "segment_target_generations": getattr(
+                    attempt,
+                    "segment_target_generations",
+                    getattr(candidate, "target_generations", 0),
+                ),
+                "attempt_nep_in_sha256": attempt_input_sha256,
+                "attempt_local_nep_in_sha256": attempt_input_sha256,
+                "restart_source_attempt_id": getattr(
+                    attempt, "restart_source_attempt_id", None
+                ),
+                "checkpoint_metadata": getattr(attempt, "checkpoint_metadata", None),
+                "restart_checkpoint_sha256": (
+                    getattr(attempt, "checkpoint_metadata", {}).get("restart_sha256")
+                    if isinstance(getattr(attempt, "checkpoint_metadata", None), Mapping)
+                    else None
+                ),
+                "model_checkpoint_sha256": (
+                    getattr(attempt, "checkpoint_metadata", {}).get("model_sha256")
+                    if isinstance(getattr(attempt, "checkpoint_metadata", None), Mapping)
+                    else None
+                ),
                 "attempt_number": attempt.attempt_number,
                 "execution_generation": getattr(attempt, "execution_generation", 1),
                 "model_run_id": candidate.model_run_id,

@@ -72,6 +72,9 @@ class FakeMlipBackend:
     def parse_completion(self, run_directory: Path) -> TrainingCompletion:
         return TrainingCompletion(True, (run_directory / "nep.txt",))
 
+    def parse_checkpoint(self, run_directory: Path):
+        return None
+
     def collect_model_artifacts(
         self,
         run_directory: Path,
