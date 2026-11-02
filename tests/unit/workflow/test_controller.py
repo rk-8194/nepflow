@@ -299,6 +299,31 @@ def test_controller_run_returns_executed_stage_result(tmp_path: Path) -> None:
     assert result == expected
 
 
+def test_running_stage_result_stays_authoritative_without_transition(
+    tmp_path: Path,
+) -> None:
+    controller = make_controller(tmp_path, "train_nep")
+    expected = StageRunResult(
+        stage=WorkflowStage.TRAIN_NEP,
+        status=StageRunState.RUNNING,
+        advanced_to=None,
+        completed=False,
+    )
+    controller.stage_registry.register(
+        WorkflowStage.TRAIN_NEP,
+        lambda _context: expected,
+    )
+
+    result = controller.run()
+
+    assert result == expected
+    assert controller.current_stage() is WorkflowStage.TRAIN_NEP
+    with StateStore(controller.state_file) as store:
+        row = store.get_stage_run("demo:train_nep")
+    assert row is not None
+    assert row["status"] == StageRunState.RUNNING.value
+
+
 def test_explicit_select_from_select_restarts_pipeline(tmp_path: Path) -> None:
     controller = make_controller(tmp_path, "select")
     write_generated_input(controller.project_dir)

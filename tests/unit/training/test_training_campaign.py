@@ -37,6 +37,7 @@ class FakeScheduler:
         self.jobs_by_name: dict[str, SlurmJobRecord] = {}
         self.submissions: list[str] = []
         self.fail_find = False
+        self.fail_submit = False
 
     def find_job_by_name(self, job_name: str, **_kwargs):
         if self.fail_find:
@@ -44,6 +45,8 @@ class FakeScheduler:
         return self.jobs_by_name.get(job_name)
 
     def submit_script(self, script_path, *, job_name=None, **_kwargs):
+        if self.fail_submit:
+            raise RuntimeError("scheduler submission unavailable")
         job_id = f"job-{len(self.submissions) + 1}"
         self.submissions.append(job_id)
         self.states[job_id] = SchedulerJobState.PENDING
@@ -253,6 +256,29 @@ def test_scheduler_query_failure_does_not_advance_pending_candidate(tmp_path: Pa
         assert campaign.candidates()[0].status == "pending"
         assert campaign.attempts()[0].status == "submitting"
         assert scheduler.submissions == []
+
+
+def test_scheduler_submission_failure_remains_an_error_and_keeps_intent(
+    tmp_path: Path,
+) -> None:
+    scheduler = FakeScheduler()
+    scheduler.fail_submit = True
+    backend = FakeBackend()
+    with StateStore(tmp_path / "state.db") as store:
+        campaign = _campaign(tmp_path, store, scheduler, backend)
+        campaign.create_run(_input(tmp_path, "candidate"), ordinal=0)
+
+        with pytest.raises(RuntimeError, match="scheduler submission unavailable"):
+            campaign.reconcile()
+
+        assert campaign.candidates()[0].status == "pending"
+        assert campaign.attempts()[0].status == "submitting"
+
+        scheduler.fail_submit = False
+        recovered = campaign.reconcile()
+
+        assert recovered.candidates[0].status == "submitted"
+        assert len(scheduler.submissions) == 1
 
 
 def test_failed_candidate_history_is_retained_and_not_promoted(tmp_path: Path) -> None:

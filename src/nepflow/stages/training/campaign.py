@@ -864,26 +864,12 @@ class TrainingCampaign:
         if existing is not None:
             job_id = self._execution.job_id(existing)
         else:
-            try:
-                job_id = self._execution.submit(self.scheduler, attempt, str(attempt.job_name))
-            except Exception as exc:
-                # Submission is an external execution boundary.  Persist the
-                # failed attempt and its explicit retry/terminal decision;
-                # never make a failed submit look like a pending job.
-                self._save_attempt(
-                    attempt,
-                    status="failed",
-                    failure_reason=f"submission:{type(exc).__name__}:{exc}",
-                )
-                next_status = "pending" if attempt.attempt_number < self.max_attempts else "failed"
-                if next_status == "failed":
-                    self._persist_failed_model(candidate, str(exc))
-                return self._save_candidate(
-                    candidate,
-                    status=next_status,
-                    attempt_number=attempt.attempt_number,
-                    failure_reason=str(exc),
-                )
+            # Keep the durable ``submitting`` intent if the external
+            # scheduler boundary fails.  Scheduler communication errors must
+            # remain errors; on a later launcher invocation the deterministic
+            # name lets us recover a submission that may have succeeded before
+            # the client observed the failure, without issuing a duplicate.
+            job_id = self._execution.submit(self.scheduler, attempt, str(attempt.job_name))
         self._save_attempt(attempt, status="submitted", job_id=job_id)
         return self._save_candidate(
             candidate,
