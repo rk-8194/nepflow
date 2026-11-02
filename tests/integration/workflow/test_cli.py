@@ -3,7 +3,8 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import pytest
 
@@ -49,6 +50,24 @@ class ConfigCliTests(unittest.TestCase):
                 cwd=project_dir,
                 capture_output=False,
             )
+
+    def test_training_self_resubmit_uses_launcher_resubmission_boundary(self) -> None:
+        args = SimpleNamespace(init=True, debug=False)
+        controller = SimpleNamespace(
+            run=Mock(side_effect=nepflow.SelfResubmitExit("training launcher deadline"))
+        )
+
+        with (
+            patch.object(nepflow, "_resubmit_slurm_job") as resubmit,
+            patch.object(nepflow.scheduler, "submit_script") as worker_submit,
+            patch.object(nepflow.scheduler, "cancel") as worker_cancel,
+        ):
+            nepflow._run_controller(args, controller, slurm_deadline=None)
+
+        controller.run.assert_called_once_with()
+        resubmit.assert_called_once_with(debug=False)
+        worker_submit.assert_not_called()
+        worker_cancel.assert_not_called()
 
     def test_resolve_resubmit_command_prefers_original_slurm_script(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

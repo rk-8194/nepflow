@@ -2,6 +2,7 @@ from pathlib import Path
 
 import pytest
 
+from nepflow.config.models import CompositionConfig, NepTrainingConfig
 from nepflow.domain.datasets import DatasetIdentity, TrainingDatasetManifest
 from nepflow.domain.identities import ArtifactIdentity
 from nepflow.hpc.jobs import (
@@ -10,7 +11,9 @@ from nepflow.hpc.jobs import (
     SlurmJobRecord,
     SubmissionResult,
 )
-from nepflow.mlip.backend import TrainingCompletion, TrainingInput
+from nepflow.mlip.backend import TrainingCompletion, TrainingInput, TrainingInputRequest
+from nepflow.mlip.nep.backend import NepBackend
+from nepflow.mlip.nep.inputs import NepHyperparameters
 from nepflow.stages.training.campaign import TrainingCampaign
 from nepflow.state.store import StateStore
 from nepflow.workflow.resubmission import SelfResubmitExit
@@ -120,3 +123,95 @@ def test_campaign_reopens_persisted_submission_without_resubmitting(tmp_path: Pa
     assert persisted_job_id != scheduler.launcher_job_id
     assert scheduler.reconciled_ids == [persisted_job_id]
     assert scheduler.submissions == 1
+
+
+def test_launcher_turnover_preserves_checkpoint_resumed_worker(tmp_path: Path) -> None:
+    dataset = TrainingDatasetManifest(
+        DatasetIdentity(
+            "dataset-checkpoint-launcher-restart",
+            {"schema_version": "nepflow.dataset.v1", "records": []},
+        ),
+        (),
+    )
+    training = NepTrainingConfig(generations=500000, max_resubmit=2)
+    composition = CompositionConfig(elements=("W",))
+    settings = NepHyperparameters.from_config(composition, training)
+    backend = NepBackend()
+    training_input = backend.render_training_input(
+        TrainingInputRequest(
+            dataset=dataset,
+            hyperparameters=training,
+            composition=composition,
+            working_directory=tmp_path / "checkpoint-candidate",
+            hyperparameters_hash=settings.identity_hash(),
+        )
+    )
+    scheduler = RestartScheduler()
+    state_path = tmp_path / "state-checkpoint.db"
+
+    with StateStore(state_path) as store:
+        store.upsert_dataset(dataset.identity)
+        campaign = TrainingCampaign.create(
+            campaign_id="campaign-checkpoint-launcher-restart",
+            dataset_id=dataset.identity.dataset_id,
+            state_store=store,
+            scheduler=scheduler,
+            backend=backend,
+            working_directory=tmp_path / "potentials-checkpoint",
+            max_attempts=3,
+        )
+        candidate = campaign.create_run(training_input, ordinal=0)
+        campaign.reconcile()
+        first_attempt = campaign.attempts(candidate.model_run_id)[0]
+        assert first_attempt.execution_directory is not None
+        first_attempt.execution_directory.joinpath("nep.restart").write_bytes(b"restart-1")
+        first_attempt.execution_directory.joinpath("nep.txt").write_text(
+            "checkpoint-1\n", encoding="utf-8"
+        )
+        first_attempt.execution_directory.joinpath("loss.out").write_text(
+            "# columns generation loss\n180000 0.2\n",
+            encoding="utf-8",
+        )
+        scheduler.states["9001"] = SchedulerJobState.TIMEOUT
+
+        resumed = campaign.reconcile()
+        worker_two = resumed.candidates[0].job_id
+        assert worker_two == "9002"
+        assert resumed.candidates[0].committed_generations == 180000
+        scheduler.states[worker_two] = SchedulerJobState.RUNNING
+
+        with pytest.raises(SelfResubmitExit):
+            campaign.reconcile_until_terminal(
+                poll_interval_seconds=0,
+                slurm_deadline=1.0,
+                clock=iter((0.0, 1.0)).__next__,
+            )
+        before_turnover = campaign.snapshot()
+        assert before_turnover.candidates[0].job_id == worker_two
+        assert before_turnover.candidates[0].committed_generations == 180000
+
+    scheduler.reconciled_ids.clear()
+    with StateStore(state_path) as store:
+        restarted = TrainingCampaign(
+            campaign_id="campaign-checkpoint-launcher-restart",
+            dataset_id=dataset.identity.dataset_id,
+            state_store=store,
+            scheduler=scheduler,
+            backend=backend,
+            working_directory=tmp_path / "potentials-checkpoint",
+            max_attempts=3,
+        )
+        with pytest.raises(SelfResubmitExit):
+            restarted.reconcile_until_terminal(
+                poll_interval_seconds=0,
+                slurm_deadline=1.0,
+                clock=iter((0.0, 1.0)).__next__,
+            )
+        after_turnover = restarted.snapshot()
+        attempts = restarted.attempts(candidate.model_run_id)
+
+    assert scheduler.submissions == 2
+    assert scheduler.reconciled_ids == [worker_two]
+    assert after_turnover.candidates[0].job_id == worker_two
+    assert after_turnover.candidates[0].committed_generations == 180000
+    assert attempts[1].restart_source_attempt_id == attempts[0].attempt_id

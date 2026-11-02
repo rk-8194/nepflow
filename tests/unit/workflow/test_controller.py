@@ -11,6 +11,7 @@ from nepflow.workflow import (
     WorkflowController,
     WorkflowStage,
 )
+from nepflow.workflow.resubmission import SelfResubmitExit
 
 VALID_PROJECT_CONFIG = (
     """
@@ -317,6 +318,24 @@ def test_running_stage_result_stays_authoritative_without_transition(
     result = controller.run()
 
     assert result == expected
+    assert controller.current_stage() is WorkflowStage.TRAIN_NEP
+    with StateStore(controller.state_file) as store:
+        row = store.get_stage_run("demo:train_nep")
+    assert row is not None
+    assert row["status"] == StageRunState.RUNNING.value
+
+
+def test_training_self_resubmit_exit_preserves_running_stage(tmp_path: Path) -> None:
+    controller = make_controller(tmp_path, "train_nep")
+
+    def train_nep(_context):
+        raise SelfResubmitExit("training launcher deadline")
+
+    controller.stage_registry.register(WorkflowStage.TRAIN_NEP, train_nep)
+
+    with pytest.raises(SelfResubmitExit, match="training launcher deadline"):
+        controller.run()
+
     assert controller.current_stage() is WorkflowStage.TRAIN_NEP
     with StateStore(controller.state_file) as store:
         row = store.get_stage_run("demo:train_nep")
