@@ -29,6 +29,7 @@ from nepflow.mlip.nep.outputs import SUCCESS_MARKER_NAME, SUCCESS_MARKER_SCHEMA
 from nepflow.stages.training.campaign import TrainingAttempt, TrainingCampaign
 from nepflow.stages.training.optimisation import ControlledSweep
 from nepflow.state.store import StateStore
+from nepflow.workflow.resubmission import SelfResubmitExit
 
 
 class FakeScheduler:
@@ -36,6 +37,8 @@ class FakeScheduler:
         self.states: dict[str, SchedulerJobState] = {}
         self.jobs_by_name: dict[str, SlurmJobRecord] = {}
         self.submissions: list[str] = []
+        self.reconcile_sequences: dict[str, list[SchedulerJobState]] = {}
+        self.reconcile_sequence_on_submit: list[SchedulerJobState] | None = None
         self.fail_find = False
         self.fail_submit = False
 
@@ -55,10 +58,17 @@ class FakeScheduler:
             name=job_name,
             state=SchedulerJobState.PENDING,
         )
+        if self.reconcile_sequence_on_submit is not None:
+            self.reconcile_sequences[job_id] = list(self.reconcile_sequence_on_submit)
         return SubmissionResult(job_id, "", "", ("sbatch", str(script_path)))
 
     def reconcile(self, job_id: str):
-        state = self.states[job_id]
+        sequence = self.reconcile_sequences.get(job_id)
+        if sequence:
+            state = sequence.pop(0)
+            self.states[job_id] = state
+        else:
+            state = self.states[job_id]
         return ReconciledJobResult(
             job_id=job_id,
             job=SlurmJobRecord(job_id=job_id, name="candidate", state=state),
@@ -193,6 +203,57 @@ def test_single_candidate_state_table_and_exact_artifact(tmp_path: Path) -> None
         assert [attempt.status for attempt in campaign.attempts(candidate.model_run_id)] == [
             "completed"
         ]
+
+
+def test_reconcile_until_terminal_polls_one_worker_to_completion(tmp_path: Path) -> None:
+    scheduler = FakeScheduler()
+    backend = FakeBackend()
+    with StateStore(tmp_path / "state.db") as store:
+        campaign = _campaign(tmp_path, store, scheduler, backend)
+        campaign.create_run(_input(tmp_path, "candidate"), ordinal=0)
+        backend.completed = True
+        scheduler.reconcile_sequence_on_submit = [
+            SchedulerJobState.PENDING,
+            SchedulerJobState.RUNNING,
+            SchedulerJobState.COMPLETED,
+        ]
+        sleeps: list[float] = []
+
+        result = campaign.reconcile_until_terminal(
+            poll_interval_seconds=3,
+            slurm_deadline=None,
+            sleeper=sleeps.append,
+        )
+
+    job_id = "job-1"
+    assert result.status == "completed"
+    assert len(scheduler.submissions) == 1
+    assert scheduler.reconcile_sequences[job_id] == []
+    assert sleeps == [3, 3]
+
+
+def test_reconcile_until_terminal_deadline_preserves_active_worker(tmp_path: Path) -> None:
+    scheduler = FakeScheduler()
+    backend = FakeBackend()
+    with StateStore(tmp_path / "state.db") as store:
+        campaign = _campaign(tmp_path, store, scheduler, backend)
+        candidate = campaign.create_run(_input(tmp_path, "candidate"), ordinal=0)
+        submitted = campaign.reconcile()
+        job_id = submitted.candidates[0].job_id or candidate.job_id or "job-1"
+        times = iter((0.0, 1.0))
+
+        with pytest.raises(SelfResubmitExit, match="NEP training reconciliation"):
+            campaign.reconcile_until_terminal(
+                poll_interval_seconds=0,
+                slurm_deadline=1.0,
+                clock=lambda: next(times),
+            )
+
+        persisted = campaign.candidates()[0]
+
+    assert persisted.job_id == job_id
+    assert persisted.status == "submitted"
+    assert len(scheduler.submissions) == 1
 
 
 def test_concurrency_and_restart_do_not_duplicate_submission(tmp_path: Path) -> None:

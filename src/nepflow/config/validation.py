@@ -558,6 +558,14 @@ def validate_config(
             f"slurm.{field_name}", getattr(config.slurm, field_name), strictly_positive=True
         )
     _validate_time("slurm.walltime", config.slurm.walltime)
+    if (
+        not isinstance(config.slurm.train_nep_walltime, str)
+        or not config.slurm.train_nep_walltime.strip()
+        or TIME_PATTERN.fullmatch(config.slurm.train_nep_walltime) is None
+    ):
+        raise ConfigurationError(
+            "slurm.train_nep_walltime must be configured and use HH:MM:SS format"
+        )
     _validate_time("slurm.train_nep_walltime", config.slurm.train_nep_walltime)
     _validate_time("slurm.gpumd_walltime", config.slurm.gpumd_walltime)
     _validate_time("slurm.memory_walltime", config.slurm.memory_walltime)

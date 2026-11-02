@@ -31,7 +31,7 @@ from .optimisation import ControlledSweep
 
 
 class TrainingStage:
-    """Compose dataset assembly, candidate preparation, and one campaign pass."""
+    """Compose dataset assembly, candidate preparation, and campaign control."""
 
     def __init__(
         self,
@@ -86,12 +86,11 @@ class TrainingStage:
 
     @staticmethod
     def _resources(config: Any) -> JobResources:
-        walltime = config.slurm.train_nep_walltime or config.slurm.walltime
         return JobResources(
             nodes=1,
             gpus_per_node=1,
             mpi_ranks=1,
-            walltime=walltime,
+            walltime=config.slurm.train_nep_walltime,
             account=config.slurm.account,
             partition=config.slurm.training_partition,
         )
@@ -386,7 +385,10 @@ class TrainingStage:
         if not config.slurm.enabled:
             result = campaign.snapshot()
         else:
-            result = campaign.reconcile()
+            result = campaign.reconcile_until_terminal(
+                poll_interval_seconds=config.slurm.poll_interval,
+                slurm_deadline=context.slurm_deadline,
+            )
         if result.status == "failed":
             return StageRunResult(
                 stage=WorkflowStage.TRAIN_NEP,
@@ -401,6 +403,10 @@ class TrainingStage:
                 advanced_to=WorkflowStage.VALIDATE,
                 completed=True,
                 message="Training campaign completed; promotion remains a separate decision",
+            )
+        if config.slurm.enabled:
+            raise StateError(
+                "NEP training reconciliation returned a non-terminal campaign in SLURM mode"
             )
         return StageRunResult(
             stage=WorkflowStage.TRAIN_NEP,

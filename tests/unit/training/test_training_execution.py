@@ -51,7 +51,7 @@ def test_worker_submission_receives_typed_training_resources(tmp_path: Path) -> 
         nodes=1,
         gpus_per_node=1,
         mpi_ranks=1,
-        walltime="02:00:00",
+        walltime="24:00:00",
         account="project",
         partition="training-gpu",
     )
@@ -78,4 +78,7 @@ def test_worker_submission_receives_typed_training_resources(tmp_path: Path) -> 
     assert execution.submit(scheduler, attempt, "nepflow-worker") == "job-1"
     assert scheduler.kwargs is not None
     assert scheduler.kwargs["resources"] == resources
+    submitted_resources = scheduler.kwargs["resources"]
+    assert isinstance(submitted_resources, JobResources)
+    assert submitted_resources.walltime == "24:00:00"
     assert scheduler.kwargs["job_name"] == "nepflow-worker"

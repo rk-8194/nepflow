@@ -550,7 +550,7 @@ class SlurmConfig:
     validation_partition: str | None = None
     max_concurrent: int = 20
     walltime: str = "03:00:00"
-    train_nep_walltime: str | None = None
+    train_nep_walltime: str = "24:00:00"
     poll_interval: int = 20
     gpumd_walltime: str = "00:10:00"
     gpumd_nodes: int = 1

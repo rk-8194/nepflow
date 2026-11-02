@@ -51,9 +51,43 @@ def test_loader_builds_immutable_typed_root_and_applies_defaults(tmp_path: Path)
     assert config.generation.surface_enabled is False
     assert config.generation.n_surfaces == 0
     assert config.hpc.vasp_command == "vasp_std"
+    assert config.slurm.train_nep_walltime == "24:00:00"
     assert config.selection.algorithm == "information_entropy"
     with pytest.raises(AttributeError):
         config.project = config.project
+
+
+def test_training_walltime_is_explicit_and_independent_from_launcher_walltime(
+    tmp_path: Path,
+) -> None:
+    text = BASE_CONFIG + "\n[slurm]\nwalltime=03:00:00\ntrain_nep_walltime=12:30:00\n"
+
+    config = load_config(write_config(tmp_path, text))
+
+    assert config.slurm.walltime == "03:00:00"
+    assert config.slurm.train_nep_walltime == "12:30:00"
+
+
+@pytest.mark.parametrize("value", ["", "not-a-time"])
+def test_invalid_training_walltime_is_rejected(tmp_path: Path, value: str) -> None:
+    text = BASE_CONFIG + f"\n[slurm]\ntrain_nep_walltime={value}\n"
+
+    with pytest.raises(
+        ConfigurationError,
+        match="slurm.train_nep_walltime must be configured and use HH:MM:SS format",
+    ):
+        load_config(write_config(tmp_path, text))
+
+
+def test_none_training_walltime_is_rejected(tmp_path: Path) -> None:
+    config = load_config(write_config(tmp_path))
+    invalid = replace(config.slurm, train_nep_walltime=None)
+
+    with pytest.raises(
+        ConfigurationError,
+        match="slurm.train_nep_walltime must be configured and use HH:MM:SS format",
+    ):
+        validate_config(replace(config, slurm=invalid))
 
 
 def test_slurm_routing_values_parse_and_blank_values_are_none(tmp_path: Path) -> None:
@@ -439,6 +473,7 @@ def test_loader_enforces_one_vasp_command_and_adapter_preserves_no_project_dir(
 
     adapted = load_legacy_config(write_config(tmp_path))
     assert adapted.get("hpc", "vasp_command") == "vasp_std"
+    assert adapted.get("slurm", "train_nep_walltime") == "24:00:00"
     assert not adapted.has_option("paths", "project_dir")
 
 

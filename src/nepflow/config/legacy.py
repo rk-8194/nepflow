@@ -427,6 +427,7 @@ def _slurm_values(config: NepflowConfig) -> dict[str, str]:
         "validation_partition": slurm.validation_partition or "",
         "max_concurrent": str(slurm.max_concurrent),
         "walltime": slurm.walltime,
+        "train_nep_walltime": slurm.train_nep_walltime,
         "poll_interval": str(slurm.poll_interval),
         "max_retry_level": str(config.dft_recovery.max_retry_level),
         "vasp_walltime": config.dft_recovery.vasp_walltime,
@@ -436,8 +437,6 @@ def _slurm_values(config: NepflowConfig) -> dict[str, str]:
         "memory_poll_interval": str(slurm.memory_poll_interval),
         "memory_walltime": slurm.memory_walltime,
     }
-    if slurm.train_nep_walltime:
-        values["train_nep_walltime"] = slurm.train_nep_walltime
     return values
 
 

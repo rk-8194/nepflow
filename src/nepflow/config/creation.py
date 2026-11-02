@@ -445,6 +445,10 @@ walltime=03:00:00
 # Individual VASP job walltime (HH:MM:SS format)
 vasp_walltime=01:00:00
 
+# Individual NEP training job walltime (HH:MM:SS format)
+# This is independent of the nepflow launcher walltime above.
+train_nep_walltime=24:00:00
+
 # Seconds between squeue polls during the launcher loop
 poll_interval=20
 

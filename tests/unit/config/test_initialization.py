@@ -169,6 +169,9 @@ class InitConfigPromptTests(unittest.TestCase):
             service.run(prompt_values=values)
 
             config = load_config(project_dir / "config" / "project.config")
+            config_text = (project_dir / "config" / "project.config").read_text(
+                encoding="utf-8"
+            )
             with StateStore(project_dir / "state.db") as store:
                 project = store.get_project("demo")
                 stage_run = store.get_stage_run("demo:init")
@@ -176,6 +179,11 @@ class InitConfigPromptTests(unittest.TestCase):
             assert project is not None
             assert project["root_path"] == str(project_dir)
             assert config.project.name == "demo"
+            assert "walltime=03:00:00" in config_text
+            assert "vasp_walltime=01:00:00" in config_text
+            assert "train_nep_walltime=24:00:00" in config_text
+            assert config.slurm.walltime == "03:00:00"
+            assert config.slurm.train_nep_walltime == "24:00:00"
             assert project["config_fingerprint"] == project["metadata"]["config_fingerprint"]
             assert project["metadata"]["config_schema_version"] == config.schema_version
             assert project["metadata"]["state_schema_version"] == CURRENT_SCHEMA_VERSION

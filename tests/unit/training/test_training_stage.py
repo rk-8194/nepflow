@@ -2,6 +2,8 @@ from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from nepflow.config.models import CompositionConfig, NepflowConfig, SlurmConfig
 from nepflow.domain.datasets import DatasetIdentity, TrainingDatasetManifest
 from nepflow.domain.identities import ArtifactIdentity
@@ -10,6 +12,7 @@ from nepflow.stages.training.campaign import CampaignReconciliationResult
 from nepflow.stages.training.stage import TrainingStage
 from nepflow.state.store import StateStore
 from nepflow.workflow import StageContext, StageRunState
+from nepflow.workflow.resubmission import SelfResubmitExit
 
 
 class RecordingBackend:
@@ -42,6 +45,7 @@ class RecordingCampaign:
     def __init__(self, **kwargs) -> None:
         self.state_store = kwargs["state_store"]
         self.campaign_id = kwargs["campaign_id"]
+        self.raise_resubmit = kwargs.get("raise_resubmit", False)
         self.calls = []
         self._candidates = []
 
@@ -66,6 +70,17 @@ class RecordingCampaign:
 
     def reconcile(self):
         raise AssertionError("disabled local training should not reconcile the scheduler")
+
+    def reconcile_until_terminal(self, *, poll_interval_seconds, slurm_deadline):
+        self.calls.append(("reconcile_until_terminal", poll_interval_seconds, slurm_deadline))
+        if self.raise_resubmit:
+            raise SelfResubmitExit("test resubmit")
+        return CampaignReconciliationResult(
+            campaign_id=self.campaign_id,
+            status="failed",
+            candidates=tuple(self._candidates),
+            promotion_decision=None,
+        )
 
     def snapshot(self):
         return CampaignReconciliationResult(
@@ -144,6 +159,8 @@ def test_training_resources_use_only_training_partition() -> None:
             dft_partition="dft-gpu",
             training_partition="train-gpu",
             validation_partition="validation-gpu",
+            walltime="03:00:00",
+            train_nep_walltime="24:00:00",
         ),
     )
 
@@ -151,3 +168,107 @@ def test_training_resources_use_only_training_partition() -> None:
 
     assert resources.account == "project-account"
     assert resources.partition == "train-gpu"
+    assert resources.walltime == "24:00:00"
+    assert resources.walltime != config.slurm.walltime
+
+
+def test_training_stage_reconciles_slurm_campaign_until_terminal(tmp_path: Path) -> None:
+    dataset = TrainingDatasetManifest(
+        DatasetIdentity(
+            "dataset-stage-slurm",
+            {"schema_version": "nepflow.dataset.v1", "records": []},
+        ),
+        (),
+    )
+    config = replace(
+        NepflowConfig(),
+        composition=CompositionConfig(elements=("Si",)),
+        slurm=SlurmConfig(
+            enabled=True,
+            max_concurrent=1,
+            poll_interval=7,
+            train_nep_walltime="24:00:00",
+        ),
+    )
+    backend = RecordingBackend()
+    campaigns = []
+
+    def campaign_factory(**kwargs):
+        campaign = RecordingCampaign(**kwargs)
+        campaigns.append(campaign)
+        return campaign
+
+    stage = TrainingStage(
+        scheduler=object(),
+        backend=backend,
+        campaign_factory=campaign_factory,
+    )
+    dataset_path = tmp_path / "dataset"
+    dataset_path.mkdir()
+    (dataset_path / "train.xyz").write_text("train\n", encoding="utf-8")
+    (dataset_path / "test.xyz").write_text("test\n", encoding="utf-8")
+    stage._assemble_dataset = lambda _context, _config, _state_store: (dataset, dataset_path)
+
+    with StateStore(tmp_path / "state.db") as state_store:
+        state_store.upsert_dataset(dataset)
+        result = stage.run(
+            StageContext(
+                project_name="demo",
+                project_dir=tmp_path,
+                config_file=tmp_path / "project.config",
+                state_file=tmp_path / "state.db",
+                state_store=state_store,
+                workflow_state=None,
+                config=config,
+                slurm_deadline=123.0,
+            )
+        )
+
+    assert result.status is StageRunState.FAILED
+    assert campaigns[0].calls[-1] == ("reconcile_until_terminal", 7, 123.0)
+
+
+def test_training_stage_propagates_slurm_resubmit_exit(tmp_path: Path) -> None:
+    dataset = TrainingDatasetManifest(
+        DatasetIdentity(
+            "dataset-stage-resubmit",
+            {"schema_version": "nepflow.dataset.v1", "records": []},
+        ),
+        (),
+    )
+    config = replace(
+        NepflowConfig(),
+        composition=CompositionConfig(elements=("Si",)),
+        slurm=SlurmConfig(enabled=True, max_concurrent=1, poll_interval=0),
+    )
+    backend = RecordingBackend()
+    dataset_path = tmp_path / "dataset"
+    dataset_path.mkdir()
+    (dataset_path / "train.xyz").write_text("train\n", encoding="utf-8")
+    (dataset_path / "test.xyz").write_text("test\n", encoding="utf-8")
+
+    def campaign_factory(**kwargs):
+        kwargs["raise_resubmit"] = True
+        return RecordingCampaign(**kwargs)
+
+    stage = TrainingStage(
+        scheduler=object(),
+        backend=backend,
+        campaign_factory=campaign_factory,
+    )
+    stage._assemble_dataset = lambda _context, _config, _state_store: (dataset, dataset_path)
+
+    with StateStore(tmp_path / "state.db") as state_store:
+        state_store.upsert_dataset(dataset)
+        with pytest.raises(SelfResubmitExit, match="test resubmit"):
+            stage.run(
+                StageContext(
+                    project_name="demo",
+                    project_dir=tmp_path,
+                    config_file=tmp_path / "project.config",
+                    state_file=tmp_path / "state.db",
+                    state_store=state_store,
+                    workflow_state=None,
+                    config=config,
+                )
+            )

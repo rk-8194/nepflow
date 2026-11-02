@@ -956,7 +956,7 @@ def parse_slurm(
         validation_partition=_optional_string(values.get("validation_partition")),
         max_concurrent=_parse_int(values.get("max_concurrent", "20"), "slurm.max_concurrent"),
         walltime=values.get("walltime", "03:00:00").strip(),
-        train_nep_walltime=_optional_string(values.get("train_nep_walltime")),
+        train_nep_walltime=values.get("train_nep_walltime", "24:00:00").strip(),
         poll_interval=_parse_int(values.get("poll_interval", "20"), "slurm.poll_interval"),
         gpumd_walltime=values.get("gpumd_walltime", "00:10:00").strip(),
         gpumd_nodes=_parse_int(values.get("gpumd_nodes", "1"), "slurm.gpumd_nodes"),

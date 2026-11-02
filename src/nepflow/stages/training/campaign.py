@@ -8,11 +8,12 @@ model merely because a backend artifact exists.
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 from nepflow.domain.datasets import DatasetIdentity, TrainingDatasetManifest
 from nepflow.domain.identities import ArtifactIdentity
@@ -34,6 +35,7 @@ from nepflow.mlip.nep.artifacts import (
     update_model_run_status,
     write_model_run_manifest,
 )
+from nepflow.workflow.resubmission import SelfResubmitExit
 
 from .execution import TrainingExecution
 from .optimisation import CandidateConfiguration
@@ -980,6 +982,12 @@ class TrainingCampaign:
             # name lets us recover a submission that may have succeeded before
             # the client observed the failure, without issuing a duplicate.
             job_id = self._execution.submit(self.scheduler, attempt, str(attempt.job_name))
+            logger.info(
+                "Submitted NEP training worker %s for %s attempt %s",
+                job_id,
+                candidate.model_run_id,
+                attempt.attempt_number,
+            )
         self._save_attempt(attempt, status="submitted", job_id=job_id)
         return self._save_candidate(
             candidate,
@@ -1182,10 +1190,14 @@ class TrainingCampaign:
         state, job = self._scheduler_state(result)
         attempt = self._active_attempt(candidate)
         execution_directory = attempt.execution_directory or candidate.run_directory
-        progress = self.backend.parse_progress(execution_directory)
-        progress_payload = self._progress_payload(candidate, attempt, progress)
         if state is SchedulerJobState.UNKNOWN:
             raise StateError(f"Scheduler returned an unknown state for {candidate.job_id}")
+        if attempt.scheduler_state == state.value:
+            logger.debug("NEP worker %s state=%s", candidate.job_id, state.value)
+        else:
+            logger.info("NEP worker %s state=%s", candidate.job_id, state.value)
+        progress = self.backend.parse_progress(execution_directory)
+        progress_payload = self._progress_payload(candidate, attempt, progress)
         if state is SchedulerJobState.PENDING:
             return self._save_active_progress(
                 candidate, attempt, state, "submitted", progress_payload
@@ -1464,6 +1476,42 @@ class TrainingCampaign:
             promotion_decision=self._campaign_payload().get("promotion_decision"),
             execution_generation=self._current_execution_generation(),
         )
+
+    def reconcile_until_terminal(
+        self,
+        *,
+        poll_interval_seconds: int,
+        slurm_deadline: float | None,
+        clock: Callable[[], float] = time.time,
+        sleeper: Callable[[float], None] = time.sleep,
+    ) -> CampaignReconciliationResult:
+        """Reconcile repeatedly until the campaign is terminal or time expires."""
+        if poll_interval_seconds < 0:
+            raise ValueError("poll_interval_seconds must not be negative")
+
+        while True:
+            if slurm_deadline is not None and clock() >= slurm_deadline:
+                raise SelfResubmitExit(
+                    "SLURM walltime deadline reached during NEP training reconciliation"
+                )
+
+            result = self.reconcile()
+            logger.info(
+                "NEP training reconciliation: status=%s counts=%s total=%d",
+                result.status,
+                result.counts,
+                len(result.candidates),
+            )
+            if result.status in {"completed", "failed"}:
+                return result
+
+            if slurm_deadline is not None and clock() >= slurm_deadline:
+                raise SelfResubmitExit(
+                    "SLURM walltime deadline reached during NEP training reconciliation"
+                )
+
+            if poll_interval_seconds > 0:
+                sleeper(poll_interval_seconds)
 
     def snapshot(self) -> CampaignReconciliationResult:
         """Read persisted campaign state without querying or submitting jobs."""

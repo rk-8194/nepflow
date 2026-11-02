@@ -271,6 +271,12 @@ The training stage shall receive:
 - per-training-job walltime;
 - retry limits.
 
+Controller and child-job walltimes are distinct resource policies.  The
+`slurm.walltime` setting governs the nepflow controller allocation, while
+`slurm.train_nep_walltime` governs each NEP training child allocation.  Neither
+setting may silently substitute for the other, and the exact worker policy is
+persisted with every training attempt.
+
 ### 5.7 Optimisation budget
 
 The user shall be able to define limits such as:
@@ -832,6 +838,11 @@ A slow candidate must not unnecessarily block submission of unrelated candidates
 
 The campaign controller itself may run under finite SLURM walltime.
 
+The controller launcher shall remain in its allocation and repeatedly
+reconcile the persisted campaign until the campaign is terminal or the
+allocation reaches its resubmission deadline.  A single launcher invocation is
+therefore not a one-pass training contract.
+
 Before its allocation expires, it shall:
 
 - persist campaign state;
@@ -839,6 +850,12 @@ Before its allocation expires, it shall:
 - persist all known scheduler job IDs;
 - preserve pending proposals;
 - exit with an explicit resubmission condition.
+
+Each NEP training candidate runs as a separate scheduler worker submitted
+through the scheduler boundary.  The controller must never execute NEP
+directly in the launcher process.  While a worker remains pending or running,
+the controller polls it using the configured interval and retains its durable
+job ID across launcher turnover.
 
 A new controller allocation shall:
 
@@ -849,6 +866,12 @@ A new controller allocation shall:
 - resume optimisation.
 
 Controller resubmission must be idempotent.
+
+On restart, a persisted active candidate is reconciled using its existing
+worker job ID before any new candidate is submitted.  Reconciliation must not
+cancel or duplicate that worker when the controller reaches its deadline;
+`SelfResubmitExit` is propagated to the workflow boundary so the outer CLI
+can resubmit the controller allocation.
 
 ---
 

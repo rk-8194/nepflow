@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 from nepflow.domain.datasets import DatasetIdentity, TrainingDatasetManifest
 from nepflow.domain.identities import ArtifactIdentity
 from nepflow.hpc.jobs import (
@@ -11,6 +13,7 @@ from nepflow.hpc.jobs import (
 from nepflow.mlip.backend import TrainingCompletion, TrainingInput
 from nepflow.stages.training.campaign import TrainingCampaign
 from nepflow.state.store import StateStore
+from nepflow.workflow.resubmission import SelfResubmitExit
 
 
 class RestartScheduler:
@@ -18,18 +21,21 @@ class RestartScheduler:
         self.jobs: dict[str, SlurmJobRecord] = {}
         self.states: dict[str, SchedulerJobState] = {}
         self.submissions = 0
+        self.reconciled_ids: list[str] = []
+        self.launcher_job_id = "9000"
 
     def find_job_by_name(self, name: str, **_kwargs):
         return next((job for job in self.jobs.values() if job.name == name), None)
 
     def submit_script(self, script_path: Path, *, job_name: str, **_kwargs):
         self.submissions += 1
-        job_id = f"restart-job-{self.submissions}"
+        job_id = f"900{self.submissions}"
         self.states[job_id] = SchedulerJobState.PENDING
         self.jobs[job_id] = SlurmJobRecord(job_id, job_name, SchedulerJobState.PENDING)
         return SubmissionResult(job_id, "", "", ("sbatch", str(script_path)))
 
     def reconcile(self, job_id: str):
+        self.reconciled_ids.append(job_id)
         state = self.states[job_id]
         return ReconciledJobResult(
             job_id,
@@ -89,6 +95,7 @@ def test_campaign_reopens_persisted_submission_without_resubmitting(tmp_path: Pa
         campaign.create_run(training_input, ordinal=0)
         first = campaign.reconcile()
         assert first.candidates[0].status == "submitted"
+        persisted_job_id = first.candidates[0].job_id
 
     with StateStore(state_path) as store:
         restarted = TrainingCampaign(
@@ -99,7 +106,17 @@ def test_campaign_reopens_persisted_submission_without_resubmitting(tmp_path: Pa
             backend=backend,
             working_directory=tmp_path / "potentials",
         )
-        second = restarted.reconcile()
+        with pytest.raises(SelfResubmitExit):
+            restarted.reconcile_until_terminal(
+                poll_interval_seconds=0,
+                slurm_deadline=1.0,
+                clock=iter((0.0, 1.0)).__next__,
+            )
+        second = restarted.snapshot()
 
     assert second.candidates[0].status == "submitted"
+    assert second.candidates[0].job_id == persisted_job_id
+    assert persisted_job_id == "9001"
+    assert persisted_job_id != scheduler.launcher_job_id
+    assert scheduler.reconciled_ids == [persisted_job_id]
     assert scheduler.submissions == 1
