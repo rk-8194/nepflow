@@ -27,3 +27,12 @@ def test_training_script_records_success_only_after_backend_command(tmp_path: Pa
     assert ".nepflow_training_success.json" in script
     assert "model-run-1" in script
     assert command_position < marker_position
+
+
+def test_later_execution_generation_uses_a_distinct_attempt_directory(tmp_path: Path) -> None:
+    candidate = type("Candidate", (), {"run_directory": tmp_path})()
+
+    assert TrainingExecution.attempt_directory(candidate, 1) == tmp_path / "attempts" / "a0001"
+    assert TrainingExecution.attempt_directory(candidate, 1, 2) == (
+        tmp_path / "attempts" / "g0002" / "a0001"
+    )

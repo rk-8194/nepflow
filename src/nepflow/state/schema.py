@@ -7,7 +7,7 @@ metadata, and mutable operational status.
 
 from __future__ import annotations
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 REQUIRED_TABLES = frozenset(
     {
@@ -27,6 +27,7 @@ REQUIRED_TABLES = frozenset(
         "validation_artifacts",
         "artifacts",
         "events",
+        "training_execution_authority",
     }
 )
 
@@ -146,6 +147,17 @@ REQUIRED_COLUMNS = {
         "event_type",
         "payload_json",
         "occurred_at",
+    },
+    "training_execution_authority": {
+        "campaign_id",
+        "dataset_id",
+        "project_id",
+        "execution_generation",
+        "status",
+        "source",
+        "created_at",
+        "updated_at",
+        "invalidated_at",
     },
 }
 
@@ -358,4 +370,26 @@ MIGRATION_1_STATEMENTS = (
     """,
 )
 
-MIGRATION_STATEMENTS = {1: MIGRATION_1_STATEMENTS}
+MIGRATION_2_STATEMENTS = (
+    """
+    CREATE TABLE IF NOT EXISTS training_execution_authority (
+        campaign_id TEXT NOT NULL,
+        dataset_id TEXT NOT NULL REFERENCES datasets(dataset_id),
+        project_id TEXT REFERENCES project(project_id),
+        execution_generation INTEGER NOT NULL CHECK(execution_generation > 0),
+        status TEXT NOT NULL CHECK(status IN ('current', 'invalidated')),
+        source TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        invalidated_at TEXT,
+        PRIMARY KEY(campaign_id, execution_generation)
+    )
+    """,
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_training_authority_current
+    ON training_execution_authority(campaign_id)
+    WHERE status = 'current'
+    """,
+)
+
+MIGRATION_STATEMENTS = {1: MIGRATION_1_STATEMENTS, 2: MIGRATION_2_STATEMENTS}

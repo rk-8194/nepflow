@@ -61,6 +61,7 @@ class TrainingAttempt:
     script_path: Path | None = None
     execution_config_hash: str | None = None
     execution_config: Mapping[str, Any] | None = None
+    execution_generation: int = 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,6 +84,7 @@ class TrainingCandidate:
     failure_reason: str | None = None
     training_input: TrainingInput | None = field(default=None, compare=False, repr=False)
     dataset_path: Path | None = field(default=None, compare=False)
+    execution_generation: int = 1
 
     @property
     def active(self) -> bool:
@@ -103,6 +105,7 @@ class CampaignReconciliationResult:
     status: str
     candidates: tuple[TrainingCandidate, ...]
     promotion_decision: Mapping[str, Any] | None = None
+    execution_generation: int = 1
 
     @property
     def all_terminal(self) -> bool:
@@ -222,6 +225,8 @@ class TrainingCampaign:
         recorder = getattr(self.state_store, "record_training_event", None)
         event_number = len(self._events(entity_type, entity_id))
         event_id = f"training:{entity_type}:{entity_id}:{event_number:012d}"
+        event_payload = dict(payload)
+        event_payload["execution_generation"] = self._current_execution_generation()
         occurred_at = datetime.now(timezone.utc)
         existing_times: list[str] = []
         for event in self._events(entity_type, entity_id):
@@ -245,7 +250,7 @@ class TrainingCampaign:
                     entity_type,
                     entity_id,
                     event_type,
-                    to_jsonable(dict(payload)),
+                    to_jsonable(event_payload),
                     event_id=event_id,
                     occurred_at=occurred_text,
                 )
@@ -253,16 +258,41 @@ class TrainingCampaign:
                 # Keep lightweight event-store fakes compatible with the
                 # canonical recorder while retaining the durable ordering on
                 # StateStore.
-                recorder(entity_type, entity_id, event_type, to_jsonable(dict(payload)))
+                recorder(entity_type, entity_id, event_type, to_jsonable(event_payload))
             return
         self.state_store.append_event(
             event_id,
             entity_type,
             entity_id,
             event_type,
-            to_jsonable(dict(payload)),
+            to_jsonable(event_payload),
             occurred_at=occurred_text,
         )
+
+    def _current_execution_generation(self) -> int:
+        getter = getattr(self.state_store, "get_training_execution_authority", None)
+        if not callable(getter):
+            return 1
+        authority = getter(self.campaign_id, self.dataset_id)
+        if authority is None:
+            ensure = getattr(self.state_store, "ensure_training_execution_authority", None)
+            if not callable(ensure):
+                return 1
+            authority = ensure(self.campaign_id, self.dataset_id)
+        return int(authority["execution_generation"])
+
+    @staticmethod
+    def _event_generation(payload: Mapping[str, Any]) -> int:
+        return int(payload.get("execution_generation", 1))
+
+    def _current_events(self, entity_type: str) -> list[dict[str, Any]]:
+        generation = self._current_execution_generation()
+        return [
+            event
+            for event in self._events(entity_type, self.campaign_id)
+            if isinstance(event.get("payload"), Mapping)
+            and self._event_generation(event["payload"]) == generation
+        ]
 
     def _events(self, entity_type: str, entity_id: str | None = None) -> list[dict[str, Any]]:
         def rows(value: object) -> list[dict[str, Any]]:
@@ -278,7 +308,7 @@ class TrainingCampaign:
         return rows(self.state_store.list_events(entity_type=entity_type, entity_id=entity_id))
 
     def _ensure_campaign(self, specification: Mapping[str, Any] | None = None) -> None:
-        events = self._events("training_campaign", self.campaign_id)
+        events = self._current_events("training_campaign")
         if not events:
             self._create_campaign(specification)
             return
@@ -367,15 +397,15 @@ class TrainingCampaign:
         self._ensure_campaign(specification)
 
     def _campaign_payload(self) -> dict[str, Any]:
-        events = self._events("training_campaign", self.campaign_id)
+        events = self._current_events("training_campaign")
         if not events:
             self._ensure_campaign()
-            events = self._events("training_campaign", self.campaign_id)
+            events = self._current_events("training_campaign")
         return dict(events[-1].get("payload", {}))
 
     def _candidate_payloads(self) -> dict[str, dict[str, Any]]:
         latest: dict[str, dict[str, Any]] = {}
-        for event in self._events("training_candidate", self.campaign_id):
+        for event in self._current_events("training_candidate"):
             payload = event.get("payload", {})
             if payload.get("campaign_id") == self.campaign_id and payload.get("model_run_id"):
                 latest[str(payload["model_run_id"])] = dict(payload)
@@ -383,7 +413,7 @@ class TrainingCampaign:
 
     def _attempt_payloads(self) -> dict[str, dict[str, Any]]:
         latest: dict[str, dict[str, Any]] = {}
-        for event in self._events("training_attempt", self.campaign_id):
+        for event in self._current_events("training_attempt"):
             payload = event.get("payload", {})
             if payload.get("campaign_id") == self.campaign_id and payload.get("attempt_id"):
                 latest[str(payload["attempt_id"])] = dict(payload)
@@ -410,6 +440,7 @@ class TrainingCampaign:
             dataset_path=(
                 None if payload.get("dataset_path") is None else Path(str(payload["dataset_path"]))
             ),
+            execution_generation=int(payload.get("execution_generation", 1)),
         )
 
     def candidates(self) -> tuple[TrainingCandidate, ...]:
@@ -451,6 +482,7 @@ class TrainingCampaign:
                     ),
                     execution_config_hash=payload.get("execution_config_hash"),
                     execution_config=payload.get("execution_config"),
+                    execution_generation=int(payload.get("execution_generation", 1)),
                 )
             )
         return tuple(sorted(records, key=lambda item: (item.attempt_number, item.attempt_id)))
@@ -590,6 +622,7 @@ class TrainingCampaign:
             "job_id": None,
             "progress": None,
             "failure_reason": None,
+            "execution_generation": self._current_execution_generation(),
         }
 
     def _persist_candidate(
@@ -613,6 +646,13 @@ class TrainingCampaign:
                     },
                 ),
                 status="prepared",
+            )
+        begin_execution = getattr(self.state_store, "begin_model_run_execution", None)
+        if callable(begin_execution):
+            begin_execution(
+                identity.model_run_id,
+                campaign_id=self.campaign_id,
+                execution_generation=int(payload.get("execution_generation", 1)),
             )
 
     def _save_campaign_status(self, status: str) -> None:
@@ -638,6 +678,7 @@ class TrainingCampaign:
             "job_id": candidate.job_id,
             "progress": candidate.progress,
             "failure_reason": candidate.failure_reason,
+            "execution_generation": candidate.execution_generation,
             "dataset_path": (
                 None if candidate.dataset_path is None else str(candidate.dataset_path)
             ),
@@ -664,6 +705,7 @@ class TrainingCampaign:
             "script_path": None if attempt.script_path is None else str(attempt.script_path),
             "execution_config_hash": attempt.execution_config_hash,
             "execution_config": attempt.execution_config,
+            "execution_generation": attempt.execution_generation,
         }
         payload.update(changes)
         self._append("training_attempt", self.campaign_id, "status", payload)
@@ -687,6 +729,7 @@ class TrainingCampaign:
             ),
             execution_config_hash=payload.get("execution_config_hash"),
             execution_config=payload.get("execution_config"),
+            execution_generation=int(payload.get("execution_generation", 1)),
         )
 
     def _input_for(self, candidate: TrainingCandidate) -> TrainingInput:
@@ -772,14 +815,26 @@ class TrainingCampaign:
             attempt = current
         else:
             number = 1 if current is None else current.attempt_number + 1
+            generation = self._current_execution_generation()
+            attempt_id = (
+                f"{candidate.model_run_id}:attempt:{number}"
+                if generation == 1
+                else f"{candidate.model_run_id}:attempt:{number}:generation:{generation}"
+            )
+            job_suffix = (
+                f"-a{number:04d}"
+                if generation == 1
+                else f"-g{generation:04d}-a{number:04d}"
+            )
             attempt = TrainingAttempt(
-                attempt_id=f"{candidate.model_run_id}:attempt:{number}",
+                attempt_id=attempt_id,
                 model_run_id=candidate.model_run_id,
                 attempt_number=number,
                 status="submitting",
                 job_name=(
-                    f"nepflow-{self.campaign_id}-{candidate.model_run_id[-12:]}-a{number:04d}"
+                    f"nepflow-{self.campaign_id}-{candidate.model_run_id[-12:]}{job_suffix}"
                 ),
+                execution_generation=generation,
             )
             self._save_attempt(attempt)
 
@@ -878,6 +933,7 @@ class TrainingCampaign:
             "model_run_id": candidate.model_run_id,
             "attempt_id": attempt.attempt_id,
             "attempt_number": attempt.attempt_number,
+            "execution_generation": attempt.execution_generation,
             "scheduler_state": SchedulerJobState.COMPLETED.value,
             "artifact_path": str(Path(collected.artifact.model.path or "").resolve()),
             "artifact_sha256": collected.artifact.model.sha256,
@@ -936,6 +992,7 @@ class TrainingCampaign:
                     execution_metadata={
                         "campaign_id": self.campaign_id,
                         "potential_path": str(candidate.run_directory),
+                        "training_execution_generation": attempt.execution_generation,
                         "completion_evidence": self._completion_evidence(
                             candidate, collected, attempt
                         ),
@@ -1174,6 +1231,7 @@ class TrainingCampaign:
             status=status,
             candidates=final,
             promotion_decision=self._campaign_payload().get("promotion_decision"),
+            execution_generation=self._current_execution_generation(),
         )
 
     def snapshot(self) -> CampaignReconciliationResult:
@@ -1186,6 +1244,7 @@ class TrainingCampaign:
             status=self._derive_status(candidates),
             candidates=candidates,
             promotion_decision=self._campaign_payload().get("promotion_decision"),
+            execution_generation=self._current_execution_generation(),
         )
 
     def promotion_decision(self) -> Mapping[str, Any] | None:

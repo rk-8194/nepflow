@@ -24,6 +24,7 @@ from .optimisation import (
     generate_candidate_matrix,
 )
 from .reports import TrainingCampaignReport, summarize_campaign
+from .rollback import TrainingRollbackResult, TrainingRollbackService
 from .stage import TrainingStage
 
 __all__ = [
@@ -39,6 +40,8 @@ __all__ = [
     "TrainingCandidate",
     "TrainingCampaign",
     "TrainingCampaignReport",
+    "TrainingRollbackResult",
+    "TrainingRollbackService",
     "TrainingStage",
     "build_dataset_metadata",
     "build_training_dataset",

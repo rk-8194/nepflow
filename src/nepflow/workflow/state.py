@@ -368,10 +368,17 @@ class WorkflowState:
                     source="explicit_workflow_rollback",
                 )
             elif typed_target is WorkflowStage.TRAIN_NEP:
-                self.store.invalidate_model_runs(
-                    self.project_id,
-                    source="explicit_workflow_rollback",
+                cleanup = base_metadata.get("cleanup_summary")
+                authority_was_invalidated = (
+                    isinstance(cleanup, Mapping)
+                    and cleanup.get("training_authority_invalidated") is True
                 )
+                if not authority_was_invalidated:
+                    generations = self.store.invalidate_training_execution_authority(
+                        self.project_id,
+                        source="explicit_workflow_rollback",
+                    )
+                    base_metadata["training_execution_generations"] = generations
             elif typed_target is WorkflowStage.VALIDATE:
                 self.store.invalidate_validation_runs(
                     self.project_id,

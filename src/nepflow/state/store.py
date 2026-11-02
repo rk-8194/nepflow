@@ -18,6 +18,7 @@ from ._dft_records import DftRecordsMixin
 from ._event_records import EventRecordsMixin
 from ._run_records import RunRecordsMixin
 from ._structure_records import StructureRecordsMixin
+from ._training_records import TrainingRecordsMixin
 from ._workflow_records import WorkflowRecordsMixin
 from .migrations import CURRENT_SCHEMA_VERSION, migrate
 
@@ -30,6 +31,7 @@ class StateStore(
     DftRecordsMixin,
     ArtifactRecordsMixin,
     DatasetRecordsMixin,
+    TrainingRecordsMixin,
     RunRecordsMixin,
     EventRecordsMixin,
 ):

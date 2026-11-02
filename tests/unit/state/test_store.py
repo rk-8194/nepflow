@@ -20,6 +20,7 @@ from nepflow.domain.models import (
 )
 from nepflow.domain.structures import GeneratedStructureRecord, StructureProvenance
 from nepflow.errors import StateError
+from nepflow.state import CURRENT_SCHEMA_VERSION
 from nepflow.state.store import StateStore
 
 
@@ -134,7 +135,7 @@ def test_full_phase3_record_chain_serializes_and_reopens(tmp_path) -> None:
                 {"source": "test"},
             )
 
-        assert store.schema_version == 1
+        assert store.schema_version == CURRENT_SCHEMA_VERSION
         assert store.get_project("project-fixture") is not None
         assert store.get_stage_run("project-fixture:init")["stage"] == "init"
         assert (

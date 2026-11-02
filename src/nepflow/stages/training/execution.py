@@ -37,8 +37,17 @@ class TrainingExecution:
         self.site_prologue = tuple(site_prologue)
 
     @staticmethod
-    def attempt_directory(candidate: Any, attempt_number: int) -> Path:
-        return candidate.run_directory / "attempts" / f"a{attempt_number:04d}"
+    def attempt_directory(
+        candidate: Any,
+        attempt_number: int,
+        execution_generation: int = 1,
+    ) -> Path:
+        generation_root = (
+            candidate.run_directory / "attempts"
+            if execution_generation == 1
+            else candidate.run_directory / "attempts" / f"g{execution_generation:04d}"
+        )
+        return generation_root / f"a{attempt_number:04d}"
 
     def write_script(
         self,
@@ -50,7 +59,9 @@ class TrainingExecution:
         """Materialize and fingerprint one deterministic attempt command."""
 
         execution_directory = attempt.execution_directory or self.attempt_directory(
-            candidate, attempt.attempt_number
+            candidate,
+            attempt.attempt_number,
+            getattr(attempt, "execution_generation", 1),
         )
         execution_directory.mkdir(parents=True, exist_ok=True)
         self._copy_inputs(candidate.run_directory, execution_directory)
@@ -166,6 +177,7 @@ class TrainingExecution:
         return to_jsonable(
             {
                 "attempt_number": attempt.attempt_number,
+                "execution_generation": getattr(attempt, "execution_generation", 1),
                 "model_run_id": candidate.model_run_id,
                 "command": list(command),
                 "resources": asdict(self.resources) if self.resources is not None else None,

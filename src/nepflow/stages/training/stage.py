@@ -255,6 +255,7 @@ class TrainingStage:
                 expected_nep_in_sha256=expected.nep_in_sha256,
                 hyperparameters_hash=training_input.hyperparameters_hash,
                 state_store=campaign.state_store,
+                reset_execution_status=getattr(created, "execution_generation", 1) > 1,
             )
 
     @staticmethod
@@ -267,6 +268,7 @@ class TrainingStage:
         expected_nep_in_sha256: str,
         hyperparameters_hash: str,
         state_store: Any,
+        reset_execution_status: bool = False,
     ) -> None:
         manifest_path = Path(run_directory) / "model_run_manifest.json"
         if manifest_path.is_file():
@@ -284,6 +286,15 @@ class TrainingStage:
             ):
                 raise StateError(
                     f"Model-run manifest conflicts with persisted candidate: {expected_model_run_id}"
+                )
+            if reset_execution_status:
+                from nepflow.mlip.nep.artifacts import update_model_run_status
+
+                update_model_run_status(
+                    Path(run_directory),
+                    "prepared",
+                    state_store=state_store,
+                    model_run_id=expected_model_run_id,
                 )
             return
         manifest = create_model_run_manifest(

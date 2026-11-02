@@ -383,15 +383,29 @@ class WorkflowController:
                 "rollback_original_stage": original.value,
             },
         )
-        cleanup_summary = self.stage_registry.rollback(typed_target, context)
-        state_result = self.workflow_state.rollback(
-            typed_target,
-            metadata={
-                "project_name": self.project_name,
-                "cleanup_summary": dict(cleanup_summary),
-            },
+        if typed_target is WorkflowStage.TRAIN_NEP:
+            with self.state_store.transaction():
+                cleanup_summary = self.stage_registry.rollback(typed_target, context)
+                state_result = self.workflow_state.rollback(
+                    typed_target,
+                    metadata={
+                        "project_name": self.project_name,
+                        "cleanup_summary": dict(cleanup_summary),
+                    },
+                )
+        else:
+            cleanup_summary = self.stage_registry.rollback(typed_target, context)
+            state_result = self.workflow_state.rollback(
+                typed_target,
+                metadata={
+                    "project_name": self.project_name,
+                    "cleanup_summary": dict(cleanup_summary),
+                },
+            )
+        return replace(
+            state_result,
+            cleanup_summary={**dict(state_result.cleanup_summary), **dict(cleanup_summary)},
         )
-        return replace(state_result, cleanup_summary=dict(cleanup_summary))
 
     def _check_deadline(self) -> None:
         if self.slurm_deadline is None:

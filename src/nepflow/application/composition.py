@@ -18,7 +18,7 @@ from nepflow.stages.generation.generators.base import ConfigurationalGenerator
 from nepflow.stages.generation.perturbations.magnetism import MagneticGenerator
 from nepflow.stages.generation.stage import PerturbationCoordinator
 from nepflow.stages.selection import SelectionStage
-from nepflow.stages.training import TrainingStage
+from nepflow.stages.training import TrainingRollbackService, TrainingStage
 from nepflow.stages.validation import ValidationStage
 from nepflow.workflow import (
     StageContext,
@@ -341,6 +341,7 @@ def _register_scheduler_stages(
     scheduler: SlurmScheduler,
 ) -> None:
     rollback_service = DftRollbackService(scheduler)
+    training_rollback_service = TrainingRollbackService(scheduler)
 
     def rollback_scheduler_events(
         context: StageContext,
@@ -422,11 +423,25 @@ def _register_scheduler_stages(
     def run_validation(context: StageContext) -> StageRunResult:
         return ValidationStage(context=context, scheduler=scheduler).run().as_workflow_result()
 
+    def rollback_train_nep(context: StageContext) -> dict[str, object]:
+        if context.state_store is None:
+            raise ValidationError("Training rollback requires the authoritative StateStore")
+        poll_interval = 0
+        if context.config is not None:
+            poll_interval = context.config.slurm.poll_interval
+        result = training_rollback_service.rollback(
+            project_id=context.project_name,
+            state_store=context.state_store,
+            scheduler=scheduler,
+            poll_interval_seconds=poll_interval,
+        )
+        return result.to_dict()
+
     registry.register(WorkflowStage.RUN_VASP, run_dft)
     registry.register_rollback(WorkflowStage.RUN_VASP, rollback_run_vasp)
     registry.register_rollback(
         WorkflowStage.TRAIN_NEP,
-        lambda context: rollback_scheduler_events(context, "training_attempt"),
+        rollback_train_nep,
     )
     registry.register_rollback(
         WorkflowStage.VALIDATE,
